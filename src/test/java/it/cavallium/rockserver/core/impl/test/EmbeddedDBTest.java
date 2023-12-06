@@ -3,50 +3,57 @@ package it.cavallium.rockserver.core.impl.test;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.Callback.CallbackDelta;
 import it.cavallium.rockserver.core.common.ColumnSchema;
-import it.cavallium.rockserver.core.common.Delta;
-import java.io.File;
+import it.cavallium.rockserver.core.common.Utils;
+import org.junit.jupiter.api.Assertions;
+
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Comparator;
-import java.util.stream.Stream;
+import java.util.concurrent.atomic.AtomicInteger;
 
 class EmbeddedDBTest {
 
-	private Path dir;
 	private EmbeddedConnection db;
+	private long colId;
 
 	@org.junit.jupiter.api.BeforeEach
 	void setUp() throws IOException {
-		this.dir = Files.createTempDirectory("db-test");
-		db = new EmbeddedConnection(dir, "test", null);
+		if (System.getProperty("rockserver.core.print-config", null) == null) {
+			System.setProperty("rockserver.core.print-config", "false");
+		}
+		db = new EmbeddedConnection(null, "test", null);
+		this.colId = db.createColumn("put-1", new ColumnSchema(new int[]{1, 2, 1, Integer.BYTES, Integer.BYTES}, 2, true));
 	}
 
 	@org.junit.jupiter.api.AfterEach
 	void tearDown() throws IOException {
-		try (Stream<Path> walk = Files.walk(dir)) {
-			db.close();
-			walk.sorted(Comparator.reverseOrder())
-					.map(Path::toFile)
-					.peek(System.out::println)
-					.forEach(File::delete);
-		}
+		db.deleteColumn(colId);
+		db.close();
 	}
 
 	@org.junit.jupiter.api.Test
 	void put() {
-		var colId = db.createColumn("put-1", new ColumnSchema(new int[]{16, 16, 16, 32, 32}, 2, true));
-		db.put(0, colId, null, null, new CallbackDelta<MemorySegment>() {
-			@Override
-			public void onSuccess(Delta<MemorySegment> previous) {
-
-			}
+		var key = new MemorySegment[] {
+				Utils.toMemorySegment(new byte[] {3}),
+				Utils.toMemorySegment(new byte[] {4, 6}),
+				Utils.toMemorySegment(new byte[] {3}),
+				Utils.toMemorySegment(new byte[] {1, 2, 3}),
+				Utils.toMemorySegment(new byte[] {0, 0, 3, 6, 7, 8})
+		};
+		var value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
+		AtomicInteger callbackCalled = new AtomicInteger();
+		db.put(0, colId, key, value1, (CallbackDelta<MemorySegment>) prev -> {
+			callbackCalled.incrementAndGet();
+			Assertions.assertNull(prev);
 		});
-		db.deleteColumn(colId);
+		Assertions.assertEquals(1, callbackCalled.get());
+		db.put(0, colId, key, MemorySegment.ofArray(new byte[] {0, 0, 5}), (CallbackDelta<MemorySegment>) prev -> {
+			callbackCalled.incrementAndGet();
+			Utils.(value1);
+		});
 	}
 
 	@org.junit.jupiter.api.Test
 	void get() {
+		throw new UnsupportedOperationException();
 	}
 }

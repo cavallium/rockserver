@@ -1,20 +1,15 @@
 package it.cavallium.rockserver.core;
 
+import static it.cavallium.rockserver.core.client.EmbeddedConnection.PRIVATE_MEMORY_URL;
 import static java.util.Objects.requireNonNull;
 
 import inet.ipaddr.HostName;
-import it.cavallium.rockserver.core.client.ClientBuilder;
+
 import java.io.IOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnixDomainSocketAddress;
-import java.net.spi.InetAddressResolver;
-import java.net.spi.InetAddressResolverProvider;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -34,7 +29,7 @@ public class Main {
 				.description("RocksDB server core");
 		parser.addArgument("-u", "--url")
 				.type(String.class)
-				.setDefault("file://" + System.getProperty("user.home") + "/rockserver-core-db")
+				.setDefault(PRIVATE_MEMORY_URL.toString())
 				.help("Specify database rocksdb://hostname:port, or unix://<path>, or file://<path>");
 		parser.addArgument("-n", "--name")
 				.type(String.class)
@@ -85,7 +80,8 @@ public class Main {
 
 		switch (url.getScheme()) {
 			case "unix" -> clientBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(url.getPath())));
-			case "file" -> clientBuilder.setEmbedded(Path.of(url.getPath()));
+			case "file" -> clientBuilder.setEmbeddedPath(Path.of(url.getPath()));
+			case "memory" -> clientBuilder.setEmbeddedInMemory(true);
 			case "rocksdb" -> clientBuilder.setAddress(new HostName(url.getHost()).asInetSocketAddress());
 			default -> throw new IllegalArgumentException("Invalid scheme: " + url.getScheme());
 		}

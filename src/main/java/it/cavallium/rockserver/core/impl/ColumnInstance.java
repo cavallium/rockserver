@@ -82,10 +82,16 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 
 	private MemorySegment computeKeyAt(Arena arena, int i, MemorySegment[] keys) {
 		if (i < schema.keys().length - schema.variableLengthKeysCount()) {
+			if (keys[i].byteSize() != schema.keys()[i]) {
+				throw new RocksDBException(RocksDBErrorType.KEY_LENGTH_MISMATCH,
+						"Key at index " + i + " has a different length than expected! Expected: " + schema.keys()[i]
+								+ ", received: " + keys[i].byteSize());
+			}
 			return keys[i];
 		} else {
 			if (schema.keys()[i] != Integer.BYTES) {
-				throw new UnsupportedOperationException("Hash size different than 32-bit is currently unsupported");
+				throw new RocksDBException(RocksDBErrorType.UNSUPPORTED_HASH_SIZE,
+						"Hash size different than 32-bit is currently unsupported");
 			} else {
 				return XXHash32.getInstance().hash(arena, keys[i], 0, 0, 0);
 			}
@@ -94,17 +100,17 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 
 	private void validateFinalKeySize(MemorySegment key) {
 		if (finalKeySizeBytes != key.byteSize()) {
-			throw new IllegalArgumentException(
-					"Keys size must be equal to the column keys size. Expected " + finalKeySizeBytes + ", got "
-							+ key.byteSize());
+			throw new RocksDBException(RocksDBErrorType.RAW_KEY_LENGTH_MISMATCH,
+					"Keys size must be equal to the column keys size. Expected: "
+							+ finalKeySizeBytes + ", got: " + key.byteSize());
 		}
 	}
 
 	private void validateKeyCount(MemorySegment[] keys) {
 		if (schema.keys().length != keys.length) {
-			throw new IllegalArgumentException(
-					"Keys count must be equal to the column keys count. Expected " + schema.keys().length + ", got "
-							+ keys.length);
+			throw new RocksDBException(RocksDBErrorType.KEYS_COUNT_MISMATCH,
+					"Keys count must be equal to the column keys count. Expected: " + schema.keys().length
+							+ ", got: " + keys.length);
 		}
 	}
 
@@ -118,8 +124,10 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 		long offset = 0;
 		for (MemorySegment keyI : variableKeys) {
 			var keyISize = keyI.byteSize();
-			bucketElementKey.set(BIG_ENDIAN_CHAR_UNALIGNED, offset += Character.BYTES, toCharExact(keyISize));
-			MemorySegment.copy(keyI, 0, bucketElementKey, offset += keyISize, keyISize);
+			bucketElementKey.set(BIG_ENDIAN_CHAR_UNALIGNED, offset, toCharExact(keyISize));
+			offset += Character.BYTES;
+			MemorySegment.copy(keyI, 0, bucketElementKey, offset, keyISize);
+			offset += keyISize;
 		}
 		assert offset == totalSize;
 		return bucketElementKey;
@@ -135,11 +143,13 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 	}
 
 	public void checkNullableValue(MemorySegment value) {
-		if (schema.hasValue() == (value == null || value == MemorySegment.NULL)) {
+		if (schema.hasValue() == (value == null)) {
 			if (schema.hasValue()) {
-				throw new RocksDBException(RocksDBErrorType.UNEXPECTED_NULL_VALUE, "Schema expects a value, but a null value has been passed");
+				throw new RocksDBException(RocksDBErrorType.UNEXPECTED_NULL_VALUE,
+						"Schema expects a value, but a null value has been passed");
 			} else {
-				throw new RocksDBException(RocksDBErrorType.VALUE_MUST_BE_NULL, "Schema expects no value, but a non-null value has been passed");
+				throw new RocksDBException(RocksDBErrorType.VALUE_MUST_BE_NULL,
+						"Schema expects no value, but a non-null value has been passed");
 			}
 		}
 	}
@@ -149,7 +159,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 		checkNullableValue(computedBucketElementValue);
 		var keySize = computedBucketElementKey.byteSize();
 		var valueSize = computedBucketElementValue != null ? computedBucketElementValue.byteSize() : 0;
-		var totalSize = keySize + valueSize;
+		var totalSize = Integer.BYTES + keySize + valueSize;
 		var computedBucketElementKV = arena.allocate(totalSize);
 		computedBucketElementKV.set(BIG_ENDIAN_INT, 0, toIntExact(totalSize));
 		MemorySegment.copy(computedBucketElementKey, 0, computedBucketElementKV, Integer.BYTES, keySize);

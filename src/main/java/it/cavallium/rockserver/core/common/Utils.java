@@ -2,8 +2,17 @@ package it.cavallium.rockserver.core.common;
 
 import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_BYTES;
 
-import java.lang.foreign.Arena;
+import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.List;
+import java.util.function.Function;
+import java.util.stream.Stream;
+
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -40,11 +49,36 @@ public class Utils {
 	}
 
 	@NotNull
-	public static MemorySegment toMemorySegment(Arena arena, byte @Nullable [] array) {
+	public static MemorySegment toMemorySegment(byte @Nullable [] array) {
 		if (array != null) {
-			return arena.allocateArray(BIG_ENDIAN_BYTES, array);
+			return MemorySegment.ofArray(array);
 		} else {
 			return MemorySegment.NULL;
 		}
 	}
+
+    public static byte[] toByteArray(MemorySegment memorySegment) {
+        return memorySegment.toArray(BIG_ENDIAN_BYTES);
+    }
+
+	public static <T, U> List<U> mapList(Collection<T> input, Function<T, U> mapper) {
+		var result = new ArrayList<U>(input.size());
+		input.forEach(t -> result.add(mapper.apply(t)));
+		return result;
+	}
+
+	public static void deleteDirectory(String path) throws RocksDBException {
+		try (Stream<Path> pathStream = Files.walk(Path.of(path))) {
+			pathStream.sorted(Comparator.reverseOrder())
+					.forEach(f -> {
+						try {
+							Files.deleteIfExists(f);
+						} catch (IOException e) {
+							throw new RocksDBException(RocksDBException.RocksDBErrorType.DIRECTORY_DELETE, e);
+						}
+					});
+		} catch (IOException e) {
+			throw new RocksDBException(RocksDBException.RocksDBErrorType.DIRECTORY_DELETE, e);
+        }
+    }
 }

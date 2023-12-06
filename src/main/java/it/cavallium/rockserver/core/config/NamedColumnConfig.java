@@ -2,8 +2,8 @@ package it.cavallium.rockserver.core.config;
 
 import org.github.gestalt.config.exceptions.GestaltException;
 
-public interface DatabaseConfig {
+public interface NamedColumnConfig extends FallbackColumnConfig {
 
-	GlobalDatabaseConfig global() throws GestaltException;
+	String name() throws GestaltException;
 
 }

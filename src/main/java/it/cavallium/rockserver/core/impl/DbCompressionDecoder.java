@@ -26,7 +26,7 @@ public class DbCompressionDecoder implements Decoder<CompressionType> {
 
 	@Override
 	public boolean matches(TypeCapture<?> klass) {
-		return klass.isAssignableFrom(CompressionType.class);
+		return klass != null && klass.isAssignableFrom(CompressionType.class);
 	}
 
 	@Override

@@ -13,15 +13,17 @@ import org.rocksdb.WriteOptions;
 
 public sealed interface TransactionalDB extends Closeable {
 
-	static TransactionalDB create(RocksDB db) {
+	static TransactionalDB create(String path, RocksDB db) {
 		return switch (db) {
-			case OptimisticTransactionDB optimisticTransactionDB -> new OptimisticTransactionalDB(optimisticTransactionDB);
-			case TransactionDB transactionDB -> new PessimisticTransactionalDB(transactionDB);
+			case OptimisticTransactionDB optimisticTransactionDB -> new OptimisticTransactionalDB(path, optimisticTransactionDB);
+			case TransactionDB transactionDB -> new PessimisticTransactionalDB(path, transactionDB);
 			default -> throw new UnsupportedOperationException("This database is not transactional");
 		};
 	}
 
 	TransactionalOptions createTransactionalOptions();
+
+	String getPath();
 
 	RocksDB get();
 	/**
@@ -89,15 +91,22 @@ public sealed interface TransactionalDB extends Closeable {
 
 	final class PessimisticTransactionalDB implements TransactionalDB {
 
+		private final String path;
 		private final TransactionDB db;
 
-		public PessimisticTransactionalDB(TransactionDB db) {
+		public PessimisticTransactionalDB(String path, TransactionDB db) {
+			this.path = path;
 			this.db = db;
 		}
 
 		@Override
 		public TransactionalOptions createTransactionalOptions() {
 			return new TransactionalOptionsPessimistic(new TransactionOptions());
+		}
+
+		@Override
+		public String getPath() {
+			return path;
 		}
 
 		@Override
@@ -153,15 +162,22 @@ public sealed interface TransactionalDB extends Closeable {
 
 	final class OptimisticTransactionalDB implements TransactionalDB {
 
+		private final String path;
 		private final OptimisticTransactionDB db;
 
-		public OptimisticTransactionalDB(OptimisticTransactionDB db) {
+		public OptimisticTransactionalDB(String path, OptimisticTransactionDB db) {
+			this.path = path;
 			this.db = db;
 		}
 
 		@Override
 		public TransactionalOptions createTransactionalOptions() {
 			return new TransactionalOptionsOptimistic(new OptimisticTransactionOptions());
+		}
+
+		@Override
+		public String getPath() {
+			return path;
 		}
 
 		@Override

@@ -8,12 +8,17 @@ public class ClientBuilder {
 
 	private InetSocketAddress iNetAddress;
 	private UnixDomainSocketAddress unixAddress;
-	private Path embedded;
+	private Path embeddedPath;
 	private String name;
 	private Path embeddedConfig;
+	private boolean embeddedInMemory;
 
-	public void setEmbedded(Path path) {
-		this.embedded = path;
+	public void setEmbeddedPath(Path path) {
+		this.embeddedPath = path;
+	}
+
+	public void setEmbeddedInMemory(boolean inMemory) {
+		this.embeddedInMemory = inMemory;
 	}
 
 	public void setUnixSocket(UnixDomainSocketAddress address) {
@@ -33,8 +38,10 @@ public class ClientBuilder {
 	}
 
 	public RocksDBConnection build() {
-		if (embedded != null) {
-			return new EmbeddedConnection(embedded, name, embeddedConfig);
+		if (embeddedInMemory) {
+			return new EmbeddedConnection(null, name, embeddedConfig);
+		} else if (embeddedPath != null) {
+			return new EmbeddedConnection(embeddedPath, name, embeddedConfig);
 		} else if (unixAddress != null) {
 			return new SocketConnectionUnix(unixAddress, name);
 		} else if (iNetAddress != null) {

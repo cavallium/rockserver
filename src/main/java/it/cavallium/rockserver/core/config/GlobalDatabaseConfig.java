@@ -1,28 +1,42 @@
 package it.cavallium.rockserver.core.config;
 
+import org.github.gestalt.config.exceptions.GestaltException;
+import org.jetbrains.annotations.Nullable;
+
 import java.nio.file.Path;
 
 public interface GlobalDatabaseConfig {
 
-	boolean spinning();
+	boolean spinning() throws GestaltException;
 
-	boolean checksum();
+	boolean checksum() throws GestaltException;
 
-	boolean useDirectIo();
+	boolean useDirectIo() throws GestaltException;
 
-	boolean allowRocksdbMemoryMapping();
+	boolean allowRocksdbMemoryMapping() throws GestaltException;
 
-	int maximumOpenFiles();
+	@Nullable
+	Integer maximumOpenFiles() throws GestaltException;
 
-	boolean optimistic();
+	boolean optimistic() throws GestaltException;
 
-	DataSize blockCache();
+	@Nullable
+	DataSize blockCache() throws GestaltException;
 
-	DataSize writeBufferManager();
+	@Nullable
+	DataSize writeBufferManager() throws GestaltException;
 
-	Path logPath();
+	@Nullable
+	Path logPath() throws GestaltException;
 
-	FallbackColumnOptions fallbackColumnOptions();
-	NamedColumnOptions[] columnOptions();
+	@Nullable
+	Path walPath() throws GestaltException;
+
+	boolean absoluteConsistency() throws GestaltException;
+
+	VolumeConfig[] volumes() throws GestaltException;
+
+	FallbackColumnConfig fallbackColumnOptions() throws GestaltException;
+	NamedColumnConfig[] columnOptions() throws GestaltException;
 
 }

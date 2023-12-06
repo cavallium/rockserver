@@ -10,15 +10,18 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.net.URI;
 import java.nio.file.Path;
+import java.util.Optional;
+
 import org.jetbrains.annotations.Nullable;
 
 public class EmbeddedConnection extends BaseConnection {
 
 	private final EmbeddedDB db;
+	public static final URI PRIVATE_MEMORY_URL = URI.create("memory://private");
 
-	public EmbeddedConnection(Path path, String name, Path embeddedConfig) {
+	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) {
 		super(name);
-		this.db = new EmbeddedDB(path, embeddedConfig);
+		this.db = new EmbeddedDB(path, name, embeddedConfig);
 	}
 
 	@Override
@@ -29,7 +32,7 @@ public class EmbeddedConnection extends BaseConnection {
 
 	@Override
 	public URI getUrl() {
-		return db.getPath().toUri();
+		return Optional.ofNullable(db.getPath()).map(Path::toUri).orElse(PRIVATE_MEMORY_URL);
 	}
 
 	@Override

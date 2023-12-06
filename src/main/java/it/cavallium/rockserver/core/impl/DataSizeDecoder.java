@@ -24,7 +24,7 @@ class DataSizeDecoder implements Decoder<DataSize> {
 
 	@Override
 	public boolean matches(TypeCapture klass) {
-		return klass.isAssignableFrom(DataSize.class);
+		return klass != null && klass.isAssignableFrom(DataSize.class);
 	}
 
 	@Override

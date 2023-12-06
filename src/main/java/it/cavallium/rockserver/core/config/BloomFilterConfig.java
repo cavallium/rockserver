@@ -1,9 +1,13 @@
 package it.cavallium.rockserver.core.config;
 
+import org.github.gestalt.config.exceptions.GestaltException;
+import org.jetbrains.annotations.Nullable;
+
 public interface BloomFilterConfig {
 
-	int bitsPerKey();
+	int bitsPerKey() throws GestaltException;
 
-	boolean optimizeForHits();
+	@Nullable
+	Boolean optimizeForHits() throws GestaltException;
 
 }
