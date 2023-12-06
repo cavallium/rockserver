@@ -1,17 +1,11 @@
 package it.cavallium.rockserver.core.config;
 
+import org.rocksdb.CompressionType;
+
 public interface DatabaseLevel {
 
-	DatabaseCompression compression();
+	CompressionType compression();
 
 	DataSize maxDictBytes();
 
-	static String stringify(DatabaseLevel o) {
-		return """
-      {
-              "compression": "%s",
-              "max-dict-bytes": "%s"
-            }\
-      """.formatted(o.compression(), o.maxDictBytes());
-	}
 }

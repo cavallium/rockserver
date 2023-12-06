@@ -193,12 +193,19 @@
                 <enabled>true</enabled>
               </agent>
               <buildArgs>
+                <buildArg>-H:+UnlockExperimentalVMOptions</buildArg>
                 <buildArg>--strict-image-heap</buildArg>
                 <buildArg>-march=native</buildArg>
-                <buildArg>-H:IncludeResourceBundles=net.sourceforge.argparse4j.internal.ArgumentParserImpl-en_US</buildArg>
+                <buildArg>-H:IncludeResourceBundles=net.sourceforge.argparse4j.internal.ArgumentParserImpl</buildArg>
                 <buildArg>-O1</buildArg>
                 <buildArg>--enable-preview</buildArg>
-                <buildArg>--no-fallback</buildArg>
+                <buildArg>-H:+StaticExecutableWithDynamicLibC</buildArg>
+                <buildArg>-H:+JNI</buildArg>
+                <buildArg>-H:IncludeResources=librocksdbjni-linux64.so</buildArg>
+                <buildArg>-H:IncludeResources=it/cavallium/rockserver/core/resources/default.conf</buildArg>
+                <buildArg>-H:DynamicProxyConfigurationFiles=proxy-config.json</buildArg>
+                <buildArg>--delay-class-initialization-to-runtime=org.rocksdb.RocksDB,org.rocksdb.RocksObject</buildArg>
+                <!--<buildArg>_-no-fallback</buildArg>-->
                 <buildArg>--gc=G1</buildArg>
               </buildArgs>
             </configuration>

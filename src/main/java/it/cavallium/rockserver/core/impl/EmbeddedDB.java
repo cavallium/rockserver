@@ -16,6 +16,7 @@ import it.cavallium.rockserver.core.common.Delta;
 import it.cavallium.rockserver.core.common.RocksDBAPI;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.config.ConfigPrinter;
 import it.cavallium.rockserver.core.config.DatabaseConfig;
 import it.cavallium.rockserver.core.impl.rocksdb.REntry;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBObjects;
@@ -80,13 +81,14 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 			}
 			var gestalt = gsb
 					.addDecoder(new DataSizeDecoder())
+					.addDecoder(new DbCompressionDecoder())
 					.addDefaultConfigLoaders()
 					.addDefaultDecoders()
 					.build();
 			gestalt.loadConfigs();
 
 			this.config = gestalt.getConfig("database", DatabaseConfig.class);
-			logger.log(Level.INFO, "Database configuration: {0}", DatabaseConfig.stringify(this.config));
+			logger.log(Level.INFO, "Database configuration: {0}", ConfigPrinter.stringifyDatabase(this.config));
 		} catch (GestaltException e) {
 			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.CONFIG_ERROR, e);
 		}

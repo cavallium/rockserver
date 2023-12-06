@@ -1,0 +1,50 @@
+[
+  {
+    "condition": {
+      "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
+    },
+    "interfaces": [
+      "it.cavallium.rockserver.core.config.DatabaseConfig"
+    ]
+  },
+  {
+    "condition": {
+      "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
+    },
+    "interfaces": [
+      "it.cavallium.rockserver.core.config.GlobalDatabaseConfig"
+    ]
+  },
+  {
+    "condition": {
+      "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
+    },
+    "interfaces": [
+      "it.cavallium.rockserver.core.config.FallbackColumnOptions"
+    ]
+  },
+  {
+    "condition": {
+      "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
+    },
+    "interfaces": [
+      "it.cavallium.rockserver.core.config.NamedColumnOptions"
+    ]
+  },
+  {
+    "condition": {
+      "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
+    },
+    "interfaces": [
+      "it.cavallium.rockserver.core.config.BloomFilterConfig"
+    ]
+  },
+  {
+    "condition": {
+      "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
+    },
+    "interfaces": [
+      "it.cavallium.rockserver.core.config.DatabaseLevel"
+    ]
+  }
+]
