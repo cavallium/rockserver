@@ -17,9 +17,12 @@ public interface RocksDBAPI {
 
 	/**
 	 * Close a transaction
+	 *
 	 * @param transactionId transaction id to close
+	 * @param commit true to commit the transaction, false to rollback it
+	 * @return true if committed, if false, you should try again
 	 */
-	void closeTransaction(long transactionId) throws RocksDBException;
+	boolean closeTransaction(long transactionId, boolean commit) throws RocksDBException;
 
 	/**
 	 * Create a column
@@ -50,11 +53,11 @@ public interface RocksDBAPI {
 	 * @param value value, or null if not needed
 	 * @param callback the callback will be executed on the same thread, exactly once.
 	 */
-	void put(long transactionId,
+	<T> T put(long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			@Nullable MemorySegment value,
-			PutCallback<? super MemorySegment> callback) throws RocksDBException;
+			PutCallback<? super MemorySegment, T> callback) throws RocksDBException;
 
 	/**
 	 * Get an element from the specified position
@@ -63,10 +66,10 @@ public interface RocksDBAPI {
 	 * @param keys column keys, or empty array if not needed
 	 * @param callback the callback will be executed on the same thread, exactly once.
 	 */
-	void get(long transactionId,
+	<T> T get(long transactionId,
 			long columnId,
 			MemorySegment[] keys,
-			GetCallback<? super MemorySegment> callback) throws RocksDBException;
+			GetCallback<? super MemorySegment, T> callback) throws RocksDBException;
 
 	/**
 	 * Open an iterator
@@ -105,8 +108,8 @@ public interface RocksDBAPI {
 	 * @param takeCount number of elements to take
 	 * @param callback the callback will be executed on the same thread, exactly once.
 	 */
-	void subsequent(long iterationId,
+	<T> T subsequent(long iterationId,
 			long skipCount,
 			long takeCount,
-			IteratorCallback<? super MemorySegment> callback) throws RocksDBException;
+			IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException;
 }

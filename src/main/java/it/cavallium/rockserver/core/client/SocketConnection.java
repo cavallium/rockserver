@@ -33,7 +33,7 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public void closeTransaction(long transactionId) {
+	public boolean closeTransaction(long transactionId, boolean commit) {
 		throw new UnsupportedOperationException();
 	}
 
@@ -53,17 +53,19 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public void put(long transactionId,
+	public <T> T put(long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			@Nullable MemorySegment value,
-			PutCallback<? super MemorySegment> callback) throws RocksDBException {
+			PutCallback<? super MemorySegment, T> callback) throws RocksDBException {
 		throw new UnsupportedOperationException();
 	}
 
 	@Override
-	public void get(long transactionId, long columnId, MemorySegment[] keys, GetCallback<? super MemorySegment> callback)
-			throws RocksDBException {
+	public <T> T get(long transactionId,
+			long columnId,
+			MemorySegment[] keys,
+			GetCallback<? super MemorySegment, T> callback) throws RocksDBException {
 		throw new UnsupportedOperationException();
 	}
 
@@ -88,10 +90,10 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public void subsequent(long iterationId,
+	public <T> T subsequent(long iterationId,
 			long skipCount,
 			long takeCount,
-			IteratorCallback<? super MemorySegment> callback) throws RocksDBException {
+			IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException {
 		throw new UnsupportedOperationException();
 	}
 }

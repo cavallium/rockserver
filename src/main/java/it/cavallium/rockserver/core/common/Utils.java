@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.core.common;
 
 import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_BYTES;
+import static java.lang.foreign.MemorySegment.NULL;
+import static java.util.Objects.requireNonNullElse;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -81,4 +83,10 @@ public class Utils {
 			throw new RocksDBException(RocksDBException.RocksDBErrorType.DIRECTORY_DELETE, e);
         }
     }
+
+	public static boolean valueEquals(MemorySegment previousValue, MemorySegment currentValue) {
+		previousValue = requireNonNullElse(previousValue, NULL);
+		currentValue = requireNonNullElse(currentValue, NULL);
+		return MemorySegment.mismatch(previousValue, 0, previousValue.byteSize(), currentValue, 0, currentValue.byteSize()) == -1;
+	}
 }

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.test;
 
+import it.cavallium.rockserver.core.impl.ColumnInstance;
 import it.cavallium.rockserver.core.impl.XXHash32;
 import java.lang.foreign.Arena;
 import java.lang.foreign.ValueLayout;
@@ -26,7 +27,7 @@ public class XXHash32Test {
 				var hash = safeXxhash32.hash(bytes, 0, bytes.length, Integer.MIN_VALUE);
 				var a = Arena.global();
 				var result = myXxhash32.hash(a, a.allocateArray(OfByte.JAVA_BYTE, bytes), 0, bytes.length, Integer.MIN_VALUE);
-				var resultInt = result.get(ValueLayout.JAVA_INT.withOrder(ByteOrder.BIG_ENDIAN), 0);
+				var resultInt = result.get(ColumnInstance.BIG_ENDIAN_INT, 0);
 				Assertions.assertEquals(hash, resultInt);
 			}
 		}

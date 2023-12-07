@@ -7,6 +7,9 @@ import static java.util.Objects.requireNonNullElse;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
+import it.cavallium.rockserver.core.common.Callback.CallbackDelta;
+import it.cavallium.rockserver.core.common.Callback.CallbackPrevious;
+import it.cavallium.rockserver.core.common.Callback.CallbackVoid;
 import it.cavallium.rockserver.core.common.Callback.GetCallback;
 import it.cavallium.rockserver.core.common.Callback.IteratorCallback;
 import it.cavallium.rockserver.core.common.Callback.PutCallback;
@@ -35,6 +38,7 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
@@ -44,6 +48,7 @@ import org.github.gestalt.config.source.ClassPathConfigSource;
 import org.github.gestalt.config.source.FileConfigSource;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.*;
+import org.rocksdb.Status.Code;
 
 public class EmbeddedDB implements RocksDBAPI, Closeable {
 
@@ -154,13 +159,16 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 
 	@Override
 	public long openTransaction(long timeoutMs) {
+		return FastRandomUtils.allocateNewValue(txs, openTransactionInternal(timeoutMs), Long.MIN_VALUE, -2);
+	}
+
+	private REntry<Transaction> openTransactionInternal(long timeoutMs) {
 		// Open the transaction operation, do not close until the transaction has been closed
 		ops.beginOp();
 		try {
-			TransactionalOptions txOpts = db.createTransactionalOptions();
+			TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
 			var writeOpts = new WriteOptions();
-			var tx = new REntry<>(db.beginTransaction(writeOpts, txOpts), new RocksDBObjects(writeOpts, txOpts));
-			return FastRandomUtils.allocateNewValue(txs, tx, Long.MIN_VALUE, -2);
+			return new REntry<>(db.beginTransaction(writeOpts, txOpts), new RocksDBObjects(writeOpts, txOpts));
 		} catch (Throwable ex) {
 			ops.endOp();
 			throw ex;
@@ -168,22 +176,68 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 	}
 
 	@Override
-	public void closeTransaction(long transactionId) {
+	public boolean closeTransaction(long transactionId, boolean commit) {
+		var tx = txs.get(transactionId);
+		if (tx != null) {
+			try {
+				var committed = closeTransaction(tx, commit);
+				if (committed) {
+					txs.remove(transactionId, tx);
+				}
+				return committed;
+			} catch (Throwable ex) {
+				txs.remove(transactionId, tx);
+				throw ex;
+			}
+		} else {
+			// Transaction not found
+			if (commit) {
+				throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.TX_NOT_FOUND, "Transaction not found: " + transactionId);
+			} else {
+				return true;
+			}
+		}
+	}
+
+	private boolean closeTransaction(REntry<Transaction> tx, boolean commit) {
 		ops.beginOp();
 		try {
-			var tx = txs.remove(transactionId);
-			if (tx != null) {
-				try {
-					tx.close();
-				} finally {
-					// Close the transaction operation
-					ops.endOp();
+			// Transaction found
+			try {
+				if (commit) {
+					if (!commitTxOptimistically(tx)) {
+						// Do not call endOp here, since the transaction is still open
+						return false;
+					}
+				} else {
+					if (tx.val().isOwningHandle()) {
+						tx.val().rollback();
+					}
 				}
-			} else {
-				throw new NoSuchElementException("Transaction not found: " + transactionId);
+				tx.close();
+				// Close the transaction operation
+				ops.endOp();
+				return true;
+			} catch (RocksDBException e) {
+				// Close the transaction operation
+				ops.endOp();
+				throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
 			}
 		} finally {
 			ops.endOp();
+		}
+	}
+
+	private boolean commitTxOptimistically(REntry<Transaction> tx) throws RocksDBException {
+		try {
+			tx.val().commit();
+			return true;
+		} catch (RocksDBException ex) {
+			var status = ex.getStatus() != null ? ex.getStatus().getCode() : Code.Ok;
+			if (status == Code.Busy || status == Code.TryAgain) {
+				return false;
+			}
+			throw ex;
 		}
 	}
 
@@ -256,31 +310,47 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 	}
 
 	@Override
-	public void put(long transactionId,
+	public <T> T put(long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			@Nullable MemorySegment value,
-			PutCallback<? super MemorySegment> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			PutCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try (var arena = Arena.ofConfined()) {
 			// Column id
 			var col = getColumn(columnId);
-			// Check for null value
-			col.checkNullableValue(value);
-
-			MemorySegment previousValue;
 			REntry<Transaction> tx;
 			if (transactionId != 0) {
 				tx = getTransaction(transactionId);
 			} else {
 				tx = null;
 			}
+			return put(arena, tx, col, keys, value, callback);
+		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+		} finally {
+			ops.endOp();
+		}
+	}
+
+	private <U> U put(Arena arena,
+			REntry<Transaction> tx,
+			ColumnInstance col,
+			MemorySegment[] keys,
+			@Nullable MemorySegment value,
+			PutCallback<? super MemorySegment, U> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+		// Check for null value
+		col.checkNullableValue(value);
+		try {
+			MemorySegment previousValue;
 			MemorySegment calculatedKey = col.calculateKey(arena, keys);
 			if (col.hasBuckets()) {
 				if (tx != null) {
 					var bucketElementKeys = col.getBucketElementKeys(keys);
 					try (var readOptions = new ReadOptions()) {
-						var previousRawBucketByteArray = tx.val().get(col.cfh(), readOptions, calculatedKey.toArray(BIG_ENDIAN_BYTES));
+						var previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 						MemorySegment previousRawBucket = toMemorySegment(previousRawBucketByteArray);
 						var bucket = new Bucket(col, previousRawBucket);
 						previousValue = bucket.addElement(bucketElementKeys, value);
@@ -290,12 +360,15 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					}
 				} else {
 					// Retry using a transaction: transactions are required to handle this kind of data
-					var newTransactionId = this.openTransaction(Long.MAX_VALUE);
+					var newTx = this.openTransactionInternal(Long.MAX_VALUE);
 					try {
-						put(newTransactionId, columnId, keys, value, callback);
-						return;
+						boolean committed;
+						do {
+							previousValue = put(arena, newTx, col, keys, value, Callback.previous());
+							committed = this.closeTransaction(newTx, true);
+						} while (!committed);
 					} finally {
-						this.closeTransaction(newTransactionId);
+						this.closeTransaction(newTx, false);
 					}
 				}
 			} else {
@@ -322,26 +395,24 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					}
 				}
 			}
-			switch (callback) {
-				case Callback.CallbackVoid<? super MemorySegment> ignored -> {}
-				case Callback.CallbackPrevious<? super MemorySegment> c -> c.onPrevious(previousValue);
-				case Callback.CallbackChanged c -> c.onChanged(valueEquals(previousValue, value));
-				case Callback.CallbackDelta<? super MemorySegment> c -> c.onSuccess(new Delta<>(previousValue, value));
-				default -> throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_3,
-						"Unexpected value: " + callback);
-			}
+			return Callback.safeCast(switch (callback) {
+				case Callback.CallbackVoid<?> ignored -> null;
+				case Callback.CallbackPrevious<?> ignored -> previousValue;
+				case Callback.CallbackChanged<?> ignored -> Utils.valueEquals(previousValue, value);
+				case Callback.CallbackDelta<?> ignored -> new Delta<>(previousValue, value);
+			});
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_UNKNOWN, ex);
-		} finally {
-			ops.endOp();
+			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		}
 	}
 
 	@Override
-	public void get(long transactionId, long columnId, MemorySegment[] keys, GetCallback<? super MemorySegment> callback)
-			throws it.cavallium.rockserver.core.common.RocksDBException {
+	public <T> T get(long transactionId,
+			long columnId,
+			MemorySegment[] keys,
+			GetCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try (var arena = Arena.ofConfined()) {
 			// Column id
@@ -368,7 +439,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 				}
 			} else {
 				boolean shouldGetCurrent = Callback.requiresGettingCurrentValue(callback)
-						|| (tx != null && callback instanceof Callback.CallbackExists<? super MemorySegment>);
+						|| (tx != null && callback instanceof Callback.CallbackExists<?>);
 				if (shouldGetCurrent) {
 					try (var readOptions = new ReadOptions()) {
 						foundValue = dbGet(tx, col, arena, readOptions, calculatedKey);
@@ -376,7 +447,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					} catch (RocksDBException e) {
 						throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_2, e);
 					}
-				} else if (callback instanceof Callback.CallbackExists<? super MemorySegment>) {
+				} else if (callback instanceof Callback.CallbackExists<?>) {
 					// tx is always null here
 					//noinspection ConstantValue
 					assert tx == null;
@@ -387,17 +458,15 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					existsValue = false;
 				}
 			}
-			switch (callback) {
-				case Callback.CallbackVoid<? super MemorySegment> ignored -> {}
-				case Callback.CallbackCurrent<? super MemorySegment> c -> c.onCurrent(foundValue);
-				case Callback.CallbackExists<? super MemorySegment> c -> c.onExists(existsValue);
-				default -> throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_3,
-						"Unexpected value: " + callback);
-			}
+			return Callback.safeCast(switch (callback) {
+				case Callback.CallbackVoid<?> ignored -> null;
+				case Callback.CallbackCurrent<?> ignored -> foundValue;
+				case Callback.CallbackExists<?> ignored -> existsValue;
+			});
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_UNKNOWN, ex);
+			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		} finally {
 			ops.endOp();
 		}
@@ -452,10 +521,10 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 	}
 
 	@Override
-	public void subsequent(long iterationId,
+	public <T> T subsequent(long iterationId,
 			long skipCount,
 			long takeCount,
-			IteratorCallback<? super MemorySegment> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			IteratorCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {
 			throw new UnsupportedOperationException();
@@ -513,12 +582,6 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 				}
 			}
 		};
-	}
-
-	private boolean valueEquals(MemorySegment previousValue, MemorySegment currentValue) {
-		previousValue = requireNonNullElse(previousValue, NULL);
-		currentValue = requireNonNullElse(currentValue, NULL);
-		return MemorySegment.mismatch(previousValue, 0, previousValue.byteSize(), currentValue, 0, currentValue.byteSize()) != -1;
 	}
 
 	private ColumnInstance getColumn(long columnId) {

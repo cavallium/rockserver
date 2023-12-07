@@ -21,7 +21,7 @@ public sealed interface TransactionalDB extends Closeable {
 		};
 	}
 
-	TransactionalOptions createTransactionalOptions();
+	TransactionalOptions createTransactionalOptions(long timeoutMs);
 
 	String getPath();
 
@@ -100,8 +100,8 @@ public sealed interface TransactionalDB extends Closeable {
 		}
 
 		@Override
-		public TransactionalOptions createTransactionalOptions() {
-			return new TransactionalOptionsPessimistic(new TransactionOptions());
+		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
+			return new TransactionalOptionsPessimistic(new TransactionOptions().setExpiration(timeoutMs));
 		}
 
 		@Override
@@ -171,7 +171,7 @@ public sealed interface TransactionalDB extends Closeable {
 		}
 
 		@Override
-		public TransactionalOptions createTransactionalOptions() {
+		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
 			return new TransactionalOptionsOptimistic(new OptimisticTransactionOptions());
 		}
 

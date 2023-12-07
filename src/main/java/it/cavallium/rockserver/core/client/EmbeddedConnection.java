@@ -41,8 +41,8 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
-	public void closeTransaction(long transactionId) {
-		db.closeTransaction(transactionId);
+	public boolean closeTransaction(long transactionId, boolean commit) {
+		return db.closeTransaction(transactionId, commit);
 	}
 
 	@Override
@@ -61,18 +61,20 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
-	public void put(long transactionId,
+	public <T> T put(long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			@Nullable MemorySegment value,
-			PutCallback<? super MemorySegment> callback) throws RocksDBException {
-		db.put(transactionId, columnId, keys, value, callback);
+			PutCallback<? super MemorySegment, T> callback) throws RocksDBException {
+		return db.put(transactionId, columnId, keys, value, callback);
 	}
 
 	@Override
-	public void get(long transactionId, long columnId, MemorySegment[] keys, GetCallback<? super MemorySegment> callback)
-			throws RocksDBException {
-		db.get(transactionId, columnId, keys, callback);
+	public <T> T get(long transactionId,
+			long columnId,
+			MemorySegment[] keys,
+			GetCallback<? super MemorySegment, T> callback) throws RocksDBException {
+		return db.get(transactionId, columnId, keys, callback);
 	}
 
 	@Override
@@ -96,10 +98,10 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
-	public void subsequent(long iterationId,
+	public <T> T subsequent(long iterationId,
 			long skipCount,
 			long takeCount,
-			IteratorCallback<? super MemorySegment> callback) throws RocksDBException {
-		db.subsequent(iterationId, skipCount, takeCount, callback);
+			IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException {
+		return db.subsequent(iterationId, skipCount, takeCount, callback);
 	}
 }

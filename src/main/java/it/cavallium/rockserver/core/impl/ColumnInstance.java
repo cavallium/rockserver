@@ -159,12 +159,11 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 		checkNullableValue(computedBucketElementValue);
 		var keySize = computedBucketElementKey.byteSize();
 		var valueSize = computedBucketElementValue != null ? computedBucketElementValue.byteSize() : 0;
-		var totalSize = Integer.BYTES + keySize + valueSize;
+		var totalSize = keySize + valueSize;
 		var computedBucketElementKV = arena.allocate(totalSize);
-		computedBucketElementKV.set(BIG_ENDIAN_INT, 0, toIntExact(totalSize));
-		MemorySegment.copy(computedBucketElementKey, 0, computedBucketElementKV, Integer.BYTES, keySize);
+		MemorySegment.copy(computedBucketElementKey, 0, computedBucketElementKV, 0, keySize);
 		if (computedBucketElementValue != null) {
-			MemorySegment.copy(computedBucketElementValue, 0, computedBucketElementKV, Integer.BYTES + keySize, valueSize);
+			MemorySegment.copy(computedBucketElementValue, 0, computedBucketElementKV, keySize, valueSize);
 		}
 		return computedBucketElementKV;
 	}

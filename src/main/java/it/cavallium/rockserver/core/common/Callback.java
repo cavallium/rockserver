@@ -1,58 +1,58 @@
 package it.cavallium.rockserver.core.common;
 
+import java.lang.foreign.MemorySegment;
 import java.util.List;
 import java.util.Map.Entry;
+import java.util.concurrent.atomic.AtomicReference;
 import org.jetbrains.annotations.Nullable;
 
-public sealed interface Callback<T> {
+public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
 
-	static boolean requiresGettingPreviousValue(PutCallback<?> callback) {
+	static boolean requiresGettingPreviousValue(PutCallback<?, ?> callback) {
 		return callback instanceof CallbackPrevious<?>
 				|| callback instanceof CallbackDelta<?>
 				|| callback instanceof CallbackChanged;
 	}
 
-	static boolean requiresGettingCurrentValue(GetCallback<?> callback) {
+	static boolean requiresGettingCurrentValue(GetCallback<?, ?> callback) {
 		return callback instanceof CallbackCurrent<?>;
 	}
 
-	sealed interface PutCallback<T> extends Callback<T> {}
-
-	sealed interface PatchCallback<T> extends Callback<T> {}
-
-	sealed interface GetCallback<T> extends Callback<T> {}
-
-	sealed interface IteratorCallback<T> extends Callback<T> {}
-
-	non-sealed interface CallbackVoid<T> extends PutCallback<T>, PatchCallback<T>, IteratorCallback<T>, GetCallback<T> {}
-
-	non-sealed interface CallbackPrevious<T> extends PutCallback<T> {
-
-		void onPrevious(@Nullable T previous);
+	static <T> CallbackPrevious<T> previous() {
+		// todo: create static instance
+		return new CallbackPrevious<>();
 	}
 
-	non-sealed interface CallbackCurrent<T> extends GetCallback<T> {
-
-		void onCurrent(@Nullable T previous);
+	static <T> CallbackDelta<T> delta() {
+		// todo: create static instance
+		return new CallbackDelta<>();
 	}
 
-	non-sealed interface CallbackExists<T> extends GetCallback<T>, IteratorCallback<T> {
-
-		void onExists(boolean exists);
+	static <U> U safeCast(Object previousValue) {
+		//noinspection unchecked
+		return (U) previousValue;
 	}
 
-	non-sealed interface CallbackDelta<T> extends PutCallback<T> {
+	sealed interface PutCallback<T, U> extends Callback<T, U> {}
 
-		void onSuccess(Delta<T> previous);
+	sealed interface PatchCallback<T, U> extends Callback<T, U> {}
+
+	sealed interface GetCallback<T, U> extends Callback<T, U> {}
+
+	sealed interface IteratorCallback<T, U> extends Callback<T, U> {}
+
+	record CallbackVoid<T>() implements PutCallback<T, Void>, PatchCallback<T, Void>, IteratorCallback<T, Void>, GetCallback<T, Void> {}
+
+	record CallbackPrevious<T>() implements PutCallback<T, @Nullable T> {}
+
+	record CallbackCurrent<T>() implements GetCallback<T, @Nullable T> {}
+
+	record CallbackExists<T>() implements GetCallback<T, Boolean>, IteratorCallback<T, Boolean> {}
+
+	record CallbackDelta<T>() implements PutCallback<T, Delta<T>> {
 	}
 
-	non-sealed interface CallbackMulti<T> extends IteratorCallback<T> {
+	record CallbackMulti<M>() implements IteratorCallback<M, List<M>> {}
 
-		void onSuccess(List<Entry<T, T>> elements);
-	}
-
-	non-sealed interface CallbackChanged extends PutCallback<Object>, PatchCallback<Object> {
-
-		void onChanged(boolean changed);
-	}
+	record CallbackChanged<T>() implements PutCallback<T, Boolean>, PatchCallback<T, Boolean> {}
 }

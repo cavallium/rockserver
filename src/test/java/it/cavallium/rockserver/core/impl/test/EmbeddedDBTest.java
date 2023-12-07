@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
+import it.cavallium.rockserver.core.common.Callback;
 import it.cavallium.rockserver.core.common.Callback.CallbackDelta;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Utils;
@@ -40,16 +41,15 @@ class EmbeddedDBTest {
 				Utils.toMemorySegment(new byte[] {0, 0, 3, 6, 7, 8})
 		};
 		var value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
-		AtomicInteger callbackCalled = new AtomicInteger();
-		db.put(0, colId, key, value1, (CallbackDelta<MemorySegment>) prev -> {
-			callbackCalled.incrementAndGet();
-			Assertions.assertNull(prev);
-		});
-		Assertions.assertEquals(1, callbackCalled.get());
-		db.put(0, colId, key, MemorySegment.ofArray(new byte[] {0, 0, 5}), (CallbackDelta<MemorySegment>) prev -> {
-			callbackCalled.incrementAndGet();
-			Utils.(value1);
-		});
+		var value2 = MemorySegment.ofArray(new byte[] {0, 0, 5});
+
+		var delta = db.put(0, colId, key, value1, Callback.delta());
+		Assertions.assertNull(delta.previous());
+		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
+
+		delta = db.put(0, colId, key, value2, Callback.delta());
+		Assertions.assertTrue(Utils.valueEquals(delta.previous(), value1));
+		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
 	}
 
 	@org.junit.jupiter.api.Test

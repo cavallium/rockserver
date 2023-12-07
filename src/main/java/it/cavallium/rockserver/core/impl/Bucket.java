@@ -1,5 +1,9 @@
 package it.cavallium.rockserver.core.impl;
 
+import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_INT;
+import static java.lang.Math.toIntExact;
+
+import it.cavallium.rockserver.core.common.Utils;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -23,11 +27,11 @@ public class Bucket {
 		this.elements = new ArrayList<>();
 		long rawBucketSegmentByteSize = rawBucketSegment.byteSize();
 		if (rawBucketSegmentByteSize > 0) {
-			var elements = rawBucketSegment.get(ValueLayout.JAVA_INT_UNALIGNED, offset);
+			var elements = rawBucketSegment.get(ColumnInstance.BIG_ENDIAN_INT_UNALIGNED, offset);
 			offset += Integer.BYTES;
 			int elementI = 0;
 			while (elementI < elements) {
-				var elementKVSize = rawBucketSegment.get(ValueLayout.JAVA_INT_UNALIGNED, offset);
+				var elementKVSize = rawBucketSegment.get(ColumnInstance.BIG_ENDIAN_INT_UNALIGNED, offset);
 				offset += Integer.BYTES;
 
 				MemorySegment[] bucketElementKeys;
@@ -37,7 +41,7 @@ public class Bucket {
 					int readKeys = 0;
 					bucketElementKeys = new MemorySegment[col.schema().variableLengthKeysCount()];
 					while (readKeys < col.schema().variableLengthKeysCount()) {
-						var keyISize = elementKVSegment.get(ValueLayout.JAVA_CHAR_UNALIGNED, segmentOffset);
+						var keyISize = elementKVSegment.get(ColumnInstance.BIG_ENDIAN_CHAR_UNALIGNED, segmentOffset);
 						segmentOffset += Character.BYTES;
 						var elementKeyISegment = elementKVSegment.asSlice(segmentOffset, keyISize);
 						bucketElementKeys[readKeys] = elementKeyISegment;
@@ -55,7 +59,7 @@ public class Bucket {
 					}
 
 					var entry = Map.entry(bucketElementKeys, bucketElementValues);
-
+					this.elements.add(entry);
 					offset += segmentOffset;
 				}
 				elementI++;
@@ -123,7 +127,7 @@ public class Bucket {
 			var arrayKeys = elem.getKey();
 			assert arrayKeys.length == bucketVariableKeys.length;
 			for (int j = 0; j < arrayKeys.length; j++) {
-				if (MemorySegment.mismatch(arrayKeys[j], 0, arrayKeys[j].byteSize(), bucketVariableKeys[j], 0, bucketVariableKeys[j].byteSize()) == -1) {
+				if (Utils.valueEquals(arrayKeys[j], bucketVariableKeys[j])) {
 					return i;
 				}
 			}
@@ -145,14 +149,16 @@ public class Bucket {
 		}
 		long totalSize = Integer.BYTES;
 		for (MemorySegment serializedElement : serializedElements) {
-			totalSize += serializedElement.byteSize();
+			totalSize += Integer.BYTES + serializedElement.byteSize();
 		}
 		var segment = arena.allocate(totalSize);
 		long offset = 0;
-		segment.set(ColumnInstance.BIG_ENDIAN_INT, offset, serializedElements.length);
+		segment.set(BIG_ENDIAN_INT, offset, serializedElements.length);
 		offset += Integer.BYTES;
 		for (MemorySegment elementAtI : serializedElements) {
 			var elementSize = elementAtI.byteSize();
+			segment.set(BIG_ENDIAN_INT, offset, toIntExact(elementSize));
+			offset += Integer.BYTES;
 			MemorySegment.copy(elementAtI, 0, segment, offset, elementSize);
 			offset += elementSize;
 		}
