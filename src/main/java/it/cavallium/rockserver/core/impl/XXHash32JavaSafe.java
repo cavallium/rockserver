@@ -21,12 +21,12 @@ import static it.cavallium.rockserver.core.impl.XXHashUtils.PRIME4;
 import static it.cavallium.rockserver.core.impl.XXHashUtils.PRIME5;
 import static java.lang.Integer.rotateLeft;
 
-import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.foreign.ValueLayout.OfByte;
 import java.lang.foreign.ValueLayout.OfInt;
 import java.nio.ByteOrder;
+import java.util.Objects;
 
 /**
  * Safe Java implementation of {@link XXHash32}.
@@ -34,7 +34,6 @@ import java.nio.ByteOrder;
 public final class XXHash32JavaSafe extends XXHash32 {
 
 
-	public static final ByteOrder NATIVE_BYTE_ORDER = ByteOrder.nativeOrder();
 	public static final XXHash32 INSTANCE = new XXHash32JavaSafe();
 	private static final OfInt INT_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 	private static final OfInt INT_BE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
@@ -42,7 +41,7 @@ public final class XXHash32JavaSafe extends XXHash32 {
 
 	@Override
 	public int hash(byte[] buf, int off, int len, int seed) {
-		checkRange(buf, off, len);
+		Objects.checkFromIndexSize(off, len, buf.length);
 
 		final int end = off + len;
 		int h32;
@@ -51,7 +50,7 @@ public final class XXHash32JavaSafe extends XXHash32 {
 			final int limit = end - 16;
 			int v1 = seed + PRIME1 + PRIME2;
 			int v2 = seed + PRIME2;
-			int v3 = seed + 0;
+			int v3 = seed;
 			int v4 = seed - PRIME1;
 			do {
 				v1 += readIntLE(buf, off) * PRIME2;
@@ -105,7 +104,7 @@ public final class XXHash32JavaSafe extends XXHash32 {
 
 	@Override
 	public void hash(MemorySegment buf, int off, int len, int seed, MemorySegment result) {
-		checkRange(buf, off, len);
+		Objects.checkFromIndexSize(off, len, buf.byteSize());
 
 		final int end = off + len;
 		int h32;
@@ -114,7 +113,7 @@ public final class XXHash32JavaSafe extends XXHash32 {
 			final int limit = end - 16;
 			int v1 = seed + PRIME1 + PRIME2;
 			int v2 = seed + PRIME2;
-			int v3 = seed + 0;
+			int v3 = seed;
 			int v4 = seed - PRIME1;
 			do {
 				v1 += readIntLE(buf, off) * PRIME2;
@@ -167,57 +166,11 @@ public final class XXHash32JavaSafe extends XXHash32 {
 		result.set(INT_BE, 0, h32);
 	}
 
-	private static void checkRange(byte[] buf, int off) {
-		if (off < 0 || off >= buf.length) {
-			throw new ArrayIndexOutOfBoundsException(off);
-		}
-	}
-
-	private static void checkRange(MemorySegment buf, int off) {
-		if (off < 0 || off >= buf.byteSize()) {
-			throw new ArrayIndexOutOfBoundsException(off);
-		}
-	}
-
-	private static void checkRange(byte[] buf, int off, int len) {
-		checkLength(len);
-		if (len > 0) {
-			checkRange(buf, off);
-			checkRange(buf, off + len - 1);
-		}
-	}
-
-	private static void checkRange(MemorySegment buf, int off, int len) {
-		checkLength(len);
-		if (len > 0) {
-			checkRange(buf, off);
-			checkRange(buf, off + len - 1);
-		}
-	}
-
-	private static void checkLength(int len) {
-		if (len < 0) {
-			throw new IllegalArgumentException("lengths must be >= 0");
-		}
-	}
-
-	private static int readIntBE(byte[] buf, int i) {
-		return ((buf[i] & 0xFF) << 24) | ((buf[i+1] & 0xFF) << 16) | ((buf[i+2] & 0xFF) << 8) | (buf[i+3] & 0xFF);
-	}
-
 	private static int readIntLE(byte[] buf, int i) {
 		return (buf[i] & 0xFF) | ((buf[i+1] & 0xFF) << 8) | ((buf[i+2] & 0xFF) << 16) | ((buf[i+3] & 0xFF) << 24);
 	}
 
 	private static int readIntLE(MemorySegment buf, int i) {
 		return buf.get(INT_LE, i);
-	}
-
-	private static int readInt(byte[] buf, int i) {
-		if (NATIVE_BYTE_ORDER == ByteOrder.BIG_ENDIAN) {
-			return readIntBE(buf, i);
-		} else {
-			return readIntLE(buf, i);
-		}
 	}
 }

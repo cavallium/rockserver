@@ -127,7 +127,7 @@ public class RocksDBLoader {
                 List<DbPath> paths = mapList(volumeConfigs, p -> new DbPath(p.path, p.targetSize));
                 options.setDbPaths(paths);
             } else if (!volumeConfigs.isEmpty() && (volumeConfigs.size() > 1 || definitiveDbPath.relativize(volumeConfigs.getFirst().path).isAbsolute())) {
-                throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "in-memory databases should not have any volume configured");
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "in-memory databases should not have any volume configured");
             }
             options.setMaxOpenFiles(Optional.ofNullable(databaseOptions.global().maximumOpenFiles()).orElse(-1));
             options.setMaxFileOpeningThreads(Runtime.getRuntime().availableProcessors());
@@ -218,7 +218,7 @@ public class RocksDBLoader {
 
             return new OptionsWithCache(options, blockCache);
         } catch (GestaltException e) {
-            throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, e);
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, e);
         }
     }
 
@@ -243,7 +243,7 @@ public class RocksDBLoader {
                 try {
                     return new DbPathRecord(definitiveDbPath.resolve(volumeConfig.volumePath()), volumeConfig.targetSize().longValue());
                 } catch (GestaltException e) {
-                    throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.CONFIG_ERROR, "Failed to load volume configurations", e);
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Failed to load volume configurations", e);
                 }
             })
             .toList();
@@ -303,7 +303,7 @@ public class RocksDBLoader {
                 String name = entry.getKey();
                 FallbackColumnConfig columnOptions = entry.getValue();
                 if (columnOptions instanceof NamedColumnConfig namedColumnConfig && !namedColumnConfig.name().equals(name)) {
-                    throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Wrong column config name: " + name);
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Wrong column config name: " + name);
                 }
 
                 var columnFamilyOptions = new ColumnFamilyOptions();
@@ -415,7 +415,7 @@ public class RocksDBLoader {
                 if (bloomFilterConfig != null) filter = bloomFilterConfig;
                 if (filter == null) {
                     if (path == null) {
-                        throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Please set a bloom filter. It's required for in-memory databases");
+                        throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Please set a bloom filter. It's required for in-memory databases");
                     }
                     if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
                         blockBasedTableConfig.setFilterPolicy(null);
@@ -533,11 +533,11 @@ public class RocksDBLoader {
             }
             return TransactionalDB.create(definitiveDbPath.toString(), db);
         } catch (IOException ex) {
-            throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (RocksDBException ex) {
-            throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {
-            throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Failed to load rocksdb", e);
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Failed to load rocksdb", e);
         }
     }
 

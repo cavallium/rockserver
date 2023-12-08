@@ -36,11 +36,13 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
@@ -173,7 +175,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		} else {
 			// Transaction not found
 			if (commit) {
-				throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.TX_NOT_FOUND, "Transaction not found: " + transactionId);
+				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.TX_NOT_FOUND, "Transaction not found: " + transactionId);
 			} else {
 				return true;
 			}
@@ -202,7 +204,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 			} catch (RocksDBException e) {
 				// Close the transaction operation
 				ops.endOp();
-				throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
+				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
 			}
 		} finally {
 			ops.endOp();
@@ -233,7 +235,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					if (schema.equals(col.schema())) {
 						return colId;
 					} else {
-						throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.COLUMN_EXISTS,
+						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_EXISTS,
 								"Column exists, with a different schema: " + name
 						);
 					}
@@ -242,7 +244,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 						var cf = db.get().createColumnFamily(new ColumnFamilyDescriptor(name.getBytes(StandardCharsets.UTF_8)));
 						return registerColumn(new ColumnInstance(cf, schema));
 					} catch (RocksDBException e) {
-						throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.COLUMN_CREATE_FAIL, e);
+						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, e);
 					}
 				}
 			}
@@ -261,7 +263,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					db.get().dropColumnFamily(col.cfh());
 					unregisterColumn(columnId).close();
 				} catch (RocksDBException e) {
-					throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.COLUMN_DELETE_FAIL, e);
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_DELETE_FAIL, e);
 				}
 			}
 		} finally {
@@ -273,7 +275,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 	public long getColumnId(String name) {
 		var columnId = getColumnIdOrNull(name);
 		if (columnId == null) {
-			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.COLUMN_NOT_FOUND,
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_NOT_FOUND,
 					"Column not found: " + name);
 		} else {
 			return columnId;
@@ -291,13 +293,14 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 	}
 
 	@Override
-	public <T> T put(long transactionId,
+	public <T> T put(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			@Nullable MemorySegment value,
 			PutCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
-		try (var arena = Arena.ofConfined()) {
+		try {
 			// Column id
 			var col = getColumn(columnId);
 			REntry<Transaction> tx;
@@ -310,7 +313,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		} finally {
 			ops.endOp();
 		}
@@ -337,7 +340,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 						previousValue = bucket.addElement(bucketElementKeys, value);
 						tx.val().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(bucket.toSegment(arena)));
 					} catch (RocksDBException e) {
-						throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_1, e);
+						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_1, e);
 					}
 				} else {
 					// Retry using a transaction: transactions are required to handle this kind of data
@@ -363,7 +366,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 						}
 						previousValue = toMemorySegment(previousValueByteArray);
 					} catch (RocksDBException e) {
-						throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_2, e);
+						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
 					}
 				} else {
 					previousValue = null;
@@ -385,17 +388,18 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		}
 	}
 
 	@Override
-	public <T> T get(long transactionId,
+	public <T> T get(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			GetCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
-		try (var arena = Arena.ofConfined()) {
+		try {
 			// Column id
 			var col = getColumn(columnId);
 
@@ -412,11 +416,15 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 				var bucketElementKeys = col.getBucketElementKeys(keys);
 				try (var readOptions = new ReadOptions()) {
 					MemorySegment previousRawBucket = dbGet(tx, col, arena, readOptions, calculatedKey);
-					var bucket = new Bucket(col, previousRawBucket);
-					foundValue = bucket.getElement(bucketElementKeys);
+					if (previousRawBucket != null) {
+						var bucket = new Bucket(col, previousRawBucket);
+						foundValue = bucket.getElement(bucketElementKeys);
+					} else {
+						foundValue = null;
+					}
 					existsValue = foundValue != null;
 				} catch (RocksDBException e) {
-					throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.GET_1, e);
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.GET_1, e);
 				}
 			} else {
 				boolean shouldGetCurrent = Callback.requiresGettingCurrentValue(callback)
@@ -426,7 +434,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 						foundValue = dbGet(tx, col, arena, readOptions, calculatedKey);
 						existsValue = foundValue != null;
 					} catch (RocksDBException e) {
-						throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_2, e);
+						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
 					}
 				} else if (callback instanceof Callback.CallbackExists<?>) {
 					// tx is always null here
@@ -447,14 +455,15 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		} finally {
 			ops.endOp();
 		}
 	}
 
 	@Override
-	public long openIterator(long transactionId,
+	public long openIterator(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] startKeysInclusive,
 			@Nullable MemorySegment[] endKeysExclusive,
@@ -492,7 +501,8 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 	}
 
 	@Override
-	public void seekTo(long iterationId, MemorySegment[] keys) throws it.cavallium.rockserver.core.common.RocksDBException {
+	public void seekTo(Arena arena, long iterationId, MemorySegment[] keys)
+			throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {
 			throw new UnsupportedOperationException();
@@ -502,7 +512,8 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 	}
 
 	@Override
-	public <T> T subsequent(long iterationId,
+	public <T> T subsequent(Arena arena,
+			long iterationId,
 			long skipCount,
 			long takeCount,
 			IteratorCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
@@ -525,7 +536,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		} else {
 			var db = this.db.get();
 			if (USE_FAST_GET) {
-				return dbGetDirect(arena, readOptions, calculatedKey);
+				return dbGetDirect(arena, col.cfh(), readOptions, calculatedKey);
 			} else {
 				var previousRawBucketByteArray = db.get(col.cfh(), readOptions, calculatedKey.toArray(BIG_ENDIAN_BYTES));
 				return toMemorySegment(previousRawBucketByteArray);
@@ -534,30 +545,35 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 	}
 
 	@Nullable
-	private MemorySegment dbGetDirect(Arena arena, ReadOptions readOptions, MemorySegment calculatedKey)
+	private MemorySegment dbGetDirect(Arena arena, ColumnFamilyHandle cfh, ReadOptions readOptions, MemorySegment calculatedKey)
 			throws RocksDBException {
 		// Get the key nio buffer to pass to RocksDB
 		ByteBuffer keyNioBuffer = calculatedKey.asByteBuffer();
 
 		// Create a direct result buffer because RocksDB works only with direct buffers
 		var resultBuffer = arena.allocate(INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES).asByteBuffer();
-		var keyMayExist = this.db.get().keyMayExist(readOptions, keyNioBuffer.rewind(), resultBuffer.clear());
+		var keyMayExist = this.db.get().keyMayExist(cfh, readOptions, keyNioBuffer.rewind(), resultBuffer.clear());
 		return switch (keyMayExist.exists) {
 			case kNotExist -> null;
 			case kExistsWithValue, kExistsWithoutValue -> {
 				// At the beginning, size reflects the expected size, then it becomes the real data size
-				int size = keyMayExist.exists == kExistsWithValue ? keyMayExist.valueLength : -1;
+				int size;
+				if (keyMayExist.exists == kExistsWithValue) {
+					size = keyMayExist.valueLength;
+				} else {
+					size = -1;
+				}
 				if (keyMayExist.exists == kExistsWithoutValue || size > resultBuffer.limit()) {
 					if (size > resultBuffer.capacity()) {
 						resultBuffer = arena.allocate(size).asByteBuffer();
 					}
-					size = this.db.get().get(readOptions, keyNioBuffer.rewind(), resultBuffer.clear());
+					size = this.db.get().get(cfh, readOptions, keyNioBuffer.rewind(), resultBuffer.clear());
 				}
 
 				if (size == RocksDB.NOT_FOUND) {
 					yield null;
 				} else if (size == resultBuffer.limit()) {
-					yield MemorySegment.ofBuffer(resultBuffer.position(0));
+					yield MemorySegment.ofBuffer(resultBuffer);
 				} else {
 					throw new IllegalStateException("size (" + size + ") != read size (" + resultBuffer.limit() + ")");
 				}
@@ -570,7 +586,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		if (col != null) {
 			return col;
 		} else {
-			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.COLUMN_NOT_FOUND,
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_NOT_FOUND,
 					"No column with id " + columnId);
 		}
 	}

@@ -29,10 +29,11 @@ public class Utils {
 	 * @since 1.8
 	 */
 	public static char toCharExact(int value) {
-		if ((char) value != value) {
+		if (value < Character.MIN_VALUE || value > Character.MAX_VALUE) {
 			throw new ArithmeticException("char overflow");
+		} else {
+			return (char) value;
 		}
-		return (char) value;
 	}
 
 	/**
@@ -44,10 +45,11 @@ public class Utils {
 	 * @since 1.8
 	 */
 	public static char toCharExact(long value) {
-		if ((char) value != value) {
+		if (value < Character.MIN_VALUE || value > Character.MAX_VALUE) {
 			throw new ArithmeticException("char overflow");
+		} else {
+			return (char) value;
 		}
-		return (char) value;
 	}
 
 	@NotNull
@@ -84,18 +86,17 @@ public class Utils {
 
 	public static void deleteDirectory(String path) throws RocksDBException {
 		try (Stream<Path> pathStream = Files.walk(Path.of(path))) {
-			pathStream.sorted(Comparator.reverseOrder())
-					.forEach(f -> {
-						try {
-							Files.deleteIfExists(f);
-						} catch (IOException e) {
-							throw new RocksDBException(RocksDBException.RocksDBErrorType.DIRECTORY_DELETE, e);
-						}
-					});
+			pathStream.sorted(Comparator.reverseOrder()).forEach(f -> {
+				try {
+					Files.deleteIfExists(f);
+				} catch (IOException e) {
+					throw RocksDBException.of(RocksDBException.RocksDBErrorType.DIRECTORY_DELETE, e);
+				}
+			});
 		} catch (IOException e) {
-			throw new RocksDBException(RocksDBException.RocksDBErrorType.DIRECTORY_DELETE, e);
-        }
-    }
+			throw RocksDBException.of(RocksDBException.RocksDBErrorType.DIRECTORY_DELETE, e);
+		}
+	}
 
 	public static boolean valueEquals(MemorySegment previousValue, MemorySegment currentValue) {
 		previousValue = requireNonNullElse(previousValue, NULL);

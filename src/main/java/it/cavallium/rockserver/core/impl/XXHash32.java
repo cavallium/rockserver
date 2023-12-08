@@ -36,11 +36,6 @@ public abstract class XXHash32 {
 	 */
 	public abstract void hash(MemorySegment buf, int off, int len, int seed, MemorySegment result);
 
-	@Override
-	public String toString() {
-		return getClass().getSimpleName();
-	}
-
 	public static XXHash32 getInstance() {
 		return XXHash32JavaSafe.INSTANCE;
 	}

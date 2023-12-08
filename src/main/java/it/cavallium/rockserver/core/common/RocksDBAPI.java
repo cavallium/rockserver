@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.common;
 import it.cavallium.rockserver.core.common.Callback.GetCallback;
 import it.cavallium.rockserver.core.common.Callback.IteratorCallback;
 import it.cavallium.rockserver.core.common.Callback.PutCallback;
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import org.jetbrains.annotations.Nullable;
 
@@ -47,13 +48,15 @@ public interface RocksDBAPI {
 
 	/**
 	 * Put an element into the specified position
+	 * @param arena arena
 	 * @param transactionId transaction id, or 0
 	 * @param columnId column id
 	 * @param keys column keys, or empty array if not needed
 	 * @param value value, or null if not needed
 	 * @param callback the callback will be executed on the same thread, exactly once.
 	 */
-	<T> T put(long transactionId,
+	<T> T put(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			@Nullable MemorySegment value,
@@ -61,18 +64,21 @@ public interface RocksDBAPI {
 
 	/**
 	 * Get an element from the specified position
+	 * @param arena arena
 	 * @param transactionId transaction id, or 0
 	 * @param columnId column id
 	 * @param keys column keys, or empty array if not needed
 	 * @param callback the callback will be executed on the same thread, exactly once.
 	 */
-	<T> T get(long transactionId,
+	<T> T get(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			GetCallback<? super MemorySegment, T> callback) throws RocksDBException;
 
 	/**
 	 * Open an iterator
+	 * @param arena arena
 	 * @param transactionId transaction id, or 0
 	 * @param columnId column id
 	 * @param startKeysInclusive start keys, inclusive. [] means "the beginning"
@@ -81,7 +87,8 @@ public interface RocksDBAPI {
 	 * @param timeoutMs timeout in milliseconds
 	 * @return iterator id
 	 */
-	long openIterator(long transactionId,
+	long openIterator(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] startKeysInclusive,
 			@Nullable MemorySegment[] endKeysExclusive,
@@ -96,19 +103,22 @@ public interface RocksDBAPI {
 
 	/**
 	 * Seek to the specific element during an iteration, or the subsequent one if not found
+	 * @param arena arena
 	 * @param iterationId iteration id
 	 * @param keys keys, inclusive. [] means "the beginning"
 	 */
-	void seekTo(long iterationId, MemorySegment[] keys) throws RocksDBException;
+	void seekTo(Arena arena, long iterationId, MemorySegment[] keys) throws RocksDBException;
 
 	/**
 	 * Get the subsequent element during an iteration
+	 * @param arena arena
 	 * @param iterationId iteration id
 	 * @param skipCount number of elements to skip
 	 * @param takeCount number of elements to take
 	 * @param callback the callback will be executed on the same thread, exactly once.
 	 */
-	<T> T subsequent(long iterationId,
+	<T> T subsequent(Arena arena,
+			long iterationId,
 			long skipCount,
 			long takeCount,
 			IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException;

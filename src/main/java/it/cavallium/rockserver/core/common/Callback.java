@@ -18,19 +18,44 @@ public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
 		return callback instanceof CallbackCurrent<?>;
 	}
 
-	static <T> CallbackPrevious<T> previous() {
-		// todo: create static instance
-		return new CallbackPrevious<>();
-	}
-
-	static <T> CallbackDelta<T> delta() {
-		// todo: create static instance
-		return new CallbackDelta<>();
-	}
-
 	static <U> U safeCast(Object previousValue) {
 		//noinspection unchecked
 		return (U) previousValue;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> CallbackPrevious<T> previous() {
+		return (CallbackPrevious<T>) CallbackPrevious.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> CallbackCurrent<T> current() {
+		return (CallbackCurrent<T>) CallbackCurrent.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> CallbackDelta<T> delta() {
+		return (CallbackDelta<T>) CallbackDelta.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> CallbackExists<T> exists() {
+		return (CallbackExists<T>) CallbackExists.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> CallbackMulti<T> multi() {
+		return (CallbackMulti<T>) CallbackMulti.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> CallbackChanged<T> changed() {
+		return (CallbackChanged<T>) CallbackChanged.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> CallbackVoid<T> none() {
+		return (CallbackVoid<T>) CallbackVoid.INSTANCE;
 	}
 
 	sealed interface PutCallback<T, U> extends Callback<T, U> {}
@@ -41,18 +66,38 @@ public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
 
 	sealed interface IteratorCallback<T, U> extends Callback<T, U> {}
 
-	record CallbackVoid<T>() implements PutCallback<T, Void>, PatchCallback<T, Void>, IteratorCallback<T, Void>, GetCallback<T, Void> {}
+	record CallbackVoid<T>() implements PutCallback<T, Void>, PatchCallback<T, Void>, IteratorCallback<T, Void>, GetCallback<T, Void> {
 
-	record CallbackPrevious<T>() implements PutCallback<T, @Nullable T> {}
-
-	record CallbackCurrent<T>() implements GetCallback<T, @Nullable T> {}
-
-	record CallbackExists<T>() implements GetCallback<T, Boolean>, IteratorCallback<T, Boolean> {}
-
-	record CallbackDelta<T>() implements PutCallback<T, Delta<T>> {
+		private static final CallbackVoid<Object> INSTANCE = new CallbackVoid<>();
 	}
 
-	record CallbackMulti<M>() implements IteratorCallback<M, List<M>> {}
+	record CallbackPrevious<T>() implements PutCallback<T, @Nullable T> {
 
-	record CallbackChanged<T>() implements PutCallback<T, Boolean>, PatchCallback<T, Boolean> {}
+		private static final CallbackPrevious<Object> INSTANCE = new CallbackPrevious<>();
+	}
+
+	record CallbackCurrent<T>() implements GetCallback<T, @Nullable T> {
+
+		private static final CallbackCurrent<Object> INSTANCE = new CallbackCurrent<>();
+	}
+
+	record CallbackExists<T>() implements GetCallback<T, Boolean>, IteratorCallback<T, Boolean> {
+
+		private static final CallbackExists<Object> INSTANCE = new CallbackExists<>();
+	}
+
+	record CallbackDelta<T>() implements PutCallback<T, Delta<T>> {
+
+		private static final CallbackDelta<Object> INSTANCE = new CallbackDelta<>();
+	}
+
+	record CallbackMulti<M>() implements IteratorCallback<M, List<M>> {
+
+		private static final CallbackMulti<Object> INSTANCE = new CallbackMulti<>();
+	}
+
+	record CallbackChanged<T>() implements PutCallback<T, Boolean>, PatchCallback<T, Boolean> {
+
+		private static final CallbackChanged<Object> INSTANCE = new CallbackChanged<>();
+	}
 }

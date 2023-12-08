@@ -7,6 +7,7 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import java.io.IOException;
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.URI;
 import java.nio.file.Path;
@@ -61,30 +62,33 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
-	public <T> T put(long transactionId,
+	public <T> T put(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			@Nullable MemorySegment value,
 			PutCallback<? super MemorySegment, T> callback) throws RocksDBException {
-		return db.put(transactionId, columnId, keys, value, callback);
+		return db.put(arena, transactionId, columnId, keys, value, callback);
 	}
 
 	@Override
-	public <T> T get(long transactionId,
+	public <T> T get(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			GetCallback<? super MemorySegment, T> callback) throws RocksDBException {
-		return db.get(transactionId, columnId, keys, callback);
+		return db.get(arena, transactionId, columnId, keys, callback);
 	}
 
 	@Override
-	public long openIterator(long transactionId,
+	public long openIterator(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] startKeysInclusive,
 			@Nullable MemorySegment[] endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
-		return db.openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+		return db.openIterator(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
 	}
 
 	@Override
@@ -93,15 +97,16 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
-	public void seekTo(long iterationId, MemorySegment[] keys) throws RocksDBException {
-		db.seekTo(iterationId, keys);
+	public void seekTo(Arena arena, long iterationId, MemorySegment[] keys) throws RocksDBException {
+		db.seekTo(arena, iterationId, keys);
 	}
 
 	@Override
-	public <T> T subsequent(long iterationId,
+	public <T> T subsequent(Arena arena,
+			long iterationId,
 			long skipCount,
 			long takeCount,
 			IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException {
-		return db.subsequent(iterationId, skipCount, takeCount, callback);
+		return db.subsequent(arena, iterationId, skipCount, takeCount, callback);
 	}
 }

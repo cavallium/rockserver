@@ -21,7 +21,7 @@ public class ConfigPrinter {
 		try {
 			return stringifyDatabase(config);
 		} catch (GestaltException e) {
-			throw new RocksDBException(RocksDBErrorType.CONFIG_ERROR, "Can't stringify config", e);
+			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't stringify config", e);
 		}
 	}
 

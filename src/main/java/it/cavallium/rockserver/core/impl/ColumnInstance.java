@@ -69,7 +69,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 		} else {
 			finalKey = arena.allocate(finalKeySizeBytes);
 			long offsetBytes = 0;
-			for (int i = 0; i < schema.keys().size(); i++) {
+			for (int i = 0; i < schema.keysCount(); i++) {
 				var computedKeyAtI = computeKeyAt(arena, i, keys);
 				var computedKeyAtISize = computedKeyAtI.byteSize();
 				MemorySegment.copy(computedKeyAtI, 0, finalKey, offsetBytes, computedKeyAtISize);
@@ -81,9 +81,9 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 	}
 
 	private MemorySegment computeKeyAt(Arena arena, int i, MemorySegment[] keys) {
-		if (i < schema.keys().size() - schema.variableLengthKeysCount()) {
+		if (i < schema.keysCount() - schema.variableLengthKeysCount()) {
 			if (keys[i].byteSize() != schema.key(i)) {
-				throw new RocksDBException(RocksDBErrorType.KEY_LENGTH_MISMATCH,
+				throw RocksDBException.of(RocksDBErrorType.KEY_LENGTH_MISMATCH,
 						"Key at index " + i + " has a different length than expected! Expected: " + schema.key(i)
 								+ ", received: " + keys[i].byteSize());
 			}
@@ -98,16 +98,16 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 
 	private void validateFinalKeySize(MemorySegment key) {
 		if (finalKeySizeBytes != key.byteSize()) {
-			throw new RocksDBException(RocksDBErrorType.RAW_KEY_LENGTH_MISMATCH,
+			throw RocksDBException.of(RocksDBErrorType.RAW_KEY_LENGTH_MISMATCH,
 					"Keys size must be equal to the column keys size. Expected: "
 							+ finalKeySizeBytes + ", got: " + key.byteSize());
 		}
 	}
 
 	private void validateKeyCount(MemorySegment[] keys) {
-		if (schema.keys().size() != keys.length) {
-			throw new RocksDBException(RocksDBErrorType.KEYS_COUNT_MISMATCH,
-					"Keys count must be equal to the column keys count. Expected: " + schema.keys().size()
+		if (schema.keysCount() != keys.length) {
+			throw RocksDBException.of(RocksDBErrorType.KEYS_COUNT_MISMATCH,
+					"Keys count must be equal to the column keys count. Expected: " + schema.keysCount()
 							+ ", got: " + keys.length);
 		}
 	}
@@ -143,10 +143,10 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 	public void checkNullableValue(MemorySegment value) {
 		if (schema.hasValue() == (value == null)) {
 			if (schema.hasValue()) {
-				throw new RocksDBException(RocksDBErrorType.UNEXPECTED_NULL_VALUE,
+				throw RocksDBException.of(RocksDBErrorType.UNEXPECTED_NULL_VALUE,
 						"Schema expects a value, but a null value has been passed");
 			} else {
-				throw new RocksDBException(RocksDBErrorType.VALUE_MUST_BE_NULL,
+				throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
 						"Schema expects no value, but a non-null value has been passed");
 			}
 		}
@@ -170,9 +170,9 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 	 * Get only the variable-length keys
 	 */
 	public MemorySegment[] getBucketElementKeys(MemorySegment[] keys) {
-		assert keys.length == schema.keys().size();
+		assert keys.length == schema.keysCount();
 		return Arrays.copyOfRange(keys,
-				schema.keys().size() - schema.variableLengthKeysCount(),
-				schema.keys().size());
+				schema.keysCount() - schema.variableLengthKeysCount(),
+				schema.keysCount());
 	}
 }

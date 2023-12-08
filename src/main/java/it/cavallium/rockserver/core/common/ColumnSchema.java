@@ -26,18 +26,18 @@ public record ColumnSchema(IntList keys, ObjectList<ColumnHashType> variableTail
 		final int keysSize = keys.size();
 		final int variableKeysSize = variableTailKeys.size();
 		if (variableKeysSize > keysSize) {
-			throw new RocksDBException(RocksDBErrorType.KEYS_COUNT_MISMATCH, "variable length keys count must be less or equal keysCount");
+			throw RocksDBException.of(RocksDBErrorType.KEYS_COUNT_MISMATCH, "variable length keys count must be less or equal keysCount");
 		}
 		for (int i = 0; i < keysSize - variableKeysSize; i++) {
 			if (keys.getInt(i) <= 0) {
-				throw new RocksDBException(RocksDBErrorType.KEY_LENGTH_MISMATCH, "Key length must be > 0");
+				throw RocksDBException.of(RocksDBErrorType.KEY_LENGTH_MISMATCH, "Key length must be > 0");
 			}
 		}
 		for (int i = keysSize - variableKeysSize; i < keysSize; i++) {
 			var hash = variableTailKeys.get(i - (keysSize - variableKeysSize));
 			var keySize = keys.getInt(i);
 			if (keySize != hash.bytesSize()) {
-				throw new RocksDBException(RocksDBErrorType.KEY_HASH_SIZE_MISMATCH, "Key hash length of type " + hash + " must be " + hash.bytesSize() + ", but it's defined as " + keySize);
+				throw RocksDBException.of(RocksDBErrorType.KEY_HASH_SIZE_MISMATCH, "Key hash length of type " + hash + " must be " + hash.bytesSize() + ", but it's defined as " + keySize);
 			}
 		}
 	}

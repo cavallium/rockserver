@@ -9,6 +9,8 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Utils;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.lang.foreign.Arena;
+import java.util.concurrent.ThreadLocalRandom;
 import org.junit.jupiter.api.Assertions;
 
 import java.io.IOException;
@@ -18,14 +20,51 @@ class EmbeddedDBTest {
 
 	private EmbeddedConnection db;
 	private long colId = 0L;
+	private Arena arena;
+	private MemorySegment bigValue;
+	private MemorySegment[] key1;
+	private MemorySegment[] collidingKey1;
+	private MemorySegment[] key2;
+	private MemorySegment value1;
+	private MemorySegment value2;
 
 	@org.junit.jupiter.api.BeforeEach
 	void setUp() throws IOException {
 		if (System.getProperty("rockserver.core.print-config", null) == null) {
 			System.setProperty("rockserver.core.print-config", "false");
 		}
+		arena = Arena.ofShared();
 		db = new EmbeddedConnection(null, "test", null);
 		createStandardColumn();
+
+
+		var bigValueArray = new byte[10_000];
+		ThreadLocalRandom.current().nextBytes(bigValueArray);
+		bigValue = MemorySegment.ofArray(bigValueArray);
+		key1 = new MemorySegment[] {
+				toMemorySegmentSimple(3),
+				toMemorySegmentSimple(4, 6),
+				toMemorySegmentSimple(3),
+				toMemorySegmentSimple(1, 2, 3),
+				toMemorySegmentSimple(6, 7, 8)
+		};
+		collidingKey1 = new MemorySegment[] {
+				toMemorySegmentSimple(3),
+				toMemorySegmentSimple(4, 6),
+				toMemorySegmentSimple(3),
+				toMemorySegmentSimple(1, 2, 3),
+				toMemorySegmentSimple(6, 7, -48)
+		};
+		key2 = new MemorySegment[] {
+				toMemorySegmentSimple(3),
+				toMemorySegmentSimple(4, 6),
+				toMemorySegmentSimple(3),
+				toMemorySegmentSimple(1, 2, 3),
+				toMemorySegmentSimple(6, 7, 7)
+		};
+
+		value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
+		value2 = MemorySegment.ofArray(new byte[] {0, 0, 5});
 	}
 
 	private void createStandardColumn() {
@@ -42,10 +81,28 @@ class EmbeddedDBTest {
 		colId = db.createColumn("column-test", schema);
 	}
 
+	void fillSomeKeys() {
+		Assertions.assertNull(db.put(arena, 0, colId, key1, value1, Callback.none()));
+		Assertions.assertNull(db.put(arena, 0, colId, collidingKey1, value2, Callback.none()));
+		Assertions.assertNull(db.put(arena, 0, colId, key2, bigValue, Callback.none()));
+		for (int i = 0; i < Byte.MAX_VALUE; i++) {
+			var keyI = new MemorySegment[] {
+					toMemorySegmentSimple(3),
+					toMemorySegmentSimple(4, 6),
+					toMemorySegmentSimple(3),
+					toMemorySegmentSimple(1, 2, 3),
+					toMemorySegmentSimple(8, 2, 5, 1, 7, i)
+			};
+			var valueI = toMemorySegmentSimple(i, i, i, i, i);
+			Assertions.assertNull(db.put(arena, 0, colId, keyI, valueI, Callback.none()));
+		}
+	}
+
 	@org.junit.jupiter.api.AfterEach
 	void tearDown() throws IOException {
 		db.deleteColumn(colId);
 		db.close();
+		arena.close();
 	}
 
 	@org.junit.jupiter.api.Test
@@ -60,11 +117,11 @@ class EmbeddedDBTest {
 		var value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
 		var value2 = MemorySegment.ofArray(new byte[] {0, 0, 5});
 
-		var delta = db.put(0, colId, key, value1, Callback.delta());
+		var delta = db.put(arena, 0, colId, key, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
 
-		delta = db.put(0, colId, key, value2, Callback.delta());
+		delta = db.put(arena, 0, colId, key, value2, Callback.delta());
 		Assertions.assertTrue(Utils.valueEquals(delta.previous(), value1));
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
 	}
@@ -94,15 +151,15 @@ class EmbeddedDBTest {
 		var value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
 		var value2 = MemorySegment.ofArray(new byte[] {0, 0, 5});
 
-		var delta = db.put(0, colId, key1, value1, Callback.delta());
+		var delta = db.put(arena, 0, colId, key1, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
 
-		delta = db.put(0, colId, key2, value2, Callback.delta());
+		delta = db.put(arena, 0, colId, key2, value2, Callback.delta());
 		Assertions.assertNull(delta.previous());
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
 
-		delta = db.put(0, colId, key2, value1, Callback.delta());
+		delta = db.put(arena, 0, colId, key2, value1, Callback.delta());
 		Assertions.assertTrue(Utils.valueEquals(delta.previous(), value2));
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
 	}
@@ -143,29 +200,32 @@ class EmbeddedDBTest {
 		var value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
 		var value2 = MemorySegment.ofArray(new byte[] {0, 0, 5});
 
-		var delta = db.put(0, colId, key1, value1, Callback.delta());
+		var delta = db.put(arena, 0, colId, key1, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
 
-		delta = db.put(0, colId, collidingKey1, value2, Callback.delta());
+		delta = db.put(arena, 0, colId, collidingKey1, value2, Callback.delta());
 		Assertions.assertNull(delta.previous());
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
 
-		delta = db.put(0, colId, collidingKey1, value1, Callback.delta());
+		delta = db.put(arena, 0, colId, collidingKey1, value1, Callback.delta());
 		Assertions.assertTrue(Utils.valueEquals(delta.previous(), value2));
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
 
-		delta = db.put(0, colId, key2, value1, Callback.delta());
+		delta = db.put(arena, 0, colId, key2, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
 
-		delta = db.put(0, colId, key2, value2, Callback.delta());
+		delta = db.put(arena, 0, colId, key2, value2, Callback.delta());
 		Assertions.assertTrue(Utils.valueEquals(delta.previous(), value1));
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
 	}
 
 	@org.junit.jupiter.api.Test
 	void get() {
-		throw new UnsupportedOperationException();
+		fillSomeKeys();
+		Assertions.assertTrue(Utils.valueEquals(value1, db.get(arena, 0, colId, key1, Callback.current())));
+		Assertions.assertTrue(Utils.valueEquals(value2, db.get(arena, 0, colId, collidingKey1, Callback.current())));
+		Assertions.assertTrue(Utils.valueEquals(bigValue, db.get(arena, 0, colId, key2, Callback.current())));
 	}
 }

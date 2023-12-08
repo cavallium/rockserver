@@ -12,12 +12,8 @@ import org.junit.jupiter.api.Test;
 
 public class XXHash32Test {
 
-	public static void main(String[] args) {
-		new XXHash32Test().test();
-	}
-
 	@Test
-	public void test() {
+	public void testMemorySegment() {
 		var safeXxhash32 = net.jpountz.xxhash.XXHashFactory.safeInstance().hash32();
 		var myXxhash32 = XXHash32.getInstance();
 		for (int runs = 0; runs < 3; runs++) {
@@ -25,6 +21,23 @@ public class XXHash32Test {
 				byte[] bytes = new byte[len];
 				ThreadLocalRandom.current().nextBytes(bytes);
 				var hash = safeXxhash32.hash(bytes, 0, bytes.length, Integer.MIN_VALUE);
+				var a = Arena.global();
+				var result = a.allocate(Integer.BYTES);
+				myXxhash32.hash(a.allocateArray(OfByte.JAVA_BYTE, bytes), 0, bytes.length, Integer.MIN_VALUE, result);
+				var resultInt = result.get(ColumnInstance.BIG_ENDIAN_INT, 0);
+				Assertions.assertEquals(hash, resultInt);
+			}
+		}
+	}
+
+	@Test
+	public void testBytes() {
+		var myXxhash32 = XXHash32.getInstance();
+		for (int runs = 0; runs < 3; runs++) {
+			for (int len = 0; len < 600; len++) {
+				byte[] bytes = new byte[len];
+				ThreadLocalRandom.current().nextBytes(bytes);
+				var hash = myXxhash32.hash(bytes, 0, bytes.length, Integer.MIN_VALUE);
 				var a = Arena.global();
 				var result = a.allocate(Integer.BYTES);
 				myXxhash32.hash(a.allocateArray(OfByte.JAVA_BYTE, bytes), 0, bytes.length, Integer.MIN_VALUE, result);

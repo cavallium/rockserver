@@ -6,6 +6,7 @@ import it.cavallium.rockserver.core.common.Callback.PutCallback;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import java.io.IOException;
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.SocketAddress;
 import org.jetbrains.annotations.Nullable;
@@ -53,7 +54,8 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public <T> T put(long transactionId,
+	public <T> T put(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			@Nullable MemorySegment value,
@@ -62,7 +64,8 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public <T> T get(long transactionId,
+	public <T> T get(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] keys,
 			GetCallback<? super MemorySegment, T> callback) throws RocksDBException {
@@ -70,7 +73,8 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public long openIterator(long transactionId,
+	public long openIterator(Arena arena,
+			long transactionId,
 			long columnId,
 			MemorySegment[] startKeysInclusive,
 			@Nullable MemorySegment[] endKeysExclusive,
@@ -85,12 +89,13 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public void seekTo(long iterationId, MemorySegment[] keys) throws RocksDBException {
+	public void seekTo(Arena arena, long iterationId, MemorySegment[] keys) throws RocksDBException {
 		throw new UnsupportedOperationException();
 	}
 
 	@Override
-	public <T> T subsequent(long iterationId,
+	public <T> T subsequent(Arena arena,
+			long iterationId,
 			long skipCount,
 			long takeCount,
 			IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException {
