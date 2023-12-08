@@ -5,6 +5,7 @@ import static java.util.Objects.requireNonNull;
 
 import inet.ipaddr.HostName;
 
+import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -60,7 +61,7 @@ public class Main {
 		}
 
 		LOG.info("Starting...");
-		RocksDB.loadLibrary();
+		RocksDBLoader.loadLibrary();
 
 		var rawUrl = ns.getString("url");
 		var name = ns.getString("name");

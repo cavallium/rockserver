@@ -19,6 +19,7 @@ import it.cavallium.rockserver.core.common.Delta;
 import it.cavallium.rockserver.core.common.RocksDBAPI;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.config.ConfigPrinter;
 import it.cavallium.rockserver.core.config.DatabaseConfig;
 import it.cavallium.rockserver.core.impl.rocksdb.REntry;
@@ -45,7 +46,10 @@ import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
 import org.github.gestalt.config.builder.GestaltBuilder;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.github.gestalt.config.source.ClassPathConfigSource;
+import org.github.gestalt.config.source.ClassPathConfigSourceBuilder;
 import org.github.gestalt.config.source.FileConfigSource;
+import org.github.gestalt.config.source.FileConfigSourceBuilder;
+import org.github.gestalt.config.source.StringConfigSourceBuilder;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.*;
 import org.rocksdb.Status.Code;
@@ -75,28 +79,10 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		this.its = new NonBlockingHashMapLong<>();
 		this.columnNamesIndex = new ConcurrentHashMap<>();
 		this.ops = new SafeShutdown();
-
-		var gsb = new GestaltBuilder();
-		try {
-			gsb.addSource(new ClassPathConfigSource("it/cavallium/rockserver/core/resources/default.conf"));
-			if (embeddedConfigPath != null) {
-				gsb.addSource(new FileConfigSource(this.embeddedConfigPath));
-			}
-			var gestalt = gsb
-					.addDecoder(new DataSizeDecoder())
-					.addDecoder(new DbCompressionDecoder())
-					.addDefaultConfigLoaders()
-					.addDefaultDecoders()
-					.build();
-			gestalt.loadConfigs();
-
-			this.config = gestalt.getConfig("database", DatabaseConfig.class);
-			this.db = RocksDBLoader.load(path, config, logger);
-			if (Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
-				logger.log(Level.INFO, "Database configuration: {0}", ConfigPrinter.stringifyDatabase(this.config));
-			}
-		} catch (GestaltException e) {
-			throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.CONFIG_ERROR, e);
+		this.config = ConfigParser.parse(this.embeddedConfigPath);
+		this.db = RocksDBLoader.load(path, config, logger);
+		if (Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
+			logger.log(Level.INFO, "Database configuration: {0}", ConfigPrinter.stringify(this.config));
 		}
 	}
 

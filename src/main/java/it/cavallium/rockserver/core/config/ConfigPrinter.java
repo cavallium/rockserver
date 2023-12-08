@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.config;
 
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import org.github.gestalt.config.exceptions.GestaltException;
 
 import java.util.*;
@@ -13,6 +15,14 @@ public class ConfigPrinter {
 				        "optimize-for-hits": %b
 				      }\
 				""".formatted(o.bitsPerKey(), o.optimizeForHits());
+	}
+
+	public static String stringify(DatabaseConfig config) {
+		try {
+			return stringifyDatabase(config);
+		} catch (GestaltException e) {
+			throw new RocksDBException(RocksDBErrorType.CONFIG_ERROR, "Can't stringify config", e);
+		}
 	}
 
 	public static String stringifyDatabase(DatabaseConfig o) throws GestaltException {
@@ -31,11 +41,11 @@ public class ConfigPrinter {
 				""".formatted(o.compression(), o.maxDictBytes());
 	}
 
-	private static List<VolumeConfig> getVolumeConfigs(GlobalDatabaseConfig g) throws GestaltException {
+	public static List<VolumeConfig> getVolumeConfigs(GlobalDatabaseConfig g) throws GestaltException {
 		try {
 			return List.of(g.volumes());
 		} catch (GestaltException ex) {
-			if (ex.getMessage().equals("Failed to get proxy config while calling method: volumes in path: database.global.")) {
+			if (ex.getMessage().startsWith("Failed to get cached object from proxy config while calling method:")) {
 				return List.of();
 			} else {
 				throw ex;
@@ -92,10 +102,10 @@ public class ConfigPrinter {
 		return """
 				{
 				      "volume-path": "%s",
-				      "target-size-bytes": %b
+				      "target-size-bytes": "%s"
 				    }\
 				""".formatted(o.volumePath(),
-				o.targetSizeBytes()
+				o.targetSize()
 		);
 	}
 

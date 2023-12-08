@@ -1,17 +1,18 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
 import org.github.gestalt.config.exceptions.GestaltException;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.*;
+import org.rocksdb.util.Environment;
 import org.rocksdb.util.SizeUnit;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -31,29 +32,56 @@ public class RocksDBLoader {
             = Boolean.parseBoolean(System.getProperty("it.cavallium.dbengine.clockcache.enable", "false"));
     private static final CacheFactory CACHE_FACTORY = USE_CLOCK_CACHE ? new ClockCacheFactory() : new LRUCacheFactory();
 
+    public static void loadLibrary() {
+        RocksDB.loadLibrary();
+        /* todo: rocksdb does not support loading the library outside of the default mechanism
+        try {
+            var jniPath = Path.of(".").resolve("jni").resolve(RocksDBMetadata.getRocksDBVersionHash());
+            if (Files.notExists(jniPath)) {
+                Files.createDirectories(jniPath);
+            }
+            // todo:
+        } catch (IOException e) {
+            RocksDB.loadLibrary();
+        }
+         */
+    }
+
+
     public static TransactionalDB load(@Nullable Path path, DatabaseConfig config, Logger logger) {
         var refs = new RocksDBObjects();
-        var optionsWithCache = makeRocksDBOptions(path, config, refs, logger);
-        return loadDb(path, config, optionsWithCache, refs, logger);
+        // Get databases directory path
+        Path definitiveDbPath;
+        if (path != null) {
+            definitiveDbPath = path.toAbsolutePath();
+        } else {
+            try {
+                definitiveDbPath = Files.createTempDirectory("temp-rocksdb");
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
+        return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger);
     }
 
     record OptionsWithCache(DBOptions options, @Nullable Cache standardCache) {}
 
-    private static OptionsWithCache makeRocksDBOptions(@Nullable Path path, DatabaseConfig databaseOptions, RocksDBObjects refs, Logger logger) {
+    private static OptionsWithCache makeRocksDBOptions(@Nullable Path path,
+        Path definitiveDbPath,
+        DatabaseConfig databaseOptions,
+        RocksDBObjects refs,
+        Logger logger) {
         try {
             // Get databases directory path
-            Path databasesDirPath;
+            Path parentPath;
             if (path != null) {
-                databasesDirPath = path.toAbsolutePath().getParent();
-                // Create base directories
-                if (Files.notExists(databasesDirPath)) {
-                    Files.createDirectories(databasesDirPath);
-                }
+                parentPath = path.toAbsolutePath().getParent();
             } else {
-                databasesDirPath = null;
+                parentPath = null;
             }
 
-            List<VolumeConfig> volumeConfigs = getVolumeConfigs(databaseOptions);
+            List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, databaseOptions);
 
             // the Options class contains a set of configurable DB options
             // that determines the behaviour of the database.
@@ -71,14 +99,10 @@ public class RocksDBLoader {
                 options.setDelayedWriteRate(customWriteRate);
             }
 
-            Optional.ofNullable(databaseOptions.global().logPath())
-                    .map(Path::toString)
-                    .ifPresent(options::setDbLogDir);
+            getLogPath(definitiveDbPath, databaseOptions).map(Path::toString).ifPresent(options::setDbLogDir);
 
             if (path != null) {
-                Optional.ofNullable(databaseOptions.global().walPath())
-                        .map(Path::toString)
-                        .ifPresent(options::setWalDir);
+                getWalDir(definitiveDbPath, databaseOptions).map(Path::toString).ifPresent(options::setWalDir);
             }
 
             options.setCreateIfMissing(true);
@@ -97,14 +121,12 @@ public class RocksDBLoader {
             options.setDeleteObsoleteFilesPeriodMicros(20 * 1000000); // 20 seconds
             options.setKeepLogFileNum(10);
 
-            if (databasesDirPath != null) {
-                requireNonNull(databasesDirPath);
+            if (parentPath != null) {
+                requireNonNull(parentPath);
                 requireNonNull(path.getFileName());
-                List<DbPath> paths = mapList(convertPaths(databasesDirPath, path.getFileName(), volumeConfigs),
-                        p -> new DbPath(p.path, p.targetSize)
-                );
+                List<DbPath> paths = mapList(volumeConfigs, p -> new DbPath(p.path, p.targetSize));
                 options.setDbPaths(paths);
-            } else if (!volumeConfigs.isEmpty()) {
+            } else if (!volumeConfigs.isEmpty() && (volumeConfigs.size() > 1 || definitiveDbPath.relativize(volumeConfigs.getFirst().path).isAbsolute())) {
                 throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "in-memory databases should not have any volume configured");
             }
             options.setMaxOpenFiles(Optional.ofNullable(databaseOptions.global().maximumOpenFiles()).orElse(-1));
@@ -195,30 +217,63 @@ public class RocksDBLoader {
             }
 
             return new OptionsWithCache(options, blockCache);
-        } catch (IOException e) {
-            throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, e);
         } catch (GestaltException e) {
             throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, e);
         }
     }
 
-    private static List<VolumeConfig> getVolumeConfigs(DatabaseConfig databaseOptions) throws GestaltException {
-        try {
-            return List.of(databaseOptions.global().volumes());
-        } catch (GestaltException ex) {
-            if (ex.getMessage().equals("Failed to get proxy config while calling method: volumes in path: database.global.")) {
-                return List.of();
-            } else {
-                throw ex;
-            }
-        }
+    private static Optional<Path> getWalDir(Path definitiveDbPath, DatabaseConfig databaseOptions)
+        throws GestaltException {
+        return Optional.ofNullable(databaseOptions.global().walPath())
+            .map(definitiveDbPath::resolve);
     }
 
-    private static TransactionalDB loadDb(@Nullable Path path, DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger) {
+    private static Optional<Path> getLogPath(Path definitiveDbPath, DatabaseConfig databaseOptions)
+        throws GestaltException {
+        return Optional.ofNullable(databaseOptions.global().logPath())
+            .map(definitiveDbPath::resolve);
+    }
+
+    public static List<DbPathRecord> getVolumeConfigs(@NotNull Path definitiveDbPath, DatabaseConfig databaseOptions)
+        throws GestaltException {
+        return ConfigPrinter
+            .getVolumeConfigs(databaseOptions.global())
+            .stream()
+            .map(volumeConfig -> {
+                try {
+                    return new DbPathRecord(definitiveDbPath.resolve(volumeConfig.volumePath()), volumeConfig.targetSize().longValue());
+                } catch (GestaltException e) {
+                    throw new it.cavallium.rockserver.core.common.RocksDBException(RocksDBErrorType.CONFIG_ERROR, "Failed to load volume configurations", e);
+                }
+            })
+            .toList();
+    }
+
+    private static TransactionalDB loadDb(@Nullable Path path,
+        @NotNull Path definitiveDbPath,
+        DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger) {
         var rocksdbOptions = optionsWithCache.options();
         try {
-            List<VolumeConfig> volumeConfigs = getVolumeConfigs(databaseOptions);
+            List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, databaseOptions);
             List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
+            var walPath = getWalDir(definitiveDbPath, databaseOptions);
+            var logPath = getLogPath(definitiveDbPath, databaseOptions);
+
+            // Create base directories
+            if (Files.notExists(definitiveDbPath)) {
+                Files.createDirectories(definitiveDbPath);
+            }
+            for (DbPathRecord volumeConfig : volumeConfigs) {
+                if (Files.notExists(volumeConfig.path)) {
+                    Files.createDirectories(volumeConfig.path);
+                }
+            }
+            if (walPath.isPresent() && Files.notExists(walPath.get())) {
+                Files.createDirectories(walPath.get());
+            }
+            if (logPath.isPresent() && Files.notExists(logPath.get())) {
+                Files.createDirectories(logPath.get());
+            }
 
             var defaultColumnOptions = new ColumnFamilyOptions();
             refs.add(defaultColumnOptions);
@@ -444,35 +499,22 @@ public class RocksDBLoader {
                 descriptors.add(new ColumnFamilyDescriptor(name.getBytes(StandardCharsets.US_ASCII), columnFamilyOptions));
             }
 
-            // Get databases directory path
-            String definitiveDbPathString;
-            if (path != null) {
-                Path databasesDirPath = path.toAbsolutePath().getParent();
-                definitiveDbPathString = databasesDirPath.toString() + File.separatorChar + path.getFileName();
-            } else {
-                try {
-                    definitiveDbPathString = Files.createTempDirectory("temp-rocksdb").toString();
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-
             var handles = new ArrayList<ColumnFamilyHandle>();
             RocksDB db;
             // a factory method that returns a RocksDB instance
             if (databaseOptions.global().optimistic()) {
-                db = OptimisticTransactionDB.open(rocksdbOptions, definitiveDbPathString, descriptors, handles);
+                db = OptimisticTransactionDB.open(rocksdbOptions, definitiveDbPath.toString(), descriptors, handles);
             } else {
                 var transactionOptions = new TransactionDBOptions()
-                        .setWritePolicy(TxnDBWritePolicy.WRITE_COMMITTED)
-                        .setTransactionLockTimeout(5000)
-                        .setDefaultLockTimeout(5000);
+                    .setWritePolicy(TxnDBWritePolicy.WRITE_COMMITTED)
+                    .setTransactionLockTimeout(5000)
+                    .setDefaultLockTimeout(5000);
                 refs.add(transactionOptions);
                 db = TransactionDB.open(rocksdbOptions,
-                        transactionOptions,
-                        definitiveDbPathString,
-                        descriptors,
-                        handles
+                    transactionOptions,
+                    definitiveDbPath.toString(),
+                    descriptors,
+                    handles
                 );
             }
 
@@ -489,7 +531,9 @@ public class RocksDBLoader {
             } catch (RocksDBException ex) {
                 logger.log(Level.FINE, "Failed to obtain stats", ex);
             }
-            return TransactionalDB.create(definitiveDbPathString, db);
+            return TransactionalDB.create(definitiveDbPath.toString(), db);
+        } catch (IOException ex) {
+            throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (RocksDBException ex) {
             throw new it.cavallium.rockserver.core.common.RocksDBException(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {
@@ -498,29 +542,6 @@ public class RocksDBLoader {
     }
 
     record DbPathRecord(Path path, long targetSize) {}
-
-    private static List<DbPathRecord> convertPaths(Path databasesDirPath, Path path, List<VolumeConfig> volumes) throws GestaltException {
-        var paths = new ArrayList<DbPathRecord>(volumes.size());
-        if (volumes.isEmpty()) {
-            return List.of(new DbPathRecord(databasesDirPath.resolve(path.getFileName() + "_hot"),
-                            0), // Legacy
-                    new DbPathRecord(databasesDirPath.resolve(path.getFileName() + "_cold"),
-                            0), // Legacy
-                    new DbPathRecord(databasesDirPath.resolve(path.getFileName() + "_colder"),
-                            1000L * 1024L * 1024L * 1024L)  // 1000GiB
-            ); // Legacy
-        }
-        for (var volume : volumes) {
-            Path volumePath;
-            if (volume.volumePath().isAbsolute()) {
-                volumePath = volume.volumePath();
-            } else {
-                volumePath = databasesDirPath.resolve(volume.volumePath());
-            }
-            paths.add(new DbPathRecord(volumePath, volume.targetSizeBytes()));
-        }
-        return paths;
-    }
 
     public static boolean isDisableAutoCompactions() {
         return parseBoolean(System.getProperty("it.cavallium.dbengine.compactions.auto.disable", "false"));

@@ -28,6 +28,10 @@ public class RocksDBException extends RuntimeException {
 		this(errorUniqueId, ex.getMessage());
 	}
 
+	public RocksDBException(RocksDBErrorType errorUniqueId, String message, org.rocksdb.RocksDBException ex) {
+		this(errorUniqueId, message + ": " + ex.getMessage());
+	}
+
 	public RocksDBErrorType getErrorUniqueId() {
 		return errorUniqueId;
 	}

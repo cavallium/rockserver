@@ -1,4 +1,6 @@
-
 .idea/
-
 target/
+tmp-rockserver-db/
+.directory
+*.iml
+hs_err_pid*.log

@@ -8,5 +8,5 @@ public interface VolumeConfig {
 
 	Path volumePath() throws GestaltException;
 
-	long targetSizeBytes() throws GestaltException;
+	DataSize targetSize() throws GestaltException;
 }
