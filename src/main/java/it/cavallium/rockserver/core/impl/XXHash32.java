@@ -34,7 +34,7 @@ public abstract class XXHash32 {
 	 * Compute the big-endian 32-bits hash of <code>buf[off:off+len]</code> using seed
 	 * <code>seed</code>.
 	 */
-	public abstract MemorySegment hash(Arena arena, MemorySegment buf, int off, int len, int seed);
+	public abstract void hash(MemorySegment buf, int off, int len, int seed, MemorySegment result);
 
 	@Override
 	public String toString() {

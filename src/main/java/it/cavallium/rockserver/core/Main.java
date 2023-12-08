@@ -81,7 +81,7 @@ public class Main {
 
 		switch (url.getScheme()) {
 			case "unix" -> clientBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(url.getPath())));
-			case "file" -> clientBuilder.setEmbeddedPath(Path.of(url.getPath()));
+			case "file" -> clientBuilder.setEmbeddedPath(Path.of((url.getAuthority() != null ? url.getAuthority() : "") + url.getPath()).normalize());
 			case "memory" -> clientBuilder.setEmbeddedInMemory(true);
 			case "rocksdb" -> clientBuilder.setAddress(new HostName(url.getHost()).asInetSocketAddress());
 			default -> throw new IllegalArgumentException("Invalid scheme: " + url.getScheme());

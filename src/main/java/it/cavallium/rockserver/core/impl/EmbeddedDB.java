@@ -7,14 +7,11 @@ import static java.util.Objects.requireNonNullElse;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
-import it.cavallium.rockserver.core.common.Callback.CallbackDelta;
-import it.cavallium.rockserver.core.common.Callback.CallbackPrevious;
-import it.cavallium.rockserver.core.common.Callback.CallbackVoid;
+import it.cavallium.rockserver.core.common.Callback;
 import it.cavallium.rockserver.core.common.Callback.GetCallback;
 import it.cavallium.rockserver.core.common.Callback.IteratorCallback;
 import it.cavallium.rockserver.core.common.Callback.PutCallback;
 import it.cavallium.rockserver.core.common.ColumnSchema;
-import it.cavallium.rockserver.core.common.Callback;
 import it.cavallium.rockserver.core.common.Delta;
 import it.cavallium.rockserver.core.common.RocksDBAPI;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -39,20 +36,18 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
-import org.github.gestalt.config.builder.GestaltBuilder;
-import org.github.gestalt.config.exceptions.GestaltException;
-import org.github.gestalt.config.source.ClassPathConfigSource;
-import org.github.gestalt.config.source.ClassPathConfigSourceBuilder;
-import org.github.gestalt.config.source.FileConfigSource;
-import org.github.gestalt.config.source.FileConfigSourceBuilder;
-import org.github.gestalt.config.source.StringConfigSourceBuilder;
 import org.jetbrains.annotations.Nullable;
-import org.rocksdb.*;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.RocksIterator;
 import org.rocksdb.Status.Code;
+import org.rocksdb.Transaction;
+import org.rocksdb.WriteOptions;
 
 public class EmbeddedDB implements RocksDBAPI, Closeable {
 

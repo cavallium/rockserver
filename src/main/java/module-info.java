@@ -8,6 +8,7 @@ module rockserver.core {
 	requires high.scale.lib;
 	requires org.github.gestalt.core;
 	requires org.github.gestalt.hocon;
+	requires it.unimi.dsi.fastutil.core;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

@@ -69,7 +69,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 		} else {
 			finalKey = arena.allocate(finalKeySizeBytes);
 			long offsetBytes = 0;
-			for (int i = 0; i < schema.keys().length; i++) {
+			for (int i = 0; i < schema.keys().size(); i++) {
 				var computedKeyAtI = computeKeyAt(arena, i, keys);
 				var computedKeyAtISize = computedKeyAtI.byteSize();
 				MemorySegment.copy(computedKeyAtI, 0, finalKey, offsetBytes, computedKeyAtISize);
@@ -81,20 +81,18 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 	}
 
 	private MemorySegment computeKeyAt(Arena arena, int i, MemorySegment[] keys) {
-		if (i < schema.keys().length - schema.variableLengthKeysCount()) {
-			if (keys[i].byteSize() != schema.keys()[i]) {
+		if (i < schema.keys().size() - schema.variableLengthKeysCount()) {
+			if (keys[i].byteSize() != schema.key(i)) {
 				throw new RocksDBException(RocksDBErrorType.KEY_LENGTH_MISMATCH,
-						"Key at index " + i + " has a different length than expected! Expected: " + schema.keys()[i]
+						"Key at index " + i + " has a different length than expected! Expected: " + schema.key(i)
 								+ ", received: " + keys[i].byteSize());
 			}
 			return keys[i];
 		} else {
-			if (schema.keys()[i] != Integer.BYTES) {
-				throw new RocksDBException(RocksDBErrorType.UNSUPPORTED_HASH_SIZE,
-						"Hash size different than 32-bit is currently unsupported");
-			} else {
-				return XXHash32.getInstance().hash(arena, keys[i], 0, 0, 0);
-			}
+			var tailKey = schema.variableTailKey(i);
+			var hashResult = arena.allocate(tailKey.bytesSize());
+			tailKey.hash(keys[i], hashResult);
+			return hashResult;
 		}
 	}
 
@@ -107,9 +105,9 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 	}
 
 	private void validateKeyCount(MemorySegment[] keys) {
-		if (schema.keys().length != keys.length) {
+		if (schema.keys().size() != keys.length) {
 			throw new RocksDBException(RocksDBErrorType.KEYS_COUNT_MISMATCH,
-					"Keys count must be equal to the column keys count. Expected: " + schema.keys().length
+					"Keys count must be equal to the column keys count. Expected: " + schema.keys().size()
 							+ ", got: " + keys.length);
 		}
 	}
@@ -172,9 +170,9 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 	 * Get only the variable-length keys
 	 */
 	public MemorySegment[] getBucketElementKeys(MemorySegment[] keys) {
-		assert keys.length == schema.keys().length;
+		assert keys.length == schema.keys().size();
 		return Arrays.copyOfRange(keys,
-				schema.keys().length - schema.variableLengthKeysCount(),
-				schema.keys().length);
+				schema.keys().size() - schema.variableLengthKeysCount(),
+				schema.keys().size());
 	}
 }

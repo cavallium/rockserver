@@ -36,8 +36,8 @@ public final class XXHash32JavaSafe extends XXHash32 {
 
 	public static final ByteOrder NATIVE_BYTE_ORDER = ByteOrder.nativeOrder();
 	public static final XXHash32 INSTANCE = new XXHash32JavaSafe();
-	private static final OfInt INT_LE = ValueLayout.JAVA_INT.withOrder(ByteOrder.LITTLE_ENDIAN);
-	private static final OfInt INT_BE = ValueLayout.JAVA_INT.withOrder(ByteOrder.BIG_ENDIAN);
+	private static final OfInt INT_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+	private static final OfInt INT_BE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 	private static final OfByte BYTE_BE = ValueLayout.JAVA_BYTE.withOrder(ByteOrder.BIG_ENDIAN);
 
 	@Override
@@ -104,7 +104,7 @@ public final class XXHash32JavaSafe extends XXHash32 {
 	}
 
 	@Override
-	public MemorySegment hash(Arena arena, MemorySegment buf, int off, int len, int seed) {
+	public void hash(MemorySegment buf, int off, int len, int seed, MemorySegment result) {
 		checkRange(buf, off, len);
 
 		final int end = off + len;
@@ -163,7 +163,8 @@ public final class XXHash32JavaSafe extends XXHash32 {
 		h32 *= PRIME3;
 		h32 ^= h32 >>> 16;
 
-		return arena.allocate(INT_BE, h32);
+		assert result.byteSize() >= Integer.BYTES;
+		result.set(INT_BE, 0, h32);
 	}
 
 	private static void checkRange(byte[] buf, int off) {

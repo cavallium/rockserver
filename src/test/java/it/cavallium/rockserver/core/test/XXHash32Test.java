@@ -26,7 +26,8 @@ public class XXHash32Test {
 				ThreadLocalRandom.current().nextBytes(bytes);
 				var hash = safeXxhash32.hash(bytes, 0, bytes.length, Integer.MIN_VALUE);
 				var a = Arena.global();
-				var result = myXxhash32.hash(a, a.allocateArray(OfByte.JAVA_BYTE, bytes), 0, bytes.length, Integer.MIN_VALUE);
+				var result = a.allocate(Integer.BYTES);
+				myXxhash32.hash(a.allocateArray(OfByte.JAVA_BYTE, bytes), 0, bytes.length, Integer.MIN_VALUE, result);
 				var resultInt = result.get(ColumnInstance.BIG_ENDIAN_INT, 0);
 				Assertions.assertEquals(hash, resultInt);
 			}

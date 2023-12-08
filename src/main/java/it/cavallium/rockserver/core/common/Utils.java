@@ -51,9 +51,22 @@ public class Utils {
 	}
 
 	@NotNull
-	public static MemorySegment toMemorySegment(byte @Nullable [] array) {
+	public static MemorySegment toMemorySegment(byte... array) {
 		if (array != null) {
 			return MemorySegment.ofArray(array);
+		} else {
+			return MemorySegment.NULL;
+		}
+	}
+
+	@NotNull
+	public static MemorySegment toMemorySegmentSimple(int... array) {
+		if (array != null) {
+			var newArray = new byte[array.length];
+			for (int i = 0; i < array.length; i++) {
+				newArray[i] = (byte) array[i];
+			}
+			return MemorySegment.ofArray(newArray);
 		} else {
 			return MemorySegment.NULL;
 		}

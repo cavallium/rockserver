@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl;
 
 import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_INT;
+import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_INT_UNALIGNED;
 import static java.lang.Math.toIntExact;
 
 import it.cavallium.rockserver.core.common.Utils;
@@ -122,15 +123,16 @@ public class Bucket {
 	}
 
 	private int indexOf(MemorySegment[] bucketVariableKeys) {
-		for (int i = 0; i < elements.size(); i++) {
+		nextElement: for (int i = 0; i < elements.size(); i++) {
 			var elem = elements.get(i);
 			var arrayKeys = elem.getKey();
 			assert arrayKeys.length == bucketVariableKeys.length;
 			for (int j = 0; j < arrayKeys.length; j++) {
-				if (Utils.valueEquals(arrayKeys[j], bucketVariableKeys[j])) {
-					return i;
+				if (!Utils.valueEquals(arrayKeys[j], bucketVariableKeys[j])) {
+					continue nextElement;
 				}
 			}
+			return i;
 		}
 		return -1;
 	}
@@ -157,7 +159,7 @@ public class Bucket {
 		offset += Integer.BYTES;
 		for (MemorySegment elementAtI : serializedElements) {
 			var elementSize = elementAtI.byteSize();
-			segment.set(BIG_ENDIAN_INT, offset, toIntExact(elementSize));
+			segment.set(BIG_ENDIAN_INT_UNALIGNED, offset, toIntExact(elementSize));
 			offset += Integer.BYTES;
 			MemorySegment.copy(elementAtI, 0, segment, offset, elementSize);
 			offset += elementSize;
