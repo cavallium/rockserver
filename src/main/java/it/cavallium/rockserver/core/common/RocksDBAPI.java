@@ -73,7 +73,7 @@ public interface RocksDBAPI {
 	/**
 	 * Get an element from the specified position
 	 * @param arena arena
-	 * @param transactionId transaction id, or 0
+	 * @param transactionId transaction id, update id for retry operations, or 0
 	 * @param columnId column id
 	 * @param keys column keys, or empty array if not needed
 	 * @param callback the callback will be executed on the same thread, exactly once.

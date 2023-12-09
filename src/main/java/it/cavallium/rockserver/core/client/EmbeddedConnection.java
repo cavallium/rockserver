@@ -79,11 +79,11 @@ public class EmbeddedConnection extends BaseConnection {
 
 	@Override
 	public <T> T get(Arena arena,
-			long transactionId,
+			long transactionOrUpdateId,
 			long columnId,
 			MemorySegment @NotNull [] keys,
 			GetCallback<? super MemorySegment, T> callback) throws RocksDBException {
-		return db.get(arena, transactionId, columnId, keys, callback);
+		return db.get(arena, transactionOrUpdateId, columnId, keys, callback);
 	}
 
 	@Override
