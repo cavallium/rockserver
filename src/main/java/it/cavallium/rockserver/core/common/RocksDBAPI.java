@@ -27,6 +27,13 @@ public interface RocksDBAPI {
 	boolean closeTransaction(long transactionId, boolean commit) throws RocksDBException;
 
 	/**
+	 * Close a failed update, discarding all changes
+	 *
+	 * @param updateId update id to close
+	 */
+	void closeFailedUpdate(long updateId) throws RocksDBException;
+
+	/**
 	 * Create a column
 	 * @param name   column name
 	 * @param schema column key-value schema
@@ -50,14 +57,14 @@ public interface RocksDBAPI {
 	/**
 	 * Put an element into the specified position
 	 * @param arena arena
-	 * @param transactionId transaction id, or 0
+	 * @param transactionOrUpdateId transaction id, update id, or 0
 	 * @param columnId column id
 	 * @param keys column keys, or empty array if not needed
 	 * @param value value, or null if not needed
 	 * @param callback the callback will be executed on the same thread, exactly once.
 	 */
 	<T> T put(Arena arena,
-			long transactionId,
+			long transactionOrUpdateId,
 			long columnId,
 			@NotNull MemorySegment @NotNull[] keys,
 			@NotNull MemorySegment value,

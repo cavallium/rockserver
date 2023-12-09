@@ -40,6 +40,10 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
+	public void closeFailedUpdate(long updateId) throws RocksDBException {
+		throw new UnsupportedOperationException();
+	}
+	@Override
 	public long createColumn(String name, @NotNull ColumnSchema schema) {
 		throw new UnsupportedOperationException();
 	}
@@ -56,7 +60,7 @@ public abstract class SocketConnection extends BaseConnection {
 
 	@Override
 	public <T> T put(Arena arena,
-			long transactionId,
+			long transactionOrUpdateId,
 			long columnId,
 			MemorySegment @NotNull [] keys,
 			@NotNull MemorySegment value,

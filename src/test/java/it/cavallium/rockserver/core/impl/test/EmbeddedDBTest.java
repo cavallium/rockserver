@@ -7,6 +7,8 @@ import it.cavallium.rockserver.core.common.Callback;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Delta;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.Utils;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -327,6 +329,48 @@ abstract class EmbeddedDBTest {
 		Assertions.assertFalse(db.get(arena, 0, colId, getNotFoundKeyI(0), Callback.exists()));
 		Assertions.assertTrue(db.get(arena, 0, colId, collidingKey1, Callback.exists()));
 		Assertions.assertTrue(db.get(arena, 0, colId, key2, Callback.exists()));
+	}
+
+	@Test
+	void update() {
+		if (getHasValues()) {
+			var forUpdate = db.get(arena, 0, colId, key1, Callback.forUpdate());
+			Assertions.assertNull(forUpdate.previous());
+			Assertions.assertTrue(forUpdate.updateId() != 0);
+			db.put(arena, forUpdate.updateId(), colId, key1, value1, Callback.none());
+
+			Assertions.assertThrows(Exception.class, () -> db.put(arena, forUpdate.updateId(), colId, key1, value2, Callback.none()));
+		}
+	}
+
+	@Test
+	void concurrentUpdate() {
+		if (getHasValues()) {
+			{
+				var forUpdate1 = db.get(arena, 0, colId, key1, Callback.forUpdate());
+				try {
+					var forUpdate2 = db.get(arena, 0, colId, key1, Callback.forUpdate());
+					try {
+						db.put(arena, forUpdate1.updateId(), colId, key1, value1, Callback.none());
+						Assertions.assertThrowsExactly(RocksDBRetryException.class, () -> db.put(arena, forUpdate2.updateId(), colId, key1, value2, Callback.none()));
+						// Retrying
+						var forUpdate3 = db.get(arena, forUpdate2.updateId(), colId, key1, Callback.forUpdate());
+						try {
+							assertSegmentEquals(value1, forUpdate3.previous());
+							db.put(arena, forUpdate3.updateId(), colId, key1, value2, Callback.none());
+						} catch (Throwable ex3) {
+							db.closeFailedUpdate(forUpdate3.updateId());
+							throw ex3;
+						}
+					} catch (Throwable ex2) {
+						db.closeFailedUpdate(forUpdate2.updateId());
+						throw ex2;
+					}
+				} catch (Throwable ex) {
+					throw ex;
+				}
+			}
+		}
 	}
 
 	public static void assertSegmentEquals(MemorySegment expected, MemorySegment input) {

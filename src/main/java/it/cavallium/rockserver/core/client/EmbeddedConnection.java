@@ -48,6 +48,11 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
+	public void closeFailedUpdate(long updateId) throws RocksDBException {
+		db.closeFailedUpdate(updateId);
+	}
+
+	@Override
 	public long createColumn(String name, @NotNull ColumnSchema schema) {
 		return db.createColumn(name, schema);
 	}
@@ -64,12 +69,12 @@ public class EmbeddedConnection extends BaseConnection {
 
 	@Override
 	public <T> T put(Arena arena,
-			long transactionId,
+			long transactionOrUpdateId,
 			long columnId,
 			@NotNull MemorySegment @NotNull [] keys,
 			@NotNull MemorySegment value,
 			PutCallback<? super MemorySegment, T> callback) throws RocksDBException {
-		return db.put(arena, transactionId, columnId, keys, value, callback);
+		return db.put(arena, transactionOrUpdateId, columnId, keys, value, callback);
 	}
 
 	@Override

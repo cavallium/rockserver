@@ -25,8 +25,7 @@ public class RocksDBException extends RuntimeException {
 		COMMIT_FAILED_TRY_AGAIN,
 		COMMIT_FAILED,
 		TX_NOT_FOUND,
-		KEY_HASH_SIZE_MISMATCH,
-		ROCKSDB_LOAD_ERROR
+		KEY_HASH_SIZE_MISMATCH, RESTRICTED_TRANSACTION, PUT_INVALID_REQUEST, UPDATE_RETRY, ROCKSDB_LOAD_ERROR
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {
@@ -49,26 +48,26 @@ public class RocksDBException extends RuntimeException {
 		}
 	}
 
-	private RocksDBException(RocksDBErrorType errorUniqueId, String message) {
+	protected RocksDBException(RocksDBErrorType errorUniqueId, String message) {
 		super(message);
 		this.errorUniqueId = errorUniqueId;
 	}
 
-	private RocksDBException(RocksDBErrorType errorUniqueId, String message, Throwable ex) {
+	protected RocksDBException(RocksDBErrorType errorUniqueId, String message, Throwable ex) {
 		super(message, ex);
 		this.errorUniqueId = errorUniqueId;
 	}
 
-	private RocksDBException(RocksDBErrorType errorUniqueId, Throwable ex) {
+	protected RocksDBException(RocksDBErrorType errorUniqueId, Throwable ex) {
 		super(ex.toString(), ex);
 		this.errorUniqueId = errorUniqueId;
 	}
 
-	private RocksDBException(RocksDBErrorType errorUniqueId, org.rocksdb.RocksDBException ex) {
+	protected RocksDBException(RocksDBErrorType errorUniqueId, org.rocksdb.RocksDBException ex) {
 		this(errorUniqueId, ex.getMessage());
 	}
 
-	private RocksDBException(RocksDBErrorType errorUniqueId, String message, org.rocksdb.RocksDBException ex) {
+	protected RocksDBException(RocksDBErrorType errorUniqueId, String message, org.rocksdb.RocksDBException ex) {
 		this(errorUniqueId, message + ": " + ex.getMessage());
 	}
 

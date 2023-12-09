@@ -1,7 +1,9 @@
 package it.cavallium.rockserver.core.common;
 
+import it.cavallium.rockserver.core.common.Callback.CallbackForUpdate;
 import it.cavallium.rockserver.core.common.Callback.CallbackPreviousPresence;
 import java.util.List;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
@@ -17,7 +19,8 @@ public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
 	}
 
 	static boolean requiresGettingCurrentValue(GetCallback<?, ?> callback) {
-		return callback instanceof CallbackCurrent<?>;
+		return callback instanceof CallbackCurrent<?>
+				|| callback instanceof Callback.CallbackForUpdate<?>;
 	}
 
 	static <U> U safeCast(Object previousValue) {
@@ -33,6 +36,11 @@ public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
 	@SuppressWarnings("unchecked")
 	static <T> CallbackCurrent<T> current() {
 		return (CallbackCurrent<T>) CallbackCurrent.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> CallbackForUpdate<T> forUpdate() {
+		return (CallbackForUpdate<T>) CallbackForUpdate.INSTANCE;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -86,6 +94,11 @@ public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
 	record CallbackCurrent<T>() implements GetCallback<T, @Nullable T> {
 
 		private static final CallbackCurrent<Object> INSTANCE = new CallbackCurrent<>();
+	}
+
+	record CallbackForUpdate<T>() implements GetCallback<T,  @NotNull UpdateContext<@Nullable T>> {
+
+		private static final CallbackForUpdate<Object> INSTANCE = new CallbackForUpdate<>();
 	}
 
 	record CallbackExists<T>() implements GetCallback<T, Boolean>, IteratorCallback<T, Boolean> {
