@@ -481,20 +481,20 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 
 	@Override
 	public <T> T get(Arena arena,
-			long transactionId,
+			long transactionOrUpdateId,
 			long columnId,
 			MemorySegment @NotNull [] keys,
 			GetCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		// Column id
 		var col = getColumn(columnId);
-		Tx tx = transactionId != 0 ? getTransaction(transactionId, true) : null;
+		Tx tx = transactionOrUpdateId != 0 ? getTransaction(transactionOrUpdateId, true) : null;
 		long updateId;
 		if (callback instanceof Callback.CallbackForUpdate<?>) {
 			if (tx == null) {
 				tx = openTransactionInternal(MAX_TRANSACTION_DURATION_MS, true);
 				updateId = allocateTransactionInternal(tx);
 			} else {
-				updateId = transactionId;
+				updateId = transactionOrUpdateId;
 			}
 		} else {
 			updateId = 0;

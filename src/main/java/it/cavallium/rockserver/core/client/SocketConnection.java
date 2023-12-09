@@ -70,7 +70,7 @@ public abstract class SocketConnection extends BaseConnection {
 
 	@Override
 	public <T> T get(Arena arena,
-			long transactionId,
+			long transactionOrUpdateId,
 			long columnId,
 			MemorySegment @NotNull [] keys,
 			GetCallback<? super MemorySegment, T> callback) throws RocksDBException {
