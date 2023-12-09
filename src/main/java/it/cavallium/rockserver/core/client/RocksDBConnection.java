@@ -3,7 +3,6 @@ package it.cavallium.rockserver.core.client;
 import it.cavallium.rockserver.core.common.RocksDBAPI;
 import java.io.Closeable;
 import java.net.URI;
-import org.jetbrains.annotations.Nullable;
 
 public interface RocksDBConnection extends Closeable, RocksDBAPI {
 

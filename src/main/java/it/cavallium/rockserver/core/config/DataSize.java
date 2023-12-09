@@ -88,13 +88,27 @@ public final class DataSize extends Number implements Comparable<DataSize> {
 			return;
 		}
 		// Measurements are like B, MB, or MiB, not longer
+		final var scale = getScale(size, numberEndOffset);
+		this.size = (negative ? -1 : 1) * number * scale;
+	}
+
+	private static int getScale(String size, int numberEndOffset) {
 		if (size.length() - numberEndOffset > 3) {
 			throw new IllegalArgumentException("Wrong measurement unit");
 		}
 		var scaleChar = size.charAt(numberEndOffset);
 		boolean powerOf2 = numberEndOffset + 1 < size.length() && size.charAt(numberEndOffset + 1) == 'i';
+		final var scale = getScale(powerOf2, scaleChar);
+		// if scale is 1, the unit should be "B", nothing more
+		if (scale == 1 && numberEndOffset + 1 != size.length()) {
+			throw new IllegalArgumentException("Invalid unit");
+		}
+		return scale;
+	}
+
+	private static int getScale(boolean powerOf2, char scaleChar) {
 		int k = powerOf2 ? 1024 : 1000;
-		var scale = switch (scaleChar) {
+		return switch (scaleChar) {
 			case 'B' -> 1;
 			case 'b' -> throw new IllegalArgumentException("Bits are not allowed");
 			case 'K', 'k' -> k;
@@ -107,11 +121,6 @@ public final class DataSize extends Number implements Comparable<DataSize> {
 			case 'Y', 'y' -> k * k * k * k * k * k * k * k;
 			default -> throw new IllegalStateException("Unexpected value: " + scaleChar);
 		};
-		// if scale is 1, the unit should be "B", nothing more
-		if (scale == 1 && numberEndOffset + 1 != size.length()) {
-			throw new IllegalArgumentException("Invalid unit");
-		}
-		this.size = (negative ? -1 : 1) * number * scale;
 	}
 
 	public static Long get(DataSize value) {

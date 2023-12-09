@@ -1,7 +1,6 @@
 package it.cavallium.rockserver.core.client;
 
 import java.io.IOException;
-import java.net.SocketAddress;
 import java.net.URI;
 import java.net.UnixDomainSocketAddress;
 import java.nio.file.Files;

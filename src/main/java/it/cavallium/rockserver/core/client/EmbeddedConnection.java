@@ -13,6 +13,7 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.Optional;
 
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public class EmbeddedConnection extends BaseConnection {
@@ -47,7 +48,7 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
-	public long createColumn(String name, ColumnSchema schema) {
+	public long createColumn(String name, @NotNull ColumnSchema schema) {
 		return db.createColumn(name, schema);
 	}
 
@@ -57,7 +58,7 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
-	public long getColumnId(String name) {
+	public long getColumnId(@NotNull String name) {
 		return db.getColumnId(name);
 	}
 
@@ -65,8 +66,8 @@ public class EmbeddedConnection extends BaseConnection {
 	public <T> T put(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment[] keys,
-			@Nullable MemorySegment value,
+			@NotNull MemorySegment @NotNull [] keys,
+			@NotNull MemorySegment value,
 			PutCallback<? super MemorySegment, T> callback) throws RocksDBException {
 		return db.put(arena, transactionId, columnId, keys, value, callback);
 	}
@@ -75,7 +76,7 @@ public class EmbeddedConnection extends BaseConnection {
 	public <T> T get(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment[] keys,
+			MemorySegment @NotNull [] keys,
 			GetCallback<? super MemorySegment, T> callback) throws RocksDBException {
 		return db.get(arena, transactionId, columnId, keys, callback);
 	}
@@ -84,7 +85,7 @@ public class EmbeddedConnection extends BaseConnection {
 	public long openIterator(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment[] startKeysInclusive,
+			@NotNull MemorySegment @NotNull [] startKeysInclusive,
 			@Nullable MemorySegment[] endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
@@ -97,7 +98,7 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
-	public void seekTo(Arena arena, long iterationId, MemorySegment[] keys) throws RocksDBException {
+	public void seekTo(Arena arena, long iterationId, MemorySegment @NotNull [] keys) throws RocksDBException {
 		db.seekTo(arena, iterationId, keys);
 	}
 
@@ -106,7 +107,7 @@ public class EmbeddedConnection extends BaseConnection {
 			long iterationId,
 			long skipCount,
 			long takeCount,
-			IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException {
+			@NotNull IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException {
 		return db.subsequent(arena, iterationId, skipCount, takeCount, callback);
 	}
 }

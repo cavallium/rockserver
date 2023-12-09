@@ -6,6 +6,7 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.Callback;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.Delta;
 import it.cavallium.rockserver.core.common.Utils;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -15,18 +16,19 @@ import org.junit.jupiter.api.Assertions;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import org.junit.jupiter.api.Test;
 
-class EmbeddedDBTest {
+abstract class EmbeddedDBTest {
 
-	private EmbeddedConnection db;
-	private long colId = 0L;
-	private Arena arena;
-	private MemorySegment bigValue;
-	private MemorySegment[] key1;
-	private MemorySegment[] collidingKey1;
-	private MemorySegment[] key2;
-	private MemorySegment value1;
-	private MemorySegment value2;
+	protected EmbeddedConnection db;
+	protected long colId = 0L;
+	protected Arena arena;
+	protected MemorySegment bigValue;
+	protected MemorySegment[] key1;
+	protected MemorySegment[] collidingKey1;
+	protected MemorySegment[] key2;
+	protected MemorySegment value1;
+	protected MemorySegment value2;
 
 	@org.junit.jupiter.api.BeforeEach
 	void setUp() throws IOException {
@@ -37,41 +39,65 @@ class EmbeddedDBTest {
 		db = new EmbeddedConnection(null, "test", null);
 		createStandardColumn();
 
+		bigValue = getBigValue();
+		key1 = getKey1();
+		collidingKey1 = getCollidingKey1();
+		key2 = getKey2();
 
+		value1 = getValue1();
+		value2 = getValue2();
+	}
+
+	protected MemorySegment getBigValue() {
 		var bigValueArray = new byte[10_000];
 		ThreadLocalRandom.current().nextBytes(bigValueArray);
-		bigValue = MemorySegment.ofArray(bigValueArray);
-		key1 = new MemorySegment[] {
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(4, 6),
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(1, 2, 3),
-				toMemorySegmentSimple(6, 7, 8)
-		};
-		collidingKey1 = new MemorySegment[] {
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(4, 6),
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(1, 2, 3),
-				toMemorySegmentSimple(6, 7, -48)
-		};
-		key2 = new MemorySegment[] {
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(4, 6),
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(1, 2, 3),
-				toMemorySegmentSimple(6, 7, 7)
-		};
+		return Utils.toMemorySegment(arena, bigValueArray);
+	}
 
-		value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
-		value2 = MemorySegment.ofArray(new byte[] {0, 0, 5});
+	protected MemorySegment[] getKey2() {
+		return new MemorySegment[] {
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 4, 6),
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 1, 2, 3),
+				toMemorySegmentSimple(arena, 6, 7, 7)
+		};
+	}
+
+	protected MemorySegment[] getCollidingKey1() {
+		return new MemorySegment[] {
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 4, 6),
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 1, 2, 3),
+				toMemorySegmentSimple(arena, 6, 7, -48)
+		};
+	}
+
+	protected MemorySegment[] getKey1() {
+		return new MemorySegment[] {
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 4, 6),
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 1, 2, 3),
+				toMemorySegmentSimple(arena, 6, 7, 8)
+		};
+	}
+
+	protected boolean getHasValues() {
+		return true;
+	}
+
+	protected MemorySegment getValue1() {
+		return Utils.toMemorySegmentSimple(arena, 0, 0, 3);
+	}
+
+	protected MemorySegment getValue2() {
+		return Utils.toMemorySegmentSimple(arena, 0, 0, 5);
 	}
 
 	private void createStandardColumn() {
-		createColumn(ColumnSchema.of(IntList.of(1, 2, 1),
-				ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.XXHASH32),
-				true
-		));
+		createColumn(getSchema());
 	}
 
 	private void createColumn(ColumnSchema schema) {
@@ -86,16 +112,34 @@ class EmbeddedDBTest {
 		Assertions.assertNull(db.put(arena, 0, colId, collidingKey1, value2, Callback.none()));
 		Assertions.assertNull(db.put(arena, 0, colId, key2, bigValue, Callback.none()));
 		for (int i = 0; i < Byte.MAX_VALUE; i++) {
-			var keyI = new MemorySegment[] {
-					toMemorySegmentSimple(3),
-					toMemorySegmentSimple(4, 6),
-					toMemorySegmentSimple(3),
-					toMemorySegmentSimple(1, 2, 3),
-					toMemorySegmentSimple(8, 2, 5, 1, 7, i)
-			};
-			var valueI = toMemorySegmentSimple(i, i, i, i, i);
+			var keyI = getKeyI(i);
+			var valueI = getValueI(i);
 			Assertions.assertNull(db.put(arena, 0, colId, keyI, valueI, Callback.none()));
 		}
+	}
+
+	protected MemorySegment[] getKeyI(int i) {
+		return new MemorySegment[] {
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 4, 6),
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 1, 2, 3),
+				toMemorySegmentSimple(arena, 8, 2, 5, 1, 7, i)
+		};
+	}
+
+	protected MemorySegment[] getNotFoundKeyI(int i) {
+		return new MemorySegment[] {
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 4, 6),
+				toMemorySegmentSimple(arena, 3),
+				toMemorySegmentSimple(arena, 1, 2, 3),
+				toMemorySegmentSimple(arena, 8, 2, 5, 1, 0, i)
+		};
+	}
+
+	protected MemorySegment getValueI(int i) {
+		return toMemorySegmentSimple(arena, i, i, i, i, i);
 	}
 
 	@org.junit.jupiter.api.AfterEach
@@ -105,19 +149,32 @@ class EmbeddedDBTest {
 		arena.close();
 	}
 
-	@org.junit.jupiter.api.Test
-	void putSameBucketSameKey() {
-		var key = new MemorySegment[] {
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(4, 6),
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(1, 2, 3),
-				toMemorySegmentSimple(0, 0, 3, 6, 7, 8)
-		};
-		var value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
-		var value2 = MemorySegment.ofArray(new byte[] {0, 0, 5});
+	@SuppressWarnings("DataFlowIssue")
+	@Test
+	void putTestErrors() {
+		var key = getKey1();
 
-		var delta = db.put(arena, 0, colId, key, value1, Callback.delta());
+		if (!getHasValues()) {
+			Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, toMemorySegmentSimple(arena, 123), Callback.delta()));
+		}
+
+		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, null, Callback.delta()));
+		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, null, value1, Callback.delta()));
+		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, null, null, Callback.delta()));
+		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, value1, null));
+		Assertions.assertThrows(Exception.class, () -> db.put(arena, 1, colId, key, value1, Callback.delta()));
+		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, 21203, key, value1, Callback.delta()));
+	}
+
+	@Test
+	void putSameBucketSameKey() {
+		var key = getKey1();
+		var value1 = getValue1();
+		var value2 = getValue2();
+
+		Delta<MemorySegment> delta;
+
+		delta = db.put(arena, 0, colId, key, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
 
@@ -126,32 +183,22 @@ class EmbeddedDBTest {
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
 	}
 
-	@org.junit.jupiter.api.Test
+	@Test
 	void putSameBucketDifferentKey() {
-		createColumn(ColumnSchema.of(IntList.of(1, 2, 1), ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.ALLSAME8), true));
+		if (getSchemaVarKeys().isEmpty()) {
+			return;
+		}
+		createColumn(ColumnSchema.of(getSchemaFixedKeys(), ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.ALLSAME8), getHasValues()));
 
-		var lastKey1 = toMemorySegmentSimple(6, 7, 8);
-		var lastKey2 = toMemorySegmentSimple(6, 7, -48);
+		var key1 = getKey1();
+		var key2 = getCollidingKey1();
 
-		var key1 = new MemorySegment[] {
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(4, 6),
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(1, 2, 3),
-				lastKey1
-		};
-		var key2 = new MemorySegment[] {
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(4, 6),
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(1, 2, 3),
-				lastKey2
-		};
+		var value1 = getValue1();
+		var value2 = getValue2();
 
-		var value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
-		var value2 = MemorySegment.ofArray(new byte[] {0, 0, 5});
+		Delta<MemorySegment> delta;
 
-		var delta = db.put(arena, 0, colId, key1, value1, Callback.delta());
+		delta = db.put(arena, 0, colId, key1, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
 
@@ -164,41 +211,29 @@ class EmbeddedDBTest {
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
 	}
 
+	protected ColumnSchema getSchema() {
+		return ColumnSchema.of(getSchemaFixedKeys(), getSchemaVarKeys(), getHasValues());
+	}
+
+	protected IntList getSchemaFixedKeys() {
+		return IntList.of(1, 2, 1);
+	}
+
+	protected ObjectList<ColumnHashType> getSchemaVarKeys() {
+		return ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.XXHASH8);
+	}
+
 	/**
 	 * Some keys have same bucket, some not
 	 */
-	@org.junit.jupiter.api.Test
+	@Test
 	void putMixedBucketMixedKey() {
-		createColumn(ColumnSchema.of(IntList.of(1, 2, 1), ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.XXHASH8), true));
+		var key1 = getKey1();
+		var collidingKey1 = getCollidingKey1();
+		var key2 = getKey2();
 
-		var lastKey1 = toMemorySegmentSimple(6, 7, 8);
-		var collidingLastKey1 = toMemorySegmentSimple(6, 7, -48);
-		var lastKey2 = toMemorySegmentSimple(6, 7, 7);
-
-		var key1 = new MemorySegment[] {
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(4, 6),
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(1, 2, 3),
-				lastKey1
-		};
-		var collidingKey1 = new MemorySegment[] {
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(4, 6),
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(1, 2, 3),
-				collidingLastKey1
-		};
-		var key2 = new MemorySegment[] {
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(4, 6),
-				toMemorySegmentSimple(3),
-				toMemorySegmentSimple(1, 2, 3),
-				lastKey2
-		};
-
-		var value1 = MemorySegment.ofArray(new byte[] {0, 0, 3});
-		var value2 = MemorySegment.ofArray(new byte[] {0, 0, 5});
+		var value1 = getValue1();
+		var value2 = getValue2();
 
 		var delta = db.put(arena, 0, colId, key1, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
@@ -221,11 +256,25 @@ class EmbeddedDBTest {
 		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
 	}
 
-	@org.junit.jupiter.api.Test
+	@Test
 	void get() {
+		Assertions.assertNull(db.get(arena, 0, colId, key1, Callback.current()));
+		Assertions.assertNull(db.get(arena, 0, colId, collidingKey1, Callback.current()));
+		Assertions.assertNull(db.get(arena, 0, colId, key2, Callback.current()));
 		fillSomeKeys();
 		Assertions.assertTrue(Utils.valueEquals(value1, db.get(arena, 0, colId, key1, Callback.current())));
+		Assertions.assertNull(db.get(arena, 0, colId, getNotFoundKeyI(0), Callback.current()));
 		Assertions.assertTrue(Utils.valueEquals(value2, db.get(arena, 0, colId, collidingKey1, Callback.current())));
 		Assertions.assertTrue(Utils.valueEquals(bigValue, db.get(arena, 0, colId, key2, Callback.current())));
+	}
+
+	@SuppressWarnings("DataFlowIssue")
+	@Test
+	void getTestError() {
+		fillSomeKeys();
+		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(arena, 0, colId, null, Callback.current())));
+		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(arena, 0, 18239, key1, Callback.current())));
+		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(arena, 1, colId, key1, Callback.current())));
+		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(arena, 0, colId, key1, null)));
 	}
 }

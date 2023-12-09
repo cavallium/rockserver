@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.SocketAddress;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public abstract class SocketConnection extends BaseConnection {
@@ -39,7 +40,7 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public long createColumn(String name, ColumnSchema schema) {
+	public long createColumn(String name, @NotNull ColumnSchema schema) {
 		throw new UnsupportedOperationException();
 	}
 
@@ -49,7 +50,7 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public long getColumnId(String name) {
+	public long getColumnId(@NotNull String name) {
 		throw new UnsupportedOperationException();
 	}
 
@@ -57,8 +58,8 @@ public abstract class SocketConnection extends BaseConnection {
 	public <T> T put(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment[] keys,
-			@Nullable MemorySegment value,
+			MemorySegment @NotNull [] keys,
+			@NotNull MemorySegment value,
 			PutCallback<? super MemorySegment, T> callback) throws RocksDBException {
 		throw new UnsupportedOperationException();
 	}
@@ -67,7 +68,7 @@ public abstract class SocketConnection extends BaseConnection {
 	public <T> T get(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment[] keys,
+			MemorySegment @NotNull [] keys,
 			GetCallback<? super MemorySegment, T> callback) throws RocksDBException {
 		throw new UnsupportedOperationException();
 	}
@@ -76,7 +77,7 @@ public abstract class SocketConnection extends BaseConnection {
 	public long openIterator(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment[] startKeysInclusive,
+			MemorySegment @NotNull [] startKeysInclusive,
 			@Nullable MemorySegment[] endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
@@ -89,7 +90,7 @@ public abstract class SocketConnection extends BaseConnection {
 	}
 
 	@Override
-	public void seekTo(Arena arena, long iterationId, MemorySegment[] keys) throws RocksDBException {
+	public void seekTo(Arena arena, long iterationId, MemorySegment @NotNull [] keys) throws RocksDBException {
 		throw new UnsupportedOperationException();
 	}
 
@@ -98,7 +99,7 @@ public abstract class SocketConnection extends BaseConnection {
 			long iterationId,
 			long skipCount,
 			long takeCount,
-			IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException {
+			@NotNull IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException {
 		throw new UnsupportedOperationException();
 	}
 }

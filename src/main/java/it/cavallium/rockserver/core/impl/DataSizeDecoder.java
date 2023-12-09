@@ -4,7 +4,6 @@ import it.cavallium.rockserver.core.config.DataSize;
 import java.util.List;
 import org.github.gestalt.config.decoder.Decoder;
 import org.github.gestalt.config.decoder.DecoderContext;
-import org.github.gestalt.config.decoder.DecoderService;
 import org.github.gestalt.config.decoder.Priority;
 import org.github.gestalt.config.entity.ValidationError;
 import org.github.gestalt.config.node.ConfigNode;

@@ -14,7 +14,6 @@ package it.cavallium.rockserver.core.impl;
  * limitations under the License.
  */
 
-import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 
 /**

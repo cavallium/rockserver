@@ -6,7 +6,6 @@ import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.*;
-import org.rocksdb.util.Environment;
 import org.rocksdb.util.SizeUnit;
 
 import java.io.IOException;
@@ -141,7 +140,6 @@ public class RocksDBLoader {
                     .orElse(0L);
 
             if (isDisableAutoCompactions()) {
-                options.setMaxBackgroundCompactions(0);
                 options.setMaxBackgroundJobs(0);
             } else {
                 var backgroundJobs = Integer.parseInt(System.getProperty("it.cavallium.dbengine.jobs.background.num", "-1"));
@@ -371,7 +369,7 @@ public class RocksDBLoader {
                     columnFamilyOptions.setBottommostCompressionOptions(lastLevelOptions.compressionOptions);
 
                     List<CompressionType> compressionPerLevel = new ArrayList<>();
-                    for (ColumnLevelConfig columnLevelConfig : List.of(columnOptions.levels())) {
+                    for (ColumnLevelConfig columnLevelConfig : columnOptions.levels()) {
                         CompressionType compression = columnLevelConfig.compression();
                         compressionPerLevel.add(compression);
                     }
@@ -532,9 +530,7 @@ public class RocksDBLoader {
                 logger.log(Level.FINE, "Failed to obtain stats", ex);
             }
             return TransactionalDB.create(definitiveDbPath.toString(), db);
-        } catch (IOException ex) {
-            throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
-        } catch (RocksDBException ex) {
+        } catch (IOException | RocksDBException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Failed to load rocksdb", e);

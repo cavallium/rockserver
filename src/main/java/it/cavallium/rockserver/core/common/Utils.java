@@ -5,7 +5,9 @@ import static java.lang.foreign.MemorySegment.NULL;
 import static java.util.Objects.requireNonNullElse;
 
 import java.io.IOException;
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -16,9 +18,17 @@ import java.util.function.Function;
 import java.util.stream.Stream;
 
 import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.Nullable;
 
 public class Utils {
+	@SuppressWarnings("resource")
+	private static final MemorySegment DUMMY_EMPTY_VALUE = Arena
+			.global()
+			.allocate(ValueLayout.JAVA_BYTE, (byte) -1)
+			.asReadOnly();
+
+	public static MemorySegment dummyEmptyValue() {
+		return DUMMY_EMPTY_VALUE;
+	}
 
 	/**
 	 * Returns the value of the {@code int} argument, throwing an exception if the value overflows an {@code char}.
@@ -61,6 +71,14 @@ public class Utils {
 		}
 	}
 
+	public static MemorySegment toMemorySegment(Arena arena, byte... array) {
+		if (array != null) {
+			return arena.allocateArray(ValueLayout.JAVA_BYTE, array);
+		} else {
+			return MemorySegment.NULL;
+		}
+	}
+
 	@NotNull
 	public static MemorySegment toMemorySegmentSimple(int... array) {
 		if (array != null) {
@@ -69,6 +87,19 @@ public class Utils {
 				newArray[i] = (byte) array[i];
 			}
 			return MemorySegment.ofArray(newArray);
+		} else {
+			return MemorySegment.NULL;
+		}
+	}
+
+	@NotNull
+	public static MemorySegment toMemorySegmentSimple(Arena arena, int... array) {
+		if (array != null) {
+			var newArray = new byte[array.length];
+			for (int i = 0; i < array.length; i++) {
+				newArray[i] = (byte) array[i];
+			}
+			return arena.allocateArray(ValueLayout.JAVA_BYTE, newArray);
 		} else {
 			return MemorySegment.NULL;
 		}

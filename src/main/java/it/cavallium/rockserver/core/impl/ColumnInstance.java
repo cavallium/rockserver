@@ -1,7 +1,6 @@
 package it.cavallium.rockserver.core.impl;
 
 import static it.cavallium.rockserver.core.common.Utils.toCharExact;
-import static java.lang.Math.toIntExact;
 
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.RocksDBException;
@@ -141,7 +140,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 	}
 
 	public void checkNullableValue(MemorySegment value) {
-		if (schema.hasValue() == (value == null)) {
+		if (schema.hasValue() == (value == null || value == MemorySegment.NULL)) {
 			if (schema.hasValue()) {
 				throw RocksDBException.of(RocksDBErrorType.UNEXPECTED_NULL_VALUE,
 						"Schema expects a value, but a null value has been passed");

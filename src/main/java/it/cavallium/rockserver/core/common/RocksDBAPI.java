@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.Callback.IteratorCallback;
 import it.cavallium.rockserver.core.common.Callback.PutCallback;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public interface RocksDBAPI {
@@ -31,7 +32,7 @@ public interface RocksDBAPI {
 	 * @param schema column key-value schema
 	 * @return column id
 	 */
-	long createColumn(String name, ColumnSchema schema) throws RocksDBException;
+	long createColumn(String name, @NotNull ColumnSchema schema) throws RocksDBException;
 
 	/**
 	 * Delete a column
@@ -44,7 +45,7 @@ public interface RocksDBAPI {
 	 * @param name column name
 	 * @return column id
 	 */
-	long getColumnId(String name) throws RocksDBException;
+	long getColumnId(@NotNull String name) throws RocksDBException;
 
 	/**
 	 * Put an element into the specified position
@@ -58,8 +59,8 @@ public interface RocksDBAPI {
 	<T> T put(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment[] keys,
-			@Nullable MemorySegment value,
+			@NotNull MemorySegment @NotNull[] keys,
+			@NotNull MemorySegment value,
 			PutCallback<? super MemorySegment, T> callback) throws RocksDBException;
 
 	/**
@@ -73,7 +74,7 @@ public interface RocksDBAPI {
 	<T> T get(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment[] keys,
+			@NotNull MemorySegment @NotNull[] keys,
 			GetCallback<? super MemorySegment, T> callback) throws RocksDBException;
 
 	/**
@@ -90,8 +91,8 @@ public interface RocksDBAPI {
 	long openIterator(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment[] startKeysInclusive,
-			@Nullable MemorySegment[] endKeysExclusive,
+			@NotNull MemorySegment @NotNull[] startKeysInclusive,
+			@NotNull MemorySegment @Nullable[] endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException;
 
@@ -107,7 +108,7 @@ public interface RocksDBAPI {
 	 * @param iterationId iteration id
 	 * @param keys keys, inclusive. [] means "the beginning"
 	 */
-	void seekTo(Arena arena, long iterationId, MemorySegment[] keys) throws RocksDBException;
+	void seekTo(Arena arena, long iterationId, @NotNull MemorySegment @NotNull[] keys) throws RocksDBException;
 
 	/**
 	 * Get the subsequent element during an iteration
@@ -121,5 +122,5 @@ public interface RocksDBAPI {
 			long iterationId,
 			long skipCount,
 			long takeCount,
-			IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException;
+			@NotNull IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException;
 }

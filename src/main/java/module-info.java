@@ -3,7 +3,6 @@ module rockserver.core {
 	requires net.sourceforge.argparse4j;
 	requires inet.ipaddr;
 	requires java.logging;
-	requires typesafe.config;
 	requires org.jetbrains.annotations;
 	requires high.scale.lib;
 	requires org.github.gestalt.core;

@@ -4,7 +4,6 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
-import java.lang.foreign.MemorySegment;
 
 public record ColumnSchema(IntList keys, ObjectList<ColumnHashType> variableTailKeys, boolean hasValue) {
 
@@ -44,7 +43,7 @@ public record ColumnSchema(IntList keys, ObjectList<ColumnHashType> variableTail
 
 	/**
 	 * Keys with their length
-	 * @return an array with the length of each key, variable-length keys must have the length of their hash
+	 * @return an int list with the length of each key, variable-length keys must have the length of their hash
 	 */
 	@Override
 	public IntList keys() {

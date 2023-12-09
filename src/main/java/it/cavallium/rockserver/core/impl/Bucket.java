@@ -7,7 +7,6 @@ import static java.lang.Math.toIntExact;
 import it.cavallium.rockserver.core.common.Utils;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
 import java.util.Map;
 import java.util.Map.Entry;

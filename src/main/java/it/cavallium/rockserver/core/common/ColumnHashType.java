@@ -11,9 +11,7 @@ public enum ColumnHashType implements HashFunction {
 		var xxHash = XXHash32.getInstance().hash(Utils.toByteArray(inputData), 0, Math.toIntExact(inputData.byteSize()), 0);
 		hashResult.set(ColumnInstance.BIG_ENDIAN_BYTES, 0, (byte) xxHash);
 	}),
-	ALLSAME8(Byte.BYTES, (inputData, hashResult) -> {
-		hashResult.set(ColumnInstance.BIG_ENDIAN_BYTES, 0, (byte) 0);
-	});
+	ALLSAME8(Byte.BYTES, (inputData, hashResult) -> hashResult.set(ColumnInstance.BIG_ENDIAN_BYTES, 0, (byte) 0));
 
 	private final int bytes;
 	private final HashFunction hashFunction;

@@ -1,9 +1,6 @@
 package it.cavallium.rockserver.core.common;
 
-import java.lang.foreign.MemorySegment;
 import java.util.List;
-import java.util.Map.Entry;
-import java.util.concurrent.atomic.AtomicReference;
 import org.jetbrains.annotations.Nullable;
 
 public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
