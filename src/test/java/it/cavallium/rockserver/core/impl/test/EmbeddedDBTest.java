@@ -11,6 +11,7 @@ import it.cavallium.rockserver.core.common.Utils;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.lang.foreign.Arena;
+import java.util.Arrays;
 import java.util.concurrent.ThreadLocalRandom;
 import org.junit.jupiter.api.Assertions;
 
@@ -156,6 +157,8 @@ abstract class EmbeddedDBTest {
 
 		if (!getHasValues()) {
 			Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, toMemorySegmentSimple(arena, 123), Callback.delta()));
+		} else {
+			Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, MemorySegment.NULL, Callback.delta()));
 		}
 
 		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, null, Callback.delta()));
@@ -176,11 +179,11 @@ abstract class EmbeddedDBTest {
 
 		delta = db.put(arena, 0, colId, key, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
+		assertSegmentEquals(value1, delta.current());
 
 		delta = db.put(arena, 0, colId, key, value2, Callback.delta());
-		Assertions.assertTrue(Utils.valueEquals(delta.previous(), value1));
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
+		assertSegmentEquals(value1, delta.previous());
+		assertSegmentEquals(value2, delta.current());
 	}
 
 	@Test
@@ -198,17 +201,61 @@ abstract class EmbeddedDBTest {
 
 		Delta<MemorySegment> delta;
 
+		Assertions.assertFalse(db.put(arena, 0, colId, getKeyI(3), value2, Callback.previousPresence()));
+		Assertions.assertFalse(db.put(arena, 0, colId, getKeyI(4), value2, Callback.previousPresence()));
+
+
 		delta = db.put(arena, 0, colId, key1, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
+		assertSegmentEquals(value1, delta.current());
 
 		delta = db.put(arena, 0, colId, key2, value2, Callback.delta());
 		Assertions.assertNull(delta.previous());
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
+		assertSegmentEquals(value2, delta.current());
 
 		delta = db.put(arena, 0, colId, key2, value1, Callback.delta());
-		Assertions.assertTrue(Utils.valueEquals(delta.previous(), value2));
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
+		assertSegmentEquals(value2, delta.previous());
+		assertSegmentEquals(value1, delta.current());
+
+		delta = db.put(arena, 0, colId, key2, value1, Callback.delta());
+		assertSegmentEquals(value1, delta.previous());
+		assertSegmentEquals(value1, delta.current());
+
+
+		Assertions.assertTrue(db.put(arena, 0, colId, key1, value2, Callback.previousPresence()));
+		Assertions.assertTrue(db.put(arena, 0, colId, key2, value2, Callback.previousPresence()));
+
+
+		delta = db.put(arena, 0, colId, key1, value1, Callback.delta());
+		assertSegmentEquals(value2, delta.previous());
+		assertSegmentEquals(value1, delta.current());
+
+		delta = db.put(arena, 0, colId, key2, value1, Callback.delta());
+		assertSegmentEquals(value2, delta.previous());
+		assertSegmentEquals(value1, delta.current());
+
+
+		Assertions.assertNull(db.put(arena, 0, colId, key1, value2, Callback.none()));
+		Assertions.assertNull(db.put(arena, 0, colId, key2, value2, Callback.none()));
+
+
+		assertSegmentEquals(value2, db.put(arena, 0, colId, key1, value1, Callback.previous()));
+		assertSegmentEquals(value2, db.put(arena, 0, colId, key2, value1, Callback.previous()));
+
+		assertSegmentEquals(value1, db.put(arena, 0, colId, key1, value1, Callback.previous()));
+		assertSegmentEquals(value1, db.put(arena, 0, colId, key2, value1, Callback.previous()));
+
+		if (!Utils.valueEquals(value1, value2)) {
+			Assertions.assertTrue(db.put(arena, 0, colId, key1, value2, Callback.changed()));
+			Assertions.assertTrue(db.put(arena, 0, colId, key2, value2, Callback.changed()));
+		}
+
+		Assertions.assertFalse(db.put(arena, 0, colId, key1, value2, Callback.changed()));
+		Assertions.assertFalse(db.put(arena, 0, colId, key2, value2, Callback.changed()));
+
+
+		assertSegmentEquals(value2, db.put(arena, 0, colId, key1, value1, Callback.previous()));
+		assertSegmentEquals(value2, db.put(arena, 0, colId, key2, value1, Callback.previous()));
 	}
 
 	protected ColumnSchema getSchema() {
@@ -237,35 +284,58 @@ abstract class EmbeddedDBTest {
 
 		var delta = db.put(arena, 0, colId, key1, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
+		assertSegmentEquals(value1, delta.current());
 
 		delta = db.put(arena, 0, colId, collidingKey1, value2, Callback.delta());
 		Assertions.assertNull(delta.previous());
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
+		assertSegmentEquals(value2, delta.current());
 
 		delta = db.put(arena, 0, colId, collidingKey1, value1, Callback.delta());
-		Assertions.assertTrue(Utils.valueEquals(delta.previous(), value2));
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
+		assertSegmentEquals(value2, delta.previous());
+		assertSegmentEquals(value1, delta.current());
 
 		delta = db.put(arena, 0, colId, key2, value1, Callback.delta());
 		Assertions.assertNull(delta.previous());
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value1));
+		assertSegmentEquals(value1, delta.current());
 
 		delta = db.put(arena, 0, colId, key2, value2, Callback.delta());
-		Assertions.assertTrue(Utils.valueEquals(delta.previous(), value1));
-		Assertions.assertTrue(Utils.valueEquals(delta.current(), value2));
+		assertSegmentEquals(value1, delta.previous());
+		assertSegmentEquals(value2, delta.current());
 	}
 
 	@Test
 	void get() {
-		Assertions.assertNull(db.get(arena, 0, colId, key1, Callback.current()));
-		Assertions.assertNull(db.get(arena, 0, colId, collidingKey1, Callback.current()));
-		Assertions.assertNull(db.get(arena, 0, colId, key2, Callback.current()));
+		if (getHasValues()) {
+			Assertions.assertNull(db.get(arena, 0, colId, key1, Callback.current()));
+			Assertions.assertNull(db.get(arena, 0, colId, collidingKey1, Callback.current()));
+			Assertions.assertNull(db.get(arena, 0, colId, key2, Callback.current()));
+		}
+		Assertions.assertFalse(db.get(arena, 0, colId, key1, Callback.exists()));
+		Assertions.assertFalse(db.get(arena, 0, colId, collidingKey1, Callback.exists()));
+		Assertions.assertFalse(db.get(arena, 0, colId, key2, Callback.exists()));
+
 		fillSomeKeys();
-		Assertions.assertTrue(Utils.valueEquals(value1, db.get(arena, 0, colId, key1, Callback.current())));
-		Assertions.assertNull(db.get(arena, 0, colId, getNotFoundKeyI(0), Callback.current()));
-		Assertions.assertTrue(Utils.valueEquals(value2, db.get(arena, 0, colId, collidingKey1, Callback.current())));
-		Assertions.assertTrue(Utils.valueEquals(bigValue, db.get(arena, 0, colId, key2, Callback.current())));
+
+		if (getHasValues()) {
+			assertSegmentEquals(value1, db.get(arena, 0, colId, key1, Callback.current()));
+			Assertions.assertNull(db.get(arena, 0, colId, getNotFoundKeyI(0), Callback.current()));
+			assertSegmentEquals(value2, db.get(arena, 0, colId, collidingKey1, Callback.current()));
+			assertSegmentEquals(bigValue, db.get(arena, 0, colId, key2, Callback.current()));
+		}
+
+		Assertions.assertTrue(db.get(arena, 0, colId, key1, Callback.exists()));
+		Assertions.assertFalse(db.get(arena, 0, colId, getNotFoundKeyI(0), Callback.exists()));
+		Assertions.assertTrue(db.get(arena, 0, colId, collidingKey1, Callback.exists()));
+		Assertions.assertTrue(db.get(arena, 0, colId, key2, Callback.exists()));
+	}
+
+	public static void assertSegmentEquals(MemorySegment expected, MemorySegment input) {
+		if (!Utils.valueEquals(expected, input)) {
+			Assertions.fail(
+					"Memory segments are not equal! Expected: "
+							+ (expected != null ? Arrays.toString(Utils.toByteArray(expected)) : "null")
+							+ ", Input: " + (input != null ? Arrays.toString(Utils.toByteArray(input)) : "null"));
+		}
 	}
 
 	@SuppressWarnings("DataFlowIssue")

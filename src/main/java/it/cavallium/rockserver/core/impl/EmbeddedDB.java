@@ -6,6 +6,7 @@ import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
 import it.cavallium.rockserver.core.common.Callback;
+import it.cavallium.rockserver.core.common.Callback.CallbackExists;
 import it.cavallium.rockserver.core.common.Callback.GetCallback;
 import it.cavallium.rockserver.core.common.Callback.IteratorCallback;
 import it.cavallium.rockserver.core.common.Callback.PutCallback;
@@ -34,6 +35,8 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
@@ -314,8 +317,45 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		}
 	}
 
+	/**
+	 * @param txConsumer this can be called multiple times, if the optimistic transaction failed
+	 */
+	public <R> R wrapWithTransactionIfNeeded(@Nullable REntry<Transaction> tx, boolean needTransaction,
+			ExFunction<@Nullable REntry<Transaction>, R> txConsumer) throws Exception {
+		if (needTransaction) {
+			return ensureWrapWithTransaction(tx, txConsumer);
+		} else {
+			return txConsumer.apply(tx);
+		}
+	}
+
+
+	/**
+	 * @param txConsumer this can be called multiple times, if the optimistic transaction failed
+	 */
+	public <R> R ensureWrapWithTransaction(@Nullable REntry<Transaction> tx,
+			ExFunction<@NotNull REntry<Transaction>, R> txConsumer) throws Exception {
+		R result;
+		if (tx == null) {
+			// Retry using a transaction: transactions are required to handle this kind of data
+			var newTx = this.openTransactionInternal(Long.MAX_VALUE);
+			try {
+				boolean committed;
+				do {
+					result = txConsumer.apply(newTx);
+					committed = this.closeTransaction(newTx, true);
+				} while (!committed);
+			} finally {
+				this.closeTransaction(newTx, false);
+			}
+		} else {
+			result = txConsumer.apply(tx);
+		}
+		return result;
+	}
+
 	private <U> U put(Arena arena,
-			@Nullable REntry<Transaction> tx,
+			@Nullable REntry<Transaction> optionalTx,
 			ColumnInstance col,
 			@NotNull MemorySegment @NotNull[] keys,
 			@NotNull MemorySegment value,
@@ -323,70 +363,74 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		// Check for null value
 		col.checkNullableValue(value);
 		try {
-			MemorySegment previousValue;
-			MemorySegment calculatedKey = col.calculateKey(arena, keys);
-			if (col.hasBuckets()) {
-				if (tx != null) {
+			boolean needsTx = col.hasBuckets()
+					|| Callback.requiresGettingPreviousValue(callback)
+					|| Callback.requiresGettingPreviousPresence(callback);
+			return wrapWithTransactionIfNeeded(optionalTx, needsTx, tx -> {
+				MemorySegment previousValue;
+				MemorySegment calculatedKey = col.calculateKey(arena, keys);
+				if (col.hasBuckets()) {
+					assert tx != null;
 					var bucketElementKeys = col.getBucketElementKeys(keys);
 					try (var readOptions = new ReadOptions()) {
 						var previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 						MemorySegment previousRawBucket = toMemorySegment(arena, previousRawBucketByteArray);
-						var bucket = new Bucket(col, previousRawBucket);
-						previousValue = bucket.addElement(bucketElementKeys, value);
-						tx.val().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(bucket.toSegment(arena)));
+						var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
+						previousValue = transformResultValue(col, bucket.addElement(bucketElementKeys, value));
+								tx.val().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(bucket.toSegment(arena)));
 					} catch (RocksDBException e) {
 						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_1, e);
 					}
 				} else {
-					// Retry using a transaction: transactions are required to handle this kind of data
-					var newTx = this.openTransactionInternal(Long.MAX_VALUE);
-					try {
-						boolean committed;
-						do {
-							previousValue = put(arena, newTx, col, keys, value, Callback.previous());
-							committed = this.closeTransaction(newTx, true);
-						} while (!committed);
-					} finally {
-						this.closeTransaction(newTx, false);
-					}
-				}
-			} else {
-				if (Callback.requiresGettingPreviousValue(callback)) {
-					try (var readOptions = new ReadOptions()) {
-						byte[] previousValueByteArray;
-						if (tx != null) {
-							previousValueByteArray = tx.val().get(col.cfh(), readOptions, calculatedKey.toArray(BIG_ENDIAN_BYTES));
-						} else {
-							previousValueByteArray = db.get().get(col.cfh(), readOptions, calculatedKey.toArray(BIG_ENDIAN_BYTES));
+					if (Callback.requiresGettingPreviousValue(callback)) {
+						assert tx != null;
+						try (var readOptions = new ReadOptions()) {
+							byte[] previousValueByteArray;
+							previousValueByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+							previousValue = transformResultValue(col, toMemorySegment(arena, previousValueByteArray));
+						} catch (RocksDBException e) {
+							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
 						}
-						previousValue = toMemorySegment(arena, previousValueByteArray);
-					} catch (RocksDBException e) {
-						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
+					} else if (Callback.requiresGettingPreviousPresence(callback)) {
+						// todo: in the future this should be replaced with just keyExists
+						assert tx != null;
+						try (var readOptions = new ReadOptions()) {
+							byte[] previousValueByteArray;
+							previousValueByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+							previousValue = previousValueByteArray != null ? MemorySegment.NULL : null;
+						} catch (RocksDBException e) {
+							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
+						}
+					} else {
+						previousValue = null;
 					}
-				} else {
-					previousValue = null;
-				}
-				if (tx != null) {
-					tx.val().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
-				} else {
-					try (var w = new WriteOptions()) {
-						var keyBB = calculatedKey.asByteBuffer();
-						ByteBuffer valueBB = (col.schema().hasValue() ? value : Utils.dummyEmptyValue()).asByteBuffer();
-						db.get().put(col.cfh(), w, keyBB, valueBB);
+					if (tx != null) {
+						tx.val().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
+					} else {
+						try (var w = new WriteOptions()) {
+							var keyBB = calculatedKey.asByteBuffer();
+							ByteBuffer valueBB = (col.schema().hasValue() ? value : Utils.dummyEmptyValue()).asByteBuffer();
+							db.get().put(col.cfh(), w, keyBB, valueBB);
+						}
 					}
 				}
-			}
-			return Callback.safeCast(switch (callback) {
-				case Callback.CallbackVoid<?> ignored -> null;
-				case Callback.CallbackPrevious<?> ignored -> previousValue;
-				case Callback.CallbackChanged<?> ignored -> Utils.valueEquals(previousValue, value);
-				case Callback.CallbackDelta<?> ignored -> new Delta<>(previousValue, value);
+				return Callback.safeCast(switch (callback) {
+					case Callback.CallbackVoid<?> ignored -> null;
+					case Callback.CallbackPrevious<?> ignored -> previousValue;
+					case Callback.CallbackPreviousPresence<?> ignored -> previousValue != null;
+					case Callback.CallbackChanged<?> ignored -> !Utils.valueEquals(previousValue, value);
+					case Callback.CallbackDelta<?> ignored -> new Delta<>(previousValue, value);
+				});
 			});
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		}
+	}
+
+	private MemorySegment transformResultValue(ColumnInstance col, MemorySegment realPreviousValue) {
+		return col.schema().hasValue() ? realPreviousValue : (realPreviousValue != null ? MemorySegment.NULL : null);
 	}
 
 	@Override
@@ -399,6 +443,11 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		try {
 			// Column id
 			var col = getColumn(columnId);
+
+			if (!col.schema().hasValue() && Callback.requiresGettingCurrentValue(callback)) {
+				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
+						"The specified callback requires a return value, but this column does not have values!");
+			}
 
 			MemorySegment foundValue;
 			boolean existsValue;
@@ -438,7 +487,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					//noinspection ConstantValue
 					assert tx == null;
 					foundValue = null;
-					existsValue = db.get().keyExists(calculatedKey.asByteBuffer());
+					existsValue = db.get().keyExists(col.cfh(), calculatedKey.asByteBuffer());
 				} else {
 					foundValue = null;
 					existsValue = false;

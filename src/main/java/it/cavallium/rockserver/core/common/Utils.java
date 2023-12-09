@@ -17,9 +17,12 @@ import java.util.List;
 import java.util.function.Function;
 import java.util.stream.Stream;
 
+import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 public class Utils {
+
 	@SuppressWarnings("resource")
 	private static final MemorySegment DUMMY_EMPTY_VALUE = Arena
 			.global()
@@ -62,24 +65,26 @@ public class Utils {
 		}
 	}
 
-	@NotNull
+	@Contract(value = "!null -> !null; null -> null", pure = true)
 	public static MemorySegment toMemorySegment(byte... array) {
 		if (array != null) {
 			return MemorySegment.ofArray(array);
 		} else {
-			return MemorySegment.NULL;
+			return null;
 		}
 	}
 
-	public static MemorySegment toMemorySegment(Arena arena, byte... array) {
+	@Contract("null, !null -> fail; _, null -> null")
+	public static @Nullable MemorySegment toMemorySegment(Arena arena, byte... array) {
 		if (array != null) {
+			assert arena != null;
 			return arena.allocateArray(ValueLayout.JAVA_BYTE, array);
 		} else {
-			return MemorySegment.NULL;
+			return null;
 		}
 	}
 
-	@NotNull
+	@Contract(value = "!null -> !null; null -> null", pure = true)
 	public static MemorySegment toMemorySegmentSimple(int... array) {
 		if (array != null) {
 			var newArray = new byte[array.length];
@@ -88,26 +93,27 @@ public class Utils {
 			}
 			return MemorySegment.ofArray(newArray);
 		} else {
-			return MemorySegment.NULL;
+			return null;
 		}
 	}
 
-	@NotNull
+	@Contract("null, !null -> fail; _, null -> null")
 	public static MemorySegment toMemorySegmentSimple(Arena arena, int... array) {
 		if (array != null) {
+			assert arena != null;
 			var newArray = new byte[array.length];
 			for (int i = 0; i < array.length; i++) {
 				newArray[i] = (byte) array[i];
 			}
 			return arena.allocateArray(ValueLayout.JAVA_BYTE, newArray);
 		} else {
-			return MemorySegment.NULL;
+			return null;
 		}
 	}
 
-    public static byte[] toByteArray(MemorySegment memorySegment) {
-        return memorySegment.toArray(BIG_ENDIAN_BYTES);
-    }
+	public static byte @NotNull[] toByteArray(@NotNull MemorySegment memorySegment) {
+		return memorySegment.toArray(BIG_ENDIAN_BYTES);
+	}
 
 	public static <T, U> List<U> mapList(Collection<T> input, Function<T, U> mapper) {
 		var result = new ArrayList<U>(input.size());
@@ -132,6 +138,7 @@ public class Utils {
 	public static boolean valueEquals(MemorySegment previousValue, MemorySegment currentValue) {
 		previousValue = requireNonNullElse(previousValue, NULL);
 		currentValue = requireNonNullElse(currentValue, NULL);
-		return MemorySegment.mismatch(previousValue, 0, previousValue.byteSize(), currentValue, 0, currentValue.byteSize()) == -1;
+		return MemorySegment.mismatch(previousValue, 0, previousValue.byteSize(), currentValue, 0, currentValue.byteSize())
+				== -1;
 	}
 }

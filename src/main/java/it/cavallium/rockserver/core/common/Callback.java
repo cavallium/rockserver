@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.common;
 
+import it.cavallium.rockserver.core.common.Callback.CallbackPreviousPresence;
 import java.util.List;
 import org.jetbrains.annotations.Nullable;
 
@@ -9,6 +10,10 @@ public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
 		return callback instanceof CallbackPrevious<?>
 				|| callback instanceof CallbackDelta<?>
 				|| callback instanceof CallbackChanged;
+	}
+
+	static boolean requiresGettingPreviousPresence(PutCallback<?, ?> callback) {
+		return callback instanceof Callback.CallbackPreviousPresence<?>;
 	}
 
 	static boolean requiresGettingCurrentValue(GetCallback<?, ?> callback) {
@@ -48,6 +53,11 @@ public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
 	@SuppressWarnings("unchecked")
 	static <T> CallbackChanged<T> changed() {
 		return (CallbackChanged<T>) CallbackChanged.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> CallbackPreviousPresence<T> previousPresence() {
+		return (CallbackPreviousPresence<T>) CallbackPreviousPresence.INSTANCE;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -96,5 +106,10 @@ public sealed interface Callback<METHOD_DATA_TYPE, RESULT_TYPE> {
 	record CallbackChanged<T>() implements PutCallback<T, Boolean>, PatchCallback<T, Boolean> {
 
 		private static final CallbackChanged<Object> INSTANCE = new CallbackChanged<>();
+	}
+
+	record CallbackPreviousPresence<T>() implements PutCallback<T, Boolean>, PatchCallback<T, Boolean> {
+
+		private static final CallbackPreviousPresence<Object> INSTANCE = new CallbackPreviousPresence<>();
 	}
 }
