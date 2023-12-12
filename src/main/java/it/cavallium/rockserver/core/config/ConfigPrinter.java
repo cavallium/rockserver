@@ -42,15 +42,7 @@ public class ConfigPrinter {
 	}
 
 	public static List<VolumeConfig> getVolumeConfigs(GlobalDatabaseConfig g) throws GestaltException {
-		try {
-			return List.of(g.volumes());
-		} catch (GestaltException ex) {
-			if (ex.getMessage().startsWith("Failed to get cached object from proxy config while calling method:")) {
-				return List.of();
-			} else {
-				throw ex;
-			}
-		}
+		return List.of(g.volumes());
 	}
 
 	public static String stringifyGlobalDatabase(GlobalDatabaseConfig o) throws GestaltException {

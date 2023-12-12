@@ -12,7 +12,7 @@
     <maven.compiler.source>21</maven.compiler.source>
     <maven.compiler.target>21</maven.compiler.target>
     <native.maven.plugin.version>0.9.28</native.maven.plugin.version>
-    <gestalt.version>0.24.1</gestalt.version>
+    <gestalt.version>0.24.2</gestalt.version>
     <rocksdb.version>8.8.1</rocksdb.version>
     <imageName>rockserver-core</imageName>
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>

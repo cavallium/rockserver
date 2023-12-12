@@ -22,7 +22,6 @@ public class ConfigParser {
 		gsb = new GestaltBuilder();
 			gsb
 					.setTreatMissingArrayIndexAsError(false)
-					.setTreatEmptyCollectionAsErrors(false)
 					.setTreatNullValuesInClassAsErrors(false)
 					.setTreatMissingValuesAsErrors(false)
 					.addDecoder(new DataSizeDecoder())
