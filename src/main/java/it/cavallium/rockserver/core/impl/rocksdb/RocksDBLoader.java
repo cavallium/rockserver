@@ -2,10 +2,14 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
+import java.io.File;
+import java.io.InputStream;
+import java.nio.file.StandardCopyOption;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.*;
+import org.rocksdb.util.Environment;
 import org.rocksdb.util.SizeUnit;
 
 import java.io.IOException;
@@ -17,6 +21,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import static it.cavallium.rockserver.core.common.Utils.mapList;
+import static it.cavallium.rockserver.core.common.Utils.toMemorySegmentSimple;
 import static java.lang.Boolean.parseBoolean;
 import static java.util.Objects.requireNonNull;
 import static org.rocksdb.ColumnFamilyOptionsInterface.DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET;
@@ -30,20 +35,52 @@ public class RocksDBLoader {
     private static final boolean USE_CLOCK_CACHE
             = Boolean.parseBoolean(System.getProperty("it.cavallium.dbengine.clockcache.enable", "false"));
     private static final CacheFactory CACHE_FACTORY = USE_CLOCK_CACHE ? new ClockCacheFactory() : new LRUCacheFactory();
+    private static final String bugJniLibraryFileName = Environment.getJniLibraryFileName("rocksdbjni");
+    private static final String jniLibraryFileName = Environment.getJniLibraryFileName("rocksdb");
+    @Nullable
+    private static final String fallbackJniLibraryFileName = Environment.getFallbackJniLibraryFileName("rocksdb");
+    @Nullable
+    private static final String bugFallbackJniLibraryFileName = Environment.getFallbackJniLibraryFileName("rocksdbjni");
 
     public static void loadLibrary() {
-        RocksDB.loadLibrary();
-        /* todo: rocksdb does not support loading the library outside of the default mechanism
         try {
             var jniPath = Path.of(".").resolve("jni").resolve(RocksDBMetadata.getRocksDBVersionHash());
             if (Files.notExists(jniPath)) {
                 Files.createDirectories(jniPath);
             }
-            // todo:
+            loadLibraryFromJarToTemp(jniPath);
+
+            RocksDB.loadLibrary(List.of(jniPath.toAbsolutePath().toString()));
         } catch (IOException e) {
             RocksDB.loadLibrary();
         }
-         */
+    }
+
+    private static Path loadLibraryFromJarToTemp(final Path tmpDir) throws IOException {
+        var temp1 = tmpDir.resolve(bugJniLibraryFileName);
+        if (Files.exists(temp1)) {
+            return temp1;
+        }
+        try (InputStream is = RocksDB.class.getClassLoader().getResourceAsStream(jniLibraryFileName)) {
+            if (is != null) {
+                Files.copy(is, temp1, StandardCopyOption.REPLACE_EXISTING);
+                return temp1;
+            }
+        }
+
+        if (bugFallbackJniLibraryFileName == null) {
+            throw new RuntimeException("rocksdb was not found inside JAR.");
+        }
+
+        var temp2 = tmpDir.resolve(bugFallbackJniLibraryFileName);
+        try (InputStream is = RocksDB.class.getClassLoader().getResourceAsStream(fallbackJniLibraryFileName)) {
+            if (is != null) {
+                Files.copy(is, temp2, StandardCopyOption.REPLACE_EXISTING);
+                return temp2;
+            }
+        }
+
+        throw new RuntimeException("rocksdb was not found inside JAR.");
     }
 
 
