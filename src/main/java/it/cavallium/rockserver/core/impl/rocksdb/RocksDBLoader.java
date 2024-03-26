@@ -21,7 +21,6 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import static it.cavallium.rockserver.core.common.Utils.mapList;
-import static it.cavallium.rockserver.core.common.Utils.toMemorySegmentSimple;
 import static java.lang.Boolean.parseBoolean;
 import static java.util.Objects.requireNonNull;
 import static org.rocksdb.ColumnFamilyOptionsInterface.DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET;
@@ -44,7 +43,8 @@ public class RocksDBLoader {
 
     public static void loadLibrary() {
         try {
-            var jniPath = Path.of(".").resolve("jni").resolve(RocksDBMetadata.getRocksDBVersionHash());
+            String currentUsersHomeDir = System.getProperty("user.home");
+            var jniPath = Path.of(currentUsersHomeDir).resolve(".jni").resolve("rocksdb").resolve(RocksDBMetadata.getRocksDBVersionHash());
             if (Files.notExists(jniPath)) {
                 Files.createDirectories(jniPath);
             }
@@ -574,7 +574,7 @@ public class RocksDBLoader {
         }
     }
 
-    record DbPathRecord(Path path, long targetSize) {}
+    public record DbPathRecord(Path path, long targetSize) {}
 
     public static boolean isDisableAutoCompactions() {
         return parseBoolean(System.getProperty("it.cavallium.dbengine.compactions.auto.disable", "false"));
