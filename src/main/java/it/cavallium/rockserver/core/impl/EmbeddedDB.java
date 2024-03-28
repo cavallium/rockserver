@@ -5,15 +5,12 @@ import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_BYTES;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
-import it.cavallium.rockserver.core.common.Callback;
-import it.cavallium.rockserver.core.common.Callback.CallbackExists;
-import it.cavallium.rockserver.core.common.Callback.CallbackForUpdate;
-import it.cavallium.rockserver.core.common.Callback.GetCallback;
-import it.cavallium.rockserver.core.common.Callback.IteratorCallback;
-import it.cavallium.rockserver.core.common.Callback.PutCallback;
+import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RequestType.RequestGet;
+import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Delta;
-import it.cavallium.rockserver.core.common.RocksDBAPI;
+import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.UpdateContext;
@@ -51,10 +48,9 @@ import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.Status.Code;
-import org.rocksdb.Transaction;
 import org.rocksdb.WriteOptions;
 
-public class EmbeddedDB implements RocksDBAPI, Closeable {
+public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 
 	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
@@ -308,7 +304,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 			long columnId,
 			@NotNull MemorySegment @NotNull [] keys,
 			@NotNull MemorySegment value,
-			PutCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestPut<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {
 			// Column id
@@ -320,7 +316,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 				tx = null;
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-			return put(arena, tx, col, updateId, keys, value, callback);
+			return put(arena, tx, col, updateId, keys, value, requestType);
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -376,12 +372,12 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 			long updateId,
 			@NotNull MemorySegment @NotNull[] keys,
 			@NotNull MemorySegment value,
-			PutCallback<? super MemorySegment, U> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestPut<? super MemorySegment, U> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		// Check for null value
 		col.checkNullableValue(value);
 		try {
-			boolean requirePreviousValue = Callback.requiresGettingPreviousValue(callback);
-			boolean requirePreviousPresence = Callback.requiresGettingPreviousPresence(callback);
+			boolean requirePreviousValue = RequestType.requiresGettingPreviousValue(callback);
+			boolean requirePreviousPresence = RequestType.requiresGettingPreviousPresence(callback);
 			boolean needsTx = col.hasBuckets()
 					|| requirePreviousValue
 					|| requirePreviousPresence;
@@ -413,7 +409,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_1, e);
 					}
 				} else {
-					if (Callback.requiresGettingPreviousValue(callback)) {
+					if (RequestType.requiresGettingPreviousValue(callback)) {
 						assert tx != null;
 						try (var readOptions = new ReadOptions()) {
 							byte[] previousValueByteArray;
@@ -422,7 +418,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 						} catch (RocksDBException e) {
 							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
 						}
-					} else if (Callback.requiresGettingPreviousPresence(callback)) {
+					} else if (RequestType.requiresGettingPreviousPresence(callback)) {
 						// todo: in the future this should be replaced with just keyExists
 						assert tx != null;
 						try (var readOptions = new ReadOptions()) {
@@ -445,12 +441,12 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 						}
 					}
 				}
-				U result = Callback.safeCast(switch (callback) {
-					case Callback.CallbackVoid<?> ignored -> null;
-					case Callback.CallbackPrevious<?> ignored -> previousValue;
-					case Callback.CallbackPreviousPresence<?> ignored -> previousValue != null;
-					case Callback.CallbackChanged<?> ignored -> !Utils.valueEquals(previousValue, value);
-					case Callback.CallbackDelta<?> ignored -> new Delta<>(previousValue, value);
+				U result = RequestType.safeCast(switch (callback) {
+					case RequestType.RequestNothing<?> ignored -> null;
+					case RequestType.RequestPrevious<?> ignored -> previousValue;
+					case RequestType.RequestPreviousPresence<?> ignored -> previousValue != null;
+					case RequestType.RequestChanged<?> ignored -> !Utils.valueEquals(previousValue, value);
+					case RequestType.RequestDelta<?> ignored -> new Delta<>(previousValue, value);
 				});
 
 				if (updateId != 0L) {
@@ -484,12 +480,12 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 			long transactionOrUpdateId,
 			long columnId,
 			MemorySegment @NotNull [] keys,
-			GetCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestGet<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		// Column id
 		var col = getColumn(columnId);
 		Tx tx = transactionOrUpdateId != 0 ? getTransaction(transactionOrUpdateId, true) : null;
 		long updateId;
-		if (callback instanceof Callback.CallbackForUpdate<?>) {
+		if (requestType instanceof RequestType.RequestForUpdate<?>) {
 			if (tx == null) {
 				tx = openTransactionInternal(MAX_TRANSACTION_DURATION_MS, true);
 				updateId = allocateTransactionInternal(tx);
@@ -501,7 +497,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 		}
 
 		try {
-			return get(arena, tx, updateId, col, keys, callback);
+			return get(arena, tx, updateId, col, keys, requestType);
 		} catch (Throwable ex) {
 			if (updateId != 0 && tx.isFromGetForUpdate()) {
 				closeTransaction(updateId, false);
@@ -515,10 +511,10 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 			long updateId,
 			ColumnInstance col,
 			MemorySegment @NotNull [] keys,
-			GetCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestGet<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {
-			if (!col.schema().hasValue() && Callback.requiresGettingCurrentValue(callback)) {
+			if (!col.schema().hasValue() && RequestType.requiresGettingCurrentValue(callback)) {
 				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
 						"The specified callback requires a return value, but this column does not have values!");
 			}
@@ -541,8 +537,8 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.GET_1, e);
 				}
 			} else {
-				boolean shouldGetCurrent = Callback.requiresGettingCurrentValue(callback)
-						|| (tx != null && callback instanceof Callback.CallbackExists<?>);
+				boolean shouldGetCurrent = RequestType.requiresGettingCurrentValue(callback)
+						|| (tx != null && callback instanceof RequestType.RequestExists<?>);
 				if (shouldGetCurrent) {
 					try (var readOptions = new ReadOptions()) {
 						foundValue = dbGet(tx, col, arena, readOptions, calculatedKey);
@@ -550,7 +546,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					} catch (RocksDBException e) {
 						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
 					}
-				} else if (callback instanceof Callback.CallbackExists<?>) {
+				} else if (callback instanceof RequestType.RequestExists<?>) {
 					// tx is always null here
 					//noinspection ConstantValue
 					assert tx == null;
@@ -561,14 +557,14 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 					existsValue = false;
 				}
 			}
-			return Callback.safeCast(switch (callback) {
-				case Callback.CallbackVoid<?> ignored -> null;
-				case Callback.CallbackCurrent<?> ignored -> foundValue;
-				case Callback.CallbackForUpdate<?> ignored -> {
+			return RequestType.safeCast(switch (callback) {
+				case RequestType.RequestNothing<?> ignored -> null;
+				case RequestType.RequestCurrent<?> ignored -> foundValue;
+				case RequestType.RequestForUpdate<?> ignored -> {
 					assert updateId != 0;
 					yield new UpdateContext<>(foundValue, updateId);
 				}
-				case Callback.CallbackExists<?> ignored -> existsValue;
+				case RequestType.RequestExists<?> ignored -> existsValue;
 			});
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
@@ -634,7 +630,7 @@ public class EmbeddedDB implements RocksDBAPI, Closeable {
 			long iterationId,
 			long skipCount,
 			long takeCount,
-			@NotNull IteratorCallback<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {
 			throw new UnsupportedOperationException();

@@ -1,10 +1,11 @@
 package it.cavallium.rockserver.core.client;
 
-import it.cavallium.rockserver.core.common.RocksDBAPI;
+import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
+import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import java.io.Closeable;
 import java.net.URI;
 
-public interface RocksDBConnection extends Closeable, RocksDBAPI {
+public interface RocksDBConnection extends Closeable {
 
 	/**
 	 * Get connection url
@@ -12,4 +13,8 @@ public interface RocksDBConnection extends Closeable, RocksDBAPI {
 	 * @return connection url
 	 */
 	URI getUrl();
+
+	RocksDBSyncAPI getSyncApi();
+
+	RocksDBAsyncAPI getAsyncApi();
 }

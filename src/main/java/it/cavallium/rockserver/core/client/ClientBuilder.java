@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.client;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.UnixDomainSocketAddress;
 import java.nio.file.Path;
@@ -37,15 +38,15 @@ public class ClientBuilder {
 		this.embeddedConfig = embeddedConfig;
 	}
 
-	public RocksDBConnection build() {
+	public RocksDBConnection build() throws IOException {
 		if (embeddedInMemory) {
 			return new EmbeddedConnection(null, name, embeddedConfig);
 		} else if (embeddedPath != null) {
 			return new EmbeddedConnection(embeddedPath, name, embeddedConfig);
 		} else if (unixAddress != null) {
-			return new SocketConnectionUnix(unixAddress, name);
+			throw new UnsupportedOperationException("Not implemented: unix socket");
 		} else if (iNetAddress != null) {
-			return new SocketConnectionInet(iNetAddress, name);
+			throw new UnsupportedOperationException("Not implemented: inet address");
 		} else {
 			throw new UnsupportedOperationException("Please set a connection type");
 		}

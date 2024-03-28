@@ -9,7 +9,7 @@ import org.github.gestalt.config.entity.ValidationError;
 import org.github.gestalt.config.node.ConfigNode;
 import org.github.gestalt.config.reflect.TypeCapture;
 import org.github.gestalt.config.tag.Tags;
-import org.github.gestalt.config.utils.ValidateOf;
+import org.github.gestalt.config.utils.GResultOf;
 import org.rocksdb.CompressionType;
 
 public class DbCompressionDecoder implements Decoder<CompressionType> {
@@ -30,15 +30,19 @@ public class DbCompressionDecoder implements Decoder<CompressionType> {
 	}
 
 	@Override
-	public ValidateOf<CompressionType> decode(String path,
+	public GResultOf<CompressionType> decode(String path,
 			Tags tags,
 			ConfigNode node,
 			TypeCapture<?> type,
 			DecoderContext decoderContext) {
 		try {
-			return ValidateOf.validateOf(DatabaseCompression.valueOf(node.getValue().orElseThrow()).compressionType(), List.of());
+			return GResultOf.resultOf(DatabaseCompression.valueOf(node.getValue().orElseThrow()).compressionType(), List.of());
 		} catch (Exception ex) {
-			return ValidateOf.inValid(new ValidationError.DecodingNumberFormatException(path, node, name()));
+			return GResultOf.errors(new ValidationError.DecodingNumberFormatException(path,
+					node,
+					name(),
+					decoderContext.getSecretConcealer()
+			));
 		}
 	}
 }

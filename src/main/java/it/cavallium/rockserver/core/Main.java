@@ -27,10 +27,14 @@ public class Main {
 		ArgumentParser parser = ArgumentParsers.newFor("rockserver-core").build()
 				.defaultHelp(true)
 				.description("RocksDB server core");
-		parser.addArgument("-u", "--url")
+		parser.addArgument("-u", "--database-url")
 				.type(String.class)
 				.setDefault(PRIVATE_MEMORY_URL.toString())
 				.help("Specify database rocksdb://hostname:port, or unix://<path>, or file://<path>");
+		parser.addArgument("-l", "--listen-url")
+				.type(String.class)
+				.setDefault("http://127.0.0.1:5332")
+				.help("Specify database http://hostname:port, or unix://<path>, or file://<path>");
 		parser.addArgument("-n", "--name")
 				.type(String.class)
 				.setDefault("main")
@@ -50,6 +54,7 @@ public class Main {
 			System.exit(1);
 		}
 		var clientBuilder = new it.cavallium.rockserver.core.client.ClientBuilder();
+		var serverBuilder = new it.cavallium.rockserver.core.server.ServerBuilder();
 
 		if (ns.getBoolean("print_default_config")) {
 			requireNonNull(Main.class.getClassLoader()
@@ -62,14 +67,16 @@ public class Main {
 		LOG.info("Starting...");
 		RocksDBLoader.loadLibrary();
 
-		var rawUrl = ns.getString("url");
+		var rawDatabaseUrl = ns.getString("database_url");
+		var rawListenUrl = ns.getString("listen_url");
 		var name = ns.getString("name");
 		var config = ns.getString("config");
 
-		var url = new URI(rawUrl);
+		var databaseUrl = new URI(rawDatabaseUrl);
+		var listenUrl = new URI(rawListenUrl);
 
 		if (config != null) {
-			if (!url.getScheme().equals("file")) {
+			if (!databaseUrl.getScheme().equals("file")) {
 				System.err.println("Do not set --config if the database is not local!");
 				System.exit(1);
 				return;
@@ -78,20 +85,36 @@ public class Main {
 			}
 		}
 
-		switch (url.getScheme()) {
-			case "unix" -> clientBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(url.getPath())));
-			case "file" -> clientBuilder.setEmbeddedPath(Path.of((url.getAuthority() != null ? url.getAuthority() : "") + url.getPath()).normalize());
+		switch (databaseUrl.getScheme()) {
+			case "unix" -> clientBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(databaseUrl.getPath())));
+			case "file" -> clientBuilder.setEmbeddedPath(Path.of((databaseUrl.getAuthority() != null ? databaseUrl.getAuthority() : "") + databaseUrl.getPath()).normalize());
 			case "memory" -> clientBuilder.setEmbeddedInMemory(true);
-			case "rocksdb" -> clientBuilder.setAddress(new HostName(url.getHost()).asInetSocketAddress());
-			default -> throw new IllegalArgumentException("Invalid scheme: " + url.getScheme());
+			case "rocksdb" -> clientBuilder.setAddress(new HostName(databaseUrl.getHost()).asInetSocketAddress());
+			default -> throw new IllegalArgumentException("Invalid scheme: " + databaseUrl.getScheme());
+		}
+
+		switch (listenUrl.getScheme()) {
+			case "unix" -> serverBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(listenUrl.getPath())));
+			case "http" -> serverBuilder.setHttpAddress(listenUrl.getHost(), listenUrl.getPort());
+			case "rocksdb" -> serverBuilder.setAddress(new HostName(listenUrl.getHost()).asInetSocketAddress());
+			default -> throw new IllegalArgumentException("Invalid scheme: " + listenUrl.getScheme());
 		}
 
 		clientBuilder.setName(name);
 		try (var connection = clientBuilder.build()) {
 			LOG.log(Level.INFO, "Connected to {0}", connection);
+
+			serverBuilder.setClient(connection);
+
 			CountDownLatch shutdownLatch = new CountDownLatch(1);
 			Runtime.getRuntime().addShutdownHook(new Thread(shutdownLatch::countDown));
-			LOG.info("Shutting down...");
+
+			try (var server = serverBuilder.build()) {
+				shutdownLatch.await();
+				LOG.info("Shutting down...");
+			}
+		} catch (InterruptedException e) {
+			throw new RuntimeException("Interrupted", e);
 		}
 		LOG.info("Shut down successfully");
 	}

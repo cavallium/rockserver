@@ -9,14 +9,40 @@
   <version>1.0.0-SNAPSHOT</version>
 
   <properties>
-    <maven.compiler.source>21</maven.compiler.source>
-    <maven.compiler.target>21</maven.compiler.target>
+    <maven.compiler.source>22</maven.compiler.source>
+    <maven.compiler.target>22</maven.compiler.target>
     <native.maven.plugin.version>0.9.28</native.maven.plugin.version>
     <gestalt.version>0.25.3</gestalt.version>
     <rocksdb.version>9.0.0</rocksdb.version>
     <imageName>rockserver-core</imageName>
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
   </properties>
+
+  <repositories>
+    <repository>
+      <id>sonatype-snapshot</id>
+      <name>Sonatype OSS Snapshots</name>
+      <releases>
+        <enabled>false</enabled>
+      </releases>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
+      <url>https://oss.sonatype.org/content/repositories/snapshots</url>
+    </repository>
+  </repositories>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>io.netty</groupId>
+        <artifactId>netty5-bom</artifactId>
+        <version>5.0.0.Alpha6-SNAPSHOT</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <dependencies>
     <dependency>
@@ -31,8 +57,8 @@
     </dependency>
     <dependency>
       <groupId>it.unimi.dsi</groupId>
-      <artifactId>fastutil-core</artifactId>
-      <version>8.5.12</version>
+      <artifactId>fastutil</artifactId>
+      <version>8.5.13</version>
     </dependency>
     <dependency>
       <groupId>com.github.seancfoley</groupId>
@@ -59,6 +85,27 @@
       <groupId>com.github.gestalt-config</groupId>
       <artifactId>gestalt-hocon</artifactId>
       <version>${gestalt.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty5-buffer</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty5-codec-http2</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty5-transport-native-io_uring</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty5-transport-classes-io_uring</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.thrift</groupId>
+      <artifactId>libthrift</artifactId>
+      <version>0.20.0</version>
     </dependency>
 
     <dependency>
@@ -99,9 +146,6 @@
             </goals>
             <configuration>
               <mainClass>it.cavallium.rockserver.core.Main</mainClass>
-              <arguments>
-                <argument>--enable-preview</argument>
-              </arguments>
             </configuration>
           </execution>
         </executions>
@@ -113,23 +157,13 @@
         <configuration>
           <source>${maven.compiler.source}</source>
           <target>${maven.compiler.source}</target>
-          <enablePreview>true</enablePreview>
-          <compilerArgs>
-            <arg>--enable-preview</arg>
-          </compilerArgs>
         </configuration>
       </plugin>
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
-        <configuration>
-          <argLine>--enable-preview</argLine>
-        </configuration>
       </plugin>
       <plugin>
         <artifactId>maven-failsafe-plugin</artifactId>
-        <configuration>
-          <argLine>--enable-preview</argLine>
-        </configuration>
       </plugin>
 
       <plugin>
@@ -209,7 +243,6 @@
                 <buildArg>-march=native</buildArg>
                 <buildArg>-H:IncludeResourceBundles=net.sourceforge.argparse4j.internal.ArgumentParserImpl</buildArg>
                 <buildArg>-O1</buildArg>
-                <buildArg>--enable-preview</buildArg>
                 <buildArg>-H:+StaticExecutableWithDynamicLibC</buildArg>
                 <buildArg>-H:+JNI</buildArg>
                 <buildArg>-H:IncludeResources=librocksdbjni-linux64.so</buildArg>
@@ -235,7 +268,6 @@
                   <executable>java</executable>
                   <workingDirectory>${project.build.directory}</workingDirectory>
                   <arguments>
-                    <argument>--enable-preview</argument>
                     <argument>-classpath</argument>
                     <classpath/>
                     <argument>${mainClass}</argument>

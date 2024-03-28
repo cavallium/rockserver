@@ -7,7 +7,18 @@ module rockserver.core {
 	requires high.scale.lib;
 	requires org.github.gestalt.core;
 	requires org.github.gestalt.hocon;
-	requires it.unimi.dsi.fastutil.core;
+	requires it.unimi.dsi.fastutil;
+	requires io.netty5.buffer;
+	requires io.netty5.codec;
+	requires io.netty5.codec.http2;
+	requires io.netty5.common;
+	requires io.netty5.handler;
+	requires io.netty5.transport;
+	requires io.netty5.transport.classes.io_uring;
+	requires io.netty5.transport.io_uring;
+	requires io.netty5.transport.unix.common;
+	requires io.netty5.codec.http;
+	requires org.apache.thrift;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

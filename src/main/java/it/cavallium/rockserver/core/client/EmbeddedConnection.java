@@ -1,10 +1,14 @@
 package it.cavallium.rockserver.core.client;
 
-import it.cavallium.rockserver.core.common.Callback.GetCallback;
-import it.cavallium.rockserver.core.common.Callback.IteratorCallback;
-import it.cavallium.rockserver.core.common.Callback.PutCallback;
+import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RequestType.RequestGet;
+import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.RocksDBAPI;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand;
+import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -13,10 +17,11 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.Optional;
 
+import java.util.concurrent.CompletionStage;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-public class EmbeddedConnection extends BaseConnection {
+public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 
 	private final EmbeddedDB db;
 	public static final URI PRIVATE_MEMORY_URL = URI.create("memory://private");
@@ -35,6 +40,16 @@ public class EmbeddedConnection extends BaseConnection {
 	@Override
 	public URI getUrl() {
 		return Optional.ofNullable(db.getPath()).map(Path::toUri).orElse(PRIVATE_MEMORY_URL);
+	}
+
+	@Override
+	public RocksDBSyncAPI getSyncApi() {
+		return this;
+	}
+
+	@Override
+	public RocksDBAsyncAPI getAsyncApi() {
+		return this;
 	}
 
 	@Override
@@ -68,13 +83,23 @@ public class EmbeddedConnection extends BaseConnection {
 	}
 
 	@Override
+	public <R> R requestSync(RocksDBAPICommand<R> req) {
+		return req.handleSync(this);
+	}
+
+	@Override
+	public <R> CompletionStage<R> requestAsync(RocksDBAPICommand<R> req) {
+		return req.handleAsync(this);
+	}
+
+	@Override
 	public <T> T put(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
 			@NotNull MemorySegment @NotNull [] keys,
 			@NotNull MemorySegment value,
-			PutCallback<? super MemorySegment, T> callback) throws RocksDBException {
-		return db.put(arena, transactionOrUpdateId, columnId, keys, value, callback);
+			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
+		return db.put(arena, transactionOrUpdateId, columnId, keys, value, requestType);
 	}
 
 	@Override
@@ -82,8 +107,8 @@ public class EmbeddedConnection extends BaseConnection {
 			long transactionOrUpdateId,
 			long columnId,
 			MemorySegment @NotNull [] keys,
-			GetCallback<? super MemorySegment, T> callback) throws RocksDBException {
-		return db.get(arena, transactionOrUpdateId, columnId, keys, callback);
+			RequestGet<? super MemorySegment, T> requestType) throws RocksDBException {
+		return db.get(arena, transactionOrUpdateId, columnId, keys, requestType);
 	}
 
 	@Override
@@ -112,7 +137,7 @@ public class EmbeddedConnection extends BaseConnection {
 			long iterationId,
 			long skipCount,
 			long takeCount,
-			@NotNull IteratorCallback<? super MemorySegment, T> callback) throws RocksDBException {
-		return db.subsequent(arena, iterationId, skipCount, takeCount, callback);
+			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws RocksDBException {
+		return db.subsequent(arena, iterationId, skipCount, takeCount, requestType);
 	}
 }
