@@ -19,6 +19,7 @@ module rockserver.core {
 	requires io.netty5.transport.unix.common;
 	requires io.netty5.codec.http;
 	requires org.apache.thrift;
+	requires org.slf4j;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

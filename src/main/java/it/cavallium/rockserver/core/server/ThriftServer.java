@@ -29,11 +29,9 @@ import org.jetbrains.annotations.NotNull;
 
 public class ThriftServer extends Server {
 
-	private final AsyncIface handler;
-
 	public ThriftServer(RocksDBConnection client, String http2Host, int http2Port) throws IOException {
 		super(client);
-		this.handler = new RocksDB.AsyncIface() {
+		var handler = new RocksDB.AsyncIface() {
 			@Override
 			public void openTransaction(long timeoutMs, AsyncMethodCallback<Long> resultHandler) {
 				client.getAsyncApi().openTransactionAsync(timeoutMs).whenComplete(handleResult(resultHandler));
@@ -231,7 +229,6 @@ public class ThriftServer extends Server {
 		} catch (TTransportException e) {
 			throw new IOException("Can't open server socket", e);
 		}
-
 	}
 
 	private @NotNull MemorySegment [] keysToRecord(List<@NotNull ByteBuffer> keys) {

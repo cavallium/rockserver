@@ -649,7 +649,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			if (tx.isFromGetForUpdate()) {
 				previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 			} else {
-				previousRawBucketByteArray = tx.val().get(col.cfh(), readOptions, calculatedKey.toArray(BIG_ENDIAN_BYTES));
+				previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES));
 			}
 			return toMemorySegment(arena, previousRawBucketByteArray);
 		} else {
