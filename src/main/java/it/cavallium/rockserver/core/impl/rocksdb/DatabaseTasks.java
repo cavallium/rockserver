@@ -31,7 +31,7 @@ public class DatabaseTasks implements Closeable {
 					try {
 						//noinspection BusyWait
 						Thread.sleep(delayWalFlushConfig.toMillis());
-					} catch (InterruptedException _) {
+					} catch (InterruptedException ignored) {
 						return;
 					}
 					try {

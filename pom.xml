@@ -33,18 +33,6 @@
     </repository>
   </repositories>
 
-  <dependencyManagement>
-    <dependencies>
-      <dependency>
-        <groupId>io.netty</groupId>
-        <artifactId>netty5-bom</artifactId>
-        <version>5.0.0.Alpha6-SNAPSHOT</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
-    </dependencies>
-  </dependencyManagement>
-
   <dependencies>
     <dependency>
       <groupId>org.rocksdb</groupId>
@@ -86,22 +74,6 @@
       <groupId>com.github.gestalt-config</groupId>
       <artifactId>gestalt-hocon</artifactId>
       <version>${gestalt.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>io.netty</groupId>
-      <artifactId>netty5-buffer</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>io.netty</groupId>
-      <artifactId>netty5-codec-http2</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>io.netty</groupId>
-      <artifactId>netty5-transport-native-io_uring</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>io.netty</groupId>
-      <artifactId>netty5-transport-classes-io_uring</artifactId>
     </dependency>
     <dependency>
       <groupId>org.apache.thrift</groupId>
@@ -159,7 +131,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.11.0</version>
+        <version>3.12.1</version>
         <configuration>
           <source>${maven.compiler.source}</source>
           <target>${maven.compiler.source}</target>
@@ -215,6 +187,9 @@
   <profiles>
     <profile>
       <id>standalone</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
       <dependencies>
         <dependency>
           <groupId>org.slf4j</groupId>
