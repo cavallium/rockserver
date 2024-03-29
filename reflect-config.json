@@ -34,5 +34,11 @@
     "methods" : [
       { "name" : "<init>", "parameterTypes" : ["java.lang.String"] }
     ]
+  },
+  {
+    "name" : "java.lang.Path",
+    "methods" : [
+      { "name" : "<init>", "parameterTypes" : ["java.lang.String"] }
+    ]
   }
 ]
