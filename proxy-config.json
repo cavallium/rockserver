@@ -54,13 +54,5 @@
     "interfaces": [
       "it.cavallium.rockserver.core.config.VolumeConfig"
     ]
-  },
-  {
-    "condition": {
-      "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
-    },
-    "interfaces": [
-      "it.cavallium.rockserver.core.config.DatabaseLevel"
-    ]
   }
 ]
