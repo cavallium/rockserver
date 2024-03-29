@@ -17,7 +17,10 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.Optional;
 
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -25,10 +28,12 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 
 	private final EmbeddedDB db;
 	public static final URI PRIVATE_MEMORY_URL = URI.create("memory://private");
+	private final ExecutorService exeuctor;
 
 	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) {
 		super(name);
 		this.db = new EmbeddedDB(path, name, embeddedConfig);
+		this.exeuctor = Executors.newVirtualThreadPerTaskExecutor();
 	}
 
 	@Override
@@ -89,7 +94,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public <R> CompletionStage<R> requestAsync(RocksDBAPICommand<R> req) {
-		return req.handleAsync(this);
+		return CompletableFuture.supplyAsync(() -> req.handleSync(this), exeuctor);
 	}
 
 	@Override
