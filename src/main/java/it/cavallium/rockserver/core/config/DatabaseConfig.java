@@ -5,5 +5,4 @@ import org.github.gestalt.config.exceptions.GestaltException;
 public interface DatabaseConfig {
 
 	GlobalDatabaseConfig global() throws GestaltException;
-
 }

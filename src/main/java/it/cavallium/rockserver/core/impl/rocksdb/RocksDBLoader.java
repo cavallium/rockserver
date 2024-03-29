@@ -2,9 +2,9 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
-import java.io.File;
 import java.io.InputStream;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -145,9 +145,11 @@ public class RocksDBLoader {
             options.setSkipStatsUpdateOnDbOpen(true);
             options.setCreateMissingColumnFamilies(true);
             options.setInfoLogLevel(InfoLogLevel.WARN_LEVEL);
-            // todo: automatically flush every x seconds?
 
-            options.setManualWalFlush(true);
+            var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
+            if (delayWalFlushConfig.isPositive()) {
+                options.setManualWalFlush(true);
+            }
 
             options.setAvoidFlushDuringShutdown(false); // Flush all WALs during shutdown
             options.setAvoidFlushDuringRecovery(true); // Flush all WALs during startup
@@ -257,6 +259,10 @@ public class RocksDBLoader {
         }
     }
 
+    private static Duration getWalFlushDelayConfig(DatabaseConfig databaseOptions) throws GestaltException {
+        return Objects.requireNonNullElse(databaseOptions.global().delayWalFlushDuration(), Duration.ZERO);
+    }
+
     private static Optional<Path> getWalDir(Path definitiveDbPath, DatabaseConfig databaseOptions)
         throws GestaltException {
         return Optional.ofNullable(databaseOptions.global().walPath())
@@ -287,6 +293,7 @@ public class RocksDBLoader {
     private static TransactionalDB loadDb(@Nullable Path path,
         @NotNull Path definitiveDbPath,
         DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger) {
+        var inMemory = path == null;
         var rocksdbOptions = optionsWithCache.options();
         try {
             List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, databaseOptions);
@@ -566,7 +573,10 @@ public class RocksDBLoader {
             } catch (RocksDBException ex) {
                 logger.log(Level.FINE, "Failed to obtain stats", ex);
             }
-            return TransactionalDB.create(definitiveDbPath.toString(), db);
+
+            var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
+            var dbTasks = new DatabaseTasks(db, inMemory, delayWalFlushConfig);
+            return TransactionalDB.create(definitiveDbPath.toString(), db, dbTasks);
         } catch (IOException | RocksDBException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {

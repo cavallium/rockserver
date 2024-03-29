@@ -1,7 +1,10 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
+import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB.BaseTransactionalDB;
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import org.rocksdb.OptimisticTransactionDB;
 import org.rocksdb.OptimisticTransactionOptions;
 import org.rocksdb.RocksDB;
@@ -13,10 +16,10 @@ import org.rocksdb.WriteOptions;
 
 public sealed interface TransactionalDB extends Closeable {
 
-	static TransactionalDB create(String path, RocksDB db) {
+	static TransactionalDB create(String path, RocksDB db, DatabaseTasks databaseTasks) {
 		return switch (db) {
-			case OptimisticTransactionDB optimisticTransactionDB -> new OptimisticTransactionalDB(path, optimisticTransactionDB);
-			case TransactionDB transactionDB -> new PessimisticTransactionalDB(path, transactionDB);
+			case OptimisticTransactionDB optimisticTransactionDB -> new OptimisticTransactionalDB(path, optimisticTransactionDB, databaseTasks);
+			case TransactionDB transactionDB -> new PessimisticTransactionalDB(path, transactionDB, databaseTasks);
 			default -> throw new UnsupportedOperationException("This database is not transactional");
 		};
 	}
@@ -89,29 +92,65 @@ public sealed interface TransactionalDB extends Closeable {
 		void close();
 	}
 
-	final class PessimisticTransactionalDB implements TransactionalDB {
+	abstract sealed class BaseTransactionalDB<RDB extends RocksDB> implements TransactionalDB {
 
 		private final String path;
-		private final TransactionDB db;
+		protected final RDB db;
+		private final DatabaseTasks databaseTasks;
 
-		public PessimisticTransactionalDB(String path, TransactionDB db) {
+		public BaseTransactionalDB(String path, RDB db, DatabaseTasks databaseTasks) {
 			this.path = path;
 			this.db = db;
+			this.databaseTasks = databaseTasks;
+
+			databaseTasks.start();
+		}
+
+		@Override
+		public final String getPath() {
+			return path;
+		}
+
+		@Override
+		public final RocksDB get() {
+			return db;
+		}
+
+		@Override
+		public void close() throws IOException {
+			List<Exception> exceptions = new ArrayList<>();
+			try {
+				databaseTasks.close();
+			} catch (Exception ex) {
+				exceptions.add(ex);
+			}
+			try {
+				db.closeE();
+			} catch (RocksDBException e) {
+				exceptions.add(e);
+			}
+			if (!exceptions.isEmpty()) {
+				IOException ex;
+				if (exceptions.size() == 1) {
+					ex = new IOException("Failed to close the database", exceptions.getFirst());
+				} else {
+					ex = new IOException("Failed to close the database");
+					exceptions.forEach(ex::addSuppressed);
+				}
+				throw ex;
+			}
+		}
+	}
+
+	final class PessimisticTransactionalDB extends BaseTransactionalDB<TransactionDB> {
+
+		public PessimisticTransactionalDB(String path, TransactionDB db, DatabaseTasks databaseTasks) {
+			super(path, db, databaseTasks);
 		}
 
 		@Override
 		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
 			return new TransactionalOptionsPessimistic(new TransactionOptions().setExpiration(timeoutMs));
-		}
-
-		@Override
-		public String getPath() {
-			return path;
-		}
-
-		@Override
-		public RocksDB get() {
-			return db;
 		}
 
 		@Override
@@ -141,15 +180,6 @@ public sealed interface TransactionalDB extends Closeable {
 			);
 		}
 
-		@Override
-		public void close() throws IOException {
-			try {
-				db.closeE();
-			} catch (RocksDBException e) {
-				throw new IOException(e);
-			}
-		}
-
 		private record TransactionalOptionsPessimistic(TransactionOptions transactionOptions) implements
 				TransactionalOptions {
 
@@ -160,29 +190,15 @@ public sealed interface TransactionalDB extends Closeable {
 		}
 	}
 
-	final class OptimisticTransactionalDB implements TransactionalDB {
+	final class OptimisticTransactionalDB extends BaseTransactionalDB<OptimisticTransactionDB> {
 
-		private final String path;
-		private final OptimisticTransactionDB db;
-
-		public OptimisticTransactionalDB(String path, OptimisticTransactionDB db) {
-			this.path = path;
-			this.db = db;
+		public OptimisticTransactionalDB(String path, OptimisticTransactionDB db, DatabaseTasks databaseTasks) {
+			super(path, db, databaseTasks);
 		}
 
 		@Override
 		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
 			return new TransactionalOptionsOptimistic(new OptimisticTransactionOptions());
-		}
-
-		@Override
-		public String getPath() {
-			return path;
-		}
-
-		@Override
-		public RocksDB get() {
-			return db;
 		}
 
 		@Override
@@ -210,15 +226,6 @@ public sealed interface TransactionalDB extends Closeable {
 					((TransactionalOptionsOptimistic) transactionOptions).transactionOptions,
 					oldTransaction
 			);
-		}
-
-		@Override
-		public void close() throws IOException {
-			try {
-				db.closeE();
-			} catch (RocksDBException e) {
-				throw new IOException(e);
-			}
 		}
 
 		private record TransactionalOptionsOptimistic(OptimisticTransactionOptions transactionOptions) implements

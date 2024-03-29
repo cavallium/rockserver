@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.config;
 
+import java.time.Duration;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.Nullable;
 
@@ -31,6 +32,9 @@ public interface GlobalDatabaseConfig {
 
 	@Nullable
 	Path walPath() throws GestaltException;
+
+	@Nullable
+	Duration delayWalFlushDuration() throws GestaltException;
 
 	boolean absoluteConsistency() throws GestaltException;
 
