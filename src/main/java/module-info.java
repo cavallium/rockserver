@@ -8,16 +8,6 @@ module rockserver.core {
 	requires org.github.gestalt.core;
 	requires org.github.gestalt.hocon;
 	requires it.unimi.dsi.fastutil;
-	requires io.netty5.buffer;
-	requires io.netty5.codec;
-	requires io.netty5.codec.http2;
-	requires io.netty5.common;
-	requires io.netty5.handler;
-	requires io.netty5.transport;
-	requires io.netty5.transport.classes.io_uring;
-	requires io.netty5.transport.io_uring;
-	requires io.netty5.transport.unix.common;
-	requires io.netty5.codec.http;
 	requires org.apache.thrift;
 	requires org.slf4j;
 
