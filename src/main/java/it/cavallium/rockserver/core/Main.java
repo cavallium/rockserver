@@ -39,7 +39,7 @@ public class Main {
 				.setDefault("main")
 				.help("Specify database name");
 		parser.addArgument("-c", "--config")
-				.type(Path.class)
+				.type(String.class)
 				.help("Specify the rockserver-core.conf file path. Do not set if the database is not local");
 		parser.addArgument("-p", "--print-default-config")
 				.type(Boolean.class)
