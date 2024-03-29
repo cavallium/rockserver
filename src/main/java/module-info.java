@@ -1,7 +1,6 @@
 module rockserver.core {
 	requires rocksdbjni;
 	requires net.sourceforge.argparse4j;
-	requires inet.ipaddr;
 	requires java.logging;
 	requires org.jetbrains.annotations;
 	requires high.scale.lib;

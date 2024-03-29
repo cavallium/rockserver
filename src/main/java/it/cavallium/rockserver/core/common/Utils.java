@@ -8,6 +8,8 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.net.InetSocketAddress;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -26,8 +28,10 @@ public class Utils {
 	@SuppressWarnings("resource")
 	private static final MemorySegment DUMMY_EMPTY_VALUE = Arena
 			.global()
-			.allocate(ValueLayout.JAVA_BYTE, (byte) -1)
+			.allocate(1)
+			.copyFrom(MemorySegment.ofArray(new byte[] {-1}))
 			.asReadOnly();
+	public static final int DEFAULT_PORT = 5333;
 
 	public static MemorySegment dummyEmptyValue() {
 		return DUMMY_EMPTY_VALUE;
@@ -78,7 +82,8 @@ public class Utils {
 	public static @Nullable MemorySegment toMemorySegment(Arena arena, byte... array) {
 		if (array != null) {
 			assert arena != null;
-			return arena.allocateArray(ValueLayout.JAVA_BYTE, array);
+			// todo: replace with allocateArray when graalvm adds it
+			return arena.allocate(array.length).copyFrom(MemorySegment.ofArray(array));
 		} else {
 			return null;
 		}
@@ -105,7 +110,8 @@ public class Utils {
 			for (int i = 0; i < array.length; i++) {
 				newArray[i] = (byte) array[i];
 			}
-			return arena.allocateArray(ValueLayout.JAVA_BYTE, newArray);
+			// todo: replace with allocateArray when graalvm adds it
+			return arena.allocate(newArray.length).copyFrom(MemorySegment.ofArray(newArray));
 		} else {
 			return null;
 		}
@@ -140,5 +146,18 @@ public class Utils {
 		currentValue = requireNonNullElse(currentValue, NULL);
 		return MemorySegment.mismatch(previousValue, 0, previousValue.byteSize(), currentValue, 0, currentValue.byteSize())
 				== -1;
+	}
+
+	public static InetSocketAddress parseHostAndPort(URI uri) {
+		return new InetSocketAddress(uri.getHost(), parsePort(uri));
+	}
+
+	public static int parsePort(URI uri) {
+		var port = uri.getPort();
+		if (port == -1) {
+			return DEFAULT_PORT;
+		} else {
+			return port;
+		}
 	}
 }

@@ -7,8 +7,8 @@ import it.cavallium.rockserver.core.common.api.ColumnHashType;
 import it.cavallium.rockserver.core.common.api.ColumnSchema;
 import it.cavallium.rockserver.core.common.api.Delta;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
-import it.cavallium.rockserver.core.common.api.RocksDB.AsyncIface;
-import it.cavallium.rockserver.core.common.api.RocksDB.AsyncProcessor;
+import it.cavallium.rockserver.core.common.api.RocksDB.Iface;
+import it.cavallium.rockserver.core.common.api.RocksDB.Processor;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
@@ -21,10 +21,7 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
-import java.util.function.BiConsumer;
-import org.apache.thrift.TException;
-import org.apache.thrift.async.AsyncMethodCallback;
-import org.apache.thrift.server.TNonblockingServer;
+import org.apache.thrift.server.TThreadedSelectorServer;
 import org.apache.thrift.transport.TNonblockingServerSocket;
 import org.apache.thrift.transport.TTransportException;
 import org.jetbrains.annotations.NotNull;
@@ -35,12 +32,12 @@ public class ThriftServer extends Server {
 
 	public ThriftServer(RocksDBConnection client, String http2Host, int http2Port) throws IOException {
 		super(client);
-		var handler = new AsyncThriftHandler(client);
+		var handler = new ThriftHandler(client);
 
 		try {
 			var serverTransport = new TNonblockingServerSocket(new InetSocketAddress(http2Host, http2Port));
-			var server = new TNonblockingServer(new TNonblockingServer.Args(serverTransport)
-					.processor(new AsyncProcessor<>(handler))
+			var server = new TThreadedSelectorServer(new TThreadedSelectorServer.Args(serverTransport)
+					.processor(new Processor<>(handler))
 			);
 
 			server.serve();
@@ -97,55 +94,9 @@ public class ThriftServer extends Server {
 		return it.cavallium.rockserver.core.common.ColumnHashType.valueOf(variableTailKey.name());
 	}
 
-	private static <T> BiConsumer<? super T, ? super Throwable> handleResult(AsyncMethodCallback<T> resultHandler) {
-		return (result, error) -> {
-			if (error != null) {
-				if (error instanceof Exception ex) {
-					resultHandler.onError(ex);
-				} else {
-					resultHandler.onError(new Exception(error));
-				}
-			} else {
-				resultHandler.onComplete(result);
-			}
-		};
-	}
-
-	private static <T> BiConsumer<? super T, ? super Throwable> handleResultWithArena(Arena arena,
-			AsyncMethodCallback<T> resultHandler) {
-		return (result, error) -> {
-			arena.close();
-			if (error != null) {
-				if (error instanceof Exception ex) {
-					resultHandler.onError(ex);
-				} else {
-					resultHandler.onError(new Exception(error));
-				}
-			} else {
-				resultHandler.onComplete(result);
-			}
-		};
-	}
-
-	private static BiConsumer<? super List<Void>, ? super Throwable> handleResultListWithArena(Arena arena,
-			AsyncMethodCallback<Void> resultHandler) {
-		return (result, error) -> {
-			arena.close();
-			if (error != null) {
-				if (error instanceof Exception ex) {
-					resultHandler.onError(ex);
-				} else {
-					resultHandler.onError(new Exception(error));
-				}
-			} else {
-				resultHandler.onComplete(null);
-			}
-		};
-	}
-
 	private static OptionalBinary mapResult(MemorySegment memorySegment) {
 		var result = new OptionalBinary();
-		return memorySegment != null ? result.setValue(memorySegment.asByteBuffer()) : result;
+		return memorySegment != null ? result.setValue(ByteBuffer.wrap(memorySegment.toArray(BYTE_BE))) : result;
 	}
 
 	private static UpdateBegin mapResult(UpdateContext<MemorySegment> context) {
@@ -164,225 +115,187 @@ public class ThriftServer extends Server {
 		return multi.stream().map(ThriftServer::mapResult).toList();
 	}
 
-	private static class AsyncThriftHandler implements AsyncIface {
+	private static class ThriftHandler implements Iface {
 
 		private final RocksDBConnection client;
 
-		public AsyncThriftHandler(RocksDBConnection client) {
+		public ThriftHandler(RocksDBConnection client) {
 			this.client = client;
 		}
 
+
 		@Override
-		public void openTransaction(long timeoutMs, AsyncMethodCallback<Long> resultHandler) {
-			client.getAsyncApi().openTransactionAsync(timeoutMs).whenComplete(handleResult(resultHandler));
+		public long openTransaction(long timeoutMs) {
+			return client.getSyncApi().openTransaction(timeoutMs);
 		}
 
 		@Override
-		public void closeTransaction(long timeoutMs, boolean commit, AsyncMethodCallback<Boolean> resultHandler) {
-			client.getAsyncApi().closeTransactionAsync(timeoutMs, commit).whenComplete(handleResult(resultHandler));
+		public boolean closeTransaction(long timeoutMs, boolean commit) {
+			return client.getSyncApi().closeTransaction(timeoutMs, commit);
 		}
 
 		@Override
-		public void closeFailedUpdate(long updateId, AsyncMethodCallback<Void> resultHandler) {
-			client.getAsyncApi().closeFailedUpdateAsync(updateId).whenComplete(handleResult(resultHandler));
+		public void closeFailedUpdate(long updateId) {
+			client.getSyncApi().closeFailedUpdate(updateId);
 		}
 
 		@Override
-		public void createColumn(String name, ColumnSchema schema, AsyncMethodCallback<Long> resultHandler) {
-			client.getAsyncApi().createColumnAsync(name, columnSchemaToRecord(schema))
-					.whenComplete(handleResult(resultHandler));
+		public long createColumn(String name, ColumnSchema schema) {
+			return client.getSyncApi().createColumn(name, columnSchemaToRecord(schema));
 		}
 
 		@Override
-		public void deleteColumn(long columnId, AsyncMethodCallback<Void> resultHandler) {
-			client.getAsyncApi().deleteColumnAsync(columnId).whenComplete(handleResult(resultHandler));
+		public void deleteColumn(long columnId) {
+			client.getSyncApi().deleteColumn(columnId);
 		}
 
 		@Override
-		public void getColumnId(String name, AsyncMethodCallback<Long> resultHandler) {
-			client.getAsyncApi().getColumnIdAsync(name).whenComplete(handleResult(resultHandler));
+		public long getColumnId(String name) {
+			return client.getSyncApi().getColumnId(name);
 		}
 
 		@Override
 		public void putFast(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value,
-				AsyncMethodCallback<Void> resultHandler) {
-			this.put(transactionOrUpdateId, columnId, keys, value, resultHandler);
+				ByteBuffer value) {
+			this.put(transactionOrUpdateId, columnId, keys, value);
 		}
 
 		@Override
 		public void put(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value,
-				AsyncMethodCallback<Void> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.putAsync(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.none())
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				ByteBuffer value) {
+			try (var arena = Arena.ofConfined()) {
+				client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.none());
+			}
 		}
 
 		@Override
 		public void putMulti(long transactionOrUpdateId,
 				long columnId,
 				List<List<ByteBuffer>> keysMulti,
-				List<ByteBuffer> valueMulti,
-				AsyncMethodCallback<Void> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.putMultiAsync(arena, transactionOrUpdateId, columnId, keysToRecords(arena, keysMulti), keyToRecords(arena, valueMulti), RequestType.none())
-					.whenComplete(handleResultListWithArena(arena, resultHandler));
+				List<ByteBuffer> valueMulti) {
+			try (var arena = Arena.ofConfined()) {
+				client.getSyncApi().putMulti(arena, transactionOrUpdateId, columnId, keysToRecords(arena, keysMulti), keyToRecords(arena, valueMulti), RequestType.none());
+			}
 		}
 
 		@Override
-		public void putGetPrevious(long transactionOrUpdateId,
+		public OptionalBinary putGetPrevious(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value,
-				AsyncMethodCallback<OptionalBinary> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.putAsync(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.previous())
-					.thenApply(ThriftServer::mapResult)
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				ByteBuffer value) {
+			try (var arena = Arena.ofConfined()) {
+				return ThriftServer.mapResult(client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.previous()));
+			}
 		}
 
 		@Override
-		public void putGetDelta(long transactionOrUpdateId,
+		public Delta putGetDelta(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value,
-				AsyncMethodCallback<Delta> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.putAsync(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.delta())
-					.thenApply(ThriftServer::mapResult)
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				ByteBuffer value) {
+			try (var arena = Arena.ofConfined()) {
+				return ThriftServer.mapResult(client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.delta()));
+			}
 		}
 
 		@Override
-		public void putGetChanged(long transactionOrUpdateId,
+		public boolean putGetChanged(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value,
-				AsyncMethodCallback<Boolean> resultHandler) {
-			var arena = Arena.ofShared();
-			client
-					.getAsyncApi()
-					.putAsync(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.changed())
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				ByteBuffer value) {
+			try (var arena = Arena.ofConfined()) {
+				return client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.changed());
+			}
 		}
 
 		@Override
-		public void putGetPreviousPresence(long transactionOrUpdateId,
+		public boolean putGetPreviousPresence(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value,
-				AsyncMethodCallback<Boolean> resultHandler) {
-			var arena = Arena.ofShared();
-			client
-					.getAsyncApi()
-					.putAsync(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.previousPresence())
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				ByteBuffer value) {
+			try (var arena = Arena.ofConfined()) {
+				return client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.previousPresence());
+			}
 		}
 
 		@Override
-		public void get(long transactionOrUpdateId,
+		public OptionalBinary get(long transactionOrUpdateId,
 				long columnId,
-				List<ByteBuffer> keys,
-				AsyncMethodCallback<OptionalBinary> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.getAsync(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), RequestType.current())
-					.thenApply(ThriftServer::mapResult)
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				List<ByteBuffer> keys) {
+			try (var arena = Arena.ofConfined()) {
+				return ThriftServer.mapResult(client.getSyncApi().get(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), RequestType.current()));
+			}
 		}
 
 		@Override
-		public void getForUpdate(long transactionOrUpdateId,
+		public UpdateBegin getForUpdate(long transactionOrUpdateId,
 				long columnId,
-				List<ByteBuffer> keys,
-				AsyncMethodCallback<UpdateBegin> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.getAsync(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), RequestType.forUpdate())
-					.thenApply(ThriftServer::mapResult)
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				List<ByteBuffer> keys) {
+			try (var arena = Arena.ofConfined()) {
+				return mapResult(client.getSyncApi().get(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), RequestType.forUpdate()));
+			}
 		}
 
 		@Override
-		public void exists(long transactionOrUpdateId,
+		public boolean exists(long transactionOrUpdateId,
 				long columnId,
-				List<ByteBuffer> keys,
-				AsyncMethodCallback<Boolean> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.getAsync(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), RequestType.exists())
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				List<ByteBuffer> keys) {
+			try (var arena = Arena.ofConfined()) {
+				return client.getSyncApi().get(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), RequestType.exists());
+			}
 		}
 
 		@Override
-		public void openIterator(long transactionId,
+		public long openIterator(long transactionId,
 				long columnId,
 				List<ByteBuffer> startKeysInclusive,
 				List<ByteBuffer> endKeysExclusive,
 				boolean reverse,
-				long timeoutMs,
-				AsyncMethodCallback<Long> resultHandler) {
-			var arena = Arena.ofShared();
-			client
-					.getAsyncApi()
-					.openIteratorAsync(arena, transactionId, columnId, keysToRecord(arena,
-							startKeysInclusive), keysToRecord(arena, endKeysExclusive), reverse, timeoutMs)
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				long timeoutMs) {
+			try (var arena = Arena.ofConfined()) {
+				return client.getSyncApi().openIterator(arena, transactionId, columnId, keysToRecord(arena, startKeysInclusive), keysToRecord(arena, endKeysExclusive), reverse, timeoutMs);
+			}
 		}
 
 		@Override
-		public void closeIterator(long iteratorId, AsyncMethodCallback<Void> resultHandler) {
-			client.getAsyncApi()
-					.closeIteratorAsync(iteratorId)
-					.whenComplete(handleResult(resultHandler));
+		public void closeIterator(long iteratorId) {
+			client.getSyncApi().closeIterator(iteratorId);
 		}
 
 		@Override
-		public void seekTo(long iterationId, List<ByteBuffer> keys, AsyncMethodCallback<Void> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.seekToAsync(arena, iterationId, keysToRecord(arena, keys))
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+		public void seekTo(long iterationId, List<ByteBuffer> keys) {
+			try (var arena = Arena.ofConfined()) {
+				client.getSyncApi().seekTo(arena, iterationId, keysToRecord(arena, keys));
+			}
 		}
 
 		@Override
-		public void subsequent(long iterationId, long skipCount, long takeCount, AsyncMethodCallback<Void> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.subsequentAsync(arena, iterationId, skipCount, takeCount, RequestType.none())
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+		public void subsequent(long iterationId, long skipCount, long takeCount) {
+			try (var arena = Arena.ofConfined()) {
+				client.getSyncApi().subsequent(arena, iterationId, skipCount, takeCount, RequestType.none());
+			}
 		}
 
 		@Override
-		public void subsequentExists(long iterationId,
+		public boolean subsequentExists(long iterationId,
 				long skipCount,
-				long takeCount,
-				AsyncMethodCallback<Boolean> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.subsequentAsync(arena, iterationId, skipCount, takeCount, RequestType.exists())
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				long takeCount) {
+			try (var arena = Arena.ofConfined()) {
+				return client.getSyncApi().subsequent(arena, iterationId, skipCount, takeCount, RequestType.exists());
+			}
 		}
 
 		@Override
-		public void subsequentMultiGet(long iterationId,
+		public List<OptionalBinary> subsequentMultiGet(long iterationId,
 				long skipCount,
-				long takeCount,
-				AsyncMethodCallback<List<OptionalBinary>> resultHandler) {
-			var arena = Arena.ofShared();
-			client.getAsyncApi()
-					.subsequentAsync(arena, iterationId, skipCount, takeCount, RequestType.multi())
-					.thenApply(ThriftServer::mapResult)
-					.whenComplete(handleResultWithArena(arena, resultHandler));
+				long takeCount) {
+			try (var arena = Arena.ofConfined()) {
+				return mapResult(client.getSyncApi().subsequent(arena, iterationId, skipCount, takeCount, RequestType.multi()));
+			}
 		}
 	}
 }

@@ -20,7 +20,7 @@
       "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
     },
     "interfaces": [
-      "it.cavallium.rockserver.core.config.FallbackColumnOptions"
+      "it.cavallium.rockserver.core.config.FallbackColumnConfig"
     ]
   },
   {
@@ -28,7 +28,15 @@
       "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
     },
     "interfaces": [
-      "it.cavallium.rockserver.core.config.NamedColumnOptions"
+      "it.cavallium.rockserver.core.config.NamedColumnConfig"
+    ]
+  },
+  {
+    "condition": {
+      "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
+    },
+    "interfaces": [
+      "it.cavallium.rockserver.core.config.ColumnLevelConfig"
     ]
   },
   {
@@ -37,6 +45,14 @@
     },
     "interfaces": [
       "it.cavallium.rockserver.core.config.BloomFilterConfig"
+    ]
+  },
+  {
+    "condition": {
+      "typeReachable": "org.github.gestalt.config.decoder.ProxyDecoder"
+    },
+    "interfaces": [
+      "it.cavallium.rockserver.core.config.VolumeConfig"
     ]
   },
   {

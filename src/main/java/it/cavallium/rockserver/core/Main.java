@@ -3,8 +3,7 @@ package it.cavallium.rockserver.core;
 import static it.cavallium.rockserver.core.client.EmbeddedConnection.PRIVATE_MEMORY_URL;
 import static java.util.Objects.requireNonNull;
 
-import inet.ipaddr.HostName;
-
+import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
 import java.io.IOException;
 import java.net.URI;
@@ -89,14 +88,14 @@ public class Main {
 			case "unix" -> clientBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(databaseUrl.getPath())));
 			case "file" -> clientBuilder.setEmbeddedPath(Path.of((databaseUrl.getAuthority() != null ? databaseUrl.getAuthority() : "") + databaseUrl.getPath()).normalize());
 			case "memory" -> clientBuilder.setEmbeddedInMemory(true);
-			case "rocksdb" -> clientBuilder.setAddress(new HostName(databaseUrl.getHost()).asInetSocketAddress());
+			case "rocksdb" -> clientBuilder.setAddress(Utils.parseHostAndPort(databaseUrl));
 			default -> throw new IllegalArgumentException("Invalid scheme: " + databaseUrl.getScheme());
 		}
 
 		switch (listenUrl.getScheme()) {
 			case "unix" -> serverBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(listenUrl.getPath())));
-			case "http" -> serverBuilder.setHttpAddress(listenUrl.getHost(), listenUrl.getPort());
-			case "rocksdb" -> serverBuilder.setAddress(new HostName(listenUrl.getHost()).asInetSocketAddress());
+			case "http" -> serverBuilder.setHttpAddress(listenUrl.getHost(), Utils.parsePort(listenUrl));
+			case "rocksdb" -> serverBuilder.setAddress(Utils.parseHostAndPort(listenUrl));
 			default -> throw new IllegalArgumentException("Invalid scheme: " + listenUrl.getScheme());
 		}
 

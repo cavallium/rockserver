@@ -1,8 +1,5 @@
 package it.cavallium.rockserver.core.common;
 
-import static java.util.concurrent.CompletableFuture.runAsync;
-import static java.util.concurrent.CompletableFuture.supplyAsync;
-
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.CloseFailedUpdate;
