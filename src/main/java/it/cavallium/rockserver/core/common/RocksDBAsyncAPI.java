@@ -12,10 +12,12 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetColumnId;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenTransaction;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Put;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.PutMulti;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.SeekTo;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Subsequent;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import org.jetbrains.annotations.NotNull;
@@ -61,6 +63,16 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 			@NotNull MemorySegment value,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestAsync(new Put<>(arena, transactionOrUpdateId, columnId, keys, value, requestType));
+	}
+
+	/** See: {@link PutMulti}. */
+	default <T> CompletionStage<List<T>> putMultiAsync(Arena arena,
+			long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<@NotNull MemorySegment @NotNull []> keys,
+			@NotNull List<@NotNull MemorySegment> values,
+			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
+		return requestAsync(new PutMulti<>(arena, transactionOrUpdateId, columnId, keys, values, requestType));
 	}
 
 	/** See: {@link Get}. */

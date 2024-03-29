@@ -49,6 +49,10 @@ public class ThriftServer extends Server {
 		}
 	}
 
+	private static @NotNull List<@NotNull MemorySegment[]> keysToRecords(Arena arena, @NotNull List<@NotNull List< @NotNull ByteBuffer>> keysMulti) {
+		return keysMulti.stream().map(keys -> keysToRecord(arena, keys)).toList();
+	}
+
 	private static MemorySegment[] keysToRecord(Arena arena, List<@NotNull ByteBuffer> keys) {
 		if (keys == null) {
 			return null;
@@ -60,6 +64,10 @@ public class ThriftServer extends Server {
 			i++;
 		}
 		return result;
+	}
+
+	private static @NotNull List<@NotNull MemorySegment> keyToRecords(Arena arena, @NotNull List<@NotNull ByteBuffer> keyMulti) {
+		return keyMulti.stream().map(key -> keyToRecord(arena, key)).toList();
 	}
 
 	private static @NotNull MemorySegment keyToRecord(Arena arena, @NotNull ByteBuffer key) {
@@ -115,6 +123,22 @@ public class ThriftServer extends Server {
 				}
 			} else {
 				resultHandler.onComplete(result);
+			}
+		};
+	}
+
+	private static BiConsumer<? super List<Void>, ? super Throwable> handleResultListWithArena(Arena arena,
+			AsyncMethodCallback<Void> resultHandler) {
+		return (result, error) -> {
+			arena.close();
+			if (error != null) {
+				if (error instanceof Exception ex) {
+					resultHandler.onError(ex);
+				} else {
+					resultHandler.onError(new Exception(error));
+				}
+			} else {
+				resultHandler.onComplete(null);
 			}
 		};
 	}
@@ -198,6 +222,18 @@ public class ThriftServer extends Server {
 			client.getAsyncApi()
 					.putAsync(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.none())
 					.whenComplete(handleResultWithArena(arena, resultHandler));
+		}
+
+		@Override
+		public void putMulti(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti,
+				AsyncMethodCallback<Void> resultHandler) {
+			var arena = Arena.ofShared();
+			client.getAsyncApi()
+					.putMultiAsync(arena, transactionOrUpdateId, columnId, keysToRecords(arena, keysMulti), keyToRecords(arena, valueMulti), RequestType.none())
+					.whenComplete(handleResultListWithArena(arena, resultHandler));
 		}
 
 		@Override

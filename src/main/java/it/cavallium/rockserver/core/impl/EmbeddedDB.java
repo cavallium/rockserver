@@ -7,6 +7,7 @@ import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
+import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Delta;
@@ -31,6 +32,8 @@ import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -324,6 +327,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		} finally {
 			ops.endOp();
 		}
+	}
+
+	@Override
+	public <T> List<T> putMulti(Arena arena,
+			long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<@NotNull MemorySegment @NotNull []> keys,
+			@NotNull List<@NotNull MemorySegment> values,
+			RequestPut<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
+		if (keys.size() != values.size()) {
+			throw new IllegalArgumentException("keys length is different than values length: " + keys.size() + " != " + values.size());
+		}
+		List<T> responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keys.size());
+		for (int i = 0; i < keys.size(); i++) {
+			var result = put(arena, transactionOrUpdateId, columnId, keys.get(i), values.get(i), requestType);
+			if (responses != null) {
+				responses.add(result);
+			}
+		}
+		return responses != null ? responses : List.of();
 	}
 
 	/**

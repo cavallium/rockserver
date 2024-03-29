@@ -15,6 +15,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.URI;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Optional;
 
 import java.util.concurrent.CompletableFuture;
@@ -105,6 +106,16 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 			@NotNull MemorySegment value,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return db.put(arena, transactionOrUpdateId, columnId, keys, value, requestType);
+	}
+
+	@Override
+	public <T> List<T> putMulti(Arena arena,
+			long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<@NotNull MemorySegment @NotNull []> keys,
+			@NotNull List<@NotNull MemorySegment> values,
+			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
+		return db.putMulti(arena, transactionOrUpdateId, columnId, keys, values, requestType);
 	}
 
 	@Override

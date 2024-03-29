@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.util.List;
 import java.util.concurrent.CompletionStage;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -149,6 +150,31 @@ public sealed interface RocksDBAPICommand<R> {
 		@Override
 		public CompletionStage<T> handleAsync(RocksDBAsyncAPI api) {
 			return api.putAsync(arena, transactionOrUpdateId, columnId, keys, value, requestType);
+		}
+
+	}
+	/**
+	 * Put multiple elements into the specified positions
+	 * @param arena arena
+	 * @param transactionOrUpdateId transaction id, update id, or 0
+	 * @param columnId column id
+	 * @param keys multiple lists of column keys
+	 * @param values multiple values, or null if not needed
+	 * @param requestType the request type determines which type of data will be returned.
+	 */
+	record PutMulti<T>(Arena arena, long transactionOrUpdateId, long columnId,
+										 @NotNull List<@NotNull MemorySegment @NotNull []> keys,
+										 @NotNull List<@NotNull MemorySegment> values,
+										 RequestPut<? super MemorySegment, T> requestType) implements RocksDBAPICommand<List<T>> {
+
+		@Override
+		public List<T> handleSync(RocksDBSyncAPI api) {
+			return api.putMulti(arena, transactionOrUpdateId, columnId, keys, values, requestType);
+		}
+
+		@Override
+		public CompletionStage<List<T>> handleAsync(RocksDBAsyncAPI api) {
+			return api.putMultiAsync(arena, transactionOrUpdateId, columnId, keys, values, requestType);
 		}
 
 	}
