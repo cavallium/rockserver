@@ -22,6 +22,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
 import java.util.function.BiConsumer;
+import org.apache.thrift.TException;
 import org.apache.thrift.async.AsyncMethodCallback;
 import org.apache.thrift.server.TNonblockingServer;
 import org.apache.thrift.transport.TNonblockingServerSocket;
@@ -119,7 +120,8 @@ public class ThriftServer extends Server {
 	}
 
 	private static OptionalBinary mapResult(MemorySegment memorySegment) {
-		return memorySegment != null ? new OptionalBinary().setValue(memorySegment.asByteBuffer()) : null;
+		var result = new OptionalBinary();
+		return memorySegment != null ? result.setValue(memorySegment.asByteBuffer()) : result;
 	}
 
 	private static UpdateBegin mapResult(UpdateContext<MemorySegment> context) {
@@ -175,6 +177,15 @@ public class ThriftServer extends Server {
 		@Override
 		public void getColumnId(String name, AsyncMethodCallback<Long> resultHandler) {
 			client.getAsyncApi().getColumnIdAsync(name).whenComplete(handleResult(resultHandler));
+		}
+
+		@Override
+		public void putFast(long transactionOrUpdateId,
+				long columnId,
+				List<ByteBuffer> keys,
+				ByteBuffer value,
+				AsyncMethodCallback<Void> resultHandler) {
+			this.put(transactionOrUpdateId, columnId, keys, value, resultHandler);
 		}
 
 		@Override

@@ -52,7 +52,9 @@ service RocksDB {
 
    i64 getColumnId(1: required string name),
 
-   oneway void put(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value),
+   oneway void putFast(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value),
+
+   void put(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value),
 
    OptionalBinary putGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value),
 
@@ -74,7 +76,7 @@ service RocksDB {
 
    void seekTo(1: required i64 iterationId, 2: required list<binary> keys),
 
-   oneway void subsequent(1: required i64 iterationId, 2: required i64 skipCount, 3: required i64 takeCount),
+   void subsequent(1: required i64 iterationId, 2: required i64 skipCount, 3: required i64 takeCount),
 
    bool subsequentExists(1: required i64 iterationId, 2: required i64 skipCount, 3: required i64 takeCount),
 
