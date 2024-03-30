@@ -54,5 +54,10 @@
     "interfaces": [
       "it.cavallium.rockserver.core.config.VolumeConfig"
     ]
+  },
+  {
+    "condition": {
+      "typeReachable": "org.rocksdb.RocksDBException"
+    }
   }
 ]
