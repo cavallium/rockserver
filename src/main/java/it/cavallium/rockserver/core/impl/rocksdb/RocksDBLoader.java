@@ -576,7 +576,7 @@ public class RocksDBLoader {
 
             var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
             var dbTasks = new DatabaseTasks(db, inMemory, delayWalFlushConfig);
-            return TransactionalDB.create(definitiveDbPath.toString(), db, dbTasks);
+            return TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks);
         } catch (IOException | RocksDBException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {

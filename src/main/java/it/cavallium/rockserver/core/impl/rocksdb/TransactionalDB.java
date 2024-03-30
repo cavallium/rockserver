@@ -1,10 +1,13 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
-import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB.BaseTransactionalDB;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.OptimisticTransactionDB;
 import org.rocksdb.OptimisticTransactionOptions;
 import org.rocksdb.RocksDB;
@@ -16,10 +19,13 @@ import org.rocksdb.WriteOptions;
 
 public sealed interface TransactionalDB extends Closeable {
 
-	static TransactionalDB create(String path, RocksDB db, DatabaseTasks databaseTasks) {
+	static TransactionalDB create(String path, RocksDB db,
+			List<ColumnFamilyDescriptor> descriptors,
+			ArrayList<ColumnFamilyHandle> handles,
+			DatabaseTasks databaseTasks) {
 		return switch (db) {
-			case OptimisticTransactionDB optimisticTransactionDB -> new OptimisticTransactionalDB(path, optimisticTransactionDB, databaseTasks);
-			case TransactionDB transactionDB -> new PessimisticTransactionalDB(path, transactionDB, databaseTasks);
+			case OptimisticTransactionDB optimisticTransactionDB -> new OptimisticTransactionalDB(path, optimisticTransactionDB, descriptors, handles, databaseTasks);
+			case TransactionDB transactionDB -> new PessimisticTransactionalDB(path, transactionDB, descriptors, handles, databaseTasks);
 			default -> throw new UnsupportedOperationException("This database is not transactional");
 		};
 	}
@@ -29,6 +35,7 @@ public sealed interface TransactionalDB extends Closeable {
 	String getPath();
 
 	RocksDB get();
+	Map<ColumnFamilyDescriptor, ColumnFamilyHandle> getStartupColumns();
 	/**
 	 * Starts a new Transaction.
 	 * <p>
@@ -97,10 +104,17 @@ public sealed interface TransactionalDB extends Closeable {
 		private final String path;
 		protected final RDB db;
 		private final DatabaseTasks databaseTasks;
+		private final List<ColumnFamilyDescriptor> descriptors;
+		private final ArrayList<ColumnFamilyHandle> handles;
 
-		public BaseTransactionalDB(String path, RDB db, DatabaseTasks databaseTasks) {
+		public BaseTransactionalDB(String path, RDB db,
+				List<ColumnFamilyDescriptor> descriptors,
+				ArrayList<ColumnFamilyHandle> handles,
+				DatabaseTasks databaseTasks) {
 			this.path = path;
 			this.db = db;
+			this.descriptors = descriptors;
+			this.handles = handles;
 			this.databaseTasks = databaseTasks;
 
 			databaseTasks.start();
@@ -117,12 +131,29 @@ public sealed interface TransactionalDB extends Closeable {
 		}
 
 		@Override
+		public Map<ColumnFamilyDescriptor, ColumnFamilyHandle> getStartupColumns() {
+			var cols = new HashMap<ColumnFamilyDescriptor, ColumnFamilyHandle>();
+			assert this.descriptors.size() == this.handles.size();
+			for (int i = 0; i < descriptors.size(); i++) {
+				cols.put(this.descriptors.get(i), this.handles.get(i));
+			}
+			return cols;
+		}
+
+		@Override
 		public void close() throws IOException {
 			List<Exception> exceptions = new ArrayList<>();
 			try {
 				databaseTasks.close();
 			} catch (Exception ex) {
 				exceptions.add(ex);
+			}
+			for (ColumnFamilyHandle handle : handles) {
+				try {
+					handle.close();
+				} catch (Exception ex) {
+					exceptions.add(ex);
+				}
 			}
 			try {
 				db.closeE();
@@ -144,8 +175,11 @@ public sealed interface TransactionalDB extends Closeable {
 
 	final class PessimisticTransactionalDB extends BaseTransactionalDB<TransactionDB> {
 
-		public PessimisticTransactionalDB(String path, TransactionDB db, DatabaseTasks databaseTasks) {
-			super(path, db, databaseTasks);
+		public PessimisticTransactionalDB(String path, TransactionDB db,
+				List<ColumnFamilyDescriptor> descriptors,
+				ArrayList<ColumnFamilyHandle> handles,
+				DatabaseTasks databaseTasks) {
+			super(path, db, descriptors, handles, databaseTasks);
 		}
 
 		@Override
@@ -192,8 +226,11 @@ public sealed interface TransactionalDB extends Closeable {
 
 	final class OptimisticTransactionalDB extends BaseTransactionalDB<OptimisticTransactionDB> {
 
-		public OptimisticTransactionalDB(String path, OptimisticTransactionDB db, DatabaseTasks databaseTasks) {
-			super(path, db, databaseTasks);
+		public OptimisticTransactionalDB(String path, OptimisticTransactionDB db,
+				List<ColumnFamilyDescriptor> descriptors,
+				ArrayList<ColumnFamilyHandle> handles,
+				DatabaseTasks databaseTasks) {
+			super(path, db, descriptors, handles, databaseTasks);
 		}
 
 		@Override

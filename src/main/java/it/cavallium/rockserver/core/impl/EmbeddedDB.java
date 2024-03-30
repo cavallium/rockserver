@@ -5,6 +5,7 @@ import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_BYTES;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
+import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
@@ -25,7 +26,13 @@ import it.cavallium.rockserver.core.impl.rocksdb.RocksDBObjects;
 import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB;
 import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB.TransactionalOptions;
 import it.cavallium.rockserver.core.impl.rocksdb.Tx;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -33,6 +40,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
@@ -58,9 +66,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final boolean USE_FAST_GET = true;
+	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
 	private final Logger logger;
 	private final @Nullable Path path;
 	private final TransactionalDB db;
+	private final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
 	private final NonBlockingHashMapLong<ColumnInstance> columns;
 	private final ConcurrentMap<String, Long> columnNamesIndex;
 	private final NonBlockingHashMapLong<Tx> txs;
@@ -68,7 +78,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	private final SafeShutdown ops;
 	private final Object columnEditLock = new Object();
 
-	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) {
+	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
 		this.path = path;
 		this.logger = Logger.getLogger("db." + name);
 		this.columns = new NonBlockingHashMapLong<>();
@@ -78,8 +88,79 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		this.ops = new SafeShutdown();
 		DatabaseConfig config = ConfigParser.parse(embeddedConfigPath);
 		this.db = RocksDBLoader.load(path, config, logger);
+		var existingColumnSchemasColumnDescriptorOptional = db
+				.getStartupColumns()
+				.entrySet()
+				.stream()
+				.filter(e -> Arrays.equals(e.getKey().getName(), COLUMN_SCHEMAS_COLUMN))
+				.findAny();
+		if (existingColumnSchemasColumnDescriptorOptional.isEmpty()) {
+			var columnSchemasColumnDescriptor = new ColumnFamilyDescriptor(COLUMN_SCHEMAS_COLUMN);
+			try {
+				columnSchemasColumnDescriptorHandle = db.get().createColumnFamily(columnSchemasColumnDescriptor);
+			} catch (RocksDBException e) {
+				throw new IOException("Cannot create system column", e);
+			}
+		} else {
+			this.columnSchemasColumnDescriptorHandle = existingColumnSchemasColumnDescriptorOptional.get().getValue();
+		}
+		try (var it = this.db.get().newIterator(columnSchemasColumnDescriptorHandle)) {
+			it.seekToFirst();
+			while (it.isValid()) {
+				var key = it.key();
+				ColumnSchema value = decodeColumnSchema(it.value());
+				this.db
+						.getStartupColumns()
+						.entrySet()
+						.stream()
+						.filter(entry -> Arrays.equals(entry.getKey().getName(), key))
+						.findAny()
+						.ifPresent(entry -> registerColumn(new ColumnInstance(entry.getValue(), value)));
+				it.next();
+			}
+		}
 		if (Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
 			logger.log(Level.INFO, "Database configuration: {0}", ConfigPrinter.stringify(config));
+		}
+	}
+
+	private ColumnSchema decodeColumnSchema(byte[] value) {
+		try (var is = new ByteArrayInputStream(value); var dis = new DataInputStream(is)) {
+			var check = dis.readByte();
+			assert check == 2;
+			var size = dis.readInt();
+			var keys = new IntArrayList(size);
+			for (int i = 0; i < size; i++) {
+				keys.add(dis.readInt());
+			}
+			size = dis.readInt();
+			var colHashTypes = new ObjectArrayList<ColumnHashType>(size);
+			for (int i = 0; i < size; i++) {
+				colHashTypes.add(ColumnHashType.values()[dis.readUnsignedByte()]);
+			}
+			var hasValue = dis.readBoolean();
+			return new ColumnSchema(keys, colHashTypes, hasValue);
+		} catch (IOException e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	private byte[] encodeColumnSchema(ColumnSchema schema) {
+		try (var baos = new ByteArrayOutputStream(); var daos = new DataOutputStream(baos)) {
+			daos.writeByte(2);
+			daos.writeInt(schema.keys().size());
+			for (int key : schema.keys()) {
+				daos.writeInt(key);
+			}
+			daos.writeInt(schema.variableTailKeys().size());
+			for (ColumnHashType variableTailKey : schema.variableTailKeys()) {
+				daos.writeByte(variableTailKey.ordinal());
+			}
+			daos.writeBoolean(schema.hasValue());
+			baos.close();
+			return baos.toByteArray();
+		} catch (IOException e) {
+			throw new RuntimeException(e);
 		}
 	}
 
@@ -97,6 +178,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				this.columns.remove(id);
 				throw new UnsupportedOperationException("Column already registered!");
 			}
+			logger.info("Registered column: " + column);
 			return id;
 		} catch (RocksDBException e) {
 			throw new RuntimeException(e);
@@ -132,6 +214,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		// Wait for 10 seconds
 		try {
 			ops.closeAndWait(MAX_TRANSACTION_DURATION_MS);
+			columnSchemasColumnDescriptorHandle.close();
 			db.close();
 			if (path == null) {
 				Utils.deleteDirectory(db.getPath());
@@ -251,7 +334,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 					}
 				} else {
 					try {
-						var cf = db.get().createColumnFamily(new ColumnFamilyDescriptor(name.getBytes(StandardCharsets.UTF_8)));
+						byte[] key = name.getBytes(StandardCharsets.UTF_8);
+						var cf = db.get().createColumnFamily(new ColumnFamilyDescriptor(key));
+						byte[] value = encodeColumnSchema(schema);
+						db.get().put(columnSchemasColumnDescriptorHandle, key, value);
 						return registerColumn(new ColumnInstance(cf, schema));
 					} catch (RocksDBException e) {
 						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, e);

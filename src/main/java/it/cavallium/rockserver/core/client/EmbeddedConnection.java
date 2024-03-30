@@ -31,7 +31,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	public static final URI PRIVATE_MEMORY_URL = URI.create("memory://private");
 	private final ExecutorService exeuctor;
 
-	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) {
+	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
 		super(name);
 		this.db = new EmbeddedDB(path, name, embeddedConfig);
 		this.exeuctor = Executors.newVirtualThreadPerTaskExecutor();
