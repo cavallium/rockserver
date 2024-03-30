@@ -55,20 +55,6 @@ import org.rocksdb.WriteOptions;
 
 public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 
-	static {
-		//noinspection ThrowableNotThrown
-		var exceptionLoadBypass = new RocksDBException("test");
-		//noinspection ResultOfMethodCallIgnored
-		exceptionLoadBypass.getMessage();
-		try {
-			var clazz = Class.forName("org.rocksdb.RocksDBException");
-			//noinspection ResultOfMethodCallIgnored
-			clazz.getSimpleName();
-		} catch (ClassNotFoundException e) {
-			throw new RuntimeException(e);
-		}
-	}
-
 	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final boolean USE_FAST_GET = true;

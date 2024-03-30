@@ -50,6 +50,11 @@
   },
   {
     "name" : "org.rocksdb.RocksDBException",
+    "methods": [
+      { "name" : "<init>", "parameterTypes" : ["java.lang.String"] },
+      { "name" : "<init>", "parameterTypes" : ["java.lang.String", "org.rocksdb.Status"] },
+      { "name" : "<init>", "parameterTypes" : ["org.rocksdb.Status"] }
+    ],
     "allPublicConstructors": true,
     "allPublicClasses": true,
     "queryAllDeclaredConstructors": true,
