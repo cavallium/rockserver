@@ -9,6 +9,7 @@ module rockserver.core {
 	requires it.unimi.dsi.fastutil;
 	requires org.apache.thrift;
 	requires org.slf4j;
+	requires org.mongodb.bson;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
