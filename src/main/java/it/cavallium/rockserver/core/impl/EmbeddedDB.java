@@ -132,6 +132,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		// Wait for 10 seconds
 		try {
 			ops.closeAndWait(MAX_TRANSACTION_DURATION_MS);
+			db.close();
 			if (path == null) {
 				Utils.deleteDirectory(db.getPath());
 			}
