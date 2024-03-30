@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.FlushOptions;
 import org.rocksdb.OptimisticTransactionDB;
 import org.rocksdb.OptimisticTransactionOptions;
 import org.rocksdb.RocksDB;
@@ -154,6 +155,16 @@ public sealed interface TransactionalDB extends Closeable {
 				} catch (Exception ex) {
 					exceptions.add(ex);
 				}
+			}
+			try {
+				db.flushWal(true);
+			} catch (RocksDBException e) {
+				exceptions.add(e);
+			}
+			try (var options = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
+				db.flush(options);
+			} catch (RocksDBException e) {
+				exceptions.add(e);
 			}
 			try {
 				db.closeE();
