@@ -47,5 +47,10 @@
       { "name" : "<init>", "parameterTypes" : ["java.lang.String"] },
       { "name" : "of", "parameterTypes" : ["java.lang.String"] }
     ]
+  },
+  {
+    "name" : "org.rocksdb.RocksDBException",
+    "allPublicConstructors": true,
+    "allPublicClasses": true
   }
 ]
