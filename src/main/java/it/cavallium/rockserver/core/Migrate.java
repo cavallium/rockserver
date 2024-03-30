@@ -63,15 +63,7 @@ public class Migrate {
 		System.out.println("parsed documents");
 		var protocol = new TBinaryProtocol(transport);
 		var client = new RocksDB.Client(protocol);
-		long columnId;
-
-		long tmpColumnId;
-		try {
-			tmpColumnId = client.getColumnId(columnName);
-		} catch (TApplicationException ex) {
-			tmpColumnId = client.createColumn(columnName, columnSchema);
-		}
-		columnId = tmpColumnId;
+		long columnId = client.createColumn(columnName, columnSchema);
 		var encoder = new BasicBSONEncoder();
 		long nn = 0;
 		long total = documentMap.size();
