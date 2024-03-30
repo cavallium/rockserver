@@ -51,6 +51,8 @@
   {
     "name" : "org.rocksdb.RocksDBException",
     "allPublicConstructors": true,
-    "allPublicClasses": true
+    "allPublicClasses": true,
+    "queryAllDeclaredConstructors": true,
+    "queryAllPublicConstructors": true
   }
 ]
