@@ -14,6 +14,6 @@ public class Server implements Closeable {
 
 	@Override
 	public void close() throws IOException {
-
+		client.close();
 	}
 }
