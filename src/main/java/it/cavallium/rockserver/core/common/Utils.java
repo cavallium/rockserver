@@ -15,6 +15,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -159,5 +160,10 @@ public class Utils {
 		} else {
 			return port;
 		}
+	}
+
+	public static String toPrettyString(MemorySegment s) {
+		var b = s.toArray(BIG_ENDIAN_BYTES);
+		return HexFormat.of().formatHex(b);
 	}
 }

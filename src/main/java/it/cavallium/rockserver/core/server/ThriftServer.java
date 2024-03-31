@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.server;
 
 import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.api.ColumnHashType;
@@ -32,7 +33,7 @@ public class ThriftServer extends Server {
 
 	public ThriftServer(RocksDBConnection client, String http2Host, int http2Port) throws IOException {
 		super(client);
-		var handler = new ThriftHandler(client);
+		var handler = new ThriftHandler(this.getClient());
 
 		try {
 			var serverTransport = new TNonblockingServerSocket(new InetSocketAddress(http2Host, http2Port));
@@ -46,11 +47,11 @@ public class ThriftServer extends Server {
 		}
 	}
 
-	private static @NotNull List<@NotNull MemorySegment[]> keysToRecords(Arena arena, @NotNull List<@NotNull List< @NotNull ByteBuffer>> keysMulti) {
+	private static @NotNull List<@NotNull Keys> keysToRecords(Arena arena, @NotNull List<@NotNull List< @NotNull ByteBuffer>> keysMulti) {
 		return keysMulti.stream().map(keys -> keysToRecord(arena, keys)).toList();
 	}
 
-	private static MemorySegment[] keysToRecord(Arena arena, List<@NotNull ByteBuffer> keys) {
+	private static Keys keysToRecord(Arena arena, List<@NotNull ByteBuffer> keys) {
 		if (keys == null) {
 			return null;
 		}
@@ -60,7 +61,7 @@ public class ThriftServer extends Server {
 			result[i] = keyToRecord(arena, key);
 			i++;
 		}
-		return result;
+		return new Keys(result);
 	}
 
 	private static @NotNull List<@NotNull MemorySegment> keyToRecords(Arena arena, @NotNull List<@NotNull ByteBuffer> keyMulti) {

@@ -18,7 +18,6 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.Subsequent;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -59,7 +58,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	default <T> CompletionStage<T> putAsync(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull MemorySegment @NotNull [] keys,
+			@NotNull Keys keys,
 			@NotNull MemorySegment value,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestAsync(new Put<>(arena, transactionOrUpdateId, columnId, keys, value, requestType));
@@ -69,7 +68,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	default <T> CompletionStage<List<T>> putMultiAsync(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull List<@NotNull MemorySegment @NotNull []> keys,
+			@NotNull List<@NotNull Keys> keys,
 			@NotNull List<@NotNull MemorySegment> values,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestAsync(new PutMulti<>(arena, transactionOrUpdateId, columnId, keys, values, requestType));
@@ -79,7 +78,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	default <T> CompletionStage<T> getAsync(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull MemorySegment @NotNull [] keys,
+			@NotNull Keys keys,
 			RequestGet<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestAsync(new Get<>(arena, transactionOrUpdateId, columnId, keys, requestType));
 	}
@@ -88,8 +87,8 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	default CompletionStage<Long> openIteratorAsync(Arena arena,
 			long transactionId,
 			long columnId,
-			@NotNull MemorySegment @NotNull [] startKeysInclusive,
-			@NotNull MemorySegment @Nullable [] endKeysExclusive,
+			@NotNull Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
 		return requestAsync(new OpenIterator(arena,
@@ -108,7 +107,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link SeekTo}. */
-	default CompletionStage<Void> seekToAsync(Arena arena, long iterationId, @NotNull MemorySegment @NotNull [] keys) throws RocksDBException {
+	default CompletionStage<Void> seekToAsync(Arena arena, long iterationId, @NotNull Keys keys) throws RocksDBException {
 		return requestAsync(new SeekTo(arena, iterationId, keys));
 	}
 
