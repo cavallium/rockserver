@@ -32,6 +32,7 @@ public class Migrate {
 		// Tunables
 		var columnName = args[0];
 		var password = args[1];
+		var hostname = args[2];
 		//
 
 		System.out.println("Column: " + columnName);
@@ -101,7 +102,7 @@ public class Migrate {
 		var protocol = new TBinaryProtocol.Factory();
 		var clients = ThreadLocal.withInitial(() -> {
 			try {
-				var socket = new TSocket("10.0.0.9", 5332);
+				var socket = new TSocket(hostname, 5332);
 				var transport = new TFramedTransport(socket);
 				transport.open();
 
