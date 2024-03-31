@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.List;
+import java.util.StringJoiner;
 import java.util.concurrent.CompletionStage;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -138,7 +139,7 @@ public sealed interface RocksDBAPICommand<R> {
 	record Put<T>(Arena arena,
 								long transactionOrUpdateId,
 								long columnId,
-								@NotNull MemorySegment @NotNull [] keys,
+								Keys keys,
 								@NotNull MemorySegment value,
 								RequestPut<? super MemorySegment, T> requestType) implements RocksDBAPICommand<T> {
 
@@ -152,6 +153,18 @@ public sealed interface RocksDBAPICommand<R> {
 			return api.putAsync(arena, transactionOrUpdateId, columnId, keys, value, requestType);
 		}
 
+		@Override
+		public String toString() {
+			var sb = new StringBuilder("PUT");
+			if (transactionOrUpdateId != 0) {
+				sb.append(" tx:").append(transactionOrUpdateId);
+			}
+			sb.append(" column:").append(columnId);
+			sb.append(" keys:").append(keys);
+			sb.append(" value:").append(Utils.toPrettyString(value));
+			sb.append(" expected:").append(requestType.getRequestTypeId());
+			return sb.toString();
+		}
 	}
 	/**
 	 * Put multiple elements into the specified positions
@@ -163,7 +176,7 @@ public sealed interface RocksDBAPICommand<R> {
 	 * @param requestType the request type determines which type of data will be returned.
 	 */
 	record PutMulti<T>(Arena arena, long transactionOrUpdateId, long columnId,
-										 @NotNull List<@NotNull MemorySegment @NotNull []> keys,
+										 @NotNull List<Keys> keys,
 										 @NotNull List<@NotNull MemorySegment> values,
 										 RequestPut<? super MemorySegment, T> requestType) implements RocksDBAPICommand<List<T>> {
 
@@ -177,6 +190,23 @@ public sealed interface RocksDBAPICommand<R> {
 			return api.putMultiAsync(arena, transactionOrUpdateId, columnId, keys, values, requestType);
 		}
 
+		@Override
+		public String toString() {
+			var sb = new StringBuilder("PUT_MULTI");
+			if (transactionOrUpdateId != 0) {
+				sb.append(" tx:").append(transactionOrUpdateId);
+			}
+			sb.append(" column:").append(columnId);
+			sb.append(" expected:").append(requestType.getRequestTypeId());
+			sb.append(" multi:[");
+			for (int i = 0; i < keys.size(); i++) {
+				if (i > 0) sb.append(",");
+				sb.append(" keys:").append(keys.get(i));
+				sb.append(" value:").append(Utils.toPrettyString(values.get(i)));
+			}
+			sb.append("]");
+			return sb.toString();
+		}
 	}
 	/**
 	 * Get an element from the specified position
@@ -189,7 +219,7 @@ public sealed interface RocksDBAPICommand<R> {
 	record Get<T>(Arena arena,
 								long transactionOrUpdateId,
 								long columnId,
-								@NotNull MemorySegment @NotNull [] keys,
+								Keys keys,
 								RequestGet<? super MemorySegment, T> requestType) implements RocksDBAPICommand<T> {
 
 		@Override
@@ -202,6 +232,17 @@ public sealed interface RocksDBAPICommand<R> {
 			return api.getAsync(arena, transactionOrUpdateId, columnId, keys, requestType);
 		}
 
+		@Override
+		public String toString() {
+			var sb = new StringBuilder("GET");
+			if (transactionOrUpdateId != 0) {
+				sb.append(" tx:").append(transactionOrUpdateId);
+			}
+			sb.append(" column:").append(columnId);
+			sb.append(" keys:").append(keys);
+			sb.append(" expected:").append(requestType.getRequestTypeId());
+			return sb.toString();
+		}
 	}
 	/**
 	 * Open an iterator
@@ -217,8 +258,8 @@ public sealed interface RocksDBAPICommand<R> {
 	record OpenIterator(Arena arena,
 											long transactionId,
 											long columnId,
-											@NotNull MemorySegment @NotNull [] startKeysInclusive,
-											@NotNull MemorySegment @Nullable [] endKeysExclusive,
+											Keys startKeysInclusive,
+											@Nullable Keys endKeysExclusive,
 											boolean reverse,
 											long timeoutMs) implements RocksDBAPICommand<Long> {
 
@@ -264,7 +305,7 @@ public sealed interface RocksDBAPICommand<R> {
 	 * @param iterationId iteration id
 	 * @param keys keys, inclusive. [] means "the beginning"
 	 */
-	record SeekTo(Arena arena, long iterationId, @NotNull MemorySegment @NotNull [] keys) implements
+	record SeekTo(Arena arena, long iterationId, Keys keys) implements
 			RocksDBAPICommand<Void> {
 
 		@Override

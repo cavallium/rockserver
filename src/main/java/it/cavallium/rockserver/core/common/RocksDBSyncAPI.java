@@ -57,7 +57,7 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	default <T> T put(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull MemorySegment @NotNull [] keys,
+			Keys keys,
 			@NotNull MemorySegment value,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestSync(new Put<>(arena, transactionOrUpdateId, columnId, keys, value, requestType));
@@ -67,7 +67,7 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	default <T> List<T> putMulti(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull List<@NotNull MemorySegment @NotNull []> keys,
+			@NotNull List<Keys> keys,
 			@NotNull List<@NotNull MemorySegment> values,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestSync(new PutMulti<>(arena, transactionOrUpdateId, columnId, keys, values, requestType));
@@ -77,7 +77,7 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	default <T> T get(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull MemorySegment @NotNull [] keys,
+			Keys keys,
 			RequestGet<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestSync(new Get<>(arena, transactionOrUpdateId, columnId, keys, requestType));
 	}
@@ -86,8 +86,8 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	default long openIterator(Arena arena,
 			long transactionId,
 			long columnId,
-			@NotNull MemorySegment @NotNull [] startKeysInclusive,
-			@NotNull MemorySegment @Nullable [] endKeysExclusive,
+			Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
 		return requestSync(new OpenIterator(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs));
@@ -99,7 +99,7 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	}
 
 	/** See: {@link SeekTo}. */
-	default void seekTo(Arena arena, long iterationId, @NotNull MemorySegment @NotNull [] keys) throws RocksDBException {
+	default void seekTo(Arena arena, long iterationId, Keys keys) throws RocksDBException {
 		requestSync(new SeekTo(arena, iterationId, keys));
 	}
 

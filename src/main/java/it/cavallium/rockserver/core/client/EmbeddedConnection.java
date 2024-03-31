@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.client;
 
+import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
@@ -102,7 +103,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	public <T> T put(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull MemorySegment @NotNull [] keys,
+			@NotNull Keys keys,
 			@NotNull MemorySegment value,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return db.put(arena, transactionOrUpdateId, columnId, keys, value, requestType);
@@ -112,7 +113,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	public <T> List<T> putMulti(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull List<@NotNull MemorySegment @NotNull []> keys,
+			@NotNull List<Keys> keys,
 			@NotNull List<@NotNull MemorySegment> values,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return db.putMulti(arena, transactionOrUpdateId, columnId, keys, values, requestType);
@@ -122,7 +123,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	public <T> T get(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			MemorySegment @NotNull [] keys,
+			Keys keys,
 			RequestGet<? super MemorySegment, T> requestType) throws RocksDBException {
 		return db.get(arena, transactionOrUpdateId, columnId, keys, requestType);
 	}
@@ -131,8 +132,8 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	public long openIterator(Arena arena,
 			long transactionId,
 			long columnId,
-			@NotNull MemorySegment @NotNull [] startKeysInclusive,
-			@Nullable MemorySegment[] endKeysExclusive,
+			@NotNull Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
 		return db.openIterator(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
@@ -144,7 +145,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public void seekTo(Arena arena, long iterationId, MemorySegment @NotNull [] keys) throws RocksDBException {
+	public void seekTo(Arena arena, long iterationId, Keys keys) throws RocksDBException {
 		db.seekTo(arena, iterationId, keys);
 	}
 

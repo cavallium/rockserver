@@ -6,9 +6,9 @@ import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
 import it.cavallium.rockserver.core.common.ColumnHashType;
+import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
-import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Delta;
@@ -392,7 +392,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	public <T> T put(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull MemorySegment @NotNull [] keys,
+			@NotNull Keys keys,
 			@NotNull MemorySegment value,
 			RequestPut<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
@@ -420,7 +420,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	public <T> List<T> putMulti(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			@NotNull List<@NotNull MemorySegment @NotNull []> keys,
+			@NotNull List<Keys> keys,
 			@NotNull List<@NotNull MemorySegment> values,
 			RequestPut<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		if (keys.size() != values.size()) {
@@ -480,7 +480,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			@Nullable Tx optionalTxOrUpdate,
 			ColumnInstance col,
 			long updateId,
-			@NotNull MemorySegment @NotNull[] keys,
+			@NotNull Keys keys,
 			@NotNull MemorySegment value,
 			RequestPut<? super MemorySegment, U> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		// Check for null value
@@ -501,14 +501,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			}
 			return wrapWithTransactionIfNeeded(optionalTxOrUpdate, needsTx, tx -> {
 				MemorySegment previousValue;
-				MemorySegment calculatedKey = col.calculateKey(arena, keys);
+				MemorySegment calculatedKey = col.calculateKey(arena, keys.keys());
 				if (updateId != 0L) {
 					assert tx != null;
 					tx.val().setSavePoint();
 				}
 				if (col.hasBuckets()) {
 					assert tx != null;
-					var bucketElementKeys = col.getBucketElementKeys(keys);
+					var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 					try (var readOptions = new ReadOptions()) {
 						var previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 						MemorySegment previousRawBucket = toMemorySegment(arena, previousRawBucketByteArray);
@@ -589,7 +589,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	public <T> T get(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
-			MemorySegment @NotNull [] keys,
+			Keys keys,
 			RequestGet<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		// Column id
 		var col = getColumn(columnId);
@@ -620,7 +620,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			Tx tx,
 			long updateId,
 			ColumnInstance col,
-			MemorySegment @NotNull [] keys,
+			Keys keys,
 			RequestGet<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {
@@ -631,9 +631,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			MemorySegment foundValue;
 			boolean existsValue;
 
-			MemorySegment calculatedKey = col.calculateKey(arena, keys);
+			MemorySegment calculatedKey = col.calculateKey(arena, keys.keys());
 			if (col.hasBuckets()) {
-				var bucketElementKeys = col.getBucketElementKeys(keys);
+				var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 				try (var readOptions = new ReadOptions()) {
 					MemorySegment previousRawBucket = dbGet(tx, col, arena, readOptions, calculatedKey);
 					if (previousRawBucket != null) {
@@ -689,8 +689,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	public long openIterator(Arena arena,
 			long transactionId,
 			long columnId,
-			MemorySegment @NotNull [] startKeysInclusive,
-			@Nullable MemorySegment[] endKeysExclusive,
+			Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		// Open an operation that ends when the iterator is closed
@@ -725,7 +725,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	}
 
 	@Override
-	public void seekTo(Arena arena, long iterationId, @NotNull MemorySegment @NotNull [] keys)
+	public void seekTo(Arena arena, long iterationId, @NotNull Keys keys)
 			throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {
