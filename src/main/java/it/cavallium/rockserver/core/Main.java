@@ -84,19 +84,21 @@ public class Main {
 			}
 		}
 
-		switch (databaseUrl.getScheme()) {
+		var databaseUrlScheme = databaseUrl.getScheme();
+		switch (databaseUrlScheme) {
 			case "unix" -> clientBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(databaseUrl.getPath())));
 			case "file" -> clientBuilder.setEmbeddedPath(Path.of((databaseUrl.getAuthority() != null ? databaseUrl.getAuthority() : "") + databaseUrl.getPath()).normalize());
 			case "memory" -> clientBuilder.setEmbeddedInMemory(true);
 			case "rocksdb" -> clientBuilder.setAddress(Utils.parseHostAndPort(databaseUrl));
-			default -> throw new IllegalArgumentException("Invalid scheme: " + databaseUrl.getScheme());
+			case null, default -> throw new IllegalArgumentException("Invalid scheme \"" + databaseUrlScheme + "\" for database url url: " + databaseUrl);
 		}
 
-		switch (listenUrl.getScheme()) {
+		var listenUrlScheme = listenUrl.getScheme();
+		switch (listenUrlScheme) {
 			case "unix" -> serverBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(listenUrl.getPath())));
 			case "http" -> serverBuilder.setHttpAddress(listenUrl.getHost(), Utils.parsePort(listenUrl));
 			case "rocksdb" -> serverBuilder.setAddress(Utils.parseHostAndPort(listenUrl));
-			default -> throw new IllegalArgumentException("Invalid scheme: " + listenUrl.getScheme());
+			case null, default -> throw new IllegalArgumentException("Invalid scheme \"" + listenUrlScheme + "\" for listen url: " + listenUrl);
 		}
 
 		clientBuilder.setName(name);
