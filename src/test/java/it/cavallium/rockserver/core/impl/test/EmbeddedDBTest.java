@@ -8,6 +8,7 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Delta;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.Utils;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -158,17 +159,17 @@ abstract class EmbeddedDBTest {
 		var key = getKey1();
 
 		if (!getHasValues()) {
-			Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, toMemorySegmentSimple(arena, 123), RequestType.delta()));
+			Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, toMemorySegmentSimple(arena, 123), RequestType.delta()));
 		} else {
-			Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, MemorySegment.NULL, RequestType.delta()));
+			Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, MemorySegment.NULL, RequestType.delta()));
+			Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, null, RequestType.delta()));
 		}
 
-		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, null, RequestType.delta()));
-		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, null, value1, RequestType.delta()));
-		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, null, null, RequestType.delta()));
-		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, colId, key, value1, null));
-		Assertions.assertThrows(Exception.class, () -> db.put(arena, 1, colId, key, value1, RequestType.delta()));
-		Assertions.assertThrows(Exception.class, () -> db.put(arena, 0, 21203, key, value1, RequestType.delta()));
+		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, null, value1, RequestType.delta()));
+		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, null, null, RequestType.delta()));
+		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, value1, null));
+		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 1, colId, key, value1, RequestType.delta()));
+		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, 21203, key, value1, RequestType.delta()));
 	}
 
 	@Test
