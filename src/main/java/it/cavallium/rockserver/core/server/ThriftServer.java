@@ -22,6 +22,7 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
+import org.apache.thrift.TException;
 import org.apache.thrift.server.TThreadedSelectorServer;
 import org.apache.thrift.transport.TNonblockingServerSocket;
 import org.apache.thrift.transport.TTransportException;
@@ -131,8 +132,8 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public boolean closeTransaction(long timeoutMs, boolean commit) {
-			return client.getSyncApi().closeTransaction(timeoutMs, commit);
+		public boolean closeTransaction(long transactionId, boolean commit) throws TException {
+			return client.getSyncApi().closeTransaction(transactionId, commit);
 		}
 
 		@Override
