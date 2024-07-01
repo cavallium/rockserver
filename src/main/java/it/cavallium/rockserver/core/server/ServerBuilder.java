@@ -14,6 +14,7 @@ public class ServerBuilder {
 	private UnixDomainSocketAddress unixAddress;
 	private String http2Host;
 	private int http2Port;
+	private boolean useThrift;
 	private RocksDBConnection client;
 
 	public void setUnixSocket(UnixDomainSocketAddress address) {
@@ -29,13 +30,21 @@ public class ServerBuilder {
 		this.http2Port = port;
 	}
 
+	public void setUseThrift(boolean useThrift) {
+		this.useThrift = useThrift;
+	}
+
 	public void setClient(RocksDBConnection client) {
 		this.client = client;
 	}
 
 	public Server build() throws IOException {
 		if (http2Host != null) {
-			return new ThriftServer(client, http2Host, http2Port);
+			if (useThrift) {
+				return new ThriftServer(client, http2Host, http2Port);
+			} else {
+				return new GrpcServer(client, http2Host, http2Port);
+			}
 		} else if (unixAddress != null) {
 			throw new UnsupportedOperationException("Not implemented: unix socket");
 		} else if (iNetAddress != null) {

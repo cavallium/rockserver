@@ -9,6 +9,13 @@ module rockserver.core {
 	requires it.unimi.dsi.fastutil;
 	requires org.apache.thrift;
 	requires org.slf4j;
+	requires protobuf.java;
+	requires io.grpc.protobuf;
+	requires io.grpc.stub;
+	requires io.grpc;
+	requires jsr305;
+	requires com.google.common;
+	requires io.grpc.netty;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

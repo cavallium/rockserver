@@ -5,6 +5,7 @@ import static java.util.Objects.requireNonNull;
 
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
+import it.cavallium.rockserver.core.server.ServerBuilder;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -30,9 +31,13 @@ public class Main {
 				.type(String.class)
 				.setDefault(PRIVATE_MEMORY_URL.toString())
 				.help("Specify database rocksdb://hostname:port, or unix://<path>, or file://<path>");
-		parser.addArgument("-l", "--listen-url")
+		parser.addArgument("-l", "--thrift-listen-url")
 				.type(String.class)
 				.setDefault("http://127.0.0.1:5332")
+				.help("Specify database http://hostname:port, or unix://<path>, or file://<path>");
+		parser.addArgument("-L", "--grpc-listen-url")
+				.type(String.class)
+				.setDefault("http://127.0.0.1:5333")
 				.help("Specify database http://hostname:port, or unix://<path>, or file://<path>");
 		parser.addArgument("-n", "--name")
 				.type(String.class)
@@ -53,7 +58,6 @@ public class Main {
 			System.exit(1);
 		}
 		var clientBuilder = new it.cavallium.rockserver.core.client.ClientBuilder();
-		var serverBuilder = new it.cavallium.rockserver.core.server.ServerBuilder();
 
 		if (ns.getBoolean("print_default_config")) {
 			requireNonNull(Main.class.getClassLoader()
@@ -67,12 +71,14 @@ public class Main {
 		RocksDBLoader.loadLibrary();
 
 		var rawDatabaseUrl = ns.getString("database_url");
-		var rawListenUrl = ns.getString("listen_url");
+		var rawThriftListenUrl = ns.getString("thrift_listen_url");
+		var rawGrpcListenUrl = ns.getString("grpc_listen_url");
 		var name = ns.getString("name");
 		var config = ns.getString("config");
 
 		var databaseUrl = new URI(rawDatabaseUrl);
-		var listenUrl = new URI(rawListenUrl);
+		var thriftListenUrl = new URI(rawThriftListenUrl);
+		var grpcListenUrl = new URI(rawGrpcListenUrl);
 
 		if (config != null) {
 			if (!databaseUrl.getScheme().equals("file")) {
@@ -93,24 +99,23 @@ public class Main {
 			case null, default -> throw new IllegalArgumentException("Invalid scheme \"" + databaseUrlScheme + "\" for database url url: " + databaseUrl);
 		}
 
-		var listenUrlScheme = listenUrl.getScheme();
-		switch (listenUrlScheme) {
-			case "unix" -> serverBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(listenUrl.getPath())));
-			case "http" -> serverBuilder.setHttpAddress(listenUrl.getHost(), Utils.parsePort(listenUrl));
-			case "rocksdb" -> serverBuilder.setAddress(Utils.parseHostAndPort(listenUrl));
-			case null, default -> throw new IllegalArgumentException("Invalid scheme \"" + listenUrlScheme + "\" for listen url: " + listenUrl);
-		}
+		var thriftServerBuilder = new it.cavallium.rockserver.core.server.ServerBuilder();
+		buildServerAddress(thriftServerBuilder, thriftListenUrl, true);
+		var grpcServerBuilder = new it.cavallium.rockserver.core.server.ServerBuilder();
+		buildServerAddress(grpcServerBuilder, grpcListenUrl, false);
 
 		clientBuilder.setName(name);
 		try (var connection = clientBuilder.build()) {
 			LOG.log(Level.INFO, "Connected to {0}", connection);
 
-			serverBuilder.setClient(connection);
+			thriftServerBuilder.setClient(connection);
+			grpcServerBuilder.setClient(connection);
 
 			CountDownLatch shutdownLatch = new CountDownLatch(1);
 			Runtime.getRuntime().addShutdownHook(new Thread(shutdownLatch::countDown));
 
-			try (var server = serverBuilder.build()) {
+			try (var _ = thriftServerBuilder.build();
+					var _ = grpcServerBuilder.build()) {
 				shutdownLatch.await();
 				LOG.info("Shutting down...");
 			}
@@ -118,5 +123,18 @@ public class Main {
 			throw new RuntimeException("Interrupted", e);
 		}
 		LOG.info("Shut down successfully");
+	}
+
+	private static void buildServerAddress(ServerBuilder serverBuilder, URI listenUrl, boolean useThrift) {
+		var thriftListenUrlScheme = listenUrl.getScheme();
+		switch (thriftListenUrlScheme) {
+			case "unix" -> serverBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(listenUrl.getPath())));
+			case "http" -> {
+				serverBuilder.setHttpAddress(listenUrl.getHost(), Utils.parsePort(listenUrl));
+				serverBuilder.setUseThrift(useThrift);
+			}
+			case "rocksdb" -> serverBuilder.setAddress(Utils.parseHostAndPort(listenUrl));
+			case null, default -> throw new IllegalArgumentException("Invalid scheme \"" + thriftListenUrlScheme + "\" for listen url: " + listenUrl);
+		}
 	}
 }

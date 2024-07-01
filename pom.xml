@@ -17,6 +17,9 @@
     <slf4j.version>2.0.12</slf4j.version>
     <imageName>rockserver-core</imageName>
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
+    <protobuf-plugin.version>0.6.1</protobuf-plugin.version>
+    <protobuf.version>3.25.3</protobuf.version>
+    <grpc.version>1.65.0</grpc.version>
   </properties>
 
   <repositories>
@@ -80,6 +83,21 @@
       <artifactId>slf4j-api</artifactId>
       <version>${slf4j.version}</version>
     </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-netty</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-protobuf</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-stub</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
 
     <dependency>
       <groupId>org.lz4</groupId>
@@ -106,6 +124,13 @@
         <filtering>false</filtering>
       </resource>
     </resources>
+    <extensions>
+      <extension>
+        <groupId>kr.motd.maven</groupId>
+        <artifactId>os-maven-plugin</artifactId>
+        <version>1.6.1</version>
+      </extension>
+    </extensions>
     <plugins>
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
@@ -167,6 +192,29 @@
             <phase>package</phase>
             <goals>
               <goal>shade</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.xolstice.maven.plugins</groupId>
+        <artifactId>protobuf-maven-plugin</artifactId>
+        <version>${protobuf-plugin.version}</version>
+        <configuration>
+          <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
+          <pluginId>grpc-java</pluginId>
+          <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
+        </configuration>
+        <executions>
+          <execution>
+            <configuration>
+              <pluginParameter>
+                @generated=omit
+              </pluginParameter>
+            </configuration>
+            <goals>
+              <goal>compile</goal>
+              <goal>compile-custom</goal>
             </goals>
           </execution>
         </executions>

@@ -22,6 +22,7 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
+import java.util.logging.Logger;
 import org.apache.thrift.TException;
 import org.apache.thrift.server.TThreadedSelectorServer;
 import org.apache.thrift.transport.TNonblockingServerSocket;
@@ -30,7 +31,11 @@ import org.jetbrains.annotations.NotNull;
 
 public class ThriftServer extends Server {
 
+	private static final Logger LOG = Logger.getLogger(ThriftServer.class.getName());
 	private static final OfByte BYTE_BE = ValueLayout.JAVA_BYTE.withOrder(ByteOrder.BIG_ENDIAN);
+
+	private final Thread thriftThread;
+	private final TThreadedSelectorServer server;
 
 	public ThriftServer(RocksDBConnection client, String http2Host, int http2Port) throws IOException {
 		super(client);
@@ -38,11 +43,14 @@ public class ThriftServer extends Server {
 
 		try {
 			var serverTransport = new TNonblockingServerSocket(new InetSocketAddress(http2Host, http2Port));
-			var server = new TThreadedSelectorServer(new TThreadedSelectorServer.Args(serverTransport)
+			this.server = new TThreadedSelectorServer(new TThreadedSelectorServer.Args(serverTransport)
 					.processor(new Processor<>(handler))
 			);
 
-			server.serve();
+			var thriftThread = new Thread(server::serve);
+			thriftThread.setName("Thrift server thread");
+			this.thriftThread = thriftThread;
+			LOG.info("Thrift RocksDB server is listening at " + http2Host + ":" + http2Port);
 		} catch (TTransportException e) {
 			throw new IOException("Can't open server socket", e);
 		}
@@ -299,5 +307,12 @@ public class ThriftServer extends Server {
 				return mapResult(client.getSyncApi().subsequent(arena, iterationId, skipCount, takeCount, RequestType.multi()));
 			}
 		}
+	}
+
+	@Override
+	public void close() throws IOException {
+		LOG.info("Thrift server is shutting down...");
+		this.server.stop();
+		super.close();
 	}
 }
