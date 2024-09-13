@@ -323,6 +323,7 @@
                 <buildArg>-H:IncludeResources=it/cavallium/rockserver/core/resources/build.properties</buildArg>
                 <buildArg>-H:DynamicProxyConfigurationFiles=proxy-config.json</buildArg>
                 <buildArg>-H:ReflectionConfigurationFiles=reflect-config.json</buildArg>
+                <buildArg>--install-exit-handlers</buildArg>
 
                 <buildArg>--initialize-at-build-time=io.jstach.rainbowgum</buildArg>
                 <buildArg>--initialize-at-build-time=io.jstach.rainbowgum.slf4j</buildArg>
