@@ -315,9 +315,7 @@
                 <buildArg>-march=native</buildArg>
                 <buildArg>-H:IncludeResourceBundles=net.sourceforge.argparse4j.internal.ArgumentParserImpl</buildArg>
                 <buildArg>-O1</buildArg>
-                <!--<buildArg>-H:+StaticExecutableWithDynamicLibC</buildArg>-->
-                <buildArg>--static</buildArg>
-                <buildArg>--libc=musl</buildArg>
+                <buildArg>-H:+StaticExecutableWithDynamicLibC</buildArg>
                 <buildArg>-H:+JNI</buildArg>
                 <buildArg>-H:+ForeignAPISupport</buildArg>
                 <buildArg>-H:IncludeResources=librocksdbjni-linux64.so</buildArg>
