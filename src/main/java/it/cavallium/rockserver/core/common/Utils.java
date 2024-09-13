@@ -4,6 +4,7 @@ import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_BYTES;
 import static java.lang.foreign.MemorySegment.NULL;
 import static java.util.Objects.requireNonNullElse;
 
+import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -65,6 +66,15 @@ public class Utils {
 			throw new ArithmeticException("char overflow");
 		} else {
 			return (char) value;
+		}
+	}
+
+	public static @NotNull MemorySegment toMemorySegment(Arena arena, ByteString value) {
+		var buf = value.asReadOnlyByteBuffer();
+		if (buf.isDirect()) {
+			return MemorySegment.ofBuffer(buf);
+		} else {
+			return arena.allocate(value.size()).copyFrom(MemorySegment.ofBuffer(buf));
 		}
 	}
 

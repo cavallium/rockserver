@@ -1,8 +1,14 @@
 package it.cavallium.rockserver.core.server;
 
+import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
+
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
+import com.google.rpc.DebugInfo;
+import io.grpc.Metadata;
+import io.grpc.Status;
 import io.grpc.netty.NettyServerBuilder;
+import io.grpc.protobuf.ProtoUtils;
 import io.grpc.stub.StreamObserver;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.ColumnHashType;
@@ -17,6 +23,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestMulti;
 import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
+import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.api.proto.Changed;
 import it.cavallium.rockserver.core.common.api.proto.CloseFailedUpdateRequest;
 import it.cavallium.rockserver.core.common.api.proto.CloseIteratorRequest;
@@ -54,9 +61,11 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.InetSocketAddress;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
+import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -149,8 +158,8 @@ public class GrpcServer extends Server {
 					.putAsync(autoArena,
 							request.getTransactionOrUpdateId(),
 							request.getColumnId(),
-							mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
-							MemorySegment.ofBuffer(request.getData().getValue().asReadOnlyByteBuffer()),
+							mapKeys(autoArena, request.getData().getKeysCount(), request.getData()::getKeys),
+							toMemorySegment(autoArena, request.getData().getValue()),
 							new RequestNothing<>()
 					)
 					.whenComplete(handleResponseObserver(MAP_EMPTY, responseObserver));
@@ -184,8 +193,8 @@ public class GrpcServer extends Server {
 									.putAsync(autoArena,
 											initialRequest.getTransactionOrUpdateId(),
 											initialRequest.getColumnId(),
-											mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
-											MemorySegment.ofBuffer(request.getData().getValue().asReadOnlyByteBuffer()),
+											mapKeys(autoArena, request.getData().getKeysCount(), request.getData()::getKeys),
+											toMemorySegment(autoArena, request.getData().getValue()),
 											new RequestNothing<>()
 									)
 									.whenComplete((_, error) -> {
@@ -228,8 +237,8 @@ public class GrpcServer extends Server {
 					.putAsync(autoArena,
 							request.getTransactionOrUpdateId(),
 							request.getColumnId(),
-							mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
-							MemorySegment.ofBuffer(request.getData().getValue().asReadOnlyByteBuffer()),
+							mapKeys(autoArena, request.getData().getKeysCount(), request.getData()::getKeys),
+							toMemorySegment(autoArena, request.getData().getValue()),
 							new RequestPrevious<>()
 					)
 					.whenComplete(handleResponseObserver(
@@ -249,8 +258,8 @@ public class GrpcServer extends Server {
 					.putAsync(autoArena,
 							request.getTransactionOrUpdateId(),
 							request.getColumnId(),
-							mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
-							MemorySegment.ofBuffer(request.getData().getValue().asReadOnlyByteBuffer()),
+							mapKeys(autoArena, request.getData().getKeysCount(), request.getData()::getKeys),
+							toMemorySegment(autoArena, request.getData().getValue()),
 							new RequestDelta<>()
 					)
 					.whenComplete(handleResponseObserver(
@@ -273,8 +282,8 @@ public class GrpcServer extends Server {
 					.putAsync(autoArena,
 							request.getTransactionOrUpdateId(),
 							request.getColumnId(),
-							mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
-							MemorySegment.ofBuffer(request.getData().getValue().asReadOnlyByteBuffer()),
+							mapKeys(autoArena, request.getData().getKeysCount(), request.getData()::getKeys),
+							toMemorySegment(autoArena, request.getData().getValue()),
 							new RequestChanged<>()
 					)
 					.whenComplete(handleResponseObserver(
@@ -288,8 +297,8 @@ public class GrpcServer extends Server {
 					.putAsync(autoArena,
 							request.getTransactionOrUpdateId(),
 							request.getColumnId(),
-							mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
-							MemorySegment.ofBuffer(request.getData().getValue().asReadOnlyByteBuffer()),
+							mapKeys(autoArena, request.getData().getKeysCount(), request.getData()::getKeys),
+							toMemorySegment(autoArena, request.getData().getValue()),
 							new RequestPreviousPresence<>()
 					)
 					.whenComplete(handleResponseObserver(
@@ -303,7 +312,7 @@ public class GrpcServer extends Server {
 					.getAsync(autoArena,
 							request.getTransactionOrUpdateId(),
 							request.getColumnId(),
-							mapKeys(request.getKeysCount(), request::getKeys),
+							mapKeys(autoArena, request.getKeysCount(), request::getKeys),
 							new RequestCurrent<>()
 					)
 					.whenComplete(handleResponseObserver(
@@ -323,7 +332,7 @@ public class GrpcServer extends Server {
 					.getAsync(autoArena,
 							request.getTransactionOrUpdateId(),
 							request.getColumnId(),
-							mapKeys(request.getKeysCount(), request::getKeys),
+							mapKeys(autoArena, request.getKeysCount(), request::getKeys),
 							new RequestForUpdate<>()
 					)
 					.whenComplete(handleResponseObserver(
@@ -344,7 +353,7 @@ public class GrpcServer extends Server {
 					.getAsync(autoArena,
 							request.getTransactionOrUpdateId(),
 							request.getColumnId(),
-							mapKeys(request.getKeysCount(), request::getKeys),
+							mapKeys(autoArena, request.getKeysCount(), request::getKeys),
 							new RequestExists<>()
 					)
 					.whenComplete(handleResponseObserver(
@@ -358,8 +367,8 @@ public class GrpcServer extends Server {
 					.openIteratorAsync(autoArena,
 							request.getTransactionId(),
 							request.getColumnId(),
-							mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-							mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+							mapKeys(autoArena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+							mapKeys(autoArena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 							request.getReverse(),
 							request.getTimeoutMs()
 					)
@@ -378,7 +387,7 @@ public class GrpcServer extends Server {
 		@Override
 		public void seekTo(SeekToRequest request, StreamObserver<Empty> responseObserver) {
 			client.getAsyncApi()
-					.seekToAsync(autoArena, request.getIterationId(), mapKeys(request.getKeysCount(), request::getKeys))
+					.seekToAsync(autoArena, request.getIterationId(), mapKeys(autoArena, request.getKeysCount(), request::getKeys))
 					.whenComplete(handleResponseObserver(MAP_EMPTY, responseObserver));
 		}
 
@@ -455,7 +464,7 @@ public class GrpcServer extends Server {
 		private static IntList mapKeysLength(int count, Int2IntFunction keyGetterAt) {
 			var l = new IntArrayList(count);
 			for (int i = 0; i < count; i++) {
-				l.add(keyGetterAt.apply(i));
+				l.add((int) keyGetterAt.apply(i));
 			}
 			return l;
 		}
@@ -474,10 +483,10 @@ public class GrpcServer extends Server {
 			return l;
 		}
 
-		private static Keys mapKeys(int count, Int2ObjectFunction<ByteString> keyGetterAt) {
+		private static Keys mapKeys(Arena arena, int count, Int2ObjectFunction<ByteString> keyGetterAt) {
 			var segments = new MemorySegment[count];
 			for (int i = 0; i < count; i++) {
-				segments[i] = MemorySegment.ofBuffer(keyGetterAt.apply(i).asReadOnlyByteBuffer());
+				segments[i] = toMemorySegment(arena, keyGetterAt.apply(i));
 			}
 			return new Keys(segments);
 		}
@@ -497,11 +506,28 @@ public class GrpcServer extends Server {
 			};
 		}
 
+		private static final Metadata.Key<DebugInfo> DEBUG_INFO_TRAILER_KEY =
+				ProtoUtils.keyForProto(DebugInfo.getDefaultInstance());
+
 		private static <PREV, T> BiConsumer<? super PREV, Throwable> handleResponseObserver(Function<PREV, T> resultMapper,
 				StreamObserver<T> responseObserver) {
 			return (value, ex) -> {
 				if (ex != null) {
-					responseObserver.onError(ex);
+					Metadata trailers = new Metadata();
+					trailers.put(DEBUG_INFO_TRAILER_KEY, DebugInfo.newBuilder()
+							.setDetail("rockserver grpc execution failed")
+							.build());
+					var cause = ex;
+					if (cause instanceof CompletionException completionException) {
+						cause = completionException;
+					}
+					if (cause instanceof it.cavallium.rockserver.core.common.RocksDBException rocksDBException) {
+						cause = rocksDBException;
+					}
+					var error = Status.INTERNAL.withCause(cause)
+							.withDescription(cause.toString())
+							.asException(trailers);
+					responseObserver.onError(error);
 				} else {
 					T mapped;
 					try {

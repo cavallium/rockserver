@@ -18,44 +18,44 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.Subsequent;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.List;
-import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CompletableFuture;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 
 	/** See: {@link OpenTransaction}. */
-	default CompletionStage<Long> openTransactionAsync(long timeoutMs) throws RocksDBException {
+	default CompletableFuture<Long> openTransactionAsync(long timeoutMs) throws RocksDBException {
 		return requestAsync(new OpenTransaction(timeoutMs));
 	}
 
 	/** See: {@link CloseTransaction}. */
-	default CompletionStage<Boolean> closeTransactionAsync(long transactionId, boolean commit) throws RocksDBException {
+	default CompletableFuture<Boolean> closeTransactionAsync(long transactionId, boolean commit) throws RocksDBException {
 		return requestAsync(new CloseTransaction(transactionId, commit));
 	}
 
 	/** See: {@link CloseFailedUpdate}. */
-	default CompletionStage<Void> closeFailedUpdateAsync(long updateId) throws RocksDBException {
+	default CompletableFuture<Void> closeFailedUpdateAsync(long updateId) throws RocksDBException {
 		return requestAsync(new CloseFailedUpdate(updateId));
 	}
 
 	/** See: {@link CreateColumn}. */
-	default CompletionStage<Long> createColumnAsync(String name, @NotNull ColumnSchema schema) throws RocksDBException {
+	default CompletableFuture<Long> createColumnAsync(String name, @NotNull ColumnSchema schema) throws RocksDBException {
 		return requestAsync(new CreateColumn(name, schema));
 	}
 
 	/** See: {@link DeleteColumn}. */
-	default CompletionStage<Void> deleteColumnAsync(long columnId) throws RocksDBException {
+	default CompletableFuture<Void> deleteColumnAsync(long columnId) throws RocksDBException {
 		return requestAsync(new DeleteColumn(columnId));
 	}
 
 	/** See: {@link GetColumnId}. */
-	default CompletionStage<Long> getColumnIdAsync(@NotNull String name) throws RocksDBException {
+	default CompletableFuture<Long> getColumnIdAsync(@NotNull String name) throws RocksDBException {
 		return requestAsync(new GetColumnId(name));
 	}
 
 	/** See: {@link Put}. */
-	default <T> CompletionStage<T> putAsync(Arena arena,
+	default <T> CompletableFuture<T> putAsync(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
@@ -65,7 +65,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link PutMulti}. */
-	default <T> CompletionStage<List<T>> putMultiAsync(Arena arena,
+	default <T> CompletableFuture<List<T>> putMultiAsync(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
@@ -75,7 +75,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link Get}. */
-	default <T> CompletionStage<T> getAsync(Arena arena,
+	default <T> CompletableFuture<T> getAsync(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
@@ -84,7 +84,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link OpenIterator}. */
-	default CompletionStage<Long> openIteratorAsync(Arena arena,
+	default CompletableFuture<Long> openIteratorAsync(Arena arena,
 			long transactionId,
 			long columnId,
 			@NotNull Keys startKeysInclusive,
@@ -102,17 +102,17 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link CloseIterator}. */
-	default CompletionStage<Void> closeIteratorAsync(long iteratorId) throws RocksDBException {
+	default CompletableFuture<Void> closeIteratorAsync(long iteratorId) throws RocksDBException {
 		return requestAsync(new CloseIterator(iteratorId));
 	}
 
 	/** See: {@link SeekTo}. */
-	default CompletionStage<Void> seekToAsync(Arena arena, long iterationId, @NotNull Keys keys) throws RocksDBException {
+	default CompletableFuture<Void> seekToAsync(Arena arena, long iterationId, @NotNull Keys keys) throws RocksDBException {
 		return requestAsync(new SeekTo(arena, iterationId, keys));
 	}
 
 	/** See: {@link Subsequent}. */
-	default <T> CompletionStage<T> subsequentAsync(Arena arena,
+	default <T> CompletableFuture<T> subsequentAsync(Arena arena,
 			long iterationId,
 			long skipCount,
 			long takeCount,

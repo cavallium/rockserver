@@ -10,6 +10,7 @@ import com.google.protobuf.Empty;
 import com.google.protobuf.UnsafeByteOperations;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
@@ -63,6 +64,7 @@ import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBS
 import it.cavallium.rockserver.core.common.api.proto.SeekToRequest;
 import it.cavallium.rockserver.core.common.api.proto.SubsequentRequest;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.URI;
@@ -70,14 +72,17 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
+	private static final Logger LOG = LoggerFactory.getLogger(GrpcConnection.class);
 	private static final Executor DIRECT_EXECUTOR = MoreExecutors.directExecutor();
 	private final ManagedChannel channel;
 	private final RocksDBServiceBlockingStub blockingStub;
@@ -121,7 +126,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletionStage<Long> openTransactionAsync(long timeoutMs) throws RocksDBException {
+	public CompletableFuture<Long> openTransactionAsync(long timeoutMs) throws RocksDBException {
 		var request = OpenTransactionRequest.newBuilder()
 				.setTimeoutMs(timeoutMs)
 				.build();
@@ -129,7 +134,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletionStage<Boolean> closeTransactionAsync(long transactionId, boolean commit) throws RocksDBException {
+	public CompletableFuture<Boolean> closeTransactionAsync(long transactionId, boolean commit) throws RocksDBException {
 		var request = CloseTransactionRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setCommit(commit)
@@ -138,7 +143,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletionStage<Void> closeFailedUpdateAsync(long updateId) throws RocksDBException {
+	public CompletableFuture<Void> closeFailedUpdateAsync(long updateId) throws RocksDBException {
 		var request = CloseFailedUpdateRequest.newBuilder()
 				.setUpdateId(updateId)
 				.build();
@@ -146,7 +151,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletionStage<Long> createColumnAsync(String name, @NotNull ColumnSchema schema) throws RocksDBException {
+	public CompletableFuture<Long> createColumnAsync(String name, @NotNull ColumnSchema schema) throws RocksDBException {
 		var request = CreateColumnRequest.newBuilder()
 				.setName(name)
 				.setSchema(mapColumnSchema(schema))
@@ -155,7 +160,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletionStage<Void> deleteColumnAsync(long columnId) throws RocksDBException {
+	public CompletableFuture<Void> deleteColumnAsync(long columnId) throws RocksDBException {
 		var request = DeleteColumnRequest.newBuilder()
 				.setColumnId(columnId)
 				.build();
@@ -163,7 +168,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletionStage<Long> getColumnIdAsync(@NotNull String name) throws RocksDBException {
+	public CompletableFuture<Long> getColumnIdAsync(@NotNull String name) throws RocksDBException {
 		var request = GetColumnIdRequest.newBuilder()
 				.setName(name)
 				.build();
@@ -172,7 +177,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <T> CompletionStage<T> putAsync(Arena arena,
+	public <T> CompletableFuture<T> putAsync(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
@@ -183,7 +188,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setColumnId(columnId)
 				.setData(mapKV(keys, value))
 				.build();
-		return (CompletionStage<T>) switch (requestType) {
+		return (CompletableFuture<T>) switch (requestType) {
 			case RequestNothing<?> _ -> toResponse(this.futureStub.put(request), _ -> null);
 			case RequestPrevious<?> _ ->
 					toResponse(this.futureStub.putGetPrevious(request), GrpcConnection::mapPrevious);
@@ -197,7 +202,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public <T> CompletionStage<List<T>> putMultiAsync(Arena arena,
+	public <T> CompletableFuture<List<T>> putMultiAsync(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<@NotNull Keys> allKeys,
@@ -270,7 +275,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <T> CompletionStage<T> getAsync(Arena arena,
+	public <T> CompletableFuture<T> getAsync(Arena arena,
 			long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
@@ -296,7 +301,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletionStage<Long> openIteratorAsync(Arena arena,
+	public CompletableFuture<Long> openIteratorAsync(Arena arena,
 			long transactionId,
 			long columnId,
 			@NotNull Keys startKeysInclusive,
@@ -315,7 +320,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletionStage<Void> closeIteratorAsync(long iteratorId) throws RocksDBException {
+	public CompletableFuture<Void> closeIteratorAsync(long iteratorId) throws RocksDBException {
 		var request = CloseIteratorRequest.newBuilder()
 				.setIteratorId(iteratorId)
 				.build();
@@ -323,7 +328,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletionStage<Void> seekToAsync(Arena arena, long iterationId, @NotNull Keys keys) throws RocksDBException {
+	public CompletableFuture<Void> seekToAsync(Arena arena, long iterationId, @NotNull Keys keys) throws RocksDBException {
 		var request = SeekToRequest.newBuilder()
 				.setIterationId(iterationId)
 				.addAllKeys(mapKeys(keys))
@@ -333,7 +338,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <T> CompletionStage<T> subsequentAsync(Arena arena,
+	public <T> CompletableFuture<T> subsequentAsync(Arena arena,
 			long iterationId,
 			long skipCount,
 			long takeCount,
@@ -346,12 +351,12 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return switch (requestType) {
 			case RequestNothing<?> _ -> toResponse(this.futureStub.subsequent(request), _ -> null);
 			case RequestExists<?> _ ->
-					(CompletionStage<T>) toResponse(this.futureStub.subsequentExists(request), PreviousPresence::getPresent);
+					(CompletableFuture<T>) toResponse(this.futureStub.subsequentExists(request), PreviousPresence::getPresent);
 			case RequestMulti<?> _ -> {
 				CollectListMappedStreamObserver<KV, MemorySegment> responseObserver
 						= new CollectListMappedStreamObserver<>(kv -> mapByteString(kv.getValue()));
 				this.asyncStub.subsequentMultiGet(request, responseObserver);
-				yield (CompletionStage<T>) responseObserver;
+				yield (CompletableFuture<T>) responseObserver;
 			}
 		};
 	}
@@ -464,5 +469,28 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}, DIRECT_EXECUTOR);
 
 		return cf;
+	}
+
+	@Override
+	public void close() {
+		try {
+			if (this.channel != null) {
+				this.channel.shutdown();
+			}
+		} catch (Exception ex) {
+			LOG.error("Failed to close channel", ex);
+		}
+		try {
+			if (this.channel != null) {
+				this.channel.awaitTermination(1, TimeUnit.MINUTES);
+			}
+		} catch (InterruptedException e) {
+			LOG.error("Failed to wait channel termination", e);
+			try {
+				this.channel.shutdownNow();
+			} catch (Exception ex) {
+				LOG.error("Failed to close channel", ex);
+			}
+		}
 	}
 }

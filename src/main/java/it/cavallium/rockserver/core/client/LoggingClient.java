@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import java.io.IOException;
 import java.net.URI;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -76,7 +77,7 @@ public class LoggingClient implements RocksDBConnection {
 		}
 
 		@Override
-		public <R> CompletionStage<R> requestAsync(RocksDBAPICommand<R> req) {
+		public <R> CompletableFuture<R> requestAsync(RocksDBAPICommand<R> req) {
 			return asyncApi.requestAsync(req).whenComplete((result, e) -> {
 				if (e != null) {
 					logger.trace("Request failed: {}    Error: {}", req, e.getMessage());

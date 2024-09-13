@@ -20,7 +20,6 @@ import java.util.List;
 import java.util.Optional;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.jetbrains.annotations.NotNull;
@@ -95,7 +94,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public <R> CompletionStage<R> requestAsync(RocksDBAPICommand<R> req) {
+	public <R> CompletableFuture<R> requestAsync(RocksDBAPICommand<R> req) {
 		return CompletableFuture.supplyAsync(() -> req.handleSync(this), exeuctor);
 	}
 
