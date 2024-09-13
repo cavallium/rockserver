@@ -4,11 +4,8 @@ import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
-import com.google.rpc.DebugInfo;
-import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.netty.NettyServerBuilder;
-import io.grpc.protobuf.ProtoUtils;
 import io.grpc.stub.StreamObserver;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.ColumnHashType;
@@ -506,17 +503,10 @@ public class GrpcServer extends Server {
 			};
 		}
 
-		private static final Metadata.Key<DebugInfo> DEBUG_INFO_TRAILER_KEY =
-				ProtoUtils.keyForProto(DebugInfo.getDefaultInstance());
-
 		private static <PREV, T> BiConsumer<? super PREV, Throwable> handleResponseObserver(Function<PREV, T> resultMapper,
 				StreamObserver<T> responseObserver) {
 			return (value, ex) -> {
 				if (ex != null) {
-					Metadata trailers = new Metadata();
-					trailers.put(DEBUG_INFO_TRAILER_KEY, DebugInfo.newBuilder()
-							.setDetail("rockserver grpc execution failed")
-							.build());
 					var cause = ex;
 					if (cause instanceof CompletionException completionException) {
 						cause = completionException;
@@ -526,7 +516,7 @@ public class GrpcServer extends Server {
 					}
 					var error = Status.INTERNAL.withCause(cause)
 							.withDescription(cause.toString())
-							.asException(trailers);
+							.asException();
 					responseObserver.onError(error);
 				} else {
 					T mapped;

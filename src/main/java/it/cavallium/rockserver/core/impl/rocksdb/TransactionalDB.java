@@ -157,17 +157,23 @@ public sealed interface TransactionalDB extends Closeable {
 				}
 			}
 			try {
-				db.flushWal(true);
+				if (db.isOwningHandle()) {
+					db.flushWal(true);
+				}
 			} catch (RocksDBException e) {
 				exceptions.add(e);
 			}
 			try (var options = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
-				db.flush(options);
+				if (db.isOwningHandle()) {
+					db.flush(options);
+				}
 			} catch (RocksDBException e) {
 				exceptions.add(e);
 			}
 			try {
-				db.closeE();
+				if (db.isOwningHandle()) {
+					db.closeE();
+				}
 			} catch (RocksDBException e) {
 				exceptions.add(e);
 			}

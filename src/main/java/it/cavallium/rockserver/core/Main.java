@@ -111,21 +111,22 @@ public class Main {
 
 		clientBuilder.setName(name);
 		try (var connection = clientBuilder.build()) {
-			LOG.info("Connected to {}", connection);
+			try {
+				LOG.info("Connected to {}", connection);
 
-			thriftServerBuilder.setClient(connection);
-			grpcServerBuilder.setClient(connection);
+				thriftServerBuilder.setClient(connection);
+				grpcServerBuilder.setClient(connection);
 
-			CountDownLatch shutdownLatch = new CountDownLatch(1);
-			Runtime.getRuntime().addShutdownHook(new Thread(shutdownLatch::countDown));
+				CountDownLatch shutdownLatch = new CountDownLatch(1);
+				Runtime.getRuntime().addShutdownHook(new Thread(shutdownLatch::countDown));
 
-			try (var _ = thriftServerBuilder.build();
-					var _ = grpcServerBuilder.build()) {
-				shutdownLatch.await();
-				LOG.info("Shutting down...");
+				try (var _ = thriftServerBuilder.build(); var _ = grpcServerBuilder.build()) {
+					shutdownLatch.await();
+					LOG.info("Shutting down...");
+				}
+			} catch (Exception ex) {
+				LOG.error("Unexpected error", ex);
 			}
-		} catch (InterruptedException e) {
-			throw new RuntimeException("Interrupted", e);
 		}
 		LOG.info("Shut down successfully");
 	}
