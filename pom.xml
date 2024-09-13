@@ -19,7 +19,7 @@
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
     <protobuf-plugin.version>0.6.1</protobuf-plugin.version>
     <protobuf.version>3.25.3</protobuf.version>
-    <grpc.version>1.65.0</grpc.version>
+    <grpc.version>1.65.1</grpc.version>
     <rainbowgum.version>0.7.0</rainbowgum.version>
   </properties>
 
@@ -113,6 +113,11 @@
       <groupId>io.grpc</groupId>
       <artifactId>grpc-netty</artifactId>
       <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-tcnative-boringssl-static</artifactId>
+      <version>2.0.65.Final</version>
     </dependency>
     <dependency>
       <groupId>io.grpc</groupId>
@@ -359,7 +364,12 @@
                 <buildArg>--initialize-at-run-time=org.rocksdb.RocksObject</buildArg>
                 <buildArg>--initialize-at-run-time=org.rocksdb.RocksDBException</buildArg>
                 <buildArg>--initialize-at-run-time=io.netty.util.AbstractReferenceCounted</buildArg>
-                <buildArg>--initialize-at-run-time=io.netty.handler.ssl.ReferenceCountedOpenSslEngine</buildArg>
+                <buildArg>--initialize-at-run-time=io.netty.handler.ssl.JdkNpnApplicationProtocolNegotiator</buildArg>
+                <buildArg>--initialize-at-run-time=io.netty.handler.ssl.JdkAlpnApplicationProtocolNegotiator</buildArg>
+                <buildArg>--initialize-at-run-time=io.netty.handler.ssl.JdkApplicationProtocolNegotiator</buildArg>
+                <buildArg>--initialize-at-run-time=io.netty.handler.ssl.OpenSslDefaultApplicationProtocolNegotiator</buildArg>
+                <buildArg>--initialize-at-run-time=io.netty.handler.ssl.OpenSslNpnApplicationProtocolNegotiator</buildArg>
+                <buildArg>--report-unsupported-elements-at-runtime</buildArg>
 
                 <buildArg>-dsa</buildArg>
                 <buildArg>--no-fallback</buildArg>

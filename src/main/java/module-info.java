@@ -21,6 +21,12 @@ module rockserver.core {
 	requires org.graalvm.nativeimage;
 	requires io.netty.common;
 	requires proto.google.common.protos;
+	requires io.netty.handler;
+	requires io.netty.buffer;
+	requires io.netty.transport;
+	requires io.netty.codec.http;
+	requires io.netty.codec;
+	requires io.netty.codec.http2;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
