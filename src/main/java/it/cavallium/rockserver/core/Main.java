@@ -12,16 +12,16 @@ import java.net.URISyntaxException;
 import java.net.UnixDomainSocketAddress;
 import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 import net.sourceforge.argparse4j.ArgumentParsers;
 import net.sourceforge.argparse4j.inf.ArgumentParser;
 import net.sourceforge.argparse4j.inf.ArgumentParserException;
 import net.sourceforge.argparse4j.inf.Namespace;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class Main {
 
-	private static final Logger LOG = Logger.getLogger("rockserver-core");
+	private static final Logger LOG = LoggerFactory.getLogger("rockserver-core");
 
 	public static void main(String[] args) throws IOException, URISyntaxException {
 		ArgumentParser parser = ArgumentParsers.newFor("rockserver-core").build()
@@ -106,7 +106,7 @@ public class Main {
 
 		clientBuilder.setName(name);
 		try (var connection = clientBuilder.build()) {
-			LOG.log(Level.INFO, "Connected to {0}", connection);
+			LOG.info("Connected to {}", connection);
 
 			thriftServerBuilder.setClient(connection);
 			grpcServerBuilder.setClient(connection);

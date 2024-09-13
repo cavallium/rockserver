@@ -48,7 +48,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
-import java.util.logging.Logger;
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -60,6 +59,8 @@ import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.Status.Code;
 import org.rocksdb.WriteOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 
@@ -80,7 +81,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
 		this.path = path;
-		this.logger = Logger.getLogger("db." + name);
+		this.logger = LoggerFactory.getLogger("db." + name);
 		this.columns = new NonBlockingHashMapLong<>();
 		this.txs = new NonBlockingHashMapLong<>();
 		this.its = new NonBlockingHashMapLong<>();
@@ -120,7 +121,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			}
 		}
 		if (Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
-			logger.log(Level.INFO, "Database configuration: {0}", ConfigPrinter.stringify(config));
+			logger.info("Database configuration: {}", ConfigPrinter.stringify(config));
 		}
 	}
 
@@ -220,7 +221,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				Utils.deleteDirectory(db.getPath());
 			}
 		} catch (TimeoutException e) {
-			logger.log(Level.SEVERE, "Some operations lasted more than 10 seconds, forcing database shutdown...");
+			logger.error("Some operations lasted more than 10 seconds, forcing database shutdown...");
 		}
 	}
 

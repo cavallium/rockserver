@@ -57,11 +57,12 @@ import java.net.InetSocketAddress;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class GrpcServer extends Server {
 
-	private static final Logger LOG = Logger.getLogger(GrpcServer.class.getName());
+	private static final Logger LOG = LoggerFactory.getLogger(GrpcServer.class.getName());
 
 	private final GrpcServerImpl grpc;
 	private final io.grpc.Server server;

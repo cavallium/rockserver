@@ -5,6 +5,14 @@ import it.cavallium.rockserver.core.config.*;
 import java.io.InputStream;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.SequencedMap;
+import java.util.logging.Level;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -16,9 +24,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.*;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+
+import org.slf4j.Logger;
 
 import static it.cavallium.rockserver.core.common.Utils.mapList;
 import static java.lang.Boolean.parseBoolean;
@@ -365,7 +372,7 @@ public class RocksDBLoader {
                 try {
                     columnFamilyOptions.setPrepopulateBlobCache(PrepopulateBlobCache.PREPOPULATE_BLOB_FLUSH_ONLY);
                 } catch (Throwable ex) {
-                    logger.log(Level.SEVERE, "Failed to set prepopulate blob cache", ex);
+                    logger.error("Failed to set prepopulate blob cache", ex);
                 }
 
                 // This option is not supported with multiple db paths
@@ -374,6 +381,8 @@ public class RocksDBLoader {
                 boolean dynamicLevelBytes = volumeConfigs.size() <= 1;
                 if (dynamicLevelBytes) {
                     columnFamilyOptions.setLevelCompactionDynamicLevelBytes(true);
+                    columnFamilyOptions.setMaxBytesForLevelBase(10 * SizeUnit.GB);
+                    columnFamilyOptions.setMaxBytesForLevelMultiplier(10);
                 } else {
                     // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
                     // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
@@ -565,13 +574,11 @@ public class RocksDBLoader {
             try {
                 for (ColumnFamilyHandle cfh : handles) {
                     var props = db.getProperty(cfh, "rocksdb.stats");
-                    logger.log(Level.FINEST, "Stats for database column {1}: {2}",
-                            new Object[]{new String(cfh.getName(), StandardCharsets.UTF_8),
-                                    props}
-                    );
+                    logger.trace("Stats for database column {}: {}", new String(cfh.getName(), StandardCharsets.UTF_8),
+                        props);
                 }
             } catch (RocksDBException ex) {
-                logger.log(Level.FINE, "Failed to obtain stats", ex);
+                logger.debug("Failed to obtain stats", ex);
             }
 
             var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);

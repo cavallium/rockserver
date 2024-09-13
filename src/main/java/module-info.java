@@ -16,6 +16,10 @@ module rockserver.core {
 	requires jsr305;
 	requires com.google.common;
 	requires io.grpc.netty;
+	requires io.jstach.rainbowgum;
+	requires io.jstach.rainbowgum.pattern;
+	requires org.graalvm.nativeimage;
+	requires io.netty.common;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

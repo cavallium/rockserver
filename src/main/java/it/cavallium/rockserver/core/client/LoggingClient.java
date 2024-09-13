@@ -8,7 +8,8 @@ import java.net.URI;
 import java.util.concurrent.CompletionStage;
 import java.util.function.Supplier;
 import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class LoggingClient implements RocksDBConnection {
 
@@ -21,7 +22,7 @@ public class LoggingClient implements RocksDBConnection {
 		this.client = client;
 		this.syncApi = new LoggingSyncApi(client.getSyncApi());
 		this.asyncApi = new LoggingAsyncApi(client.getAsyncApi());
-		this.logger = Logger.getLogger("db.requests");
+		this.logger = LoggerFactory.getLogger("db.requests");
 	}
 
 	@Override
@@ -58,10 +59,10 @@ public class LoggingClient implements RocksDBConnection {
 			try {
 				result = syncApi.requestSync(req);
 			} catch (Throwable e) {
-				logger.log(Level.FINEST, "Request failed: {0}    Error: {1}", new Object[] {req, e.getMessage()});
+				logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
 				throw e;
 			}
-			logger.log(Level.FINEST, "Request executed: {0}    Result: {1}", new Object[] {req, result});
+			logger.trace("Request executed: {}    Result: {}", req, result);
 			return result;
 		}
 	}
@@ -78,9 +79,9 @@ public class LoggingClient implements RocksDBConnection {
 		public <R> CompletionStage<R> requestAsync(RocksDBAPICommand<R> req) {
 			return asyncApi.requestAsync(req).whenComplete((result, e) -> {
 				if (e != null) {
-					logger.log(Level.FINEST, "Request failed: {0}    Error: {1}", new Object[] {req, e.getMessage()});
+					logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
 				} else {
-					logger.log(Level.FINEST, "Request executed: {0}    Result: {1}", new Object[] {req, result});
+					logger.trace("Request executed: {}    Result: {}", req, result);
 				}
 			});
 		}

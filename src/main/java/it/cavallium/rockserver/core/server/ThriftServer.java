@@ -22,16 +22,17 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
-import java.util.logging.Logger;
 import org.apache.thrift.TException;
 import org.apache.thrift.server.TThreadedSelectorServer;
 import org.apache.thrift.transport.TNonblockingServerSocket;
 import org.apache.thrift.transport.TTransportException;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class ThriftServer extends Server {
 
-	private static final Logger LOG = Logger.getLogger(ThriftServer.class.getName());
+	private static final Logger LOG = LoggerFactory.getLogger(ThriftServer.class.getName());
 	private static final OfByte BYTE_BE = ValueLayout.JAVA_BYTE.withOrder(ByteOrder.BIG_ENDIAN);
 
 	private final Thread thriftThread;

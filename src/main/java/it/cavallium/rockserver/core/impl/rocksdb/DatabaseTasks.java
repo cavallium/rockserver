@@ -4,9 +4,10 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.logging.Level;
-import java.util.logging.Logger;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class DatabaseTasks implements Closeable {
 
@@ -19,7 +20,7 @@ public class DatabaseTasks implements Closeable {
 	public DatabaseTasks(RocksDB db, boolean inMemory, Duration delayWalFlushConfig) {
 		this.db = db;
 		this.inMemory = inMemory;
-		this.logger = Logger.getLogger("db." + db.getName() + ".tasks");
+		this.logger = LoggerFactory.getLogger("db." + db.getName() + ".tasks");
 		this.delayWalFlushConfig = inMemory ? Duration.ZERO : delayWalFlushConfig;
 	}
 
@@ -37,7 +38,7 @@ public class DatabaseTasks implements Closeable {
 					try {
 						db.flushWal(true);
 					} catch (RocksDBException e) {
-						logger.log(Level.SEVERE, "Failed to flush database \"%s\" wal".formatted(db.getName()), e);
+						logger.error("Failed to flush database \"%s\" wal".formatted(db.getName()), e);
 					}
 				}
 			});
