@@ -37,6 +37,31 @@
     </repository>
   </repositories>
 
+  <distributionManagement>
+    <repository>
+      <id>mchv-release-distribution</id>
+      <name>MCHV Release Apache Maven Packages Distribution</name>
+      <url>https://mvn.mchv.eu/repository/mchv</url>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+      <snapshots>
+        <enabled>false</enabled>
+      </snapshots>
+    </repository>
+    <snapshotRepository>
+      <id>mchv-snapshot-distribution</id>
+      <name>MCHV Snapshot Apache Maven Packages Distribution</name>
+      <url>https://mvn.mchv.eu/repository/mchv-snapshot</url>
+      <releases>
+        <enabled>false</enabled>
+      </releases>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
+    </snapshotRepository>
+  </distributionManagement>
+
   <dependencies>
     <dependency>
       <groupId>org.rocksdb</groupId>
