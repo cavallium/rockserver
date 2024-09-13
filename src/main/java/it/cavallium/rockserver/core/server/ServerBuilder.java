@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.server;
 import it.cavallium.rockserver.core.client.ClientBuilder;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.UnixDomainSocketAddress;
@@ -10,10 +11,9 @@ import java.nio.file.Path;
 
 public class ServerBuilder {
 
-	private InetSocketAddress iNetAddress;
+	private HostAndPort iNetAddress;
 	private UnixDomainSocketAddress unixAddress;
-	private String http2Host;
-	private int http2Port;
+	private HostAndPort http2Address;
 	private boolean useThrift;
 	private RocksDBConnection client;
 
@@ -21,13 +21,12 @@ public class ServerBuilder {
 		this.unixAddress = address;
 	}
 
-	public void setAddress(InetSocketAddress address) {
+	public void setAddress(HostAndPort address) {
 		this.iNetAddress = address;
 	}
 
-	public void setHttpAddress(String host, int port) {
-		this.http2Host = host;
-		this.http2Port = port;
+	public void setHttpAddress(HostAndPort address) {
+		this.http2Address = address;
 	}
 
 	public void setUseThrift(boolean useThrift) {
@@ -39,11 +38,11 @@ public class ServerBuilder {
 	}
 
 	public Server build() throws IOException {
-		if (http2Host != null) {
+		if (http2Address != null) {
 			if (useThrift) {
-				return new ThriftServer(client, http2Host, http2Port);
+				return new ThriftServer(client, http2Address.host(), http2Address.port());
 			} else {
-				return new GrpcServer(client, http2Host, http2Port);
+				return new GrpcServer(client, http2Address.host(), http2Address.port());
 			}
 		} else if (unixAddress != null) {
 			throw new UnsupportedOperationException("Not implemented: unix socket");

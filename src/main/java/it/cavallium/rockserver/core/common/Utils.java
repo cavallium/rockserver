@@ -7,8 +7,6 @@ import static java.util.Objects.requireNonNullElse;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -149,8 +147,8 @@ public class Utils {
 				== -1;
 	}
 
-	public static InetSocketAddress parseHostAndPort(URI uri) {
-		return new InetSocketAddress(uri.getHost(), parsePort(uri));
+	public static HostAndPort parseHostAndPort(URI uri) {
+		return new HostAndPort(uri.getHost(), parsePort(uri));
 	}
 
 	public static int parsePort(URI uri) {
@@ -166,4 +164,6 @@ public class Utils {
 		var b = s.toArray(BIG_ENDIAN_BYTES);
 		return HexFormat.of().formatHex(b);
 	}
+
+	public record HostAndPort(String host, int port) {}
 }

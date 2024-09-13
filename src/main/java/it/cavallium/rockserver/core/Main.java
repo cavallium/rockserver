@@ -4,6 +4,7 @@ import static it.cavallium.rockserver.core.client.EmbeddedConnection.PRIVATE_MEM
 import static java.util.Objects.requireNonNull;
 
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
 import it.cavallium.rockserver.core.server.ServerBuilder;
 import java.io.IOException;
@@ -95,6 +96,10 @@ public class Main {
 			case "unix" -> clientBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(databaseUrl.getPath())));
 			case "file" -> clientBuilder.setEmbeddedPath(Path.of((databaseUrl.getAuthority() != null ? databaseUrl.getAuthority() : "") + databaseUrl.getPath()).normalize());
 			case "memory" -> clientBuilder.setEmbeddedInMemory(true);
+			case "http" -> {
+				clientBuilder.setHttpAddress(Utils.parseHostAndPort(databaseUrl));
+				clientBuilder.setUseThrift(false);
+			}
 			case "rocksdb" -> clientBuilder.setAddress(Utils.parseHostAndPort(databaseUrl));
 			case null, default -> throw new IllegalArgumentException("Invalid scheme \"" + databaseUrlScheme + "\" for database url url: " + databaseUrl);
 		}
@@ -130,7 +135,7 @@ public class Main {
 		switch (thriftListenUrlScheme) {
 			case "unix" -> serverBuilder.setUnixSocket(UnixDomainSocketAddress.of(Path.of(listenUrl.getPath())));
 			case "http" -> {
-				serverBuilder.setHttpAddress(listenUrl.getHost(), Utils.parsePort(listenUrl));
+				serverBuilder.setHttpAddress(new HostAndPort(listenUrl.getHost(), Utils.parsePort(listenUrl)));
 				serverBuilder.setUseThrift(useThrift);
 			}
 			case "rocksdb" -> serverBuilder.setAddress(Utils.parseHostAndPort(listenUrl));

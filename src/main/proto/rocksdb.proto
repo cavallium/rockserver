@@ -90,9 +90,13 @@ service RocksDBService {
   rpc put(PutRequest) returns (google.protobuf.Empty);
   rpc putMulti(stream PutMultiRequest) returns (google.protobuf.Empty);
   rpc putGetPrevious(PutRequest) returns (Previous);
+  rpc putMultiGetPrevious(stream PutMultiRequest) returns (stream Previous);
   rpc putGetDelta(PutRequest) returns (Delta);
+  rpc putMultiGetDelta(stream PutMultiRequest) returns (stream Delta);
   rpc putGetChanged(PutRequest) returns (Changed);
+  rpc putMultiGetChanged(stream PutMultiRequest) returns (stream Changed);
   rpc putGetPreviousPresence(PutRequest) returns (PreviousPresence);
+  rpc putMultiGetPreviousPresence(stream PutMultiRequest) returns (stream PreviousPresence);
   rpc get(GetRequest) returns (GetResponse);
   rpc getForUpdate(GetRequest) returns (UpdateBegin);
   rpc exists(GetRequest) returns (PreviousPresence);

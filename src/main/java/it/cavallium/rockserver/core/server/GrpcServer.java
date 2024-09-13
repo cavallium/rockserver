@@ -408,6 +408,11 @@ public class GrpcServer extends Server {
 							responseObserver));
 		}
 
+		@Override
+		public void subsequentMultiGet(SubsequentRequest request, StreamObserver<KV> responseObserver) {
+			subsequentMultiPage(request, responseObserver, 0);
+		}
+
 		public void subsequentMultiPage(SubsequentRequest request, StreamObserver<KV> responseObserver, int pageIndex) {
 			final long pageSize = 16L;
 			if (request.getTakeCount() > pageIndex * pageSize) {
@@ -436,11 +441,6 @@ public class GrpcServer extends Server {
 			} else {
 				responseObserver.onCompleted();
 			}
-		}
-
-		@Override
-		public void subsequentMultiGet(SubsequentRequest request, StreamObserver<KV> responseObserver) {
-			subsequentMultiPage(request, responseObserver, 0);
 		}
 
 		// mappers

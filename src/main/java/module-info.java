@@ -20,6 +20,7 @@ module rockserver.core {
 	requires io.jstach.rainbowgum.pattern;
 	requires org.graalvm.nativeimage;
 	requires io.netty.common;
+	requires proto.google.common.protos;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
