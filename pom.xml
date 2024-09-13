@@ -359,6 +359,7 @@
                 <buildArg>--initialize-at-run-time=org.rocksdb.RocksObject</buildArg>
                 <buildArg>--initialize-at-run-time=org.rocksdb.RocksDBException</buildArg>
                 <buildArg>--initialize-at-run-time=io.netty.util.AbstractReferenceCounted</buildArg>
+                <buildArg>--initialize-at-run-time=io.netty.handler.ssl.ReferenceCountedOpenSslEngine</buildArg>
 
                 <buildArg>-dsa</buildArg>
                 <buildArg>--no-fallback</buildArg>
