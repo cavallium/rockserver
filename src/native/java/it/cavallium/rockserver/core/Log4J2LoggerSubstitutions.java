@@ -1,4 +1,4 @@
-package it.cavallium.rockserver.core.logging;
+package it.cavallium.rockserver.core;
 
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;

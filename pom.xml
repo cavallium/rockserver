@@ -237,10 +237,7 @@
 
   <profiles>
     <profile>
-      <id>standalone</id>
-      <activation>
-        <activeByDefault>false</activeByDefault>
-      </activation>
+      <id>fatjar</id>
       <dependencies>
         <dependency>
           <groupId>io.jstach.rainbowgum</groupId>
@@ -277,18 +274,12 @@
                 <configuration>
                   <sources>
                     <source>src/standalone/java/</source>
+                    <source>src/fatjar/java/</source>
                   </sources>
                 </configuration>
               </execution>
             </executions>
           </plugin>
-        </plugins>
-      </build>
-    </profile>
-    <profile>
-      <id>fatjar</id>
-      <build>
-        <plugins>
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-shade-plugin</artifactId>
@@ -310,10 +301,77 @@
         </plugins>
       </build>
     </profile>
+
     <profile>
-      <id>native</id>
+      <id>library</id>
       <build>
         <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.4.0</version>
+            <executions>
+              <execution>
+                <id>add-source</id>
+                <phase>generate-sources</phase>
+                <goals>
+                  <goal>add-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>src/library/java/</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
+      <id>native</id>
+      <dependencies>
+        <dependency>
+          <groupId>io.jstach.rainbowgum</groupId>
+          <artifactId>rainbowgum-core</artifactId>
+          <version>${rainbowgum.version}</version>
+          <scope>compile</scope>
+        </dependency>
+        <dependency>
+          <groupId>io.jstach.rainbowgum</groupId>
+          <artifactId>rainbowgum-pattern</artifactId>
+          <version>${rainbowgum.version}</version>
+          <scope>compile</scope>
+        </dependency>
+        <dependency>
+          <groupId>io.jstach.rainbowgum</groupId>
+          <artifactId>rainbowgum-slf4j</artifactId>
+          <version>${rainbowgum.version}</version>
+          <scope>compile</scope>
+        </dependency>
+      </dependencies>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.4.0</version>
+            <executions>
+              <execution>
+                <id>add-source</id>
+                <phase>generate-sources</phase>
+                <goals>
+                  <goal>add-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>src/native/java/</source>
+                    <source>src/standalone/java/</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
           <plugin>
             <groupId>org.graalvm.buildtools</groupId>
             <artifactId>native-maven-plugin</artifactId>

@@ -1,4 +1,4 @@
-package it.cavallium.rockserver.core.logging;
+package it.cavallium.rockserver.core;
 
 import java.nio.ByteBuffer;
 

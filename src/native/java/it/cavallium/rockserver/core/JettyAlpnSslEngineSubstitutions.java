@@ -1,4 +1,4 @@
-package it.cavallium.rockserver.core.logging;
+package it.cavallium.rockserver.core;
 
 import static io.netty.handler.codec.http.HttpHeaderValues.DEFLATE;
 import static io.netty.handler.codec.http.HttpHeaderValues.GZIP;
