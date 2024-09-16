@@ -34,7 +34,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
 		super(name);
 		this.db = new EmbeddedDB(path, name, embeddedConfig);
-		this.exeuctor = Executors.newVirtualThreadPerTaskExecutor();
+		this.exeuctor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
 	}
 
 	@Override
