@@ -467,10 +467,12 @@ public class GrpcServer extends Server {
 		}
 
 		private static void closeArenaSafe(Arena autoArena) {
-			try {
-				autoArena.close();
-			} catch (Exception ex2) {
-				LOG.error("Failed to close arena", ex2);
+			if (autoArena != null) {
+				try {
+					autoArena.close();
+				} catch (Exception ex2) {
+					LOG.error("Failed to close arena", ex2);
+				}
 			}
 		}
 
