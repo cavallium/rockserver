@@ -162,11 +162,11 @@ abstract class EmbeddedDBTest {
 			Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, toMemorySegmentSimple(arena, 123), RequestType.delta()));
 		} else {
 			Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, MemorySegment.NULL, RequestType.delta()));
-			Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, null, RequestType.delta()));
+			Assertions.assertThrows(IllegalArgumentException.class, () -> db.put(arena, 0, colId, key, null, RequestType.delta()));
 		}
 
-		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, null, value1, RequestType.delta()));
-		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, null, null, RequestType.delta()));
+		Assertions.assertThrows(IllegalArgumentException.class, () -> db.put(arena, 0, colId, null, value1, RequestType.delta()));
+		Assertions.assertThrows(IllegalArgumentException.class, () -> db.put(arena, 0, colId, null, null, RequestType.delta()));
 		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, value1, null));
 		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 1, colId, key, value1, RequestType.delta()));
 		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, 21203, key, value1, RequestType.delta()));

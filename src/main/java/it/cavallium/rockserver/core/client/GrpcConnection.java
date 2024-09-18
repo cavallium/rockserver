@@ -119,7 +119,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public <R> R requestSync(RocksDBAPICommand<R> req) {
-		var asyncResponse = requestAsync(req);
+		var asyncResponse = req.handleAsync(this);
 		return asyncResponse
 				.toCompletableFuture()
 				.join();
