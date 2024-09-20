@@ -65,6 +65,8 @@ message GetColumnIdResponse {int64 columnId = 1;}
 
 message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
 
+message PutBatchRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated KV data = 3;}
+
 message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
 message PutMultiRequest {oneof putMultiRequestType {PutMultiInitialRequest initialRequest = 1;KV data = 2;}}
 
@@ -88,6 +90,7 @@ service RocksDBService {
   rpc deleteColumn(DeleteColumnRequest) returns (google.protobuf.Empty);
   rpc getColumnId(GetColumnIdRequest) returns (GetColumnIdResponse);
   rpc put(PutRequest) returns (google.protobuf.Empty);
+  rpc putBatch(PutBatchRequest) returns (google.protobuf.Empty);
   rpc putMulti(stream PutMultiRequest) returns (google.protobuf.Empty);
   rpc putGetPrevious(PutRequest) returns (Previous);
   rpc putMultiGetPrevious(stream PutMultiRequest) returns (stream Previous);

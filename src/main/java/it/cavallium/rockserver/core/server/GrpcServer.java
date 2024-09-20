@@ -15,6 +15,8 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.common.ColumnHashType;
+import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
@@ -24,33 +26,9 @@ import it.cavallium.rockserver.core.common.RequestType.RequestMulti;
 import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
-import it.cavallium.rockserver.core.common.api.proto.Changed;
-import it.cavallium.rockserver.core.common.api.proto.CloseFailedUpdateRequest;
-import it.cavallium.rockserver.core.common.api.proto.CloseIteratorRequest;
-import it.cavallium.rockserver.core.common.api.proto.CloseTransactionRequest;
-import it.cavallium.rockserver.core.common.api.proto.CloseTransactionResponse;
-import it.cavallium.rockserver.core.common.api.proto.CreateColumnRequest;
-import it.cavallium.rockserver.core.common.api.proto.CreateColumnResponse;
-import it.cavallium.rockserver.core.common.api.proto.DeleteColumnRequest;
+import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
-import it.cavallium.rockserver.core.common.api.proto.GetColumnIdRequest;
-import it.cavallium.rockserver.core.common.api.proto.GetColumnIdResponse;
-import it.cavallium.rockserver.core.common.api.proto.GetRequest;
-import it.cavallium.rockserver.core.common.api.proto.GetResponse;
-import it.cavallium.rockserver.core.common.api.proto.KV;
-import it.cavallium.rockserver.core.common.api.proto.OpenIteratorRequest;
-import it.cavallium.rockserver.core.common.api.proto.OpenIteratorResponse;
-import it.cavallium.rockserver.core.common.api.proto.OpenTransactionRequest;
-import it.cavallium.rockserver.core.common.api.proto.OpenTransactionResponse;
-import it.cavallium.rockserver.core.common.api.proto.Previous;
-import it.cavallium.rockserver.core.common.api.proto.PreviousPresence;
-import it.cavallium.rockserver.core.common.api.proto.PutMultiInitialRequest;
-import it.cavallium.rockserver.core.common.api.proto.PutMultiRequest;
-import it.cavallium.rockserver.core.common.api.proto.PutRequest;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceImplBase;
-import it.cavallium.rockserver.core.common.api.proto.SeekToRequest;
-import it.cavallium.rockserver.core.common.api.proto.SubsequentRequest;
-import it.cavallium.rockserver.core.common.api.proto.UpdateBegin;
 import it.unimi.dsi.fastutil.ints.Int2IntFunction;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -61,6 +39,8 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
@@ -147,6 +127,7 @@ public class GrpcServer extends Server {
 			executor.execute(() -> {
 				try {
 					api.closeFailedUpdate(request.getUpdateId());
+					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
 				} catch (Throwable ex) {
 					responseObserver.onError(ex);
@@ -168,6 +149,7 @@ public class GrpcServer extends Server {
 		public void deleteColumn(DeleteColumnRequest request, StreamObserver<Empty> responseObserver) {
 			executor.execute(() -> {
 				api.deleteColumn(request.getColumnId());
+				responseObserver.onNext(Empty.getDefaultInstance());
 				responseObserver.onCompleted();
 			});
 		}
@@ -199,8 +181,30 @@ public class GrpcServer extends Server {
                                 new RequestNothing<>()
                         );
                     }
+					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
+					responseObserver.onError(ex);
+				}
+			});
+		}
+
+		@Override
+		public void putBatch(PutBatchRequest request, StreamObserver<Empty> responseObserver) {
+			executor.execute(() -> {
+				try {
+					try (var arena = Arena.ofConfined()) {
+						api.putMulti(arena,
+								request.getTransactionOrUpdateId(),
+								request.getColumnId(),
+								mapKeysKV(arena, request.getDataCount(), request::getData),
+								mapValuesKV(arena, request.getDataCount(), request::getData),
+								new RequestNothing<>()
+						);
+					}
+					responseObserver.onNext(Empty.getDefaultInstance());
+					responseObserver.onCompleted();
+				} catch (Throwable ex) {
 					responseObserver.onError(ex);
 				}
 			});
@@ -248,6 +252,7 @@ public class GrpcServer extends Server {
 								var newProcessedRequestCount = processedRequestsCount.incrementAndGet();
 								if (requestsCountFinalized) {
 									if (newProcessedRequestCount == requestsCount) {
+										responseObserver.onNext(Empty.getDefaultInstance());
 										responseObserver.onCompleted();
 									}
 								}
@@ -471,6 +476,7 @@ public class GrpcServer extends Server {
 			executor.execute(() -> {
 				try {
 					api.closeIterator(request.getIteratorId());
+					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
 				} catch (Throwable ex) {
 					responseObserver.onError(ex);
@@ -485,6 +491,7 @@ public class GrpcServer extends Server {
                     try (var arena = Arena.ofConfined()) {
                         api.seekTo(arena, request.getIterationId(), mapKeys(arena, request.getKeysCount(), request::getKeys));
                     }
+					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
 					responseObserver.onError(ex);
@@ -502,6 +509,7 @@ public class GrpcServer extends Server {
                                 request.getTakeCount(),
                                 new RequestNothing<>());
                     }
+					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
 					responseObserver.onError(ex);
@@ -607,6 +615,23 @@ public class GrpcServer extends Server {
 				segments[i] = toMemorySegment(arena, keyGetterAt.apply(i));
 			}
 			return new Keys(segments);
+		}
+
+		private static List<Keys> mapKeysKV(Arena arena, int count, Int2ObjectFunction<KV> keyGetterAt) {
+			var keys = new ArrayList<Keys>(count);
+			for (int i = 0; i < count; i++) {
+				var k = keyGetterAt.apply(i);
+				keys.add(mapKeys(arena, k.getKeysCount(), k::getKeys));
+			}
+			return keys;
+		}
+
+		private static List<MemorySegment> mapValuesKV(Arena arena, int count, Int2ObjectFunction<KV> keyGetterAt) {
+			var keys = new ArrayList<MemorySegment>(count);
+			for (int i = 0; i < count; i++) {
+				keys.add(toMemorySegment(arena, keyGetterAt.get(i).getValue()));
+			}
+			return keys;
 		}
 	}
 

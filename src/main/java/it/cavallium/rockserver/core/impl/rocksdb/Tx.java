@@ -5,7 +5,7 @@ import org.rocksdb.AbstractNativeReference;
 import org.rocksdb.Transaction;
 
 public record Tx(Transaction val, boolean isFromGetForUpdate, RocksDBObjects objs)
-		implements Closeable {
+		implements Closeable, TxOrWb {
 
 	@Override
 	public void close() {

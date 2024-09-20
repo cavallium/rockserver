@@ -33,36 +33,10 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
-import it.cavallium.rockserver.core.common.api.proto.Changed;
-import it.cavallium.rockserver.core.common.api.proto.CloseFailedUpdateRequest;
-import it.cavallium.rockserver.core.common.api.proto.CloseIteratorRequest;
-import it.cavallium.rockserver.core.common.api.proto.CloseTransactionRequest;
-import it.cavallium.rockserver.core.common.api.proto.CloseTransactionResponse;
-import it.cavallium.rockserver.core.common.api.proto.ColumnHashType;
-import it.cavallium.rockserver.core.common.api.proto.CreateColumnRequest;
-import it.cavallium.rockserver.core.common.api.proto.CreateColumnResponse;
-import it.cavallium.rockserver.core.common.api.proto.DeleteColumnRequest;
-import it.cavallium.rockserver.core.common.api.proto.Delta;
-import it.cavallium.rockserver.core.common.api.proto.GetColumnIdRequest;
-import it.cavallium.rockserver.core.common.api.proto.GetColumnIdResponse;
-import it.cavallium.rockserver.core.common.api.proto.GetRequest;
-import it.cavallium.rockserver.core.common.api.proto.GetResponse;
-import it.cavallium.rockserver.core.common.api.proto.KV;
-import it.cavallium.rockserver.core.common.api.proto.OpenIteratorRequest;
-import it.cavallium.rockserver.core.common.api.proto.OpenIteratorResponse;
-import it.cavallium.rockserver.core.common.api.proto.OpenTransactionRequest;
-import it.cavallium.rockserver.core.common.api.proto.OpenTransactionResponse;
-import it.cavallium.rockserver.core.common.api.proto.Previous;
-import it.cavallium.rockserver.core.common.api.proto.PreviousPresence;
-import it.cavallium.rockserver.core.common.api.proto.PutMultiInitialRequest;
-import it.cavallium.rockserver.core.common.api.proto.PutMultiRequest;
-import it.cavallium.rockserver.core.common.api.proto.PutRequest;
-import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceBlockingStub;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceFutureStub;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceStub;
-import it.cavallium.rockserver.core.common.api.proto.SeekToRequest;
-import it.cavallium.rockserver.core.common.api.proto.SubsequentRequest;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -214,6 +188,25 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 					+ count + " != " + allValues.size());
 		}
 
+		CompletableFuture<List<T>> responseObserver;
+
+		if (requestType instanceof RequestType.RequestNothing<?>) {
+			var putBatchRequestBuilder = PutBatchRequest.newBuilder()
+					.setTransactionOrUpdateId(transactionOrUpdateId)
+					.setColumnId(columnId);
+
+			var it1 = allKeys.iterator();
+			var it2 = allValues.iterator();
+
+			while (it1.hasNext()) {
+				var k = it1.next();
+				var v = it2.next();
+				putBatchRequestBuilder.addData(mapKV(k, v));
+			}
+
+			return toResponse(futureStub.putBatch(putBatchRequestBuilder.build()), _ -> null);
+		}
+
 		var initialRequest = PutMultiRequest.newBuilder()
 				.setInitialRequest(PutMultiInitialRequest.newBuilder()
 						.setTransactionOrUpdateId(transactionOrUpdateId)
@@ -221,15 +214,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 						.build())
 				.build();
 
-		CompletableFuture<List<T>> responseObserver;
-
 		StreamObserver<PutMultiRequest> requestPublisher = switch (requestType) {
-			case RequestNothing<?> _ -> {
-				var thisResponseObserver = new CollectListStreamObserver<Empty>(0);
-				//noinspection unchecked
-				responseObserver = (CompletableFuture<List<T>>) (CompletableFuture<?>) thisResponseObserver;
-				yield this.asyncStub.putMulti(thisResponseObserver);
-			}
 			case RequestPrevious<?> _ -> {
 				var thisResponseObserver = new CollectListMappedStreamObserver<Previous, @Nullable MemorySegment>(
 						GrpcConnection::mapPrevious, count);
