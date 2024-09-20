@@ -45,6 +45,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.rocksdb.util.SizeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -77,6 +78,7 @@ public class GrpcServer extends Server {
 				.directExecutor()
 				.channelType(channelType)
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
+				.maxInboundMessageSize(Math.toIntExact(128 * SizeUnit.MB))
 				.addService(grpc)
 				.build();
 		server.start();
