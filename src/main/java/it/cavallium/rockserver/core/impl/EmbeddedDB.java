@@ -431,8 +431,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 						var key = keyIt.next();
 						var value = valusIt.next();
 						put(arena, wb, col, 0, key, value, requestType);
-						wb.write(db.get());
 					}
+					wb.write(db.get());
 				}
 				return List.of();
 			} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
