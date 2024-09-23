@@ -29,6 +29,13 @@ enum Operation {
   PREVIOUS_PRESENCE = 8;
 }
 
+enum PutBatchMode {
+  WRITE_BATCH = 0;
+  WRITE_BATCH_NO_WAL = 1;
+  SST_INGESTION = 2;
+  SST_INGEST_BEHIND = 3;
+}
+
 message Delta {
   optional bytes previous = 1;
   optional bytes current = 2;
@@ -65,7 +72,7 @@ message GetColumnIdResponse {int64 columnId = 1;}
 
 message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
 
-message PutBatchRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated KV data = 3;}
+message PutBatchRequest {int64 columnId = 1; repeated KV data = 2; PutBatchMode mode = 3;}
 
 message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
 message PutMultiRequest {oneof putMultiRequestType {PutMultiInitialRequest initialRequest = 1;KV data = 2;}}

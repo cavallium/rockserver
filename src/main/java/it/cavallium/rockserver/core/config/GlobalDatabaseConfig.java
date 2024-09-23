@@ -38,6 +38,10 @@ public interface GlobalDatabaseConfig {
 
 	boolean absoluteConsistency() throws GestaltException;
 
+	boolean ingestBehind() throws GestaltException;
+
+	boolean unorderedWrite() throws GestaltException;
+
 	VolumeConfig[] volumes() throws GestaltException;
 
 	FallbackColumnConfig fallbackColumnOptions() throws GestaltException;

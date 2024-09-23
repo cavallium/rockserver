@@ -12,9 +12,9 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnSchema;
-import it.cavallium.rockserver.core.common.Keys;
-import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
@@ -26,14 +26,10 @@ import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
-import it.cavallium.rockserver.core.common.RocksDBAPI;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand;
-import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
-import it.cavallium.rockserver.core.common.RocksDBException;
-import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
-import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.common.api.proto.*;
+import it.cavallium.rockserver.core.common.api.proto.ColumnHashType;
+import it.cavallium.rockserver.core.common.api.proto.Delta;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceBlockingStub;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceFutureStub;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceStub;
@@ -190,10 +186,10 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 		CompletableFuture<List<T>> responseObserver;
 
-		if (requestType instanceof RequestType.RequestNothing<?>) {
+		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L) {
 			var putBatchRequestBuilder = PutBatchRequest.newBuilder()
-					.setTransactionOrUpdateId(transactionOrUpdateId)
-					.setColumnId(columnId);
+					.setColumnId(columnId)
+					.setMode(it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH);
 
 			var it1 = allKeys.iterator();
 			var it2 = allValues.iterator();
@@ -215,6 +211,12 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.build();
 
 		StreamObserver<PutMultiRequest> requestPublisher = switch (requestType) {
+			case RequestNothing<?> _ -> {
+				var thisResponseObserver = new CollectListStreamObserver<Empty>(0);
+				//noinspection unchecked
+				responseObserver = (CompletableFuture<List<T>>) (CompletableFuture<?>) thisResponseObserver;
+				yield this.asyncStub.putMulti(thisResponseObserver);
+			}
 			case RequestPrevious<?> _ -> {
 				var thisResponseObserver = new CollectListMappedStreamObserver<Previous, @Nullable MemorySegment>(
 						GrpcConnection::mapPrevious, count);
@@ -256,6 +258,39 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}
 
 		return responseObserver;
+	}
+
+	@Override
+	public CompletableFuture<Void> putBatchAsync(Arena arena,
+												 long columnId,
+												 @NotNull List<@NotNull Keys> allKeys,
+												 @NotNull List<@NotNull MemorySegment> allValues,
+												 @NotNull PutBatchMode mode) throws RocksDBException {
+		var count = allKeys.size();
+		if (count != allValues.size()) {
+			throw new IllegalArgumentException("Keys length is different than values length! "
+					+ count + " != " + allValues.size());
+		}
+
+		var putBatchRequestBuilder = PutBatchRequest.newBuilder()
+				.setColumnId(columnId)
+				.setMode(switch (mode) {
+                    case WRITE_BATCH -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH;
+                    case WRITE_BATCH_NO_WAL -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH_NO_WAL;
+                    case SST_INGESTION -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.SST_INGESTION;
+                    case SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.SST_INGEST_BEHIND;
+                });
+
+		var it1 = allKeys.iterator();
+		var it2 = allValues.iterator();
+
+		while (it1.hasNext()) {
+			var k = it1.next();
+			var v = it2.next();
+			putBatchRequestBuilder.addData(mapKV(k, v));
+		}
+
+		return toResponse(futureStub.putBatch(putBatchRequestBuilder.build()), _ -> null);
 	}
 
 	@SuppressWarnings("unchecked")

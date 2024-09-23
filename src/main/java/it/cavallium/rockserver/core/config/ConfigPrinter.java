@@ -69,6 +69,7 @@ public class ConfigPrinter {
 				    "log-path": "%s",
 				    "wal-path": "%s",
 				    "absolute-consistency": %b,
+				    "ingest-behind": %b,
 				    "volumes": %s,
 				    "fallback-column-options": %s,
 				    "column-options": %s
@@ -84,6 +85,7 @@ public class ConfigPrinter {
 				o.logPath(),
 				o.walPath(),
 				o.absoluteConsistency(),
+				o.ingestBehind(),
 				result.toString(),
 				stringifyFallbackColumn(o.fallbackColumnOptions()),
 				joiner.toString()

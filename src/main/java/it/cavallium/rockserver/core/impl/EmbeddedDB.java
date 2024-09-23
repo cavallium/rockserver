@@ -5,18 +5,10 @@ import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_BYTES;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
-import it.cavallium.rockserver.core.common.ColumnHashType;
-import it.cavallium.rockserver.core.common.Keys;
-import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
-import it.cavallium.rockserver.core.common.ColumnSchema;
-import it.cavallium.rockserver.core.common.Delta;
-import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
-import it.cavallium.rockserver.core.common.RocksDBRetryException;
-import it.cavallium.rockserver.core.common.UpdateContext;
-import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.config.ConfigPrinter;
 import it.cavallium.rockserver.core.config.DatabaseConfig;
@@ -34,6 +26,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -43,11 +36,12 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
-import java.util.logging.Level;
+
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.*;
+import org.rocksdb.RocksDBException;
 import org.rocksdb.Status.Code;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -420,28 +414,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		if (requestType instanceof RequestType.RequestNothing<?>
 				&& !getColumn(columnId).hasBuckets()
 				&& transactionOrUpdateId == 0L) {
-			ops.beginOp();
-			try {
-				// Column id
-				var col = getColumn(columnId);
-                try (var wb = new WB(new WriteBatch())) {
-					var keyIt = keys.iterator();
-					var valusIt = values.iterator();
-					while (keyIt.hasNext()) {
-						var key = keyIt.next();
-						var value = valusIt.next();
-						put(arena, wb, col, 0, key, value, requestType);
-					}
-					wb.write(db.get());
-				}
-				return List.of();
-			} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
-				throw ex;
-			} catch (Exception ex) {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-			} finally {
-				ops.endOp();
-			}
+			putBatch(arena, columnId, keys, values, PutBatchMode.WRITE_BATCH);
+			return List.of();
 		} else {
 			List<T> responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keys.size());
 			for (int i = 0; i < keys.size(); i++) {
@@ -454,11 +428,82 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		}
 	}
 
+
+	@Override
+	public void putBatch(Arena arena,
+						 long columnId,
+						 @NotNull List<Keys> keys,
+						 @NotNull List<@NotNull MemorySegment> values,
+						 @NotNull PutBatchMode mode) throws it.cavallium.rockserver.core.common.RocksDBException {
+		if (keys.size() != values.size()) {
+			throw new IllegalArgumentException("keys length is different than values length: " + keys.size() + " != " + values.size());
+		}
+		ops.beginOp();
+		try {
+			// Column id
+			var col = getColumn(columnId);
+			List<AutoCloseable> refs = new ArrayList<>();
+			try {
+				DBWriter writer = switch (mode) {
+					case WRITE_BATCH, WRITE_BATCH_NO_WAL -> {
+						var wb = new WB(db.get(), new WriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL);
+						refs.add(wb);
+						yield wb;
+					}
+					case SST_INGESTION, SST_INGEST_BEHIND -> {
+						var envOptions = new EnvOptions();
+						refs.add(envOptions);
+						var compressionOptions = new CompressionOptions()
+								.setEnabled(true)
+								.setMaxDictBytes(32768)
+								.setZStdMaxTrainBytes(32768 * 4);
+						refs.add(compressionOptions);
+						var options = new Options()
+								.setCompressionOptions(compressionOptions)
+								.setCompressionType(CompressionType.ZSTD_COMPRESSION)
+								.setUnorderedWrite(true)
+								.setAllowIngestBehind(mode == PutBatchMode.SST_INGEST_BEHIND)
+								.setAllowConcurrentMemtableWrite(true);
+						refs.add(options);
+						var tempFile = Files.createTempFile("temp", ".sst");
+						var sstFileWriter = new SstFileWriter(envOptions, options);
+						var sstWriter = new SSTWriter(db.get(), col, tempFile, sstFileWriter, mode == PutBatchMode.SST_INGEST_BEHIND);
+						refs.add(sstWriter);
+						sstFileWriter.open(tempFile.toString());
+						yield sstWriter;
+					}
+				};
+				var keyIt = keys.iterator();
+				var valusIt = values.iterator();
+				while (keyIt.hasNext()) {
+					var key = keyIt.next();
+					var value = valusIt.next();
+					put(arena, writer, col, 0, key, value, RequestType.none());
+				}
+				writer.writePending();
+			} finally {
+				for (int i = refs.size() - 1; i >= 0; i--) {
+					try {
+						refs.get(i).close();
+					} catch (Exception ex) {
+						logger.error("Failed to close reference during batch write", ex);
+					}
+				}
+			}
+        } catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+		} finally {
+			ops.endOp();
+		}
+	}
+
 	/**
 	 * @param txConsumer this can be called multiple times, if the optimistic transaction failed
 	 */
-	public <T extends TxOrWb, R> R wrapWithTransactionIfNeeded(@Nullable T tx, boolean needTransaction,
-			ExFunction<@Nullable T, R> txConsumer) throws Exception {
+	public <T extends DBWriter, R> R wrapWithTransactionIfNeeded(@Nullable T tx, boolean needTransaction,
+																 ExFunction<@Nullable T, R> txConsumer) throws Exception {
 		if (needTransaction) {
 			return ensureWrapWithTransaction(tx, txConsumer);
 		} else {
@@ -470,8 +515,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	/**
 	 * @param txConsumer this can be called multiple times, if the optimistic transaction failed
 	 */
-	public <T extends TxOrWb, R> R ensureWrapWithTransaction(@Nullable T tx,
-			ExFunction<@NotNull T, R> txConsumer) throws Exception {
+	public <T extends DBWriter, R> R ensureWrapWithTransaction(@Nullable T tx,
+															   ExFunction<@NotNull T, R> txConsumer) throws Exception {
 		R result;
 		if (tx == null) {
 			// Retry using a transaction: transactions are required to handle this kind of data
@@ -496,7 +541,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	}
 
 	private <U> U put(Arena arena,
-			@Nullable TxOrWb optionalTxOrUpdate,
+			@Nullable DBWriter optionalDbWriter,
 			ColumnInstance col,
 			long updateId,
 			@NotNull Keys keys,
@@ -510,55 +555,55 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			boolean needsTx = col.hasBuckets()
 					|| requirePreviousValue
 					|| requirePreviousPresence;
-			if (optionalTxOrUpdate instanceof Tx tx && tx.isFromGetForUpdate() && (requirePreviousValue || requirePreviousPresence)) {
+			if (optionalDbWriter instanceof Tx tx && tx.isFromGetForUpdate() && (requirePreviousValue || requirePreviousPresence)) {
 				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"You can't get the previous value or delta, when you are already updating that value");
 			}
-			if (updateId != 0L && !(optionalTxOrUpdate instanceof Tx)) {
+			if (updateId != 0L && !(optionalDbWriter instanceof Tx)) {
 				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Update id must be accompanied with a valid transaction");
 			}
-			if (col.hasBuckets() && (optionalTxOrUpdate instanceof WB)) {
+			if (col.hasBuckets() && (optionalDbWriter != null && !(optionalDbWriter instanceof Tx))) {
 				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Column with buckets don't support write batches");
 			}
-			return wrapWithTransactionIfNeeded(optionalTxOrUpdate, needsTx, tx -> {
+			return wrapWithTransactionIfNeeded(optionalDbWriter, needsTx, dbWriter -> {
 				MemorySegment previousValue;
 				MemorySegment calculatedKey = col.calculateKey(arena, keys.keys());
 				if (updateId != 0L) {
-					assert tx instanceof Tx;
-					((Tx) tx).val().setSavePoint();
+					assert dbWriter instanceof Tx;
+					((Tx) dbWriter).val().setSavePoint();
 				}
 				if (col.hasBuckets()) {
-					assert tx instanceof Tx;
+					assert dbWriter instanceof Tx;
 					var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 					try (var readOptions = new ReadOptions()) {
-						var previousRawBucketByteArray = ((Tx) tx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+						var previousRawBucketByteArray = ((Tx) dbWriter).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 						MemorySegment previousRawBucket = toMemorySegment(arena, previousRawBucketByteArray);
 						var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
 						previousValue = transformResultValue(col, bucket.addElement(bucketElementKeys, value));
 						var k = Utils.toByteArray(calculatedKey);
 						var v = Utils.toByteArray(bucket.toSegment(arena));
-						((Tx) tx).val().put(col.cfh(), k, v);
+						((Tx) dbWriter).val().put(col.cfh(), k, v);
 					} catch (RocksDBException e) {
 						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_1, e);
 					}
 				} else {
 					if (RequestType.requiresGettingPreviousValue(callback)) {
-						assert tx instanceof Tx;
+						assert dbWriter instanceof Tx;
 						try (var readOptions = new ReadOptions()) {
 							byte[] previousValueByteArray;
-							previousValueByteArray = ((Tx) tx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+							previousValueByteArray = ((Tx) dbWriter).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 							previousValue = transformResultValue(col, toMemorySegment(arena, previousValueByteArray));
 						} catch (RocksDBException e) {
 							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
 						}
 					} else if (RequestType.requiresGettingPreviousPresence(callback)) {
 						// todo: in the future this should be replaced with just keyExists
-						assert tx instanceof Tx;
+						assert dbWriter instanceof Tx;
 						try (var readOptions = new ReadOptions()) {
 							byte[] previousValueByteArray;
-							previousValueByteArray = ((Tx) tx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+							previousValueByteArray = ((Tx) dbWriter).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 							previousValue = previousValueByteArray != null ? MemorySegment.NULL : null;
 						} catch (RocksDBException e) {
 							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
@@ -566,8 +611,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 					} else {
 						previousValue = null;
 					}
-					switch (tx) {
+					switch (dbWriter) {
 						case WB wb -> wb.wb().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
+						case SSTWriter sstWriter -> sstWriter.sstFileWriter().put(Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
 						case Tx t -> t.val().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
 						case null -> {
 							try (var w = new WriteOptions()) {
@@ -588,8 +634,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 
 				if (updateId != 0L) {
 					if (!closeTransaction(updateId, true)) {
-						((Tx) tx).val().rollbackToSavePoint();
-						((Tx) tx).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
+						((Tx) dbWriter).val().rollbackToSavePoint();
+						((Tx) dbWriter).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
 						throw new RocksDBRetryException();
 					}
 				}

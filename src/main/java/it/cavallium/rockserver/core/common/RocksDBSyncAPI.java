@@ -13,6 +13,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenTransaction;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Put;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.PutMulti;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.PutBatch;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.SeekTo;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Subsequent;
 import java.lang.foreign.Arena;
@@ -71,6 +72,15 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 			@NotNull List<@NotNull MemorySegment> values,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestSync(new PutMulti<>(arena, transactionOrUpdateId, columnId, keys, values, requestType));
+	}
+
+	/** See: {@link PutBatch}. */
+	default void putBatch(Arena arena,
+						  long columnId,
+						  @NotNull List<Keys> keys,
+						  @NotNull List<@NotNull MemorySegment> values,
+						  @NotNull PutBatchMode mode) throws RocksDBException {
+		requestSync(new PutBatch(arena, columnId, keys, values, mode));
 	}
 
 	/** See: {@link Get}. */

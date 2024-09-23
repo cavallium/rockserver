@@ -26,7 +26,8 @@ public class RocksDBException extends RuntimeException {
 		COMMIT_FAILED,
 		TX_NOT_FOUND,
 		KEY_HASH_SIZE_MISMATCH, RESTRICTED_TRANSACTION, PUT_INVALID_REQUEST, UPDATE_RETRY, ROCKSDB_LOAD_ERROR,
-		WRITE_BATCH_1
+		WRITE_BATCH_1,
+		SST_WRITE_1
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {

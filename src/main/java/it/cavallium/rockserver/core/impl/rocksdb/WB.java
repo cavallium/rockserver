@@ -8,16 +8,16 @@ import org.rocksdb.WriteOptions;
 
 import java.io.Closeable;
 
-public record WB(@NotNull WriteBatch wb) implements Closeable, TxOrWb {
+public record WB(RocksDB rocksDB, @NotNull WriteBatch wb, boolean disableWal) implements Closeable, DBWriter {
     private static final boolean MIGRATE = Boolean.parseBoolean(System.getProperty("rocksdb.migrate", "false"));
     @Override
     public void close() {
         wb.close();
     }
 
-    public void write(RocksDB rocksDB) throws RocksDBException {
+    public void writePending() throws RocksDBException {
         try (var w = new WriteOptions()) {
-            if (MIGRATE) {
+            if (disableWal || MIGRATE) {
                 w.setDisableWAL(true);
             }
             rocksDB.write(w, wb);

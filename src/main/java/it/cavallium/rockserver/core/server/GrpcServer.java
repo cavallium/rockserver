@@ -17,6 +17,7 @@ import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
@@ -196,12 +197,17 @@ public class GrpcServer extends Server {
 			executor.execute(() -> {
 				try {
 					try (var arena = Arena.ofConfined()) {
-						api.putMulti(arena,
-								request.getTransactionOrUpdateId(),
+						api.putBatch(arena,
 								request.getColumnId(),
 								mapKeysKV(arena, request.getDataCount(), request::getData),
 								mapValuesKV(arena, request.getDataCount(), request::getData),
-								new RequestNothing<>()
+								switch (request.getMode()) {
+                                    case WRITE_BATCH -> PutBatchMode.WRITE_BATCH;
+                                    case WRITE_BATCH_NO_WAL -> PutBatchMode.WRITE_BATCH_NO_WAL;
+                                    case SST_INGESTION -> PutBatchMode.SST_INGESTION;
+                                    case SST_INGEST_BEHIND -> PutBatchMode.SST_INGEST_BEHIND;
+                                    case UNRECOGNIZED -> throw new UnsupportedOperationException("Unrecognized request \"mode\"");
+                                }
 						);
 					}
 					responseObserver.onNext(Empty.getDefaultInstance());

@@ -1,15 +1,8 @@
 package it.cavallium.rockserver.core.client;
 
-import it.cavallium.rockserver.core.common.Keys;
-import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
-import it.cavallium.rockserver.core.common.ColumnSchema;
-import it.cavallium.rockserver.core.common.RocksDBAPI;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand;
-import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
-import it.cavallium.rockserver.core.common.RocksDBException;
-import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -116,6 +109,15 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 			@NotNull List<@NotNull MemorySegment> values,
 			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
 		return db.putMulti(arena, transactionOrUpdateId, columnId, keys, values, requestType);
+	}
+
+	@Override
+	public void putBatch(Arena arena,
+						 long columnId,
+						 @NotNull List<Keys> keys,
+						 @NotNull List<@NotNull MemorySegment> values,
+						 @NotNull PutBatchMode mode) throws RocksDBException {
+		db.putBatch(arena, columnId, keys, values, mode);
 	}
 
 	@Override

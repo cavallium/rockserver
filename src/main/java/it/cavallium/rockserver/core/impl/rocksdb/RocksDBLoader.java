@@ -260,6 +260,10 @@ public class RocksDBLoader {
                 options.setUseDirectIoForFlushAndCompaction(true);
             }
 
+            options
+                    .setAllowIngestBehind(databaseOptions.global().ingestBehind())
+                    .setUnorderedWrite(databaseOptions.global().unorderedWrite());
+
             return new OptionsWithCache(options, blockCache);
         } catch (GestaltException e) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, e);

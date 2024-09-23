@@ -176,9 +176,9 @@ public sealed interface RocksDBAPICommand<R> {
 	 * @param requestType the request type determines which type of data will be returned.
 	 */
 	record PutMulti<T>(Arena arena, long transactionOrUpdateId, long columnId,
-										 @NotNull List<Keys> keys,
-										 @NotNull List<@NotNull MemorySegment> values,
-										 RequestPut<? super MemorySegment, T> requestType) implements RocksDBAPICommand<List<T>> {
+					   @NotNull List<Keys> keys,
+					   @NotNull List<@NotNull MemorySegment> values,
+					   RequestPut<? super MemorySegment, T> requestType) implements RocksDBAPICommand<List<T>> {
 
 		@Override
 		public List<T> handleSync(RocksDBSyncAPI api) {
@@ -199,6 +199,45 @@ public sealed interface RocksDBAPICommand<R> {
 			sb.append(" column:").append(columnId);
 			sb.append(" expected:").append(requestType.getRequestTypeId());
 			sb.append(" multi:[");
+			for (int i = 0; i < keys.size(); i++) {
+				if (i > 0) sb.append(",");
+				sb.append(" keys:").append(keys.get(i));
+				sb.append(" value:").append(Utils.toPrettyString(values.get(i)));
+			}
+			sb.append("]");
+			return sb.toString();
+		}
+	}
+	/**
+	 * Put multiple elements into the specified positions
+	 * @param arena arena
+	 * @param columnId column id
+	 * @param keys multiple lists of column keys
+	 * @param values multiple values, or null if not needed
+	 * @param mode put batch mode
+	 */
+	record PutBatch(Arena arena, long columnId,
+					@NotNull List<Keys> keys,
+					@NotNull List<@NotNull MemorySegment> values,
+					@NotNull PutBatchMode mode) implements RocksDBAPICommand<Void> {
+
+		@Override
+		public Void handleSync(RocksDBSyncAPI api) {
+			api.putBatch(arena, columnId, keys, values, mode);
+			return null;
+		}
+
+		@Override
+		public CompletionStage<Void> handleAsync(RocksDBAsyncAPI api) {
+			return api.putBatchAsync(arena, columnId, keys, values, mode);
+		}
+
+		@Override
+		public String toString() {
+			var sb = new StringBuilder("PUT_BATCH");
+			sb.append(" column:").append(columnId);
+			sb.append(" mode:").append(mode);
+			sb.append(" batch:[");
 			for (int i = 0; i < keys.size(); i++) {
 				if (i > 0) sb.append(",");
 				sb.append(" keys:").append(keys.get(i));
