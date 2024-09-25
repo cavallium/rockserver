@@ -34,6 +34,9 @@ public interface GlobalDatabaseConfig {
 	Path walPath() throws GestaltException;
 
 	@Nullable
+	Path tempSstPath() throws GestaltException;
+
+	@Nullable
 	Duration delayWalFlushDuration() throws GestaltException;
 
 	boolean absoluteConsistency() throws GestaltException;

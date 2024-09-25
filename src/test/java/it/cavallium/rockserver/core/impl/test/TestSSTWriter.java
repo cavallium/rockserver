@@ -18,8 +18,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -29,162 +32,19 @@ public class TestSSTWriter {
 
     private EmbeddedDB db;
     private long colId;
+    private Path tempSstPath;
 
     @BeforeEach
     public void setUp() throws IOException {
         db = new EmbeddedDB(null, "test", null);
         this.colId = db.createColumn("test", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+        this.tempSstPath = Files.createTempDirectory("tempssts");
     }
 
     @Test
     public void test() throws IOException {
         LOG.info("Obtaining sst writer");
-        var globalDatabaseConfigOverride = new GlobalDatabaseConfig() {
-            @Override
-            public boolean spinning() {
-                return false;
-            }
-
-            @Override
-            public boolean checksum() {
-                return false;
-            }
-
-            @Override
-            public boolean useDirectIo() {
-                return false;
-            }
-
-            @Override
-            public boolean allowRocksdbMemoryMapping() {
-                return true;
-            }
-
-            @Override
-            public @Nullable Integer maximumOpenFiles() {
-                return -1;
-            }
-
-            @Override
-            public boolean optimistic() {
-                return true;
-            }
-
-            @Override
-            public @Nullable DataSize blockCache() {
-                return new DataSize("10MiB");
-            }
-
-            @Override
-            public @Nullable DataSize writeBufferManager() {
-                return new DataSize("1MiB");
-            }
-
-            @Override
-            public @Nullable Path logPath() {
-                return null;
-            }
-
-            @Override
-            public @Nullable Path walPath() {
-                return null;
-            }
-
-            @Override
-            public @Nullable Duration delayWalFlushDuration() {
-                return null;
-            }
-
-            @Override
-            public boolean absoluteConsistency() {
-                return false;
-            }
-
-            @Override
-            public boolean ingestBehind() {
-                return true;
-            }
-
-            @Override
-            public boolean unorderedWrite() {
-                return false;
-            }
-
-            @Override
-            public VolumeConfig[] volumes() {
-                return new VolumeConfig[0];
-            }
-
-            @Override
-            public FallbackColumnConfig fallbackColumnOptions() {
-                return null;
-            }
-
-            @Override
-            public NamedColumnConfig[] columnOptions() {
-                return new NamedColumnConfig[0];
-            }
-        };
-        var fallbackColumnConfig = new FallbackColumnConfig() {
-
-            @Override
-            public ColumnLevelConfig[] levels() {
-                return new ColumnLevelConfig[] {
-                    new ColumnLevelConfig() {
-                        @Override
-                        public CompressionType compression() {
-                            return CompressionType.NO_COMPRESSION;
-                        }
-
-                        @Override
-                        public DataSize maxDictBytes() {
-                            return DataSize.ZERO;
-                        }
-                    }
-                };
-            }
-
-            @Override
-            public @Nullable DataSize memtableMemoryBudgetBytes() {
-                return new DataSize("1MiB");
-            }
-
-            @Override
-            public @Nullable Boolean cacheIndexAndFilterBlocks() {
-                return true;
-            }
-
-            @Override
-            public @Nullable Boolean partitionFilters() {
-                return false;
-            }
-
-            @Override
-            public @Nullable BloomFilterConfig bloomFilter() {
-                return new BloomFilterConfig() {
-                    @Override
-                    public int bitsPerKey() {
-                        return 10;
-                    }
-
-                    @Override
-                    public @Nullable Boolean optimizeForHits() {
-                        return true;
-                    }
-                };
-            }
-
-            @Override
-            public @Nullable DataSize blockSize() {
-                return new DataSize("128KiB");
-            }
-
-            @Override
-            public @Nullable DataSize writeBufferSize() {
-                return new DataSize("1MiB");
-            }
-        };
-        try (var sstWriter = db.getSSTWriter(colId, globalDatabaseConfigOverride, fallbackColumnConfig, false, true)) {
+        try (var sstWriter = db.getSSTWriter(colId, null, null, true, false)) {
             LOG.info("Creating sst");
             var tl = ThreadLocalRandom.current();
             var bytes = new byte[1024];
@@ -204,5 +64,13 @@ public class TestSSTWriter {
     @AfterEach
     public void tearDown() throws IOException {
         db.close();
+        Files.walkFileTree(tempSstPath, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Files.deleteIfExists(file);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        Files.deleteIfExists(tempSstPath);
     }
 }

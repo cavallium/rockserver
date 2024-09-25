@@ -24,6 +24,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -64,6 +65,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	private final SafeShutdown ops;
 	private final Object columnEditLock = new Object();
 	private final DatabaseConfig config;
+	private Path tempSSTsPath;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
 		this.path = path;
@@ -79,7 +81,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		this.db = loadedDb.db();
 		this.dbOptions = loadedDb.dbOptions();
 		this.columnsConifg = loadedDb.definitiveColumnFamilyOptionsMap();
-		var existingColumnSchemasColumnDescriptorOptional = db
+        try {
+            this.tempSSTsPath = config.global().tempSstPath();
+        } catch (GestaltException e) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get wal path");
+        }
+        var existingColumnSchemasColumnDescriptorOptional = db
 				.getStartupColumns()
 				.entrySet()
 				.stream()
@@ -556,7 +563,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				columnConifg = null;
 				refs = null;
 			}
-            return SSTWriter.open(db, col, columnConifg, forceNoOptions, ingestBehind, refs);
+			if (Files.notExists(tempSSTsPath)) {
+				Files.createDirectories(tempSSTsPath);
+			}
+            return SSTWriter.open(tempSSTsPath, db, col, columnConifg, forceNoOptions, ingestBehind, refs);
         } catch (IOException ex) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.SST_WRITE_2, ex);
         } catch (RocksDBException ex) {

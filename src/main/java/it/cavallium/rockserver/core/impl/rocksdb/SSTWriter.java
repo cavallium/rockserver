@@ -20,7 +20,7 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
 
     private static final Logger LOG = LoggerFactory.getLogger(SSTWriter.class);
 
-    public static SSTWriter open(TransactionalDB db, ColumnInstance col, ColumnFamilyOptions columnConifg, boolean forceNoOptions, boolean ingestBehind, RocksDBObjects refs) throws IOException, org.rocksdb.RocksDBException {
+    public static SSTWriter open(Path tempSSTsPath, TransactionalDB db, ColumnInstance col, ColumnFamilyOptions columnConifg, boolean forceNoOptions, boolean ingestBehind, RocksDBObjects refs) throws IOException, org.rocksdb.RocksDBException {
         if (refs == null) {
             refs = new RocksDBObjects();
         }
@@ -56,15 +56,19 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                         .setCompressionPerLevel(columnConifg.compressionPerLevel())
                         .setNumLevels(columnConifg.numLevels())
                         .setTableFormatConfig(columnConifg.tableFormatConfig())
-                        .setMemTableConfig(columnConifg.memTableConfig())
                         .setTargetFileSizeBase(columnConifg.targetFileSizeBase())
                         .setTargetFileSizeMultiplier(columnConifg.targetFileSizeMultiplier())
                         .setMaxOpenFiles(-1);
+                if (columnConifg.memTableConfig() != null) {
+                        options.setMemTableConfig(columnConifg.memTableConfig());
+                } else {
+                    options.setMemTableConfig(new SkipListMemTableConfig());
+                }
             }
         }
         Path tempFile;
         try {
-            var tempDir = Path.of(db.getPath()).resolve(".temp_sst");
+            var tempDir = tempSSTsPath;
             if (Files.notExists(tempDir)) {
                 Files.createDirectories(tempDir);
             }
