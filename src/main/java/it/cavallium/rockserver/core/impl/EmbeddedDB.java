@@ -440,6 +440,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		try {
 			var cf = new CompletableFuture<Void>();
 			batchPublisher.subscribe(new Subscriber<>() {
+				private boolean stopped;
 				private Subscription subscription;
 				private ColumnInstance col;
 				private ArrayList<AutoCloseable> refs;
@@ -476,6 +477,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 
 				@Override
 				public void onNext(KVBatch kvBatch) {
+					if (stopped) {
+						return;
+					}
 					var keyIt = kvBatch.keys().iterator();
 					var valueIt = kvBatch.values().iterator();
 					try (var arena = Arena.ofConfined()) {
@@ -516,6 +520,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				}
 
 				private void doFinally() {
+					stopped = true;
 					for (int i = refs.size() - 1; i >= 0; i--) {
 						try {
 							var c = refs.get(i);

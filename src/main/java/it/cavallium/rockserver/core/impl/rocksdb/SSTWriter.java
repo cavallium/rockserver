@@ -85,7 +85,6 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
 
     public void put(byte[] key, byte[] value) throws RocksDBException {
         try {
-            checkOwningHandle();
             sstFileWriter.put(key, value);
         } catch (org.rocksdb.RocksDBException e) {
             throw RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR, e);
@@ -94,7 +93,6 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
 
     public void put(ByteBuffer key, ByteBuffer value) throws RocksDBException {
         try {
-            checkOwningHandle();
             sstFileWriter.put(key, value);
         } catch (org.rocksdb.RocksDBException e) {
             throw RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR, e);
