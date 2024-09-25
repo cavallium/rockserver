@@ -3,24 +3,25 @@ package it.cavallium.rockserver.core.impl.test;
 import static it.cavallium.rockserver.core.common.Utils.toMemorySegmentSimple;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
-import it.cavallium.rockserver.core.common.Keys;
-import it.cavallium.rockserver.core.common.RequestType;
-import it.cavallium.rockserver.core.common.ColumnHashType;
-import it.cavallium.rockserver.core.common.ColumnSchema;
-import it.cavallium.rockserver.core.common.Delta;
-import it.cavallium.rockserver.core.common.RocksDBException;
-import it.cavallium.rockserver.core.common.RocksDBRetryException;
-import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.*;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.lang.foreign.Arena;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
+
+import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.Assertions;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import org.junit.jupiter.api.Test;
+import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 
 abstract class EmbeddedDBTest {
 
@@ -359,6 +360,73 @@ abstract class EmbeddedDBTest {
 			db.put(arena, forUpdate.updateId(), colId, key1, value1, RequestType.none());
 
 			Assertions.assertThrows(Exception.class, () -> db.put(arena, forUpdate.updateId(), colId, key1, value2, RequestType.none()));
+		}
+	}
+
+	@Test
+	void putBatchSST() {
+		@NotNull Publisher<@NotNull KVBatch> batchPublisher = new Publisher<KVBatch>() {
+			@Override
+			public void subscribe(Subscriber<? super KVBatch> subscriber) {
+				subscriber.onSubscribe(new Subscription() {
+					Iterator<KVBatch> it;
+					{
+						ArrayList<KVBatch> items = new ArrayList<>();
+						ArrayList<Keys> keys = new ArrayList<>();
+						ArrayList<MemorySegment> values = new ArrayList<>();
+						for (int i = 0; i < 2; i++) {
+							var keyI = getKeyI(i);
+							var valueI = getValueI(i);
+							keys.add(keyI);
+							values.add(valueI);
+						}
+						items.add(new KVBatch(keys, values));
+						keys = new ArrayList<>();
+						values = new ArrayList<>();
+						for (int i = 2; i < 4; i++) {
+							var keyI = getKeyI(i);
+							var valueI = getValueI(i);
+							keys.add(keyI);
+							values.add(valueI);
+						}
+						items.add(new KVBatch(keys, values));
+						it = items.iterator();
+					}
+					@Override
+					public void request(long l) {
+						while (l-- > 0) {
+							if (it.hasNext()) {
+								subscriber.onNext(it.next());
+							} else {
+								subscriber.onComplete();
+								return;
+							}
+						}
+					}
+
+					@Override
+					public void cancel() {
+
+					}
+				});
+			}
+		};
+		if (this.getSchema().variableLengthKeysCount() <= 0) {
+			db.putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
+
+			if (getHasValues()) {
+				for (int i = 0; i < 4; i++) {
+					assertSegmentEquals(getValueI(i), db.get(arena, 0, colId, getKeyI(i), RequestType.current()));
+				}
+			}
+			for (int i = 0; i < 4; i++) {
+				Assertions.assertTrue(db.get(arena, 0, colId, getKeyI(i), RequestType.exists()));
+			}
+		} else {
+			Assertions.assertThrows(RocksDBException.class, () -> {
+				db.putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
+			});
+
 		}
 	}
 

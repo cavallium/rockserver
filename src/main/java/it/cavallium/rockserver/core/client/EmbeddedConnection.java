@@ -17,6 +17,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.reactivestreams.Publisher;
 
 public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 
@@ -88,6 +89,10 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public <R> CompletableFuture<R> requestAsync(RocksDBAPICommand<R> req) {
+		if (req instanceof RocksDBAPICommand.PutBatch putBatch) {
+            //noinspection unchecked
+            return (CompletableFuture<R>) this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
+		}
 		return CompletableFuture.supplyAsync(() -> req.handleSync(this), exeuctor);
 	}
 
@@ -112,12 +117,17 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public void putBatch(Arena arena,
-						 long columnId,
-						 @NotNull List<Keys> keys,
-						 @NotNull List<@NotNull MemorySegment> values,
+	public CompletableFuture<Void> putBatchAsync(long columnId,
+												 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
+												 @NotNull PutBatchMode mode) throws RocksDBException {
+		return db.putBatchInternal(columnId, batchPublisher, mode);
+	}
+
+	@Override
+	public void putBatch(long columnId,
+						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 						 @NotNull PutBatchMode mode) throws RocksDBException {
-		db.putBatch(arena, columnId, keys, values, mode);
+		db.putBatch(columnId, batchPublisher, mode);
 	}
 
 	@Override

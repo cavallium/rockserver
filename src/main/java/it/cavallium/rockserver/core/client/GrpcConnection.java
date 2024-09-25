@@ -11,9 +11,10 @@ import com.google.protobuf.UnsafeByteOperations;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
-import io.grpc.stub.StreamObserver;
+import io.grpc.stub.*;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
@@ -40,13 +41,18 @@ import java.lang.foreign.MemorySegment;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -187,20 +193,20 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		CompletableFuture<List<T>> responseObserver;
 
 		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L) {
-			var putBatchRequestBuilder = PutBatchRequest.newBuilder()
-					.setColumnId(columnId)
-					.setMode(it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH);
+			return putBatchAsync(columnId, subscriber -> {
+                var sub = new Subscription() {
+                    @Override
+                    public void request(long l) {
+                    }
 
-			var it1 = allKeys.iterator();
-			var it2 = allValues.iterator();
+                    @Override
+                    public void cancel() {
 
-			while (it1.hasNext()) {
-				var k = it1.next();
-				var v = it2.next();
-				putBatchRequestBuilder.addData(mapKV(k, v));
-			}
-
-			return toResponse(futureStub.putBatch(putBatchRequestBuilder.build()), _ -> null);
+                    }
+                };
+                subscriber.onSubscribe(sub);
+                subscriber.onNext(new KVBatch(allKeys, allValues));
+            }, PutBatchMode.WRITE_BATCH).thenApply(_ -> List.of());
 		}
 
 		var initialRequest = PutMultiRequest.newBuilder()
@@ -261,36 +267,105 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletableFuture<Void> putBatchAsync(Arena arena,
-												 long columnId,
-												 @NotNull List<@NotNull Keys> allKeys,
-												 @NotNull List<@NotNull MemorySegment> allValues,
+	public CompletableFuture<Void> putBatchAsync(long columnId,
+												 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 												 @NotNull PutBatchMode mode) throws RocksDBException {
-		var count = allKeys.size();
-		if (count != allValues.size()) {
-			throw new IllegalArgumentException("Keys length is different than values length! "
-					+ count + " != " + allValues.size());
-		}
+		var cf = new CompletableFuture<Void>();
+		var responseobserver = new ClientResponseObserver<PutBatchRequest, Empty>() {
+			private ClientCallStreamObserver<PutBatchRequest> requestStream;
+			private Subscription subscription;
 
-		var putBatchRequestBuilder = PutBatchRequest.newBuilder()
-				.setColumnId(columnId)
-				.setMode(switch (mode) {
-                    case WRITE_BATCH -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH;
-                    case WRITE_BATCH_NO_WAL -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH_NO_WAL;
-                    case SST_INGESTION -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.SST_INGESTION;
-                    case SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.SST_INGEST_BEHIND;
-                });
+			@Override
+			public void beforeStart(ClientCallStreamObserver<PutBatchRequest> requestStream) {
+				this.requestStream = requestStream;
+				// Set up manual flow control for the response stream. It feels backwards to configure the response
+				// stream's flow control using the request stream's observer, but this is the way it is.
+				requestStream.disableAutoRequestWithInitial(1);
 
-		var it1 = allKeys.iterator();
-		var it2 = allValues.iterator();
+				var subscriber = new Subscriber<KVBatch>() {
+					private volatile boolean finalized;
 
-		while (it1.hasNext()) {
-			var k = it1.next();
-			var v = it2.next();
-			putBatchRequestBuilder.addData(mapKV(k, v));
-		}
+					@Override
+					public void onSubscribe(Subscription subscription2) {
+						subscription = subscription2;
+					}
 
-		return toResponse(futureStub.putBatch(putBatchRequestBuilder.build()), _ -> null);
+					@Override
+					public void onNext(KVBatch batch) {
+						var request = PutBatchRequest.newBuilder();
+						request.setData(mapKVBatch(batch));
+						requestStream.onNext(request.build());
+						if (requestStream.isReady()) {
+							subscription.request(1);
+						}
+					}
+
+					@Override
+					public void onError(Throwable throwable) {
+						this.finalized = true;
+						requestStream.onError(throwable);
+					}
+
+					@Override
+					public void onComplete() {
+						this.finalized = true;
+						requestStream.onCompleted();
+					}
+				};
+
+
+				batchPublisher.subscribe(subscriber);
+
+				// Set up a back-pressure-aware producer for the request stream. The onReadyHandler will be invoked
+				// when the consuming side has enough buffer space to receive more messages.
+				//
+				// Messages are serialized into a transport-specific transmit buffer. Depending on the size of this buffer,
+				// MANY messages may be buffered, however, they haven't yet been sent to the server. The server must call
+				// request() to pull a buffered message from the client.
+				//
+				// Note: the onReadyHandler's invocation is serialized on the same thread pool as the incoming
+				// StreamObserver's onNext(), onError(), and onComplete() handlers. Blocking the onReadyHandler will prevent
+				// additional messages from being processed by the incoming StreamObserver. The onReadyHandler must return
+				// in a timely manner or else message processing throughput will suffer.
+				requestStream.setOnReadyHandler(new Runnable() {
+
+					@Override
+					public void run() {
+						// Start generating values from where we left off on a non-gRPC thread.
+						subscription.request(1);
+					}
+				});
+			}
+
+			@Override
+			public void onNext(Empty empty) {}
+
+			@Override
+			public void onError(Throwable throwable) {
+				cf.completeExceptionally(throwable);
+			}
+
+			@Override
+			public void onCompleted() {
+				cf.complete(null);
+			}
+		};
+
+		var requestStream = asyncStub.putBatch(responseobserver);
+
+		requestStream.onNext(PutBatchRequest.newBuilder()
+				.setInitialRequest(PutBatchInitialRequest.newBuilder()
+						.setColumnId(columnId)
+						.setMode(switch (mode) {
+							case WRITE_BATCH -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH;
+							case WRITE_BATCH_NO_WAL -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH_NO_WAL;
+							case SST_INGESTION -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.SST_INGESTION;
+							case SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.SST_INGEST_BEHIND;
+						})
+						.build())
+				.build());
+
+		return cf;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -395,6 +470,33 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	private static MemorySegment mapByteString(ByteString data) {
 		return data != null ? MemorySegment.ofBuffer(data.asReadOnlyByteBuffer()) : null;
+	}
+
+	private static it.cavallium.rockserver.core.common.api.proto.KVBatch mapKVBatch(@NotNull KVBatch kvBatch) {
+		return it.cavallium.rockserver.core.common.api.proto.KVBatch.newBuilder()
+				.addAllEntries(mapKVList(kvBatch.keys(), kvBatch.values()))
+				.build();
+	}
+
+	private static Iterable<KV> mapKVList(@NotNull List<Keys> keys, @NotNull List<MemorySegment> values) {
+		return new Iterable<>() {
+			@Override
+			public @NotNull Iterator<KV> iterator() {
+				var it1 = keys.iterator();
+				var it2 = values.iterator();
+				return new Iterator<>() {
+					@Override
+					public boolean hasNext() {
+						return it1.hasNext();
+					}
+
+					@Override
+					public KV next() {
+						return mapKV(it1.next(), it2.next());
+					}
+				};
+			}
+		};
 	}
 
 	private static KV mapKV(@NotNull Keys keys, @NotNull MemorySegment value) {

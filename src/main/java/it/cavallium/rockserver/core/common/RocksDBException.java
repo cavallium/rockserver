@@ -27,7 +27,11 @@ public class RocksDBException extends RuntimeException {
 		TX_NOT_FOUND,
 		KEY_HASH_SIZE_MISMATCH, RESTRICTED_TRANSACTION, PUT_INVALID_REQUEST, UPDATE_RETRY, ROCKSDB_LOAD_ERROR,
 		WRITE_BATCH_1,
-		SST_WRITE_1
+		SST_WRITE_1,
+		SST_WRITE_2,
+		SST_WRITE_3,
+		SST_WRITE_4,
+		SST_GET_SIZE_FAILED
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {
@@ -35,7 +39,7 @@ public class RocksDBException extends RuntimeException {
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, Throwable ex) {
-		if (ex instanceof RocksDBException e) {
+		if (ex instanceof org.rocksdb.RocksDBException e) {
 			return new RocksDBException(errorUniqueId, e);
 		} else {
 			return new RocksDBException(errorUniqueId, ex);
@@ -43,7 +47,7 @@ public class RocksDBException extends RuntimeException {
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message, Throwable ex) {
-		if (ex instanceof RocksDBException e) {
+		if (ex instanceof org.rocksdb.RocksDBException e) {
 			return new RocksDBException(errorUniqueId, message, e);
 		} else {
 			return new RocksDBException(errorUniqueId, message, ex);
@@ -67,6 +71,7 @@ public class RocksDBException extends RuntimeException {
 
 	protected RocksDBException(RocksDBErrorType errorUniqueId, org.rocksdb.RocksDBException ex) {
 		this(errorUniqueId, ex.getMessage());
+		super.initCause(ex);
 	}
 
 	protected RocksDBException(RocksDBErrorType errorUniqueId, String message, org.rocksdb.RocksDBException ex) {

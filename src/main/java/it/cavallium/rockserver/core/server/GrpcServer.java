@@ -4,7 +4,9 @@ import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
+import io.grpc.Status;
 import io.grpc.netty.NettyServerBuilder;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
@@ -17,6 +19,7 @@ import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
@@ -42,11 +45,14 @@ import java.lang.foreign.MemorySegment;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.rocksdb.util.SizeUnit;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -79,7 +85,7 @@ public class GrpcServer extends Server {
 				.directExecutor()
 				.channelType(channelType)
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
-				.maxInboundMessageSize(Math.toIntExact(128 * SizeUnit.MB))
+				.maxInboundMessageSize(128 * 1024 * 1024)
 				.addService(grpc)
 				.build();
 		server.start();
@@ -88,9 +94,11 @@ public class GrpcServer extends Server {
 
 	private final class GrpcServerImpl extends RocksDBServiceImplBase {
 
+		private final RocksDBAsyncAPI asyncApi;
         private final RocksDBSyncAPI api;
 
 		public GrpcServerImpl(RocksDBConnection client) {
+			this.asyncApi = client.getAsyncApi();
             this.api = client.getSyncApi();
 		}
 
@@ -105,7 +113,7 @@ public class GrpcServer extends Server {
 					responseObserver.onNext(OpenTransactionResponse.newBuilder().setTransactionId(txId).build());
 					responseObserver.onCompleted();
 				} catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -120,7 +128,7 @@ public class GrpcServer extends Server {
 					responseObserver.onNext(response);
 					responseObserver.onCompleted();
 				} catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -133,7 +141,7 @@ public class GrpcServer extends Server {
 					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
 				} catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -141,19 +149,27 @@ public class GrpcServer extends Server {
 		@Override
 		public void createColumn(CreateColumnRequest request, StreamObserver<CreateColumnResponse> responseObserver) {
 			executor.execute(() -> {
-				var colId = api.createColumn(request.getName(), mapColumnSchema(request.getSchema()));
-				var response = CreateColumnResponse.newBuilder().setColumnId(colId).build();
-				responseObserver.onNext(response);
-				responseObserver.onCompleted();
+				try {
+					var colId = api.createColumn(request.getName(), mapColumnSchema(request.getSchema()));
+					var response = CreateColumnResponse.newBuilder().setColumnId(colId).build();
+					responseObserver.onNext(response);
+					responseObserver.onCompleted();
+				} catch (Throwable ex) {
+					handleError(responseObserver, ex);
+				}
 			});
 		}
 
 		@Override
 		public void deleteColumn(DeleteColumnRequest request, StreamObserver<Empty> responseObserver) {
 			executor.execute(() -> {
-				api.deleteColumn(request.getColumnId());
-				responseObserver.onNext(Empty.getDefaultInstance());
-				responseObserver.onCompleted();
+				try {
+					api.deleteColumn(request.getColumnId());
+					responseObserver.onNext(Empty.getDefaultInstance());
+					responseObserver.onCompleted();
+				} catch (Throwable ex) {
+					handleError(responseObserver, ex);
+				}
 			});
 		}
 
@@ -166,7 +182,7 @@ public class GrpcServer extends Server {
 					responseObserver.onNext(response);
 					responseObserver.onCompleted();
 				} catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -187,35 +203,127 @@ public class GrpcServer extends Server {
 					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
 
 		@Override
-		public void putBatch(PutBatchRequest request, StreamObserver<Empty> responseObserver) {
-			executor.execute(() -> {
-				try {
-					try (var arena = Arena.ofConfined()) {
-						api.putBatch(arena,
-								request.getColumnId(),
-								mapKeysKV(arena, request.getDataCount(), request::getData),
-								mapValuesKV(arena, request.getDataCount(), request::getData),
-								switch (request.getMode()) {
-                                    case WRITE_BATCH -> PutBatchMode.WRITE_BATCH;
-                                    case WRITE_BATCH_NO_WAL -> PutBatchMode.WRITE_BATCH_NO_WAL;
-                                    case SST_INGESTION -> PutBatchMode.SST_INGESTION;
-                                    case SST_INGEST_BEHIND -> PutBatchMode.SST_INGEST_BEHIND;
-                                    case UNRECOGNIZED -> throw new UnsupportedOperationException("Unrecognized request \"mode\"");
-                                }
-						);
-					}
-					responseObserver.onNext(Empty.getDefaultInstance());
-					responseObserver.onCompleted();
-				} catch (Throwable ex) {
-					responseObserver.onError(ex);
+		public StreamObserver<PutBatchRequest> putBatch(StreamObserver<Empty> responseObserver) {
+			final ServerCallStreamObserver<Empty> serverCallStreamObserver =
+					(ServerCallStreamObserver<Empty>) responseObserver;
+			serverCallStreamObserver.disableAutoRequest();
+			serverCallStreamObserver.request(1);
+			var requestObserver = new StreamObserver<PutBatchRequest>() {
+				enum State {
+					BEFORE_INITIAL_REQUEST,
+					RECEIVING_DATA,
+					RECEIVED_ALL
 				}
-			});
+				private final ExecutorService sstExecutor = Executors.newSingleThreadExecutor();
+				final AtomicInteger pendingRequests = new AtomicInteger();
+				State state = State.BEFORE_INITIAL_REQUEST;
+				private PutBatchInitialRequest initialRequest;
+				private Subscriber<? super KVBatch> putBatchInputsSubscriber;
+				@Override
+				public void onNext(PutBatchRequest putBatchRequest) {
+					if (state == State.BEFORE_INITIAL_REQUEST) {
+						if (!putBatchRequest.hasInitialRequest()) {
+							serverCallStreamObserver.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+						}
+
+						initialRequest = putBatchRequest.getInitialRequest();
+
+						try {
+							asyncApi.putBatchAsync(initialRequest.getColumnId(),
+									subscriber2 -> {
+										putBatchInputsSubscriber = subscriber2;
+										subscriber2.onSubscribe(new Subscription() {
+											@Override
+											public void request(long l) {
+												serverCallStreamObserver.request(Math.toIntExact(l));
+											}
+
+											@Override
+											public void cancel() {
+												serverCallStreamObserver.onError(new IOException("Cancelled"));
+
+											}
+										});
+									},
+									switch (initialRequest.getMode()) {
+										case WRITE_BATCH -> PutBatchMode.WRITE_BATCH;
+										case WRITE_BATCH_NO_WAL -> PutBatchMode.WRITE_BATCH_NO_WAL;
+										case SST_INGESTION -> PutBatchMode.SST_INGESTION;
+										case SST_INGEST_BEHIND -> PutBatchMode.SST_INGEST_BEHIND;
+										case UNRECOGNIZED -> throw new UnsupportedOperationException("Unrecognized request \"mode\"");
+									}
+							).whenComplete((_, ex) -> {
+								if (ex != null) {
+									handleError(serverCallStreamObserver, ex);
+								} else {
+									serverCallStreamObserver.onNext(Empty.getDefaultInstance());
+									serverCallStreamObserver.onCompleted();
+								}
+							});
+						} catch (Throwable ex) {
+							handleError(serverCallStreamObserver, ex);
+						}
+						state = State.RECEIVING_DATA;
+					} else if (state == State.RECEIVING_DATA) {
+						pendingRequests.incrementAndGet();
+						var kvBatch = putBatchRequest.getData();
+						sstExecutor.execute(() -> {
+							try {
+								try (var arena = Arena.ofConfined()) {
+									putBatchInputsSubscriber.onNext(mapKVBatch(arena, kvBatch.getEntriesCount(), kvBatch::getEntries));
+								}
+								checkCompleted(true);
+							} catch (Throwable ex) {
+								putBatchInputsSubscriber.onError(ex);
+							}
+						});
+					} else {
+						serverCallStreamObserver.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Invalid request"));
+					}
+				}
+
+				@Override
+				public void onError(Throwable throwable) {
+					state = State.RECEIVED_ALL;
+					doFinally();
+					if (putBatchInputsSubscriber != null) {
+						putBatchInputsSubscriber.onError(throwable);
+					} else {
+						serverCallStreamObserver.onError(throwable);
+					}
+				}
+
+				@Override
+				public void onCompleted() {
+					if (state == State.BEFORE_INITIAL_REQUEST) {
+						serverCallStreamObserver.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+					} else if (state == State.RECEIVING_DATA) {
+						state = State.RECEIVED_ALL;
+						checkCompleted(false);
+					} else {
+						putBatchInputsSubscriber.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR, "Unknown state during onComplete: " + state));
+					}
+				}
+
+				private void checkCompleted(boolean requestDone) {
+					if ((requestDone ? pendingRequests.decrementAndGet() : pendingRequests.get()) == 0
+							&& state == State.RECEIVED_ALL) {
+						doFinally();
+						putBatchInputsSubscriber.onComplete();
+					}
+				}
+
+				private void doFinally() {
+					sstExecutor.shutdown();
+				}
+			};
+			return requestObserver;
 		}
 
 		@Override
@@ -253,7 +361,7 @@ public class GrpcServer extends Server {
                                                 new RequestNothing<>());
                                     }
                                 } catch (RocksDBException ex) {
-									responseObserver.onError(ex);
+									handleError(responseObserver, ex);
 									return;
 								}
 
@@ -308,7 +416,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -337,7 +445,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -359,7 +467,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -381,7 +489,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -406,7 +514,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -432,7 +540,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -452,7 +560,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -474,7 +582,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -487,7 +595,7 @@ public class GrpcServer extends Server {
 					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
 				} catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -502,7 +610,7 @@ public class GrpcServer extends Server {
 					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -520,7 +628,7 @@ public class GrpcServer extends Server {
 					responseObserver.onNext(Empty.getDefaultInstance());
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -539,7 +647,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -571,7 +679,7 @@ public class GrpcServer extends Server {
                     }
 					responseObserver.onCompleted();
                 } catch (Throwable ex) {
-					responseObserver.onError(ex);
+					handleError(responseObserver, ex);
 				}
 			});
 		}
@@ -640,6 +748,30 @@ public class GrpcServer extends Server {
 				keys.add(toMemorySegment(arena, keyGetterAt.get(i).getValue()));
 			}
 			return keys;
+		}
+
+		private static KVBatch mapKVBatch(Arena arena, int count, Int2ObjectFunction<KV> getterAt) {
+			return new KVBatch(
+					mapKeysKV(arena, count, getterAt),
+					mapValuesKV(arena, count, getterAt)
+			);
+		}
+
+		private static void handleError(StreamObserver<?> responseObserver, Throwable ex) {
+			if (ex instanceof CompletionException exx) {
+				handleError(responseObserver, exx.getCause());
+			} else {
+				if (ex instanceof RocksDBException e) {
+					responseObserver.onError(Status.INTERNAL
+							.withDescription(e.getLocalizedMessage())
+							.withCause(e)
+							.asException());
+				} else {
+					responseObserver.onError(Status.INTERNAL
+							.withCause(ex)
+							.asException());
+				}
+			}
 		}
 	}
 

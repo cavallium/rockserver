@@ -5,14 +5,8 @@ import it.cavallium.rockserver.core.config.*;
 import java.io.InputStream;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.SequencedMap;
-import java.util.logging.Level;
+import java.util.*;
+
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -90,8 +84,207 @@ public class RocksDBLoader {
         throw new RuntimeException("rocksdb was not found inside JAR.");
     }
 
+    public record LoadedDb(TransactionalDB db, DBOptions dbOptions,
+                           Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap) {}
 
-    public static TransactionalDB load(@Nullable Path path, DatabaseConfig config, Logger logger) {
+    public static ColumnFamilyOptions getColumnOptions(
+            GlobalDatabaseConfig globalDatabaseConfig,
+            FallbackColumnConfig columnOptions, Logger logger,
+            RocksDBObjects refs,
+            boolean inMemory,
+            @Nullable Cache cache) {
+        try {
+            var columnFamilyOptions = new ColumnFamilyOptions();
+            refs.add(columnFamilyOptions);
+
+            //noinspection ConstantConditions
+            if (columnOptions.memtableMemoryBudgetBytes() != null) {
+                // about 512MB of ram will be used for level style compaction
+                columnFamilyOptions.optimizeLevelStyleCompaction(Optional.ofNullable(columnOptions.memtableMemoryBudgetBytes())
+                        .map(DataSize::longValue)
+                        .orElse(DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET));
+            }
+
+            if (isDisableAutoCompactions()) {
+                columnFamilyOptions.setDisableAutoCompactions(true);
+            }
+            try {
+                columnFamilyOptions.setPrepopulateBlobCache(PrepopulateBlobCache.PREPOPULATE_BLOB_FLUSH_ONLY);
+            } catch (Throwable ex) {
+                logger.error("Failed to set prepopulate blob cache", ex);
+            }
+
+            // This option is not supported with multiple db paths
+            // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
+            // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
+            boolean dynamicLevelBytes = (globalDatabaseConfig.volumes() == null || globalDatabaseConfig.volumes().length <= 1)
+                    && !globalDatabaseConfig.ingestBehind();
+            if (dynamicLevelBytes) {
+                columnFamilyOptions.setLevelCompactionDynamicLevelBytes(true);
+            }
+
+            // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
+            columnFamilyOptions
+                    .setTargetFileSizeBase(256 * SizeUnit.MB)
+                    .setMaxBytesForLevelBase(SizeUnit.GB);
+
+            if (isDisableAutoCompactions()) {
+                columnFamilyOptions.setLevel0FileNumCompactionTrigger(-1);
+            } else if (!FOLLOW_ROCKSDB_OPTIMIZATIONS) {
+                // ArangoDB uses a value of 2: https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
+                // Higher values speed up writes, but slow down reads
+                columnFamilyOptions.setLevel0FileNumCompactionTrigger(2);
+            }
+            if (isDisableSlowdown()) {
+                columnFamilyOptions.setLevel0SlowdownWritesTrigger(-1);
+                columnFamilyOptions.setLevel0StopWritesTrigger(Integer.MAX_VALUE);
+                columnFamilyOptions.setHardPendingCompactionBytesLimit(Long.MAX_VALUE);
+                columnFamilyOptions.setSoftPendingCompactionBytesLimit(Long.MAX_VALUE);
+            }
+            {
+                // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
+                columnFamilyOptions.setLevel0SlowdownWritesTrigger(20);
+                // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
+                columnFamilyOptions.setLevel0StopWritesTrigger(36);
+            }
+
+            if (columnOptions.levels().length > 0) {
+                columnFamilyOptions.setNumLevels(columnOptions.levels().length);
+                var firstLevelOptions = getRocksLevelOptions(columnOptions.levels()[0], refs);
+                columnFamilyOptions.setCompressionType(firstLevelOptions.compressionType);
+                columnFamilyOptions.setCompressionOptions(firstLevelOptions.compressionOptions);
+
+                var lastLevelOptions = getRocksLevelOptions(columnOptions
+                        .levels()[columnOptions.levels().length - 1], refs);
+                columnFamilyOptions.setBottommostCompressionType(lastLevelOptions.compressionType);
+                columnFamilyOptions.setBottommostCompressionOptions(lastLevelOptions.compressionOptions);
+
+                List<CompressionType> compressionPerLevel = new ArrayList<>();
+                for (ColumnLevelConfig columnLevelConfig : columnOptions.levels()) {
+                    CompressionType compression = columnLevelConfig.compression();
+                    compressionPerLevel.add(compression);
+                }
+                columnFamilyOptions.setCompressionPerLevel(compressionPerLevel);
+            } else {
+                columnFamilyOptions.setNumLevels(7);
+                List<CompressionType> compressionTypes = new ArrayList<>(7);
+                for (int i = 0; i < 7; i++) {
+                    if (i < 2) {
+                        compressionTypes.add(CompressionType.NO_COMPRESSION);
+                    } else {
+                        compressionTypes.add(CompressionType.LZ4_COMPRESSION);
+                    }
+                }
+                columnFamilyOptions.setBottommostCompressionType(CompressionType.LZ4HC_COMPRESSION);
+                var compressionOptions = new CompressionOptions()
+                        .setEnabled(true)
+                        .setMaxDictBytes(Math.toIntExact(32 * SizeUnit.KB));
+                refs.add(compressionOptions);
+                setZstdCompressionOptions(compressionOptions);
+                columnFamilyOptions.setBottommostCompressionOptions(compressionOptions);
+                columnFamilyOptions.setCompressionPerLevel(compressionTypes);
+            }
+
+            final BlockBasedTableConfig tableOptions = new BlockBasedTableConfig();
+
+            if (!FOLLOW_ROCKSDB_OPTIMIZATIONS) {
+                columnFamilyOptions.setWriteBufferSize(256 * SizeUnit.MB);
+            }
+            Optional.ofNullable(columnOptions.writeBufferSize())
+                    .map(DataSize::longValue)
+                    .ifPresent(columnFamilyOptions::setWriteBufferSize);
+
+            columnFamilyOptions.setMaxWriteBufferNumberToMaintain(1);
+            if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
+                blockBasedTableConfig.setVerifyCompression(false);
+            }
+            // If OptimizeFiltersForHits == true: memory size = bitsPerKey * (totalKeys * 0.1)
+            // If OptimizeFiltersForHits == false: memory size = bitsPerKey * totalKeys
+            BloomFilterConfig filter = null;
+            BloomFilterConfig bloomFilterConfig = columnOptions.bloomFilter();
+            if (bloomFilterConfig != null) filter = bloomFilterConfig;
+            if (filter == null) {
+                if (inMemory) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Please set a bloom filter. It's required for in-memory databases");
+                }
+                if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
+                    blockBasedTableConfig.setFilterPolicy(null);
+                }
+            } else {
+                final BloomFilter bloomFilter = new BloomFilter(filter.bitsPerKey());
+                refs.add(bloomFilter);
+                if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
+                    blockBasedTableConfig.setFilterPolicy(bloomFilter);
+                }
+            }
+            boolean cacheIndexAndFilterBlocks = !inMemory && Optional.ofNullable(columnOptions.cacheIndexAndFilterBlocks())
+                    // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+                    .orElse(true);
+            if (globalDatabaseConfig.spinning()) {
+                // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
+                columnFamilyOptions.setMinWriteBufferNumberToMerge(3);
+                // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
+                columnFamilyOptions.setMaxWriteBufferNumber(4);
+            }
+            if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
+                blockBasedTableConfig
+                        // http://rocksdb.org/blog/2018/08/23/data-block-hash-index.html
+                        .setDataBlockIndexType(DataBlockIndexType.kDataBlockBinaryAndHash)
+                        // http://rocksdb.org/blog/2018/08/23/data-block-hash-index.html
+                        .setDataBlockHashTableUtilRatio(0.75)
+                        // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+                        .setPinTopLevelIndexAndFilter(true)
+                        // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+                        .setPinL0FilterAndIndexBlocksInCache(!inMemory)
+                        // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+                        .setCacheIndexAndFilterBlocksWithHighPriority(true)
+                        .setCacheIndexAndFilterBlocks(cacheIndexAndFilterBlocks)
+                        // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+                        // Enabling partition filters increase the reads by 2x
+                        .setPartitionFilters(Optional.ofNullable(columnOptions.partitionFilters()).orElse(false))
+                        // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+                        .setIndexType(inMemory ? IndexType.kHashSearch : Optional.ofNullable(columnOptions.partitionFilters()).orElse(false) ? IndexType.kTwoLevelIndexSearch : IndexType.kBinarySearch)
+                        .setChecksumType(inMemory ? ChecksumType.kNoChecksum : ChecksumType.kXXH3)
+                        // Spinning disks: 64KiB to 256KiB (also 512KiB). SSDs: 16KiB
+                        // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
+                        // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
+                        .setBlockSize(inMemory ? 4 * SizeUnit.KB : Optional.ofNullable(columnOptions.blockSize())
+                                .map(DataSize::longValue)
+                                .orElse((globalDatabaseConfig.spinning() ? 128 : 16) * SizeUnit.KB))
+                        .setBlockCache(cache)
+                        .setNoBlockCache(cache == null);
+            }
+            if (inMemory) {
+                columnFamilyOptions.useCappedPrefixExtractor(4);
+                tableOptions.setBlockRestartInterval(4);
+            }
+
+            columnFamilyOptions.setTableFormatConfig(tableOptions);
+            columnFamilyOptions.setCompactionPriority(CompactionPriority.MinOverlappingRatio);
+            // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
+            // https://github.com/EighteenZi/rocksdb_wiki/blob/master/RocksDB-Tuning-Guide.md#throughput-gap-between-random-read-vs-sequential-read-is-much-higher-in-spinning-disks-suggestions=
+            BloomFilterConfig bloomFilterOptions = columnOptions.bloomFilter();
+            if (bloomFilterOptions != null) {
+                // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
+                // https://github.com/EighteenZi/rocksdb_wiki/blob/master/RocksDB-Tuning-Guide.md#throughput-gap-between-random-read-vs-sequential-read-is-much-higher-in-spinning-disks-suggestions=
+                boolean optimizeForHits = globalDatabaseConfig.spinning();
+                Boolean value = bloomFilterOptions.optimizeForHits();
+                if (value != null) optimizeForHits = value;
+                columnFamilyOptions.setOptimizeFiltersForHits(optimizeForHits);
+            }
+            return columnFamilyOptions;
+        } catch (GestaltException ex) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, ex);
+        }
+    }
+
+    private static void setZstdCompressionOptions(CompressionOptions compressionOptions) {
+        // https://rocksdb.org/blog/2021/05/31/dictionary-compression.html#:~:text=(zstd%20only,it%20to%20100x
+        compressionOptions
+                .setZStdMaxTrainBytes(compressionOptions.maxDictBytes() * 100);
+    }
+
+    public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger) {
         var refs = new RocksDBObjects();
         // Get databases directory path
         Path definitiveDbPath;
@@ -132,7 +325,9 @@ public class RocksDBLoader {
             refs.add(options);
             options.setParanoidChecks(PARANOID_CHECKS);
             options.setSkipCheckingSstFileSizesOnDbOpen(true);
-            options.setEnablePipelinedWrite(true);
+            if (!databaseOptions.global().unorderedWrite()) {
+                options.setEnablePipelinedWrite(true);
+            }
             var maxSubCompactions = Integer.parseInt(System.getProperty("it.cavallium.dbengine.compactions.max.sub", "-1"));
             if (maxSubCompactions > 0) {
                 options.setMaxSubcompactions(maxSubCompactions);
@@ -301,11 +496,12 @@ public class RocksDBLoader {
             .toList();
     }
 
-    private static TransactionalDB loadDb(@Nullable Path path,
+    private static LoadedDb loadDb(@Nullable Path path,
         @NotNull Path definitiveDbPath,
         DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger) {
         var inMemory = path == null;
         var rocksdbOptions = optionsWithCache.options();
+        Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap = new HashMap<>();
         try {
             List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, databaseOptions);
             List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
@@ -359,199 +555,12 @@ public class RocksDBLoader {
                     throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Wrong column config name: " + name);
                 }
 
-                var columnFamilyOptions = new ColumnFamilyOptions();
+                var columnFamilyOptions = getColumnOptions(databaseOptions.global(), columnOptions,
+                        logger, refs, path == null, optionsWithCache.standardCache());
                 refs.add(columnFamilyOptions);
 
-                //noinspection ConstantConditions
-                if (columnOptions.memtableMemoryBudgetBytes() != null) {
-                    // about 512MB of ram will be used for level style compaction
-                    columnFamilyOptions.optimizeLevelStyleCompaction(Optional.ofNullable(columnOptions.memtableMemoryBudgetBytes())
-                            .map(DataSize::longValue)
-                            .orElse(DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET));
-                }
-
-                if (isDisableAutoCompactions()) {
-                    columnFamilyOptions.setDisableAutoCompactions(true);
-                }
-                try {
-                    columnFamilyOptions.setPrepopulateBlobCache(PrepopulateBlobCache.PREPOPULATE_BLOB_FLUSH_ONLY);
-                } catch (Throwable ex) {
-                    logger.error("Failed to set prepopulate blob cache", ex);
-                }
-
-                // This option is not supported with multiple db paths
-                // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
-                // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
-                boolean dynamicLevelBytes = volumeConfigs.size() <= 1;
-                if (dynamicLevelBytes) {
-                    columnFamilyOptions.setLevelCompactionDynamicLevelBytes(true);
-                    columnFamilyOptions.setMaxBytesForLevelBase(10 * SizeUnit.GB);
-                    columnFamilyOptions.setMaxBytesForLevelMultiplier(10);
-                } else {
-                    // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
-                    // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
-                    columnFamilyOptions.setMaxBytesForLevelBase(256 * SizeUnit.MB);
-                    // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
-                    columnFamilyOptions.setMaxBytesForLevelMultiplier(10);
-                }
-                if (isDisableAutoCompactions()) {
-                    columnFamilyOptions.setLevel0FileNumCompactionTrigger(-1);
-                } else if (!FOLLOW_ROCKSDB_OPTIMIZATIONS) {
-                    // ArangoDB uses a value of 2: https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
-                    // Higher values speed up writes, but slow down reads
-                    columnFamilyOptions.setLevel0FileNumCompactionTrigger(2);
-                }
-                if (isDisableSlowdown()) {
-                    columnFamilyOptions.setLevel0SlowdownWritesTrigger(-1);
-                    columnFamilyOptions.setLevel0StopWritesTrigger(Integer.MAX_VALUE);
-                    columnFamilyOptions.setHardPendingCompactionBytesLimit(Long.MAX_VALUE);
-                    columnFamilyOptions.setSoftPendingCompactionBytesLimit(Long.MAX_VALUE);
-                }
-                {
-                    // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
-                    columnFamilyOptions.setLevel0SlowdownWritesTrigger(20);
-                    // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
-                    columnFamilyOptions.setLevel0StopWritesTrigger(36);
-                }
-
-                if (columnOptions.levels().length > 0) {
-                    columnFamilyOptions.setNumLevels(columnOptions.levels().length);
-                    var firstLevelOptions = getRocksLevelOptions(columnOptions.levels()[0], refs);
-                    columnFamilyOptions.setCompressionType(firstLevelOptions.compressionType);
-                    columnFamilyOptions.setCompressionOptions(firstLevelOptions.compressionOptions);
-
-                    var lastLevelOptions = getRocksLevelOptions(columnOptions
-                            .levels()[columnOptions.levels().length - 1], refs);
-                    columnFamilyOptions.setBottommostCompressionType(lastLevelOptions.compressionType);
-                    columnFamilyOptions.setBottommostCompressionOptions(lastLevelOptions.compressionOptions);
-
-                    List<CompressionType> compressionPerLevel = new ArrayList<>();
-                    for (ColumnLevelConfig columnLevelConfig : columnOptions.levels()) {
-                        CompressionType compression = columnLevelConfig.compression();
-                        compressionPerLevel.add(compression);
-                    }
-                    columnFamilyOptions.setCompressionPerLevel(compressionPerLevel);
-                } else {
-                    columnFamilyOptions.setNumLevels(7);
-                    List<CompressionType> compressionTypes = new ArrayList<>(7);
-                    for (int i = 0; i < 7; i++) {
-                        if (i < 2) {
-                            compressionTypes.add(CompressionType.NO_COMPRESSION);
-                        } else {
-                            compressionTypes.add(CompressionType.LZ4_COMPRESSION);
-                        }
-                    }
-                    columnFamilyOptions.setBottommostCompressionType(CompressionType.LZ4HC_COMPRESSION);
-                    var compressionOptions = new CompressionOptions()
-                            .setEnabled(true)
-                            .setMaxDictBytes(32768);
-                    refs.add(compressionOptions);
-                    columnFamilyOptions.setBottommostCompressionOptions(compressionOptions);
-                    columnFamilyOptions.setCompressionPerLevel(compressionTypes);
-                }
-
-                final BlockBasedTableConfig tableOptions = new BlockBasedTableConfig();
-
-                if (!FOLLOW_ROCKSDB_OPTIMIZATIONS) {
-                    columnFamilyOptions.setWriteBufferSize(256 * SizeUnit.MB);
-                }
-                Optional.ofNullable(columnOptions.writeBufferSize())
-                        .map(DataSize::longValue)
-                        .ifPresent(columnFamilyOptions::setWriteBufferSize);
-
-                columnFamilyOptions.setMaxWriteBufferNumberToMaintain(1);
-                if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
-                    blockBasedTableConfig.setVerifyCompression(false);
-                }
-                // If OptimizeFiltersForHits == true: memory size = bitsPerKey * (totalKeys * 0.1)
-                // If OptimizeFiltersForHits == false: memory size = bitsPerKey * totalKeys
-                BloomFilterConfig filter = null;
-                BloomFilterConfig bloomFilterConfig = columnOptions.bloomFilter();
-                if (bloomFilterConfig != null) filter = bloomFilterConfig;
-                if (filter == null) {
-                    if (path == null) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Please set a bloom filter. It's required for in-memory databases");
-                    }
-                    if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
-                        blockBasedTableConfig.setFilterPolicy(null);
-                    }
-                } else {
-                    final BloomFilter bloomFilter = new BloomFilter(filter.bitsPerKey());
-                    refs.add(bloomFilter);
-                    if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
-                        blockBasedTableConfig.setFilterPolicy(bloomFilter);
-                    }
-                }
-                boolean cacheIndexAndFilterBlocks = path != null && Optional.ofNullable(columnOptions.cacheIndexAndFilterBlocks())
-                        // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
-                        .orElse(true);
-                if (databaseOptions.global().spinning()) {
-                    if (!FOLLOW_ROCKSDB_OPTIMIZATIONS) {
-                        // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
-                        // cacheIndexAndFilterBlocks = true;
-                        // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
-                        columnFamilyOptions.setMinWriteBufferNumberToMerge(3);
-                        // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
-                        columnFamilyOptions.setMaxWriteBufferNumber(4);
-                    }
-                }
-                if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
-                    blockBasedTableConfig
-                            // http://rocksdb.org/blog/2018/08/23/data-block-hash-index.html
-                            .setDataBlockIndexType(DataBlockIndexType.kDataBlockBinaryAndHash)
-                            // http://rocksdb.org/blog/2018/08/23/data-block-hash-index.html
-                            .setDataBlockHashTableUtilRatio(0.75)
-                            // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
-                            .setPinTopLevelIndexAndFilter(true)
-                            // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
-                            .setPinL0FilterAndIndexBlocksInCache(path != null)
-                            // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
-                            .setCacheIndexAndFilterBlocksWithHighPriority(true)
-                            .setCacheIndexAndFilterBlocks(cacheIndexAndFilterBlocks)
-                            // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
-                            // Enabling partition filters increase the reads by 2x
-                            .setPartitionFilters(Optional.ofNullable(columnOptions.partitionFilters()).orElse(false))
-                            // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
-                            .setIndexType(path == null ? IndexType.kHashSearch : Optional.ofNullable(columnOptions.partitionFilters()).orElse(false) ? IndexType.kTwoLevelIndexSearch : IndexType.kBinarySearch)
-                            .setChecksumType(path == null ? ChecksumType.kNoChecksum : ChecksumType.kXXH3)
-                            // Spinning disks: 64KiB to 256KiB (also 512KiB). SSDs: 16KiB
-                            // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
-                            // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
-                            .setBlockSize(path == null ? 4096 : Optional.ofNullable(columnOptions.blockSize()).map(DataSize::longValue).orElse((databaseOptions.global().spinning() ? 128 : 16) * 1024L))
-                            .setBlockCache(optionsWithCache.standardCache())
-                            .setNoBlockCache(optionsWithCache.standardCache() == null);
-                }
-                if (path == null) {
-                    columnFamilyOptions.useCappedPrefixExtractor(4);
-                    tableOptions.setBlockRestartInterval(4);
-                }
-
-                columnFamilyOptions.setTableFormatConfig(tableOptions);
-                columnFamilyOptions.setCompactionPriority(CompactionPriority.MinOverlappingRatio);
-                // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
-                // https://github.com/EighteenZi/rocksdb_wiki/blob/master/RocksDB-Tuning-Guide.md#throughput-gap-between-random-read-vs-sequential-read-is-much-higher-in-spinning-disks-suggestions=
-                BloomFilterConfig bloomFilterOptions = columnOptions.bloomFilter();
-                if (bloomFilterOptions != null) {
-                    // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
-                    // https://github.com/EighteenZi/rocksdb_wiki/blob/master/RocksDB-Tuning-Guide.md#throughput-gap-between-random-read-vs-sequential-read-is-much-higher-in-spinning-disks-suggestions=
-                    boolean optimizeForHits = databaseOptions.global().spinning();
-                    Boolean value = bloomFilterOptions.optimizeForHits();
-                    if (value != null) optimizeForHits = value;
-                    columnFamilyOptions.setOptimizeFiltersForHits(optimizeForHits);
-                }
-
-                if (!FOLLOW_ROCKSDB_OPTIMIZATIONS) {
-                    // // Increasing this value can reduce the frequency of compaction and reduce write amplification,
-                    // // but it will also cause old data to be unable to be cleaned up in time, thus increasing read amplification.
-                    // // This parameter is not easy to adjust. It is generally not recommended to set it above 256MB.
-                    // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
-                    columnFamilyOptions.setTargetFileSizeBase(64 * SizeUnit.MB);
-                    // // For each level up, the threshold is multiplied by the factor target_file_size_multiplier
-                    // // (but the default value is 1, which means that the maximum sstable of each level is the same).
-                    columnFamilyOptions.setTargetFileSizeMultiplier(2);
-                }
-
                 descriptors.add(new ColumnFamilyDescriptor(name.getBytes(StandardCharsets.US_ASCII), columnFamilyOptions));
+                definitiveColumnFamilyOptionsMap.put(name, columnFamilyOptions);
             }
 
             var handles = new ArrayList<ColumnFamilyHandle>();
@@ -587,7 +596,7 @@ public class RocksDBLoader {
 
             var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
             var dbTasks = new DatabaseTasks(db, inMemory, delayWalFlushConfig);
-            return TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks);
+            return new LoadedDb(TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks), rocksdbOptions, definitiveColumnFamilyOptionsMap);
         } catch (IOException | RocksDBException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {
@@ -612,8 +621,9 @@ public class RocksDBLoader {
         var compressionOptions = new CompressionOptions();
         refs.add(compressionOptions);
         if (compressionType != CompressionType.NO_COMPRESSION) {
-            compressionOptions.setEnabled(true);
-            compressionOptions.setMaxDictBytes(Math.toIntExact(levelOptions.maxDictBytes().longValue()));
+            compressionOptions.setEnabled(true)
+                    .setMaxDictBytes(Math.toIntExact(levelOptions.maxDictBytes().longValue()));
+            setZstdCompressionOptions(compressionOptions);
         } else {
             compressionOptions.setEnabled(false);
         }

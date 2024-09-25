@@ -9,9 +9,7 @@ import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
-import it.cavallium.rockserver.core.config.ConfigParser;
-import it.cavallium.rockserver.core.config.ConfigPrinter;
-import it.cavallium.rockserver.core.config.DatabaseConfig;
+import it.cavallium.rockserver.core.config.*;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
 import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB.TransactionalOptions;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -26,20 +24,21 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.NoSuchElementException;
-import java.util.Objects;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
 
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
+import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.VisibleForTesting;
+import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 import org.rocksdb.*;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.Status.Code;
@@ -55,13 +54,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	private final Logger logger;
 	private final @Nullable Path path;
 	private final TransactionalDB db;
+	private final DBOptions dbOptions;
 	private final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
 	private final NonBlockingHashMapLong<ColumnInstance> columns;
+	private final Map<String, ColumnFamilyOptions> columnsConifg;
 	private final ConcurrentMap<String, Long> columnNamesIndex;
 	private final NonBlockingHashMapLong<Tx> txs;
 	private final NonBlockingHashMapLong<REntry<RocksIterator>> its;
 	private final SafeShutdown ops;
 	private final Object columnEditLock = new Object();
+	private final DatabaseConfig config;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
 		this.path = path;
@@ -72,7 +74,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		this.columnNamesIndex = new ConcurrentHashMap<>();
 		this.ops = new SafeShutdown();
 		DatabaseConfig config = ConfigParser.parse(embeddedConfigPath);
-		this.db = RocksDBLoader.load(path, config, logger);
+		this.config = config;
+		var loadedDb = RocksDBLoader.load(path, config, logger);
+		this.db = loadedDb.db();
+		this.dbOptions = loadedDb.dbOptions();
+		this.columnsConifg = loadedDb.definitiveColumnFamilyOptionsMap();
 		var existingColumnSchemasColumnDescriptorOptional = db
 				.getStartupColumns()
 				.entrySet()
@@ -411,91 +417,163 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		if (keys.size() != values.size()) {
 			throw new IllegalArgumentException("keys length is different than values length: " + keys.size() + " != " + values.size());
 		}
-		if (requestType instanceof RequestType.RequestNothing<?>
-				&& !getColumn(columnId).hasBuckets()
-				&& transactionOrUpdateId == 0L) {
-			putBatch(arena, columnId, keys, values, PutBatchMode.WRITE_BATCH);
-			return List.of();
-		} else {
-			List<T> responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keys.size());
-			for (int i = 0; i < keys.size(); i++) {
-				var result = put(arena, transactionOrUpdateId, columnId, keys.get(i), values.get(i), requestType);
-				if (responses != null) {
-					responses.add(result);
-				}
+		List<T> responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keys.size());
+		for (int i = 0; i < keys.size(); i++) {
+			var result = put(arena, transactionOrUpdateId, columnId, keys.get(i), values.get(i), requestType);
+			if (responses != null) {
+				responses.add(result);
 			}
-			return responses != null ? responses : List.of();
+		}
+		return responses != null ? responses : List.of();
+	}
+
+	public CompletableFuture<Void> putBatchInternal(long columnId,
+						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
+						 @NotNull PutBatchMode mode) throws it.cavallium.rockserver.core.common.RocksDBException {
+		try {
+			var cf = new CompletableFuture<Void>();
+			batchPublisher.subscribe(new Subscriber<>() {
+				private Subscription subscription;
+				private ColumnInstance col;
+				private ArrayList<AutoCloseable> refs;
+				private DBWriter writer;
+
+				@Override
+				public void onSubscribe(Subscription subscription) {
+					ops.beginOp();
+
+					try {
+						// Column id
+						col = getColumn(columnId);
+						refs = new ArrayList<>();
+
+						writer = switch (mode) {
+							case WRITE_BATCH, WRITE_BATCH_NO_WAL -> {
+								var wb = new WB(db.get(), new WriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL);
+								refs.add(wb);
+								yield wb;
+							}
+							case SST_INGESTION, SST_INGEST_BEHIND -> {
+								var sstWriter = getSSTWriter(columnId, null, null, true, mode == PutBatchMode.SST_INGEST_BEHIND);
+								refs.add(sstWriter);
+								yield sstWriter;
+							}
+						};
+					} catch (Throwable ex) {
+						doFinally();
+						throw ex;
+					}
+					this.subscription = subscription;
+					subscription.request(1);
+				}
+
+				@Override
+				public void onNext(KVBatch kvBatch) {
+					var keyIt = kvBatch.keys().iterator();
+					var valueIt = kvBatch.values().iterator();
+					try (var arena = Arena.ofConfined()) {
+						while (keyIt.hasNext()) {
+							var key = keyIt.next();
+							var value = valueIt.next();
+							put(arena, writer, col, 0, key, value, RequestType.none());
+						}
+					} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+						doFinally();
+						throw ex;
+					} catch (Exception ex) {
+						doFinally();
+						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+					}
+					subscription.request(1);
+				}
+
+				@Override
+				public void onError(Throwable throwable) {
+					cf.completeExceptionally(throwable);
+					doFinally();
+				}
+
+				@Override
+				public void onComplete() {
+					try {
+						try {
+							writer.writePending();
+						} catch (Throwable ex) {
+							cf.completeExceptionally(ex);
+							return;
+						}
+						cf.complete(null);
+					} finally {
+						doFinally();
+					}
+				}
+
+				private void doFinally() {
+					for (int i = refs.size() - 1; i >= 0; i--) {
+						try {
+							var c = refs.get(i);
+							if (c instanceof AbstractImmutableNativeReference fr) {
+								if (fr.isOwningHandle()) {
+									c.close();
+								}
+							} else {
+								c.close();
+							}
+						} catch (Exception ex) {
+							logger.error("Failed to close reference during batch write", ex);
+						}
+					}
+					ops.endOp();
+				}
+			});
+			return cf;
+		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		}
 	}
 
+	@VisibleForTesting
+	public SSTWriter getSSTWriter(long colId,
+								  @Nullable GlobalDatabaseConfig globalDatabaseConfigOverride,
+								  @Nullable FallbackColumnConfig columnConfigOverride,
+								  boolean forceNoOptions,
+								  boolean ingestBehind) throws it.cavallium.rockserver.core.common.RocksDBException {
+		try {
+			var col = getColumn(colId);
+			ColumnFamilyOptions columnConifg;
+			RocksDBObjects refs;
+			if (!forceNoOptions) {
+				if (columnConfigOverride != null) {
+					refs = new RocksDBObjects();
+					columnConifg = RocksDBLoader.getColumnOptions(globalDatabaseConfigOverride, columnConfigOverride, logger, refs, path == null, null);
+				} else {
+					columnConifg = columnsConifg.get(new String(col.cfh().getName(), StandardCharsets.UTF_8));
+					refs = null;
+				}
+			} else {
+				columnConifg = null;
+				refs = null;
+			}
+            return SSTWriter.open(db, col, columnConifg, forceNoOptions, ingestBehind, refs);
+        } catch (IOException ex) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.SST_WRITE_2, ex);
+        } catch (RocksDBException ex) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.SST_WRITE_3, ex);
+        }
+    }
 
 	@Override
-	public void putBatch(Arena arena,
-						 long columnId,
-						 @NotNull List<Keys> keys,
-						 @NotNull List<@NotNull MemorySegment> values,
+	public void putBatch(long columnId,
+						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 						 @NotNull PutBatchMode mode) throws it.cavallium.rockserver.core.common.RocksDBException {
-		if (keys.size() != values.size()) {
-			throw new IllegalArgumentException("keys length is different than values length: " + keys.size() + " != " + values.size());
-		}
-		ops.beginOp();
 		try {
-			// Column id
-			var col = getColumn(columnId);
-			List<AutoCloseable> refs = new ArrayList<>();
-			try {
-				DBWriter writer = switch (mode) {
-					case WRITE_BATCH, WRITE_BATCH_NO_WAL -> {
-						var wb = new WB(db.get(), new WriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL);
-						refs.add(wb);
-						yield wb;
-					}
-					case SST_INGESTION, SST_INGEST_BEHIND -> {
-						var envOptions = new EnvOptions();
-						refs.add(envOptions);
-						var compressionOptions = new CompressionOptions()
-								.setEnabled(true)
-								.setMaxDictBytes(32768)
-								.setZStdMaxTrainBytes(32768 * 4);
-						refs.add(compressionOptions);
-						var options = new Options()
-								.setCompressionOptions(compressionOptions)
-								.setCompressionType(CompressionType.ZSTD_COMPRESSION)
-								.setUnorderedWrite(true)
-								.setAllowIngestBehind(mode == PutBatchMode.SST_INGEST_BEHIND)
-								.setAllowConcurrentMemtableWrite(true);
-						refs.add(options);
-						var tempFile = Files.createTempFile("temp", ".sst");
-						var sstFileWriter = new SstFileWriter(envOptions, options);
-						var sstWriter = new SSTWriter(db.get(), col, tempFile, sstFileWriter, mode == PutBatchMode.SST_INGEST_BEHIND);
-						refs.add(sstWriter);
-						sstFileWriter.open(tempFile.toString());
-						yield sstWriter;
-					}
-				};
-				var keyIt = keys.iterator();
-				var valusIt = values.iterator();
-				while (keyIt.hasNext()) {
-					var key = keyIt.next();
-					var value = valusIt.next();
-					put(arena, writer, col, 0, key, value, RequestType.none());
-				}
-				writer.writePending();
-			} finally {
-				for (int i = refs.size() - 1; i >= 0; i--) {
-					try {
-						refs.get(i).close();
-					} catch (Exception ex) {
-						logger.error("Failed to close reference during batch write", ex);
-					}
-				}
-			}
+			putBatchInternal(columnId, batchPublisher, mode).get();
         } catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			ops.endOp();
 		}
 	}
 
@@ -613,7 +691,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 					}
 					switch (dbWriter) {
 						case WB wb -> wb.wb().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
-						case SSTWriter sstWriter -> sstWriter.sstFileWriter().put(Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
+						case SSTWriter sstWriter -> {
+							var keyBB = calculatedKey.asByteBuffer();
+							ByteBuffer valueBB = (col.schema().hasValue() ? value : Utils.dummyEmptyValue()).asByteBuffer();
+							sstWriter.put(keyBB, valueBB);
+						}
 						case Tx t -> t.val().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
 						case null -> {
 							try (var w = new WriteOptions()) {

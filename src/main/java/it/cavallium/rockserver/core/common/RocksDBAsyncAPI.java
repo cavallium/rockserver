@@ -76,12 +76,10 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link PutBatch}. */
-	default CompletableFuture<Void> putBatchAsync(Arena arena,
-			long columnId,
-			@NotNull List<@NotNull Keys> keys,
-			@NotNull List<@NotNull MemorySegment> values,
+	default CompletableFuture<Void> putBatchAsync(long columnId,
+			@NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode) throws RocksDBException {
-		return requestAsync(new PutBatch(arena, columnId, keys, values, mode));
+		return requestAsync(new PutBatch(columnId, batchPublisher, mode));
 	}
 
 	/** See: {@link Get}. */

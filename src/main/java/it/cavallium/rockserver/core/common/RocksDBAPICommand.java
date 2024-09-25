@@ -17,8 +17,10 @@ public sealed interface RocksDBAPICommand<R> {
 
 	/**
 	 * Open a transaction
+	 * <p>
+	 * Returns the transaction id
+	 *
 	 * @param timeoutMs timeout in milliseconds
-	 * @return transaction id
 	 */
 	record OpenTransaction(long timeoutMs) implements RocksDBAPICommand<Long> {
 
@@ -35,10 +37,11 @@ public sealed interface RocksDBAPICommand<R> {
 	}
 	/**
 	 * Close a transaction
+	 * <p>
+	 * Returns true if committed, if false, you should try again
 	 *
 	 * @param transactionId transaction id to close
 	 * @param commit true to commit the transaction, false to rollback it
-	 * @return true if committed, if false, you should try again
 	 */
 	record CloseTransaction(long transactionId, boolean commit) implements RocksDBAPICommand<Boolean> {
 
@@ -74,9 +77,11 @@ public sealed interface RocksDBAPICommand<R> {
 	}
 	/**
 	 * Create a column
+	 * <p>
+	 * Returns the column id
+	 *
 	 * @param name   column name
 	 * @param schema column key-value schema
-	 * @return column id
 	 */
 	record CreateColumn(String name, @NotNull ColumnSchema schema) implements RocksDBAPICommand<Long> {
 
@@ -111,8 +116,10 @@ public sealed interface RocksDBAPICommand<R> {
 	}
 	/**
 	 * Get column id by name
+	 * <p>
+	 * Returns the column id
+	 *
 	 * @param name column name
-	 * @return column id
 	 */
 	record GetColumnId(@NotNull String name) implements RocksDBAPICommand<Long> {
 
@@ -210,26 +217,23 @@ public sealed interface RocksDBAPICommand<R> {
 	}
 	/**
 	 * Put multiple elements into the specified positions
-	 * @param arena arena
 	 * @param columnId column id
-	 * @param keys multiple lists of column keys
-	 * @param values multiple values, or null if not needed
+	 * @param batchPublisher publisher of batches of keys and values
 	 * @param mode put batch mode
 	 */
-	record PutBatch(Arena arena, long columnId,
-					@NotNull List<Keys> keys,
-					@NotNull List<@NotNull MemorySegment> values,
+	record PutBatch(long columnId,
+					@NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
 					@NotNull PutBatchMode mode) implements RocksDBAPICommand<Void> {
 
 		@Override
 		public Void handleSync(RocksDBSyncAPI api) {
-			api.putBatch(arena, columnId, keys, values, mode);
+			api.putBatch(columnId, batchPublisher, mode);
 			return null;
 		}
 
 		@Override
 		public CompletionStage<Void> handleAsync(RocksDBAsyncAPI api) {
-			return api.putBatchAsync(arena, columnId, keys, values, mode);
+			return api.putBatchAsync(columnId, batchPublisher, mode);
 		}
 
 		@Override
@@ -237,13 +241,7 @@ public sealed interface RocksDBAPICommand<R> {
 			var sb = new StringBuilder("PUT_BATCH");
 			sb.append(" column:").append(columnId);
 			sb.append(" mode:").append(mode);
-			sb.append(" batch:[");
-			for (int i = 0; i < keys.size(); i++) {
-				if (i > 0) sb.append(",");
-				sb.append(" keys:").append(keys.get(i));
-				sb.append(" value:").append(Utils.toPrettyString(values.get(i)));
-			}
-			sb.append("]");
+			sb.append(" batch:[...]");
 			return sb.toString();
 		}
 	}
@@ -285,6 +283,9 @@ public sealed interface RocksDBAPICommand<R> {
 	}
 	/**
 	 * Open an iterator
+	 * <p>
+	 * Returns the iterator id
+	 *
 	 * @param arena arena
 	 * @param transactionId transaction id, or 0
 	 * @param columnId column id
@@ -292,7 +293,6 @@ public sealed interface RocksDBAPICommand<R> {
 	 * @param endKeysExclusive end keys, exclusive. Null means "the end"
 	 * @param reverse if true, seek in reverse direction
 	 * @param timeoutMs timeout in milliseconds
-	 * @return iterator id
 	 */
 	record OpenIterator(Arena arena,
 											long transactionId,

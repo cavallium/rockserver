@@ -28,6 +28,7 @@ module rockserver.core {
 	requires io.netty.codec;
 	requires io.netty.codec.http2;
 	requires io.netty.transport.classes.epoll;
+	requires org.reactivestreams;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

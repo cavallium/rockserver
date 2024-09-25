@@ -75,12 +75,10 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	}
 
 	/** See: {@link PutBatch}. */
-	default void putBatch(Arena arena,
-						  long columnId,
-						  @NotNull List<Keys> keys,
-						  @NotNull List<@NotNull MemorySegment> values,
+	default void putBatch(long columnId,
+						  @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
 						  @NotNull PutBatchMode mode) throws RocksDBException {
-		requestSync(new PutBatch(arena, columnId, keys, values, mode));
+		requestSync(new PutBatch(columnId, batchPublisher, mode));
 	}
 
 	/** See: {@link Get}. */
