@@ -85,7 +85,7 @@ public class GrpcServer extends Server {
 				.directExecutor()
 				.channelType(channelType)
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
-				.maxInboundMessageSize(128 * 1024 * 1024)
+				.maxInboundMessageSize(512 * 1024 * 1024)
 				.addService(grpc)
 				.build();
 		server.start();
