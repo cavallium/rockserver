@@ -102,8 +102,8 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
     @Override
     public void writePending() throws it.cavallium.rockserver.core.common.RocksDBException {
         try {
+            checkOwningHandle();
             try (this) {
-                checkOwningHandle();
                 sstFileWriter.finish();
                 try (var ingestOptions = new IngestExternalFileOptions()) {
                     ingestOptions

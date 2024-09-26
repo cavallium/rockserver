@@ -290,25 +290,29 @@ public class GrpcServer extends Server {
 
 				@Override
 				public void onError(Throwable throwable) {
-					state = State.RECEIVED_ALL;
-					doFinally();
-					if (putBatchInputsSubscriber != null) {
-						putBatchInputsSubscriber.onError(throwable);
-					} else {
-						serverCallStreamObserver.onError(throwable);
-					}
+					sstExecutor.execute(() -> {
+						state = State.RECEIVED_ALL;
+						doFinally();
+						if (putBatchInputsSubscriber != null) {
+							putBatchInputsSubscriber.onError(throwable);
+						} else {
+							serverCallStreamObserver.onError(throwable);
+						}
+					});
 				}
 
 				@Override
 				public void onCompleted() {
-					if (state == State.BEFORE_INITIAL_REQUEST) {
-						serverCallStreamObserver.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
-					} else if (state == State.RECEIVING_DATA) {
-						state = State.RECEIVED_ALL;
-						checkCompleted(false);
-					} else {
-						putBatchInputsSubscriber.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR, "Unknown state during onComplete: " + state));
-					}
+					sstExecutor.execute(() -> {
+						if (state == State.BEFORE_INITIAL_REQUEST) {
+							serverCallStreamObserver.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+						} else if (state == State.RECEIVING_DATA) {
+							state = State.RECEIVED_ALL;
+							checkCompleted(false);
+						} else {
+							putBatchInputsSubscriber.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR, "Unknown state during onComplete: " + state));
+						}
+					});
 				}
 
 				private void checkCompleted(boolean requestDone) {
