@@ -43,18 +43,6 @@ public class RocksDBLoader {
     private static final String bugFallbackJniLibraryFileName = Environment.getFallbackJniLibraryFileName("rocksdbjni");
 
     public static void loadLibrary() {
-        try {
-            String currentUsersHomeDir = System.getProperty("user.home");
-            var jniPath = Path.of(currentUsersHomeDir).resolve(".jni").resolve("rocksdb").resolve(RocksDBMetadata.getRocksDBVersionHash());
-            if (Files.notExists(jniPath)) {
-                Files.createDirectories(jniPath);
-            }
-            loadLibraryFromJarToTemp(jniPath);
-
-            RocksDB.loadLibrary(List.of(jniPath.toAbsolutePath().toString()));
-        } catch (IOException e) {
-            RocksDB.loadLibrary();
-        }
         for (final CompressionType compressionType : CompressionType.values()) {
             try {
                 if (compressionType.getLibraryName() != null) {
@@ -66,6 +54,18 @@ public class RocksDBLoader {
                 }
                 // since it may be optional, we ignore its loading failure here.
             }
+        }
+        try {
+            String currentUsersHomeDir = System.getProperty("user.home");
+            var jniPath = Path.of(currentUsersHomeDir).resolve(".jni").resolve("rocksdb").resolve(RocksDBMetadata.getRocksDBVersionHash());
+            if (Files.notExists(jniPath)) {
+                Files.createDirectories(jniPath);
+            }
+            loadLibraryFromJarToTemp(jniPath);
+
+            RocksDB.loadLibrary(List.of(jniPath.toAbsolutePath().toString()));
+        } catch (IOException e) {
+            RocksDB.loadLibrary();
         }
     }
 
