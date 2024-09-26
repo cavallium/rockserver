@@ -56,9 +56,9 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                         .setMaxOpenFiles(-1)
                         .setCompressionPerLevel(columnConifg.compressionPerLevel())
                         .setCompressionType(columnConifg.compressionType())
-                        .setCompressionOptions(columnConifg.compressionOptions())
+                        .setCompressionOptions(cloneCompressionOptions(columnConifg.compressionOptions()))
                         .setBottommostCompressionType(columnConifg.bottommostCompressionType())
-                        .setBottommostCompressionOptions(columnConifg.bottommostCompressionOptions());
+                        .setBottommostCompressionOptions(cloneCompressionOptions(columnConifg.bottommostCompressionOptions()));
                 if (columnConifg.memTableConfig() != null) {
                         options.setMemTableConfig(columnConifg.memTableConfig());
                 } else {
@@ -81,6 +81,16 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
         var sstWriter = new SSTWriter(db.get(), col, tempFile, sstFileWriter, ingestBehind, refs);
         sstFileWriter.open(tempFile.toString());
         return sstWriter;
+    }
+
+    private static CompressionOptions cloneCompressionOptions(CompressionOptions compressionOptions) {
+        return new CompressionOptions()
+                .setEnabled(compressionOptions.enabled())
+                .setMaxDictBytes(compressionOptions.maxDictBytes())
+                .setLevel(compressionOptions.level())
+                .setStrategy(compressionOptions.strategy())
+                .setZStdMaxTrainBytes(compressionOptions.zstdMaxTrainBytes())
+                .setWindowBits(compressionOptions.windowBits());
     }
 
     public void put(byte[] key, byte[] value) throws RocksDBException {

@@ -55,6 +55,18 @@ public class RocksDBLoader {
         } catch (IOException e) {
             RocksDB.loadLibrary();
         }
+        for (final CompressionType compressionType : CompressionType.values()) {
+            try {
+                if (compressionType.getLibraryName() != null) {
+                    System.loadLibrary(compressionType.getLibraryName());
+                }
+            } catch (final UnsatisfiedLinkError e) {
+                if (compressionType == CompressionType.ZSTD_COMPRESSION) {
+                    throw new IllegalStateException("Can't load ZSTD", e);
+                }
+                // since it may be optional, we ignore its loading failure here.
+            }
+        }
     }
 
     private static Path loadLibraryFromJarToTemp(final Path tmpDir) throws IOException {
