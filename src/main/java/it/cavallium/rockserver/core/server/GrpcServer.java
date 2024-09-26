@@ -71,13 +71,18 @@ public class GrpcServer extends Server {
 		this.grpc = new GrpcServerImpl(this.getClient());
 		EventLoopGroup elg;
 		Class<? extends ServerChannel> channelType;
-		try {
-            elg = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
-			channelType = EpollServerDomainSocketChannel.class;
-        } catch (Throwable ex) {
-			LOG.warn("Can't load Epoll event loop group, the server will be slower", ex);
+		if (http2Port != 0) {
 			elg = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
 			channelType = NioServerSocketChannel.class;
+		} else {
+			try {
+				elg = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
+				channelType = EpollServerDomainSocketChannel.class;
+			} catch (Throwable ex) {
+				LOG.warn("Can't load Epoll event loop group, the server will be slower", ex);
+				elg = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
+				channelType = NioServerSocketChannel.class;
+			}
 		}
 		this.elg = elg;
 		this.executor = Executors.newWorkStealingPool(Runtime.getRuntime().availableProcessors() * 2);
