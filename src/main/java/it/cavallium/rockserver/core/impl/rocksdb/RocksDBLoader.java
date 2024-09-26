@@ -49,6 +49,9 @@ public class RocksDBLoader {
                     System.loadLibrary(compressionType.getLibraryName());
                 }
             } catch (final UnsatisfiedLinkError e) {
+                if (compressionType == CompressionType.LZ4_COMPRESSION) {
+                    throw new IllegalStateException("Can't load LZ4", e);
+                }
                 if (compressionType == CompressionType.ZSTD_COMPRESSION) {
                     throw new IllegalStateException("Can't load ZSTD", e);
                 }
