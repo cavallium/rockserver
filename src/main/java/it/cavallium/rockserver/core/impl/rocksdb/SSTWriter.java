@@ -49,16 +49,16 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                     .setParanoidFileChecks(false);
             if (columnConifg != null) {
                 options
-                        .setCompressionType(columnConifg.compressionType())
-                        .setCompressionOptions(columnConifg.compressionOptions())
-                        .setBottommostCompressionType(columnConifg.bottommostCompressionType())
-                        .setBottommostCompressionOptions(columnConifg.bottommostCompressionOptions())
-                        .setCompressionPerLevel(columnConifg.compressionPerLevel())
                         .setNumLevels(columnConifg.numLevels())
                         .setTableFormatConfig(columnConifg.tableFormatConfig())
                         .setTargetFileSizeBase(columnConifg.targetFileSizeBase())
                         .setTargetFileSizeMultiplier(columnConifg.targetFileSizeMultiplier())
-                        .setMaxOpenFiles(-1);
+                        .setMaxOpenFiles(-1)
+                        .setCompressionPerLevel(columnConifg.compressionPerLevel())
+                        .setCompressionType(columnConifg.compressionType())
+                        .setCompressionOptions(columnConifg.compressionOptions())
+                        .setBottommostCompressionType(columnConifg.bottommostCompressionType())
+                        .setBottommostCompressionOptions(columnConifg.bottommostCompressionOptions());
                 if (columnConifg.memTableConfig() != null) {
                         options.setMemTableConfig(columnConifg.memTableConfig());
                 } else {

@@ -150,6 +150,17 @@ public class RocksDBLoader {
 
             if (columnOptions.levels().length > 0) {
                 columnFamilyOptions.setNumLevels(columnOptions.levels().length);
+
+                List<CompressionType> compressionPerLevel = new ArrayList<>();
+                for (ColumnLevelConfig columnLevelConfig : columnOptions.levels()) {
+                    CompressionType compression = columnLevelConfig.compression();
+                    compressionPerLevel.add(compression);
+                }
+                if (compressionPerLevel.size() != columnOptions.levels().length) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Database column levels and compression per level count is different! %s != %s".formatted(compressionPerLevel.size(), columnOptions.levels().length));
+                }
+                columnFamilyOptions.setCompressionPerLevel(compressionPerLevel);
+
                 var firstLevelOptions = getRocksLevelOptions(columnOptions.levels()[0], refs);
                 columnFamilyOptions.setCompressionType(firstLevelOptions.compressionType);
                 columnFamilyOptions.setCompressionOptions(firstLevelOptions.compressionOptions);
@@ -158,13 +169,6 @@ public class RocksDBLoader {
                         .levels()[columnOptions.levels().length - 1], refs);
                 columnFamilyOptions.setBottommostCompressionType(lastLevelOptions.compressionType);
                 columnFamilyOptions.setBottommostCompressionOptions(lastLevelOptions.compressionOptions);
-
-                List<CompressionType> compressionPerLevel = new ArrayList<>();
-                for (ColumnLevelConfig columnLevelConfig : columnOptions.levels()) {
-                    CompressionType compression = columnLevelConfig.compression();
-                    compressionPerLevel.add(compression);
-                }
-                columnFamilyOptions.setCompressionPerLevel(compressionPerLevel);
             } else {
                 columnFamilyOptions.setNumLevels(7);
                 List<CompressionType> compressionTypes = new ArrayList<>(7);
