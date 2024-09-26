@@ -71,7 +71,7 @@ public class GrpcServer extends Server {
 		EventLoopGroup elg;
 		Class<? extends ServerChannel> channelType;
 		try {
-            elg = new EpollEventLoopGroup(1);
+            elg = new EpollEventLoopGroup(Math.min(8, Runtime.getRuntime().availableProcessors()));
 			channelType = EpollServerDomainSocketChannel.class;
         } catch (UnsatisfiedLinkError ex) {
 			elg = new NioEventLoopGroup();
