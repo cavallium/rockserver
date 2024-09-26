@@ -40,7 +40,7 @@ public class DataSizeDecoder implements Decoder<DataSize> {
 			return GResultOf.errors(new ValidationError.DecodingNumberFormatException(path,
 					node,
 					name(),
-					decoderContext.getSecretConcealer()
+					decoderContext
 			));
 		}
 	}

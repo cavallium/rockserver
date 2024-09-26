@@ -462,7 +462,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 								yield wb;
 							}
 							case SST_INGESTION, SST_INGEST_BEHIND -> {
-								var sstWriter = getSSTWriter(columnId, null, null, true, mode == PutBatchMode.SST_INGEST_BEHIND);
+								var sstWriter = getSSTWriter(columnId, null, null, false, mode == PutBatchMode.SST_INGEST_BEHIND);
 								refs.add(sstWriter);
 								yield sstWriter;
 							}

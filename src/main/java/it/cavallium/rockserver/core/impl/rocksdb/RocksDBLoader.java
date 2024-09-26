@@ -488,8 +488,10 @@ public class RocksDBLoader {
             .stream()
             .map(volumeConfig -> {
                 try {
-                    return new DbPathRecord(definitiveDbPath.resolve(volumeConfig.volumePath()), volumeConfig.targetSize().longValue());
-                } catch (GestaltException e) {
+                    var volumePath = volumeConfig.volumePath();
+                    Objects.requireNonNull(volumePath, "volumePath is null");
+                    return new DbPathRecord(definitiveDbPath.resolve(volumePath), volumeConfig.targetSize().longValue());
+                } catch (NullPointerException | GestaltException e) {
                     throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Failed to load volume configurations", e);
                 }
             })

@@ -41,7 +41,7 @@ public class DbCompressionDecoder implements Decoder<CompressionType> {
 			return GResultOf.errors(new ValidationError.DecodingNumberFormatException(path,
 					node,
 					name(),
-					decoderContext.getSecretConcealer()
+					decoderContext
 			));
 		}
 	}

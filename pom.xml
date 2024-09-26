@@ -12,7 +12,7 @@
     <maven.compiler.source>22</maven.compiler.source>
     <maven.compiler.target>22</maven.compiler.target>
     <native.maven.plugin.version>0.9.28</native.maven.plugin.version>
-    <gestalt.version>0.25.3</gestalt.version>
+    <gestalt.version>0.32.1</gestalt.version>
     <rocksdb.version>9.0.0</rocksdb.version>
     <slf4j.version>2.0.12</slf4j.version>
     <imageName>rockserver-core</imageName>
