@@ -15,6 +15,7 @@ import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollServerDomainSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.util.NettyRuntime;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnHashType;
@@ -71,10 +72,11 @@ public class GrpcServer extends Server {
 		EventLoopGroup elg;
 		Class<? extends ServerChannel> channelType;
 		try {
-            elg = new EpollEventLoopGroup(Math.min(8, Runtime.getRuntime().availableProcessors()));
+            elg = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
 			channelType = EpollServerDomainSocketChannel.class;
         } catch (UnsatisfiedLinkError ex) {
-			elg = new NioEventLoopGroup();
+			LOG.warn("Can't load Epoll event loop group, the server will be slower", ex);
+			elg = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
 			channelType = NioServerSocketChannel.class;
 		}
 		this.elg = elg;
