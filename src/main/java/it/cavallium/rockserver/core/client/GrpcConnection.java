@@ -12,10 +12,12 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.*;
+import io.netty.channel.epoll.EpollDomainSocketChannel;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollServerDomainSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnSchema;
@@ -77,14 +79,14 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.forAddress(socketAddress)
 				.directExecutor()
 				.usePlaintext();
-		if (socketAddress instanceof UnixDomainSocketAddress _) {
+		if (socketAddress instanceof DomainSocketAddress _) {
 			channelBuilder
 					.eventLoopGroup(new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2))
-					.channelType(EpollServerDomainSocketChannel.class);
+					.channelType(EpollDomainSocketChannel.class);
 		} else {
 			channelBuilder
 					.eventLoopGroup(new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2))
-					.channelType(NioServerSocketChannel.class);
+					.channelType(NioSocketChannel.class);
 		}
 		this.channel = channelBuilder.build();
 		this.blockingStub = RocksDBServiceGrpc.newBlockingStub(channel);
