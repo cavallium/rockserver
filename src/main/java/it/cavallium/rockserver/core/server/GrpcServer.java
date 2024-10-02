@@ -772,15 +772,20 @@ public class GrpcServer extends Server {
 			if (ex instanceof CompletionException exx) {
 				handleError(responseObserver, exx.getCause());
 			} else {
-				if (ex instanceof RocksDBException e) {
-					responseObserver.onError(Status.INTERNAL
-							.withDescription(e.getLocalizedMessage())
-							.withCause(e)
-							.asException());
+				var serverResponseObserver = ((ServerCallStreamObserver<?>) responseObserver);
+				if (!serverResponseObserver.isCancelled()) {
+					if (ex instanceof RocksDBException e) {
+						responseObserver.onError(Status.INTERNAL
+								.withDescription(e.getLocalizedMessage())
+								.withCause(e)
+								.asException());
+					} else {
+						responseObserver.onError(Status.INTERNAL
+								.withCause(ex)
+								.asException());
+					}
 				} else {
-					responseObserver.onError(Status.INTERNAL
-							.withCause(ex)
-							.asException());
+					LOG.error("Unexpected error", ex);
 				}
 			}
 		}
