@@ -5,6 +5,7 @@ import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyServerBuilder;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
@@ -769,6 +770,11 @@ public class GrpcServer extends Server {
 		}
 
 		private static void handleError(StreamObserver<?> responseObserver, Throwable ex) {
+			if (ex instanceof StatusRuntimeException e && e.getStatus().getCode().equals(Status.CANCELLED.getCode())) {
+				LOG.warn("Connection cancelled: {}", e.getStatus().getDescription());
+				return;
+			}
+
 			if (ex instanceof CompletionException exx) {
 				handleError(responseObserver, exx.getCause());
 			} else {
