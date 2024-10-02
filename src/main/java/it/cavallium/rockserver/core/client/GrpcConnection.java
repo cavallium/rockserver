@@ -10,7 +10,13 @@ import com.google.protobuf.Empty;
 import com.google.protobuf.UnsafeByteOperations;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.*;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.epoll.EpollServerDomainSocketChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.unix.DomainSocketAddress;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KVBatch;
@@ -34,7 +40,11 @@ import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBS
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.net.URI;
+import java.net.UnixDomainSocketAddress;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -61,17 +71,40 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	private final RocksDBServiceFutureStub futureStub;
 	private final URI address;
 
-	public GrpcConnection(String name, HostAndPort address) {
+	private GrpcConnection(String name, SocketAddress socketAddress, URI address) {
 		super(name);
-		var channelBuilder = ManagedChannelBuilder
-				.forAddress(address.host(), address.port())
+		var channelBuilder = NettyChannelBuilder
+				.forAddress(socketAddress)
 				.directExecutor()
 				.usePlaintext();
+		if (socketAddress instanceof UnixDomainSocketAddress _) {
+			channelBuilder
+					.eventLoopGroup(new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2))
+					.channelType(EpollServerDomainSocketChannel.class);
+		} else {
+			channelBuilder
+					.eventLoopGroup(new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2))
+					.channelType(NioServerSocketChannel.class);
+		}
 		this.channel = channelBuilder.build();
 		this.blockingStub = RocksDBServiceGrpc.newBlockingStub(channel);
 		this.asyncStub = RocksDBServiceGrpc.newStub(channel);
 		this.futureStub = RocksDBServiceGrpc.newFutureStub(channel);
-		this.address = URI.create("http://" + address.host() + ":" + address.port());
+		this.address = address;
+	}
+
+	public static GrpcConnection forHostAndPort(String name, HostAndPort address) {
+		return new GrpcConnection(name,
+				new InetSocketAddress(address.host(), address.port()),
+				URI.create("http://" + address.host() + ":" + address.port())
+		);
+	}
+
+	public static GrpcConnection forPath(String name, Path unixSocketPath) {
+		return new GrpcConnection(name,
+				new DomainSocketAddress(unixSocketPath.toFile()),
+				URI.create("unix://" + unixSocketPath)
+		);
 	}
 
 	@Override

@@ -1,13 +1,11 @@
 package it.cavallium.rockserver.core.server;
 
-import it.cavallium.rockserver.core.client.ClientBuilder;
-import it.cavallium.rockserver.core.client.EmbeddedConnection;
+import io.netty.channel.unix.DomainSocketAddress;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.UnixDomainSocketAddress;
-import java.nio.file.Path;
 
 public class ServerBuilder {
 
@@ -42,10 +40,10 @@ public class ServerBuilder {
 			if (useThrift) {
 				return new ThriftServer(client, http2Address.host(), http2Address.port());
 			} else {
-				return new GrpcServer(client, http2Address.host(), http2Address.port());
+				return new GrpcServer(client, new InetSocketAddress(http2Address.host(), http2Address.port()));
 			}
 		} else if (unixAddress != null) {
-			throw new UnsupportedOperationException("Not implemented: unix socket");
+			return new GrpcServer(client, new DomainSocketAddress(unixAddress.getPath().toFile()));
 		} else if (iNetAddress != null) {
 			throw new UnsupportedOperationException("Not implemented: inet address");
 		} else {

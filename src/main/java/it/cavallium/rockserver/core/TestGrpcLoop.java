@@ -15,11 +15,12 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.net.InetSocketAddress;
 
 public class TestGrpcLoop {
     public static void main(String[] args) throws IOException, InterruptedException {
         var embeddedDB = new EmbeddedConnection(null, "main", null);
-        var server = new GrpcServer(embeddedDB, "localhost", 12345);
+        var server = new GrpcServer(embeddedDB, new InetSocketAddress("localhost", 12345));
         var clientB = new ClientBuilder();
         clientB.setHttpAddress(new Utils.HostAndPort("localhost", 12345));
         clientB.setName("local");

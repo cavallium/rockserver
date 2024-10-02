@@ -16,6 +16,7 @@ import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollServerDomainSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.unix.DomainSocketAddress;
 import io.netty.util.NettyRuntime;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
@@ -45,6 +46,8 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.net.UnixDomainSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletionException;
@@ -67,27 +70,22 @@ public class GrpcServer extends Server {
 	private final ExecutorService executor;
 	private final io.grpc.Server server;
 
-	public GrpcServer(RocksDBConnection client, String http2Host, int http2Port) throws IOException {
+	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
 		this.grpc = new GrpcServerImpl(this.getClient());
 		EventLoopGroup elg;
 		Class<? extends ServerChannel> channelType;
-		if (http2Port != 0) {
+		if (socketAddress instanceof DomainSocketAddress _) {
+			elg = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
+			channelType = EpollServerDomainSocketChannel.class;
+		} else {
 			elg = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
 			channelType = NioServerSocketChannel.class;
-		} else {
-			try {
-				elg = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
-				channelType = EpollServerDomainSocketChannel.class;
-			} catch (Throwable ex) {
-				LOG.warn("Can't load Epoll event loop group, the server will be slower", ex);
-				elg = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
-				channelType = NioServerSocketChannel.class;
-			}
 		}
 		this.elg = elg;
 		this.executor = Executors.newWorkStealingPool(Runtime.getRuntime().availableProcessors() * 2);
-		this.server = NettyServerBuilder.forAddress(new InetSocketAddress(http2Host, http2Port))
+		this.server = NettyServerBuilder
+				.forAddress(socketAddress)
 				.bossEventLoopGroup(elg)
 				.workerEventLoopGroup(elg)
 				.directExecutor()
@@ -97,7 +95,7 @@ public class GrpcServer extends Server {
 				.addService(grpc)
 				.build();
 		server.start();
-		LOG.info("GRPC RocksDB server is listening at " + http2Host + ":" + http2Port);
+		LOG.info("GRPC RocksDB server is listening at " + socketAddress);
 	}
 
 	private final class GrpcServerImpl extends RocksDBServiceImplBase {

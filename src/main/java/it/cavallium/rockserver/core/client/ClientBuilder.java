@@ -54,12 +54,12 @@ public class ClientBuilder {
 		} else if (embeddedPath != null) {
 			return new EmbeddedConnection(embeddedPath, name, embeddedConfig);
 		} else if (unixAddress != null) {
-			throw new UnsupportedOperationException("Not implemented: unix socket");
+			return GrpcConnection.forPath(name, unixAddress.getPath());
 		} else if (httpAddress != null) {
 			if (useThrift) {
 				throw new UnsupportedOperationException("Not implemented: thrift http2 address");
 			} else {
-				return new GrpcConnection(name, httpAddress);
+				return GrpcConnection.forHostAndPort(name, httpAddress);
 			}
 		} else if (iNetAddress != null) {
 			throw new UnsupportedOperationException("Not implemented: inet address");
