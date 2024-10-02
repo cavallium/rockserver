@@ -65,6 +65,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		super(name);
 		var channelBuilder = ManagedChannelBuilder
 				.forAddress(address.host(), address.port())
+				.directExecutor()
 				.usePlaintext();
 		this.channel = channelBuilder.build();
 		this.blockingStub = RocksDBServiceGrpc.newBlockingStub(channel);
