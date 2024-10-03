@@ -75,8 +75,16 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	private GrpcConnection(String name, SocketAddress socketAddress, URI address) {
 		super(name);
-		var channelBuilder = NettyChannelBuilder
-				.forAddress(socketAddress)
+		NettyChannelBuilder channelBuilder;
+		if (socketAddress instanceof InetSocketAddress inetSocketAddress) {
+			channelBuilder = NettyChannelBuilder
+					.forAddress(inetSocketAddress.getHostString(), inetSocketAddress.getPort());
+		} else {
+			channelBuilder = NettyChannelBuilder
+					.forAddress(socketAddress);
+		}
+
+		channelBuilder
 				.directExecutor()
 				.usePlaintext();
 		if (socketAddress instanceof DomainSocketAddress _) {
