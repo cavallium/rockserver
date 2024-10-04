@@ -65,6 +65,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	private final SafeShutdown ops;
 	private final Object columnEditLock = new Object();
 	private final DatabaseConfig config;
+	private final RocksDBObjects refs;
+	private final @Nullable Cache cache;
 	private Path tempSSTsPath;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
@@ -80,6 +82,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		var loadedDb = RocksDBLoader.load(path, config, logger);
 		this.db = loadedDb.db();
 		this.dbOptions = loadedDb.dbOptions();
+		this.refs = loadedDb.refs();
+		this.cache = loadedDb.cache();
 		this.columnsConifg = loadedDb.definitiveColumnFamilyOptionsMap();
         try {
             this.tempSSTsPath = config.global().tempSstPath();
@@ -204,6 +208,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		if (retries >= 5000) {
 			throw new IllegalStateException("Can't find column in column names index: " + name);
 		}
+
+		ColumnFamilyOptions columnConfig;
+		while ((columnConfig = this.columnsConifg.remove(name)) == null && retries++ < 5_000) {
+			Thread.yield();
+		}
+		if (columnConfig != null) {
+			columnConfig.close();
+		}
+		if (retries >= 5000) {
+			throw new IllegalStateException("Can't find column in column names index: " + name);
+		}
+
 		return col;
 	}
 
@@ -214,6 +230,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			ops.closeAndWait(MAX_TRANSACTION_DURATION_MS);
 			columnSchemasColumnDescriptorHandle.close();
 			db.close();
+			refs.close();
 			if (path == null) {
 				Utils.deleteDirectory(db.getPath());
 			}
@@ -332,12 +349,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 					}
 				} else {
 					try {
+						var options = RocksDBLoader.getColumnOptions(name, this.config.global(),
+								logger, this.refs, path == null, cache);
+						var prev = columnsConifg.put(name, options);
+						if (prev != null) {
+							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL,
+									"ColumnsConfig already exists with name \"" + name + "\"");
+						}
 						byte[] key = name.getBytes(StandardCharsets.UTF_8);
-						var cf = db.get().createColumnFamily(new ColumnFamilyDescriptor(key));
+						var cf = db.get().createColumnFamily(new ColumnFamilyDescriptor(key, options));
 						byte[] value = encodeColumnSchema(schema);
 						db.get().put(columnSchemasColumnDescriptorHandle, key, value);
 						return registerColumn(new ColumnInstance(cf, schema));
-					} catch (RocksDBException e) {
+					} catch (RocksDBException | GestaltException e) {
 						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, e);
 					}
 				}
@@ -462,7 +486,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 								yield wb;
 							}
 							case SST_INGESTION, SST_INGEST_BEHIND -> {
-								var sstWriter = getSSTWriter(columnId, null, null, false, mode == PutBatchMode.SST_INGEST_BEHIND);
+								var sstWriter = getSSTWriter(columnId, null, false, mode == PutBatchMode.SST_INGEST_BEHIND);
 								refs.add(sstWriter);
 								yield sstWriter;
 							}
@@ -549,7 +573,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	@VisibleForTesting
 	public SSTWriter getSSTWriter(long colId,
 								  @Nullable GlobalDatabaseConfig globalDatabaseConfigOverride,
-								  @Nullable FallbackColumnConfig columnConfigOverride,
 								  boolean forceNoOptions,
 								  boolean ingestBehind) throws it.cavallium.rockserver.core.common.RocksDBException {
 		try {
@@ -557,11 +580,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			ColumnFamilyOptions columnConifg;
 			RocksDBObjects refs;
 			if (!forceNoOptions) {
-				if (columnConfigOverride != null) {
-					refs = new RocksDBObjects();
-					columnConifg = RocksDBLoader.getColumnOptions(globalDatabaseConfigOverride, columnConfigOverride, logger, refs, path == null, null);
+				var name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
+				refs = new RocksDBObjects();
+				if (globalDatabaseConfigOverride != null) {
+					columnConifg = RocksDBLoader.getColumnOptions(name, globalDatabaseConfigOverride, logger, refs, false, null);
 				} else {
-					columnConifg = columnsConifg.get(new String(col.cfh().getName(), StandardCharsets.UTF_8));
+					try {
+						columnConifg = RocksDBLoader.getColumnOptions(name, this.config.global(), logger, refs, false, null);
+					} catch (GestaltException e) {
+						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
+					}
 					refs = null;
 				}
 			} else {
@@ -1002,4 +1030,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		return path;
 	}
 
+	@VisibleForTesting
+	public TransactionalDB getDb() {
+		return db;
+	}
+
+	@VisibleForTesting
+	public DatabaseConfig getConfig() {
+		return config;
+	}
 }

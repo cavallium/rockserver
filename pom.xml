@@ -10,9 +10,9 @@
 
   <properties>
     <maven.compiler.source>22</maven.compiler.source>
-    <maven.compiler.target>22</maven.compiler.target>
+    <maven.compiler.targe>22</maven.compiler.targe>
     <native.maven.plugin.version>0.9.28</native.maven.plugin.version>
-    <gestalt.version>0.32.1</gestalt.version>
+    <gestalt.version>0.32.2</gestalt.version>
     <rocksdb.version>9.0.0</rocksdb.version>
     <slf4j.version>2.0.12</slf4j.version>
     <imageName>rockserver-core</imageName>

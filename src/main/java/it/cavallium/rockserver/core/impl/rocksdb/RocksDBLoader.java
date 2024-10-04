@@ -100,17 +100,29 @@ public class RocksDBLoader {
     }
 
     public record LoadedDb(TransactionalDB db, DBOptions dbOptions,
-                           Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap) {}
+                           Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap, RocksDBObjects refs,
+                           @Nullable Cache cache) {}
 
-    public static ColumnFamilyOptions getColumnOptions(
-            GlobalDatabaseConfig globalDatabaseConfig,
-            FallbackColumnConfig columnOptions, Logger logger,
-            RocksDBObjects refs,
-            boolean inMemory,
-            @Nullable Cache cache) {
+    public static ColumnFamilyOptions getColumnOptions(String name,
+        GlobalDatabaseConfig globalDatabaseConfig,
+        Logger logger,
+        RocksDBObjects refs,
+        boolean inMemory,
+        @Nullable Cache cache) {
         try {
             var columnFamilyOptions = new ColumnFamilyOptions();
             refs.add(columnFamilyOptions);
+
+            FallbackColumnConfig columnOptions = null;
+            for (NamedColumnConfig namedColumnConfig : globalDatabaseConfig.columnOptions()) {
+                if (namedColumnConfig.name().equals(name)) {
+                    columnOptions = namedColumnConfig;
+                    break;
+                }
+            }
+            if (columnOptions == null) {
+                columnOptions = globalDatabaseConfig.fallbackColumnOptions();
+            }
 
             //noinspection ConstantConditions
             if (columnOptions.memtableMemoryBudgetBytes() != null) {
@@ -571,12 +583,7 @@ public class RocksDBLoader {
 
             for (Map.Entry<String, FallbackColumnConfig> entry : columnConfigMap.entrySet()) {
                 String name = entry.getKey();
-                FallbackColumnConfig columnOptions = entry.getValue();
-                if (columnOptions instanceof NamedColumnConfig namedColumnConfig && !namedColumnConfig.name().equals(name)) {
-                    throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "Wrong column config name: " + name);
-                }
-
-                var columnFamilyOptions = getColumnOptions(databaseOptions.global(), columnOptions,
+                var columnFamilyOptions = getColumnOptions(name, databaseOptions.global(),
                         logger, refs, path == null, optionsWithCache.standardCache());
                 refs.add(columnFamilyOptions);
 
@@ -617,7 +624,7 @@ public class RocksDBLoader {
 
             var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
             var dbTasks = new DatabaseTasks(db, inMemory, delayWalFlushConfig);
-            return new LoadedDb(TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks), rocksdbOptions, definitiveColumnFamilyOptionsMap);
+            return new LoadedDb(TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks), rocksdbOptions, definitiveColumnFamilyOptionsMap, refs, optionsWithCache.standardCache());
         } catch (IOException | RocksDBException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {

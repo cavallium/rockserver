@@ -14,6 +14,9 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.rocksdb.CompressionType;
+import org.rocksdb.Options;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.SstFileReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,7 +47,7 @@ public class TestSSTWriter {
     @Test
     public void test() throws IOException {
         LOG.info("Obtaining sst writer");
-        try (var sstWriter = db.getSSTWriter(colId, null, null, true, false)) {
+        try (var sstWriter = db.getSSTWriter(colId, null, true, false)) {
             LOG.info("Creating sst");
             var tl = ThreadLocalRandom.current();
             var bytes = new byte[1024];
@@ -57,6 +60,38 @@ public class TestSSTWriter {
             LOG.info("Writing pending sst data");
             sstWriter.writePending();
             LOG.info("Done, closing");
+        }
+        LOG.info("Done");
+    }
+
+    @Test
+    public void testCompression() throws IOException, RocksDBException, GestaltException {
+        LOG.info("Obtaining sst writer");
+        try (var sstWriter = db.getSSTWriter(colId, null, false, false)) {
+            LOG.info("Creating sst");
+            var tl = ThreadLocalRandom.current();
+            var bytes = new byte[1024];
+            long i = 0;
+            while (i < 1_000) {
+                var ib = Longs.toByteArray(i++);
+                tl.nextBytes(bytes);
+                sstWriter.put(ib, bytes);
+            }
+            LOG.info("Writing pending sst data");
+            sstWriter.writePending();
+            LOG.info("Done, closing");
+        }
+        var transactionalDB = db.getDb();
+        var rocksDB = transactionalDB.get();
+        var metadata = rocksDB.getLiveFilesMetaData();
+        Assertions.assertEquals(1, metadata.size(), "There are more than one sst files");
+        var sstMetadata = metadata.getFirst();
+        var sstPath = Path.of(sstMetadata.path(), sstMetadata.fileName());
+        Assertions.assertTrue(Files.exists(sstPath), "SST file does not exists");
+        try (var options = new Options(); var sstReader = new SstFileReader(options)) {
+            sstReader.open(sstPath.toString());
+            var p = sstReader.getTableProperties();
+            Assertions.assertNotEquals("snappy", p.getCompressionName().toLowerCase());
         }
         LOG.info("Done");
     }

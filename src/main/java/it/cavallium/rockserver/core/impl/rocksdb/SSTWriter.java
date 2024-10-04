@@ -61,8 +61,6 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                         .setBottommostCompressionOptions(cloneCompressionOptions(columnConifg.bottommostCompressionOptions()));
                 if (columnConifg.memTableConfig() != null) {
                         options.setMemTableConfig(columnConifg.memTableConfig());
-                } else {
-                    options.setMemTableConfig(new SkipListMemTableConfig());
                 }
             }
         }
