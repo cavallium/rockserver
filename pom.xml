@@ -13,7 +13,7 @@
     <maven.compiler.targe>22</maven.compiler.targe>
     <native.maven.plugin.version>0.9.28</native.maven.plugin.version>
     <gestalt.version>0.32.2</gestalt.version>
-    <rocksdb.version>9.0.0</rocksdb.version>
+    <rocksdb.version>9.6.1</rocksdb.version>
     <slf4j.version>2.0.12</slf4j.version>
     <imageName>rockserver-core</imageName>
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
@@ -35,6 +35,11 @@
         <enabled>true</enabled>
       </snapshots>
       <url>https://oss.sonatype.org/content/repositories/snapshots</url>
+    </repository>
+    <repository>
+      <id>maven_central</id>
+      <name>Maven Central</name>
+      <url>https://repo.maven.apache.org/maven2/</url>
     </repository>
   </repositories>
 
@@ -82,7 +87,7 @@
     <dependency>
       <groupId>org.jetbrains</groupId>
       <artifactId>annotations</artifactId>
-      <version>24.0.1</version>
+      <version>24.1.0</version>
       <scope>compile</scope>
     </dependency>
     <dependency>
@@ -103,7 +108,7 @@
     <dependency>
       <groupId>org.apache.thrift</groupId>
       <artifactId>libthrift</artifactId>
-      <version>0.20.0</version>
+      <version>0.21.0</version>
     </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
