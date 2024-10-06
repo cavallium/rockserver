@@ -21,6 +21,7 @@ public class TestGrpcLoop {
     public static void main(String[] args) throws IOException, InterruptedException {
         var embeddedDB = new EmbeddedConnection(null, "main", null);
         var server = new GrpcServer(embeddedDB, new InetSocketAddress("localhost", 12345));
+        server.start();
         var clientB = new ClientBuilder();
         clientB.setHttpAddress(new Utils.HostAndPort("localhost", 12345));
         clientB.setName("local");

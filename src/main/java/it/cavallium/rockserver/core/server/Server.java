@@ -5,7 +5,7 @@ import it.cavallium.rockserver.core.client.RocksDBConnection;
 import java.io.Closeable;
 import java.io.IOException;
 
-public class Server implements Closeable {
+public abstract class Server implements Closeable {
 
 	private final RocksDBConnection client;
 
@@ -16,6 +16,8 @@ public class Server implements Closeable {
 	public RocksDBConnection getClient() {
 		return client;
 	}
+
+	public abstract void start() throws IOException;
 
 	@Override
 	public void close() throws IOException {

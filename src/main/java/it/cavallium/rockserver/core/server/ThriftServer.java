@@ -57,6 +57,10 @@ public class ThriftServer extends Server {
 		}
 	}
 
+	public void start() {
+		thriftThread.start();
+	}
+
 	private static @NotNull List<@NotNull Keys> keysToRecords(Arena arena, @NotNull List<@NotNull List< @NotNull ByteBuffer>> keysMulti) {
 		return keysMulti.stream().map(keys -> keysToRecord(arena, keys)).toList();
 	}

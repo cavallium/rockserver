@@ -94,8 +94,12 @@ public class GrpcServer extends Server {
 				.maxInboundMessageSize(512 * 1024 * 1024)
 				.addService(grpc)
 				.build();
-		server.start();
 		LOG.info("GRPC RocksDB server is listening at " + socketAddress);
+	}
+
+	@Override
+	public void start() throws IOException {
+		server.start();
 	}
 
 	private final class GrpcServerImpl extends RocksDBServiceImplBase {

@@ -56,6 +56,7 @@ public class LoggingClient implements RocksDBConnection {
 
 		@Override
 		public <R> R requestSync(RocksDBAPICommand<R> req) {
+			logger.trace("Request input (sync): {}", req);
 			R result;
 			try {
 				result = syncApi.requestSync(req);
@@ -78,6 +79,7 @@ public class LoggingClient implements RocksDBConnection {
 
 		@Override
 		public <R> CompletableFuture<R> requestAsync(RocksDBAPICommand<R> req) {
+			logger.trace("Request input (async): {}", req);
 			return asyncApi.requestAsync(req).whenComplete((result, e) -> {
 				if (e != null) {
 					logger.trace("Request failed: {}    Error: {}", req, e.getMessage());

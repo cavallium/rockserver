@@ -120,7 +120,9 @@ public class Main {
 				CountDownLatch shutdownLatch = new CountDownLatch(1);
 				Runtime.getRuntime().addShutdownHook(new Thread(shutdownLatch::countDown));
 
-				try (var _ = thriftServerBuilder.build(); var _ = grpcServerBuilder.build()) {
+				try (var thrift = thriftServerBuilder.build(); var grpc = grpcServerBuilder.build()) {
+					thrift.start();
+					grpc.start();
 					shutdownLatch.await();
 					LOG.info("Shutting down...");
 				}
