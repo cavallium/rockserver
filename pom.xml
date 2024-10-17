@@ -19,7 +19,7 @@
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
     <protobuf-plugin.version>0.6.1</protobuf-plugin.version>
     <protobuf.version>3.25.3</protobuf.version>
-    <grpc.version>1.65.1</grpc.version>
+    <grpc.version>1.68.0</grpc.version>
     <netty.version>4.1.100.Final</netty.version>
     <rainbowgum.version>0.7.0</rainbowgum.version>
   </properties>
@@ -161,7 +161,7 @@
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
-      <version>5.9.2</version>
+      <version>5.10.1</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -204,10 +204,9 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.12.1</version>
+        <version>3.13.0</version>
         <configuration>
-          <source>${maven.compiler.source}</source>
-          <target>${maven.compiler.source}</target>
+          <release>${maven.compiler.release}</release>
         </configuration>
       </plugin>
       <plugin>
@@ -221,7 +220,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
-        <version>3.3.0</version>
+        <version>3.4.1</version>
         <configuration>
           <archive>
             <manifest>
@@ -332,7 +331,7 @@
           <plugin>
             <groupId>org.codehaus.mojo</groupId>
             <artifactId>build-helper-maven-plugin</artifactId>
-            <version>3.4.0</version>
+            <version>3.5.0</version>
             <executions>
               <execution>
                 <id>add-source</id>
@@ -462,7 +461,7 @@
           <plugin>
             <groupId>org.codehaus.mojo</groupId>
             <artifactId>exec-maven-plugin</artifactId>
-            <version>3.0.0</version>
+            <version>3.3.0</version>
             <executions>
               <execution>
                 <id>java-agent</id>
