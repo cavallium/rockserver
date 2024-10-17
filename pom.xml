@@ -6,11 +6,11 @@
 
   <groupId>it.cavallium.rockserver</groupId>
   <artifactId>rockserver-core</artifactId>
-  <version>1.0.0-SNAPSHOT</version>
+  <version>${revision}</version>
 
   <properties>
-    <maven.compiler.source>22</maven.compiler.source>
-    <maven.compiler.targe>22</maven.compiler.targe>
+    <revision>1.0.0-SNAPSHOT</revision>
+    <maven.compiler.release>23</maven.compiler.release>
     <native.maven.plugin.version>0.9.28</native.maven.plugin.version>
     <gestalt.version>0.32.2</gestalt.version>
     <rocksdb.version>9.6.1</rocksdb.version>
