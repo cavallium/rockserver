@@ -2,24 +2,27 @@ package it.cavallium.rockserver.core.common;
 
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.CloseFailedUpdate;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.CloseIterator;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.CloseTransaction;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.CreateColumn;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.DeleteColumn;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.Get;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetColumnId;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetRange;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenIterator;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenTransaction;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.Put;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.PutMulti;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.PutBatch;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.SeekTo;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.Subsequent;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Put;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.List;
+import java.util.stream.Stream;
+
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -121,15 +124,27 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new Subsequent<>(arena, iterationId, skipCount, takeCount, requestType));
 	}
 
+	/** See: {@link ReduceRange}. */
+	default <T> T reduceRange(Arena arena,
+							  long transactionId,
+							  long columnId,
+							  @Nullable Keys startKeysInclusive,
+							  @Nullable Keys endKeysExclusive,
+							  boolean reverse,
+							  @NotNull RequestType.RequestGetRange<? super KV, T> requestType,
+							  long timeoutMs) throws RocksDBException {
+		return requestSync(new ReduceRange<>(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
+	}
+
 	/** See: {@link GetRange}. */
-	default <T> T getRange(Arena arena,
-						   long transactionId,
-						   long columnId,
-						   @Nullable Keys startKeysInclusive,
-						   @Nullable Keys endKeysExclusive,
-						   boolean reverse,
-						   @NotNull RequestType.RequestGetRange<? super KV, T> requestType,
-						   long timeoutMs) throws RocksDBException {
+	default <T> Stream<T> getRange(Arena arena,
+								   long transactionId,
+								   long columnId,
+								   @Nullable Keys startKeysInclusive,
+								   @Nullable Keys endKeysExclusive,
+								   boolean reverse,
+								   @NotNull RequestType.RequestGetRange<? super KV, T> requestType,
+								   long timeoutMs) throws RocksDBException {
 		return requestSync(new GetRange<>(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
 	}
 }

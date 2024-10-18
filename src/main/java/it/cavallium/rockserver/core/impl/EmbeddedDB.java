@@ -949,14 +949,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 
 	@SuppressWarnings("unchecked")
     @Override
-	public <T> T getRange(Arena arena,
-						  long transactionId,
-						  long columnId,
-						  @Nullable Keys startKeysInclusive,
-						  @Nullable Keys endKeysExclusive,
-						  boolean reverse,
-						  RequestType.@NotNull RequestGetRange<? super KV, T> requestType,
-						  long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
+	public <T> T reduceRange(Arena arena,
+							 long transactionId,
+							 long columnId,
+							 @Nullable Keys startKeysInclusive,
+							 @Nullable Keys endKeysExclusive,
+							 boolean reverse,
+							 RequestType.@NotNull RequestGetRange<? super KV, T> requestType,
+							 long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {
 			var col = getColumn(columnId);

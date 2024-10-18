@@ -384,23 +384,27 @@ abstract class EmbeddedDBTest {
 	}
 
 	@Test
-	void getRangeFirstAndLast() {
+	void reduceRangeFirstAndLast() {
 		var firstKey = getKVSequenceFirst().keys();
 		var lastKey = getKVSequenceLast().keys();
 		var prevLastKV = getKVSequence().get(getKVSequence().size() - 2);
 		if (getSchemaVarKeys().isEmpty()) {
-			FirstAndLast<KV> firstAndLast = db.getRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+			FirstAndLast<KV> firstAndLast = db.reduceRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
 			Assertions.assertNull(firstAndLast.first(), "First should be empty because the db is empty");
 			Assertions.assertNull(firstAndLast.last(), "Last should be empty because the db is empty");
 
 			fillSomeKeys();
 
-			firstAndLast = db.getRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+			firstAndLast = db.reduceRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
 			Assertions.assertEquals(getKVSequenceFirst(), firstAndLast.first(), "First key mismatch");
 			Assertions.assertEquals(prevLastKV, firstAndLast.last(), "Last key mismatch");
+
+			firstAndLast = db.reduceRange(arena, 0, colId, firstKey, firstKey, false, RequestType.firstAndLast(), 1000);
+			Assertions.assertNull(firstAndLast.first(), "First should be empty because the range is empty");
+			Assertions.assertNull(firstAndLast.last(), "Last should be empty because the range is empty");
 		} else {
 			Assertions.assertThrowsExactly(RocksDBException.class, () -> {
-				db.getRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+				db.reduceRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
 			});
 		}
 	}

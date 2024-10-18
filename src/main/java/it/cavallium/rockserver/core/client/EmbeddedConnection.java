@@ -15,9 +15,14 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.stream.Stream;
+
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 
 public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 
@@ -83,17 +88,18 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public <R> R requestSync(RocksDBAPICommand<R> req) {
+	public <R, RS> RS requestSync(RocksDBAPICommand<R, RS, ?> req) {
 		return req.handleSync(this);
 	}
 
-	@Override
-	public <R> CompletableFuture<R> requestAsync(RocksDBAPICommand<R> req) {
-		if (req instanceof RocksDBAPICommand.PutBatch putBatch) {
-            //noinspection unchecked
-            return (CompletableFuture<R>) this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
-		}
-		return CompletableFuture.supplyAsync(() -> req.handleSync(this), exeuctor);
+	@SuppressWarnings("unchecked")
+    @Override
+	public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> req) {
+		return (RA) switch (req) {
+			case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
+			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> CompletableFuture.supplyAsync(() -> req.handleSync(this), exeuctor);
+			case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
+		};
 	}
 
 	@Override
@@ -170,7 +176,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public <T> T getRange(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		return db.getRange(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+	public <T> T reduceRange(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+		return db.reduceRange(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
 	}
 }

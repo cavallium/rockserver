@@ -30,8 +30,9 @@ module rockserver.core {
 	requires io.netty.transport.classes.epoll;
 	requires org.reactivestreams;
 	requires io.netty.transport.unix.common;
+    requires reactor.core;
 
-	exports it.cavallium.rockserver.core.client;
+    exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
 	exports it.cavallium.rockserver.core.config;
 	opens it.cavallium.rockserver.core.resources;

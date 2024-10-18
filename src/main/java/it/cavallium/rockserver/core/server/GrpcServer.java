@@ -706,7 +706,7 @@ public class GrpcServer extends Server {
 				try {
 					try (var arena = Arena.ofConfined()) {
                         it.cavallium.rockserver.core.common.FirstAndLast<it.cavallium.rockserver.core.common.KV> firstAndLast
-								= api.getRange(arena,
+								= api.reduceRange(arena,
 										request.getTransactionId(),
 										request.getColumnId(),
 										mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),

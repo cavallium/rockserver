@@ -61,6 +61,7 @@ import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 
 import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
 
@@ -133,12 +134,19 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return this;
 	}
 
-	@Override
-	public <R> R requestSync(RocksDBAPICommand<R> req) {
-		var asyncResponse = req.handleAsync(this);
-		return asyncResponse
-				.toCompletableFuture()
-				.join();
+	@SuppressWarnings("unchecked")
+    @Override
+	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> req) {
+		return (RS) switch (req) {
+			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> {
+				var asyncResponse = (CompletableFuture<R>) req.handleAsync(this);
+				yield asyncResponse.join();
+			}
+            case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> {
+				var asyncResponse = (Publisher<R>) req.handleAsync(this);
+				yield Flux.from(asyncResponse).toStream();
+			}
+        };
 	}
 
 	@Override
@@ -508,7 +516,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <T> CompletableFuture<T> getRangeAsync(Arena arena, long transactionId, long columnId, @NotNull Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+	public <T> CompletableFuture<T> reduceRangeAsync(Arena arena, long transactionId, long columnId, @NotNull Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
 		var request = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -524,6 +532,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 							result.hasLast() ? mapKV(arena, result.getLast()) : null
 					));
 		};
+	}
+
+	@Override
+	public <T> Publisher<T> getRangeStream(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+		// todo: implement
 	}
 
 	private static it.cavallium.rockserver.core.common.Delta<MemorySegment> mapDelta(Delta x) {
