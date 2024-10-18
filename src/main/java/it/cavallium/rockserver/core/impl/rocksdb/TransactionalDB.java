@@ -149,13 +149,6 @@ public sealed interface TransactionalDB extends Closeable {
 			} catch (Exception ex) {
 				exceptions.add(ex);
 			}
-			for (ColumnFamilyHandle handle : handles) {
-				try {
-					handle.close();
-				} catch (Exception ex) {
-					exceptions.add(ex);
-				}
-			}
 			try {
 				if (db.isOwningHandle()) {
 					db.flushWal(true);
@@ -165,10 +158,17 @@ public sealed interface TransactionalDB extends Closeable {
 			}
 			try (var options = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
 				if (db.isOwningHandle()) {
-					db.flush(options);
+					db.flush(options, handles);
 				}
 			} catch (RocksDBException e) {
 				exceptions.add(e);
+			}
+			for (ColumnFamilyHandle handle : handles) {
+				try {
+					handle.close();
+				} catch (Exception ex) {
+					exceptions.add(ex);
+				}
 			}
 			try {
 				if (db.isOwningHandle()) {
