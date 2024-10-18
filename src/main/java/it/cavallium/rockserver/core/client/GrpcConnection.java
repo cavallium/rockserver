@@ -9,18 +9,16 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import com.google.protobuf.UnsafeByteOperations;
 import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
 import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.*;
 import io.netty.channel.epoll.EpollDomainSocketChannel;
 import io.netty.channel.epoll.EpollEventLoopGroup;
-import io.netty.channel.epoll.EpollServerDomainSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.FirstAndLast;
 import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
@@ -36,16 +34,17 @@ import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.ColumnHashType;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
+import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceBlockingStub;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceFutureStub;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceStub;
+import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URI;
-import java.net.UnixDomainSocketAddress;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -62,6 +61,8 @@ import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
 
 public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
@@ -505,6 +506,26 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		};
 	}
 
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> CompletableFuture<T> getRangeAsync(Arena arena, long transactionId, long columnId, @NotNull Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+		var request = GetRangeRequest.newBuilder()
+				.setTransactionId(transactionId)
+				.setColumnId(columnId)
+				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
+				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
+				.setReverse(reverse)
+				.setTimeoutMs(timeoutMs)
+				.build();
+		return (CompletableFuture<T>) switch (requestType) {
+			case RequestType.RequestGetFirstAndLast<?> _ ->
+					toResponse(this.futureStub.getRangeFirstAndLast(request), result -> new FirstAndLast<>(
+							result.hasFirst() ? mapKV(arena, result.getFirst()) : null,
+							result.hasLast() ? mapKV(arena, result.getLast()) : null
+					));
+		};
+	}
+
 	private static it.cavallium.rockserver.core.common.Delta<MemorySegment> mapDelta(Delta x) {
 		return new it.cavallium.rockserver.core.common.Delta<>(
 				x.hasPrevious() ? mapByteString(x.getPrevious()) : null,
@@ -553,6 +574,21 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.addAllKeys(mapKeys(keys))
 				.setValue(mapValue(value))
 				.build();
+	}
+
+	private static it.cavallium.rockserver.core.common.KV mapKV(Arena arena, @NotNull KV entry) {
+		return new it.cavallium.rockserver.core.common.KV(
+				mapKeys(arena, entry.getKeysCount(), entry::getKeys),
+				toMemorySegment(arena, entry.getValue())
+		);
+	}
+
+	private static Keys mapKeys(Arena arena, int count, Int2ObjectFunction<ByteString> keyGetterAt) {
+		var segments = new MemorySegment[count];
+		for (int i = 0; i < count; i++) {
+			segments[i] = toMemorySegment(arena, keyGetterAt.apply(i));
+		}
+		return new Keys(segments);
 	}
 
 	private static Iterable<? extends ByteString> mapKeys(Keys keys) {

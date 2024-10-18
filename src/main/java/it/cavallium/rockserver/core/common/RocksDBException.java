@@ -31,7 +31,9 @@ public class RocksDBException extends RuntimeException {
 		SST_WRITE_2,
 		SST_WRITE_3,
 		SST_WRITE_4,
-		SST_GET_SIZE_FAILED
+		SST_GET_SIZE_FAILED,
+		UNSUPPORTED_COLUMN_TYPE,
+		NOT_IMPLEMENTED
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {

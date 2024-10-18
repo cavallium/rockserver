@@ -901,7 +901,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				//noinspection resource
 				it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
 			} else {
-				it = db.get().newIterator(col.cfh());
+				it = db.get().newIterator(col.cfh(), ro);
 			}
 			var itEntry = new REntry<>(it, new RocksDBObjects(ro));
             return FastRandomUtils.allocateNewValue(its, itEntry, 1, Long.MAX_VALUE);
@@ -947,11 +947,86 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		}
 	}
 
+	@SuppressWarnings("unchecked")
+    @Override
+	public <T> T getRange(Arena arena,
+						  long transactionId,
+						  long columnId,
+						  @Nullable Keys startKeysInclusive,
+						  @Nullable Keys endKeysExclusive,
+						  boolean reverse,
+						  RequestType.@NotNull RequestGetRange<? super KV, T> requestType,
+						  long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
+		ops.beginOp();
+		try {
+			var col = getColumn(columnId);
+
+			if (requestType instanceof RequestType.RequestGetFirstAndLast<?>) {
+				if (col.hasBuckets()) {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.UNSUPPORTED_COLUMN_TYPE,
+							"Can't get the first and last range element of a column with buckets");
+				}
+			}
+
+			try (var ro = new ReadOptions()) {
+				MemorySegment calculatedStartKey = startKeysInclusive != null ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
+				MemorySegment calculatedEndKey = endKeysExclusive != null ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
+				try (var startKeySlice = calculatedStartKey != null ? toDirectSlice(calculatedStartKey) : null;
+					 var endKeySlice = calculatedEndKey != null ? toDirectSlice(calculatedEndKey) : null) {
+					if (startKeysInclusive != null) {
+						ro.setIterateLowerBound(startKeySlice);
+					}
+					if (endKeySlice != null) {
+						ro.setIterateUpperBound(endKeySlice);
+					}
+
+					RocksIterator it;
+					if (transactionId > 0L) {
+						//noinspection resource
+						it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+					} else {
+						it = db.get().newIterator(col.cfh(), ro);
+					}
+					try (it) {
+						return (T) switch (requestType) {
+							case RequestType.RequestGetFirstAndLast<?> _ -> {
+								if (!reverse) {
+									it.seekToFirst();
+								} else {
+									it.seekToLast();
+								}
+								if (!it.isValid()) {
+									yield new FirstAndLast<>(null, null);
+								}
+								var calculatedKey = toMemorySegment(arena, it.key());
+								var calculatedValue = col.schema().hasValue() ? toMemorySegment(it.value()) : MemorySegment.NULL;
+								var first = decodeKVNoBuckets(arena, col, calculatedKey, calculatedValue);
+
+								if (!reverse) {
+									it.seekToLast();
+								} else {
+									it.seekToFirst();
+								}
+
+								calculatedKey = toMemorySegment(arena, it.key());
+								calculatedValue = col.schema().hasValue() ? toMemorySegment(it.value()) : MemorySegment.NULL;
+								var last = decodeKVNoBuckets(arena, col, calculatedKey, calculatedValue);
+								yield new FirstAndLast<>(first, last);
+							}
+						};
+					}
+				}
+			}
+		} finally {
+			ops.endOp();
+		}
+	}
+
 	private MemorySegment dbGet(Tx tx,
-			ColumnInstance col,
-			Arena arena,
-			ReadOptions readOptions,
-			MemorySegment calculatedKey) throws RocksDBException {
+								ColumnInstance col,
+								Arena arena,
+								ReadOptions readOptions,
+								MemorySegment calculatedKey) throws RocksDBException {
 		if (tx != null) {
 			byte[] previousRawBucketByteArray;
 			if (tx.isFromGetForUpdate()) {
@@ -1038,5 +1113,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	@VisibleForTesting
 	public DatabaseConfig getConfig() {
 		return config;
+	}
+
+	private AbstractSlice<?> toDirectSlice(MemorySegment calculatedKey) {
+		return new DirectSlice(calculatedKey.asByteBuffer(), (int) calculatedKey.byteSize());
+	}
+
+	private KV decodeKVNoBuckets(Arena arena, ColumnInstance col, MemorySegment calculatedKey, MemorySegment calculatedValue) {
+		var keys = col.decodeKeys(arena, calculatedKey, calculatedValue);
+		return new KV(new Keys(keys), calculatedValue);
+	}
+
+	private KV decodeKV(Arena arena, ColumnInstance col, MemorySegment calculatedKey, MemorySegment calculatedValue) {
+		var keys = col.decodeKeys(arena, calculatedKey, calculatedValue);
+		// todo: implement
+		throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
+				"Bucket column type not implemented, implement them");
 	}
 }

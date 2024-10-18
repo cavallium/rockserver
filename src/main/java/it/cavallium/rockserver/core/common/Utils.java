@@ -8,6 +8,7 @@ import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -155,6 +156,16 @@ public class Utils {
 		currentValue = requireNonNullElse(currentValue, NULL);
 		return MemorySegment.mismatch(previousValue, 0, previousValue.byteSize(), currentValue, 0, currentValue.byteSize())
 				== -1;
+	}
+
+	public static int valueHash(MemorySegment value) {
+		value = requireNonNullElse(value, NULL);
+		int hash = 7;
+		var len = value.byteSize();
+		for (long i = 0; i < len; i++) {
+			hash = hash * 31 + value.get(ValueLayout.JAVA_BYTE, i);
+		}
+		return hash;
 	}
 
 	public static HostAndPort parseHostAndPort(URI uri) {

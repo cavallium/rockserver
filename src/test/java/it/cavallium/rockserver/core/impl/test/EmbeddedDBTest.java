@@ -14,15 +14,16 @@ import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 
 import org.jetbrains.annotations.NotNull;
-import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.*;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
-import org.junit.jupiter.api.Test;
+
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 
+@TestMethodOrder(MethodOrderer.MethodName.class)
 abstract class EmbeddedDBTest {
 
 	protected EmbeddedConnection db;
@@ -87,6 +88,25 @@ abstract class EmbeddedDBTest {
 				toMemorySegmentSimple(arena, 1, 2, 3),
 				toMemorySegmentSimple(arena, 6, 7, 8)
 		});
+	}
+
+	/**
+	 * @return a sorted sequence of k-v pairs
+	 */
+	protected List<KV> getKVSequence() {
+		var result = new ArrayList<KV>();
+		for (int i = 0; i < Byte.MAX_VALUE; i++) {
+			result.add(new KV(getKeyI(i), getValueI(i)));
+		}
+		return result;
+	}
+
+	protected KV getKVSequenceFirst() {
+		return getKVSequence().getFirst();
+	}
+
+	protected KV getKVSequenceLast() {
+		return getKVSequence().getLast();
 	}
 
 	protected boolean getHasValues() {
@@ -360,6 +380,28 @@ abstract class EmbeddedDBTest {
 			db.put(arena, forUpdate.updateId(), colId, key1, value1, RequestType.none());
 
 			Assertions.assertThrows(Exception.class, () -> db.put(arena, forUpdate.updateId(), colId, key1, value2, RequestType.none()));
+		}
+	}
+
+	@Test
+	void getRangeFirstAndLast() {
+		var firstKey = getKVSequenceFirst().keys();
+		var lastKey = getKVSequenceLast().keys();
+		var prevLastKV = getKVSequence().get(getKVSequence().size() - 2);
+		if (getSchemaVarKeys().isEmpty()) {
+			FirstAndLast<KV> firstAndLast = db.getRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+			Assertions.assertNull(firstAndLast.first(), "First should be empty because the db is empty");
+			Assertions.assertNull(firstAndLast.last(), "Last should be empty because the db is empty");
+
+			fillSomeKeys();
+
+			firstAndLast = db.getRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+			Assertions.assertEquals(getKVSequenceFirst(), firstAndLast.first(), "First key mismatch");
+			Assertions.assertEquals(prevLastKV, firstAndLast.last(), "Last key mismatch");
+		} else {
+			Assertions.assertThrowsExactly(RocksDBException.class, () -> {
+				db.getRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+			});
 		}
 	}
 

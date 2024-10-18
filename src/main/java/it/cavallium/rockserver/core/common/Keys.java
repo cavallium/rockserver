@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.common;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
@@ -21,11 +22,25 @@ public record Keys(@NotNull MemorySegment @NotNull ... keys) {
 			return false;
 		}
 		Keys keys1 = (Keys) o;
-		return Arrays.equals(keys, keys1.keys);
+		if (keys.length != keys1.keys.length) {
+			return false;
+		}
+		for (int i = 0; i < keys.length; i++) {
+			var k1 = keys[i];
+			var k2 = keys1.keys[i];
+			if (!Utils.valueEquals(k1, k2)) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	@Override
 	public int hashCode() {
-		return Arrays.hashCode(keys);
+		int hash = 7;
+		for (@NotNull MemorySegment key : keys) {
+			hash = hash * 31 + Utils.valueHash(key);
+		}
+		return hash;
 	}
 }

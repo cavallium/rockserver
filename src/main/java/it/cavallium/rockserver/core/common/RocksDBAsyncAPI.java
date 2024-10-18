@@ -9,7 +9,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.CreateColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.DeleteColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetColumnId;
-import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenIterator;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenTransaction;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Put;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.PutMulti;
@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.reactivestreams.Publisher;
 
 public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 
@@ -77,7 +78,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 
 	/** See: {@link PutBatch}. */
 	default CompletableFuture<Void> putBatchAsync(long columnId,
-			@NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode) throws RocksDBException {
 		return requestAsync(new PutBatch(columnId, batchPublisher, mode));
 	}
@@ -99,7 +100,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
-		return requestAsync(new OpenIterator(arena,
+		return requestAsync(new RocksDBAPICommand.OpenIterator(arena,
 				transactionId,
 				columnId,
 				startKeysInclusive,
@@ -126,5 +127,25 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 			long takeCount,
 			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestAsync(new Subsequent<>(arena, iterationId, skipCount, takeCount, requestType));
+	}
+
+	/** See: {@link GetRange}. */
+	default <T> CompletableFuture<T> getRangeAsync(Arena arena,
+												   long transactionId,
+												   long columnId,
+												   @Nullable Keys startKeysInclusive,
+												   @Nullable Keys endKeysExclusive,
+												   boolean reverse,
+												   RequestType.RequestGetRange<? super KV, T> requestType,
+												   long timeoutMs) throws RocksDBException {
+		return requestAsync(new RocksDBAPICommand.GetRange<>(arena,
+				transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs
+		));
 	}
 }

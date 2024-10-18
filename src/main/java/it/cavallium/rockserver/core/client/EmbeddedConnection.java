@@ -168,4 +168,9 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws RocksDBException {
 		return db.subsequent(arena, iterationId, skipCount, takeCount, requestType);
 	}
+
+	@Override
+	public <T> T getRange(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+		return db.getRange(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+	}
 }

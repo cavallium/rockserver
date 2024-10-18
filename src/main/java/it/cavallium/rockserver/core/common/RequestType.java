@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.core.common;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -16,7 +18,8 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		DELTA(new RequestDelta()),
 		MULTI(new RequestMulti()),
 		CHANGED(new RequestChanged()),
-		PREVIOUS_PRESENCE(new RequestPreviousPresence());
+		PREVIOUS_PRESENCE(new RequestPreviousPresence()),
+		FIRST_AND_LAST(new RequestGetFirstAndLast());
 
 		private final RequestType requestType;
 
@@ -92,6 +95,11 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 	}
 
 	@SuppressWarnings("unchecked")
+	static <T> RequestGetFirstAndLast<T> firstAndLast() {
+		return (RequestGetFirstAndLast<T>) RequestGetFirstAndLast.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
 	static <T> RequestNothing<T> none() {
 		return (RequestNothing<T>) RequestNothing.INSTANCE;
 	}
@@ -101,6 +109,8 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 	sealed interface RequestPatch<T, U> extends RequestType<T, U> {}
 
 	sealed interface RequestGet<T, U> extends RequestType<T, U> {}
+
+	sealed interface RequestGetRange<T, U> extends RequestType<T, U> {}
 
 	sealed interface RequestIterate<T, U> extends RequestType<T, U> {}
 
@@ -192,6 +202,16 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		@Override
 		public RequestTypeId getRequestTypeId() {
 			return RequestTypeId.PREVIOUS_PRESENCE;
+		}
+	}
+
+	record RequestGetFirstAndLast<T>() implements RequestGetRange<T, FirstAndLast<T>> {
+
+		private static final RequestGetFirstAndLast<Object> INSTANCE = new RequestGetFirstAndLast<>();
+
+		@Override
+		public RequestTypeId getRequestTypeId() {
+			return RequestTypeId.FIRST_AND_LAST;
 		}
 	}
 }

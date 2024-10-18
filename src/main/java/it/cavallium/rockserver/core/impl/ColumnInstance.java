@@ -31,6 +31,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 
 	public static final OfChar BIG_ENDIAN_CHAR_UNALIGNED = OfByte.JAVA_CHAR_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 	public static final OfInt BIG_ENDIAN_INT_UNALIGNED = OfByte.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+	private static final MemorySegment[] EMPTY_MEMORY_SEGMENT_ARRAY = new MemorySegment[0];
 
 	public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema) {
 		this(cfh, schema, calculateFinalKeySizeBytes(schema));
@@ -77,6 +78,36 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 		}
 		validateFinalKeySize(finalKey);
 		return finalKey;
+	}
+
+	/**
+	 * @param bucketValue pass this parameter only if the columnInstance has variable-length keys
+	 */
+	@NotNull
+	public MemorySegment[] decodeKeys(Arena arena, MemorySegment calculatedKey, @Nullable MemorySegment bucketValue) {
+		validateFinalKeySize(calculatedKey);
+		MemorySegment[] finalKeys;
+		if (calculatedKey == MemorySegment.NULL) {
+			finalKeys = EMPTY_MEMORY_SEGMENT_ARRAY;
+		} else if (!hasBuckets()) {
+			if (schema.keysCount() == 1) {
+				finalKeys = new MemorySegment[] {calculatedKey};
+			} else {
+				finalKeys = new MemorySegment[schema.keysCount()];
+				long offsetBytes = 0;
+				for (int i = 0; i < schema.keysCount(); i++) {
+					var keyLength = schema.key(i);
+					var finalKey = finalKeys[i] = arena.allocate(keyLength);
+					MemorySegment.copy(calculatedKey, offsetBytes, finalKey, 0, keyLength);
+					offsetBytes += keyLength;
+				}
+			}
+		} else {
+			// todo: implement
+			throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "Unsupported bucket columns, implement them");
+		}
+		validateKeyCount(finalKeys);
+		return finalKeys;
 	}
 
 	private MemorySegment computeKeyAt(Arena arena, int i, MemorySegment[] keys) {

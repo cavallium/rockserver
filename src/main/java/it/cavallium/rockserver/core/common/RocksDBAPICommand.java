@@ -5,7 +5,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.List;
-import java.util.StringJoiner;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -382,6 +382,56 @@ public sealed interface RocksDBAPICommand<R> {
 		@Override
 		public CompletionStage<T> handleAsync(RocksDBAsyncAPI api) {
 			return api.subsequentAsync(arena, iterationId, skipCount, takeCount, requestType);
+		}
+
+	}
+	/**
+	 * Get some values in a range
+	 * <p>
+	 * Returns the result
+	 *
+	 * @param arena arena
+	 * @param transactionId transaction id, or 0
+	 * @param columnId column id
+	 * @param startKeysInclusive start keys, inclusive. [] means "the beginning"
+	 * @param endKeysExclusive end keys, exclusive. Null means "the end"
+	 * @param reverse if true, seek in reverse direction
+	 * @param requestType the request type determines which type of data will be returned.
+	 * @param timeoutMs timeout in milliseconds
+	 */
+	record GetRange<T>(Arena arena,
+					   long transactionId,
+					   long columnId,
+					   @Nullable Keys startKeysInclusive,
+					   @Nullable Keys endKeysExclusive,
+					   boolean reverse,
+					   RequestType.RequestGetRange<? super KV, T> requestType,
+					   long timeoutMs) implements RocksDBAPICommand<T> {
+
+		@Override
+		public T handleSync(RocksDBSyncAPI api) {
+			return api.getRange(arena,
+					transactionId,
+					columnId,
+					startKeysInclusive,
+					endKeysExclusive,
+					reverse,
+					requestType,
+					timeoutMs
+			);
+		}
+
+		@Override
+		public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
+			return api.getRangeAsync(arena,
+					transactionId,
+					columnId,
+					startKeysInclusive,
+					endKeysExclusive,
+					reverse,
+					requestType,
+					timeoutMs
+			);
 		}
 
 	}

@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.CreateColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.DeleteColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetColumnId;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.OpenTransaction;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Put;
@@ -118,5 +119,17 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 			long takeCount,
 			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws RocksDBException {
 		return requestSync(new Subsequent<>(arena, iterationId, skipCount, takeCount, requestType));
+	}
+
+	/** See: {@link GetRange}. */
+	default <T> T getRange(Arena arena,
+						   long transactionId,
+						   long columnId,
+						   @Nullable Keys startKeysInclusive,
+						   @Nullable Keys endKeysExclusive,
+						   boolean reverse,
+						   @NotNull RequestType.RequestGetRange<? super KV, T> requestType,
+						   long timeoutMs) throws RocksDBException {
+		return requestSync(new GetRange<>(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
 	}
 }

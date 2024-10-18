@@ -4,6 +4,7 @@ import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
+import com.google.protobuf.UnsafeByteOperations;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyServerBuilder;
@@ -17,7 +18,6 @@ import io.netty.channel.epoll.EpollServerDomainSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
-import io.netty.util.NettyRuntime;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnHashType;
@@ -35,6 +35,8 @@ import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
+import it.cavallium.rockserver.core.common.api.proto.FirstAndLast;
+import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceImplBase;
 import it.unimi.dsi.fastutil.ints.Int2IntFunction;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
@@ -45,9 +47,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.net.InetSocketAddress;
 import java.net.SocketAddress;
-import java.net.UnixDomainSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletionException;
@@ -56,6 +56,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
@@ -698,6 +700,33 @@ public class GrpcServer extends Server {
 			});
 		}
 
+		@Override
+		public void getRangeFirstAndLast(GetRangeRequest request, StreamObserver<FirstAndLast> responseObserver) {
+			executor.execute(() -> {
+				try {
+					try (var arena = Arena.ofConfined()) {
+                        it.cavallium.rockserver.core.common.FirstAndLast<it.cavallium.rockserver.core.common.KV> firstAndLast
+								= api.getRange(arena,
+										request.getTransactionId(),
+										request.getColumnId(),
+										mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+										mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+										request.getReverse(),
+										RequestType.firstAndLast(),
+										request.getTimeoutMs()
+								);
+						responseObserver.onNext(FirstAndLast.newBuilder()
+								.setFirst(unmapKV(firstAndLast.first()))
+								.setLast(unmapKV(firstAndLast.last()))
+								.build());
+					}
+					responseObserver.onCompleted();
+				} catch (Throwable ex) {
+					handleError(responseObserver, ex);
+				}
+			});
+		}
+
 		private static void closeArenaSafe(Arena autoArena) {
 			if (autoArena != null) {
 				try {
@@ -709,6 +738,27 @@ public class GrpcServer extends Server {
 		}
 
 		// mappers
+
+		private static KV unmapKV(it.cavallium.rockserver.core.common.KV kv) {
+			if (kv == null) return null;
+			return KV.newBuilder()
+					.addAllKeys(unmapKeys(kv.keys()))
+					.setValue(unmapValue(kv.value()))
+					.build();
+		}
+
+		private static List<ByteString> unmapKeys(@NotNull Keys keys) {
+			var result = new ArrayList<ByteString>(keys.keys().length);
+			for (@NotNull MemorySegment key : keys.keys()) {
+				result.add(UnsafeByteOperations.unsafeWrap(key.asByteBuffer()));
+			}
+			return result;
+		}
+
+		private static ByteString unmapValue(@Nullable MemorySegment value) {
+			if (value == null) return null;
+			return UnsafeByteOperations.unsafeWrap(value.asByteBuffer());
+		}
 
 		private static ColumnSchema mapColumnSchema(it.cavallium.rockserver.core.common.api.proto.ColumnSchema schema) {
 			return ColumnSchema.of(mapKeysLength(schema.getFixedKeysCount(), schema::getFixedKeys),
