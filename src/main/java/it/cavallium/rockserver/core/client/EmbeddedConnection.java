@@ -88,7 +88,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public <R, RS> RS requestSync(RocksDBAPICommand<R, RS, ?> req) {
+	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> req) {
 		return req.handleSync(this);
 	}
 
@@ -176,7 +176,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public <T> T reduceRange(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+	public <T> T reduceRange(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestReduceRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
 		return db.reduceRange(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
 	}
 }

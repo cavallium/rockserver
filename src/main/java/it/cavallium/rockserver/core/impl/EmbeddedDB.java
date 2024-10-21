@@ -955,7 +955,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 							 @Nullable Keys startKeysInclusive,
 							 @Nullable Keys endKeysExclusive,
 							 boolean reverse,
-							 RequestType.@NotNull RequestGetRange<? super KV, T> requestType,
+							 RequestType.@NotNull RequestReduceRange<? super KV, T> requestType,
 							 long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {

@@ -73,6 +73,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	private final RocksDBServiceBlockingStub blockingStub;
 	private final RocksDBServiceStub asyncStub;
 	private final RocksDBServiceFutureStub futureStub;
+	private final ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStub;
 	private final URI address;
 
 	private GrpcConnection(String name, SocketAddress socketAddress, URI address) {
@@ -102,6 +103,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		this.blockingStub = RocksDBServiceGrpc.newBlockingStub(channel);
 		this.asyncStub = RocksDBServiceGrpc.newStub(channel);
 		this.futureStub = RocksDBServiceGrpc.newFutureStub(channel);
+		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 		this.address = address;
 	}
 
@@ -515,8 +517,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@SuppressWarnings("unchecked")
-	@Override
-	public <T> CompletableFuture<T> reduceRangeAsync(Arena arena, long transactionId, long columnId, @NotNull Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+    @Override
+	public <T> CompletableFuture<T> reduceRangeAsync(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestReduceRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
 		var request = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -527,16 +529,28 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.build();
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestType.RequestGetFirstAndLast<?> _ ->
-					toResponse(this.futureStub.getRangeFirstAndLast(request), result -> new FirstAndLast<>(
+					toResponse(this.futureStub.reduceRangeFirstAndLast(request), result -> new FirstAndLast<>(
 							result.hasFirst() ? mapKV(arena, result.getFirst()) : null,
 							result.hasLast() ? mapKV(arena, result.getLast()) : null
 					));
 		};
 	}
 
-	@Override
-	public <T> Publisher<T> getRangeStream(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
-		// todo: implement
+	@SuppressWarnings("unchecked")
+    @Override
+	public <T> Publisher<T> getRangeAsync(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+		var request = GetRangeRequest.newBuilder()
+				.setTransactionId(transactionId)
+				.setColumnId(columnId)
+				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
+				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
+				.setReverse(reverse)
+				.setTimeoutMs(timeoutMs)
+				.build();
+		return (Publisher<T>) switch (requestType) {
+			case RequestType.RequestGetAllInRange<?> _ -> reactiveStub.getAllInRange(request)
+					.map(kv -> mapKV(arena, kv));
+		};
 	}
 
 	private static it.cavallium.rockserver.core.common.Delta<MemorySegment> mapDelta(Delta x) {

@@ -6,11 +6,12 @@ import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import java.io.IOException;
 import java.net.URI;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
-import java.util.function.Supplier;
-import java.util.logging.Level;
+
+import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
+import reactor.core.publisher.Flux;
 
 public class LoggingClient implements RocksDBConnection {
 
@@ -55,9 +56,9 @@ public class LoggingClient implements RocksDBConnection {
 		}
 
 		@Override
-		public <R> R requestSync(RocksDBAPICommand<R> req) {
+		public <RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> SYNC_RESULT requestSync(RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> req) {
 			logger.trace("Request input (sync): {}", req);
-			R result;
+			SYNC_RESULT result;
 			try {
 				result = syncApi.requestSync(req);
 			} catch (Throwable e) {
@@ -77,16 +78,37 @@ public class LoggingClient implements RocksDBConnection {
 			this.asyncApi = asyncApi;
 		}
 
-		@Override
-		public <R> CompletableFuture<R> requestAsync(RocksDBAPICommand<R> req) {
-			logger.trace("Request input (async): {}", req);
-			return asyncApi.requestAsync(req).whenComplete((result, e) -> {
-				if (e != null) {
-					logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
-				} else {
-					logger.trace("Request executed: {}    Result: {}", req, result);
-				}
-			});
+		@SuppressWarnings("unchecked")
+        @Override
+		public <RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> ASYNC_RESULT requestAsync(RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> req) {
+			if (!logger.isEnabledForLevel(Level.TRACE)) {
+				return asyncApi.requestAsync(req);
+			} else {
+				logger.trace("Request input (async): {}", req);
+				var r = asyncApi.requestAsync(req);
+				return switch (req) {
+					case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ ->
+                            (ASYNC_RESULT) ((CompletableFuture<?>) r).whenComplete((result, e) -> {
+                                if (e != null) {
+                                    logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
+                                } else {
+                                    logger.trace("Request executed: {}    Result: {}", req, result);
+                                }
+                            });
+					case RocksDBAPICommand.RocksDBAPICommandStream<?> _ ->
+                            (ASYNC_RESULT) Flux.from((Publisher<?>) r).doOnEach(signal -> {
+                                if (signal.isOnNext()) {
+                                    logger.trace("Request: {}    Partial result: {}", req, signal);
+                                } else if (signal.isOnError()) {
+                                    var e = signal.getThrowable();
+                                    assert e != null;
+									logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
+                                } else if (signal.isOnComplete()) {
+                                    logger.trace("Request executed: {}    Result: terminated successfully", req);
+                                }
+                            });
+				};
+			}
 		}
 	}
 }

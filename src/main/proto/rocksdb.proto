@@ -124,6 +124,6 @@ service RocksDBService {
   rpc subsequent(SubsequentRequest) returns (google.protobuf.Empty);
   rpc subsequentExists(SubsequentRequest) returns (PreviousPresence);
   rpc subsequentMultiGet(SubsequentRequest) returns (stream KV);
-  rpc getRangeFirstAndLast(GetRangeRequest) returns (FirstAndLast);
-  rpc getRangeStream(GetRangeRequest) returns (stream KV);
+  rpc reduceRangeFirstAndLast(GetRangeRequest) returns (FirstAndLast);
+  rpc getAllInRange(GetRangeRequest) returns (stream KV);
 }

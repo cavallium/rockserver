@@ -119,6 +119,12 @@
       <groupId>io.grpc</groupId>
       <artifactId>grpc-netty</artifactId>
       <version>${grpc.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>com.google.code.findbugs</groupId>
+          <artifactId>jsr305</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <dependency>
       <groupId>io.netty</groupId>
@@ -140,11 +146,23 @@
       <groupId>io.grpc</groupId>
       <artifactId>grpc-protobuf</artifactId>
       <version>${grpc.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>com.google.code.findbugs</groupId>
+          <artifactId>jsr305</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <dependency>
       <groupId>io.grpc</groupId>
       <artifactId>grpc-stub</artifactId>
       <version>${grpc.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>com.google.code.findbugs</groupId>
+          <artifactId>jsr305</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <dependency>
       <groupId>org.reactivestreams</groupId>
@@ -155,6 +173,18 @@
       <groupId>io.projectreactor</groupId>
       <artifactId>reactor-core</artifactId>
       <version>3.6.4</version>
+    </dependency>
+    <dependency>
+      <groupId>com.salesforce.servicelibs</groupId>
+      <artifactId>reactor-grpc-stub</artifactId>
+      <version>1.2.4</version>
+      <scope>provided</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>com.google.code.findbugs</groupId>
+          <artifactId>jsr305</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
 
     <dependency>
@@ -244,6 +274,15 @@
           <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
           <pluginId>grpc-java</pluginId>
           <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
+          <protocPlugins>
+            <protocPlugin>
+              <id>reactor-grpc</id>
+              <groupId>com.salesforce.servicelibs</groupId>
+              <artifactId>reactor-grpc</artifactId>
+              <version>1.2.4</version>
+              <mainClass>com.salesforce.reactorgrpc.ReactorGrpcGenerator</mainClass>
+            </protocPlugin>
+          </protocPlugins>
         </configuration>
         <executions>
           <execution>

@@ -410,7 +410,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 							  @Nullable Keys startKeysInclusive,
 							  @Nullable Keys endKeysExclusive,
 							  boolean reverse,
-							  RequestType.RequestGetRange<? super KV, T> requestType,
+							  RequestType.RequestReduceRange<? super KV, T> requestType,
 							  long timeoutMs) implements RocksDBAPICommandSingle<T> {
 
 			@Override

@@ -131,7 +131,7 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 							  @Nullable Keys startKeysInclusive,
 							  @Nullable Keys endKeysExclusive,
 							  boolean reverse,
-							  @NotNull RequestType.RequestGetRange<? super KV, T> requestType,
+							  @NotNull RequestType.RequestReduceRange<? super KV, T> requestType,
 							  long timeoutMs) throws RocksDBException {
 		return requestSync(new ReduceRange<>(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
 	}

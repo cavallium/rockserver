@@ -17,6 +17,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.List;
@@ -137,7 +138,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 													  @Nullable Keys startKeysInclusive,
 													  @Nullable Keys endKeysExclusive,
 													  boolean reverse,
-													  RequestType.RequestGetRange<? super KV, T> requestType,
+													  RequestType.RequestReduceRange<? super KV, T> requestType,
 													  long timeoutMs) throws RocksDBException {
 		return requestAsync(new ReduceRange<>(arena,
 				transactionId,

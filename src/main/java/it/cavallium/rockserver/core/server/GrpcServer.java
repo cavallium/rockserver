@@ -48,8 +48,10 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.SocketAddress;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -62,6 +64,11 @@ import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 public class GrpcServer extends Server {
 
@@ -69,7 +76,7 @@ public class GrpcServer extends Server {
 
 	private final GrpcServerImpl grpc;
 	private final EventLoopGroup elg;
-	private final ExecutorService executor;
+	private final Scheduler executor;
 	private final io.grpc.Server server;
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
@@ -85,7 +92,7 @@ public class GrpcServer extends Server {
 			channelType = NioServerSocketChannel.class;
 		}
 		this.elg = elg;
-		this.executor = Executors.newWorkStealingPool(Runtime.getRuntime().availableProcessors() * 2);
+		this.executor = Schedulers.newBoundedElastic(Runtime.getRuntime().availableProcessors() * 2, Schedulers.DEFAULT_BOUNDED_ELASTIC_QUEUESIZE, "server-db-executor");
 		this.server = NettyServerBuilder
 				.forAddress(socketAddress)
 				.bossEventLoopGroup(elg)
@@ -104,7 +111,7 @@ public class GrpcServer extends Server {
 		server.start();
 	}
 
-	private final class GrpcServerImpl extends RocksDBServiceImplBase {
+	private final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplBase {
 
 		private final RocksDBAsyncAPI asyncApi;
         private final RocksDBSyncAPI api;
@@ -116,360 +123,185 @@ public class GrpcServer extends Server {
 
 		// functions
 
+
 		@Override
-		public void openTransaction(OpenTransactionRequest request,
-				StreamObserver<OpenTransactionResponse> responseObserver) {
-			executor.execute(() -> {
-				try {
-					var txId = api.openTransaction(request.getTimeoutMs());
-					responseObserver.onNext(OpenTransactionResponse.newBuilder().setTransactionId(txId).build());
-					responseObserver.onCompleted();
-				} catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
+		public Mono<OpenTransactionResponse> openTransaction(OpenTransactionRequest request) {
+			return executeSync(() -> {
+				var txId = api.openTransaction(request.getTimeoutMs());
+				return OpenTransactionResponse.newBuilder().setTransactionId(txId).build();
 			});
 		}
 
 		@Override
-		public void closeTransaction(CloseTransactionRequest request,
-				StreamObserver<CloseTransactionResponse> responseObserver) {
-			executor.execute(() -> {
-				try {
-					var committed = api.closeTransaction(request.getTransactionId(), request.getCommit());
-					var response = CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
-					responseObserver.onNext(response);
-					responseObserver.onCompleted();
-				} catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
+		public Mono<CloseTransactionResponse> closeTransaction(CloseTransactionRequest request) {
+			return executeSync(() -> {
+				var committed = api.closeTransaction(request.getTransactionId(), request.getCommit());
+                return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
 			});
 		}
 
 		@Override
-		public void closeFailedUpdate(CloseFailedUpdateRequest request, StreamObserver<Empty> responseObserver) {
-			executor.execute(() -> {
-				try {
-					api.closeFailedUpdate(request.getUpdateId());
-					responseObserver.onNext(Empty.getDefaultInstance());
-					responseObserver.onCompleted();
-				} catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
+		public Mono<Empty> closeFailedUpdate(CloseFailedUpdateRequest request) {
+			return executeSync(() -> {
+				api.closeFailedUpdate(request.getUpdateId());
+				return Empty.getDefaultInstance();
 			});
 		}
 
 		@Override
-		public void createColumn(CreateColumnRequest request, StreamObserver<CreateColumnResponse> responseObserver) {
-			executor.execute(() -> {
-				try {
-					var colId = api.createColumn(request.getName(), mapColumnSchema(request.getSchema()));
-					var response = CreateColumnResponse.newBuilder().setColumnId(colId).build();
-					responseObserver.onNext(response);
-					responseObserver.onCompleted();
-				} catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
+		public Mono<CreateColumnResponse> createColumn(CreateColumnRequest request) {
+			return executeSync(() -> {
+				var colId = api.createColumn(request.getName(), mapColumnSchema(request.getSchema()));
+				return CreateColumnResponse.newBuilder().setColumnId(colId).build();
 			});
 		}
 
 		@Override
-		public void deleteColumn(DeleteColumnRequest request, StreamObserver<Empty> responseObserver) {
-			executor.execute(() -> {
-				try {
-					api.deleteColumn(request.getColumnId());
-					responseObserver.onNext(Empty.getDefaultInstance());
-					responseObserver.onCompleted();
-				} catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
+		public Mono<Empty> deleteColumn(DeleteColumnRequest request) {
+			return executeSync(() -> {
+				api.deleteColumn(request.getColumnId());
+				return Empty.getDefaultInstance();
 			});
 		}
 
 		@Override
-		public void getColumnId(GetColumnIdRequest request, StreamObserver<GetColumnIdResponse> responseObserver) {
-			executor.execute(() -> {
-				try {
-					var colId = api.getColumnId(request.getName());
-					var response = GetColumnIdResponse.newBuilder().setColumnId(colId).build();
-					responseObserver.onNext(response);
-					responseObserver.onCompleted();
-				} catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
+		public Mono<GetColumnIdResponse> getColumnId(GetColumnIdRequest request) {
+			return executeSync(() -> {
+				var colId = api.getColumnId(request.getName());
+				return GetColumnIdResponse.newBuilder().setColumnId(colId).build();
 			});
 		}
 
 		@Override
-		public void put(PutRequest request, StreamObserver<Empty> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        api.put(arena,
-                                request.getTransactionOrUpdateId(),
-                                request.getColumnId(),
-                                mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-                                toMemorySegment(arena, request.getData().getValue()),
-                                new RequestNothing<>()
-                        );
-                    }
-					responseObserver.onNext(Empty.getDefaultInstance());
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
+		public Mono<Empty> put(PutRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					api.put(arena,
+							request.getTransactionOrUpdateId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
+							toMemorySegment(arena, request.getData().getValue()),
+							new RequestNothing<>()
+					);
 				}
+				return Empty.getDefaultInstance();
 			});
 		}
 
 		@Override
-		public StreamObserver<PutBatchRequest> putBatch(StreamObserver<Empty> responseObserver) {
-			final ServerCallStreamObserver<Empty> serverCallStreamObserver =
-					(ServerCallStreamObserver<Empty>) responseObserver;
-			serverCallStreamObserver.disableAutoRequest();
-			serverCallStreamObserver.request(1);
-			var requestObserver = new StreamObserver<PutBatchRequest>() {
-				enum State {
-					BEFORE_INITIAL_REQUEST,
-					RECEIVING_DATA,
-					RECEIVED_ALL
-				}
-				private final ExecutorService sstExecutor = Executors.newSingleThreadExecutor();
-				final AtomicInteger pendingRequests = new AtomicInteger();
-				State state = State.BEFORE_INITIAL_REQUEST;
-				private PutBatchInitialRequest initialRequest;
-				private Subscriber<? super KVBatch> putBatchInputsSubscriber;
-				@Override
-				public void onNext(PutBatchRequest putBatchRequest) {
-					if (state == State.BEFORE_INITIAL_REQUEST) {
-						if (!putBatchRequest.hasInitialRequest()) {
-							serverCallStreamObserver.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
-						}
-
-						initialRequest = putBatchRequest.getInitialRequest();
-
-						try {
-							asyncApi.putBatchAsync(initialRequest.getColumnId(),
-									subscriber2 -> {
-										putBatchInputsSubscriber = subscriber2;
-										subscriber2.onSubscribe(new Subscription() {
-											@Override
-											public void request(long l) {
-												serverCallStreamObserver.request(Math.toIntExact(l));
-											}
-
-											@Override
-											public void cancel() {
-												serverCallStreamObserver.onError(new IOException("Cancelled"));
-
-											}
-										});
-									},
-									switch (initialRequest.getMode()) {
-										case WRITE_BATCH -> PutBatchMode.WRITE_BATCH;
-										case WRITE_BATCH_NO_WAL -> PutBatchMode.WRITE_BATCH_NO_WAL;
-										case SST_INGESTION -> PutBatchMode.SST_INGESTION;
-										case SST_INGEST_BEHIND -> PutBatchMode.SST_INGEST_BEHIND;
-										case UNRECOGNIZED -> throw new UnsupportedOperationException("Unrecognized request \"mode\"");
-									}
-							).whenComplete((_, ex) -> {
-								if (ex != null) {
-									handleError(serverCallStreamObserver, ex);
-								} else {
-									serverCallStreamObserver.onNext(Empty.getDefaultInstance());
-									serverCallStreamObserver.onCompleted();
-								}
-							});
-						} catch (Throwable ex) {
-							handleError(serverCallStreamObserver, ex);
-						}
-						state = State.RECEIVING_DATA;
-					} else if (state == State.RECEIVING_DATA) {
-						pendingRequests.incrementAndGet();
-						var kvBatch = putBatchRequest.getData();
-						sstExecutor.execute(() -> {
-							try {
-								try (var arena = Arena.ofConfined()) {
-									putBatchInputsSubscriber.onNext(mapKVBatch(arena, kvBatch.getEntriesCount(), kvBatch::getEntries));
-								}
-								checkCompleted(true);
-							} catch (Throwable ex) {
-								putBatchInputsSubscriber.onError(ex);
-							}
-						});
-					} else {
-						serverCallStreamObserver.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Invalid request"));
+		public Mono<Empty> putBatch(Flux<PutBatchRequest> request) {
+			return request.switchOnFirst((firstSignal, nextRequests) -> {
+				if (firstSignal.isOnNext()) {
+					var firstValue = firstSignal.get();
+                    assert firstValue != null;
+                    if (!firstValue.hasInitialRequest()) {
+						return Mono.<Empty>error(RocksDBException.of(
+								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
-				}
+					var initialRequest = firstValue.getInitialRequest();
+					var mode = switch (initialRequest.getMode()) {
+						case WRITE_BATCH -> PutBatchMode.WRITE_BATCH;
+						case WRITE_BATCH_NO_WAL -> PutBatchMode.WRITE_BATCH_NO_WAL;
+						case SST_INGESTION -> PutBatchMode.SST_INGESTION;
+						case SST_INGEST_BEHIND -> PutBatchMode.SST_INGEST_BEHIND;
+						case UNRECOGNIZED -> throw new UnsupportedOperationException("Unrecognized request \"mode\"");
+					};
 
-				@Override
-				public void onError(Throwable throwable) {
-					sstExecutor.execute(() -> {
-						state = State.RECEIVED_ALL;
-						doFinally();
-						if (putBatchInputsSubscriber != null) {
-							putBatchInputsSubscriber.onError(throwable);
-						} else {
-							serverCallStreamObserver.onError(throwable);
-						}
+					var batches = nextRequests.map(putBatchRequest -> {
+						var batch = putBatchRequest.getData();
+						return mapKVBatch(Arena.ofAuto(), batch.getEntriesCount(), batch::getEntries);
 					});
-				}
 
-				@Override
-				public void onCompleted() {
-					sstExecutor.execute(() -> {
-						if (state == State.BEFORE_INITIAL_REQUEST) {
-							serverCallStreamObserver.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
-						} else if (state == State.RECEIVING_DATA) {
-							state = State.RECEIVED_ALL;
-							checkCompleted(false);
-						} else {
-							putBatchInputsSubscriber.onError(RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR, "Unknown state during onComplete: " + state));
-						}
-					});
+					return Mono.fromFuture(asyncApi.putBatchAsync(initialRequest.getColumnId(), batches, mode));
+				} else if (firstSignal.isOnComplete()) {
+					return Mono.just(RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+				} else {
+					return nextRequests;
 				}
-
-				private void checkCompleted(boolean requestDone) {
-					if ((requestDone ? pendingRequests.decrementAndGet() : pendingRequests.get()) == 0
-							&& state == State.RECEIVED_ALL) {
-						doFinally();
-						putBatchInputsSubscriber.onComplete();
-					}
-				}
-
-				private void doFinally() {
-					sstExecutor.shutdown();
-				}
-			};
-			return requestObserver;
+			}).then(Mono.just(Empty.getDefaultInstance()));
 		}
 
 		@Override
-		public StreamObserver<PutMultiRequest> putMulti(StreamObserver<Empty> responseObserver) {
-			return new StreamObserver<>() {
-				private boolean initialRequestDone = false;
-				private long requestsCount = 0;
-				private boolean requestsCountFinalized;
-				private final AtomicLong processedRequestsCount = new AtomicLong();
-				private PutMultiInitialRequest initialRequest;
-
-				@Override
-				public void onNext(PutMultiRequest request) {
-					switch (request.getPutMultiRequestTypeCase()) {
-						case INITIALREQUEST -> {
-							if (initialRequestDone) {
-								throw new UnsupportedOperationException("Initial request already done!");
-							}
-							this.initialRequest = request.getInitialRequest();
-							this.initialRequestDone = true;
-						}
-						case DATA -> {
-							if (!initialRequestDone) {
-								throw new UnsupportedOperationException("Initial request already done!");
-							}
-							++requestsCount;
-							executor.execute(() -> {
-								try {
-                                    try (var arena = Arena.ofConfined()) {
-                                        api.put(arena,
-                                                initialRequest.getTransactionOrUpdateId(),
-                                                initialRequest.getColumnId(),
-                                                mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-                                                toMemorySegment(arena, request.getData().getValue()),
-                                                new RequestNothing<>());
-                                    }
-                                } catch (RocksDBException ex) {
-									handleError(responseObserver, ex);
-									return;
-								}
-
-								var newProcessedRequestCount = processedRequestsCount.incrementAndGet();
-								if (requestsCountFinalized) {
-									if (newProcessedRequestCount == requestsCount) {
-										responseObserver.onNext(Empty.getDefaultInstance());
-										responseObserver.onCompleted();
-									}
-								}
-							});
-						}
-						case null, default ->
-								throw new UnsupportedOperationException("Unsupported operation: "
-										+ request.getPutMultiRequestTypeCase());
+		public Mono<Empty> putMulti(Flux<PutMultiRequest> request) {
+			return request.switchOnFirst((firstSignal, nextRequests) -> {
+				if (firstSignal.isOnNext()) {
+					var firstValue = firstSignal.get();
+					assert firstValue != null;
+					if (!firstValue.hasInitialRequest()) {
+						return Mono.<Empty>error(RocksDBException.of(
+								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
-				}
+					var initialRequest = firstValue.getInitialRequest();
 
-				@Override
-				public void onError(Throwable t) {
-					responseObserver.onError(t);
+                    return nextRequests
+                            .publishOn(executor)
+                            .doOnNext(putRequest -> {
+                                var data = putRequest.getData();
+                                try (var arena = Arena.ofConfined()) {
+                                    api.put(arena,
+                                            initialRequest.getTransactionOrUpdateId(),
+                                            initialRequest.getColumnId(),
+                                            mapKeys(arena, data.getKeysCount(), data::getKeys),
+                                            toMemorySegment(arena, data.getValue()),
+                                            new RequestNothing<>());
+                                }
+                            });
+				} else if (firstSignal.isOnComplete()) {
+					return Mono.just(RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+				} else {
+					return nextRequests;
 				}
-
-				@Override
-				public void onCompleted() {
-					requestsCountFinalized = true;
-					if (requestsCount == 0) {
-						responseObserver.onCompleted();
-					}
-				}
-			};
+			}).then(Mono.just(Empty.getDefaultInstance()));
 		}
 
 		@Override
-		public void putGetPrevious(PutRequest request, StreamObserver<Previous> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        var prev = api.put(arena,
-                                request.getTransactionOrUpdateId(),
-                                request.getColumnId(),
-                                mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-                                toMemorySegment(arena, request.getData().getValue()),
-                                new RequestPrevious<>()
-                        );
-                        var prevBuilder = Previous.newBuilder();
-                        if (prev != null) {
-                            prevBuilder.setPrevious(ByteString.copyFrom(prev.asByteBuffer()));
-                        }
-                        var response = prevBuilder.build();
-						responseObserver.onNext(response);
-                    }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
+		public Mono<Previous> putGetPrevious(PutRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					var prev = api.put(arena,
+							request.getTransactionOrUpdateId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
+							toMemorySegment(arena, request.getData().getValue()),
+							new RequestPrevious<>()
+					);
+					var prevBuilder = Previous.newBuilder();
+					if (prev != null) {
+						prevBuilder.setPrevious(ByteString.copyFrom(prev.asByteBuffer()));
+					}
+                    return prevBuilder.build();
 				}
 			});
 		}
 
 		@Override
-		public void putGetDelta(PutRequest request, StreamObserver<Delta> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        var delta = api.put(arena,
-                                request.getTransactionOrUpdateId(),
-                                request.getColumnId(),
-                                mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-                                toMemorySegment(arena, request.getData().getValue()),
-                                new RequestDelta<>()
-                        );
-                        var deltaBuilder = Delta.newBuilder();
-                        if (delta.previous() != null) {
-                            deltaBuilder.setPrevious(ByteString.copyFrom(delta.previous().asByteBuffer()));
-                        }
-                        if (delta.current() != null) {
-                            deltaBuilder.setCurrent(ByteString.copyFrom(delta.current().asByteBuffer()));
-                        }
-                        var response = deltaBuilder.build();
-                        responseObserver.onNext(response);
-                    }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
+		public Mono<Delta> putGetDelta(PutRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					var delta = api.put(arena,
+							request.getTransactionOrUpdateId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
+							toMemorySegment(arena, request.getData().getValue()),
+							new RequestDelta<>()
+					);
+					var deltaBuilder = Delta.newBuilder();
+					if (delta.previous() != null) {
+						deltaBuilder.setPrevious(ByteString.copyFrom(delta.previous().asByteBuffer()));
+					}
+					if (delta.current() != null) {
+						deltaBuilder.setCurrent(ByteString.copyFrom(delta.current().asByteBuffer()));
+					}
+					return deltaBuilder.build();
 				}
 			});
 		}
 
 		@Override
-		public void putGetChanged(PutRequest request, StreamObserver<Changed> responseObserver) {
-			executor.execute(() -> {
-				try {
+		public Mono<Changed> putGetChanged(PutRequest request) {
+			return executeSync(() -> {
                     try (var arena = Arena.ofConfined()) {
                         var changed = api.put(arena,
                                 request.getTransactionOrUpdateId(),
@@ -478,251 +310,188 @@ public class GrpcServer extends Server {
                                 toMemorySegment(arena, request.getData().getValue()),
                                 new RequestChanged<>()
                         );
-                        var response = Changed.newBuilder().setChanged(changed).build();
-                        responseObserver.onNext(response);
+                        return Changed.newBuilder().setChanged(changed).build();
                     }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
+			});
+		}
+
+		@Override
+		public Mono<PreviousPresence> putGetPreviousPresence(PutRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					var present = api.put(arena,
+							request.getTransactionOrUpdateId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
+							toMemorySegment(arena, request.getData().getValue()),
+							new RequestPreviousPresence<>()
+					);
+					return PreviousPresence.newBuilder().setPresent(present).build();
 				}
 			});
 		}
 
 		@Override
-		public void putGetPreviousPresence(PutRequest request, StreamObserver<PreviousPresence> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        var present = api.put(arena,
-                                request.getTransactionOrUpdateId(),
-                                request.getColumnId(),
-                                mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-                                toMemorySegment(arena, request.getData().getValue()),
-                                new RequestPreviousPresence<>()
-                        );
-                        var response = PreviousPresence.newBuilder().setPresent(present).build();
-                        responseObserver.onNext(response);
-                    }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void get(GetRequest request, StreamObserver<GetResponse> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        var current = api.get(arena,
-                                request.getTransactionOrUpdateId(),
-                                request.getColumnId(),
-                                mapKeys(arena, request.getKeysCount(), request::getKeys),
-                                new RequestCurrent<>()
-                        );
-                        var responseBuilder = GetResponse.newBuilder();
-                        if (current != null) {
-                            responseBuilder.setValue(ByteString.copyFrom(current.asByteBuffer()));
-                        }
-                        var response = responseBuilder.build();
-                        responseObserver.onNext(response);
-                    }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void getForUpdate(GetRequest request, StreamObserver<UpdateBegin> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        var forUpdate = api.get(arena,
-                                request.getTransactionOrUpdateId(),
-                                request.getColumnId(),
-                                mapKeys(arena, request.getKeysCount(), request::getKeys),
-                                new RequestForUpdate<>()
-                        );
-                        var responseBuilder = UpdateBegin.newBuilder();
-                        responseBuilder.setUpdateId(forUpdate.updateId());
-                        if (forUpdate.previous() != null) {
-                            responseBuilder.setPrevious(ByteString.copyFrom(forUpdate.previous().asByteBuffer()));
-                        }
-                        var response = responseBuilder.build();
-                        responseObserver.onNext(response);
-                    }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void exists(GetRequest request, StreamObserver<PreviousPresence> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        var exists = api.get(arena,
-                                request.getTransactionOrUpdateId(),
-                                request.getColumnId(),
-                                mapKeys(arena, request.getKeysCount(), request::getKeys),
-                                new RequestExists<>()
-                        );
-                        responseObserver.onNext(PreviousPresence.newBuilder().setPresent(exists).build());
-                    }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void openIterator(OpenIteratorRequest request, StreamObserver<OpenIteratorResponse> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        var iteratorId = api.openIterator(arena,
-                                request.getTransactionId(),
-                                request.getColumnId(),
-                                mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-                                mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
-                                request.getReverse(),
-                                request.getTimeoutMs()
-                        );
-                        responseObserver.onNext(OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build());
-                    }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void closeIterator(CloseIteratorRequest request, StreamObserver<Empty> responseObserver) {
-			executor.execute(() -> {
-				try {
-					api.closeIterator(request.getIteratorId());
-					responseObserver.onNext(Empty.getDefaultInstance());
-					responseObserver.onCompleted();
-				} catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void seekTo(SeekToRequest request, StreamObserver<Empty> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        api.seekTo(arena, request.getIterationId(), mapKeys(arena, request.getKeysCount(), request::getKeys));
-                    }
-					responseObserver.onNext(Empty.getDefaultInstance());
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void subsequent(SubsequentRequest request, StreamObserver<Empty> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        api.subsequent(arena, request.getIterationId(),
-                                request.getSkipCount(),
-                                request.getTakeCount(),
-                                new RequestNothing<>());
-                    }
-					responseObserver.onNext(Empty.getDefaultInstance());
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void subsequentExists(SubsequentRequest request, StreamObserver<PreviousPresence> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        var exists = api.subsequent(arena, request.getIterationId(),
-                                request.getSkipCount(),
-                                request.getTakeCount(),
-                                new RequestExists<>());
-                        var response = PreviousPresence.newBuilder().setPresent(exists).build();
-                        responseObserver.onNext(response);
-                    }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void subsequentMultiGet(SubsequentRequest request, StreamObserver<KV> responseObserver) {
-			executor.execute(() -> {
-				try {
-                    try (var arena = Arena.ofConfined()) {
-                        int pageIndex = 0;
-                        final long pageSize = 16L;
-                        while (request.getTakeCount() > pageIndex * pageSize) {
-                            var response = api.subsequent(arena,
-                                    request.getIterationId(),
-                                    pageIndex == 0 ? request.getSkipCount() : 0,
-                                    Math.min(request.getTakeCount() - pageIndex * pageSize, pageSize),
-                                    new RequestMulti<>()
-                            );
-                            for (MemorySegment entry : response) {
-                                Keys keys = null; // todo: implement
-                                MemorySegment value = entry;
-                                responseObserver.onNext(KV.newBuilder()
-                                        .addAllKeys(null) // todo: implement
-                                        .setValue(ByteString.copyFrom(value.asByteBuffer()))
-                                        .build());
-                            }
-                            pageIndex++;
-                        }
-                    }
-					responseObserver.onCompleted();
-                } catch (Throwable ex) {
-					handleError(responseObserver, ex);
-				}
-			});
-		}
-
-		@Override
-		public void getRangeFirstAndLast(GetRangeRequest request, StreamObserver<FirstAndLast> responseObserver) {
-			executor.execute(() -> {
-				try {
-					try (var arena = Arena.ofConfined()) {
-                        it.cavallium.rockserver.core.common.FirstAndLast<it.cavallium.rockserver.core.common.KV> firstAndLast
-								= api.reduceRange(arena,
-										request.getTransactionId(),
-										request.getColumnId(),
-										mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-										mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
-										request.getReverse(),
-										RequestType.firstAndLast(),
-										request.getTimeoutMs()
-								);
-						responseObserver.onNext(FirstAndLast.newBuilder()
-								.setFirst(unmapKV(firstAndLast.first()))
-								.setLast(unmapKV(firstAndLast.last()))
-								.build());
+		public Mono<GetResponse> get(GetRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					var current = api.get(arena,
+							request.getTransactionOrUpdateId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getKeysCount(), request::getKeys),
+							new RequestCurrent<>()
+					);
+					var responseBuilder = GetResponse.newBuilder();
+					if (current != null) {
+						responseBuilder.setValue(ByteString.copyFrom(current.asByteBuffer()));
 					}
-					responseObserver.onCompleted();
-				} catch (Throwable ex) {
-					handleError(responseObserver, ex);
+					return responseBuilder.build();
+				}
+			});
+		}
+
+		@Override
+		public Mono<UpdateBegin> getForUpdate(GetRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					var forUpdate = api.get(arena,
+							request.getTransactionOrUpdateId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getKeysCount(), request::getKeys),
+							new RequestForUpdate<>()
+					);
+					var responseBuilder = UpdateBegin.newBuilder();
+					responseBuilder.setUpdateId(forUpdate.updateId());
+					if (forUpdate.previous() != null) {
+						responseBuilder.setPrevious(ByteString.copyFrom(forUpdate.previous().asByteBuffer()));
+					}
+					return responseBuilder.build();
+				}
+			});
+		}
+
+		@Override
+		public Mono<PreviousPresence> exists(GetRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					var exists = api.get(arena,
+							request.getTransactionOrUpdateId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getKeysCount(), request::getKeys),
+							new RequestExists<>()
+					);
+					return PreviousPresence.newBuilder().setPresent(exists).build();
+				}
+			});
+		}
+
+		@Override
+		public Mono<OpenIteratorResponse> openIterator(OpenIteratorRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					var iteratorId = api.openIterator(arena,
+							request.getTransactionId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+							request.getReverse(),
+							request.getTimeoutMs()
+					);
+					return OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build();
+				}
+			});
+		}
+
+		@Override
+		public Mono<Empty> closeIterator(CloseIteratorRequest request) {
+			return executeSync(() -> {
+				api.closeIterator(request.getIteratorId());
+				return Empty.getDefaultInstance();
+			});
+		}
+
+		@Override
+		public Mono<Empty> seekTo(SeekToRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					api.seekTo(arena, request.getIterationId(), mapKeys(arena, request.getKeysCount(), request::getKeys));
+				}
+				return Empty.getDefaultInstance();
+			});
+		}
+
+		@Override
+		public Mono<Empty> subsequent(SubsequentRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					api.subsequent(arena, request.getIterationId(),
+							request.getSkipCount(),
+							request.getTakeCount(),
+							new RequestNothing<>());
+				}
+				return Empty.getDefaultInstance();
+			});
+		}
+
+		@Override
+		public Mono<PreviousPresence> subsequentExists(SubsequentRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					var exists = api.subsequent(arena, request.getIterationId(),
+							request.getSkipCount(),
+							request.getTakeCount(),
+							new RequestExists<>());
+					return PreviousPresence.newBuilder().setPresent(exists).build();
+				}
+			});
+		}
+
+		@Override
+		public Flux<KV> subsequentMultiGet(SubsequentRequest request) {
+			return Flux.create(emitter -> {
+				try (var arena = Arena.ofConfined()) {
+					int pageIndex = 0;
+					final long pageSize = 16L;
+					while (request.getTakeCount() > pageIndex * pageSize) {
+						var response = api.subsequent(arena,
+								request.getIterationId(),
+								pageIndex == 0 ? request.getSkipCount() : 0,
+								Math.min(request.getTakeCount() - pageIndex * pageSize, pageSize),
+								new RequestMulti<>()
+						);
+						for (MemorySegment entry : response) {
+							Keys keys = null; // todo: implement
+							MemorySegment value = entry;
+							emitter.next(KV.newBuilder()
+									.addAllKeys(null) // todo: implement
+									.setValue(ByteString.copyFrom(value.asByteBuffer()))
+									.build());
+						}
+						pageIndex++;
+					}
+				}
+				emitter.complete();
+			}, FluxSink.OverflowStrategy.BUFFER);
+		}
+
+		@Override
+		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					it.cavallium.rockserver.core.common.FirstAndLast<it.cavallium.rockserver.core.common.KV> firstAndLast
+							= api.reduceRange(arena,
+							request.getTransactionId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+							request.getReverse(),
+							RequestType.firstAndLast(),
+							request.getTimeoutMs()
+					);
+					return FirstAndLast.newBuilder()
+							.setFirst(unmapKV(firstAndLast.first()))
+							.setLast(unmapKV(firstAndLast.last()))
+							.build();
 				}
 			});
 		}
@@ -735,6 +504,12 @@ public class GrpcServer extends Server {
 					LOG.error("Failed to close arena", ex2);
 				}
 			}
+		}
+
+		// utils
+
+		private <T> Mono<T> executeSync(Callable<T> callable) {
+			return Mono.fromCallable(callable).subscribeOn(executor);
 		}
 
 		// mappers
@@ -859,7 +634,11 @@ public class GrpcServer extends Server {
 			throw new RuntimeException(e);
 		}
 		elg.close();
-		executor.close();
+		executor.disposeGracefully().timeout(Duration.ofMinutes(2)).onErrorResume(ex -> {
+			LOG.error("Grpc server executor shutdown timed out, terminating...", ex);
+			executor.dispose();
+			return Mono.empty();
+		}).block();
 		super.close();
 	}
 }

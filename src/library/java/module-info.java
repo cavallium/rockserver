@@ -13,7 +13,6 @@ module rockserver.core {
 	requires io.grpc.protobuf;
 	requires io.grpc.stub;
 	requires io.grpc;
-	requires jsr305;
 	requires com.google.common;
 	requires io.grpc.netty;
 	requires io.netty.common;
@@ -28,6 +27,8 @@ module rockserver.core {
 	requires io.netty.transport.classes.epoll;
 	requires org.reactivestreams;
 	requires io.netty.transport.unix.common;
+	requires reactor.grpc.stub;
+	requires java.annotation;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
