@@ -31,6 +31,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Stream;
 
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
 import org.github.gestalt.config.exceptions.GestaltException;
@@ -45,6 +46,8 @@ import org.rocksdb.RocksDBException;
 import org.rocksdb.Status.Code;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 
 public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 
@@ -52,6 +55,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final boolean USE_FAST_GET = true;
 	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
+	private static final KV NO_MORE_RESULTS = new KV(new Keys(), null);
 	private final Logger logger;
 	private final @Nullable Path path;
 	private final TransactionalDB db;
@@ -1020,6 +1024,104 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		} finally {
 			ops.endOp();
 		}
+	}
+
+	@Override
+	public <T> Stream<T> getRange(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
+		return Flux
+				.from(this.getRangeAsync(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs))
+				.toStream();
+	}
+
+	/** See: {@link it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange}. */
+	public <T> Publisher<T> getRangeAsync(Arena arena,
+										   long transactionId,
+										   long columnId,
+										   @Nullable Keys startKeysInclusive,
+										   @Nullable Keys endKeysExclusive,
+										   boolean reverse,
+										   RequestType.RequestGetRange<? super KV, T> requestType,
+										   long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
+		record Resources(ColumnInstance col, ReadOptions ro, AbstractSlice<?> startKeySlice,
+						 AbstractSlice<?> endKeySlice, RocksIterator it) {
+			public void close() {
+				ro.close();
+				startKeySlice.close();
+				endKeySlice.close();
+				it.close();
+			}
+		}
+		return Flux.using(() -> {
+			var col = getColumn(columnId);
+
+			if (requestType instanceof RequestType.RequestGetAllInRange<?>) {
+				if (col.hasBuckets()) {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.UNSUPPORTED_COLUMN_TYPE,
+							"Can't get the range elements of a column with buckets");
+				}
+			}
+
+			var ro = new ReadOptions();
+			try {
+				MemorySegment calculatedStartKey = startKeysInclusive != null ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
+				MemorySegment calculatedEndKey = endKeysExclusive != null ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
+				var startKeySlice = calculatedStartKey != null ? toDirectSlice(calculatedStartKey) : null;
+				try {
+					var endKeySlice = calculatedEndKey != null ? toDirectSlice(calculatedEndKey) : null;
+					try {
+						if (startKeysInclusive != null) {
+							ro.setIterateLowerBound(startKeySlice);
+						}
+						if (endKeySlice != null) {
+							ro.setIterateUpperBound(endKeySlice);
+						}
+
+						RocksIterator it;
+						if (transactionId > 0L) {
+							//noinspection resource
+							it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+						} else {
+							it = db.get().newIterator(col.cfh(), ro);
+						}
+						return new Resources(col, ro, startKeySlice, endKeySlice, it);
+					} catch (Throwable ex) {
+						if (endKeySlice != null) endKeySlice.close();
+						throw ex;
+					}
+				} catch (Throwable ex) {
+					if (startKeySlice != null) startKeySlice.close();
+					throw ex;
+				}
+			} catch (Throwable ex) {
+				ro.close();
+				throw ex;
+			}
+		}, res -> Flux.<T, RocksIterator>generate(() -> {
+            if (!reverse) {
+                res.it.seekToFirst();
+            } else {
+                res.it.seekToLast();
+            }
+            return res.it;
+        }, (it, sink) -> {
+            if (!it.isValid()) {
+                sink.complete();
+            } else {
+                var calculatedKey = toMemorySegment(arena, it.key());
+                var calculatedValue = res.col.schema().hasValue() ? toMemorySegment(it.value()) : MemorySegment.NULL;
+				//noinspection unchecked
+				sink.next((T) decodeKVNoBuckets(arena, res.col, calculatedKey, calculatedValue));
+				if (!reverse) {
+					res.it.next();
+				} else {
+					res.it.prev();
+				}
+            }
+            return it;
+        }), Resources::close)
+				.subscribeOn(Schedulers.boundedElastic())
+				.doFirst(ops::beginOp)
+				.doFinally(_ -> ops.endOp());
 	}
 
 	private MemorySegment dbGet(Tx tx,

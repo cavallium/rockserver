@@ -205,7 +205,7 @@ public class GrpcServer extends Server {
 						return mapKVBatch(Arena.ofAuto(), batch.getEntriesCount(), batch::getEntries);
 					});
 
-					return Mono.fromFuture(asyncApi.putBatchAsync(initialRequest.getColumnId(), batches, mode));
+					return Mono.fromFuture(() -> asyncApi.putBatchAsync(initialRequest.getColumnId(), batches, mode));
 				} else if (firstSignal.isOnComplete()) {
 					return Mono.just(RocksDBException.of(
 							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
@@ -487,6 +487,22 @@ public class GrpcServer extends Server {
 							.build();
 				}
 			});
+		}
+
+		@Override
+		public Flux<KV> getAllInRange(GetRangeRequest request) {
+			var arena = Arena.ofAuto();
+			return Flux
+					.from(asyncApi.getRangeAsync(arena,
+							request.getTransactionId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+							request.getReverse(),
+							RequestType.allInRange(),
+							request.getTimeoutMs()
+					))
+					.map(GrpcServerImpl::unmapKV);
 		}
 
 		private static void closeArenaSafe(Arena autoArena) {

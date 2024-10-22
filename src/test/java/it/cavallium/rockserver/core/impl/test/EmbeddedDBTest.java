@@ -7,10 +7,7 @@ import it.cavallium.rockserver.core.common.*;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.lang.foreign.Arena;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
 import org.jetbrains.annotations.NotNull;
@@ -18,6 +15,7 @@ import org.junit.jupiter.api.*;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.util.stream.Collectors;
 
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
@@ -405,6 +403,53 @@ abstract class EmbeddedDBTest {
 		} else {
 			Assertions.assertThrowsExactly(RocksDBException.class, () -> {
 				db.reduceRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+			});
+		}
+	}
+
+	@Test
+	void getRangeAll() {
+		int initIndex = 1;
+		int count = 5;
+
+		var rangeInitKey = getKVSequence().get(initIndex);
+		var rangeEndKeyExcl = getKVSequence().get(initIndex + count);
+		var rangeEndKeyIncl = getKVSequence().get(initIndex + count - 1);
+		if (getSchemaVarKeys().isEmpty()) {
+			var results = db.getRange(arena, 0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000).toList();
+			Assertions.assertEquals(0, results.size(), "Results count must be 0");
+
+			fillSomeKeys();
+
+			boolean reverse = false;
+			while (true) {
+				results = db.getRange(arena, 0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), reverse, RequestType.allInRange(), 1000).toList();
+
+				var expectedResults = getKVSequence().stream().skip(initIndex).limit(count).collect(Collectors.toCollection(ArrayList::new));
+				if (reverse) {
+					Collections.reverse(expectedResults);
+				}
+				assert expectedResults.size() == count;
+
+				Assertions.assertEquals(count, results.size(), "Results count is not as expected. Reverse = " + reverse);
+
+				for (int i = 0; i < expectedResults.size(); i++) {
+					var currentI = results.get(i);
+					var expectedI = expectedResults.get(i);
+					Assertions.assertEquals(expectedI, currentI, "Element at index " + i + " mismatch. Reverse = " + reverse);
+				}
+
+
+				if (!reverse) {
+					reverse = true;
+				} else {
+					break;
+				}
+			}
+		} else {
+			Assertions.assertThrowsExactly(RocksDBException.class, () -> {
+				db.getRange(arena, 0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000)
+						.toList();
 			});
 		}
 	}

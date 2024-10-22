@@ -386,12 +386,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			case RequestNothing<?> _ -> toResponse(this.futureStub.subsequent(request), _ -> null);
 			case RequestExists<?> _ ->
 					(CompletableFuture<T>) toResponse(this.futureStub.subsequentExists(request), PreviousPresence::getPresent);
-			case RequestMulti<?> _ -> {
-				CollectListMappedStreamObserver<KV, MemorySegment> responseObserver
-						= new CollectListMappedStreamObserver<>(kv -> mapByteString(kv.getValue()));
-				this.asyncStub.subsequentMultiGet(request, responseObserver);
-				yield (CompletableFuture<T>) responseObserver;
-			}
+			case RequestMulti<?> _ ->
+					(CompletableFuture<T>) this.reactiveStub.subsequentMultiGet(request)
+							.map(kv -> mapByteString(kv.getValue()))
+							.collectList()
+							.toFuture();
 		};
 	}
 

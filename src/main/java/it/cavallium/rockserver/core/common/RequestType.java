@@ -18,7 +18,8 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		MULTI(new RequestMulti()),
 		CHANGED(new RequestChanged()),
 		PREVIOUS_PRESENCE(new RequestPreviousPresence()),
-		FIRST_AND_LAST(new RequestGetFirstAndLast());
+		FIRST_AND_LAST(new RequestGetFirstAndLast()),
+		ALL_IN_RANGE(new RequestGetAllInRange());
 
 		private final RequestType requestType;
 
@@ -221,13 +222,13 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		}
 	}
 
-	record RequestGetAllInRange<T>() implements RequestGetRange<T, FirstAndLast<T>> {
+	record RequestGetAllInRange<T>() implements RequestGetRange<T, T> {
 
 		private static final RequestGetAllInRange<Object> INSTANCE = new RequestGetAllInRange<>();
 
 		@Override
 		public RequestTypeId getRequestTypeId() {
-			return RequestTypeId.FIRST_AND_LAST;
+			return RequestTypeId.ALL_IN_RANGE;
 		}
 	}
 }
