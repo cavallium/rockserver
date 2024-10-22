@@ -29,8 +29,9 @@ module rockserver.core {
 	requires io.netty.transport.classes.epoll;
 	requires org.reactivestreams;
 	requires io.netty.transport.unix.common;
-	requires reactor.grpc.stub;
-	requires java.annotation;
+    requires reactor.core;
+    requires reactor.grpc.stub;
+    requires java.annotation;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

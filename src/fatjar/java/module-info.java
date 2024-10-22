@@ -33,7 +33,7 @@ module rockserver.core {
     requires reactor.grpc.stub;
     requires java.annotation;
 
-    exports it.cavallium.rockserver.core.client;
+	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
 	exports it.cavallium.rockserver.core.config;
 	opens it.cavallium.rockserver.core.resources;
