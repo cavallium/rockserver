@@ -411,6 +411,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 							result.hasFirst() ? mapKV(arena, result.getFirst()) : null,
 							result.hasLast() ? mapKV(arena, result.getLast()) : null
 					));
+			case RequestType.RequestEntriesCount<?> _ ->
+					toResponse(this.futureStub.reduceRangeEntriesCount(request), EntriesCount::getCount);
+			default -> throw new UnsupportedOperationException();
 		};
 	}
 

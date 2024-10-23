@@ -490,6 +490,25 @@ public class GrpcServer extends Server {
 		}
 
 		@Override
+		public Mono<EntriesCount> reduceRangeEntriesCount(GetRangeRequest request) {
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					long entriesCount
+							= api.reduceRange(arena,
+							request.getTransactionId(),
+							request.getColumnId(),
+							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+							request.getReverse(),
+							RequestType.entriesCount(),
+							request.getTimeoutMs()
+					);
+					return EntriesCount.newBuilder().setCount(entriesCount).build();
+				}
+			});
+		}
+
+		@Override
 		public Flux<KV> getAllInRange(GetRangeRequest request) {
 			var arena = Arena.ofAuto();
 			return Flux
@@ -502,7 +521,13 @@ public class GrpcServer extends Server {
 							RequestType.allInRange(),
 							request.getTimeoutMs()
 					))
-					.map(GrpcServerImpl::unmapKV);
+					.map(GrpcServerImpl::unmapKV)
+					.onErrorResume(ex -> {
+						if (!(ex instanceof RocksDBException)) {
+							LOG.error("Unexpected error during request: {}", request, ex);
+						}
+						return Mono.error(ex);
+					});
 		}
 
 		private static void closeArenaSafe(Arena autoArena) {

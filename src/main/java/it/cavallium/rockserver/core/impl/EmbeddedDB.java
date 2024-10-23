@@ -975,11 +975,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			}
 
 			try (var ro = new ReadOptions()) {
-				MemorySegment calculatedStartKey = startKeysInclusive != null ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
-				MemorySegment calculatedEndKey = endKeysExclusive != null ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
+				MemorySegment calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
+				MemorySegment calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
 				try (var startKeySlice = calculatedStartKey != null ? toDirectSlice(calculatedStartKey) : null;
 					 var endKeySlice = calculatedEndKey != null ? toDirectSlice(calculatedEndKey) : null) {
-					if (startKeysInclusive != null) {
+					if (startKeySlice != null) {
 						ro.setIterateLowerBound(startKeySlice);
 					}
 					if (endKeySlice != null) {
@@ -996,16 +996,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 					try (it) {
 						return (T) switch (requestType) {
 							case RequestEntriesCount<?> _ -> {
-								long count = 0;
-								it.seekToFirst();
-								if (calculatedStartKey != null || calculatedEndKey != null) {
+								if (calculatedStartKey != null || calculatedEndKey != null || path == null) {
+									long count = 0;
+									it.seekToFirst();
 									while (it.isValid()) {
 										count++;
 										it.next();
 									}
 									yield count;
 								} else {
-									Map<String, TableProperties> props = null;
+									Map<String, TableProperties> props ;
 									try {
 										props = db.get().getPropertiesOfAllTables(col.cfh());
 									} catch (org.rocksdb.RocksDBException e) {
@@ -1054,12 +1054,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	@Override
 	public <T> Stream<T> getRange(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		return Flux
-				.from(this.getRangeAsync(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs))
+				.from(this.getRangeAsyncInternal(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs))
 				.toStream();
 	}
 
 	/** See: {@link it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange}. */
-	public <T> Publisher<T> getRangeAsync(Arena arena,
+	public <T> Publisher<T> getRangeAsyncInternal(Arena arena,
 										   long transactionId,
 										   long columnId,
 										   @Nullable Keys startKeysInclusive,
@@ -1071,8 +1071,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 						 AbstractSlice<?> endKeySlice, RocksIterator it) {
 			public void close() {
 				ro.close();
-				startKeySlice.close();
-				endKeySlice.close();
+				if (startKeySlice != null) startKeySlice.close();
+				if (endKeySlice != null) endKeySlice.close();
 				it.close();
 			}
 		}
@@ -1088,13 +1088,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 
 			var ro = new ReadOptions();
 			try {
-				MemorySegment calculatedStartKey = startKeysInclusive != null ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
-				MemorySegment calculatedEndKey = endKeysExclusive != null ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
+				MemorySegment calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
+				MemorySegment calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
 				var startKeySlice = calculatedStartKey != null ? toDirectSlice(calculatedStartKey) : null;
 				try {
 					var endKeySlice = calculatedEndKey != null ? toDirectSlice(calculatedEndKey) : null;
 					try {
-						if (startKeysInclusive != null) {
+						if (startKeySlice != null) {
 							ro.setIterateLowerBound(startKeySlice);
 						}
 						if (endKeySlice != null) {

@@ -160,7 +160,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 										   boolean reverse,
 										   RequestType.RequestGetRange<? super KV, T> requestType,
 										   long timeoutMs) throws RocksDBException {
-		throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED,
-				"GetRangeStream is not implemented");
+		return requestAsync(new GetRange<>(arena,
+				transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs
+		));
 	}
 }

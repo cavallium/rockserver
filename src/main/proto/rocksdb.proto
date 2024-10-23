@@ -96,6 +96,7 @@ message SubsequentRequest {int64 iterationId = 1; int64 skipCount = 2; int64 tak
 
 message GetRangeRequest {int64 transactionId = 1; int64 columnId = 2; repeated bytes startKeysInclusive = 3; repeated bytes endKeysExclusive = 4; bool reverse = 5; int64 timeoutMs = 6;}
 message FirstAndLast {optional KV first = 1; optional KV last = 2;}
+message EntriesCount {int64 count = 1;}
 
 service RocksDBService {
   rpc openTransaction(OpenTransactionRequest) returns (OpenTransactionResponse);
@@ -125,5 +126,6 @@ service RocksDBService {
   rpc subsequentExists(SubsequentRequest) returns (PreviousPresence);
   rpc subsequentMultiGet(SubsequentRequest) returns (stream KV);
   rpc reduceRangeFirstAndLast(GetRangeRequest) returns (FirstAndLast);
+  rpc reduceRangeEntriesCount(GetRangeRequest) returns (EntriesCount);
   rpc getAllInRange(GetRangeRequest) returns (stream KV);
 }
