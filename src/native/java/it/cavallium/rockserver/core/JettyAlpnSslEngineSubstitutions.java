@@ -181,6 +181,7 @@ final class Target_io_netty_handler_ssl_JdkSslServerContext {
 			ClientAuth clientAuth,
 			String[] protocols,
 			boolean startTls,
+			SecureRandom secureRandom,
 			String keyStore) throws SSLException {
 	}
 }
@@ -189,11 +190,21 @@ final class Target_io_netty_handler_ssl_JdkSslServerContext {
 final class Target_io_netty_handler_ssl_JdkSslClientContext {
 
 	@Alias
-	Target_io_netty_handler_ssl_JdkSslClientContext(Provider sslContextProvider, X509Certificate[] trustCertCollection,
-			TrustManagerFactory trustManagerFactory, X509Certificate[] keyCertChain, PrivateKey key,
-			String keyPassword, KeyManagerFactory keyManagerFactory, Iterable<String> ciphers,
-			CipherSuiteFilter cipherFilter, ApplicationProtocolConfig apn, String[] protocols,
-			long sessionCacheSize, long sessionTimeout, String keyStoreType) throws SSLException {
+	Target_io_netty_handler_ssl_JdkSslClientContext(Provider sslContextProvider,
+			X509Certificate[] trustCertCollection,
+			TrustManagerFactory trustManagerFactory,
+			X509Certificate[] keyCertChain,
+			PrivateKey key,
+			String keyPassword,
+			KeyManagerFactory keyManagerFactory,
+			Iterable<String> ciphers,
+			CipherSuiteFilter cipherFilter,
+			ApplicationProtocolConfig apn,
+			String[] protocols,
+			long sessionCacheSize,
+			long sessionTimeout,
+			SecureRandom secureRandom,
+			String keyStoreType) throws SSLException {
 	}
 }
 
@@ -250,6 +261,7 @@ final class Target_io_netty_handler_ssl_SslContext {
 			String[] protocols,
 			boolean startTls,
 			boolean enableOcsp,
+			SecureRandom secureRandom,
 			String keyStoreType,
 			Map.Entry<SslContextOption<?>, Object>... ctxOptions) throws SSLException {
 		if (enableOcsp) {
@@ -258,7 +270,7 @@ final class Target_io_netty_handler_ssl_SslContext {
 		return (SslContext) (Object) new Target_io_netty_handler_ssl_JdkSslServerContext(sslContextProvider,
 				trustCertCollection, trustManagerFactory, keyCertChain, key, keyPassword,
 				keyManagerFactory, ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout, clientAuth, protocols,
-				startTls, keyStoreType);
+				startTls, secureRandom, keyStoreType);
 	}
 
 	@Substitute
@@ -267,14 +279,15 @@ final class Target_io_netty_handler_ssl_SslContext {
 			TrustManagerFactory trustManagerFactory, X509Certificate[] keyCertChain, PrivateKey key, String keyPassword,
 			KeyManagerFactory keyManagerFactory, Iterable<String> ciphers, CipherSuiteFilter cipherFilter,
 			ApplicationProtocolConfig apn, String[] protocols, long sessionCacheSize, long sessionTimeout,
-			boolean enableOcsp, String keyStoreType, Map.Entry<SslContextOption<?>, Object>... options) throws SSLException {
+			boolean enableOcsp, SecureRandom secureRandom, String keyStoreType,
+			Map.Entry<SslContextOption<?>, Object>... options) throws SSLException {
 		if (enableOcsp) {
 			throw new IllegalArgumentException("OCSP is not supported with this SslProvider: " + provider);
 		}
 		return (SslContext) (Object) new Target_io_netty_handler_ssl_JdkSslClientContext(sslContextProvider,
 				trustCert, trustManagerFactory, keyCertChain, key, keyPassword,
 				keyManagerFactory, ciphers, cipherFilter, apn, protocols, sessionCacheSize,
-				sessionTimeout, keyStoreType);
+				sessionTimeout, secureRandom, keyStoreType);
 	}
 
 }

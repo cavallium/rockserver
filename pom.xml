@@ -11,7 +11,7 @@
   <properties>
     <revision>1.0.0-SNAPSHOT</revision>
     <maven.compiler.release>23</maven.compiler.release>
-    <native.maven.plugin.version>0.9.28</native.maven.plugin.version>
+    <native.maven.plugin.version>0.10.3</native.maven.plugin.version>
     <gestalt.version>0.32.2</gestalt.version>
     <rocksdb.version>9.6.1</rocksdb.version>
     <slf4j.version>2.0.12</slf4j.version>
@@ -418,6 +418,11 @@
           <artifactId>rainbowgum-slf4j</artifactId>
           <version>${rainbowgum.version}</version>
           <scope>compile</scope>
+        </dependency>
+        <dependency>
+          <groupId>org.graalvm.sdk</groupId>
+          <artifactId>nativeimage</artifactId>
+          <version>23.1.0</version>
         </dependency>
       </dependencies>
       <build>
