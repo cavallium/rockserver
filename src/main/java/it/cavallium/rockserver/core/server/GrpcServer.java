@@ -469,23 +469,22 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
-			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					it.cavallium.rockserver.core.common.FirstAndLast<it.cavallium.rockserver.core.common.KV> firstAndLast
-							= api.reduceRange(arena,
-							request.getTransactionId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
-							request.getReverse(),
-							RequestType.firstAndLast(),
-							request.getTimeoutMs()
-					);
-					return FirstAndLast.newBuilder()
-							.setFirst(unmapKV(firstAndLast.first()))
-							.setLast(unmapKV(firstAndLast.last()))
-							.build();
+			var arena = Arena.ofAuto();
+			return Mono.fromFuture(() -> asyncApi.reduceRangeAsync(arena, request.getTransactionId(), request.getColumnId(),
+					mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+					mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+					request.getReverse(),
+					RequestType.firstAndLast(),
+					request.getTimeoutMs()
+			)).map(firstAndLast -> {
+				var resultBuilder = FirstAndLast.newBuilder();
+				if (firstAndLast.first() != null) {
+					resultBuilder.setFirst(unmapKV(firstAndLast.first()));
 				}
+				if (firstAndLast.last() != null) {
+					resultBuilder.setLast(unmapKV(firstAndLast.last()));
+				}
+				return resultBuilder.build();
 			});
 		}
 
