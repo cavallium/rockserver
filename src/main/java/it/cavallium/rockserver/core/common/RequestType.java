@@ -19,7 +19,8 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		CHANGED(new RequestChanged()),
 		PREVIOUS_PRESENCE(new RequestPreviousPresence()),
 		FIRST_AND_LAST(new RequestGetFirstAndLast()),
-		ALL_IN_RANGE(new RequestGetAllInRange());
+		ALL_IN_RANGE(new RequestGetAllInRange()),
+		ENTRIES_COUNT(new RequestEntriesCount());
 
 		private final RequestType requestType;
 
@@ -97,6 +98,11 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 	@SuppressWarnings("unchecked")
 	static <T> RequestGetFirstAndLast<T> firstAndLast() {
 		return (RequestGetFirstAndLast<T>) RequestGetFirstAndLast.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> RequestEntriesCount<T> entriesCount() {
+		return (RequestEntriesCount<T>) RequestEntriesCount.INSTANCE;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -219,6 +225,16 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		@Override
 		public RequestTypeId getRequestTypeId() {
 			return RequestTypeId.FIRST_AND_LAST;
+		}
+	}
+
+	record RequestEntriesCount<T>() implements RequestReduceRange<T, Long> {
+
+		private static final RequestEntriesCount<Object> INSTANCE = new RequestEntriesCount<>();
+
+		@Override
+		public RequestTypeId getRequestTypeId() {
+			return RequestTypeId.ENTRIES_COUNT;
 		}
 	}
 
