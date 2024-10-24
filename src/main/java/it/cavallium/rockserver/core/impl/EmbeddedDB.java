@@ -181,10 +181,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				var columnName = new String(column.cfh().getName(), StandardCharsets.UTF_8);
 				long hashCode = columnName.hashCode();
 				long id;
-				if (this.columnNamesIndex.get(columnName) == hashCode) {
+				if (Objects.equals(this.columnNamesIndex.get(columnName), hashCode)) {
 					id = hashCode;
 				} else if (this.columns.get(hashCode) == null) {
 					id = hashCode;
+					this.columns.put(id, column);
 				} else {
 					id = FastRandomUtils.allocateNewValue(this.columns, column, 1, Long.MAX_VALUE);
 				}
