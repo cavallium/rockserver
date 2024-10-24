@@ -301,6 +301,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Changed> putGetChanged(PutRequest request) {
 			return executeSync(() -> {
+				if(true) throw new RocksDBRetryException();
 				try (var arena = Arena.ofConfined()) {
 					var changed = api.put(arena,
 							request.getTransactionOrUpdateId(),
@@ -564,7 +565,7 @@ public class GrpcServer extends Server {
 		@Override
 		protected Throwable onErrorMap(Throwable throwable) {
 			var ex = handleError(throwable).asException();
-			if (ex.getStatus().getCode() == Code.INTERNAL && !(throwable instanceof RocksDBException)) {
+			if (ex.getStatus().getCode() == Code.INTERNAL && !(throwable.getCause() instanceof RocksDBException)) {
 				LOG.error("Unexpected internal error during request", ex);
 			}
 			return ex;

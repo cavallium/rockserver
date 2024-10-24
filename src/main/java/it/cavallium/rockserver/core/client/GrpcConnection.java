@@ -9,6 +9,7 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.UnsafeByteOperations;
 import io.grpc.ManagedChannel;
 import io.grpc.Status;
+import io.grpc.Status.Code;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
 import io.netty.channel.epoll.EpollDomainSocketChannel;
@@ -580,7 +581,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	private static Throwable mapGrpcStatusError(@NotNull Throwable t) {
 		if (t instanceof StatusRuntimeException statusRuntimeException
-				&& statusRuntimeException.getStatus() == Status.INTERNAL
+				&& statusRuntimeException.getStatus().getCode() == Code.INTERNAL
 				&& statusRuntimeException.getStatus().getDescription() != null
 				&& statusRuntimeException.getStatus().getDescription().startsWith(grpcRocksDbErrorPrefixString)) {
 			var desc = statusRuntimeException.getStatus().getDescription();
