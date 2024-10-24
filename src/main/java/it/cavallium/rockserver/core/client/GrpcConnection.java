@@ -8,6 +8,8 @@ import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.UnsafeByteOperations;
 import io.grpc.ManagedChannel;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
 import io.netty.channel.epoll.EpollDomainSocketChannel;
 import io.netty.channel.epoll.EpollEventLoopGroup;
@@ -28,6 +30,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.ColumnHashType;
@@ -566,11 +569,28 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 			@Override
 			public void onFailure(@NotNull Throwable t) {
-				cf.completeExceptionally(t);
+				cf.completeExceptionally(mapGrpcStatusError(t));
 			}
 		}, DIRECT_EXECUTOR);
 
 		return cf;
+	}
+
+	private static final String grpcRocksDbErrorPrefixString = "RocksDBError: [uid:";
+
+	private static Throwable mapGrpcStatusError(@NotNull Throwable t) {
+		if (t instanceof StatusRuntimeException statusRuntimeException
+				&& statusRuntimeException.getStatus() == Status.INTERNAL
+				&& statusRuntimeException.getStatus().getDescription() != null
+				&& statusRuntimeException.getStatus().getDescription().startsWith(grpcRocksDbErrorPrefixString)) {
+			var desc = statusRuntimeException.getStatus().getDescription();
+			var closeIndex = desc.indexOf(']');
+			var errorCode = desc.substring(grpcRocksDbErrorPrefixString.length(), closeIndex);
+			var errorDescription = desc.substring(closeIndex + 1);
+			return RocksDBException.of(RocksDBErrorType.valueOf(errorCode), errorDescription);
+		} else {
+			return t;
+		}
 	}
 
 	private static <T> CompletableFuture<T> toResponse(ListenableFuture<T> listenableFuture) {
