@@ -176,19 +176,29 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	 * Do not try to register a column that may already be registered
 	 */
 	private long registerColumn(@NotNull ColumnInstance column) {
-		try {
-			var columnName = new String(column.cfh().getName(), StandardCharsets.UTF_8);
-			long id = FastRandomUtils.allocateNewValue(this.columns, column, 1, Long.MAX_VALUE);
-			Long previous = this.columnNamesIndex.putIfAbsent(columnName, id);
-			if (previous != null) {
-				//noinspection resource
-				this.columns.remove(id);
-				throw new UnsupportedOperationException("Column already registered!");
+		synchronized (columnEditLock) {
+			try {
+				var columnName = new String(column.cfh().getName(), StandardCharsets.UTF_8);
+				long hashCode = columnName.hashCode();
+				long id;
+				if (this.columnNamesIndex.get(columnName) == hashCode) {
+					id = hashCode;
+				} else if (this.columns.get(hashCode) == null) {
+					id = hashCode;
+				} else {
+					id = FastRandomUtils.allocateNewValue(this.columns, column, 1, Long.MAX_VALUE);
+				}
+				Long previous = this.columnNamesIndex.putIfAbsent(columnName, id);
+				if (previous != null) {
+					//noinspection resource
+					this.columns.remove(id);
+					throw new UnsupportedOperationException("Column already registered!");
+				}
+				logger.info("Registered column: " + column);
+				return id;
+			} catch (org.rocksdb.RocksDBException e) {
+				throw new RuntimeException(e);
 			}
-			logger.info("Registered column: " + column);
-			return id;
-		} catch (org.rocksdb.RocksDBException e) {
-			throw new RuntimeException(e);
 		}
 	}
 
@@ -197,35 +207,37 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	 * Do not try to unregister a column that may already be unregistered, or that may not be registered
 	 */
 	private ColumnInstance unregisterColumn(long id) {
-		var col = this.columns.remove(id);
-		Objects.requireNonNull(col, () -> "Column does not exist: " + id);
-		String name;
-		try {
-			name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
-		} catch (org.rocksdb.RocksDBException e) {
-			throw new RuntimeException(e);
-		}
-		// Unregister the column name from the index avoiding race conditions
-		int retries = 0;
-		while (this.columnNamesIndex.remove(name) == null && retries++ < 5_000) {
-			Thread.yield();
-		}
-		if (retries >= 5000) {
-			throw new IllegalStateException("Can't find column in column names index: " + name);
-		}
+		synchronized (columnEditLock) {
+			var col = this.columns.remove(id);
+			Objects.requireNonNull(col, () -> "Column does not exist: " + id);
+			String name;
+			try {
+				name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
+			} catch (org.rocksdb.RocksDBException e) {
+				throw new RuntimeException(e);
+			}
+			// Unregister the column name from the index avoiding race conditions
+			int retries = 0;
+			while (this.columnNamesIndex.remove(name) == null && retries++ < 5_000) {
+				Thread.yield();
+			}
+			if (retries >= 5000) {
+				throw new IllegalStateException("Can't find column in column names index: " + name);
+			}
 
-		ColumnFamilyOptions columnConfig;
-		while ((columnConfig = this.columnsConifg.remove(name)) == null && retries++ < 5_000) {
-			Thread.yield();
-		}
-		if (columnConfig != null) {
-			columnConfig.close();
-		}
-		if (retries >= 5000) {
-			throw new IllegalStateException("Can't find column in column names index: " + name);
-		}
+			ColumnFamilyOptions columnConfig;
+			while ((columnConfig = this.columnsConifg.remove(name)) == null && retries++ < 5_000) {
+				Thread.yield();
+			}
+			if (columnConfig != null) {
+				columnConfig.close();
+			}
+			if (retries >= 5000) {
+				throw new IllegalStateException("Can't find column in column names index: " + name);
+			}
 
-		return col;
+			return col;
+		}
 	}
 
 	@Override

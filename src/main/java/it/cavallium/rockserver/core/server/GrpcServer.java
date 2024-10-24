@@ -542,8 +542,9 @@ public class GrpcServer extends Server {
 		private <T> Function<Flux<T>, Flux<T>> onErrorMapFluxWithRequestInfo(String requestName, Message request) {
 			return flux -> flux.onErrorResume(throwable -> {
 				var ex = handleError(throwable).asException();
-				if (ex.getStatus().getCode() == Code.INTERNAL) {
-					LOG.error("Unexpected internal error during request: {}", request, ex);
+				if (ex.getStatus().getCode() == Code.INTERNAL && !(throwable instanceof RocksDBException)) {
+					LOG.error("Unexpected internal error during request \"{}\": {}", requestName, request.toString(), ex);
+					return Mono.error(RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex.getCause()));
 				}
 				return Mono.error(ex);
 			});
@@ -552,7 +553,7 @@ public class GrpcServer extends Server {
 		private <T> Function<Mono<T>, Mono<T>> onErrorMapMonoWithRequestInfo(String requestName, Message request) {
 			return flux -> flux.onErrorResume(throwable -> {
 				var ex = handleError(throwable).asException();
-				if (ex.getStatus().getCode() == Code.INTERNAL) {
+				if (ex.getStatus().getCode() == Code.INTERNAL && !(throwable instanceof RocksDBException)) {
 					LOG.error("Unexpected internal error during request \"{}\": {}", requestName, request.toString(), ex);
 					return Mono.error(RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex.getCause()));
 				}
