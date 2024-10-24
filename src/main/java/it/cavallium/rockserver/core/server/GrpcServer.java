@@ -301,7 +301,6 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Changed> putGetChanged(PutRequest request) {
 			return executeSync(() -> {
-				if(true) throw new RocksDBRetryException();
 				try (var arena = Arena.ofConfined()) {
 					var changed = api.put(arena,
 							request.getTransactionOrUpdateId(),

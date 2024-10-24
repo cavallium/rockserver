@@ -587,7 +587,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			var desc = statusRuntimeException.getStatus().getDescription();
 			var closeIndex = desc.indexOf(']');
 			var errorCode = desc.substring(grpcRocksDbErrorPrefixString.length(), closeIndex);
-			var errorDescription = desc.substring(closeIndex + 1);
+			var errorDescription = desc.substring(closeIndex + 2);
 			return RocksDBException.of(RocksDBErrorType.valueOf(errorCode), errorDescription);
 		} else {
 			return t;
