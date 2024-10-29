@@ -4,6 +4,8 @@ import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.InternalConnection;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -13,6 +15,7 @@ import java.util.List;
 import java.util.Optional;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Stream;
@@ -21,16 +24,14 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
 
-public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
+public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, InternalConnection {
 
 	private final EmbeddedDB db;
 	public static final URI PRIVATE_MEMORY_URL = URI.create("memory://private");
-	private final ExecutorService exeuctor;
 
 	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
 		super(name);
 		this.db = new EmbeddedDB(path, name, embeddedConfig);
-		this.exeuctor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
 	}
 
 	@Override
@@ -95,7 +96,8 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 		return (RA) switch (req) {
 			case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
 			case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.arena(), getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
-			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> CompletableFuture.supplyAsync(() -> req.handleSync(this), exeuctor);
+			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> CompletableFuture.supplyAsync(() -> req.handleSync(this),
+					(req.isReadOnly() ? db.getScheduler().readExecutor() : db.getScheduler().writeExecutor()));
 			case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
 		};
 	}
@@ -186,5 +188,10 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public <T> Publisher<T> getRangeAsync(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
 		return db.getRangeAsyncInternal(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+	}
+
+	@Override
+	public RWScheduler getScheduler() {
+		return db.getScheduler();
 	}
 }

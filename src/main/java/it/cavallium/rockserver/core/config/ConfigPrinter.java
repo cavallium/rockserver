@@ -28,8 +28,9 @@ public class ConfigPrinter {
 	public static String stringifyDatabase(DatabaseConfig o) throws GestaltException {
 		return """
 				{
+				  "parallelism": %s,
 				  "global": %s
-				}""".formatted(stringifyGlobalDatabase(o.global()));
+				}""".formatted(stringifyParallelism(o.parallelism()), stringifyGlobalDatabase(o.global()));
 	}
 
 	public static String stringifyLevel(ColumnLevelConfig o) throws GestaltException {
@@ -89,6 +90,17 @@ public class ConfigPrinter {
 				result.toString(),
 				stringifyFallbackColumn(o.fallbackColumnOptions()),
 				joiner.toString()
+		);
+	}
+
+	public static String stringifyParallelism(ParallelismConfig o) throws GestaltException {
+		return """
+				{
+				    "read": %d,
+				    "write": %d
+				  }\
+				""".formatted(o.read(),
+				o.write()
 		);
 	}
 

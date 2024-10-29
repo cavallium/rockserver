@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.common;
 
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.List;
@@ -17,6 +18,8 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 	SYNC_RESULT handleSync(RocksDBSyncAPI api);
 	ASYNC_RESULT handleAsync(RocksDBAsyncAPI api);
+
+	boolean isReadOnly();
 
 	sealed interface RocksDBAPICommandSingle<R> extends RocksDBAPICommand<R, R, CompletableFuture<R>> {
 
@@ -40,6 +43,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return api.openTransactionAsync(timeoutMs);
 			}
 
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
 		}
 		/**
 		 * Close a transaction
@@ -61,6 +69,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return api.closeTransactionAsync(transactionId, commit);
 			}
 
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
 		}
 		/**
 		 * Close a failed update, discarding all changes
@@ -78,6 +91,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
 				return api.closeFailedUpdateAsync(updateId);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
 			}
 
 		}
@@ -101,6 +119,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return api.createColumnAsync(name, schema);
 			}
 
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
 		}
 		/**
 		 * Delete a column
@@ -117,6 +140,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
 				return api.deleteColumnAsync(columnId);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
 			}
 
 		}
@@ -137,6 +165,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
 				return api.getColumnIdAsync(name);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
 			}
 
 		}
@@ -164,6 +197,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
 				return api.putAsync(arena, transactionOrUpdateId, columnId, keys, value, requestType);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
 			}
 
 			@Override
@@ -201,6 +239,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public CompletableFuture<List<T>> handleAsync(RocksDBAsyncAPI api) {
 				return api.putMultiAsync(arena, transactionOrUpdateId, columnId, keys, values, requestType);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
 			}
 
 			@Override
@@ -243,6 +286,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			}
 
 			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
+			@Override
 			public String toString() {
 				var sb = new StringBuilder("PUT_BATCH");
 				sb.append(" column:").append(columnId);
@@ -273,6 +321,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
 				return api.getAsync(arena, transactionOrUpdateId, columnId, keys, requestType);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return requestType.getRequestTypeId() != RequestTypeId.FOR_UPDATE;
 			}
 
 			@Override
@@ -325,6 +378,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				);
 			}
 
+			@Override
+			public boolean isReadOnly() {
+				return true;
+			}
+
 		}
 		/**
 		 * Close an iterator
@@ -341,6 +399,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
 				return api.closeIteratorAsync(iteratorId);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
 			}
 
 		}
@@ -361,6 +424,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
 				return api.seekToAsync(arena, iterationId, keys);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
 			}
 
 		}
@@ -387,6 +455,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
 				return api.subsequentAsync(arena, iterationId, skipCount, takeCount, requestType);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
 			}
 
 		}
@@ -437,6 +510,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 						requestType,
 						timeoutMs
 				);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
 			}
 
 		}
@@ -490,6 +568,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 						requestType,
 						timeoutMs
 				);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
 			}
 
 		}

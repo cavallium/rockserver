@@ -32,6 +32,7 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
 
@@ -48,9 +49,10 @@ import org.rocksdb.Status.Code;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
-public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
+public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
 	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
@@ -61,6 +63,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 	private final @Nullable Path path;
 	private final TransactionalDB db;
 	private final DBOptions dbOptions;
+	private final RWScheduler scheduler;
 	private final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
 	private final NonBlockingHashMapLong<ColumnInstance> columns;
 	private final Map<String, ColumnFamilyOptions> columnsConifg;
@@ -89,6 +92,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		this.dbOptions = loadedDb.dbOptions();
 		this.refs = loadedDb.refs();
 		this.cache = loadedDb.cache();
+		try {
+			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
+			int writeCap = Objects.requireNonNullElse(config.parallelism().write(), Runtime.getRuntime().availableProcessors());
+			this.scheduler = new RWScheduler(readCap, writeCap, "db");
+		} catch (GestaltException e) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get the scheduler parallelism");
+		}
 		this.columnsConifg = loadedDb.definitiveColumnFamilyOptionsMap();
         try {
             this.tempSSTsPath = config.global().tempSstPath();
@@ -255,6 +265,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		} catch (TimeoutException e) {
 			logger.error("Some operations lasted more than 10 seconds, forcing database shutdown...");
 		}
+	}
+
+	private ReadOptions newReadOptions() {
+		var ro = new ReadOptions();
+		ro.setAsyncIo(true);
+		return ro;
 	}
 
 	@Override
@@ -716,7 +732,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				if (col.hasBuckets()) {
 					assert dbWriter instanceof Tx;
 					var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-					try (var readOptions = new ReadOptions()) {
+					try (var readOptions = newReadOptions()) {
 						var previousRawBucketByteArray = ((Tx) dbWriter).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 						MemorySegment previousRawBucket = toMemorySegment(arena, previousRawBucketByteArray);
 						var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
@@ -730,7 +746,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				} else {
 					if (RequestType.requiresGettingPreviousValue(callback)) {
 						assert dbWriter instanceof Tx;
-						try (var readOptions = new ReadOptions()) {
+						try (var readOptions = newReadOptions()) {
 							byte[] previousValueByteArray;
 							previousValueByteArray = ((Tx) dbWriter).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 							previousValue = transformResultValue(col, toMemorySegment(arena, previousValueByteArray));
@@ -740,7 +756,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 					} else if (RequestType.requiresGettingPreviousPresence(callback)) {
 						// todo: in the future this should be replaced with just keyExists
 						assert dbWriter instanceof Tx;
-						try (var readOptions = new ReadOptions()) {
+						try (var readOptions = newReadOptions()) {
 							byte[] previousValueByteArray;
 							previousValueByteArray = ((Tx) dbWriter).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
 							previousValue = previousValueByteArray != null ? MemorySegment.NULL : null;
@@ -850,7 +866,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 			MemorySegment calculatedKey = col.calculateKey(arena, keys.keys());
 			if (col.hasBuckets()) {
 				var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-				try (var readOptions = new ReadOptions()) {
+				try (var readOptions = newReadOptions()) {
 					MemorySegment previousRawBucket = dbGet(tx, col, arena, readOptions, calculatedKey);
 					if (previousRawBucket != null) {
 						var bucket = new Bucket(col, previousRawBucket);
@@ -866,7 +882,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				boolean shouldGetCurrent = RequestType.requiresGettingCurrentValue(callback)
 						|| (tx != null && callback instanceof RequestType.RequestExists<?>);
 				if (shouldGetCurrent) {
-					try (var readOptions = new ReadOptions()) {
+					try (var readOptions = newReadOptions()) {
 						foundValue = dbGet(tx, col, arena, readOptions, calculatedKey);
 						existsValue = foundValue != null;
 					} catch (org.rocksdb.RocksDBException e) {
@@ -914,7 +930,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		try {
 			var col = getColumn(columnId);
 			RocksIterator it;
-			var ro = new ReadOptions();
+			var ro = newReadOptions();
 			if (transactionId > 0L) {
 				//noinspection resource
 				it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
@@ -987,7 +1003,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				}
 			}
 
-			try (var ro = new ReadOptions()) {
+			try (var ro = newReadOptions()) {
 				MemorySegment calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
 				MemorySegment calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
 				try (var startKeySlice = calculatedStartKey != null ? toDirectSlice(calculatedStartKey) : null;
@@ -1099,7 +1115,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 				}
 			}
 
-			var ro = new ReadOptions();
+			var ro = newReadOptions();
 			try {
 				MemorySegment calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
 				MemorySegment calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
@@ -1157,7 +1173,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 					}
 					return it;
         }), Resources::close)
-				.subscribeOn(Schedulers.boundedElastic())
+				.subscribeOn(scheduler.read())
 				.doFirst(ops::beginOp)
 				.doFinally(_ -> ops.endOp());
 	}
@@ -1269,5 +1285,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, Closeable {
 		// todo: implement
 		throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
 				"Bucket column type not implemented, implement them");
+	}
+
+	@Override
+	public RWScheduler getScheduler() {
+		return scheduler;
 	}
 }

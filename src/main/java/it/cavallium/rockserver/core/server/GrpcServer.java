@@ -39,6 +39,8 @@ import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
 import it.cavallium.rockserver.core.common.api.proto.FirstAndLast;
 import it.cavallium.rockserver.core.common.api.proto.KV;
+import it.cavallium.rockserver.core.impl.InternalConnection;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.Int2IntFunction;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -63,8 +65,6 @@ import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Scheduler;
-import reactor.core.scheduler.Schedulers;
 
 public class GrpcServer extends Server {
 
@@ -72,11 +72,19 @@ public class GrpcServer extends Server {
 
 	private final GrpcServerImpl grpc;
 	private final EventLoopGroup elg;
-	private final Scheduler executor;
 	private final io.grpc.Server server;
+	private final RWScheduler scheduler;
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
+		if (client instanceof InternalConnection internalConnection) {
+			this.scheduler = internalConnection.getScheduler();
+		} else {
+			this.scheduler = new RWScheduler(Runtime.getRuntime().availableProcessors(),
+					Runtime.getRuntime().availableProcessors(),
+					"grpc-db"
+			);
+		}
 		this.grpc = new GrpcServerImpl(this.getClient());
 		EventLoopGroup elg;
 		Class<? extends ServerChannel> channelType;
@@ -88,7 +96,6 @@ public class GrpcServer extends Server {
 			channelType = NioServerSocketChannel.class;
 		}
 		this.elg = elg;
-		this.executor = Schedulers.newBoundedElastic(Runtime.getRuntime().availableProcessors() * 2, Schedulers.DEFAULT_BOUNDED_ELASTIC_QUEUESIZE, "server-db-executor");
 		this.server = NettyServerBuilder
 				.forAddress(socketAddress)
 				.bossEventLoopGroup(elg)
@@ -125,7 +132,7 @@ public class GrpcServer extends Server {
 			return executeSync(() -> {
 				var txId = api.openTransaction(request.getTimeoutMs());
 				return OpenTransactionResponse.newBuilder().setTransactionId(txId).build();
-			}).transform(this.onErrorMapMonoWithRequestInfo("openTransaction", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("openTransaction", request));
 		}
 
 		@Override
@@ -133,7 +140,7 @@ public class GrpcServer extends Server {
 			return executeSync(() -> {
 				var committed = api.closeTransaction(request.getTransactionId(), request.getCommit());
                 return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
-			}).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
 		}
 
 		@Override
@@ -141,7 +148,7 @@ public class GrpcServer extends Server {
 			return executeSync(() -> {
 				api.closeFailedUpdate(request.getUpdateId());
 				return Empty.getDefaultInstance();
-			}).transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
 		}
 
 		@Override
@@ -149,7 +156,7 @@ public class GrpcServer extends Server {
 			return executeSync(() -> {
 				var colId = api.createColumn(request.getName(), mapColumnSchema(request.getSchema()));
 				return CreateColumnResponse.newBuilder().setColumnId(colId).build();
-			}).transform(this.onErrorMapMonoWithRequestInfo("createColumn", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("createColumn", request));
 		}
 
 		@Override
@@ -157,7 +164,7 @@ public class GrpcServer extends Server {
 			return executeSync(() -> {
 				api.deleteColumn(request.getColumnId());
 				return Empty.getDefaultInstance();
-			}).transform(this.onErrorMapMonoWithRequestInfo("deleteColumn", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteColumn", request));
 		}
 
 		@Override
@@ -165,7 +172,7 @@ public class GrpcServer extends Server {
 			return executeSync(() -> {
 				var colId = api.getColumnId(request.getName());
 				return GetColumnIdResponse.newBuilder().setColumnId(colId).build();
-			}).transform(this.onErrorMapMonoWithRequestInfo("getColumnId", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("getColumnId", request));
 		}
 
 		@Override
@@ -181,7 +188,7 @@ public class GrpcServer extends Server {
 					);
 				}
 				return Empty.getDefaultInstance();
-			}).transform(this.onErrorMapMonoWithRequestInfo("put", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("put", request));
 		}
 
 		@Override
@@ -233,7 +240,7 @@ public class GrpcServer extends Server {
 					var initialRequest = firstValue.getInitialRequest();
 
                     return nextRequests
-												.publishOn(executor)
+												.publishOn(scheduler.write())
 												.doOnNext(putRequest -> {
 														var data = putRequest.getData();
 														try (var arena = Arena.ofConfined()) {
@@ -272,7 +279,7 @@ public class GrpcServer extends Server {
 					}
 					return prevBuilder.build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("putGetPrevious", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetPrevious", request));
 		}
 
 		@Override
@@ -295,7 +302,7 @@ public class GrpcServer extends Server {
 					}
 					return deltaBuilder.build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("putGetDelta", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetDelta", request));
 		}
 
 		@Override
@@ -311,7 +318,7 @@ public class GrpcServer extends Server {
 					);
 					return Changed.newBuilder().setChanged(changed).build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("putGetChanged", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetChanged", request));
 		}
 
 		@Override
@@ -327,7 +334,7 @@ public class GrpcServer extends Server {
 					);
 					return PreviousPresence.newBuilder().setPresent(present).build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("putGetPreviousPresence", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetPreviousPresence", request));
 		}
 
 		@Override
@@ -346,7 +353,7 @@ public class GrpcServer extends Server {
 					}
 					return responseBuilder.build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("get", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("get", request));
 		}
 
 		@Override
@@ -366,7 +373,7 @@ public class GrpcServer extends Server {
 					}
 					return responseBuilder.build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("getForUpdate", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("getForUpdate", request));
 		}
 
 		@Override
@@ -381,7 +388,7 @@ public class GrpcServer extends Server {
 					);
 					return PreviousPresence.newBuilder().setPresent(exists).build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("exists", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("exists", request));
 		}
 
 		@Override
@@ -398,7 +405,7 @@ public class GrpcServer extends Server {
 					);
 					return OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
 		}
 
 		@Override
@@ -406,7 +413,7 @@ public class GrpcServer extends Server {
 			return executeSync(() -> {
 				api.closeIterator(request.getIteratorId());
 				return Empty.getDefaultInstance();
-			}).transform(this.onErrorMapMonoWithRequestInfo("closeIterator", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("closeIterator", request));
 		}
 
 		@Override
@@ -416,7 +423,7 @@ public class GrpcServer extends Server {
 					api.seekTo(arena, request.getIterationId(), mapKeys(arena, request.getKeysCount(), request::getKeys));
 				}
 				return Empty.getDefaultInstance();
-			}).transform(this.onErrorMapMonoWithRequestInfo("seekTo", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("seekTo", request));
 		}
 
 		@Override
@@ -429,7 +436,7 @@ public class GrpcServer extends Server {
 							new RequestNothing<>());
 				}
 				return Empty.getDefaultInstance();
-			}).transform(this.onErrorMapMonoWithRequestInfo("subsequent", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("subsequent", request));
 		}
 
 		@Override
@@ -442,7 +449,7 @@ public class GrpcServer extends Server {
 							new RequestExists<>());
 					return PreviousPresence.newBuilder().setPresent(exists).build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("subsequentExists", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("subsequentExists", request));
 		}
 
 		@Override
@@ -510,7 +517,7 @@ public class GrpcServer extends Server {
 					);
 					return EntriesCount.newBuilder().setCount(entriesCount).build();
 				}
-			}).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeEntriesCount", request));
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeEntriesCount", request));
 		}
 
 		@Override
@@ -533,8 +540,8 @@ public class GrpcServer extends Server {
 
 		// utils
 
-		private <T> Mono<T> executeSync(Callable<T> callable) {
-			return Mono.fromCallable(callable).subscribeOn(executor);
+		private <T> Mono<T> executeSync(Callable<T> callable, boolean isReadOnly) {
+			return Mono.fromCallable(callable).subscribeOn(isReadOnly ? scheduler.read() : scheduler.write());
 		}
 
 		// mappers
@@ -661,17 +668,12 @@ public class GrpcServer extends Server {
 			if (ex instanceof CompletionException exx) {
 				return handleError(exx.getCause());
 			} else {
-				if (ex instanceof RocksDBException e) {
-					return Status.INTERNAL
-							.withDescription(e.getLocalizedMessage())
-							.withCause(e);
-				} else if (ex instanceof StatusException ex2) {
-					return ex2.getStatus();
-				} else if (ex instanceof StatusRuntimeException ex3) {
-					return ex3.getStatus();
-				} else {
-					return Status.INTERNAL.withCause(ex);
-				}
+				return switch (ex) {
+					case RocksDBException e -> Status.INTERNAL.withDescription(e.getLocalizedMessage()).withCause(e);
+					case StatusException ex2 -> ex2.getStatus();
+					case StatusRuntimeException ex3 -> ex3.getStatus();
+					case null, default -> Status.INTERNAL.withCause(ex);
+				};
 			}
 		}
 	}
@@ -686,9 +688,9 @@ public class GrpcServer extends Server {
 			throw new RuntimeException(e);
 		}
 		elg.close();
-		executor.disposeGracefully().timeout(Duration.ofMinutes(2)).onErrorResume(ex -> {
+		scheduler.disposeGracefully().timeout(Duration.ofMinutes(2)).onErrorResume(ex -> {
 			LOG.error("Grpc server executor shutdown timed out, terminating...", ex);
-			executor.dispose();
+			scheduler.dispose();
 			return Mono.empty();
 		}).block();
 		super.close();
