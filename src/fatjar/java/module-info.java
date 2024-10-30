@@ -32,6 +32,13 @@ module rockserver.core {
 	requires reactor.core;
 	requires reactor.grpc.stub;
 	requires java.annotation;
+	requires micrometer.core;
+	requires micrometer.registry.jmx;
+	requires micrometer.registry.influx;
+	requires java.net.http;
+	requires io.vertx.core;
+	requires vertx.rx.java3;
+	requires io.reactivex.rxjava3;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

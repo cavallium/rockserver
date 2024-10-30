@@ -7,4 +7,6 @@ public interface DatabaseConfig {
 	GlobalDatabaseConfig global() throws GestaltException;
 
 	ParallelismConfig parallelism() throws GestaltException;
+
+	MetricsConfig metrics() throws GestaltException;
 }

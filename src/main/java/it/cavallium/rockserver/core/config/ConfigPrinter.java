@@ -29,8 +29,11 @@ public class ConfigPrinter {
 		return """
 				{
 				  "parallelism": %s,
+				  "metrics": %s,
 				  "global": %s
-				}""".formatted(stringifyParallelism(o.parallelism()), stringifyGlobalDatabase(o.global()));
+				}""".formatted(stringifyParallelism(o.parallelism()),
+				stringifyMetrics(o.metrics()),
+				stringifyGlobalDatabase(o.global()));
 	}
 
 	public static String stringifyLevel(ColumnLevelConfig o) throws GestaltException {
@@ -102,6 +105,46 @@ public class ConfigPrinter {
 				""".formatted(o.read(),
 				o.write()
 		);
+	}
+
+	public static String stringifyMetrics(MetricsConfig o) throws GestaltException {
+		return """
+				{
+				    "influx": %s,
+				    "jmx": %s
+				  }\
+				""".formatted(stringifyInflux(o.influx()),
+				stringifyJmx(o.jmx())
+		);
+	}
+
+	public static String stringifyInflux(InfluxMetricsConfig o) throws GestaltException {
+		return """
+				{
+				      "enabled": %b,
+				      "url": "%s",
+				      "bucket": "%s",
+				      "user": "%s",
+				      "token": "%s",
+				      "org": "%s",
+				      "allow-insecure-certificates": %b
+				    }\
+				""".formatted(o.enabled(),
+				o.url(),
+				o.bucket(),
+				o.user(),
+				o.token(),
+				o.org(),
+				o.allowInsecureCertificates()
+		);
+	}
+
+	public static String stringifyJmx(JmxMetricsConfig o) throws GestaltException {
+		return """
+				{
+				      "enabled": %b
+				    }\
+				""".formatted(o.enabled());
 	}
 
 	private static String stringifyVolume(VolumeConfig o) throws GestaltException {
