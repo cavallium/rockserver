@@ -97,7 +97,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final MetricsManager metrics;
 	private final String name;
 	private final List<Meter> meters = new ArrayList<>();
-	private final Timer loadTimer;
 	private final Timer openTransactionTimer;
 	private final Timer closeTransactionTimer;
 	private final Timer closeFailedUpdateTimer;
@@ -114,6 +113,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer subsequentTimer;
 	private final Timer reduceRangeTimer;
 	private final Timer getRangeTimer;
+	private final RocksDBStatistics rocksDBStatistics;
 	private Path tempSSTsPath;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
@@ -128,7 +128,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		DatabaseConfig config = ConfigParser.parse(embeddedConfigPath);
 
 		this.metrics = new MetricsManager(config);
-		this.loadTimer = createTimer(Tags.empty());
+		Timer loadTimer = createTimer(Tags.of("action", "load"));
 		this.openTransactionTimer = createActionTimer(OpenTransaction.class);
 		this.closeTransactionTimer = createActionTimer(CloseTransaction.class);
 		this.closeFailedUpdateTimer = createActionTimer(CloseFailedUpdate.class);
@@ -153,6 +153,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.dbOptions = loadedDb.dbOptions();
 		this.refs = loadedDb.refs();
 		this.cache = loadedDb.cache();
+		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache);
 		try {
 			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
 			int writeCap = Objects.requireNonNullElse(config.parallelism().write(), Runtime.getRuntime().availableProcessors());
@@ -345,6 +346,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			for (Meter meter : meters) {
 				meter.close();
 			}
+			rocksDBStatistics.close();
 			if (metrics != null) {
 				metrics.close();
 			}

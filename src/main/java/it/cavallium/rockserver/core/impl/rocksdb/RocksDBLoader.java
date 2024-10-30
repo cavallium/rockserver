@@ -356,6 +356,12 @@ public class RocksDBLoader {
             refs.add(options);
             options.setParanoidChecks(PARANOID_CHECKS);
             options.setSkipCheckingSstFileSizesOnDbOpen(true);
+
+            var statistics = new Statistics();
+            refs.add(statistics);
+            statistics.setStatsLevel(StatsLevel.EXCEPT_TIME_FOR_MUTEX);
+            options.setStatistics(statistics);
+
             if (!databaseOptions.global().unorderedWrite()) {
                 options.setEnablePipelinedWrite(true);
             }
