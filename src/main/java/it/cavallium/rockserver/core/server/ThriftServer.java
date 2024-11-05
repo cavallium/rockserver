@@ -48,9 +48,7 @@ public class ThriftServer extends Server {
 					.processor(new Processor<>(handler))
 			);
 
-			var thriftThread = new Thread(server::serve);
-			thriftThread.setName("Thrift server thread");
-			this.thriftThread = thriftThread;
+			this.thriftThread = Thread.ofPlatform().name("Thrift server thread").unstarted(server::serve);
 			LOG.info("Thrift RocksDB server is listening at " + http2Host + ":" + http2Port);
 		} catch (TTransportException e) {
 			throw new IOException("Can't open server socket", e);

@@ -26,7 +26,7 @@ public class DatabaseTasks implements Closeable {
 
 	public synchronized void start() {
 		if (delayWalFlushConfig.toMillis() > 0) {
-			this.walFlushThread = Thread.ofVirtual().name("db." + db.getName() + ".tasks.wal.flush").start(() -> {
+			this.walFlushThread = Thread.ofPlatform().name("db." + db.getName() + ".tasks.wal.flush").start(() -> {
 				logger.info("Database delayed flush thread is enabled, it will flush the database every %.2f seconds".formatted(delayWalFlushConfig.toMillis() / 1000d));
 				while (!Thread.interrupted()) {
 					try {

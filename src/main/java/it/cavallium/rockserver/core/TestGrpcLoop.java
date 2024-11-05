@@ -30,7 +30,7 @@ public class TestGrpcLoop {
         var col = client.getSyncApi().createColumn("test", ColumnSchema.of(IntList.of(15), ObjectList.of(), true));
         var parallelism = 4;
         for (int i = 0; i < parallelism; i++) {
-            var t = new Thread(() -> {
+            var t = Thread.ofPlatform().daemon().name("test-requests-thread-" + i).start(() -> {
                 while (true) {
                     try (var arena = Arena.ofConfined()) {
                         var delta = client.getSyncApi().put(arena, 0, col,
@@ -40,9 +40,6 @@ public class TestGrpcLoop {
                     }
                 }
             });
-            t.setDaemon(true);
-            t.setName("test-requests-thread-" + i);
-            t.start();
             if (i + 1 == parallelism) {
                 t.join();
             }

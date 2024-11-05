@@ -118,7 +118,8 @@ public class Main {
 				grpcServerBuilder.setClient(connection);
 
 				CountDownLatch shutdownLatch = new CountDownLatch(1);
-				Runtime.getRuntime().addShutdownHook(new Thread(shutdownLatch::countDown));
+				Runtime.getRuntime().addShutdownHook(Thread.ofPlatform()
+						.name("DB shutdown hook").unstarted(shutdownLatch::countDown));
 
 				try (var thrift = thriftServerBuilder.build(); var grpc = grpcServerBuilder.build()) {
 					thrift.start();
