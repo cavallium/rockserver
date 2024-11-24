@@ -66,7 +66,7 @@ public class MetricsManager implements AutoCloseable {
 
 						@Override
 						public @NotNull String domain() {
-							return "metrics";
+							return "rockserver.metrics";
 						}
 
 						@Override
@@ -179,6 +179,8 @@ public class MetricsManager implements AutoCloseable {
 			} else {
 				this.httpClient = null;
 			}
+
+			compositeRegistry.config().commonTags("appname", "rockserver");
 
 			new JvmCompilationMetrics().bindTo(compositeRegistry);
 			new JvmMemoryMetrics().bindTo(compositeRegistry);
