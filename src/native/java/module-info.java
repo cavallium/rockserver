@@ -39,6 +39,7 @@ module rockserver.core {
 	requires io.vertx.core;
 	requires vertx.rx.java3;
 	requires io.reactivex.rxjava3;
+	requires micrometer.jvm.extras;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

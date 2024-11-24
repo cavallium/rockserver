@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.impl;
 
+import io.github.mweirauch.micrometer.jvm.extras.ProcessMemoryMetrics;
+import io.github.mweirauch.micrometer.jvm.extras.ProcessThreadMetrics;
 import io.micrometer.core.instrument.Clock;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -194,6 +196,8 @@ public class MetricsManager implements AutoCloseable {
 			new JvmThreadMetrics().bindTo(compositeRegistry);
 			this.heapPressureMetrics = new JvmHeapPressureMetrics();
 			heapPressureMetrics.bindTo(compositeRegistry);
+			new ProcessMemoryMetrics().bindTo(compositeRegistry);
+			new ProcessThreadMetrics().bindTo(compositeRegistry);
 
 			compositeRegistry.gauge("yotsuba.uptime.millis",
 					this,
