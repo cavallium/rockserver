@@ -173,21 +173,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			logger.debug("Cleaning expired transactions...");
 			var idsToRemove = new LongArrayList();
 			var startTime = System.currentTimeMillis();
-			EmbeddedDB.this.txs.forEach(((txId, tx) -> {
-				if (startTime >= tx.expirationTimestamp()) {
-					idsToRemove.add((long) txId);
-				}
-			}));
-			idsToRemove.forEach(id -> {
-				var tx = EmbeddedDB.this.txs.remove(id);
-				if (tx != null) {
-					try {
-						tx.close();
-					} catch (Throwable ex) {
-						logger.error("Failed to close a transaction", ex);
+			ops.beginOp();
+			try {
+				EmbeddedDB.this.txs.forEach(((txId, tx) -> {
+					if (startTime >= tx.expirationTimestamp()) {
+						idsToRemove.add((long) txId);
 					}
-				}
-			});
+				}));
+				idsToRemove.forEach(id -> {
+					var tx = EmbeddedDB.this.txs.remove(id);
+					if (tx != null) {
+						try {
+							tx.close();
+						} catch (Throwable ex) {
+							logger.error("Failed to close a transaction", ex);
+						}
+					}
+				});
+			} finally {
+				ops.endOp();
+			}
 			var endTime = System.currentTimeMillis();
 			var removedCount = idsToRemove.size();
 			if (removedCount > 2) {
@@ -202,21 +207,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			logger.debug("Cleaning expired iterators...");
 			var idsToRemove = new LongArrayList();
 			var startTime = System.currentTimeMillis();
-			EmbeddedDB.this.its.forEach(((itId, entry) -> {
-				if (entry.expirationTimestamp() != null && startTime >= entry.expirationTimestamp()) {
-					idsToRemove.add((long) itId);
-				}
-			}));
-			idsToRemove.forEach(id -> {
-				var it = EmbeddedDB.this.its.remove(id);
-				if (it != null) {
-					try {
-						it.close();
-					} catch (Throwable ex) {
-						logger.error("Failed to close an iteration", ex);
+			ops.beginOp();
+			try {
+				EmbeddedDB.this.its.forEach(((itId, entry) -> {
+					if (entry.expirationTimestamp() != null && startTime >= entry.expirationTimestamp()) {
+						idsToRemove.add((long) itId);
 					}
-				}
-			});
+				}));
+				idsToRemove.forEach(id -> {
+					var it = EmbeddedDB.this.its.remove(id);
+					if (it != null) {
+						try {
+							it.close();
+						} catch (Throwable ex) {
+							logger.error("Failed to close an iteration", ex);
+						}
+					}
+				});
+			} finally {
+				ops.endOp();
+			}
 			var endTime = System.currentTimeMillis();
 			var removedCount = idsToRemove.size();
 			if (removedCount > 2) {
