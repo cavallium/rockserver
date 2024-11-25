@@ -178,7 +178,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					idsToRemove.add((long) txId);
 				}
 			}));
-			idsToRemove.forEach(EmbeddedDB.this.txs::remove);
+			idsToRemove.forEach(id -> {
+				var tx = EmbeddedDB.this.txs.remove(id);
+				if (tx != null) {
+					try {
+						tx.close();
+					} catch (Throwable ex) {
+						logger.error("Failed to close a transaction", ex);
+					}
+				}
+			});
 			var endTime = System.currentTimeMillis();
 			var removedCount = idsToRemove.size();
 			if (removedCount > 2) {
@@ -198,7 +207,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					idsToRemove.add((long) itId);
 				}
 			}));
-			idsToRemove.forEach(EmbeddedDB.this.its::remove);
+			idsToRemove.forEach(id -> {
+				var it = EmbeddedDB.this.its.remove(id);
+				if (it != null) {
+					try {
+						it.close();
+					} catch (Throwable ex) {
+						logger.error("Failed to close an iteration", ex);
+					}
+				}
+			});
 			var endTime = System.currentTimeMillis();
 			var removedCount = idsToRemove.size();
 			if (removedCount > 2) {
