@@ -8,6 +8,7 @@ import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.util.NamedThreadFactory;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestEntriesCount;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
@@ -34,6 +35,7 @@ import it.cavallium.rockserver.core.config.*;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
 import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB.TransactionalOptions;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -53,6 +55,9 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.LongAdder;
@@ -83,6 +88,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final TransactionalDB db;
 	private final DBOptions dbOptions;
 	private final RWScheduler scheduler;
+	private final ScheduledExecutorService leakScheduler;
 	private final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
 	private final NonBlockingHashMapLong<ColumnInstance> columns;
 	private final Map<String, ColumnFamilyOptions> columnsConifg;
@@ -161,6 +167,48 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} catch (GestaltException e) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get the scheduler parallelism");
 		}
+		this.leakScheduler = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("db-leak-scheduler"));
+
+		leakScheduler.scheduleWithFixedDelay(() -> {
+			logger.debug("Cleaning expired transactions...");
+			var idsToRemove = new LongArrayList();
+			var startTime = System.currentTimeMillis();
+			EmbeddedDB.this.txs.forEach(((txId, tx) -> {
+				if (startTime >= tx.expirationTimestamp()) {
+					idsToRemove.add((long) txId);
+				}
+			}));
+			idsToRemove.forEach(EmbeddedDB.this.txs::remove);
+			var endTime = System.currentTimeMillis();
+			var removedCount = idsToRemove.size();
+			if (removedCount > 2) {
+				logger.info("Cleaned {} expired transactions in {}, please debug leaked transactions if this number is too high",
+						removedCount, Duration.ofMillis(endTime - startTime));
+			} else {
+				logger.debug("Cleaned {} expired transactions in {}", removedCount, Duration.ofMillis(endTime - startTime));
+			}
+		}, 1, 1, TimeUnit.MINUTES);
+
+		leakScheduler.scheduleWithFixedDelay(() -> {
+			logger.debug("Cleaning expired iterators...");
+			var idsToRemove = new LongArrayList();
+			var startTime = System.currentTimeMillis();
+			EmbeddedDB.this.its.forEach(((itId, entry) -> {
+				if (entry.expirationTimestamp() != null && startTime >= entry.expirationTimestamp()) {
+					idsToRemove.add((long) itId);
+				}
+			}));
+			idsToRemove.forEach(EmbeddedDB.this.its::remove);
+			var endTime = System.currentTimeMillis();
+			var removedCount = idsToRemove.size();
+			if (removedCount > 2) {
+				logger.info("Cleaned {} expired iterators in {}, please debug leaked iterators if this number is too high",
+						removedCount, Duration.ofMillis(endTime - startTime));
+			} else {
+				logger.debug("Cleaned {} expired iterators in {}", removedCount, Duration.ofMillis(endTime - startTime));
+			}
+		}, 1, 1, TimeUnit.MINUTES);
+
 		this.columnsConifg = loadedDb.definitiveColumnFamilyOptionsMap();
         try {
             this.tempSSTsPath = config.global().tempSstPath();
@@ -350,6 +398,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (metrics != null) {
 				metrics.close();
 			}
+			leakScheduler.close();
 		} catch (TimeoutException e) {
 			logger.error("Some operations lasted more than 10 seconds, forcing database shutdown...");
 		}
@@ -380,9 +429,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		// Open the transaction operation, do not close until the transaction has been closed
 		ops.beginOp();
 		try {
+			var expirationTimestamp = timeoutMs + System.currentTimeMillis();
 			TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
 			var writeOpts = new WriteOptions();
-			return new Tx(db.beginTransaction(writeOpts, txOpts), isFromGetForUpdate, new RocksDBObjects(writeOpts, txOpts));
+			try {
+				return new Tx(db.beginTransaction(writeOpts, txOpts), isFromGetForUpdate, expirationTimestamp,
+						new RocksDBObjects(writeOpts, txOpts));
+			} catch (Throwable ex) {
+				writeOpts.close();
+				throw ex;
+			}
 		} catch (Throwable ex) {
 			ops.endOp();
 			throw ex;
@@ -1070,6 +1126,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		// Open an operation that ends when the iterator is closed
 		ops.beginOp();
 		try {
+			var expirationTimestamp = timeoutMs + System.currentTimeMillis();
 			var col = getColumn(columnId);
 			RocksIterator it;
 			var ro = newReadOptions();
@@ -1079,7 +1136,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			} else {
 				it = db.get().newIterator(col.cfh(), ro);
 			}
-			var itEntry = new REntry<>(it, new RocksDBObjects(ro));
+			var itEntry = new REntry<>(it, expirationTimestamp, new RocksDBObjects(ro));
             return FastRandomUtils.allocateNewValue(its, itEntry, 1, Long.MAX_VALUE);
 		} catch (Throwable ex) {
 			ops.endOp();

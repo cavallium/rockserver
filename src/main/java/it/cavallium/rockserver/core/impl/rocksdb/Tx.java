@@ -5,7 +5,7 @@ import java.io.Closeable;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import org.rocksdb.Transaction;
 
-public record Tx(Transaction val, boolean isFromGetForUpdate, RocksDBObjects objs)
+public record Tx(Transaction val, boolean isFromGetForUpdate, long expirationTimestamp, RocksDBObjects objs)
 		implements Closeable, DBWriter {
 
 	@Override
