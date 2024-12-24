@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.rocksdb.AbstractImmutableNativeReference;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.FlushOptions;
@@ -107,6 +108,8 @@ public sealed interface TransactionalDB extends Closeable {
 		private final DatabaseTasks databaseTasks;
 		private final List<ColumnFamilyDescriptor> descriptors;
 		private final ArrayList<ColumnFamilyHandle> handles;
+		private final Object closeLock = new Object();
+		private volatile boolean closed = false;
 
 		public BaseTransactionalDB(String path, RDB db,
 				List<ColumnFamilyDescriptor> descriptors,
@@ -143,49 +146,61 @@ public sealed interface TransactionalDB extends Closeable {
 
 		@Override
 		public void close() throws IOException {
-			List<Exception> exceptions = new ArrayList<>();
-			try {
-				databaseTasks.close();
-			} catch (Exception ex) {
-				exceptions.add(ex);
+			if (this.closed) {
+				return;
 			}
-			try {
-				if (db.isOwningHandle()) {
-					db.flushWal(true);
+			synchronized (this.closeLock) {
+				if (this.closed) {
+					return;
 				}
-			} catch (RocksDBException e) {
-				exceptions.add(e);
-			}
-			try (var options = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
-				if (db.isOwningHandle()) {
-					db.flush(options, handles);
-				}
-			} catch (RocksDBException e) {
-				exceptions.add(e);
-			}
-			for (ColumnFamilyHandle handle : handles) {
+				this.closed = true;
+				List<Exception> exceptions = new ArrayList<>();
 				try {
-					handle.close();
+					databaseTasks.close();
 				} catch (Exception ex) {
 					exceptions.add(ex);
 				}
-			}
-			try {
-				if (db.isOwningHandle()) {
-					db.closeE();
+				try {
+					if (db.isOwningHandle()) {
+						db.flushWal(true);
+					}
+				} catch (RocksDBException e) {
+					exceptions.add(e);
 				}
-			} catch (RocksDBException e) {
-				exceptions.add(e);
-			}
-			if (!exceptions.isEmpty()) {
-				IOException ex;
-				if (exceptions.size() == 1) {
-					ex = new IOException("Failed to close the database", exceptions.getFirst());
-				} else {
-					ex = new IOException("Failed to close the database");
-					exceptions.forEach(ex::addSuppressed);
+				try (var options = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
+					if (db.isOwningHandle()) {
+						var openHandles = handles.stream().filter(AbstractImmutableNativeReference::isOwningHandle).toList();
+						db.flush(options, openHandles);
+					}
+				} catch (RocksDBException e) {
+					exceptions.add(e);
 				}
-				throw ex;
+				for (ColumnFamilyHandle handle : handles) {
+					try {
+						if (handle.isOwningHandle()) {
+							handle.close();
+						}
+					} catch (Exception ex) {
+						exceptions.add(ex);
+					}
+				}
+				try {
+					if (db.isOwningHandle()) {
+						db.closeE();
+					}
+				} catch (RocksDBException e) {
+					exceptions.add(e);
+				}
+				if (!exceptions.isEmpty()) {
+					IOException ex;
+					if (exceptions.size() == 1) {
+						ex = new IOException("Failed to close the database", exceptions.getFirst());
+					} else {
+						ex = new IOException("Failed to close the database");
+						exceptions.forEach(ex::addSuppressed);
+					}
+					throw ex;
+				}
 			}
 		}
 	}
