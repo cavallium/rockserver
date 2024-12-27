@@ -62,6 +62,7 @@ public class ConfigPrinter {
 		}
 		return """
 				{
+				    "enable-fast-get": %b,
 				    "spinning": %b,
 				    "checksum": %b,
 				    "use-direct-io": %b,
@@ -78,7 +79,8 @@ public class ConfigPrinter {
 				    "fallback-column-options": %s,
 				    "column-options": %s
 				  }\
-				""".formatted(o.spinning(),
+				""".formatted(o.enableFastGet(),
+				o.spinning(),
 				o.checksum(),
 				o.useDirectIo(),
 				o.allowRocksdbMemoryMapping(),

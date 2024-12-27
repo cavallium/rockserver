@@ -81,7 +81,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
-	private static final boolean USE_FAST_GET = true;
 	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
 	private final Logger logger;
 	private final @Nullable Path path;
@@ -120,6 +119,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer reduceRangeTimer;
 	private final Timer getRangeTimer;
 	private final RocksDBStatistics rocksDBStatistics;
+	private final boolean fastGet;
 	private Path tempSSTsPath;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
@@ -164,6 +164,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
 			int writeCap = Objects.requireNonNullElse(config.parallelism().write(), Runtime.getRuntime().availableProcessors());
 			this.scheduler = new RWScheduler(readCap, writeCap, "db");
+			this.fastGet = config.global().enableFastGet();
 		} catch (GestaltException e) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get the scheduler parallelism");
 		}
@@ -1477,7 +1478,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return toMemorySegment(arena, previousRawBucketByteArray);
 		} else {
 			var db = this.db.get();
-			if (USE_FAST_GET) {
+			if (fastGet) {
 				return dbGetDirect(arena, col.cfh(), readOptions, calculatedKey);
 			} else {
 				var previousRawBucketByteArray = db.get(col.cfh(), readOptions, calculatedKey.toArray(BIG_ENDIAN_BYTES));

@@ -34,6 +34,8 @@ public interface GlobalDatabaseConfig {
 
 	boolean absoluteConsistency() throws GestaltException;
 
+	boolean enableFastGet() throws GestaltException;
+
 	boolean ingestBehind() throws GestaltException;
 
 	boolean unorderedWrite() throws GestaltException;
