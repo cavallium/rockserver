@@ -460,11 +460,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var expirationTimestamp = timeoutMs + System.currentTimeMillis();
 			TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
 			var writeOpts = new WriteOptions();
+			var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
 			try {
-				return new Tx(db.beginTransaction(writeOpts, txOpts), isFromGetForUpdate, expirationTimestamp,
-						new RocksDBObjects(writeOpts, txOpts));
+				return new Tx(db.beginTransaction(writeOpts, txOpts), isFromGetForUpdate, expirationTimestamp, rocksObjects);
 			} catch (Throwable ex) {
-				writeOpts.close();
+				rocksObjects.close();
 				throw ex;
 			}
 		} catch (Throwable ex) {
