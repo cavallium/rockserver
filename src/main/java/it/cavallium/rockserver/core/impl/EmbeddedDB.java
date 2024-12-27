@@ -519,29 +519,41 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Contract("_, false -> true; _, true -> _")
 	private boolean closeTransactionInternal(@NotNull Tx tx, boolean commit) {
 		ops.beginOp();
+		// Transaction found
 		try {
-			// Transaction found
-			try {
-				if (commit) {
-					boolean succeeded = commitTxOptimistically(tx);
-					if (!succeeded) {
-						// Do not call endOp here, since the transaction is still open
-						return false;
-					}
-				} else {
-					if (tx.val().isOwningHandle()) {
-						tx.val().rollback();
+			if (commit) {
+				boolean succeeded;
+				try {
+					tx.val().commit();
+					succeeded = true;
+				} catch (org.rocksdb.RocksDBException ex) {
+					var status = ex.getStatus() != null ? ex.getStatus().getCode() : Code.Ok;
+					if (status == Code.Busy || status == Code.TryAgain) {
+						succeeded = false;
+					} else {
+						throw ex;
 					}
 				}
-				tx.close();
-				// Close the transaction operation
-				ops.endOp();
-				return true;
-			} catch (org.rocksdb.RocksDBException e) {
-				// Close the transaction operation
-				ops.endOp();
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
+				if (!succeeded) {
+					// Do not call endOp here, since the transaction is still open
+					return false;
+				}
+			} else {
+				if (tx.val().isOwningHandle()) {
+					tx.val().rollback();
+				}
 			}
+			tx.close();
+			// Close the transaction operation
+			ops.endOp();
+			return true;
+		} catch (org.rocksdb.RocksDBException e) {
+			// Close the transaction operation
+			ops.endOp();
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
+		} catch (Throwable ex) {
+			ops.endOp();
+			throw  ex;
 		} finally {
 			ops.endOp();
 		}
@@ -555,22 +567,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} finally {
 			var end = System.nanoTime();
 			closeFailedUpdateTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-	/**
-	 * @return false if failed optimistic commit
-	 */
-	private boolean commitTxOptimistically(@NotNull Tx tx) throws org.rocksdb.RocksDBException {
-		try {
-			tx.val().commit();
-			return true;
-		} catch (org.rocksdb.RocksDBException ex) {
-			var status = ex.getStatus() != null ? ex.getStatus().getCode() : Code.Ok;
-			if (status == Code.Busy || status == Code.TryAgain) {
-				return false;
-			}
-			throw ex;
 		}
 	}
 
@@ -923,11 +919,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// Retry using a transaction: transactions are required to handle this kind of data
 			newTx = owningNewTx ? this.openTransactionInternal(120_000, false) : optionalDbWriter;
 			try {
+				boolean didGetForUpdateInternally = false;
 				boolean committedOwnedTx;
 				do {
 					MemorySegment previousValue;
 					MemorySegment calculatedKey = col.calculateKey(arena, keys.keys());
 					if (updateId != 0L) {
+						assert !owningNewTx;
 						((Tx) newTx).val().setSavePoint();
 					}
 					if (col.hasBuckets()) {
@@ -935,6 +933,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 						try (var readOptions = newReadOptions()) {
 							var previousRawBucketByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+							didGetForUpdateInternally = true;
 							MemorySegment previousRawBucket = toMemorySegment(arena, previousRawBucketByteArray);
 							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
 							previousValue = transformResultValue(col, bucket.addElement(bucketElementKeys, value));
@@ -950,6 +949,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							try (var readOptions = newReadOptions()) {
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+								didGetForUpdateInternally = true;
 								previousValue = transformResultValue(col, toMemorySegment(arena, previousValueByteArray));
 							} catch (org.rocksdb.RocksDBException e) {
 								throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
@@ -960,6 +960,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							try (var readOptions = newReadOptions()) {
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+								didGetForUpdateInternally = true;
 								previousValue = previousValueByteArray != null ? MemorySegment.NULL : null;
 							} catch (org.rocksdb.RocksDBException e) {
 								throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
@@ -996,7 +997,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						boolean committed = closeTransaction(updateId, true);
 						if (!committed) {
 							((Tx) newTx).val().rollbackToSavePoint();
-							((Tx) newTx).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
+							int undosCount = 0;
+							if (((Tx) newTx).isFromGetForUpdate()) {
+								undosCount++;
+							}
+							if (didGetForUpdateInternally) {
+								undosCount++;
+							}
+							for (int i = 0; i < undosCount; i++) {
+								((Tx) newTx).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
+							}
 							throw new RocksDBRetryException();
 						}
 					}
@@ -1004,6 +1014,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (owningNewTx) {
 						committedOwnedTx = this.closeTransactionInternal((Tx) newTx, true);
 						if (!committedOwnedTx) {
+							if (didGetForUpdateInternally) {
+								((Tx) newTx).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
+							}
 							Thread.yield();
 						}
 					} else {
