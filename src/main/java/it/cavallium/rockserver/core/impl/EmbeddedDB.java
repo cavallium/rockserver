@@ -71,8 +71,21 @@ import org.jetbrains.annotations.VisibleForTesting;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
-import org.rocksdb.*;
+import org.rocksdb.AbstractImmutableNativeReference;
+import org.rocksdb.AbstractSlice;
+import org.rocksdb.Cache;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.DBOptions;
+import org.rocksdb.DirectSlice;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksIterator;
 import org.rocksdb.Status.Code;
+import org.rocksdb.TableProperties;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
@@ -434,7 +447,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private ReadOptions newReadOptions() {
-		var ro = new ReadOptions();
+		var ro = new ReadOptions() {
+			{
+				RocksLeakDetector.register(this, owningHandle_);
+			}
+		};
 		ro.setAsyncIo(true);
 		return ro;
 	}
@@ -460,7 +477,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			var expirationTimestamp = timeoutMs + System.currentTimeMillis();
 			TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
-			var writeOpts = new WriteOptions();
+			var writeOpts = new WriteOptions() {
+				{
+					RocksLeakDetector.register(this, owningHandle_);
+				}
+			};
 			var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
 			try {
 				return new Tx(db.beginTransaction(writeOpts, txOpts), isFromGetForUpdate, expirationTimestamp, rocksObjects);
@@ -741,7 +762,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 						writer = switch (mode) {
 							case WRITE_BATCH, WRITE_BATCH_NO_WAL -> {
-								var wb = new WB(db.get(), new WriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL);
+								var wb = new WB(db.get(), new WriteBatch() {
+									{
+										RocksLeakDetector.register(this, owningHandle_);
+									}
+								}, mode == PutBatchMode.WRITE_BATCH_NO_WAL);
 								refs.add(wb);
 								yield wb;
 							}
@@ -978,7 +1003,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							}
 							case Tx t -> t.val().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
 							case null -> {
-								try (var w = new WriteOptions()) {
+								try (var w = new WriteOptions() {
+									{
+										RocksLeakDetector.register(this, owningHandle_);
+									}
+								}) {
 									var keyBB = calculatedKey.asByteBuffer();
 									ByteBuffer valueBB = (col.schema().hasValue() ? value : Utils.dummyEmptyValue()).asByteBuffer();
 									db.get().put(col.cfh(), w, keyBB, valueBB);

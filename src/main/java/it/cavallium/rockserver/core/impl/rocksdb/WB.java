@@ -16,7 +16,11 @@ public record WB(RocksDB rocksDB, @NotNull WriteBatch wb, boolean disableWal) im
     }
 
     public void writePending() throws RocksDBException {
-        try (var w = new WriteOptions()) {
+        try (var w = new WriteOptions() {
+          {
+            RocksLeakDetector.register(this, owningHandle_);
+          }
+        }) {
             if (disableWal || MIGRATE) {
                 w.setDisableWAL(true);
             }

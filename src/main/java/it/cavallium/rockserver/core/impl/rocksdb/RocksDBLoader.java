@@ -110,7 +110,11 @@ public class RocksDBLoader {
         boolean inMemory,
         @Nullable Cache cache) {
         try {
-            var columnFamilyOptions = new ColumnFamilyOptions();
+            var columnFamilyOptions = new ColumnFamilyOptions() {
+              {
+                RocksLeakDetector.register(this, owningHandle_);
+              }
+            };
             refs.add(columnFamilyOptions);
 
             FallbackColumnConfig columnOptions = null;
@@ -207,9 +211,12 @@ public class RocksDBLoader {
                     }
                 }
                 columnFamilyOptions.setBottommostCompressionType(CompressionType.LZ4HC_COMPRESSION);
-                var compressionOptions = new CompressionOptions()
-                        .setEnabled(true)
-                        .setMaxDictBytes(Math.toIntExact(32 * SizeUnit.KB));
+                var compressionOptions = new CompressionOptions() {
+                  {
+                    RocksLeakDetector.register(this, owningHandle_);
+                  }
+                }.setEnabled(true)
+                    .setMaxDictBytes(Math.toIntExact(32 * SizeUnit.KB));
                 refs.add(compressionOptions);
                 setZstdCompressionOptions(compressionOptions);
                 columnFamilyOptions.setBottommostCompressionOptions(compressionOptions);
@@ -242,7 +249,11 @@ public class RocksDBLoader {
                     blockBasedTableConfig.setFilterPolicy(null);
                 }
             } else {
-                final BloomFilter bloomFilter = new BloomFilter(filter.bitsPerKey());
+                final BloomFilter bloomFilter = new BloomFilter(filter.bitsPerKey()) {
+                  {
+                    RocksLeakDetector.register(this, owningHandle_);
+                  }
+                };
                 refs.add(bloomFilter);
                 if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
                     blockBasedTableConfig.setFilterPolicy(bloomFilter);
@@ -352,12 +363,20 @@ public class RocksDBLoader {
 
             // the Options class contains a set of configurable DB options
             // that determines the behaviour of the database.
-            var options = new DBOptions();
+            var options = new DBOptions() {
+              {
+                RocksLeakDetector.register(this, owningHandle_);
+              }
+            };
             refs.add(options);
             options.setParanoidChecks(PARANOID_CHECKS);
             options.setSkipCheckingSstFileSizesOnDbOpen(true);
 
-            var statistics = new Statistics();
+            var statistics = new Statistics() {
+              {
+                RocksLeakDetector.register(this, owningHandle_);
+              }
+            };
             refs.add(statistics);
             statistics.setStatsLevel(StatsLevel.EXCEPT_TIME_FOR_MUTEX);
             options.setStatistics(statistics);
@@ -471,7 +490,11 @@ public class RocksDBLoader {
             options.setIncreaseParallelism(Runtime.getRuntime().availableProcessors());
 
             if (path != null && writeBufferManagerSize > 0L) {
-                var writeBufferManager = new WriteBufferManager(writeBufferManagerSize, blockCache, false);
+                var writeBufferManager = new WriteBufferManager(writeBufferManagerSize, blockCache, false) {
+                  {
+                    RocksLeakDetector.register(this, owningHandle_);
+                  }
+                };
                 refs.add(writeBufferManager);
                 options.setWriteBufferManager(writeBufferManager);
             }
@@ -563,7 +586,11 @@ public class RocksDBLoader {
                 Files.createDirectories(logPath.get());
             }
 
-            var defaultColumnOptions = new ColumnFamilyOptions();
+            var defaultColumnOptions = new ColumnFamilyOptions() {
+              {
+                RocksLeakDetector.register(this, owningHandle_);
+              }
+            };
             refs.add(defaultColumnOptions);
             descriptors.add(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, defaultColumnOptions));
 
@@ -578,7 +605,11 @@ public class RocksDBLoader {
             }
             if (path != null) {
                 List<String> existingColumnFamilies;
-                try (var options = new Options()) {
+                try (var options = new Options() {
+                  {
+                    RocksLeakDetector.register(this, owningHandle_);
+                  }
+                }) {
                     options.setCreateIfMissing(true);
                     existingColumnFamilies = mapList(RocksDB.listColumnFamilies(options, path.toString()), b -> new String(b, StandardCharsets.UTF_8));
                 }
@@ -603,7 +634,11 @@ public class RocksDBLoader {
             if (databaseOptions.global().optimistic()) {
                 db = OptimisticTransactionDB.open(rocksdbOptions, definitiveDbPath.toString(), descriptors, handles);
             } else {
-                var transactionOptions = new TransactionDBOptions()
+                var transactionOptions = new TransactionDBOptions() {
+                  {
+                    RocksLeakDetector.register(this, owningHandle_);
+                  }
+                }
                     .setWritePolicy(TxnDBWritePolicy.WRITE_COMMITTED)
                     .setTransactionLockTimeout(5000)
                     .setDefaultLockTimeout(5000);
@@ -652,7 +687,11 @@ public class RocksDBLoader {
     private record RocksLevelOptions(CompressionType compressionType, CompressionOptions compressionOptions) {}
     private static RocksLevelOptions getRocksLevelOptions(ColumnLevelConfig levelOptions, RocksDBObjects refs) throws GestaltException {
         var compressionType = levelOptions.compression();
-        var compressionOptions = new CompressionOptions();
+        var compressionOptions = new CompressionOptions() {
+          {
+            RocksLeakDetector.register(this, owningHandle_);
+          }
+        };
         refs.add(compressionOptions);
         if (compressionType != CompressionType.NO_COMPRESSION) {
             compressionOptions.setEnabled(true)

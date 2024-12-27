@@ -7,6 +7,10 @@ public class ClockCacheFactory implements CacheFactory {
 
 	@Override
 	public Cache newCache(long size) {
-		return new ClockCache(size);
+		return new ClockCache(size) {
+			{
+				RocksLeakDetector.register(this, owningHandle_);
+			}
+		};
 	}
 }

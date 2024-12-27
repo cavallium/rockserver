@@ -216,7 +216,11 @@ public sealed interface TransactionalDB extends Closeable {
 
 		@Override
 		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
-			return new TransactionalOptionsPessimistic(new TransactionOptions().setExpiration(timeoutMs));
+			return new TransactionalOptionsPessimistic(new TransactionOptions() {
+				{
+					RocksLeakDetector.register(this, owningHandle_);
+				}
+			}.setExpiration(timeoutMs));
 		}
 
 		@Override
@@ -267,7 +271,11 @@ public sealed interface TransactionalDB extends Closeable {
 
 		@Override
 		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
-			return new TransactionalOptionsOptimistic(new OptimisticTransactionOptions());
+			return new TransactionalOptionsOptimistic(new OptimisticTransactionOptions() {
+				{
+					RocksLeakDetector.register(this, owningHandle_);
+				}
+			});
 		}
 
 		@Override

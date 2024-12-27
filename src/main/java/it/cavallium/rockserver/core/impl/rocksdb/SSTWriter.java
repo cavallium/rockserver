@@ -24,7 +24,11 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
         if (refs == null) {
             refs = new RocksDBObjects();
         }
-        var envOptions = new EnvOptions();
+        var envOptions = new EnvOptions() {
+            {
+                RocksLeakDetector.register(this, owningHandle_);
+            }
+        };
         if (!forceNoOptions) {
             envOptions
                     .setAllowFallocate(true)
@@ -35,7 +39,11 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
         }
         refs.add(envOptions);
 
-        var options = new Options();
+        var options = new Options() {
+					{
+						RocksLeakDetector.register(this, owningHandle_);
+					}
+        };
         refs.add(options);
         if (!forceNoOptions) {
             options
@@ -75,14 +83,22 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
             refs.close();
             throw ex;
         }
-        var sstFileWriter = new SstFileWriter(envOptions, options);
+        var sstFileWriter = new SstFileWriter(envOptions, options) {
+					{
+						RocksLeakDetector.register(this, owningHandle_);
+					}
+        };
         var sstWriter = new SSTWriter(db.get(), col, tempFile, sstFileWriter, ingestBehind, refs);
         sstFileWriter.open(tempFile.toString());
         return sstWriter;
     }
 
     private static CompressionOptions cloneCompressionOptions(CompressionOptions compressionOptions) {
-        return new CompressionOptions()
+        return new CompressionOptions() {
+					{
+						RocksLeakDetector.register(this, owningHandle_);
+					}
+        }
                 .setEnabled(compressionOptions.enabled())
                 .setMaxDictBytes(compressionOptions.maxDictBytes())
                 .setLevel(compressionOptions.level())
@@ -113,7 +129,11 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
             checkOwningHandle();
             try (this) {
                 sstFileWriter.finish();
-                try (var ingestOptions = new IngestExternalFileOptions()) {
+                try (var ingestOptions = new IngestExternalFileOptions() {
+									{
+										RocksLeakDetector.register(this, owningHandle_);
+									}
+                }) {
                     ingestOptions
                             .setIngestBehind(ingestBehind)
                             .setAllowBlockingFlush(true)

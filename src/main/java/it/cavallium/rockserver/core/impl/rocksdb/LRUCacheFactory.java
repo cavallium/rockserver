@@ -7,6 +7,10 @@ public class LRUCacheFactory implements CacheFactory {
 
 	@Override
 	public Cache newCache(long size) {
-		return new LRUCache(size);
+		return new LRUCache(size) {
+			{
+				RocksLeakDetector.register(this, owningHandle_);
+			}
+		};
 	}
 }
