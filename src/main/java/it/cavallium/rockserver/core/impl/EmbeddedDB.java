@@ -993,7 +993,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					});
 
 					if (updateId != 0L) {
-						if (!closeTransaction(updateId, true)) {
+						boolean committed = closeTransaction(updateId, true);
+						if (!committed) {
 							((Tx) newTx).val().rollbackToSavePoint();
 							((Tx) newTx).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
 							throw new RocksDBRetryException();
