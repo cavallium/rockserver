@@ -198,6 +198,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					var tx = EmbeddedDB.this.txs.remove(id);
 					if (tx != null) {
 						try {
+							if (tx.val().isOwningHandle()) {
+								tx.val().rollback();
+							}
 							tx.close();
 						} catch (Throwable ex) {
 							logger.error("Failed to close a transaction", ex);
