@@ -16,6 +16,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.Cache;
+import org.rocksdb.HistogramData;
 import org.rocksdb.HistogramType;
 import org.rocksdb.Statistics;
 import org.rocksdb.TickerType;
@@ -57,33 +58,43 @@ public class RocksDBStatistics {
 				.register(metrics.getRegistry());
 
 		this.executor = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("rocksdb-statistics"));
+
+		EnumMap<HistogramType, HistogramData> histogramDataRef = new EnumMap<>(HistogramType.class);
+
+		histogramMap.forEach((histogramType, multiGauge) -> {
+			// Pre populate all
+			histogramDataRef.put(histogramType, statistics.getHistogramData(histogramType));
+
+			multiGauge.register(List.of(
+					Row.of(Tags.of("field", "average"), () -> histogramDataRef.get(histogramType).getAverage()),
+					Row.of(Tags.of("field", "count"), () -> histogramDataRef.get(histogramType).getCount()),
+					Row.of(Tags.of("field", "max"), () -> histogramDataRef.get(histogramType).getMax()),
+					Row.of(Tags.of("field", "min"), () -> histogramDataRef.get(histogramType).getMin()),
+					Row.of(Tags.of("field", "median"), () -> histogramDataRef.get(histogramType).getMedian()),
+					Row.of(Tags.of("field", "percentile95"), () -> histogramDataRef.get(histogramType).getPercentile95()),
+					Row.of(Tags.of("field", "percentile99"), () -> histogramDataRef.get(histogramType).getPercentile99()),
+					Row.of(Tags.of("field", "standard_deviation"), () -> histogramDataRef.get(histogramType).getStandardDeviation()),
+					Row.of(Tags.of("field", "sum"), () -> histogramDataRef.get(histogramType).getSum())
+			), true);
+		});
+
+		if (cache != null) {
+			cacheStats.register(List.of(
+					Row.of(Tags.of("field", "usage"), cache.getUsage()),
+					Row.of(Tags.of("field", "pinned_usage"), cache.getPinnedUsage())
+			), true);
+		}
+
 		this.scheduledTask = executor.scheduleAtFixedRate(() -> {
-			tickerMap.forEach(((tickerType, counter) -> {
+			for (TickerType tickerType : tickerMap.keySet()) {
 				var tickerCount = statistics.getAndResetTickerCount(tickerType);
-				counter.increment(tickerCount);
-			}));
-
-			histogramMap.forEach((histogramType, multiGauge) -> {
-				var histogramData = statistics.getHistogramData(histogramType);
-				multiGauge.register(List.of(
-						Row.of(Tags.of("field", "average"), histogramData.getAverage()),
-						Row.of(Tags.of("field", "count"), histogramData.getCount()),
-						Row.of(Tags.of("field", "max"), histogramData.getMax()),
-						Row.of(Tags.of("field", "min"), histogramData.getMin()),
-						Row.of(Tags.of("field", "median"), histogramData.getMedian()),
-						Row.of(Tags.of("field", "percentile95"), histogramData.getPercentile95()),
-						Row.of(Tags.of("field", "percentile99"), histogramData.getPercentile99()),
-						Row.of(Tags.of("field", "standard_deviation"), histogramData.getStandardDeviation()),
-						Row.of(Tags.of("field", "sum"), histogramData.getSum())
-				), true);
-			});
-
-			if (cache != null) {
-				cacheStats.register(List.of(
-						Row.of(Tags.of("field", "usage"), cache.getUsage()),
-						Row.of(Tags.of("field", "pinned_usage"), cache.getPinnedUsage())
-				), true);
+				tickerMap.get(tickerType).increment(tickerCount);
 			}
+
+			for (HistogramType histogramType : histogramMap.keySet()) {
+				histogramDataRef.put(histogramType, statistics.getHistogramData(histogramType));
+			}
+
 		}, 10, 60, TimeUnit.SECONDS);
 	}
 
