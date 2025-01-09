@@ -175,6 +175,13 @@ public sealed interface TransactionalDB extends Closeable {
 				} catch (RocksDBException e) {
 					exceptions.add(e);
 				}
+				try {
+					if (db.isOwningHandle()) {
+						db.closeE();
+					}
+				} catch (RocksDBException e) {
+					exceptions.add(e);
+				}
 				for (ColumnFamilyHandle handle : handles) {
 					try {
 						if (handle.isOwningHandle()) {
@@ -183,13 +190,6 @@ public sealed interface TransactionalDB extends Closeable {
 					} catch (Exception ex) {
 						exceptions.add(ex);
 					}
-				}
-				try {
-					if (db.isOwningHandle()) {
-						db.closeE();
-					}
-				} catch (RocksDBException e) {
-					exceptions.add(e);
 				}
 				if (!exceptions.isEmpty()) {
 					IOException ex;
