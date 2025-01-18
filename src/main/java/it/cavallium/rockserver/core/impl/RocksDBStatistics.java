@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl;
 
+import com.google.common.cache.CacheStats;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MultiGauge;
 import io.micrometer.core.instrument.MultiGauge.Row;
@@ -111,14 +112,15 @@ public class RocksDBStatistics {
 
 				var taskEndTime = System.nanoTime();
 
-				var nextTaskStartTime = taskStartTime + 60000000000L;
+				long nextTaskStartTime = taskStartTime;
+				while (nextTaskStartTime <= taskEndTime) {
+					nextTaskStartTime += 60000000000L;
+				}
 
-				if (nextTaskStartTime > taskEndTime) {
-					try {
-						Thread.sleep(Duration.ofNanos(nextTaskStartTime - taskEndTime));
-					} catch (InterruptedException e) {
-						throw new RuntimeException(e);
-					}
+				try {
+					Thread.sleep(Duration.ofNanos(nextTaskStartTime - taskEndTime));
+				} catch (InterruptedException e) {
+					throw new RuntimeException(e);
 				}
 			}
 		});
