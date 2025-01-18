@@ -4,32 +4,35 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MultiGauge;
 import io.micrometer.core.instrument.MultiGauge.Row;
 import io.micrometer.core.instrument.Tags;
-import io.micrometer.core.instrument.util.NamedThreadFactory;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.Cache;
 import org.rocksdb.HistogramData;
 import org.rocksdb.HistogramType;
 import org.rocksdb.Statistics;
 import org.rocksdb.TickerType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class RocksDBStatistics {
+
+	private static final Logger LOG = LoggerFactory.getLogger(RocksDBStatistics.class);
 
 	private final Statistics statistics;
 	private final MetricsManager metrics;
 	private final EnumMap<TickerType, Counter> tickerMap;
 	private final EnumMap<HistogramType, MultiGauge> histogramMap;
-	private final ScheduledExecutorService executor;
-	private final ScheduledFuture<?> scheduledTask;
+	private final Thread executor;
 	private final MultiGauge cacheStats;
+
+	private volatile boolean stopRequested = false;
 
 	public RocksDBStatistics(String name, Statistics statistics, MetricsManager metrics, @Nullable Cache cache) {
 		this.statistics = statistics;
@@ -57,9 +60,9 @@ public class RocksDBStatistics {
 				.tag("database", name)
 				.register(metrics.getRegistry());
 
-		this.executor = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("rocksdb-statistics"));
 
 		EnumMap<HistogramType, HistogramData> histogramDataRef = new EnumMap<>(HistogramType.class);
+		AtomicReference<CacheStats> cacheStatsRef = new AtomicReference<>(cache != null ? getCacheStats(cache) : new CacheStats(0L, 0L));
 
 		histogramMap.forEach((histogramType, multiGauge) -> {
 			// Pre populate all
@@ -80,26 +83,61 @@ public class RocksDBStatistics {
 
 		if (cache != null) {
 			cacheStats.register(List.of(
-					Row.of(Tags.of("field", "usage"), cache.getUsage()),
-					Row.of(Tags.of("field", "pinned_usage"), cache.getPinnedUsage())
+					Row.of(Tags.of("field", "usage"), () -> cacheStatsRef.get().usage()),
+					Row.of(Tags.of("field", "pinned_usage"), () -> cacheStatsRef.get().pinnedUsage())
 			), true);
 		}
 
-		this.scheduledTask = executor.scheduleAtFixedRate(() -> {
-			for (TickerType tickerType : tickerMap.keySet()) {
-				var tickerCount = statistics.getAndResetTickerCount(tickerType);
-				tickerMap.get(tickerType).increment(tickerCount);
-			}
+		this.executor = new Thread(() -> {
+			while (!stopRequested) {
+				var taskStartTime = System.nanoTime();
 
-			for (HistogramType histogramType : histogramMap.keySet()) {
-				histogramDataRef.put(histogramType, statistics.getHistogramData(histogramType));
-			}
+				try {
+					for (TickerType tickerType : tickerMap.keySet()) {
+						var tickerCount = statistics.getAndResetTickerCount(tickerType);
+						tickerMap.get(tickerType).increment(tickerCount);
+					}
 
-		}, 10, 60, TimeUnit.SECONDS);
+					for (HistogramType histogramType : histogramMap.keySet()) {
+						histogramDataRef.put(histogramType, statistics.getHistogramData(histogramType));
+					}
+
+					if (cache != null) {
+						cacheStatsRef.set(getCacheStats(cache));
+					}
+				} catch (Throwable ex) {
+					LOG.error("Fatal error during stats collection", ex);
+				}
+
+				var taskEndTime = System.nanoTime();
+
+				var nextTaskStartTime = taskStartTime + 60000000000L;
+
+				if (nextTaskStartTime > taskEndTime) {
+					try {
+						Thread.sleep(Duration.ofNanos(nextTaskStartTime - taskEndTime));
+					} catch (InterruptedException e) {
+						throw new RuntimeException(e);
+					}
+				}
+			}
+		});
+		executor.setName("rocksdb-statistics");
+		executor.setDaemon(true);
 	}
 
+	private CacheStats getCacheStats(@NotNull Cache cache) {
+		return new CacheStats(cache.getUsage(), cache.getPinnedUsage());
+	}
+
+	private record CacheStats(long usage, long pinnedUsage) {}
+
 	public void close() {
-		scheduledTask.cancel(false);
-		executor.close();
+		stopRequested = true;
+		try {
+			executor.join();
+		} catch (InterruptedException e) {
+			LOG.error("Failed to close executor", e);
+		}
 	}
 }
