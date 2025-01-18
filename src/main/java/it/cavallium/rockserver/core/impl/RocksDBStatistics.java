@@ -126,6 +126,7 @@ public class RocksDBStatistics {
 		});
 		executor.setName("rocksdb-statistics");
 		executor.setDaemon(true);
+		executor.start();
 	}
 
 	private CacheStats getCacheStats(@NotNull Cache cache) {
