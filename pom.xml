@@ -12,16 +12,16 @@
     <revision>1.0.0-SNAPSHOT</revision>
     <maven.compiler.release>23</maven.compiler.release>
     <native.maven.plugin.version>0.10.3</native.maven.plugin.version>
-    <gestalt.version>0.32.2</gestalt.version>
+    <gestalt.version>0.35.1</gestalt.version>
     <rocksdb.version>9.8.4</rocksdb.version>
-    <slf4j.version>2.0.12</slf4j.version>
+    <slf4j.version>2.0.16</slf4j.version>
     <imageName>rockserver-core</imageName>
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
     <protobuf-plugin.version>0.6.1</protobuf-plugin.version>
-    <protobuf.version>3.25.3</protobuf.version>
-    <grpc.version>1.68.0</grpc.version>
-    <netty.version>4.1.100.Final</netty.version>
-    <rainbowgum.version>0.7.0</rainbowgum.version>
+    <protobuf.version>3.25.5</protobuf.version>
+    <grpc.version>1.69.1</grpc.version>
+    <netty.version>4.1.117.Final</netty.version>
+    <rainbowgum.version>0.8.1</rainbowgum.version>
   </properties>
 
   <repositories>

@@ -9,7 +9,7 @@ module rockserver.core {
 	requires it.unimi.dsi.fastutil;
 	requires org.apache.thrift;
 	requires org.slf4j;
-	requires protobuf.java;
+	requires com.google.protobuf;
 	requires io.grpc.protobuf;
 	requires io.grpc.stub;
 	requires io.grpc;
