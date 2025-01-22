@@ -20,7 +20,6 @@ import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.FirstAndLast;
 import it.cavallium.rockserver.core.common.KVBatch;
-import it.cavallium.rockserver.core.common.KVBatch.KVBatchOwned;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
@@ -304,12 +303,10 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 						.build())
 				.build());
 		var nextRequests = Flux.from(batchPublisher).map(batch -> {
-			try (batch) {
-				var request = PutBatchRequest.newBuilder();
-				request.setData(mapKVBatch(batch));
-				return request.build();
-			}
-		}).doOnDiscard(KVBatchOwned.class, KVBatchOwned::close);
+			var request = PutBatchRequest.newBuilder();
+			request.setData(mapKVBatch(batch));
+			return request.build();
+		});
 		var inputFlux = initialRequest.concatWith(nextRequests);
 		return reactiveStub.putBatch(inputFlux).then().toFuture();
 	}

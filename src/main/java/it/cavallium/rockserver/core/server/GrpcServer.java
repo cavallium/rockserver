@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.server;
 
+import static it.cavallium.rockserver.core.common.Utils.toByteArray;
 import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
 
 import com.google.protobuf.ByteString;
@@ -24,7 +25,6 @@ import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KVBatch;
-import it.cavallium.rockserver.core.common.KVBatch.KVBatchOwned;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
@@ -214,14 +214,12 @@ public class GrpcServer extends Server {
 
 					var batches = nextRequests.<KVBatch>handle((putBatchRequest, sink) -> {
 						var batch = putBatchRequest.getData();
-						var arena = Arena.ofConfined();
 						try {
-							sink.next(mapKVBatch(arena, batch.getEntriesCount(), batch::getEntries, true));
+							sink.next(mapKVBatch(null, batch.getEntriesCount(), batch::getEntries));
 						} catch (Throwable ex) {
-							arena.close();
 							sink.error(ex);
 						}
-					}).doOnDiscard(KVBatchOwned.class, KVBatchOwned::close);
+					});
 
 					return Mono
 							.fromFuture(() -> asyncApi.putBatchAsync(initialRequest.getColumnId(), batches, mode))
@@ -490,22 +488,25 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
-			return Mono.using(Arena::ofConfined, arena ->  Mono.fromFuture(() -> asyncApi.reduceRangeAsync(arena, request.getTransactionId(), request.getColumnId(),
-					mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-					mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
-					request.getReverse(),
-					RequestType.firstAndLast(),
-					request.getTimeoutMs()
-			)).map(firstAndLast -> {
-				var resultBuilder = FirstAndLast.newBuilder();
-				if (firstAndLast.first() != null) {
-					resultBuilder.setFirst(unmapKV(firstAndLast.first()));
+			return executeSync(() -> {
+				try (var arena = Arena.ofConfined()) {
+					var firstAndLast = api.reduceRange(arena, request.getTransactionId(), request.getColumnId(),
+							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+							request.getReverse(),
+							RequestType.firstAndLast(),
+							request.getTimeoutMs()
+					);
+					var resultBuilder = FirstAndLast.newBuilder();
+					if (firstAndLast.first() != null) {
+						resultBuilder.setFirst(unmapKVHeap(firstAndLast.first()));
+					}
+					if (firstAndLast.last() != null) {
+						resultBuilder.setLast(unmapKVHeap(firstAndLast.last()));
+					}
+					return resultBuilder.build();
 				}
-				if (firstAndLast.last() != null) {
-					resultBuilder.setLast(unmapKV(firstAndLast.last()));
-				}
-				return resultBuilder.build();
-			}).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeFirstAndLast", request)), Arena::close);
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeFirstAndLast", request));
 		}
 
 		@Override
@@ -539,7 +540,7 @@ public class GrpcServer extends Server {
 							RequestType.allInRange(),
 							request.getTimeoutMs()
 					))
-					.map(GrpcServerImpl::unmapKV)
+					.map(GrpcServerImpl::unmapKVHeap)
 					.transform(this.onErrorMapFluxWithRequestInfo("getAllInRange", request)), Arena::close);
 		}
 
@@ -591,7 +592,23 @@ public class GrpcServer extends Server {
 					.build();
 		}
 
+		private static KV unmapKVHeap(it.cavallium.rockserver.core.common.KV kv) {
+			if (kv == null) return null;
+			return KV.newBuilder()
+					.addAllKeys(unmapKeysHeap(kv.keys()))
+					.setValue(unmapValueHeap(kv.value()))
+					.build();
+		}
+
 		private static List<ByteString> unmapKeys(@NotNull Keys keys) {
+			var result = new ArrayList<ByteString>(keys.keys().length);
+			for (@NotNull MemorySegment key : keys.keys()) {
+				result.add(UnsafeByteOperations.unsafeWrap(key.asByteBuffer()));
+			}
+			return result;
+		}
+
+		private static List<ByteString> unmapKeysHeap(@NotNull Keys keys) {
 			var result = new ArrayList<ByteString>(keys.keys().length);
 			for (@NotNull MemorySegment key : keys.keys()) {
 				result.add(UnsafeByteOperations.unsafeWrap(key.asByteBuffer()));
@@ -601,7 +618,12 @@ public class GrpcServer extends Server {
 
 		private static ByteString unmapValue(@Nullable MemorySegment value) {
 			if (value == null) return null;
-			return UnsafeByteOperations.unsafeWrap(value.asByteBuffer());
+			return UnsafeByteOperations.unsafeWrap(toByteArray(value));
+		}
+
+		private static ByteString unmapValueHeap(@Nullable MemorySegment value) {
+			if (value == null) return null;
+			return UnsafeByteOperations.unsafeWrap(toByteArray(value));
 		}
 
 		private static ColumnSchema mapColumnSchema(it.cavallium.rockserver.core.common.api.proto.ColumnSchema schema) {
@@ -633,7 +655,7 @@ public class GrpcServer extends Server {
 			return l;
 		}
 
-		private static Keys mapKeys(Arena arena, int count, Int2ObjectFunction<ByteString> keyGetterAt) {
+		private static Keys mapKeys(@Nullable Arena arena, int count, Int2ObjectFunction<ByteString> keyGetterAt) {
 			var segments = new MemorySegment[count];
 			for (int i = 0; i < count; i++) {
 				segments[i] = toMemorySegment(arena, keyGetterAt.apply(i));
@@ -641,7 +663,7 @@ public class GrpcServer extends Server {
 			return new Keys(segments);
 		}
 
-		private static List<Keys> mapKeysKV(Arena arena, int count, Int2ObjectFunction<KV> keyGetterAt) {
+		private static List<Keys> mapKeysKV(@Nullable Arena arena, int count, Int2ObjectFunction<KV> keyGetterAt) {
 			var keys = new ArrayList<Keys>(count);
 			for (int i = 0; i < count; i++) {
 				var k = keyGetterAt.apply(i);
@@ -658,10 +680,10 @@ public class GrpcServer extends Server {
 			return keys;
 		}
 
-		private static KVBatch mapKVBatch(Arena arena, int count, Int2ObjectFunction<KV> getterAt, boolean owned) {
+		private static KVBatch mapKVBatch(@Nullable Arena arena, int count, Int2ObjectFunction<KV> getterAt) {
 			var kk = mapKeysKV(arena, count, getterAt);
 			var vv = mapValuesKV(arena, count, getterAt);
-			return owned ? new KVBatchOwned(arena, kk, vv) : new KVBatchRef(kk, vv);
+			return new KVBatchRef(kk, vv);
 		}
 
 		private static Status handleError(Throwable ex) {

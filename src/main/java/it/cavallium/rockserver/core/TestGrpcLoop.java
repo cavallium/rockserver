@@ -34,9 +34,9 @@ public class TestGrpcLoop {
                 while (true) {
                     try (var arena = Arena.ofConfined()) {
                         var delta = client.getSyncApi().put(arena, 0, col,
-                                new Keys(new MemorySegment[]{MemorySegment.ofArray(new byte[15])}),
-                                MemorySegment.ofArray(new byte[15]),
-                                RequestType.delta());
+                            new Keys(new MemorySegment[]{MemorySegment.ofArray(new byte[15])}),
+                            MemorySegment.ofArray(new byte[15]),
+                            RequestType.delta());
                     }
                 }
             });

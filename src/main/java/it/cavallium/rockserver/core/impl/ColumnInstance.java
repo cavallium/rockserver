@@ -84,7 +84,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 	 * @param bucketValue pass this parameter only if the columnInstance has variable-length keys
 	 */
 	@NotNull
-	public MemorySegment[] decodeKeys(Arena arena, MemorySegment calculatedKey, @Nullable MemorySegment bucketValue) {
+	public MemorySegment[] decodeKeys(@Nullable Arena arena, MemorySegment calculatedKey, @Nullable MemorySegment bucketValue) {
 		validateFinalKeySize(calculatedKey);
 		MemorySegment[] finalKeys;
 		if (calculatedKey == MemorySegment.NULL) {
@@ -97,7 +97,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 				long offsetBytes = 0;
 				for (int i = 0; i < schema.keysCount(); i++) {
 					var keyLength = schema.key(i);
-					var finalKey = finalKeys[i] = arena.allocate(keyLength);
+					var finalKey = finalKeys[i] = arena == null ? MemorySegment.ofArray(new byte[keyLength]) : arena.allocate(keyLength);
 					MemorySegment.copy(calculatedKey, offsetBytes, finalKey, 0, keyLength);
 					offsetBytes += keyLength;
 				}

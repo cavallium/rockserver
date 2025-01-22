@@ -788,27 +788,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 				@Override
 				public void onNext(KVBatch kvBatch) {
-					try (kvBatch) {
-						if (stopped) {
-							return;
-						}
-						var keyIt = kvBatch.keys().iterator();
-						var valueIt = kvBatch.values().iterator();
-						try (var arena = Arena.ofConfined()) {
-							while (keyIt.hasNext()) {
-								var key = keyIt.next();
-								var value = valueIt.next();
-								put(arena, writer, col, 0, key, value, RequestType.none());
-							}
-						} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
-							doFinally();
-							throw ex;
-						} catch (Exception ex) {
-							doFinally();
-							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-						}
-						subscription.request(1);
+					if (stopped) {
+						return;
 					}
+					var keyIt = kvBatch.keys().iterator();
+					var valueIt = kvBatch.values().iterator();
+					try (var arena = Arena.ofConfined()) {
+						while (keyIt.hasNext()) {
+							var key = keyIt.next();
+							var value = valueIt.next();
+							put(arena, writer, col, 0, key, value, RequestType.none());
+						}
+					} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+						doFinally();
+						throw ex;
+					} catch (Exception ex) {
+						doFinally();
+						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+					}
+					subscription.request(1);
 				}
 
 				@Override
@@ -1382,7 +1380,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	/** See: {@link it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange}. */
-	public <T> Publisher<T> getRangeAsyncInternal(Arena arena,
+	public <T> Publisher<T> getRangeAsyncInternal(Arena paramsArena,
 										   long transactionId,
 										   long columnId,
 										   @Nullable Keys startKeysInclusive,
@@ -1391,13 +1389,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 										   RequestType.RequestGetRange<? super KV, T> requestType,
 										   long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		LongAdder totalTime =  new LongAdder();
-		record Resources(ColumnInstance col, ReadOptions ro, AbstractSlice<?> startKeySlice,
+		record Resources(Arena arena, ColumnInstance col, ReadOptions ro, AbstractSlice<?> startKeySlice,
 						 AbstractSlice<?> endKeySlice, RocksIterator it) {
 			public void close() {
 				ro.close();
 				if (startKeySlice != null) startKeySlice.close();
 				if (endKeySlice != null) endKeySlice.close();
 				it.close();
+				arena.close();
 			}
 		}
 		return Flux.using(() -> {
@@ -1411,39 +1410,45 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 
-			var ro = newReadOptions();
+			var arena = Arena.ofConfined();
 			try {
-				MemorySegment calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
-				MemorySegment calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
-				var startKeySlice = calculatedStartKey != null ? toDirectSlice(calculatedStartKey) : null;
+				var ro = newReadOptions();
 				try {
-					var endKeySlice = calculatedEndKey != null ? toDirectSlice(calculatedEndKey) : null;
+					MemorySegment calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
+					MemorySegment calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
+					var startKeySlice = calculatedStartKey != null ? toDirectSlice(calculatedStartKey) : null;
 					try {
-						if (startKeySlice != null) {
-							ro.setIterateLowerBound(startKeySlice);
-						}
-						if (endKeySlice != null) {
-							ro.setIterateUpperBound(endKeySlice);
-						}
+						var endKeySlice = calculatedEndKey != null ? toDirectSlice(calculatedEndKey) : null;
+						try {
+							if (startKeySlice != null) {
+								ro.setIterateLowerBound(startKeySlice);
+							}
+							if (endKeySlice != null) {
+								ro.setIterateUpperBound(endKeySlice);
+							}
 
-						RocksIterator it;
-						if (transactionId > 0L) {
-							//noinspection resource
-							it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
-						} else {
-							it = db.get().newIterator(col.cfh(), ro);
+							RocksIterator it;
+							if (transactionId > 0L) {
+								//noinspection resource
+								it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+							} else {
+								it = db.get().newIterator(col.cfh(), ro);
+							}
+							return new Resources(arena, col, ro, startKeySlice, endKeySlice, it);
+						} catch (Throwable ex) {
+							if (endKeySlice != null) endKeySlice.close();
+							throw ex;
 						}
-						return new Resources(col, ro, startKeySlice, endKeySlice, it);
 					} catch (Throwable ex) {
-						if (endKeySlice != null) endKeySlice.close();
+						if (startKeySlice != null) startKeySlice.close();
 						throw ex;
 					}
 				} catch (Throwable ex) {
-					if (startKeySlice != null) startKeySlice.close();
+					ro.close();
 					throw ex;
 				}
 			} catch (Throwable ex) {
-				ro.close();
+				arena.close();
 				throw ex;
 			} finally {
 				totalTime.add(System.nanoTime() - initializationStartTime);
@@ -1466,15 +1471,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (!it.isValid()) {
 					sink.complete();
 				} else {
-					var calculatedKey = toMemorySegment(arena, it.key());
+					var calculatedKey = toMemorySegment(null, it.key());
 					var calculatedValue = res.col.schema().hasValue() ? toMemorySegment(it.value()) : MemorySegment.NULL;
 					if (!reverse) {
 						res.it.next();
 					} else {
 						res.it.prev();
 					}
+					var kv = decodeKVNoBuckets(null, res.col, calculatedKey, calculatedValue);
+
 					//noinspection unchecked
-					sink.next((T) decodeKVNoBuckets(arena, res.col, calculatedKey, calculatedValue));
+					sink.next((T) kv);
 				}
 				return it;
 			} finally {
@@ -1593,7 +1600,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return new DirectSlice(calculatedKey.asByteBuffer(), (int) calculatedKey.byteSize());
 	}
 
-	private KV decodeKVNoBuckets(Arena arena, ColumnInstance col, MemorySegment calculatedKey, MemorySegment calculatedValue) {
+	private KV decodeKVNoBuckets(@Nullable Arena arena, ColumnInstance col, MemorySegment calculatedKey, MemorySegment calculatedValue) {
 		var keys = col.decodeKeys(arena, calculatedKey, calculatedValue);
 		return new KV(new Keys(keys), calculatedValue);
 	}

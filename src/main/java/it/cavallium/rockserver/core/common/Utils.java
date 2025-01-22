@@ -70,12 +70,14 @@ public class Utils {
 		}
 	}
 
-	public static @NotNull MemorySegment toMemorySegment(Arena arena, ByteString value) {
+	public static @NotNull MemorySegment toMemorySegment(@Nullable Arena arena, ByteString value) {
 		var buf = value.asReadOnlyByteBuffer();
 		if (buf.isDirect()) {
 			return MemorySegment.ofBuffer(buf);
-		} else {
+		} else if (arena != null) {
 			return arena.allocate(value.size()).copyFrom(MemorySegment.ofBuffer(buf));
+		} else {
+			return MemorySegment.ofBuffer(buf);
 		}
 	}
 
@@ -88,12 +90,15 @@ public class Utils {
 		}
 	}
 
-	@Contract("null, !null -> fail; _, null -> null")
-	public static @Nullable MemorySegment toMemorySegment(Arena arena, byte... array) {
+	@Contract("_, null -> null")
+	public static @Nullable MemorySegment toMemorySegment(@Nullable Arena arena, byte... array) {
 		if (array != null) {
-			assert arena != null;
-			// todo: replace with allocateArray when graalvm adds it
-			return arena.allocate(array.length).copyFrom(MemorySegment.ofArray(array));
+			if (arena == null) {
+				return MemorySegment.ofArray(array);
+			} else {
+				// todo: replace with allocateArray when graalvm adds it
+				return arena.allocate(array.length).copyFrom(MemorySegment.ofArray(array));
+			}
 		} else {
 			return null;
 		}
