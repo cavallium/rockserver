@@ -214,7 +214,7 @@ public class GrpcServer extends Server {
 
 					var batches = nextRequests.map(putBatchRequest -> {
 						var batch = putBatchRequest.getData();
-						return mapKVBatch(Arena.ofAuto(), batch.getEntriesCount(), batch::getEntries, true);
+						return mapKVBatch(Arena.ofConfined(), batch.getEntriesCount(), batch::getEntries, true);
 					}).doOnDiscard(KVBatchOwned.class, KVBatchOwned::close);
 
 					return Mono
@@ -484,7 +484,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
-			return Mono.using(Arena::ofAuto, arena ->  Mono.fromFuture(() -> asyncApi.reduceRangeAsync(arena, request.getTransactionId(), request.getColumnId(),
+			return Mono.using(Arena::ofConfined, arena ->  Mono.fromFuture(() -> asyncApi.reduceRangeAsync(arena, request.getTransactionId(), request.getColumnId(),
 					mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
 					mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 					request.getReverse(),
@@ -523,7 +523,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Flux<KV> getAllInRange(GetRangeRequest request) {
-			return Flux.using(Arena::ofAuto, arena -> Flux
+			return Flux.using(Arena::ofConfined, arena -> Flux
 					.from(asyncApi.getRangeAsync(arena,
 							request.getTransactionId(),
 							request.getColumnId(),
