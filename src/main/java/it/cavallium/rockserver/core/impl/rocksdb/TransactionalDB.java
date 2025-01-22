@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.lang.foreign.Arena;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -175,6 +176,7 @@ public sealed interface TransactionalDB extends Closeable {
 				} catch (RocksDBException e) {
 					exceptions.add(e);
 				}
+				db.cancelAllBackgroundWork(true);
 				try {
 					if (db.isOwningHandle()) {
 						db.closeE();
