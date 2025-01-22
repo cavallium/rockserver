@@ -611,14 +611,14 @@ public class GrpcServer extends Server {
 		private static List<ByteString> unmapKeysHeap(@NotNull Keys keys) {
 			var result = new ArrayList<ByteString>(keys.keys().length);
 			for (@NotNull MemorySegment key : keys.keys()) {
-				result.add(UnsafeByteOperations.unsafeWrap(key.asByteBuffer()));
+				result.add(UnsafeByteOperations.unsafeWrap(toByteArray(key)));
 			}
 			return result;
 		}
 
 		private static ByteString unmapValue(@Nullable MemorySegment value) {
 			if (value == null) return null;
-			return UnsafeByteOperations.unsafeWrap(toByteArray(value));
+			return UnsafeByteOperations.unsafeWrap(value.asByteBuffer());
 		}
 
 		private static ByteString unmapValueHeap(@Nullable MemorySegment value) {
