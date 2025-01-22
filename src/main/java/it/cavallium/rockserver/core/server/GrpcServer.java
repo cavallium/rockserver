@@ -212,9 +212,15 @@ public class GrpcServer extends Server {
 						case UNRECOGNIZED -> throw new UnsupportedOperationException("Unrecognized request \"mode\"");
 					};
 
-					var batches = nextRequests.map(putBatchRequest -> {
+					var batches = nextRequests.<KVBatch>handle((putBatchRequest, sink) -> {
 						var batch = putBatchRequest.getData();
-						return mapKVBatch(Arena.ofConfined(), batch.getEntriesCount(), batch::getEntries, true);
+						var arena = Arena.ofConfined();
+						try {
+							sink.next(mapKVBatch(arena, batch.getEntriesCount(), batch::getEntries, true));
+						} catch (Throwable ex) {
+							arena.close();
+							sink.error(ex);
+						}
 					}).doOnDiscard(KVBatchOwned.class, KVBatchOwned::close);
 
 					return Mono
