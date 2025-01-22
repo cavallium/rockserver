@@ -24,6 +24,8 @@ import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KVBatch;
+import it.cavallium.rockserver.core.common.KVBatch.KVBatchOwned;
+import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
@@ -212,8 +214,8 @@ public class GrpcServer extends Server {
 
 					var batches = nextRequests.map(putBatchRequest -> {
 						var batch = putBatchRequest.getData();
-						return mapKVBatch(Arena.ofAuto(), batch.getEntriesCount(), batch::getEntries);
-					});
+						return mapKVBatch(Arena.ofAuto(), batch.getEntriesCount(), batch::getEntries, true);
+					}).doOnDiscard(KVBatchOwned.class, KVBatchOwned::close);
 
 					return Mono
 							.fromFuture(() -> asyncApi.putBatchAsync(initialRequest.getColumnId(), batches, mode))
@@ -482,8 +484,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
-			var arena = Arena.ofAuto();
-			return Mono.fromFuture(() -> asyncApi.reduceRangeAsync(arena, request.getTransactionId(), request.getColumnId(),
+			return Mono.using(Arena::ofAuto, arena ->  Mono.fromFuture(() -> asyncApi.reduceRangeAsync(arena, request.getTransactionId(), request.getColumnId(),
 					mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
 					mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 					request.getReverse(),
@@ -498,7 +499,7 @@ public class GrpcServer extends Server {
 					resultBuilder.setLast(unmapKV(firstAndLast.last()));
 				}
 				return resultBuilder.build();
-			}).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeFirstAndLast", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeFirstAndLast", request)), Arena::close);
 		}
 
 		@Override
@@ -522,8 +523,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Flux<KV> getAllInRange(GetRangeRequest request) {
-			var arena = Arena.ofAuto();
-			return Flux
+			return Flux.using(Arena::ofAuto, arena -> Flux
 					.from(asyncApi.getRangeAsync(arena,
 							request.getTransactionId(),
 							request.getColumnId(),
@@ -534,7 +534,7 @@ public class GrpcServer extends Server {
 							request.getTimeoutMs()
 					))
 					.map(GrpcServerImpl::unmapKV)
-					.transform(this.onErrorMapFluxWithRequestInfo("getAllInRange", request));
+					.transform(this.onErrorMapFluxWithRequestInfo("getAllInRange", request)), Arena::close);
 		}
 
 
@@ -652,11 +652,10 @@ public class GrpcServer extends Server {
 			return keys;
 		}
 
-		private static KVBatch mapKVBatch(Arena arena, int count, Int2ObjectFunction<KV> getterAt) {
-			return new KVBatch(
-					mapKeysKV(arena, count, getterAt),
-					mapValuesKV(arena, count, getterAt)
-			);
+		private static KVBatch mapKVBatch(Arena arena, int count, Int2ObjectFunction<KV> getterAt, boolean owned) {
+			var kk = mapKeysKV(arena, count, getterAt);
+			var vv = mapValuesKV(arena, count, getterAt);
+			return owned ? new KVBatchOwned(arena, kk, vv) : new KVBatchRef(kk, vv);
 		}
 
 		private static Status handleError(Throwable ex) {

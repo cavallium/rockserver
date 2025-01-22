@@ -774,8 +774,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								yield wb;
 							}
 							case SST_INGESTION, SST_INGEST_BEHIND -> {
-								var sstWriter = getSSTWriter(columnId, null, false, mode == PutBatchMode.SST_INGEST_BEHIND);
-								refs.add(sstWriter);
+								var sstWriter = getSSTWriter(columnId, null, false, mode == PutBatchMode.SST_INGEST_BEHIND);								refs.add(sstWriter);
 								yield sstWriter;
 							}
 						};
@@ -789,25 +788,27 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 				@Override
 				public void onNext(KVBatch kvBatch) {
-					if (stopped) {
-						return;
-					}
-					var keyIt = kvBatch.keys().iterator();
-					var valueIt = kvBatch.values().iterator();
-					try (var arena = Arena.ofConfined()) {
-						while (keyIt.hasNext()) {
-							var key = keyIt.next();
-							var value = valueIt.next();
-							put(arena, writer, col, 0, key, value, RequestType.none());
+					try (kvBatch) {
+						if (stopped) {
+							return;
 						}
-					} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
-						doFinally();
-						throw ex;
-					} catch (Exception ex) {
-						doFinally();
-						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+						var keyIt = kvBatch.keys().iterator();
+						var valueIt = kvBatch.values().iterator();
+						try (var arena = Arena.ofConfined()) {
+							while (keyIt.hasNext()) {
+								var key = keyIt.next();
+								var value = valueIt.next();
+								put(arena, writer, col, 0, key, value, RequestType.none());
+							}
+						} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+							doFinally();
+							throw ex;
+						} catch (Exception ex) {
+							doFinally();
+							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+						}
+						subscription.request(1);
 					}
-					subscription.request(1);
 				}
 
 				@Override

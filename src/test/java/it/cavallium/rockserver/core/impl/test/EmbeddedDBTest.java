@@ -4,6 +4,7 @@ import static it.cavallium.rockserver.core.common.Utils.toMemorySegmentSimple;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.lang.foreign.Arena;
@@ -471,7 +472,7 @@ abstract class EmbeddedDBTest {
 							keys.add(keyI);
 							values.add(valueI);
 						}
-						items.add(new KVBatch(keys, values));
+						items.add(new KVBatchRef(keys, values));
 						keys = new ArrayList<>();
 						values = new ArrayList<>();
 						for (int i = 2; i < 4; i++) {
@@ -480,7 +481,7 @@ abstract class EmbeddedDBTest {
 							keys.add(keyI);
 							values.add(valueI);
 						}
-						items.add(new KVBatch(keys, values));
+						items.add(new KVBatchRef(keys, values));
 						it = items.iterator();
 					}
 					@Override

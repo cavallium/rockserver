@@ -20,6 +20,8 @@ import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.FirstAndLast;
 import it.cavallium.rockserver.core.common.KVBatch;
+import it.cavallium.rockserver.core.common.KVBatch.KVBatchOwned;
+import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
@@ -240,7 +242,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}
 
 		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L) {
-			return putBatchAsync(columnId, Flux.just(new KVBatch(allKeys, allValues)), PutBatchMode.WRITE_BATCH)
+			return putBatchAsync(columnId, Flux.just(new KVBatchRef(allKeys, allValues)), PutBatchMode.WRITE_BATCH)
 					.thenApply(_ -> List.of());
 		}
 
@@ -302,10 +304,12 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 						.build())
 				.build());
 		var nextRequests = Flux.from(batchPublisher).map(batch -> {
-			var request = PutBatchRequest.newBuilder();
-			request.setData(mapKVBatch(batch));
-			return request.build();
-		});
+			try (batch) {
+				var request = PutBatchRequest.newBuilder();
+				request.setData(mapKVBatch(batch));
+				return request.build();
+			}
+		}).doOnDiscard(KVBatchOwned.class, KVBatchOwned::close);
 		var inputFlux = initialRequest.concatWith(nextRequests);
 		return reactiveStub.putBatch(inputFlux).then().toFuture();
 	}
@@ -466,30 +470,20 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	private static it.cavallium.rockserver.core.common.api.proto.KVBatch mapKVBatch(@NotNull KVBatch kvBatch) {
+		var list = mapKVList(kvBatch.keys(), kvBatch.values());
 		return it.cavallium.rockserver.core.common.api.proto.KVBatch.newBuilder()
-				.addAllEntries(mapKVList(kvBatch.keys(), kvBatch.values()))
+				.addAllEntries(list)
 				.build();
 	}
 
 	private static Iterable<KV> mapKVList(@NotNull List<Keys> keys, @NotNull List<MemorySegment> values) {
-		return new Iterable<>() {
-			@Override
-			public @NotNull Iterator<KV> iterator() {
-				var it1 = keys.iterator();
-				var it2 = values.iterator();
-				return new Iterator<>() {
-					@Override
-					public boolean hasNext() {
-						return it1.hasNext();
-					}
-
-					@Override
-					public KV next() {
-						return mapKV(it1.next(), it2.next());
-					}
-				};
-			}
-		};
+		List<KV> result = new ArrayList<>(keys.size());
+		var it1 = keys.iterator();
+		var it2 = values.iterator();
+		while (it1.hasNext()) {
+			result.add(mapKV(it1.next(), it2.next()));
+		}
+		return result;
 	}
 
 	private static KV mapKV(@NotNull Keys keys, @NotNull MemorySegment value) {

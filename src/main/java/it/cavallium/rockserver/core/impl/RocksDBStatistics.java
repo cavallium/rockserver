@@ -120,7 +120,7 @@ public class RocksDBStatistics {
 				try {
 					Thread.sleep(Duration.ofNanos(nextTaskStartTime - taskEndTime));
 				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
+					LOG.debug("Statistics sleep interrupted");
 				}
 			}
 		});
@@ -137,6 +137,7 @@ public class RocksDBStatistics {
 
 	public void close() {
 		stopRequested = true;
+		executor.interrupt();
 		try {
 			executor.join();
 		} catch (InterruptedException e) {
