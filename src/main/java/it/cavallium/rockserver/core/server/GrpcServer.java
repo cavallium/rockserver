@@ -712,7 +712,7 @@ public class GrpcServer extends Server {
 		try {
 			server.awaitTermination();
 		} catch (InterruptedException e) {
-			throw new RuntimeException(e);
+			LOG.error("Server shutdown interrupted", e);
 		}
 		elg.close();
 		scheduler.disposeGracefully().timeout(Duration.ofMinutes(2)).onErrorResume(ex -> {
