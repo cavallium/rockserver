@@ -1,9 +1,12 @@
 package it.cavallium.rockserver.core.server;
 
+import static it.cavallium.rockserver.core.common.Utils.asByteBuffer;
+
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.UpdateContext;
+import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.api.ColumnHashType;
 import it.cavallium.rockserver.core.common.api.ColumnSchema;
 import it.cavallium.rockserver.core.common.api.Delta;
@@ -14,13 +17,9 @@ import it.cavallium.rockserver.core.common.api.UpdateBegin;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.lang.foreign.ValueLayout.OfByte;
+import it.cavallium.buffer.Buf;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.List;
 import org.apache.thrift.TException;
 import org.apache.thrift.server.TThreadedSelectorServer;
@@ -33,7 +32,6 @@ import org.slf4j.LoggerFactory;
 public class ThriftServer extends Server {
 
 	private static final Logger LOG = LoggerFactory.getLogger(ThriftServer.class.getName());
-	private static final OfByte BYTE_BE = ValueLayout.JAVA_BYTE.withOrder(ByteOrder.BIG_ENDIAN);
 
 	private final Thread thriftThread;
 	private final TThreadedSelectorServer server;
@@ -59,33 +57,29 @@ public class ThriftServer extends Server {
 		thriftThread.start();
 	}
 
-	private static @NotNull List<@NotNull Keys> keysToRecords(Arena arena, @NotNull List<@NotNull List< @NotNull ByteBuffer>> keysMulti) {
-		return keysMulti.stream().map(keys -> keysToRecord(arena, keys)).toList();
+	private static @NotNull List<@NotNull Keys> keysToRecords(@NotNull List<@NotNull List< @NotNull ByteBuffer>> keysMulti) {
+		return keysMulti.stream().map(ThriftServer::keysToRecord).toList();
 	}
 
-	private static Keys keysToRecord(Arena arena, List<@NotNull ByteBuffer> keys) {
+	private static Keys keysToRecord(List<@NotNull ByteBuffer> keys) {
 		if (keys == null) {
 			return null;
 		}
-		var result = new MemorySegment[keys.size()];
+		var result = new Buf[keys.size()];
 		int i = 0;
 		for (ByteBuffer key : keys) {
-			result[i] = keyToRecord(arena, key);
+			result[i] = keyToRecord(key);
 			i++;
 		}
 		return new Keys(result);
 	}
 
-	private static @NotNull List<@NotNull MemorySegment> keyToRecords(Arena arena, @NotNull List<@NotNull ByteBuffer> keyMulti) {
-		return keyMulti.stream().map(key -> keyToRecord(arena, key)).toList();
+	private static @NotNull List<@NotNull Buf> keyToRecords(@NotNull List<@NotNull ByteBuffer> keyMulti) {
+		return keyMulti.stream().map(ThriftServer::keyToRecord).toList();
 	}
 
-	private static @NotNull MemorySegment keyToRecord(Arena arena, @NotNull ByteBuffer key) {
-		if (key.isDirect()) {
-			return MemorySegment.ofBuffer(key);
-		} else {
-			return arena.allocate(key.remaining()).copyFrom(MemorySegment.ofBuffer(key));
-		}
+	private static @NotNull Buf keyToRecord(@NotNull ByteBuffer key) {
+		return Utils.fromByteBuffer(key);
 	}
 
 	private static it.cavallium.rockserver.core.common.ColumnSchema columnSchemaToRecord(ColumnSchema schema) {
@@ -107,24 +101,24 @@ public class ThriftServer extends Server {
 		return it.cavallium.rockserver.core.common.ColumnHashType.valueOf(variableTailKey.name());
 	}
 
-	private static OptionalBinary mapResult(MemorySegment memorySegment) {
+	private static OptionalBinary mapResult(Buf buf) {
 		var result = new OptionalBinary();
-		return memorySegment != null ? result.setValue(ByteBuffer.wrap(memorySegment.toArray(BYTE_BE))) : result;
+		return buf != null ? result.setValue(asByteBuffer(buf)) : result;
 	}
 
-	private static UpdateBegin mapResult(UpdateContext<MemorySegment> context) {
+	private static UpdateBegin mapResult(UpdateContext<Buf> context) {
 		return new UpdateBegin()
 				.setUpdateId(context.updateId())
-				.setPrevious(context.previous() != null ? context.previous().asByteBuffer() : null);
+				.setPrevious(context.previous() != null ? asByteBuffer(context.previous()) : null);
 	}
 
-	private static Delta mapResult(it.cavallium.rockserver.core.common.Delta<MemorySegment> delta) {
+	private static Delta mapResult(it.cavallium.rockserver.core.common.Delta<Buf> delta) {
 		return new Delta()
-				.setPrevious(delta.previous() != null ? delta.previous().asByteBuffer() : null)
-				.setCurrent(delta.current() != null ? delta.current().asByteBuffer() : null);
+				.setPrevious(delta.previous() != null ? asByteBuffer(delta.previous()) : null)
+				.setCurrent(delta.current() != null ? asByteBuffer(delta.current()) : null);
 	}
 
-	private static List<OptionalBinary> mapResult(List<MemorySegment> multi) {
+	private static List<OptionalBinary> mapResult(List<Buf> multi) {
 		return multi.stream().map(ThriftServer::mapResult).toList();
 	}
 
@@ -180,9 +174,7 @@ public class ThriftServer extends Server {
 				long columnId,
 				List<ByteBuffer> keys,
 				ByteBuffer value) {
-			try (var arena = Arena.ofConfined()) {
-				client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.none());
-			}
+			client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.none());
 		}
 
 		@Override
@@ -190,9 +182,8 @@ public class ThriftServer extends Server {
 				long columnId,
 				List<List<ByteBuffer>> keysMulti,
 				List<ByteBuffer> valueMulti) {
-			try (var arena = Arena.ofConfined()) {
-				client.getSyncApi().putMulti(arena, transactionOrUpdateId, columnId, keysToRecords(arena, keysMulti), keyToRecords(arena, valueMulti), RequestType.none());
-			}
+			client.getSyncApi().putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(
+					valueMulti), RequestType.none());
 		}
 
 		@Override
@@ -200,9 +191,7 @@ public class ThriftServer extends Server {
 				long columnId,
 				List<ByteBuffer> keys,
 				ByteBuffer value) {
-			try (var arena = Arena.ofConfined()) {
-				return ThriftServer.mapResult(client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.previous()));
-			}
+			return ThriftServer.mapResult(client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.previous()));
 		}
 
 		@Override
@@ -210,9 +199,7 @@ public class ThriftServer extends Server {
 				long columnId,
 				List<ByteBuffer> keys,
 				ByteBuffer value) {
-			try (var arena = Arena.ofConfined()) {
-				return ThriftServer.mapResult(client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.delta()));
-			}
+			return ThriftServer.mapResult(client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.delta()));
 		}
 
 		@Override
@@ -220,9 +207,7 @@ public class ThriftServer extends Server {
 				long columnId,
 				List<ByteBuffer> keys,
 				ByteBuffer value) {
-			try (var arena = Arena.ofConfined()) {
-				return client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.changed());
-			}
+			return client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.changed());
 		}
 
 		@Override
@@ -230,36 +215,28 @@ public class ThriftServer extends Server {
 				long columnId,
 				List<ByteBuffer> keys,
 				ByteBuffer value) {
-			try (var arena = Arena.ofConfined()) {
-				return client.getSyncApi().put(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), keyToRecord(arena, value), RequestType.previousPresence());
-			}
+			return client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.previousPresence());
 		}
 
 		@Override
 		public OptionalBinary get(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys) {
-			try (var arena = Arena.ofConfined()) {
-				return ThriftServer.mapResult(client.getSyncApi().get(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), RequestType.current()));
-			}
+			return ThriftServer.mapResult(client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.current()));
 		}
 
 		@Override
 		public UpdateBegin getForUpdate(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys) {
-			try (var arena = Arena.ofConfined()) {
-				return mapResult(client.getSyncApi().get(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), RequestType.forUpdate()));
-			}
+			return mapResult(client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.forUpdate()));
 		}
 
 		@Override
 		public boolean exists(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys) {
-			try (var arena = Arena.ofConfined()) {
-				return client.getSyncApi().get(arena, transactionOrUpdateId, columnId, keysToRecord(arena, keys), RequestType.exists());
-			}
+			return client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.exists());
 		}
 
 		@Override
@@ -269,9 +246,8 @@ public class ThriftServer extends Server {
 				List<ByteBuffer> endKeysExclusive,
 				boolean reverse,
 				long timeoutMs) {
-			try (var arena = Arena.ofConfined()) {
-				return client.getSyncApi().openIterator(arena, transactionId, columnId, keysToRecord(arena, startKeysInclusive), keysToRecord(arena, endKeysExclusive), reverse, timeoutMs);
-			}
+			return client.getSyncApi().openIterator(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(
+					endKeysExclusive), reverse, timeoutMs);
 		}
 
 		@Override
@@ -281,34 +257,26 @@ public class ThriftServer extends Server {
 
 		@Override
 		public void seekTo(long iterationId, List<ByteBuffer> keys) {
-			try (var arena = Arena.ofConfined()) {
-				client.getSyncApi().seekTo(arena, iterationId, keysToRecord(arena, keys));
-			}
+			client.getSyncApi().seekTo(iterationId, keysToRecord(keys));
 		}
 
 		@Override
 		public void subsequent(long iterationId, long skipCount, long takeCount) {
-			try (var arena = Arena.ofConfined()) {
-				client.getSyncApi().subsequent(arena, iterationId, skipCount, takeCount, RequestType.none());
-			}
+			client.getSyncApi().subsequent(iterationId, skipCount, takeCount, RequestType.none());
 		}
 
 		@Override
 		public boolean subsequentExists(long iterationId,
 				long skipCount,
 				long takeCount) {
-			try (var arena = Arena.ofConfined()) {
-				return client.getSyncApi().subsequent(arena, iterationId, skipCount, takeCount, RequestType.exists());
-			}
+			return client.getSyncApi().subsequent(iterationId, skipCount, takeCount, RequestType.exists());
 		}
 
 		@Override
 		public List<OptionalBinary> subsequentMultiGet(long iterationId,
 				long skipCount,
 				long takeCount) {
-			try (var arena = Arena.ofConfined()) {
-				return mapResult(client.getSyncApi().subsequent(arena, iterationId, skipCount, takeCount, RequestType.multi()));
-			}
+			return mapResult(client.getSyncApi().subsequent(iterationId, skipCount, takeCount, RequestType.multi()));
 		}
 	}
 

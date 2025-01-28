@@ -21,11 +21,7 @@ import static it.cavallium.rockserver.core.impl.XXHashUtils.PRIME4;
 import static it.cavallium.rockserver.core.impl.XXHashUtils.PRIME5;
 import static java.lang.Integer.rotateLeft;
 
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.lang.foreign.ValueLayout.OfByte;
-import java.lang.foreign.ValueLayout.OfInt;
-import java.nio.ByteOrder;
+import it.cavallium.buffer.Buf;
 import java.util.Objects;
 
 /**
@@ -35,9 +31,6 @@ public final class XXHash32JavaSafe extends XXHash32 {
 
 
 	public static final XXHash32 INSTANCE = new XXHash32JavaSafe();
-	private static final OfInt INT_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-	private static final OfInt INT_BE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-	private static final OfByte BYTE_BE = ValueLayout.JAVA_BYTE.withOrder(ByteOrder.BIG_ENDIAN);
 
 	@Override
 	public int hash(byte[] buf, int off, int len, int seed) {
@@ -103,8 +96,8 @@ public final class XXHash32JavaSafe extends XXHash32 {
 	}
 
 	@Override
-	public void hash(MemorySegment buf, int off, int len, int seed, MemorySegment result) {
-		Objects.checkFromIndexSize(off, len, buf.byteSize());
+	public void hash(Buf buf, int off, int len, int seed, Buf result) {
+		Objects.checkFromIndexSize(off, len, buf.size());
 
 		final int end = off + len;
 		int h32;
@@ -151,7 +144,7 @@ public final class XXHash32JavaSafe extends XXHash32 {
 		}
 
 		while (off < end) {
-			h32 += (buf.get(BYTE_BE, off) & 0xFF) * PRIME5;
+			h32 += (buf.getByte(off) & 0xFF) * PRIME5;
 			h32 = rotateLeft(h32, 11) * PRIME1;
 			++off;
 		}
@@ -162,15 +155,15 @@ public final class XXHash32JavaSafe extends XXHash32 {
 		h32 *= PRIME3;
 		h32 ^= h32 >>> 16;
 
-		assert result.byteSize() >= Integer.BYTES;
-		result.set(INT_BE, 0, h32);
+		assert result.size() >= Integer.BYTES;
+		result.setInt(0, h32);
 	}
 
 	private static int readIntLE(byte[] buf, int i) {
 		return (buf[i] & 0xFF) | ((buf[i+1] & 0xFF) << 8) | ((buf[i+2] & 0xFF) << 16) | ((buf[i+3] & 0xFF) << 24);
 	}
 
-	private static int readIntLE(MemorySegment buf, int i) {
-		return buf.get(INT_LE, i);
+	private static int readIntLE(Buf buf, int i) {
+		return buf.getIntLE(i);
 	}
 }

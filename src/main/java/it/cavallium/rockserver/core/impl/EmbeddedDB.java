@@ -1,7 +1,8 @@
 package it.cavallium.rockserver.core.impl;
 
-import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
-import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_BYTES;
+import static it.cavallium.rockserver.core.common.Utils.dummyRocksDBEmptyValue;
+import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
+import static it.cavallium.rockserver.core.common.Utils.toBuf;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
@@ -9,6 +10,7 @@ import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.util.NamedThreadFactory;
+import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestEntriesCount;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
@@ -29,7 +31,6 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
-import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
@@ -43,8 +44,6 @@ import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -79,9 +78,11 @@ import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.DBOptions;
 import org.rocksdb.DirectSlice;
+import org.rocksdb.Holder;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
+import org.rocksdb.Slice;
 import org.rocksdb.Status.Code;
 import org.rocksdb.TableProperties;
 import org.rocksdb.WriteBatch;
@@ -686,12 +687,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public <T> T put(Arena arena,
-			long transactionOrUpdateId,
+	public <T> T put(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
-			@NotNull MemorySegment value,
-			RequestPut<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
+			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
@@ -704,7 +704,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				tx = null;
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-			return put(arena, tx, col, updateId, keys, value, requestType);
+			return put(tx, col, updateId, keys, value, requestType);
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -717,12 +717,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public <T> List<T> putMulti(Arena arena,
-			long transactionOrUpdateId,
+	public <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
-			@NotNull List<@NotNull MemorySegment> values,
-			RequestPut<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
+			@NotNull List<@NotNull Buf> values,
+			RequestPut<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
 		try {
 			if (keys.size() != values.size()) {
@@ -730,7 +729,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			List<T> responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keys.size());
 			for (int i = 0; i < keys.size(); i++) {
-				var result = put(arena, transactionOrUpdateId, columnId, keys.get(i), values.get(i), requestType);
+				var result = put(transactionOrUpdateId, columnId, keys.get(i), values.get(i), requestType);
 				if (responses != null) {
 					responses.add(result);
 				}
@@ -793,11 +792,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					var keyIt = kvBatch.keys().iterator();
 					var valueIt = kvBatch.values().iterator();
-					try (var arena = Arena.ofConfined()) {
+					try {
 						while (keyIt.hasNext()) {
 							var key = keyIt.next();
 							var value = valueIt.next();
-							put(arena, writer, col, 0, key, value, RequestType.none());
+							put(writer, col, 0, key, value, RequestType.none());
 						}
 					} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 						doFinally();
@@ -911,13 +910,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private <U> U put(Arena arena,
-			@Nullable DBWriter optionalDbWriter,
+	private <U> U put(@Nullable DBWriter optionalDbWriter,
 			ColumnInstance col,
 			long updateId,
 			@NotNull Keys keys,
-			@NotNull MemorySegment value,
-			RequestPut<? super MemorySegment, U> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			@NotNull Buf value,
+			RequestPut<? super Buf, U> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		// Check for null value
 		col.checkNullableValue(value);
 		try {
@@ -950,8 +948,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				boolean didGetForUpdateInternally = false;
 				boolean committedOwnedTx;
 				do {
-					MemorySegment previousValue;
-					MemorySegment calculatedKey = col.calculateKey(arena, keys.keys());
+					Buf previousValue;
+					Buf calculatedKey = col.calculateKey(keys.keys());
 					if (updateId != 0L) {
 						assert !owningNewTx;
 						((Tx) newTx).val().setSavePoint();
@@ -960,13 +958,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 						try (var readOptions = newReadOptions()) {
-							var previousRawBucketByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+							var previousRawBucketByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
 							didGetForUpdateInternally = true;
-							MemorySegment previousRawBucket = toMemorySegment(arena, previousRawBucketByteArray);
+							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
 							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
 							previousValue = transformResultValue(col, bucket.addElement(bucketElementKeys, value));
 							var k = Utils.toByteArray(calculatedKey);
-							var v = Utils.toByteArray(bucket.toSegment(arena));
+							var v = Utils.toByteArray(bucket.toSegment());
 							((Tx) newTx).val().put(col.cfh(), k, v);
 						} catch (org.rocksdb.RocksDBException e) {
 							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_1, e);
@@ -976,9 +974,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							assert newTx instanceof Tx;
 							try (var readOptions = newReadOptions()) {
 								byte[] previousValueByteArray;
-								previousValueByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+								previousValueByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
 								didGetForUpdateInternally = true;
-								previousValue = transformResultValue(col, toMemorySegment(arena, previousValueByteArray));
+								previousValue = transformResultValue(col, toBuf(previousValueByteArray));
 							} catch (org.rocksdb.RocksDBException e) {
 								throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
 							}
@@ -987,9 +985,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							assert newTx instanceof Tx;
 							try (var readOptions = newReadOptions()) {
 								byte[] previousValueByteArray;
-								previousValueByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+								previousValueByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
 								didGetForUpdateInternally = true;
-								previousValue = previousValueByteArray != null ? MemorySegment.NULL : null;
+								previousValue = previousValueByteArray != null ? Utils.emptyBuf() : null;
 							} catch (org.rocksdb.RocksDBException e) {
 								throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
 							}
@@ -997,21 +995,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							previousValue = null;
 						}
 						switch (newTx) {
-							case WB wb -> wb.wb().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
+							case WB wb -> wb.wb().put(col.cfh(), calculatedKey.toByteArray(), value.toByteArray());
 							case SSTWriter sstWriter -> {
-								var keyBB = calculatedKey.asByteBuffer();
-								ByteBuffer valueBB = (col.schema().hasValue() ? value : Utils.dummyEmptyValue()).asByteBuffer();
+								var keyBB = calculatedKey.toByteArray();
+								var valueBB = (col.schema().hasValue() ? value : dummyRocksDBEmptyValue()).toByteArray();
 								sstWriter.put(keyBB, valueBB);
 							}
-							case Tx t -> t.val().put(col.cfh(), Utils.toByteArray(calculatedKey), Utils.toByteArray(value));
+							case Tx t -> t.val().put(col.cfh(), calculatedKey.toByteArray(), value.toByteArray());
 							case null -> {
 								try (var w = new WriteOptions() {
 									{
 										RocksLeakDetector.register(this, owningHandle_);
 									}
 								}) {
-									var keyBB = calculatedKey.asByteBuffer();
-									ByteBuffer valueBB = (col.schema().hasValue() ? value : Utils.dummyEmptyValue()).asByteBuffer();
+									var keyBB = calculatedKey.toByteArray();
+									var valueBB = (col.schema().hasValue() ? value : dummyRocksDBEmptyValue()).toByteArray();
 									db.get().put(col.cfh(), w, keyBB, valueBB);
 								}
 							}
@@ -1073,16 +1071,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private MemorySegment transformResultValue(ColumnInstance col, MemorySegment realPreviousValue) {
-		return col.schema().hasValue() ? realPreviousValue : (realPreviousValue != null ? MemorySegment.NULL : null);
+	private Buf transformResultValue(ColumnInstance col, Buf realPreviousValue) {
+		return col.schema().hasValue() ? realPreviousValue : (realPreviousValue != null ? emptyBuf() : null);
 	}
 
 	@Override
-	public <T> T get(Arena arena,
-			long transactionOrUpdateId,
+	public <T> T get(long transactionOrUpdateId,
 			long columnId,
 			Keys keys,
-			RequestGet<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestGet<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
 		try {
 			// Column id
@@ -1104,7 +1101,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 
 			try {
-				return get(arena, tx, updateId, col, keys, requestType);
+				return get(tx, updateId, col, keys, requestType);
 			} catch (Throwable ex) {
 				if (tx != prevTx) {
 					closeTransaction(updateId, false);
@@ -1117,26 +1114,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private <T> T get(Arena arena,
-			Tx tx,
+	private <T> T get(Tx tx,
 			long updateId,
 			ColumnInstance col,
 			Keys keys,
-			RequestGet<? super MemorySegment, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestGet<? super Buf, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
 		ops.beginOp();
 		try {
 			if (!col.schema().hasValue() && RequestType.requiresGettingCurrentValue(callback)) {
 				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
 						"The specified callback requires a return value, but this column does not have values!");
 			}
-			MemorySegment foundValue;
+			Buf foundValue;
 			boolean existsValue;
 
-			MemorySegment calculatedKey = col.calculateKey(arena, keys.keys());
+			Buf calculatedKey = col.calculateKey(keys.keys());
 			if (col.hasBuckets()) {
 				var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 				try (var readOptions = newReadOptions()) {
-					MemorySegment previousRawBucket = dbGet(tx, col, arena, readOptions, calculatedKey);
+					Buf previousRawBucket = dbGet(tx, col, readOptions, calculatedKey);
 					if (previousRawBucket != null) {
 						var bucket = new Bucket(col, previousRawBucket);
 						foundValue = bucket.getElement(bucketElementKeys);
@@ -1152,7 +1148,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						|| (tx != null && callback instanceof RequestType.RequestExists<?>);
 				if (shouldGetCurrent) {
 					try (var readOptions = newReadOptions()) {
-						foundValue = dbGet(tx, col, arena, readOptions, calculatedKey);
+						foundValue = dbGet(tx, col, readOptions, calculatedKey);
 						existsValue = foundValue != null;
 					} catch (org.rocksdb.RocksDBException e) {
 						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
@@ -1162,7 +1158,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					//noinspection ConstantValue
 					assert tx == null;
 					foundValue = null;
-					existsValue = db.get().keyExists(col.cfh(), calculatedKey.asByteBuffer());
+					existsValue = db.get().keyExists(col.cfh(),
+							calculatedKey.getBackingByteArray(),
+							calculatedKey.getBackingByteArrayOffset(),
+							calculatedKey.getBackingByteArrayLength()
+					);
 				} else {
 					foundValue = null;
 					existsValue = false;
@@ -1187,8 +1187,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public long openIterator(Arena arena,
-			long transactionId,
+	public long openIterator(long transactionId,
 			long columnId,
 			Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
@@ -1233,7 +1232,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public void seekTo(Arena arena, long iterationId, @NotNull Keys keys)
+	public void seekTo(long iterationId, @NotNull Keys keys)
 			throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
 		ops.beginOp();
@@ -1247,11 +1246,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public <T> T subsequent(Arena arena,
-			long iterationId,
+	public <T> T subsequent(long iterationId,
 			long skipCount,
 			long takeCount,
-			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
+			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
@@ -1265,8 +1263,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@SuppressWarnings("unchecked")
     @Override
-	public <T> T reduceRange(Arena arena,
-							 long transactionId,
+	public <T> T reduceRange(long transactionId,
 							 long columnId,
 							 @Nullable Keys startKeysInclusive,
 							 @Nullable Keys endKeysExclusive,
@@ -1287,10 +1284,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 
 			try (var ro = newReadOptions()) {
-				MemorySegment calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
-				MemorySegment calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
-				try (var startKeySlice = calculatedStartKey != null ? toDirectSlice(calculatedStartKey) : null;
-					 var endKeySlice = calculatedEndKey != null ? toDirectSlice(calculatedEndKey) : null) {
+				Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(startKeysInclusive.keys()) : null;
+				Buf calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(endKeysExclusive.keys()) : null;
+				try (var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
+					 var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null) {
 					if (startKeySlice != null) {
 						ro.setIterateLowerBound(startKeySlice);
 					}
@@ -1339,9 +1336,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								if (!it.isValid()) {
 									yield new FirstAndLast<>(null, null);
 								}
-								var calculatedKey = toMemorySegment(arena, it.key());
-								var calculatedValue = col.schema().hasValue() ? toMemorySegment(it.value()) : MemorySegment.NULL;
-								var first = decodeKVNoBuckets(arena, col, calculatedKey, calculatedValue);
+								var calculatedKey = toBuf(it.key());
+								var calculatedValue = col.schema().hasValue() ? toBuf(it.value()) : emptyBuf();
+								var first = decodeKVNoBuckets(col, calculatedKey, calculatedValue);
 
 								if (!reverse) {
 									it.seekToLast();
@@ -1349,9 +1346,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									it.seekToFirst();
 								}
 
-								calculatedKey = toMemorySegment(arena, it.key());
-								calculatedValue = col.schema().hasValue() ? toMemorySegment(it.value()) : MemorySegment.NULL;
-								var last = decodeKVNoBuckets(arena, col, calculatedKey, calculatedValue);
+								calculatedKey = toBuf(it.key());
+								calculatedValue = col.schema().hasValue() ? toBuf(it.value()) : emptyBuf();
+								var last = decodeKVNoBuckets(col, calculatedKey, calculatedValue);
 								yield new FirstAndLast<>(first, last);
 							}
 						};
@@ -1366,8 +1363,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public <T> Stream<T> getRange(Arena arena,
-			long transactionId,
+	public <T> Stream<T> getRange(long transactionId,
 			long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
@@ -1375,13 +1371,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
 			long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		return Flux
-				.from(this.getRangeAsyncInternal(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs))
+				.from(this.getRangeAsyncInternal(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs))
 				.toStream();
 	}
 
 	/** See: {@link it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange}. */
-	public <T> Publisher<T> getRangeAsyncInternal(Arena paramsArena,
-										   long transactionId,
+	public <T> Publisher<T> getRangeAsyncInternal(long transactionId,
 										   long columnId,
 										   @Nullable Keys startKeysInclusive,
 										   @Nullable Keys endKeysExclusive,
@@ -1389,14 +1384,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 										   RequestType.RequestGetRange<? super KV, T> requestType,
 										   long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		LongAdder totalTime =  new LongAdder();
-		record Resources(Arena arena, ColumnInstance col, ReadOptions ro, AbstractSlice<?> startKeySlice,
+		record Resources(ColumnInstance col, ReadOptions ro, AbstractSlice<?> startKeySlice,
 						 AbstractSlice<?> endKeySlice, RocksIterator it) {
 			public void close() {
 				ro.close();
 				if (startKeySlice != null) startKeySlice.close();
 				if (endKeySlice != null) endKeySlice.close();
 				it.close();
-				arena.close();
 			}
 		}
 		return Flux.using(() -> {
@@ -1410,45 +1404,39 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 
-			var arena = Arena.ofConfined();
+			var ro = newReadOptions();
 			try {
-				var ro = newReadOptions();
+				Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(startKeysInclusive.keys()) : null;
+				Buf calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(endKeysExclusive.keys()) : null;
+				var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
 				try {
-					MemorySegment calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(arena, startKeysInclusive.keys()) : null;
-					MemorySegment calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(arena, endKeysExclusive.keys()) : null;
-					var startKeySlice = calculatedStartKey != null ? toDirectSlice(calculatedStartKey) : null;
+					var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null;
 					try {
-						var endKeySlice = calculatedEndKey != null ? toDirectSlice(calculatedEndKey) : null;
-						try {
-							if (startKeySlice != null) {
-								ro.setIterateLowerBound(startKeySlice);
-							}
-							if (endKeySlice != null) {
-								ro.setIterateUpperBound(endKeySlice);
-							}
-
-							RocksIterator it;
-							if (transactionId > 0L) {
-								//noinspection resource
-								it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
-							} else {
-								it = db.get().newIterator(col.cfh(), ro);
-							}
-							return new Resources(arena, col, ro, startKeySlice, endKeySlice, it);
-						} catch (Throwable ex) {
-							if (endKeySlice != null) endKeySlice.close();
-							throw ex;
+						if (startKeySlice != null) {
+							ro.setIterateLowerBound(startKeySlice);
 						}
+						if (endKeySlice != null) {
+							ro.setIterateUpperBound(endKeySlice);
+						}
+
+						RocksIterator it;
+						if (transactionId > 0L) {
+							//noinspection resource
+							it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+						} else {
+							it = db.get().newIterator(col.cfh(), ro);
+						}
+						return new Resources(col, ro, startKeySlice, endKeySlice, it);
 					} catch (Throwable ex) {
-						if (startKeySlice != null) startKeySlice.close();
+						if (endKeySlice != null) endKeySlice.close();
 						throw ex;
 					}
 				} catch (Throwable ex) {
-					ro.close();
+					if (startKeySlice != null) startKeySlice.close();
 					throw ex;
 				}
 			} catch (Throwable ex) {
-				arena.close();
+				ro.close();
 				throw ex;
 			} finally {
 				totalTime.add(System.nanoTime() - initializationStartTime);
@@ -1471,14 +1459,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (!it.isValid()) {
 					sink.complete();
 				} else {
-					var calculatedKey = toMemorySegment(null, it.key());
-					var calculatedValue = res.col.schema().hasValue() ? toMemorySegment(it.value()) : MemorySegment.NULL;
+					var calculatedKey = toBuf(it.key());
+					var calculatedValue = res.col.schema().hasValue() ? toBuf(it.value()) : emptyBuf();
 					if (!reverse) {
 						res.it.next();
 					} else {
 						res.it.prev();
 					}
-					var kv = decodeKVNoBuckets(null, res.col, calculatedKey, calculatedValue);
+					var kv = decodeKVNoBuckets(res.col, calculatedKey, calculatedValue);
 
 					//noinspection unchecked
 					sink.next((T) kv);
@@ -1503,38 +1491,41 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		});
 	}
 
-	private MemorySegment dbGet(Tx tx,
-								ColumnInstance col,
-								Arena arena,
-								ReadOptions readOptions,
-								MemorySegment calculatedKey) throws org.rocksdb.RocksDBException {
+	private Buf dbGet(Tx tx,
+								ColumnInstance col, ReadOptions readOptions,
+								Buf calculatedKey) throws org.rocksdb.RocksDBException {
 		if (tx != null) {
 			byte[] previousRawBucketByteArray;
 			if (tx.isFromGetForUpdate()) {
-				previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES), true);
+				previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
 			} else {
-				previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKey.toArray(BIG_ENDIAN_BYTES));
+				previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKey.toByteArray());
 			}
-			return toMemorySegment(arena, previousRawBucketByteArray);
+			return toBuf(previousRawBucketByteArray);
 		} else {
 			var db = this.db.get();
 			if (fastGet) {
-				return dbGetDirect(arena, col.cfh(), readOptions, calculatedKey);
+				return dbGetIndirect(col.cfh(), readOptions, calculatedKey);
 			} else {
-				var previousRawBucketByteArray = db.get(col.cfh(), readOptions, calculatedKey.toArray(BIG_ENDIAN_BYTES));
-				return toMemorySegment(arena, previousRawBucketByteArray);
+				var previousRawBucketByteArray = db.get(col.cfh(),
+						readOptions,
+						calculatedKey.getBackingByteArray(),
+						calculatedKey.getBackingByteArrayOffset(),
+						calculatedKey.getBackingByteArrayLength()
+				);
+				return toBuf(previousRawBucketByteArray);
 			}
 		}
 	}
 
 	@Nullable
-	private MemorySegment dbGetDirect(Arena arena, ColumnFamilyHandle cfh, ReadOptions readOptions, MemorySegment calculatedKey)
+	private Buf dbGetDirect(ColumnFamilyHandle cfh, ReadOptions readOptions, Buf calculatedKey)
 			throws org.rocksdb.RocksDBException {
 		// Get the key nio buffer to pass to RocksDB
-		ByteBuffer keyNioBuffer = calculatedKey.asByteBuffer();
+		ByteBuffer keyNioBuffer = calculatedKey.asHeapByteBuffer();
 
 		// Create a direct result buffer because RocksDB works only with direct buffers
-		var resultBuffer = arena.allocate(INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES).asByteBuffer();
+		var resultBuffer = ByteBuffer.allocate(INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES);
 		var keyMayExist = this.db.get().keyMayExist(cfh, readOptions, keyNioBuffer.rewind(), resultBuffer.clear());
 		return switch (keyMayExist.exists) {
 			case kNotExist -> null;
@@ -1543,7 +1534,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				int size = keyMayExist.exists == kExistsWithValue ? keyMayExist.valueLength : -1;
 				if (keyMayExist.exists == kExistsWithoutValue || size > resultBuffer.limit()) {
 					if (size > resultBuffer.capacity()) {
-						resultBuffer = arena.allocate(size).asByteBuffer();
+						resultBuffer = ByteBuffer.allocate(size);
 					}
 					size = this.db.get().get(cfh, readOptions, keyNioBuffer.rewind(), resultBuffer.clear());
 				}
@@ -1551,12 +1542,29 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (size == RocksDB.NOT_FOUND) {
 					yield null;
 				} else if (size == resultBuffer.limit()) {
-					yield MemorySegment.ofBuffer(resultBuffer);
+					yield Utils.fromHeapByteBuffer(resultBuffer);
 				} else {
 					throw new IllegalStateException("size (" + size + ") != read size (" + resultBuffer.limit() + ")");
 				}
 			}
 		};
+	}
+
+	@Nullable
+	private Buf dbGetIndirect(ColumnFamilyHandle cfh, ReadOptions readOptions, Buf calculatedKey)
+			throws org.rocksdb.RocksDBException {
+		var valueHolder = new Holder<byte[]>();
+		var keyMayExist = this.db.get().keyMayExist(cfh, readOptions, calculatedKey.getBackingByteArray(), calculatedKey.getBackingByteArrayOffset(), calculatedKey.getBackingByteArrayLength(), valueHolder);
+		if (keyMayExist) {
+			var value = valueHolder.getValue();
+			if (value != null) {
+				return Buf.wrap(value);
+			} else {
+				return toBuf(this.db.get().get(cfh, readOptions, calculatedKey.getBackingByteArray(), calculatedKey.getBackingByteArrayOffset(), calculatedKey.getBackingByteArrayLength()));
+			}
+		} else {
+			return null;
+		}
 	}
 
 	private ColumnInstance getColumn(long columnId) {
@@ -1596,17 +1604,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return config;
 	}
 
-	private AbstractSlice<?> toDirectSlice(MemorySegment calculatedKey) {
-		return new DirectSlice(calculatedKey.asByteBuffer(), (int) calculatedKey.byteSize());
+	private AbstractSlice<?> toDirectSlice(Buf calculatedKey) {
+		return new DirectSlice(calculatedKey.asHeapByteBuffer(), calculatedKey.size());
 	}
 
-	private KV decodeKVNoBuckets(@Nullable Arena arena, ColumnInstance col, MemorySegment calculatedKey, MemorySegment calculatedValue) {
-		var keys = col.decodeKeys(arena, calculatedKey, calculatedValue);
+	private AbstractSlice<?> toSlice(Buf calculatedKey) {
+		return new Slice(calculatedKey.asArray());
+	}
+
+	private KV decodeKVNoBuckets(ColumnInstance col, Buf calculatedKey, Buf calculatedValue) {
+		var keys = col.decodeKeys(calculatedKey, calculatedValue);
 		return new KV(new Keys(keys), calculatedValue);
 	}
 
-	private KV decodeKV(Arena arena, ColumnInstance col, MemorySegment calculatedKey, MemorySegment calculatedValue) {
-		var keys = col.decodeKeys(arena, calculatedKey, calculatedValue);
+	private KV decodeKV(ColumnInstance col, Buf calculatedKey, Buf calculatedValue) {
+		var keys = col.decodeKeys(calculatedKey, calculatedValue);
 		// todo: implement
 		throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
 				"Bucket column type not implemented, implement them");

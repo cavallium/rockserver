@@ -13,6 +13,7 @@ module rockserver.core {
 	requires io.grpc.protobuf;
 	requires io.grpc.stub;
 	requires io.grpc;
+	requires it.cavallium.datagen;
 	requires com.google.common;
 	requires io.grpc.netty;
 	requires io.jstach.rainbowgum;

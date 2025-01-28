@@ -2,7 +2,6 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import java.lang.ref.Cleaner;
 import java.util.concurrent.atomic.AtomicBoolean;
-import org.rocksdb.AbstractImmutableNativeReference;
 import org.rocksdb.RocksObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

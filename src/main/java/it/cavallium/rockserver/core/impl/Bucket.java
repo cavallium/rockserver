@@ -1,12 +1,10 @@
 package it.cavallium.rockserver.core.impl;
 
-import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_INT;
-import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_INT_UNALIGNED;
+import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
 import static java.lang.Math.toIntExact;
 
 import it.cavallium.rockserver.core.common.Utils;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
+import it.cavallium.buffer.Buf;
 import java.util.ArrayList;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -15,46 +13,46 @@ import org.jetbrains.annotations.Nullable;
 public class Bucket {
 
 	private final ColumnInstance col;
-	private final ArrayList<Entry<MemorySegment[], MemorySegment>> elements;
+	private final ArrayList<Entry<Buf[], Buf>> elements;
 
 	public Bucket(ColumnInstance col) {
-		this(col, MemorySegment.NULL);
+		this(col, emptyBuf());
 	}
 
-	public Bucket(ColumnInstance col, MemorySegment rawBucketSegment) {
+	public Bucket(ColumnInstance col, Buf rawBucketSegment) {
 		this.col = col;
-		long offset = 0;
+		int offset = 0;
 		this.elements = new ArrayList<>();
-		long rawBucketSegmentByteSize = rawBucketSegment.byteSize();
+		int rawBucketSegmentByteSize = rawBucketSegment.size();
 		if (rawBucketSegmentByteSize > 0) {
-			var elements = rawBucketSegment.get(ColumnInstance.BIG_ENDIAN_INT_UNALIGNED, offset);
+			var elements = rawBucketSegment.getInt(offset);
 			offset += Integer.BYTES;
 			int elementI = 0;
 			while (elementI < elements) {
-				var elementKVSize = rawBucketSegment.get(ColumnInstance.BIG_ENDIAN_INT_UNALIGNED, offset);
+				var elementKVSize = rawBucketSegment.getInt(offset);
 				offset += Integer.BYTES;
 
-				MemorySegment[] bucketElementKeys;
+				Buf[] bucketElementKeys;
 				{
 					int segmentOffset = 0;
-					var elementKVSegment = rawBucketSegment.asSlice(offset, elementKVSize, 1);
+					var elementKVSegment = rawBucketSegment.subList(offset, offset + elementKVSize);
 					int readKeys = 0;
-					bucketElementKeys = new MemorySegment[col.schema().variableLengthKeysCount()];
+					bucketElementKeys = new Buf[col.schema().variableLengthKeysCount()];
 					while (readKeys < col.schema().variableLengthKeysCount()) {
-						var keyISize = elementKVSegment.get(ColumnInstance.BIG_ENDIAN_CHAR_UNALIGNED, segmentOffset);
+						var keyISize = elementKVSegment.getChar(segmentOffset);
 						segmentOffset += Character.BYTES;
-						var elementKeyISegment = elementKVSegment.asSlice(segmentOffset, keyISize);
+						var elementKeyISegment = elementKVSegment.subList(segmentOffset, segmentOffset + keyISize);
 						bucketElementKeys[readKeys] = elementKeyISegment;
 						segmentOffset += keyISize;
 						readKeys++;
 					}
 
-					MemorySegment bucketElementValues;
+					Buf bucketElementValues;
 					if (col.schema().hasValue()) {
-						bucketElementValues = elementKVSegment.asSlice(segmentOffset, elementKVSize - segmentOffset);
+						bucketElementValues = elementKVSegment.subList(segmentOffset, elementKVSize);
 						segmentOffset = elementKVSize;
 					} else {
-						bucketElementValues = MemorySegment.NULL;
+						bucketElementValues = emptyBuf();
 						assert segmentOffset == elementKVSize;
 					}
 
@@ -70,12 +68,12 @@ public class Bucket {
 
 	/**
 	 * Add or replace an element
-	 * @return Return the previous value ({@link MemorySegment#NULL} if no value is expected),
+	 * @return Return the previous value ({@link Utils#emptyBuf()} if no value is expected),
 	 * return null if no element was present
 	 */
 	@Nullable
-	public MemorySegment addElement(MemorySegment[] bucketVariableKeys, @Nullable MemorySegment value) {
-		var element = Map.entry(bucketVariableKeys, value != null ? value : MemorySegment.NULL);
+	public Buf addElement(Buf[] bucketVariableKeys, @Nullable Buf value) {
+		var element = Map.entry(bucketVariableKeys, value != null ? value : emptyBuf());
 		var i = indexOf(bucketVariableKeys);
 		if (i == -1) {
 			this.elements.add(element);
@@ -89,11 +87,11 @@ public class Bucket {
 
 	/**
 	 * Remove an element
-	 * @return Return the previous value ({@link MemorySegment#NULL} if no value is expected),
+	 * @return Return the previous value ({@link Utils#emptyBuf()} if no value is expected),
 	 * return null if no element was present
 	 */
 	@Nullable
-	public MemorySegment removeElement(MemorySegment[] bucketVariableKeys) {
+	public Buf removeElement(Buf[] bucketVariableKeys) {
 		var i = indexOf(bucketVariableKeys);
 		if (i == -1) {
 			return null;
@@ -106,11 +104,11 @@ public class Bucket {
 
 	/**
 	 * Get an element
-	 * @return Return the value ({@link MemorySegment#NULL} if no value is expected),
+	 * @return Return the value ({@link Utils#emptyBuf()} if no value is expected),
 	 * return null if no element was present
 	 */
 	@Nullable
-	public MemorySegment getElement(MemorySegment[] bucketVariableKeys) {
+	public Buf getElement(Buf[] bucketVariableKeys) {
 		var i = indexOf(bucketVariableKeys);
 		if (i == -1) {
 			return null;
@@ -121,7 +119,7 @@ public class Bucket {
 		}
 	}
 
-	private int indexOf(MemorySegment[] bucketVariableKeys) {
+	private int indexOf(Buf[] bucketVariableKeys) {
 		nextElement: for (int i = 0; i < elements.size(); i++) {
 			var elem = elements.get(i);
 			var arrayKeys = elem.getKey();
@@ -136,31 +134,31 @@ public class Bucket {
 		return -1;
 	}
 
-	public MemorySegment toSegment(Arena arena) {
+	public Buf toSegment() {
 		if (this.elements.isEmpty()) {
-			return MemorySegment.NULL;
+			return emptyBuf();
 		}
-		MemorySegment[] serializedElements = new MemorySegment[this.elements.size()];
-		ArrayList<Entry<MemorySegment[], MemorySegment>> entries = this.elements;
+		Buf[] serializedElements = new Buf[this.elements.size()];
+		ArrayList<Entry<Buf[], Buf>> entries = this.elements;
 		for (int i = 0; i < entries.size(); i++) {
-			Entry<MemorySegment[], MemorySegment> element = entries.get(i);
-			var computedBucketElementKey = col.computeBucketElementKey(arena, element.getKey());
+			Entry<Buf[], Buf> element = entries.get(i);
+			var computedBucketElementKey = col.computeBucketElementKey(element.getKey());
 			var computedBucketElementValue = col.computeBucketElementValue(element.getValue());
-			serializedElements[i] = col.computeBucketElementKeyValue(arena, computedBucketElementKey, computedBucketElementValue);
+			serializedElements[i] = col.computeBucketElementKeyValue(computedBucketElementKey, computedBucketElementValue);
 		}
-		long totalSize = Integer.BYTES;
-		for (MemorySegment serializedElement : serializedElements) {
-			totalSize += Integer.BYTES + serializedElement.byteSize();
+		int totalSize = Integer.BYTES;
+		for (Buf serializedElement : serializedElements) {
+			totalSize += Integer.BYTES + serializedElement.size();
 		}
-		var segment = arena.allocate(totalSize);
-		long offset = 0;
-		segment.set(BIG_ENDIAN_INT, offset, serializedElements.length);
+		var segment = Buf.createZeroes(totalSize);
+		int offset = 0;
+		segment.setInt(offset, serializedElements.length);
 		offset += Integer.BYTES;
-		for (MemorySegment elementAtI : serializedElements) {
-			var elementSize = elementAtI.byteSize();
-			segment.set(BIG_ENDIAN_INT_UNALIGNED, offset, toIntExact(elementSize));
+		for (Buf elementAtI : serializedElements) {
+			var elementSize = elementAtI.size();
+			segment.setInt(offset, toIntExact(elementSize));
 			offset += Integer.BYTES;
-			MemorySegment.copy(elementAtI, 0, segment, offset, elementSize);
+			segment.setBytesFromBuf(offset, elementAtI, 0, elementSize);
 			offset += elementSize;
 		}
 		return segment;

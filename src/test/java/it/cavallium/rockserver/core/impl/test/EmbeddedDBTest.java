@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
-import static it.cavallium.rockserver.core.common.Utils.toMemorySegmentSimple;
+import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
+import static it.cavallium.rockserver.core.common.Utils.toBufSimple;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.*;
@@ -15,7 +16,7 @@ import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.*;
 
 import java.io.IOException;
-import java.lang.foreign.MemorySegment;
+import it.cavallium.buffer.Buf;
 import java.util.stream.Collectors;
 
 import org.reactivestreams.Publisher;
@@ -28,12 +29,12 @@ abstract class EmbeddedDBTest {
 	protected EmbeddedConnection db;
 	protected long colId = 0L;
 	protected Arena arena;
-	protected MemorySegment bigValue;
+	protected Buf bigValue;
 	protected Keys key1;
 	protected Keys collidingKey1;
 	protected Keys key2;
-	protected MemorySegment value1;
-	protected MemorySegment value2;
+	protected Buf value1;
+	protected Buf value2;
 
 	@org.junit.jupiter.api.BeforeEach
 	void setUp() throws IOException {
@@ -53,39 +54,39 @@ abstract class EmbeddedDBTest {
 		value2 = getValue2();
 	}
 
-	protected MemorySegment getBigValue() {
+	protected Buf getBigValue() {
 		var bigValueArray = new byte[10_000];
 		ThreadLocalRandom.current().nextBytes(bigValueArray);
-		return Utils.toMemorySegment(arena, bigValueArray);
+		return Utils.toBuf(bigValueArray);
 	}
 
 	protected Keys getKey2() {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 4, 6),
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 1, 2, 3),
-				toMemorySegmentSimple(arena, 6, 7, 7)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(4, 6),
+				toBufSimple(3),
+				toBufSimple(1, 2, 3),
+				toBufSimple(6, 7, 7)
 		});
 	}
 
 	protected Keys getCollidingKey1() {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 4, 6),
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 1, 2, 3),
-				toMemorySegmentSimple(arena, 6, 7, -48)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(4, 6),
+				toBufSimple(3),
+				toBufSimple(1, 2, 3),
+				toBufSimple(6, 7, -48)
 		});
 	}
 
 	protected Keys getKey1() {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 4, 6),
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 1, 2, 3),
-				toMemorySegmentSimple(arena, 6, 7, 8)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(4, 6),
+				toBufSimple(3),
+				toBufSimple(1, 2, 3),
+				toBufSimple(6, 7, 8)
 		});
 	}
 
@@ -112,12 +113,12 @@ abstract class EmbeddedDBTest {
 		return true;
 	}
 
-	protected MemorySegment getValue1() {
-		return Utils.toMemorySegmentSimple(arena, 0, 0, 3);
+	protected Buf getValue1() {
+		return Utils.toBufSimple(0, 0, 3);
 	}
 
-	protected MemorySegment getValue2() {
-		return Utils.toMemorySegmentSimple(arena, 0, 0, 5);
+	protected Buf getValue2() {
+		return Utils.toBufSimple(0, 0, 5);
 	}
 
 	private void createStandardColumn() {
@@ -132,38 +133,38 @@ abstract class EmbeddedDBTest {
 	}
 
 	void fillSomeKeys() {
-		Assertions.assertNull(db.put(arena, 0, colId, key1, value1, RequestType.none()));
-		Assertions.assertNull(db.put(arena, 0, colId, collidingKey1, value2, RequestType.none()));
-		Assertions.assertNull(db.put(arena, 0, colId, key2, bigValue, RequestType.none()));
+		Assertions.assertNull(db.put(0, colId, key1, value1, RequestType.none()));
+		Assertions.assertNull(db.put(0, colId, collidingKey1, value2, RequestType.none()));
+		Assertions.assertNull(db.put(0, colId, key2, bigValue, RequestType.none()));
 		for (int i = 0; i < Byte.MAX_VALUE; i++) {
 			var keyI = getKeyI(i);
 			var valueI = getValueI(i);
-			Assertions.assertNull(db.put(arena, 0, colId, keyI, valueI, RequestType.none()));
+			Assertions.assertNull(db.put(0, colId, keyI, valueI, RequestType.none()));
 		}
 	}
 
 	protected Keys getKeyI(int i) {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 4, 6),
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 1, 2, 3),
-				toMemorySegmentSimple(arena, 8, 2, 5, 1, 7, i)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(4, 6),
+				toBufSimple(3),
+				toBufSimple(1, 2, 3),
+				toBufSimple(8, 2, 5, 1, 7, i)
 		});
 	}
 
 	protected Keys getNotFoundKeyI(int i) {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 4, 6),
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 1, 2, 3),
-				toMemorySegmentSimple(arena, 8, 2, 5, 1, 0, i)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(4, 6),
+				toBufSimple(3),
+				toBufSimple(1, 2, 3),
+				toBufSimple(8, 2, 5, 1, 0, i)
 		});
 	}
 
-	protected MemorySegment getValueI(int i) {
-		return toMemorySegmentSimple(arena, i, i, i, i, i);
+	protected Buf getValueI(int i) {
+		return toBufSimple(i, i, i, i, i);
 	}
 
 	@org.junit.jupiter.api.AfterEach
@@ -179,12 +180,12 @@ abstract class EmbeddedDBTest {
 		var key = getKey1();
 
 		if (!getHasValues()) {
-			Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, toMemorySegmentSimple(arena, 123), RequestType.delta()));
+			Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, toBufSimple(123), RequestType.delta()));
 		} else {
-			Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, MemorySegment.NULL, RequestType.delta()));
+			Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, emptyBuf(), RequestType.delta()));
 			Assertions.assertThrows(RocksDBException.class, () -> {
 				try {
-					db.put(arena, 0, colId, key, null, RequestType.delta());
+					db.put(0, colId, key, null, RequestType.delta());
 				} catch (IllegalArgumentException ex) {
 					throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
 				}
@@ -193,21 +194,21 @@ abstract class EmbeddedDBTest {
 
 		Assertions.assertThrows(RocksDBException.class, () -> {
 			try {
-				db.put(arena, 0, colId, null, value1, RequestType.delta());
+				db.put(0, colId, null, value1, RequestType.delta());
 			} catch (IllegalArgumentException ex) {
 				throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
 			}
 		});
 		Assertions.assertThrows(RocksDBException.class, () -> {
 			try {
-				db.put(arena, 0, colId, null, null, RequestType.delta());
+				db.put(0, colId, null, null, RequestType.delta());
 			} catch (IllegalArgumentException ex) {
 				throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
 			}
 		});
-		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, colId, key, value1, null));
-		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 1, colId, key, value1, RequestType.delta()));
-		Assertions.assertThrows(RocksDBException.class, () -> db.put(arena, 0, 21203, key, value1, RequestType.delta()));
+		Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, value1, null));
+		Assertions.assertThrows(RocksDBException.class, () -> db.put(1, colId, key, value1, RequestType.delta()));
+		Assertions.assertThrows(RocksDBException.class, () -> db.put(0, 21203, key, value1, RequestType.delta()));
 	}
 
 	@Test
@@ -216,13 +217,13 @@ abstract class EmbeddedDBTest {
 		var value1 = getValue1();
 		var value2 = getValue2();
 
-		Delta<MemorySegment> delta;
+		Delta<Buf> delta;
 
-		delta = db.put(arena, 0, colId, key, value1, RequestType.delta());
+		delta = db.put(0, colId, key, value1, RequestType.delta());
 		Assertions.assertNull(delta.previous());
 		assertSegmentEquals(value1, delta.current());
 
-		delta = db.put(arena, 0, colId, key, value2, RequestType.delta());
+		delta = db.put(0, colId, key, value2, RequestType.delta());
 		assertSegmentEquals(value1, delta.previous());
 		assertSegmentEquals(value2, delta.current());
 	}
@@ -240,63 +241,63 @@ abstract class EmbeddedDBTest {
 		var value1 = getValue1();
 		var value2 = getValue2();
 
-		Delta<MemorySegment> delta;
+		Delta<Buf> delta;
 
-		Assertions.assertFalse(db.put(arena, 0, colId, getKeyI(3), value2, RequestType.previousPresence()));
-		Assertions.assertFalse(db.put(arena, 0, colId, getKeyI(4), value2, RequestType.previousPresence()));
+		Assertions.assertFalse(db.put(0, colId, getKeyI(3), value2, RequestType.previousPresence()));
+		Assertions.assertFalse(db.put(0, colId, getKeyI(4), value2, RequestType.previousPresence()));
 
 
-		delta = db.put(arena, 0, colId, key1, value1, RequestType.delta());
+		delta = db.put(0, colId, key1, value1, RequestType.delta());
 		Assertions.assertNull(delta.previous());
 		assertSegmentEquals(value1, delta.current());
 
-		delta = db.put(arena, 0, colId, key2, value2, RequestType.delta());
+		delta = db.put(0, colId, key2, value2, RequestType.delta());
 		Assertions.assertNull(delta.previous());
 		assertSegmentEquals(value2, delta.current());
 
-		delta = db.put(arena, 0, colId, key2, value1, RequestType.delta());
+		delta = db.put(0, colId, key2, value1, RequestType.delta());
 		assertSegmentEquals(value2, delta.previous());
 		assertSegmentEquals(value1, delta.current());
 
-		delta = db.put(arena, 0, colId, key2, value1, RequestType.delta());
+		delta = db.put(0, colId, key2, value1, RequestType.delta());
 		assertSegmentEquals(value1, delta.previous());
 		assertSegmentEquals(value1, delta.current());
 
 
-		Assertions.assertTrue(db.put(arena, 0, colId, key1, value2, RequestType.previousPresence()));
-		Assertions.assertTrue(db.put(arena, 0, colId, key2, value2, RequestType.previousPresence()));
+		Assertions.assertTrue(db.put(0, colId, key1, value2, RequestType.previousPresence()));
+		Assertions.assertTrue(db.put(0, colId, key2, value2, RequestType.previousPresence()));
 
 
-		delta = db.put(arena, 0, colId, key1, value1, RequestType.delta());
+		delta = db.put(0, colId, key1, value1, RequestType.delta());
 		assertSegmentEquals(value2, delta.previous());
 		assertSegmentEquals(value1, delta.current());
 
-		delta = db.put(arena, 0, colId, key2, value1, RequestType.delta());
+		delta = db.put(0, colId, key2, value1, RequestType.delta());
 		assertSegmentEquals(value2, delta.previous());
 		assertSegmentEquals(value1, delta.current());
 
 
-		Assertions.assertNull(db.put(arena, 0, colId, key1, value2, RequestType.none()));
-		Assertions.assertNull(db.put(arena, 0, colId, key2, value2, RequestType.none()));
+		Assertions.assertNull(db.put(0, colId, key1, value2, RequestType.none()));
+		Assertions.assertNull(db.put(0, colId, key2, value2, RequestType.none()));
 
 
-		assertSegmentEquals(value2, db.put(arena, 0, colId, key1, value1, RequestType.previous()));
-		assertSegmentEquals(value2, db.put(arena, 0, colId, key2, value1, RequestType.previous()));
+		assertSegmentEquals(value2, db.put(0, colId, key1, value1, RequestType.previous()));
+		assertSegmentEquals(value2, db.put(0, colId, key2, value1, RequestType.previous()));
 
-		assertSegmentEquals(value1, db.put(arena, 0, colId, key1, value1, RequestType.previous()));
-		assertSegmentEquals(value1, db.put(arena, 0, colId, key2, value1, RequestType.previous()));
+		assertSegmentEquals(value1, db.put(0, colId, key1, value1, RequestType.previous()));
+		assertSegmentEquals(value1, db.put(0, colId, key2, value1, RequestType.previous()));
 
 		if (!Utils.valueEquals(value1, value2)) {
-			Assertions.assertTrue(db.put(arena, 0, colId, key1, value2, RequestType.changed()));
-			Assertions.assertTrue(db.put(arena, 0, colId, key2, value2, RequestType.changed()));
+			Assertions.assertTrue(db.put(0, colId, key1, value2, RequestType.changed()));
+			Assertions.assertTrue(db.put(0, colId, key2, value2, RequestType.changed()));
 		}
 
-		Assertions.assertFalse(db.put(arena, 0, colId, key1, value2, RequestType.changed()));
-		Assertions.assertFalse(db.put(arena, 0, colId, key2, value2, RequestType.changed()));
+		Assertions.assertFalse(db.put(0, colId, key1, value2, RequestType.changed()));
+		Assertions.assertFalse(db.put(0, colId, key2, value2, RequestType.changed()));
 
 
-		assertSegmentEquals(value2, db.put(arena, 0, colId, key1, value1, RequestType.previous()));
-		assertSegmentEquals(value2, db.put(arena, 0, colId, key2, value1, RequestType.previous()));
+		assertSegmentEquals(value2, db.put(0, colId, key1, value1, RequestType.previous()));
+		assertSegmentEquals(value2, db.put(0, colId, key2, value1, RequestType.previous()));
 	}
 
 	protected ColumnSchema getSchema() {
@@ -323,23 +324,23 @@ abstract class EmbeddedDBTest {
 		var value1 = getValue1();
 		var value2 = getValue2();
 
-		var delta = db.put(arena, 0, colId, key1, value1, RequestType.delta());
+		var delta = db.put(0, colId, key1, value1, RequestType.delta());
 		Assertions.assertNull(delta.previous());
 		assertSegmentEquals(value1, delta.current());
 
-		delta = db.put(arena, 0, colId, collidingKey1, value2, RequestType.delta());
+		delta = db.put(0, colId, collidingKey1, value2, RequestType.delta());
 		Assertions.assertNull(delta.previous());
 		assertSegmentEquals(value2, delta.current());
 
-		delta = db.put(arena, 0, colId, collidingKey1, value1, RequestType.delta());
+		delta = db.put(0, colId, collidingKey1, value1, RequestType.delta());
 		assertSegmentEquals(value2, delta.previous());
 		assertSegmentEquals(value1, delta.current());
 
-		delta = db.put(arena, 0, colId, key2, value1, RequestType.delta());
+		delta = db.put(0, colId, key2, value1, RequestType.delta());
 		Assertions.assertNull(delta.previous());
 		assertSegmentEquals(value1, delta.current());
 
-		delta = db.put(arena, 0, colId, key2, value2, RequestType.delta());
+		delta = db.put(0, colId, key2, value2, RequestType.delta());
 		assertSegmentEquals(value1, delta.previous());
 		assertSegmentEquals(value2, delta.current());
 	}
@@ -347,38 +348,38 @@ abstract class EmbeddedDBTest {
 	@Test
 	void get() {
 		if (getHasValues()) {
-			Assertions.assertNull(db.get(arena, 0, colId, key1, RequestType.current()));
-			Assertions.assertNull(db.get(arena, 0, colId, collidingKey1, RequestType.current()));
-			Assertions.assertNull(db.get(arena, 0, colId, key2, RequestType.current()));
+			Assertions.assertNull(db.get(0, colId, key1, RequestType.current()));
+			Assertions.assertNull(db.get(0, colId, collidingKey1, RequestType.current()));
+			Assertions.assertNull(db.get(0, colId, key2, RequestType.current()));
 		}
-		Assertions.assertFalse(db.get(arena, 0, colId, key1, RequestType.exists()));
-		Assertions.assertFalse(db.get(arena, 0, colId, collidingKey1, RequestType.exists()));
-		Assertions.assertFalse(db.get(arena, 0, colId, key2, RequestType.exists()));
+		Assertions.assertFalse(db.get(0, colId, key1, RequestType.exists()));
+		Assertions.assertFalse(db.get(0, colId, collidingKey1, RequestType.exists()));
+		Assertions.assertFalse(db.get(0, colId, key2, RequestType.exists()));
 
 		fillSomeKeys();
 
 		if (getHasValues()) {
-			assertSegmentEquals(value1, db.get(arena, 0, colId, key1, RequestType.current()));
-			Assertions.assertNull(db.get(arena, 0, colId, getNotFoundKeyI(0), RequestType.current()));
-			assertSegmentEquals(value2, db.get(arena, 0, colId, collidingKey1, RequestType.current()));
-			assertSegmentEquals(bigValue, db.get(arena, 0, colId, key2, RequestType.current()));
+			assertSegmentEquals(value1, db.get(0, colId, key1, RequestType.current()));
+			Assertions.assertNull(db.get(0, colId, getNotFoundKeyI(0), RequestType.current()));
+			assertSegmentEquals(value2, db.get(0, colId, collidingKey1, RequestType.current()));
+			assertSegmentEquals(bigValue, db.get(0, colId, key2, RequestType.current()));
 		}
 
-		Assertions.assertTrue(db.get(arena, 0, colId, key1, RequestType.exists()));
-		Assertions.assertFalse(db.get(arena, 0, colId, getNotFoundKeyI(0), RequestType.exists()));
-		Assertions.assertTrue(db.get(arena, 0, colId, collidingKey1, RequestType.exists()));
-		Assertions.assertTrue(db.get(arena, 0, colId, key2, RequestType.exists()));
+		Assertions.assertTrue(db.get(0, colId, key1, RequestType.exists()));
+		Assertions.assertFalse(db.get(0, colId, getNotFoundKeyI(0), RequestType.exists()));
+		Assertions.assertTrue(db.get(0, colId, collidingKey1, RequestType.exists()));
+		Assertions.assertTrue(db.get(0, colId, key2, RequestType.exists()));
 	}
 
 	@Test
 	void update() {
 		if (getHasValues()) {
-			var forUpdate = db.get(arena, 0, colId, key1, RequestType.forUpdate());
+			var forUpdate = db.get(0, colId, key1, RequestType.forUpdate());
 			Assertions.assertNull(forUpdate.previous());
 			Assertions.assertTrue(forUpdate.updateId() != 0);
-			db.put(arena, forUpdate.updateId(), colId, key1, value1, RequestType.none());
+			db.put(forUpdate.updateId(), colId, key1, value1, RequestType.none());
 
-			Assertions.assertThrows(Exception.class, () -> db.put(arena, forUpdate.updateId(), colId, key1, value2, RequestType.none()));
+			Assertions.assertThrows(Exception.class, () -> db.put(forUpdate.updateId(), colId, key1, value2, RequestType.none()));
 		}
 	}
 
@@ -388,22 +389,22 @@ abstract class EmbeddedDBTest {
 		var lastKey = getKVSequenceLast().keys();
 		var prevLastKV = getKVSequence().get(getKVSequence().size() - 2);
 		if (getSchemaVarKeys().isEmpty()) {
-			FirstAndLast<KV> firstAndLast = db.reduceRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+			FirstAndLast<KV> firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
 			Assertions.assertNull(firstAndLast.first(), "First should be empty because the db is empty");
 			Assertions.assertNull(firstAndLast.last(), "Last should be empty because the db is empty");
 
 			fillSomeKeys();
 
-			firstAndLast = db.reduceRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+			firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
 			Assertions.assertEquals(getKVSequenceFirst(), firstAndLast.first(), "First key mismatch");
 			Assertions.assertEquals(prevLastKV, firstAndLast.last(), "Last key mismatch");
 
-			firstAndLast = db.reduceRange(arena, 0, colId, firstKey, firstKey, false, RequestType.firstAndLast(), 1000);
+			firstAndLast = db.reduceRange(0, colId, firstKey, firstKey, false, RequestType.firstAndLast(), 1000);
 			Assertions.assertNull(firstAndLast.first(), "First should be empty because the range is empty");
 			Assertions.assertNull(firstAndLast.last(), "Last should be empty because the range is empty");
 		} else {
 			Assertions.assertThrowsExactly(RocksDBException.class, () -> {
-				db.reduceRange(arena, 0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+				db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
 			});
 		}
 	}
@@ -417,14 +418,14 @@ abstract class EmbeddedDBTest {
 		var rangeEndKeyExcl = getKVSequence().get(initIndex + count);
 		var rangeEndKeyIncl = getKVSequence().get(initIndex + count - 1);
 		if (getSchemaVarKeys().isEmpty()) {
-			var results = db.getRange(arena, 0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000).toList();
+			var results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000).toList();
 			Assertions.assertEquals(0, results.size(), "Results count must be 0");
 
 			fillSomeKeys();
 
 			boolean reverse = false;
 			while (true) {
-				results = db.getRange(arena, 0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), reverse, RequestType.allInRange(), 1000).toList();
+				results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), reverse, RequestType.allInRange(), 1000).toList();
 
 				var expectedResults = getKVSequence().stream().skip(initIndex).limit(count).collect(Collectors.toCollection(ArrayList::new));
 				if (reverse) {
@@ -449,7 +450,7 @@ abstract class EmbeddedDBTest {
 			}
 		} else {
 			Assertions.assertThrowsExactly(RocksDBException.class, () -> {
-				db.getRange(arena, 0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000)
+				db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000)
 						.toList();
 			});
 		}
@@ -465,7 +466,7 @@ abstract class EmbeddedDBTest {
 					{
 						ArrayList<KVBatch> items = new ArrayList<>();
 						ArrayList<Keys> keys = new ArrayList<>();
-						ArrayList<MemorySegment> values = new ArrayList<>();
+						ArrayList<Buf> values = new ArrayList<>();
 						for (int i = 0; i < 2; i++) {
 							var keyI = getKeyI(i);
 							var valueI = getValueI(i);
@@ -508,11 +509,11 @@ abstract class EmbeddedDBTest {
 
 			if (getHasValues()) {
 				for (int i = 0; i < 4; i++) {
-					assertSegmentEquals(getValueI(i), db.get(arena, 0, colId, getKeyI(i), RequestType.current()));
+					assertSegmentEquals(getValueI(i), db.get(0, colId, getKeyI(i), RequestType.current()));
 				}
 			}
 			for (int i = 0; i < 4; i++) {
-				Assertions.assertTrue(db.get(arena, 0, colId, getKeyI(i), RequestType.exists()));
+				Assertions.assertTrue(db.get(0, colId, getKeyI(i), RequestType.exists()));
 			}
 		} else {
 			Assertions.assertThrows(RocksDBException.class, () -> {
@@ -526,17 +527,17 @@ abstract class EmbeddedDBTest {
 	void concurrentUpdate() {
 		if (getHasValues()) {
 			{
-				var forUpdate1 = db.get(arena, 0, colId, key1, RequestType.forUpdate());
+				var forUpdate1 = db.get(0, colId, key1, RequestType.forUpdate());
 				try {
-					var forUpdate2 = db.get(arena, 0, colId, key1, RequestType.forUpdate());
+					var forUpdate2 = db.get(0, colId, key1, RequestType.forUpdate());
 					try {
-						db.put(arena, forUpdate1.updateId(), colId, key1, value1, RequestType.none());
-						Assertions.assertThrowsExactly(RocksDBRetryException.class, () -> db.put(arena, forUpdate2.updateId(), colId, key1, value2, RequestType.none()));
+						db.put(forUpdate1.updateId(), colId, key1, value1, RequestType.none());
+						Assertions.assertThrowsExactly(RocksDBRetryException.class, () -> db.put(forUpdate2.updateId(), colId, key1, value2, RequestType.none()));
 						// Retrying
-						var forUpdate3 = db.get(arena, forUpdate2.updateId(), colId, key1, RequestType.forUpdate());
+						var forUpdate3 = db.get(forUpdate2.updateId(), colId, key1, RequestType.forUpdate());
 						try {
 							assertSegmentEquals(value1, forUpdate3.previous());
-							db.put(arena, forUpdate3.updateId(), colId, key1, value2, RequestType.none());
+							db.put(forUpdate3.updateId(), colId, key1, value2, RequestType.none());
 						} catch (Throwable ex3) {
 							db.closeFailedUpdate(forUpdate3.updateId());
 							throw ex3;
@@ -552,7 +553,7 @@ abstract class EmbeddedDBTest {
 		}
 	}
 
-	public static void assertSegmentEquals(MemorySegment expected, MemorySegment input) {
+	public static void assertSegmentEquals(Buf expected, Buf input) {
 		if (!Utils.valueEquals(expected, input)) {
 			Assertions.fail(
 					"Memory segments are not equal! Expected: "
@@ -565,9 +566,9 @@ abstract class EmbeddedDBTest {
 	@Test
 	void getTestError() {
 		fillSomeKeys();
-		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(arena, 0, colId, null, RequestType.current())));
-		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(arena, 0, 18239, key1, RequestType.current())));
-		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(arena, 1, colId, key1, RequestType.current())));
-		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(arena, 0, colId, key1, null)));
+		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(0, colId, null, RequestType.current())));
+		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(0, 18239, key1, RequestType.current())));
+		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(1, colId, key1, RequestType.current())));
+		Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(0, colId, key1, null)));
 	}
 }

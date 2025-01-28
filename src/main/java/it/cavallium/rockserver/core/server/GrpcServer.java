@@ -1,7 +1,7 @@
 package it.cavallium.rockserver.core.server;
 
 import static it.cavallium.rockserver.core.common.Utils.toByteArray;
-import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
+import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
@@ -50,8 +50,7 @@ import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
+import it.cavallium.buffer.Buf;
 import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -180,15 +179,12 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Empty> put(PutRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					api.put(arena,
-							request.getTransactionOrUpdateId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-							toMemorySegment(arena, request.getData().getValue()),
-							new RequestNothing<>()
-					);
-				}
+				api.put(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						toBuf(request.getData().getValue()),
+						new RequestNothing<>()
+				);
 				return Empty.getDefaultInstance();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("put", request));
 		}
@@ -215,7 +211,7 @@ public class GrpcServer extends Server {
 					var batches = nextRequests.<KVBatch>handle((putBatchRequest, sink) -> {
 						var batch = putBatchRequest.getData();
 						try {
-							sink.next(mapKVBatch(null, batch.getEntriesCount(), batch::getEntries));
+							sink.next(mapKVBatch(batch.getEntriesCount(), batch::getEntries));
 						} catch (Throwable ex) {
 							sink.error(ex);
 						}
@@ -249,14 +245,11 @@ public class GrpcServer extends Server {
 												.publishOn(scheduler.write())
 												.doOnNext(putRequest -> {
 														var data = putRequest.getData();
-														try (var arena = Arena.ofConfined()) {
-																api.put(arena,
-																				initialRequest.getTransactionOrUpdateId(),
-																				initialRequest.getColumnId(),
-																				mapKeys(arena, data.getKeysCount(), data::getKeys),
-																				toMemorySegment(arena, data.getValue()),
-																				new RequestNothing<>());
-														}
+													api.put(initialRequest.getTransactionOrUpdateId(),
+																	initialRequest.getColumnId(),
+																	mapKeys(data.getKeysCount(), data::getKeys),
+																	toBuf(data.getValue()),
+																	new RequestNothing<>());
 												})
 												.transform(this.onErrorMapFluxWithRequestInfo("putMulti", initialRequest));
 				} else if (firstSignal.isOnComplete()) {
@@ -271,146 +264,122 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Previous> putGetPrevious(PutRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var prev = api.put(arena,
-							request.getTransactionOrUpdateId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-							toMemorySegment(arena, request.getData().getValue()),
-							new RequestPrevious<>()
-					);
-					var prevBuilder = Previous.newBuilder();
-					if (prev != null) {
-						prevBuilder.setPrevious(ByteString.copyFrom(prev.asByteBuffer()));
-					}
-					return prevBuilder.build();
+				var prev = api.put(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						toBuf(request.getData().getValue()),
+						new RequestPrevious<>()
+				);
+				var prevBuilder = Previous.newBuilder();
+				if (prev != null) {
+					prevBuilder.setPrevious(Utils.toByteString(prev));
 				}
+				return prevBuilder.build();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetPrevious", request));
 		}
 
 		@Override
 		public Mono<Delta> putGetDelta(PutRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var delta = api.put(arena,
-							request.getTransactionOrUpdateId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-							toMemorySegment(arena, request.getData().getValue()),
-							new RequestDelta<>()
-					);
-					var deltaBuilder = Delta.newBuilder();
-					if (delta.previous() != null) {
-						deltaBuilder.setPrevious(ByteString.copyFrom(delta.previous().asByteBuffer()));
-					}
-					if (delta.current() != null) {
-						deltaBuilder.setCurrent(ByteString.copyFrom(delta.current().asByteBuffer()));
-					}
-					return deltaBuilder.build();
+				var delta = api.put(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						toBuf(request.getData().getValue()),
+						new RequestDelta<>()
+				);
+				var deltaBuilder = Delta.newBuilder();
+				if (delta.previous() != null) {
+					deltaBuilder.setPrevious(Utils.toByteString(delta.previous()));
 				}
+				if (delta.current() != null) {
+					deltaBuilder.setCurrent(Utils.toByteString(delta.current()));
+				}
+				return deltaBuilder.build();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetDelta", request));
 		}
 
 		@Override
 		public Mono<Changed> putGetChanged(PutRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var changed = api.put(arena,
-							request.getTransactionOrUpdateId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-							toMemorySegment(arena, request.getData().getValue()),
-							new RequestChanged<>()
-					);
-					return Changed.newBuilder().setChanged(changed).build();
-				}
+				var changed = api.put(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						toBuf(request.getData().getValue()),
+						new RequestChanged<>()
+				);
+				return Changed.newBuilder().setChanged(changed).build();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetChanged", request));
 		}
 
 		@Override
 		public Mono<PreviousPresence> putGetPreviousPresence(PutRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var present = api.put(arena,
-							request.getTransactionOrUpdateId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getData().getKeysCount(), request.getData()::getKeys),
-							toMemorySegment(arena, request.getData().getValue()),
-							new RequestPreviousPresence<>()
-					);
-					return PreviousPresence.newBuilder().setPresent(present).build();
-				}
+				var present = api.put(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						toBuf(request.getData().getValue()),
+						new RequestPreviousPresence<>()
+				);
+				return PreviousPresence.newBuilder().setPresent(present).build();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetPreviousPresence", request));
 		}
 
 		@Override
 		public Mono<GetResponse> get(GetRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var current = api.get(arena,
-							request.getTransactionOrUpdateId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getKeysCount(), request::getKeys),
-							new RequestCurrent<>()
-					);
-					var responseBuilder = GetResponse.newBuilder();
-					if (current != null) {
-						responseBuilder.setValue(ByteString.copyFrom(current.asByteBuffer()));
-					}
-					return responseBuilder.build();
+				var current = api.get(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getKeysCount(), request::getKeys),
+						new RequestCurrent<>()
+				);
+				var responseBuilder = GetResponse.newBuilder();
+				if (current != null) {
+					responseBuilder.setValue(Utils.toByteString(current));
 				}
+				return responseBuilder.build();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("get", request));
 		}
 
 		@Override
 		public Mono<UpdateBegin> getForUpdate(GetRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var forUpdate = api.get(arena,
-							request.getTransactionOrUpdateId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getKeysCount(), request::getKeys),
-							new RequestForUpdate<>()
-					);
-					var responseBuilder = UpdateBegin.newBuilder();
-					responseBuilder.setUpdateId(forUpdate.updateId());
-					if (forUpdate.previous() != null) {
-						responseBuilder.setPrevious(ByteString.copyFrom(forUpdate.previous().asByteBuffer()));
-					}
-					return responseBuilder.build();
+				var forUpdate = api.get(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getKeysCount(), request::getKeys),
+						new RequestForUpdate<>()
+				);
+				var responseBuilder = UpdateBegin.newBuilder();
+				responseBuilder.setUpdateId(forUpdate.updateId());
+				if (forUpdate.previous() != null) {
+					responseBuilder.setPrevious(Utils.toByteString(forUpdate.previous()));
 				}
+				return responseBuilder.build();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("getForUpdate", request));
 		}
 
 		@Override
 		public Mono<PreviousPresence> exists(GetRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var exists = api.get(arena,
-							request.getTransactionOrUpdateId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getKeysCount(), request::getKeys),
-							new RequestExists<>()
-					);
-					return PreviousPresence.newBuilder().setPresent(exists).build();
-				}
+				var exists = api.get(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getKeysCount(), request::getKeys),
+						new RequestExists<>()
+				);
+				return PreviousPresence.newBuilder().setPresent(exists).build();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("exists", request));
 		}
 
 		@Override
 		public Mono<OpenIteratorResponse> openIterator(OpenIteratorRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var iteratorId = api.openIterator(arena,
-							request.getTransactionId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
-							request.getReverse(),
-							request.getTimeoutMs()
-					);
-					return OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build();
-				}
+				var iteratorId = api.openIterator(request.getTransactionId(),
+						request.getColumnId(),
+						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+						request.getReverse(),
+						request.getTimeoutMs()
+				);
+				return OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
 		}
 
@@ -425,9 +394,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Empty> seekTo(SeekToRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					api.seekTo(arena, request.getIterationId(), mapKeys(arena, request.getKeysCount(), request::getKeys));
-				}
+				api.seekTo(request.getIterationId(), mapKeys(request.getKeysCount(), request::getKeys));
 				return Empty.getDefaultInstance();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("seekTo", request));
 		}
@@ -435,12 +402,10 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Empty> subsequent(SubsequentRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					api.subsequent(arena, request.getIterationId(),
-							request.getSkipCount(),
-							request.getTakeCount(),
-							new RequestNothing<>());
-				}
+				api.subsequent(request.getIterationId(),
+						request.getSkipCount(),
+						request.getTakeCount(),
+						new RequestNothing<>());
 				return Empty.getDefaultInstance();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("subsequent", request));
 		}
@@ -448,39 +413,34 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<PreviousPresence> subsequentExists(SubsequentRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var exists = api.subsequent(arena, request.getIterationId(),
-							request.getSkipCount(),
-							request.getTakeCount(),
-							new RequestExists<>());
-					return PreviousPresence.newBuilder().setPresent(exists).build();
-				}
+				var exists = api.subsequent(request.getIterationId(),
+						request.getSkipCount(),
+						request.getTakeCount(),
+						new RequestExists<>());
+				return PreviousPresence.newBuilder().setPresent(exists).build();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("subsequentExists", request));
 		}
 
 		@Override
 		public Flux<KV> subsequentMultiGet(SubsequentRequest request) {
 			return Flux.<KV>create(emitter -> {
-				try (var arena = Arena.ofConfined()) {
-					int pageIndex = 0;
-					final long pageSize = 16L;
-					while (request.getTakeCount() > pageIndex * pageSize) {
-						var response = api.subsequent(arena,
-								request.getIterationId(),
-								pageIndex == 0 ? request.getSkipCount() : 0,
-								Math.min(request.getTakeCount() - pageIndex * pageSize, pageSize),
-								new RequestMulti<>()
-						);
-						for (MemorySegment entry : response) {
-							Keys keys = null; // todo: implement
-							MemorySegment value = entry;
-							emitter.next(KV.newBuilder()
-									.addAllKeys(null) // todo: implement
-									.setValue(ByteString.copyFrom(value.asByteBuffer()))
-									.build());
-						}
-						pageIndex++;
+				int pageIndex = 0;
+				final long pageSize = 16L;
+				while (request.getTakeCount() > pageIndex * pageSize) {
+					var response = api.subsequent(request.getIterationId(),
+							pageIndex == 0 ? request.getSkipCount() : 0,
+							Math.min(request.getTakeCount() - pageIndex * pageSize, pageSize),
+							new RequestMulti<>()
+					);
+					for (Buf entry : response) {
+						Keys keys = null; // todo: implement
+						Buf value = entry;
+						emitter.next(KV.newBuilder()
+								.addAllKeys(null) // todo: implement
+								.setValue(Utils.toByteString(value))
+								.build());
 					}
+					pageIndex++;
 				}
 				emitter.complete();
 			}, FluxSink.OverflowStrategy.BUFFER).transform(this.onErrorMapFluxWithRequestInfo("subsequentMultiGet", request));
@@ -489,59 +449,53 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					var firstAndLast = api.reduceRange(arena, request.getTransactionId(), request.getColumnId(),
-							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
-							request.getReverse(),
-							RequestType.firstAndLast(),
-							request.getTimeoutMs()
-					);
-					var resultBuilder = FirstAndLast.newBuilder();
-					if (firstAndLast.first() != null) {
-						resultBuilder.setFirst(unmapKVHeap(firstAndLast.first()));
-					}
-					if (firstAndLast.last() != null) {
-						resultBuilder.setLast(unmapKVHeap(firstAndLast.last()));
-					}
-					return resultBuilder.build();
+				var firstAndLast = api.reduceRange(request.getTransactionId(), request.getColumnId(),
+						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+						request.getReverse(),
+						RequestType.firstAndLast(),
+						request.getTimeoutMs()
+				);
+				var resultBuilder = FirstAndLast.newBuilder();
+				if (firstAndLast.first() != null) {
+					resultBuilder.setFirst(unmapKVHeap(firstAndLast.first()));
 				}
+				if (firstAndLast.last() != null) {
+					resultBuilder.setLast(unmapKVHeap(firstAndLast.last()));
+				}
+				return resultBuilder.build();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeFirstAndLast", request));
 		}
 
 		@Override
 		public Mono<EntriesCount> reduceRangeEntriesCount(GetRangeRequest request) {
 			return executeSync(() -> {
-				try (var arena = Arena.ofConfined()) {
-					long entriesCount
-							= api.reduceRange(arena,
-							request.getTransactionId(),
-							request.getColumnId(),
-							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
-							request.getReverse(),
-							RequestType.entriesCount(),
-							request.getTimeoutMs()
-					);
-					return EntriesCount.newBuilder().setCount(entriesCount).build();
-				}
+				long entriesCount
+						= api.reduceRange(request.getTransactionId(),
+						request.getColumnId(),
+						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+						request.getReverse(),
+						RequestType.entriesCount(),
+						request.getTimeoutMs()
+				);
+				return EntriesCount.newBuilder().setCount(entriesCount).build();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeEntriesCount", request));
 		}
 
 		@Override
 		public Flux<KV> getAllInRange(GetRangeRequest request) {
-			return Flux.using(Arena::ofConfined, arena -> Flux
-					.from(asyncApi.getRangeAsync(arena,
-							request.getTransactionId(),
+			return Flux
+					.from(asyncApi.getRangeAsync(request.getTransactionId(),
 							request.getColumnId(),
-							mapKeys(arena, request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-							mapKeys(arena, request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+							mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+							mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 							request.getReverse(),
 							RequestType.allInRange(),
 							request.getTimeoutMs()
 					))
 					.map(GrpcServerImpl::unmapKVHeap)
-					.transform(this.onErrorMapFluxWithRequestInfo("getAllInRange", request)), Arena::close);
+					.transform(this.onErrorMapFluxWithRequestInfo("getAllInRange", request));
 		}
 
 
@@ -602,28 +556,28 @@ public class GrpcServer extends Server {
 
 		private static List<ByteString> unmapKeys(@NotNull Keys keys) {
 			var result = new ArrayList<ByteString>(keys.keys().length);
-			for (@NotNull MemorySegment key : keys.keys()) {
-				result.add(UnsafeByteOperations.unsafeWrap(key.asByteBuffer()));
+			for (@NotNull Buf key : keys.keys()) {
+				result.add(Utils.toByteString(key));
 			}
 			return result;
 		}
 
 		private static List<ByteString> unmapKeysHeap(@NotNull Keys keys) {
 			var result = new ArrayList<ByteString>(keys.keys().length);
-			for (@NotNull MemorySegment key : keys.keys()) {
+			for (@NotNull Buf key : keys.keys()) {
 				result.add(UnsafeByteOperations.unsafeWrap(toByteArray(key)));
 			}
 			return result;
 		}
 
-		private static ByteString unmapValue(@Nullable MemorySegment value) {
+		private static ByteString unmapValue(@Nullable Buf value) {
 			if (value == null) return null;
-			return UnsafeByteOperations.unsafeWrap(value.asByteBuffer());
+			return Utils.toByteString(value);
 		}
 
-		private static ByteString unmapValueHeap(@Nullable MemorySegment value) {
+		private static ByteString unmapValueHeap(@Nullable Buf value) {
 			if (value == null) return null;
-			return UnsafeByteOperations.unsafeWrap(toByteArray(value));
+			return Utils.toByteString(value);
 		}
 
 		private static ColumnSchema mapColumnSchema(it.cavallium.rockserver.core.common.api.proto.ColumnSchema schema) {
@@ -655,34 +609,34 @@ public class GrpcServer extends Server {
 			return l;
 		}
 
-		private static Keys mapKeys(@Nullable Arena arena, int count, Int2ObjectFunction<ByteString> keyGetterAt) {
-			var segments = new MemorySegment[count];
+		private static Keys mapKeys(int count, Int2ObjectFunction<ByteString> keyGetterAt) {
+			var segments = new Buf[count];
 			for (int i = 0; i < count; i++) {
-				segments[i] = toMemorySegment(arena, keyGetterAt.apply(i));
+				segments[i] = toBuf(keyGetterAt.apply(i));
 			}
 			return new Keys(segments);
 		}
 
-		private static List<Keys> mapKeysKV(@Nullable Arena arena, int count, Int2ObjectFunction<KV> keyGetterAt) {
+		private static List<Keys> mapKeysKV(int count, Int2ObjectFunction<KV> keyGetterAt) {
 			var keys = new ArrayList<Keys>(count);
 			for (int i = 0; i < count; i++) {
 				var k = keyGetterAt.apply(i);
-				keys.add(mapKeys(arena, k.getKeysCount(), k::getKeys));
+				keys.add(mapKeys(k.getKeysCount(), k::getKeys));
 			}
 			return keys;
 		}
 
-		private static List<MemorySegment> mapValuesKV(Arena arena, int count, Int2ObjectFunction<KV> keyGetterAt) {
-			var keys = new ArrayList<MemorySegment>(count);
+		private static List<Buf> mapValuesKV(int count, Int2ObjectFunction<KV> keyGetterAt) {
+			var keys = new ArrayList<Buf>(count);
 			for (int i = 0; i < count; i++) {
-				keys.add(toMemorySegment(arena, keyGetterAt.get(i).getValue()));
+				keys.add(toBuf(keyGetterAt.get(i).getValue()));
 			}
 			return keys;
 		}
 
-		private static KVBatch mapKVBatch(@Nullable Arena arena, int count, Int2ObjectFunction<KV> getterAt) {
-			var kk = mapKeysKV(arena, count, getterAt);
-			var vv = mapValuesKV(arena, count, getterAt);
+		private static KVBatch mapKVBatch(int count, Int2ObjectFunction<KV> getterAt) {
+			var kk = mapKeysKV(count, getterAt);
+			var vv = mapValuesKV(count, getterAt);
 			return new KVBatchRef(kk, vv);
 		}
 

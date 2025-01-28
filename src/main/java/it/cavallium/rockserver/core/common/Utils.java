@@ -1,15 +1,12 @@
 package it.cavallium.rockserver.core.common;
 
-import static it.cavallium.rockserver.core.impl.ColumnInstance.BIG_ENDIAN_BYTES;
-import static java.lang.foreign.MemorySegment.NULL;
 import static java.util.Objects.requireNonNullElse;
 
 import com.google.protobuf.ByteString;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
+import it.cavallium.buffer.Buf;
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -21,20 +18,15 @@ import java.util.function.Function;
 import java.util.stream.Stream;
 
 import org.jetbrains.annotations.Contract;
-import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.VisibleForTesting;
 
 public class Utils {
 
-	@SuppressWarnings("resource")
-	private static final MemorySegment DUMMY_EMPTY_VALUE = Arena
-			.global()
-			.allocate(1)
-			.copyFrom(MemorySegment.ofArray(new byte[] {-1}))
-			.asReadOnly();
+	private static final Buf DUMMY_EMPTY_VALUE = Buf.wrap(new byte[] {-1}).freeze();
 	public static final int DEFAULT_PORT = 5333;
+	private static final Buf EMPTY_BUF = Buf.create(0).freeze();
 
-	public static MemorySegment dummyEmptyValue() {
+	public static Buf dummyRocksDBEmptyValue() {
 		return DUMMY_EMPTY_VALUE;
 	}
 
@@ -70,70 +62,31 @@ public class Utils {
 		}
 	}
 
-	public static @NotNull MemorySegment toMemorySegment(@Nullable Arena arena, ByteString value) {
-		var buf = value.asReadOnlyByteBuffer();
-		if (buf.isDirect()) {
-			return MemorySegment.ofBuffer(buf);
-		} else if (arena != null) {
-			return arena.allocate(value.size()).copyFrom(MemorySegment.ofBuffer(buf));
-		} else {
-			return MemorySegment.ofBuffer(buf);
-		}
-	}
-
 	@Contract(value = "!null -> !null; null -> null", pure = true)
-	public static MemorySegment toMemorySegment(byte... array) {
+	public static Buf toBuf(byte... array) {
 		if (array != null) {
-			return MemorySegment.ofArray(array);
+			return Buf.wrap(array);
 		} else {
 			return null;
 		}
 	}
 
-	@Contract("_, null -> null")
-	public static @Nullable MemorySegment toMemorySegment(@Nullable Arena arena, byte... array) {
-		if (array != null) {
-			if (arena == null) {
-				return MemorySegment.ofArray(array);
-			} else {
-				// todo: replace with allocateArray when graalvm adds it
-				return arena.allocate(array.length).copyFrom(MemorySegment.ofArray(array));
-			}
-		} else {
-			return null;
-		}
-	}
-
-	@Contract(value = "!null -> !null; null -> null", pure = true)
-	public static MemorySegment toMemorySegmentSimple(int... array) {
+	@VisibleForTesting
+	@Contract(value = "null -> null", pure = true)
+	public static Buf toBufSimple(int... array) {
 		if (array != null) {
 			var newArray = new byte[array.length];
 			for (int i = 0; i < array.length; i++) {
 				newArray[i] = (byte) array[i];
 			}
-			return MemorySegment.ofArray(newArray);
+			return Buf.wrap(newArray);
 		} else {
 			return null;
 		}
 	}
 
-	@Contract("null, !null -> fail; _, null -> null")
-	public static MemorySegment toMemorySegmentSimple(Arena arena, int... array) {
-		if (array != null) {
-			assert arena != null;
-			var newArray = new byte[array.length];
-			for (int i = 0; i < array.length; i++) {
-				newArray[i] = (byte) array[i];
-			}
-			// todo: replace with allocateArray when graalvm adds it
-			return arena.allocate(newArray.length).copyFrom(MemorySegment.ofArray(newArray));
-		} else {
-			return null;
-		}
-	}
-
-	public static byte @NotNull[] toByteArray(@NotNull MemorySegment memorySegment) {
-		return memorySegment.toArray(BIG_ENDIAN_BYTES);
+	public static byte[] toByteArray(Buf buf) {
+		return buf != null ? buf.toByteArray() : null;
 	}
 
 	public static <T, U> List<U> mapList(Collection<T> input, Function<T, U> mapper) {
@@ -156,21 +109,15 @@ public class Utils {
 		}
 	}
 
-	public static boolean valueEquals(MemorySegment previousValue, MemorySegment currentValue) {
-		previousValue = requireNonNullElse(previousValue, NULL);
-		currentValue = requireNonNullElse(currentValue, NULL);
-		return MemorySegment.mismatch(previousValue, 0, previousValue.byteSize(), currentValue, 0, currentValue.byteSize())
-				== -1;
+	public static boolean valueEquals(Buf previousValue, Buf currentValue) {
+		previousValue = requireNonNullElse(previousValue, emptyBuf());
+		currentValue = requireNonNullElse(currentValue, emptyBuf());
+		return previousValue.equals(currentValue);
 	}
 
-	public static int valueHash(MemorySegment value) {
-		value = requireNonNullElse(value, NULL);
-		int hash = 7;
-		var len = value.byteSize();
-		for (long i = 0; i < len; i++) {
-			hash = hash * 31 + value.get(ValueLayout.JAVA_BYTE, i);
-		}
-		return hash;
+	public static int valueHash(Buf value) {
+		value = requireNonNullElse(value, emptyBuf());
+		return value.hashCode();
 	}
 
 	public static HostAndPort parseHostAndPort(URI uri) {
@@ -186,9 +133,46 @@ public class Utils {
 		}
 	}
 
-	public static String toPrettyString(MemorySegment s) {
-		var b = s.toArray(BIG_ENDIAN_BYTES);
-		return HexFormat.of().formatHex(b);
+	public static String toPrettyString(Buf s) {
+		return HexFormat.of().formatHex(s.getBackingByteArray(), s.getBackingByteArrayFrom(), s.getBackingByteArrayTo());
+	}
+
+	public static Buf emptyBuf() {
+		return EMPTY_BUF;
+	}
+
+	public static Buf fromHeapByteBuffer(ByteBuffer resultBuffer) {
+		if (resultBuffer == null) return null;
+		var arrayOffset = resultBuffer.arrayOffset();
+		return Buf.wrap(resultBuffer.array(), arrayOffset, arrayOffset + resultBuffer.limit());
+	}
+
+	public static Buf fromByteBuffer(ByteBuffer resultBuffer) {
+		if (resultBuffer == null) return null;
+		if (resultBuffer.hasArray()) {
+			return fromHeapByteBuffer(resultBuffer);
+		} else {
+			var out = new byte[resultBuffer.remaining()];
+			resultBuffer.get(out);
+			return Buf.wrap(out);
+		}
+	}
+
+	public static Buf toBuf(ByteString data) {
+		return data != null ? Buf.wrap(data.toByteArray()) : null;
+	}
+
+	public static ByteString toByteString(Buf buf) {
+		return ByteString.copyFrom(buf.getBackingByteArray(),
+				buf.getBackingByteArrayOffset(),
+				buf.getBackingByteArrayLength()
+		);
+	}
+
+	public static ByteBuffer asByteBuffer(Buf buf) {
+		return ByteBuffer.wrap(buf.getBackingByteArray(),
+				buf.getBackingByteArrayOffset(),
+				buf.getBackingByteArrayLength());
 	}
 
 	public record HostAndPort(String host, int port) {}

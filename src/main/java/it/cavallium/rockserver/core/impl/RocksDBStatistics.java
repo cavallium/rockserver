@@ -1,6 +1,5 @@
 package it.cavallium.rockserver.core.impl;
 
-import com.google.common.cache.CacheStats;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MultiGauge;
 import io.micrometer.core.instrument.MultiGauge.Row;

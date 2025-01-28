@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.common;
 
+import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
@@ -18,8 +19,6 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -59,23 +58,21 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	}
 
 	/** See: {@link Put}. */
-	default <T> T put(Arena arena,
-			long transactionOrUpdateId,
+	default <T> T put(long transactionOrUpdateId,
 			long columnId,
 			Keys keys,
-			@NotNull MemorySegment value,
-			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
-		return requestSync(new Put<>(arena, transactionOrUpdateId, columnId, keys, value, requestType));
+			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		return requestSync(new Put<>(transactionOrUpdateId, columnId, keys, value, requestType));
 	}
 
 	/** See: {@link PutMulti}. */
-	default <T> List<T> putMulti(Arena arena,
-			long transactionOrUpdateId,
+	default <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
-			@NotNull List<@NotNull MemorySegment> values,
-			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
-		return requestSync(new PutMulti<>(arena, transactionOrUpdateId, columnId, keys, values, requestType));
+			@NotNull List<@NotNull Buf> values,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		return requestSync(new PutMulti<>(transactionOrUpdateId, columnId, keys, values, requestType));
 	}
 
 	/** See: {@link PutBatch}. */
@@ -86,23 +83,21 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	}
 
 	/** See: {@link Get}. */
-	default <T> T get(Arena arena,
-			long transactionOrUpdateId,
+	default <T> T get(long transactionOrUpdateId,
 			long columnId,
 			Keys keys,
-			RequestGet<? super MemorySegment, T> requestType) throws RocksDBException {
-		return requestSync(new Get<>(arena, transactionOrUpdateId, columnId, keys, requestType));
+			RequestGet<? super Buf, T> requestType) throws RocksDBException {
+		return requestSync(new Get<>(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
 	/** See: {@link OpenIterator}. */
-	default long openIterator(Arena arena,
-			long transactionId,
+	default long openIterator(long transactionId,
 			long columnId,
 			Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
-		return requestSync(new OpenIterator(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs));
+		return requestSync(new OpenIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs));
 	}
 
 	/** See: {@link CloseIterator}. */
@@ -111,40 +106,37 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	}
 
 	/** See: {@link SeekTo}. */
-	default void seekTo(Arena arena, long iterationId, Keys keys) throws RocksDBException {
-		requestSync(new SeekTo(arena, iterationId, keys));
+	default void seekTo(long iterationId, Keys keys) throws RocksDBException {
+		requestSync(new SeekTo(iterationId, keys));
 	}
 
 	/** See: {@link Subsequent}. */
-	default <T> T subsequent(Arena arena,
-			long iterationId,
+	default <T> T subsequent(long iterationId,
 			long skipCount,
 			long takeCount,
-			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws RocksDBException {
-		return requestSync(new Subsequent<>(arena, iterationId, skipCount, takeCount, requestType));
+			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws RocksDBException {
+		return requestSync(new Subsequent<>(iterationId, skipCount, takeCount, requestType));
 	}
 
 	/** See: {@link ReduceRange}. */
-	default <T> T reduceRange(Arena arena,
-							  long transactionId,
+	default <T> T reduceRange(long transactionId,
 							  long columnId,
 							  @Nullable Keys startKeysInclusive,
 							  @Nullable Keys endKeysExclusive,
 							  boolean reverse,
 							  @NotNull RequestType.RequestReduceRange<? super KV, T> requestType,
 							  long timeoutMs) throws RocksDBException {
-		return requestSync(new ReduceRange<>(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
+		return requestSync(new ReduceRange<>(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
 	}
 
 	/** See: {@link GetRange}. */
-	default <T> Stream<T> getRange(Arena arena,
-								   long transactionId,
+	default <T> Stream<T> getRange(long transactionId,
 								   long columnId,
 								   @Nullable Keys startKeysInclusive,
 								   @Nullable Keys endKeysExclusive,
 								   boolean reverse,
 								   @NotNull RequestType.RequestGetRange<? super KV, T> requestType,
 								   long timeoutMs) throws RocksDBException {
-		return requestSync(new GetRange<>(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
+		return requestSync(new GetRange<>(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
 	}
 }

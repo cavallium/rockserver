@@ -1,8 +1,8 @@
 package it.cavallium.rockserver.core.common;
 
-import java.lang.foreign.MemorySegment;
+import it.cavallium.buffer.Buf;
 
 public interface HashFunction {
 
-	void hash(MemorySegment inputData, MemorySegment hashResult);
+	void hash(Buf inputData, Buf hashResult);
 }

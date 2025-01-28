@@ -1,13 +1,11 @@
 package it.cavallium.rockserver.core.common;
 
+import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 import java.util.stream.Stream;
 
 import org.jetbrains.annotations.NotNull;
@@ -175,28 +173,27 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		}
 		/**
 		 * Put an element into the specified position
-		 * @param arena arena
+		 *
 		 * @param transactionOrUpdateId transaction id, update id, or 0
-		 * @param columnId column id
-		 * @param keys column keys, or empty array if not needed
-		 * @param value value, or null if not needed
-		 * @param requestType the request type determines which type of data will be returned.
+		 * @param columnId              column id
+		 * @param keys                  column keys, or empty array if not needed
+		 * @param value                 value, or null if not needed
+		 * @param requestType           the request type determines which type of data will be returned.
 		 */
-		record Put<T>(Arena arena,
-					  long transactionOrUpdateId,
+		record Put<T>(long transactionOrUpdateId,
 					  long columnId,
 					  Keys keys,
-					  @NotNull MemorySegment value,
-					  RequestPut<? super MemorySegment, T> requestType) implements RocksDBAPICommandSingle<T> {
+					  @NotNull Buf value,
+					  RequestPut<? super Buf, T> requestType) implements RocksDBAPICommandSingle<T> {
 
 			@Override
 			public T handleSync(RocksDBSyncAPI api) {
-				return api.put(arena, transactionOrUpdateId, columnId, keys, value, requestType);
+				return api.put(transactionOrUpdateId, columnId, keys, value, requestType);
 			}
 
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
-				return api.putAsync(arena, transactionOrUpdateId, columnId, keys, value, requestType);
+				return api.putAsync(transactionOrUpdateId, columnId, keys, value, requestType);
 			}
 
 			@Override
@@ -219,26 +216,26 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		}
 		/**
 		 * Put multiple elements into the specified positions
-		 * @param arena arena
+		 *
 		 * @param transactionOrUpdateId transaction id, update id, or 0
-		 * @param columnId column id
-		 * @param keys multiple lists of column keys
-		 * @param values multiple values, or null if not needed
-		 * @param requestType the request type determines which type of data will be returned.
+		 * @param columnId              column id
+		 * @param keys                  multiple lists of column keys
+		 * @param values                multiple values, or null if not needed
+		 * @param requestType           the request type determines which type of data will be returned.
 		 */
-		record PutMulti<T>(Arena arena, long transactionOrUpdateId, long columnId,
-						   @NotNull List<Keys> keys,
-						   @NotNull List<@NotNull MemorySegment> values,
-						   RequestPut<? super MemorySegment, T> requestType) implements RocksDBAPICommandSingle<List<T>> {
+		record PutMulti<T>(long transactionOrUpdateId, long columnId,
+											 @NotNull List<Keys> keys,
+											 @NotNull List<@NotNull Buf> values,
+											 RequestPut<? super Buf, T> requestType) implements RocksDBAPICommandSingle<List<T>> {
 
 			@Override
 			public List<T> handleSync(RocksDBSyncAPI api) {
-				return api.putMulti(arena, transactionOrUpdateId, columnId, keys, values, requestType);
+				return api.putMulti(transactionOrUpdateId, columnId, keys, values, requestType);
 			}
 
 			@Override
 			public CompletableFuture<List<T>> handleAsync(RocksDBAsyncAPI api) {
-				return api.putMultiAsync(arena, transactionOrUpdateId, columnId, keys, values, requestType);
+				return api.putMultiAsync(transactionOrUpdateId, columnId, keys, values, requestType);
 			}
 
 			@Override
@@ -301,26 +298,24 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		}
 		/**
 		 * Get an element from the specified position
-		 * @param arena arena
 		 * @param transactionOrUpdateId transaction id, update id for retry operations, or 0
 		 * @param columnId column id
 		 * @param keys column keys, or empty array if not needed
 		 * @param requestType the request type determines which type of data will be returned.
 		 */
-		record Get<T>(Arena arena,
-					  long transactionOrUpdateId,
+		record Get<T>(long transactionOrUpdateId,
 					  long columnId,
 					  Keys keys,
-					  RequestGet<? super MemorySegment, T> requestType) implements RocksDBAPICommandSingle<T> {
+					  RequestGet<? super Buf, T> requestType) implements RocksDBAPICommandSingle<T> {
 
 			@Override
 			public T handleSync(RocksDBSyncAPI api) {
-				return api.get(arena, transactionOrUpdateId, columnId, keys, requestType);
+				return api.get(transactionOrUpdateId, columnId, keys, requestType);
 			}
 
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
-				return api.getAsync(arena, transactionOrUpdateId, columnId, keys, requestType);
+				return api.getAsync(transactionOrUpdateId, columnId, keys, requestType);
 			}
 
 			@Override
@@ -345,7 +340,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * <p>
 		 * Returns the iterator id
 		 *
-		 * @param arena arena
 		 * @param transactionId transaction id, or 0
 		 * @param columnId column id
 		 * @param startKeysInclusive start keys, inclusive. [] means "the beginning"
@@ -353,8 +347,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param reverse if true, seek in reverse direction
 		 * @param timeoutMs timeout in milliseconds
 		 */
-		record OpenIterator(Arena arena,
-							long transactionId,
+		record OpenIterator(long transactionId,
 							long columnId,
 							Keys startKeysInclusive,
 							@Nullable Keys endKeysExclusive,
@@ -363,13 +356,12 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 			@Override
 			public Long handleSync(RocksDBSyncAPI api) {
-				return api.openIterator(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+				return api.openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
 			}
 
 			@Override
 			public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
-				return api.openIteratorAsync(arena,
-						transactionId,
+				return api.openIteratorAsync(transactionId,
 						columnId,
 						startKeysInclusive,
 						endKeysExclusive,
@@ -409,21 +401,20 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		}
 		/**
 		 * Seek to the specific element during an iteration, or the subsequent one if not found
-		 * @param arena arena
 		 * @param iterationId iteration id
 		 * @param keys keys, inclusive. [] means "the beginning"
 		 */
-		record SeekTo(Arena arena, long iterationId, Keys keys) implements RocksDBAPICommandSingle<Void> {
+		record SeekTo(long iterationId, Keys keys) implements RocksDBAPICommandSingle<Void> {
 
 			@Override
 			public Void handleSync(RocksDBSyncAPI api) {
-				api.seekTo(arena, iterationId, keys);
+				api.seekTo(iterationId, keys);
 				return null;
 			}
 
 			@Override
 			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
-				return api.seekToAsync(arena, iterationId, keys);
+				return api.seekToAsync(iterationId, keys);
 			}
 
 			@Override
@@ -434,27 +425,25 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		}
 		/**
 		 * Get the subsequent element during an iteration
-		 * @param arena arena
 		 * @param iterationId iteration id
 		 * @param skipCount number of elements to skip
 		 * @param takeCount number of elements to take
 		 * @param requestType the request type determines which type of data will be returned.
 		 */
-		record Subsequent<T>(Arena arena,
-							 long iterationId,
+		record Subsequent<T>(long iterationId,
 							 long skipCount,
 							 long takeCount,
-							 @NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType)
+							 @NotNull RequestType.RequestIterate<? super Buf, T> requestType)
 				implements RocksDBAPICommandSingle<T> {
 
 			@Override
 			public T handleSync(RocksDBSyncAPI api) {
-				return api.subsequent(arena, iterationId, skipCount, takeCount, requestType);
+				return api.subsequent(iterationId, skipCount, takeCount, requestType);
 			}
 
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
-				return api.subsequentAsync(arena, iterationId, skipCount, takeCount, requestType);
+				return api.subsequentAsync(iterationId, skipCount, takeCount, requestType);
 			}
 
 			@Override
@@ -468,7 +457,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * <p>
 		 * Returns the result
 		 *
-		 * @param arena arena
 		 * @param transactionId transaction id, or 0
 		 * @param columnId column id
 		 * @param startKeysInclusive start keys, inclusive. [] means "the beginning"
@@ -477,8 +465,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param requestType the request type determines which type of data will be returned.
 		 * @param timeoutMs timeout in milliseconds
 		 */
-		record ReduceRange<T>(Arena arena,
-							  long transactionId,
+		record ReduceRange<T>(long transactionId,
 							  long columnId,
 							  @Nullable Keys startKeysInclusive,
 							  @Nullable Keys endKeysExclusive,
@@ -488,8 +475,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 			@Override
 			public T handleSync(RocksDBSyncAPI api) {
-				return api.reduceRange(arena,
-						transactionId,
+				return api.reduceRange(transactionId,
 						columnId,
 						startKeysInclusive,
 						endKeysExclusive,
@@ -501,8 +487,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
-				return api.reduceRangeAsync(arena,
-						transactionId,
+				return api.reduceRangeAsync(transactionId,
 						columnId,
 						startKeysInclusive,
 						endKeysExclusive,
@@ -526,7 +511,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * <p>
 		 * Returns the result
 		 *
-		 * @param arena arena
 		 * @param transactionId transaction id, or 0
 		 * @param columnId column id
 		 * @param startKeysInclusive start keys, inclusive. [] means "the beginning"
@@ -535,8 +519,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param requestType the request type determines which type of data will be returned.
 		 * @param timeoutMs timeout in milliseconds
 		 */
-		record GetRange<T>(Arena arena,
-						   long transactionId,
+		record GetRange<T>(long transactionId,
 						   long columnId,
 						   @Nullable Keys startKeysInclusive,
 						   @Nullable Keys endKeysExclusive,
@@ -546,8 +529,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 			@Override
 			public Stream<T> handleSync(RocksDBSyncAPI api) {
-				return api.getRange(arena,
-						transactionId,
+				return api.getRange(transactionId,
 						columnId,
 						startKeysInclusive,
 						endKeysExclusive,
@@ -559,8 +541,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 			@Override
 			public Publisher<T> handleAsync(RocksDBAsyncAPI api) {
-				return api.getRangeAsync(arena,
-						transactionId,
+				return api.getRangeAsync(transactionId,
 						columnId,
 						startKeysInclusive,
 						endKeysExclusive,

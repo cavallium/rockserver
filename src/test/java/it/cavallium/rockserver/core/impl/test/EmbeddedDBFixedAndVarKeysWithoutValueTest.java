@@ -1,22 +1,24 @@
 package it.cavallium.rockserver.core.impl.test;
 
-import java.lang.foreign.MemorySegment;
+import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
+
+import it.cavallium.buffer.Buf;
 
 public class EmbeddedDBFixedAndVarKeysWithoutValueTest extends EmbeddedDBTest {
 
 	@Override
-	protected MemorySegment getValue1() {
-		return MemorySegment.NULL;
+	protected Buf getValue1() {
+		return emptyBuf();
 	}
 
 	@Override
-	protected MemorySegment getValue2() {
-		return MemorySegment.NULL;
+	protected Buf getValue2() {
+		return emptyBuf();
 	}
 
 	@Override
-	protected MemorySegment getValueI(int i) {
-		return MemorySegment.NULL;
+	protected Buf getValueI(int i) {
+		return emptyBuf();
 	}
 
 	@Override
@@ -25,7 +27,7 @@ public class EmbeddedDBFixedAndVarKeysWithoutValueTest extends EmbeddedDBTest {
 	}
 
 	@Override
-	protected MemorySegment getBigValue() {
-		return MemorySegment.NULL;
+	protected Buf getBigValue() {
+		return emptyBuf();
 	}
 }

@@ -3,10 +3,10 @@ package it.cavallium.rockserver.core.common;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.lang.foreign.MemorySegment;
+import it.cavallium.buffer.Buf;
 import java.util.Objects;
 
-public record KV(@NotNull Keys keys, @Nullable MemorySegment value) {
+public record KV(@NotNull Keys keys, @Nullable Buf value) {
     @Override
     public String toString() {
         return "KV{" + keys + "=" + (value != null ? Utils.toPrettyString(value) : "null") + '}';

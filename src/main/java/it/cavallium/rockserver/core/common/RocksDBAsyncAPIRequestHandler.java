@@ -1,7 +1,6 @@
 package it.cavallium.rockserver.core.common;
 
 import org.reactivestreams.Publisher;
-import org.reactivestreams.Subscriber;
 
 import java.util.concurrent.CompletableFuture;
 

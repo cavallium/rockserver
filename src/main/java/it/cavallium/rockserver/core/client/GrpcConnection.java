@@ -41,8 +41,7 @@ import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBS
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceStub;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
+import it.cavallium.buffer.Buf;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URI;
@@ -64,7 +63,7 @@ import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
-import static it.cavallium.rockserver.core.common.Utils.toMemorySegment;
+import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
 public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
@@ -136,18 +135,18 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@SuppressWarnings("unchecked")
-    @Override
+	@Override
 	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> req) {
 		return (RS) switch (req) {
 			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> {
 				var asyncResponse = (CompletableFuture<R>) req.handleAsync(this);
 				yield asyncResponse.join();
 			}
-            case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> {
+			case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> {
 				var asyncResponse = (Publisher<R>) req.handleAsync(this);
 				yield Flux.from(asyncResponse).toStream();
 			}
-        };
+		};
 	}
 
 	@Override
@@ -202,12 +201,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <T> CompletableFuture<T> putAsync(Arena arena,
-			long transactionOrUpdateId,
+	public <T> CompletableFuture<T> putAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
-			@NotNull MemorySegment value,
-			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
+			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		var request = PutRequest.newBuilder()
 				.setTransactionOrUpdateId(transactionOrUpdateId)
 				.setColumnId(columnId)
@@ -227,13 +225,12 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@SuppressWarnings("unchecked")
-    @Override
-	public <T> CompletableFuture<List<T>> putMultiAsync(Arena arena,
-			long transactionOrUpdateId,
+	@Override
+	public <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<@NotNull Keys> allKeys,
-			@NotNull List<@NotNull MemorySegment> allValues,
-			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
+			@NotNull List<@NotNull Buf> allValues,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		var count = allKeys.size();
 		if (count != allValues.size()) {
 			throw new IllegalArgumentException("Keys length is different than values length! "
@@ -266,7 +263,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 							.toFuture();
 			case RequestPrevious<?> _ ->
 					this.reactiveStub.putMultiGetPrevious(inputRequests)
-							.collect(() -> new ArrayList<@Nullable MemorySegment>(),
+							.collect(() -> new ArrayList<@Nullable Buf>(),
 									(list, value) -> list.add(GrpcConnection.mapPrevious(value)))
 							.toFuture();
 			case RequestDelta<?> _ ->
@@ -289,8 +286,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public CompletableFuture<Void> putBatchAsync(long columnId,
-												 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
-												 @NotNull PutBatchMode mode) throws RocksDBException {
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull PutBatchMode mode) throws RocksDBException {
 		var initialRequest = Mono.just(PutBatchRequest.newBuilder()
 				.setInitialRequest(PutBatchInitialRequest.newBuilder()
 						.setColumnId(columnId)
@@ -313,11 +310,10 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <T> CompletableFuture<T> getAsync(Arena arena,
-			long transactionOrUpdateId,
+	public <T> CompletableFuture<T> getAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
-			RequestGet<? super MemorySegment, T> requestType) throws RocksDBException {
+			RequestGet<? super Buf, T> requestType) throws RocksDBException {
 		var request = GetRequest.newBuilder()
 				.setTransactionOrUpdateId(transactionOrUpdateId)
 				.setColumnId(columnId)
@@ -339,8 +335,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletableFuture<Long> openIteratorAsync(Arena arena,
-			long transactionId,
+	public CompletableFuture<Long> openIteratorAsync(long transactionId,
 			long columnId,
 			@NotNull Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
@@ -366,7 +361,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletableFuture<Void> seekToAsync(Arena arena, long iterationId, @NotNull Keys keys) throws RocksDBException {
+	public CompletableFuture<Void> seekToAsync(long iterationId, @NotNull Keys keys) throws RocksDBException {
 		var request = SeekToRequest.newBuilder()
 				.setIterationId(iterationId)
 				.addAllKeys(mapKeys(keys))
@@ -376,11 +371,10 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <T> CompletableFuture<T> subsequentAsync(Arena arena,
-			long iterationId,
+	public <T> CompletableFuture<T> subsequentAsync(long iterationId,
 			long skipCount,
 			long takeCount,
-			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws RocksDBException {
+			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws RocksDBException {
 		var request = SubsequentRequest.newBuilder()
 				.setIterationId(iterationId)
 				.setSkipCount(skipCount)
@@ -399,8 +393,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@SuppressWarnings("unchecked")
-    @Override
-	public <T> CompletableFuture<T> reduceRangeAsync(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestReduceRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+	@Override
+	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestReduceRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
 		var request = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -412,8 +406,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestType.RequestGetFirstAndLast<?> _ ->
 					toResponse(this.futureStub.reduceRangeFirstAndLast(request), result -> new FirstAndLast<>(
-							result.hasFirst() ? mapKV(arena, result.getFirst()) : null,
-							result.hasLast() ? mapKV(arena, result.getLast()) : null
+							result.hasFirst() ? mapKV(result.getFirst()) : null,
+							result.hasLast() ? mapKV(result.getLast()) : null
 					));
 			case RequestType.RequestEntriesCount<?> _ ->
 					toResponse(this.futureStub.reduceRangeEntriesCount(request), EntriesCount::getCount);
@@ -422,8 +416,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@SuppressWarnings("unchecked")
-    @Override
-	public <T> Publisher<T> getRangeAsync(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+	@Override
+	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
 		var request = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -434,11 +428,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.build();
 		return (Publisher<T>) switch (requestType) {
 			case RequestType.RequestGetAllInRange<?> _ -> reactiveStub.getAllInRange(request)
-					.map(kv -> mapKV(arena, kv));
+					.map(kv -> mapKV(kv));
 		};
 	}
 
-	private static it.cavallium.rockserver.core.common.Delta<MemorySegment> mapDelta(Delta x) {
+	private static it.cavallium.rockserver.core.common.Delta<Buf> mapDelta(Delta x) {
 		return new it.cavallium.rockserver.core.common.Delta<>(
 				x.hasPrevious() ? mapByteString(x.getPrevious()) : null,
 				x.hasCurrent() ? mapByteString(x.getCurrent()) : null
@@ -458,12 +452,12 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Nullable
-	private static MemorySegment mapPrevious(Previous x) {
+	private static Buf mapPrevious(Previous x) {
 		return x.hasPrevious() ? mapByteString(x.getPrevious()) : null;
 	}
 
-	private static MemorySegment mapByteString(ByteString data) {
-		return data != null ? MemorySegment.ofBuffer(data.asReadOnlyByteBuffer()) : null;
+	private static Buf mapByteString(ByteString data) {
+		return Utils.toBuf(data);
 	}
 
 	private static it.cavallium.rockserver.core.common.api.proto.KVBatch mapKVBatch(@NotNull KVBatch kvBatch) {
@@ -473,7 +467,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.build();
 	}
 
-	private static Iterable<KV> mapKVList(@NotNull List<Keys> keys, @NotNull List<MemorySegment> values) {
+	private static Iterable<KV> mapKVList(@NotNull List<Keys> keys, @NotNull List<Buf> values) {
 		List<KV> result = new ArrayList<>(keys.size());
 		var it1 = keys.iterator();
 		var it2 = values.iterator();
@@ -483,35 +477,40 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return result;
 	}
 
-	private static KV mapKV(@NotNull Keys keys, @NotNull MemorySegment value) {
+	private static KV mapKV(@NotNull Keys keys, @NotNull Buf value) {
 		return KV.newBuilder()
 				.addAllKeys(mapKeys(keys))
 				.setValue(mapValue(value))
 				.build();
 	}
 
-	private static it.cavallium.rockserver.core.common.KV mapKV(Arena arena, @NotNull KV entry) {
+	private static it.cavallium.rockserver.core.common.KV mapKV(@NotNull KV entry) {
 		return new it.cavallium.rockserver.core.common.KV(
-				mapKeys(arena, entry.getKeysCount(), entry::getKeys),
-				toMemorySegment(arena, entry.getValue())
+				mapKeys(entry.getKeysCount(), entry::getKeys),
+				toBuf(entry.getValue())
 		);
 	}
 
-	private static Keys mapKeys(Arena arena, int count, Int2ObjectFunction<ByteString> keyGetterAt) {
-		var segments = new MemorySegment[count];
+	private static Keys mapKeys(int count, Int2ObjectFunction<ByteString> keyGetterAt) {
+		var segments = new Buf[count];
 		for (int i = 0; i < count; i++) {
-			segments[i] = toMemorySegment(arena, keyGetterAt.apply(i));
+			segments[i] = toBuf(keyGetterAt.apply(i));
 		}
 		return new Keys(segments);
 	}
 
 	private static Iterable<? extends ByteString> mapKeys(Keys keys) {
 		if (keys == null) return List.of();
-		return Iterables.transform(Arrays.asList(keys.keys()), k -> UnsafeByteOperations.unsafeWrap(k.asByteBuffer()));
+		return Iterables.transform(Arrays.asList(keys.keys()),
+				k -> UnsafeByteOperations.unsafeWrap(k.getBackingByteArray(),
+						k.getBackingByteArrayOffset(),
+						k.getBackingByteArrayLength()));
 	}
 
-	private static ByteString mapValue(@NotNull MemorySegment value) {
-		return UnsafeByteOperations.unsafeWrap(value.asByteBuffer());
+	private static ByteString mapValue(@NotNull Buf value) {
+		return UnsafeByteOperations.unsafeWrap(value.getBackingByteArray(),
+				value.getBackingByteArrayOffset(),
+				value.getBackingByteArrayLength());
 	}
 
 	private static it.cavallium.rockserver.core.common.api.proto.ColumnSchema mapColumnSchema(@NotNull ColumnSchema schema) {

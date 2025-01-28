@@ -1,11 +1,12 @@
 package it.cavallium.rockserver.core.impl.test;
 
-import static it.cavallium.rockserver.core.common.Utils.toMemorySegmentSimple;
+import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
+import static it.cavallium.rockserver.core.common.Utils.toBufSimple;
 
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.Keys;
 import it.unimi.dsi.fastutil.objects.ObjectList;
-import java.lang.foreign.MemorySegment;
+import it.cavallium.buffer.Buf;
 
 public class EmbeddedDBFixedWithoutValueTest extends EmbeddedDBTest {
 
@@ -16,46 +17,46 @@ public class EmbeddedDBFixedWithoutValueTest extends EmbeddedDBTest {
 
 	@Override
 	protected Keys getKeyI(int i) {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 4, 7),
-				toMemorySegmentSimple(arena, i)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(4, 7),
+				toBufSimple(i)
 		});
 	}
 
 	@Override
 	protected Keys getNotFoundKeyI(int i) {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 5, 6),
-				toMemorySegmentSimple(arena, i)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(5, 6),
+				toBufSimple(i)
 		});
 	}
 
 	@Override
 	protected Keys getKey1() {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 4, 6),
-				toMemorySegmentSimple(arena, 3)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(4, 6),
+				toBufSimple(3)
 		});
 	}
 
 	@Override
 	protected Keys getKey2() {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 4, 6),
-				toMemorySegmentSimple(arena, 4)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(4, 6),
+				toBufSimple(4)
 		});
 	}
 
 	@Override
 	protected Keys getCollidingKey1() {
-		return new Keys(new MemorySegment[] {
-				toMemorySegmentSimple(arena, 3),
-				toMemorySegmentSimple(arena, 4, 6),
-				toMemorySegmentSimple(arena, 5)
+		return new Keys(new Buf[] {
+				toBufSimple(3),
+				toBufSimple(4, 6),
+				toBufSimple(5)
 		});
 	}
 
@@ -65,22 +66,22 @@ public class EmbeddedDBFixedWithoutValueTest extends EmbeddedDBTest {
 	}
 
 	@Override
-	protected MemorySegment getValue1() {
-		return MemorySegment.NULL;
+	protected Buf getValue1() {
+		return emptyBuf();
 	}
 
 	@Override
-	protected MemorySegment getValue2() {
-		return MemorySegment.NULL;
+	protected Buf getValue2() {
+		return emptyBuf();
 	}
 
 	@Override
-	protected MemorySegment getValueI(int i) {
-		return MemorySegment.NULL;
+	protected Buf getValueI(int i) {
+		return emptyBuf();
 	}
 
 	@Override
-	protected MemorySegment getBigValue() {
-		return MemorySegment.NULL;
+	protected Buf getBigValue() {
+		return emptyBuf();
 	}
 }

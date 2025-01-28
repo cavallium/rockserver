@@ -2,7 +2,6 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.lang.foreign.Arena;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;

@@ -14,7 +14,7 @@ package it.cavallium.rockserver.core.impl;
  * limitations under the License.
  */
 
-import java.lang.foreign.MemorySegment;
+import it.cavallium.buffer.Buf;
 
 /**
  * A 32-bits hash.
@@ -33,7 +33,7 @@ public abstract class XXHash32 {
 	 * Compute the big-endian 32-bits hash of <code>buf[off:off+len]</code> using seed
 	 * <code>seed</code>.
 	 */
-	public abstract void hash(MemorySegment buf, int off, int len, int seed, MemorySegment result);
+	public abstract void hash(Buf buf, int off, int len, int seed, Buf result);
 
 	public static XXHash32 getInstance() {
 		return XXHash32JavaSafe.INSTANCE;

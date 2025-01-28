@@ -18,8 +18,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
+import it.cavallium.buffer.Buf;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import org.jetbrains.annotations.NotNull;
@@ -59,23 +58,21 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link Put}. */
-	default <T> CompletableFuture<T> putAsync(Arena arena,
-			long transactionOrUpdateId,
+	default <T> CompletableFuture<T> putAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
-			@NotNull MemorySegment value,
-			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
-		return requestAsync(new Put<>(arena, transactionOrUpdateId, columnId, keys, value, requestType));
+			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		return requestAsync(new Put<>(transactionOrUpdateId, columnId, keys, value, requestType));
 	}
 
 	/** See: {@link PutMulti}. */
-	default <T> CompletableFuture<List<T>> putMultiAsync(Arena arena,
-			long transactionOrUpdateId,
+	default <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
-			@NotNull List<@NotNull MemorySegment> values,
-			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
-		return requestAsync(new PutMulti<>(arena, transactionOrUpdateId, columnId, keys, values, requestType));
+			@NotNull List<@NotNull Buf> values,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		return requestAsync(new PutMulti<>(transactionOrUpdateId, columnId, keys, values, requestType));
 	}
 
 	/** See: {@link PutBatch}. */
@@ -86,24 +83,21 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link Get}. */
-	default <T> CompletableFuture<T> getAsync(Arena arena,
-			long transactionOrUpdateId,
+	default <T> CompletableFuture<T> getAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
-			RequestGet<? super MemorySegment, T> requestType) throws RocksDBException {
-		return requestAsync(new Get<>(arena, transactionOrUpdateId, columnId, keys, requestType));
+			RequestGet<? super Buf, T> requestType) throws RocksDBException {
+		return requestAsync(new Get<>(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
 	/** See: {@link OpenIterator}. */
-	default CompletableFuture<Long> openIteratorAsync(Arena arena,
-			long transactionId,
+	default CompletableFuture<Long> openIteratorAsync(long transactionId,
 			long columnId,
 			@NotNull Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
-		return requestAsync(new OpenIterator(arena,
-				transactionId,
+		return requestAsync(new OpenIterator(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,
@@ -118,30 +112,27 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link SeekTo}. */
-	default CompletableFuture<Void> seekToAsync(Arena arena, long iterationId, @NotNull Keys keys) throws RocksDBException {
-		return requestAsync(new SeekTo(arena, iterationId, keys));
+	default CompletableFuture<Void> seekToAsync(long iterationId, @NotNull Keys keys) throws RocksDBException {
+		return requestAsync(new SeekTo(iterationId, keys));
 	}
 
 	/** See: {@link Subsequent}. */
-	default <T> CompletableFuture<T> subsequentAsync(Arena arena,
-			long iterationId,
+	default <T> CompletableFuture<T> subsequentAsync(long iterationId,
 			long skipCount,
 			long takeCount,
-			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws RocksDBException {
-		return requestAsync(new Subsequent<>(arena, iterationId, skipCount, takeCount, requestType));
+			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws RocksDBException {
+		return requestAsync(new Subsequent<>(iterationId, skipCount, takeCount, requestType));
 	}
 
 	/** See: {@link ReduceRange}. */
-	default <T> CompletableFuture<T> reduceRangeAsync(Arena arena,
-													  long transactionId,
+	default <T> CompletableFuture<T> reduceRangeAsync(long transactionId,
 													  long columnId,
 													  @Nullable Keys startKeysInclusive,
 													  @Nullable Keys endKeysExclusive,
 													  boolean reverse,
 													  RequestType.RequestReduceRange<? super KV, T> requestType,
 													  long timeoutMs) throws RocksDBException {
-		return requestAsync(new ReduceRange<>(arena,
-				transactionId,
+		return requestAsync(new ReduceRange<>(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,
@@ -152,16 +143,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
 	/** See: {@link GetRange}. */
-	default <T> Publisher<T> getRangeAsync(Arena arena,
-										   long transactionId,
+	default <T> Publisher<T> getRangeAsync(long transactionId,
 										   long columnId,
 										   @Nullable Keys startKeysInclusive,
 										   @Nullable Keys endKeysExclusive,
 										   boolean reverse,
 										   RequestType.RequestGetRange<? super KV, T> requestType,
 										   long timeoutMs) throws RocksDBException {
-		return requestAsync(new GetRange<>(arena,
-				transactionId,
+		return requestAsync(new GetRange<>(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,

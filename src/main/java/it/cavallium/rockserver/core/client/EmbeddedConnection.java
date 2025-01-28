@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.client;
 
+import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
@@ -7,17 +8,12 @@ import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.stream.Stream;
 
 import org.jetbrains.annotations.NotNull;
@@ -95,7 +91,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> req) {
 		return (RA) switch (req) {
 			case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
-			case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.arena(), getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
+			case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
 			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> CompletableFuture.supplyAsync(() -> req.handleSync(this),
 					(req.isReadOnly() ? db.getScheduler().readExecutor() : db.getScheduler().writeExecutor()));
 			case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
@@ -103,23 +99,21 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public <T> T put(Arena arena,
-			long transactionOrUpdateId,
+	public <T> T put(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
-			@NotNull MemorySegment value,
-			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
-		return db.put(arena, transactionOrUpdateId, columnId, keys, value, requestType);
+			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		return db.put(transactionOrUpdateId, columnId, keys, value, requestType);
 	}
 
 	@Override
-	public <T> List<T> putMulti(Arena arena,
-			long transactionOrUpdateId,
+	public <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
-			@NotNull List<@NotNull MemorySegment> values,
-			RequestPut<? super MemorySegment, T> requestType) throws RocksDBException {
-		return db.putMulti(arena, transactionOrUpdateId, columnId, keys, values, requestType);
+			@NotNull List<@NotNull Buf> values,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		return db.putMulti(transactionOrUpdateId, columnId, keys, values, requestType);
 	}
 
 	@Override
@@ -137,23 +131,21 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public <T> T get(Arena arena,
-			long transactionOrUpdateId,
+	public <T> T get(long transactionOrUpdateId,
 			long columnId,
 			Keys keys,
-			RequestGet<? super MemorySegment, T> requestType) throws RocksDBException {
-		return db.get(arena, transactionOrUpdateId, columnId, keys, requestType);
+			RequestGet<? super Buf, T> requestType) throws RocksDBException {
+		return db.get(transactionOrUpdateId, columnId, keys, requestType);
 	}
 
 	@Override
-	public long openIterator(Arena arena,
-			long transactionId,
+	public long openIterator(long transactionId,
 			long columnId,
 			@NotNull Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
-		return db.openIterator(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+		return db.openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
 	}
 
 	@Override
@@ -162,32 +154,31 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public void seekTo(Arena arena, long iterationId, Keys keys) throws RocksDBException {
-		db.seekTo(arena, iterationId, keys);
+	public void seekTo(long iterationId, Keys keys) throws RocksDBException {
+		db.seekTo(iterationId, keys);
 	}
 
 	@Override
-	public <T> T subsequent(Arena arena,
-			long iterationId,
+	public <T> T subsequent(long iterationId,
 			long skipCount,
 			long takeCount,
-			@NotNull RequestType.RequestIterate<? super MemorySegment, T> requestType) throws RocksDBException {
-		return db.subsequent(arena, iterationId, skipCount, takeCount, requestType);
+			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws RocksDBException {
+		return db.subsequent(iterationId, skipCount, takeCount, requestType);
 	}
 
 	@Override
-	public <T> T reduceRange(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestReduceRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		return db.reduceRange(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+	public <T> T reduceRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestReduceRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+		return db.reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
 	}
 
 	@Override
-	public <T> Stream<T> getRange(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		return db.getRange(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+	public <T> Stream<T> getRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+		return db.getRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
 	}
 
 	@Override
-	public <T> Publisher<T> getRangeAsync(Arena arena, long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		return db.getRangeAsyncInternal(arena, transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+		return db.getRangeAsyncInternal(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
 	}
 
 	@Override

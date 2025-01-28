@@ -1,12 +1,11 @@
 package it.cavallium.rockserver.core.common;
 
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
+import it.cavallium.buffer.Buf;
 import java.util.Arrays;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
 
-public record Keys(@NotNull MemorySegment @NotNull ... keys) {
+public record Keys(@NotNull Buf @NotNull ... keys) {
 
 	@Override
 	public String toString() {
@@ -38,7 +37,7 @@ public record Keys(@NotNull MemorySegment @NotNull ... keys) {
 	@Override
 	public int hashCode() {
 		int hash = 7;
-		for (@NotNull MemorySegment key : keys) {
+		for (@NotNull Buf key : keys) {
 			hash = hash * 31 + Utils.valueHash(key);
 		}
 		return hash;

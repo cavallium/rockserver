@@ -3,7 +3,6 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 import java.io.Closeable;
 import java.io.IOException;
 import java.time.Duration;
-import java.util.logging.Level;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
