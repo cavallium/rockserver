@@ -17,6 +17,7 @@ import net.sourceforge.argparse4j.ArgumentParsers;
 import net.sourceforge.argparse4j.inf.ArgumentParser;
 import net.sourceforge.argparse4j.inf.ArgumentParserException;
 import net.sourceforge.argparse4j.inf.Namespace;
+import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -70,6 +71,8 @@ public class Main {
 
 		LOG.info("Starting...");
 		RocksDBLoader.loadLibrary();
+
+		LOG.info("RocksDB version: {}", RocksDB.rocksdbVersion());
 
 		var rawDatabaseUrl = ns.getString("database_url");
 		var rawThriftListenUrl = ns.getString("thrift_listen_url");
