@@ -800,10 +800,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						}
 					} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 						doFinally();
-						throw ex;
-					} catch (Exception ex) {
+						cf.completeExceptionally(ex);
+						return;
+					} catch (Throwable ex) {
 						doFinally();
-						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+						var ex2 = it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+						cf.completeExceptionally(ex2);
+						return;
 					}
 					subscription.request(1);
 				}
@@ -1586,7 +1589,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			return tx;
 		} else {
-			throw new NoSuchElementException("No transaction with id " + transactionId);
+			throw RocksDBException.of(RocksDBErrorType.TRANSACTION_NOT_FOUND, "No transaction with id " + transactionId);
 		}
 	}
 

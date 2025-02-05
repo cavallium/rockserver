@@ -41,6 +41,7 @@ module rockserver.core {
 	requires vertx.rx.java3;
 	requires io.reactivex.rxjava3;
 	requires micrometer.jvm.extras;
+	requires org.checkerframework.checker.qual;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
@@ -49,5 +50,6 @@ module rockserver.core {
 	opens it.cavallium.rockserver.core.config to org.github.gestalt.core, org.github.gestalt.hocon;
 	exports it.cavallium.rockserver.core.impl.rocksdb;
 	exports it.cavallium.rockserver.core.impl;
-	exports it.cavallium.rockserver.core.common.api.proto to protobuf.java;
+	exports it.cavallium.rockserver.core.common.api.proto to protobuf.java, com.google.protobuf;
+	exports it.cavallium.rockserver.core.server to rockserver.core.test;
 }

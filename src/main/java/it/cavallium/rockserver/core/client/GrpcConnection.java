@@ -26,11 +26,13 @@ import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
 import it.cavallium.rockserver.core.common.RequestType.RequestExists;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
+import it.cavallium.rockserver.core.common.RequestType.RequestGetRange;
 import it.cavallium.rockserver.core.common.RequestType.RequestMulti;
 import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RequestType.RequestReduceRange;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.common.api.proto.*;
@@ -51,6 +53,7 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
@@ -139,8 +142,17 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> req) {
 		return (RS) switch (req) {
 			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> {
-				var asyncResponse = (CompletableFuture<R>) req.handleAsync(this);
-				yield asyncResponse.join();
+				try {
+					var asyncResponse = (CompletableFuture<R>) req.handleAsync(this);
+					yield asyncResponse.join();
+				} catch (CompletionException ex) {
+					var cause = ex.getCause();
+					if (cause instanceof RuntimeException exx) {
+						throw exx;
+					} else {
+						throw ex;
+					}
+				}
 			}
 			case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> {
 				var asyncResponse = (Publisher<R>) req.handleAsync(this);
@@ -211,6 +223,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setColumnId(columnId)
 				.setData(mapKV(keys, value))
 				.build();
+		if (requestType == null) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Null request type");
+		}
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestNothing<?> _ -> toResponse(this.futureStub.put(request), _ -> null);
 			case RequestPrevious<?> _ ->
@@ -258,29 +273,29 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 		return (CompletableFuture<List<T>>) (switch (requestType) {
 			case RequestNothing<?> _ ->
-					this.reactiveStub.putMulti(inputRequests)
+					toResponse(this.reactiveStub.putMulti(inputRequests)
 							.ignoreElement()
-							.toFuture();
+							.toFuture());
 			case RequestPrevious<?> _ ->
-					this.reactiveStub.putMultiGetPrevious(inputRequests)
+					toResponse(this.reactiveStub.putMultiGetPrevious(inputRequests)
 							.collect(() -> new ArrayList<@Nullable Buf>(),
 									(list, value) -> list.add(GrpcConnection.mapPrevious(value)))
-							.toFuture();
+							.toFuture());
 			case RequestDelta<?> _ ->
-					this.reactiveStub.putMultiGetDelta(inputRequests)
+					toResponse(this.reactiveStub.putMultiGetDelta(inputRequests)
 							.map(GrpcConnection::mapDelta)
 							.collectList()
-							.toFuture();
+							.toFuture());
 			case RequestChanged<?> _ ->
-					this.reactiveStub.putMultiGetChanged(inputRequests)
+					toResponse(this.reactiveStub.putMultiGetChanged(inputRequests)
 							.map(Changed::getChanged)
 							.collectList()
-							.toFuture();
+							.toFuture());
 			case RequestPreviousPresence<?> _ ->
-					this.reactiveStub.putMultiGetPreviousPresence(inputRequests)
+					toResponse(this.reactiveStub.putMultiGetPreviousPresence(inputRequests)
 							.map(PreviousPresence::getPresent)
 							.collectList()
-							.toFuture();
+							.toFuture());
 		});
 	}
 
@@ -305,7 +320,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			return request.build();
 		});
 		var inputFlux = initialRequest.concatWith(nextRequests);
-		return reactiveStub.putBatch(inputFlux).then().toFuture();
+		return toResponse(reactiveStub.putBatch(inputFlux).then().toFuture());
 	}
 
 	@SuppressWarnings("unchecked")
@@ -314,6 +329,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			@NotNull Keys keys,
 			RequestGet<? super Buf, T> requestType) throws RocksDBException {
+		if (requestType == null) {
+			throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "requestType");
+		}
 		var request = GetRequest.newBuilder()
 				.setTransactionOrUpdateId(transactionOrUpdateId)
 				.setColumnId(columnId)
@@ -324,12 +342,13 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 					x.hasPrevious() ? mapByteString(x.getPrevious()) : null,
 					x.getUpdateId()
 			));
+		} else if (requestType instanceof RequestType.RequestExists<?>) {
+			return toResponse(this.futureStub.exists(request), x -> (T) (Boolean) x.getPresent());
 		} else {
 			return toResponse(this.futureStub.get(request), x -> switch (requestType) {
 				case RequestNothing<?> _ -> null;
 				case RequestType.RequestCurrent<?> _ -> x.hasValue() ? (T) mapByteString(x.getValue()) : null;
 				case RequestType.RequestForUpdate<?> _ -> throw new IllegalStateException();
-				case RequestType.RequestExists<?> _ -> (T) (Boolean) x.hasValue();
 			});
 		}
 	}
@@ -385,16 +404,17 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			case RequestExists<?> _ ->
 					(CompletableFuture<T>) toResponse(this.futureStub.subsequentExists(request), PreviousPresence::getPresent);
 			case RequestMulti<?> _ ->
-					(CompletableFuture<T>) this.reactiveStub.subsequentMultiGet(request)
+					(CompletableFuture<T>) toResponse(this.reactiveStub.subsequentMultiGet(request)
 							.map(kv -> mapByteString(kv.getValue()))
 							.collectList()
-							.toFuture();
+							.toFuture());
 		};
 	}
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestReduceRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.
+		RequestReduceRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
 		var request = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -417,7 +437,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.
+		RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
 		var request = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -427,8 +448,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setTimeoutMs(timeoutMs)
 				.build();
 		return (Publisher<T>) switch (requestType) {
-			case RequestType.RequestGetAllInRange<?> _ -> reactiveStub.getAllInRange(request)
-					.map(kv -> mapKV(kv));
+			case RequestType.RequestGetAllInRange<?> _ -> toResponse(reactiveStub.getAllInRange(request)
+					.map(kv -> mapKV(kv)));
 		};
 	}
 
@@ -541,6 +562,19 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return result;
 	}
 
+	private static <T> CompletableFuture<T> toResponse(CompletableFuture<T> future) {
+		return future
+				.exceptionallyCompose(ex -> CompletableFuture.failedFuture(mapGrpcStatusError(ex)));
+	}
+
+	private static <T> Mono<T> toResponse(Mono<T> mono) {
+		return mono.onErrorMap(GrpcConnection::mapGrpcStatusError);
+	}
+
+	private static <T> Flux<T> toResponse(Flux<T> flux) {
+		return flux.onErrorMap(GrpcConnection::mapGrpcStatusError);
+	}
+
 	private static <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture, Function<T, U> mapper) {
 		var cf = new CompletableFuture<U>() {
 			@Override
@@ -577,7 +611,12 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			var closeIndex = desc.indexOf(']');
 			var errorCode = desc.substring(grpcRocksDbErrorPrefixString.length(), closeIndex);
 			var errorDescription = desc.substring(closeIndex + 2);
-			return RocksDBException.of(RocksDBErrorType.valueOf(errorCode), errorDescription);
+			var errorType = RocksDBErrorType.valueOf(errorCode);
+			if (errorType == RocksDBErrorType.UPDATE_RETRY) {
+				return new RocksDBRetryException();
+			} else {
+				return RocksDBException.of(errorType, errorDescription);
+			}
 		} else {
 			return t;
 		}

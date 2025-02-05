@@ -35,14 +35,18 @@ public class RocksDBException extends RuntimeException {
 		UNSUPPORTED_COLUMN_TYPE,
 		NOT_IMPLEMENTED,
 		GET_PROPERTY_ERROR,
-		INTERNAL_ERROR
+		INTERNAL_ERROR,
+		TRANSACTION_NOT_FOUND,
+		NULL_ARGUMENT
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {
+		checkStaticInvocationType(errorUniqueId);
 		return new RocksDBException(errorUniqueId, message);
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, Throwable ex) {
+		checkStaticInvocationType(errorUniqueId);
 		if (ex instanceof org.rocksdb.RocksDBException e) {
 			return new RocksDBException(errorUniqueId, e);
 		} else {
@@ -51,10 +55,17 @@ public class RocksDBException extends RuntimeException {
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message, Throwable ex) {
+		checkStaticInvocationType(errorUniqueId);
 		if (ex instanceof org.rocksdb.RocksDBException e) {
 			return new RocksDBException(errorUniqueId, message, e);
 		} else {
 			return new RocksDBException(errorUniqueId, message, ex);
+		}
+	}
+
+	private static void checkStaticInvocationType(RocksDBErrorType errorUniqueId) {
+		if (errorUniqueId == RocksDBErrorType.UPDATE_RETRY) {
+			throw new UnsupportedOperationException("Please use new RocksDBRetryException()");
 		}
 	}
 
