@@ -9,7 +9,7 @@ public class LRUCacheFactory implements CacheFactory {
 	public Cache newCache(long size) {
 		return new LRUCache(size) {
 			{
-				RocksLeakDetector.register(this, owningHandle_);
+				RocksLeakDetector.register(this, "lru-cache", owningHandle_);
 			}
 		};
 	}

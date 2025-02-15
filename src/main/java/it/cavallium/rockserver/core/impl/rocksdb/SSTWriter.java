@@ -26,7 +26,7 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
         }
         var envOptions = new EnvOptions() {
             {
-                RocksLeakDetector.register(this, owningHandle_);
+                RocksLeakDetector.register(this, "sst-writer-open-env-options", owningHandle_);
             }
         };
         if (!forceNoOptions) {
@@ -41,7 +41,7 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
 
         var options = new Options() {
 					{
-						RocksLeakDetector.register(this, owningHandle_);
+						RocksLeakDetector.register(this, "sst-writer-open-options", owningHandle_);
 					}
         };
         refs.add(options);
@@ -85,7 +85,7 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
         }
         var sstFileWriter = new SstFileWriter(envOptions, options) {
 					{
-						RocksLeakDetector.register(this, owningHandle_);
+						RocksLeakDetector.register(this, "sst-writer-open-sst-file-writer", owningHandle_);
 					}
         };
         var sstWriter = new SSTWriter(db.get(), col, tempFile, sstFileWriter, ingestBehind, refs);
@@ -96,7 +96,7 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
     private static CompressionOptions cloneCompressionOptions(CompressionOptions compressionOptions) {
         return new CompressionOptions() {
 					{
-						RocksLeakDetector.register(this, owningHandle_);
+						RocksLeakDetector.register(this, "clone-compression-options-compression-options", owningHandle_);
 					}
         }
                 .setEnabled(compressionOptions.enabled())
@@ -131,7 +131,7 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                 sstFileWriter.finish();
                 try (var ingestOptions = new IngestExternalFileOptions() {
 									{
-										RocksLeakDetector.register(this, owningHandle_);
+										RocksLeakDetector.register(this, "ingest-external-file-options", owningHandle_);
 									}
                 }) {
                     ingestOptions

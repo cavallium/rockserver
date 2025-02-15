@@ -16,12 +16,12 @@ public class RocksLeakDetector {
 	));
 	public static final Cleaner CLEANER = Cleaner.create();
 
-	public static void register(RocksObject nativeReference, AtomicBoolean owningHandle) {
+	public static void register(RocksObject nativeReference, String label, AtomicBoolean owningHandle) {
 		if (ENABLE_LEAK_DETECTION) {
 			var resourceClass = nativeReference.getClass();
 			CLEANER.register(nativeReference, () -> {
 				if (owningHandle.get()) {
-					LOG.error("Resource leak of type {}", resourceClass);
+					LOG.error("Resource leak of type {} with label \"{}\"", resourceClass, label);
 				}
 			});
 		}

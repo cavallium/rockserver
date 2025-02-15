@@ -219,7 +219,7 @@ public sealed interface TransactionalDB extends Closeable {
 		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
 			return new TransactionalOptionsPessimistic(new TransactionOptions() {
 				{
-					RocksLeakDetector.register(this, owningHandle_);
+					RocksLeakDetector.register(this, "create-transactional-options-transaction-options", owningHandle_);
 				}
 			}.setExpiration(timeoutMs));
 		}
@@ -274,7 +274,7 @@ public sealed interface TransactionalDB extends Closeable {
 		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
 			return new TransactionalOptionsOptimistic(new OptimisticTransactionOptions() {
 				{
-					RocksLeakDetector.register(this, owningHandle_);
+					RocksLeakDetector.register(this, "create-transactional-options-optimistic-transaction-options", owningHandle_);
 				}
 			});
 		}

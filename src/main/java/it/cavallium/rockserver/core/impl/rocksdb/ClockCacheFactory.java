@@ -9,7 +9,7 @@ public class ClockCacheFactory implements CacheFactory {
 	public Cache newCache(long size) {
 		return new ClockCache(size) {
 			{
-				RocksLeakDetector.register(this, owningHandle_);
+				RocksLeakDetector.register(this, "clock-cache", owningHandle_);
 			}
 		};
 	}

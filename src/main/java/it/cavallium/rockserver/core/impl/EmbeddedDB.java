@@ -85,8 +85,6 @@ import org.rocksdb.RocksIterator;
 import org.rocksdb.Slice;
 import org.rocksdb.Status.Code;
 import org.rocksdb.TableProperties;
-import org.rocksdb.WriteBatch;
-import org.rocksdb.WriteOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
@@ -451,12 +449,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private ReadOptions newReadOptions() {
-		var ro = new ReadOptions() {
-			{
-				RocksLeakDetector.register(this, owningHandle_);
-			}
-		};
+	private ReadOptions newReadOptions(String label) {
+		var ro = new LeakSafeReadOptions(label);
 		ro.setAsyncIo(true);
 		return ro;
 	}
@@ -482,11 +476,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			var expirationTimestamp = timeoutMs + System.currentTimeMillis();
 			TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
-			var writeOpts = new WriteOptions() {
-				{
-					RocksLeakDetector.register(this, owningHandle_);
-				}
-			};
+			var writeOpts = new LeakSafeWriteOptions("open-transaction-internal-write-options");
 			var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
 			try {
 				return new Tx(db.beginTransaction(writeOpts, txOpts), isFromGetForUpdate, expirationTimestamp, rocksObjects);
@@ -765,11 +755,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 						writer = switch (mode) {
 							case WRITE_BATCH, WRITE_BATCH_NO_WAL -> {
-								var wb = new WB(db.get(), new WriteBatch() {
-									{
-										RocksLeakDetector.register(this, owningHandle_);
-									}
-								}, mode == PutBatchMode.WRITE_BATCH_NO_WAL);
+								var wb = new WB(db.get(), new LeakSafeWriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL);
 								refs.add(wb);
 								yield wb;
 							}
@@ -961,7 +947,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (col.hasBuckets()) {
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-						try (var readOptions = newReadOptions()) {
+						try (var readOptions = newReadOptions(null)) {
 							var previousRawBucketByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
 							didGetForUpdateInternally = true;
 							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
@@ -976,7 +962,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					} else {
 						if (RequestType.requiresGettingPreviousValue(callback)) {
 							assert newTx instanceof Tx;
-							try (var readOptions = newReadOptions()) {
+							try (var readOptions = newReadOptions(null)) {
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
 								didGetForUpdateInternally = true;
@@ -987,7 +973,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
 							// todo: in the future this should be replaced with just keyExists
 							assert newTx instanceof Tx;
-							try (var readOptions = newReadOptions()) {
+							try (var readOptions = newReadOptions(null)) {
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
 								didGetForUpdateInternally = true;
@@ -1007,11 +993,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							}
 							case Tx t -> t.val().put(col.cfh(), calculatedKey.toByteArray(), value.toByteArray());
 							case null -> {
-								try (var w = new WriteOptions() {
-									{
-										RocksLeakDetector.register(this, owningHandle_);
-									}
-								}) {
+								try (var w = new LeakSafeWriteOptions(null)) {
 									var keyBB = calculatedKey.toByteArray();
 									var valueBB = (col.schema().hasValue() ? value : dummyRocksDBEmptyValue()).toByteArray();
 									db.get().put(col.cfh(), w, keyBB, valueBB);
@@ -1135,7 +1117,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Buf calculatedKey = col.calculateKey(keys.keys());
 			if (col.hasBuckets()) {
 				var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-				try (var readOptions = newReadOptions()) {
+				try (var readOptions = newReadOptions(null)) {
 					Buf previousRawBucket = dbGet(tx, col, readOptions, calculatedKey);
 					if (previousRawBucket != null) {
 						var bucket = new Bucket(col, previousRawBucket);
@@ -1151,7 +1133,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				boolean shouldGetCurrent = RequestType.requiresGettingCurrentValue(callback)
 						|| (tx != null && callback instanceof RequestType.RequestExists<?>);
 				if (shouldGetCurrent) {
-					try (var readOptions = newReadOptions()) {
+					try (var readOptions = newReadOptions(null)) {
 						foundValue = dbGet(tx, col, readOptions, calculatedKey);
 						existsValue = foundValue != null;
 					} catch (org.rocksdb.RocksDBException e) {
@@ -1204,7 +1186,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var expirationTimestamp = timeoutMs + System.currentTimeMillis();
 			var col = getColumn(columnId);
 			RocksIterator it;
-			var ro = newReadOptions();
+			var ro = newReadOptions("open-iterator-read-options");
 			if (transactionId > 0L) {
 				//noinspection resource
 				it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
@@ -1287,7 +1269,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 
-			try (var ro = newReadOptions()) {
+			try (var ro = newReadOptions(null)) {
 				Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(startKeysInclusive.keys()) : null;
 				Buf calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(endKeysExclusive.keys()) : null;
 				try (var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
@@ -1411,51 +1393,45 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			Resources res;
 
-			var iteratorScheduler = Schedulers.single(scheduler.read());
+			var ro = newReadOptions("get-range-async-read-options");
 			try {
-				var ro = newReadOptions();
+				Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(
+						startKeysInclusive.keys()) : null;
+				Buf calculatedEndKey =
+						endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(endKeysExclusive.keys()) : null;
+				var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
 				try {
-					Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(
-							startKeysInclusive.keys()) : null;
-					Buf calculatedEndKey =
-							endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(endKeysExclusive.keys()) : null;
-					var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
+					var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null;
 					try {
-						var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null;
-						try {
-							if (startKeySlice != null) {
-								ro.setIterateLowerBound(startKeySlice);
-							}
-							if (endKeySlice != null) {
-								ro.setIterateUpperBound(endKeySlice);
-							}
-
-							RocksIterator it;
-							if (transactionId > 0L) {
-								//noinspection resource
-								it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
-							} else {
-								it = db.get().newIterator(col.cfh(), ro);
-							}
-							res = new Resources(col, ro, startKeySlice, endKeySlice, it);
-						} catch (Throwable ex) {
-							if (endKeySlice != null) {
-								endKeySlice.close();
-							}
-							throw ex;
-						}
-					} catch (Throwable ex) {
 						if (startKeySlice != null) {
-							startKeySlice.close();
+							ro.setIterateLowerBound(startKeySlice);
+						}
+						if (endKeySlice != null) {
+							ro.setIterateUpperBound(endKeySlice);
+						}
+
+						RocksIterator it;
+						if (transactionId > 0L) {
+							//noinspection resource
+							it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+						} else {
+							it = db.get().newIterator(col.cfh(), ro);
+						}
+						res = new Resources(col, ro, startKeySlice, endKeySlice, it);
+					} catch (Throwable ex) {
+						if (endKeySlice != null) {
+							endKeySlice.close();
 						}
 						throw ex;
 					}
 				} catch (Throwable ex) {
-					ro.close();
+					if (startKeySlice != null) {
+						startKeySlice.close();
+					}
 					throw ex;
 				}
 			} catch (Throwable ex) {
-				iteratorScheduler.dispose();
+				ro.close();
 				throw ex;
 			} finally {
 				totalTime.add(System.nanoTime() - initializationStartTime);
@@ -1469,6 +1445,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					res.it.seekToLast();
 				}
 				return res;
+			} catch (Throwable ex) {
+				res.close();
+				throw ex;
 			} finally {
 				totalTime.add(System.nanoTime() - seekStartTime);
 			}
@@ -1494,10 +1473,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			} finally {
 				totalTime.add(System.nanoTime() - nextTime);
 			}
-		}, resources -> {
+		}, res -> {
 			var closeTime = System.nanoTime();
 			try {
-				resources.close();
+				res.close();
 			} finally {
 				totalTime.add(System.nanoTime() - closeTime);
 			}
@@ -1656,4 +1635,5 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public RWScheduler getScheduler() {
 		return scheduler;
 	}
+
 }

@@ -112,7 +112,7 @@ public class RocksDBLoader {
         try {
             var columnFamilyOptions = new ColumnFamilyOptions() {
               {
-                RocksLeakDetector.register(this, owningHandle_);
+                RocksLeakDetector.register(this, "cf-options", owningHandle_);
               }
             };
             refs.add(columnFamilyOptions);
@@ -213,7 +213,7 @@ public class RocksDBLoader {
                 columnFamilyOptions.setBottommostCompressionType(CompressionType.LZ4HC_COMPRESSION);
                 var compressionOptions = new CompressionOptions() {
                   {
-                    RocksLeakDetector.register(this, owningHandle_);
+                    RocksLeakDetector.register(this, "compression-options", owningHandle_);
                   }
                 }.setEnabled(true)
                     .setMaxDictBytes(Math.toIntExact(32 * SizeUnit.KB));
@@ -251,7 +251,7 @@ public class RocksDBLoader {
             } else {
                 final BloomFilter bloomFilter = new BloomFilter(filter.bitsPerKey()) {
                   {
-                    RocksLeakDetector.register(this, owningHandle_);
+                    RocksLeakDetector.register(this, "bloom-filter", owningHandle_);
                   }
                 };
                 refs.add(bloomFilter);
@@ -365,7 +365,7 @@ public class RocksDBLoader {
             // that determines the behaviour of the database.
             var options = new DBOptions() {
               {
-                RocksLeakDetector.register(this, owningHandle_);
+                RocksLeakDetector.register(this, "db-options", owningHandle_);
               }
             };
             refs.add(options);
@@ -374,7 +374,7 @@ public class RocksDBLoader {
 
             var statistics = new Statistics() {
               {
-                RocksLeakDetector.register(this, owningHandle_);
+                RocksLeakDetector.register(this, "statistics", owningHandle_);
               }
             };
             refs.add(statistics);
@@ -492,7 +492,7 @@ public class RocksDBLoader {
             if (path != null && writeBufferManagerSize > 0L) {
                 var writeBufferManager = new WriteBufferManager(writeBufferManagerSize, blockCache, false) {
                   {
-                    RocksLeakDetector.register(this, owningHandle_);
+                    RocksLeakDetector.register(this, "wb-manager", owningHandle_);
                   }
                 };
                 refs.add(writeBufferManager);
@@ -588,7 +588,7 @@ public class RocksDBLoader {
 
             var defaultColumnOptions = new ColumnFamilyOptions() {
               {
-                RocksLeakDetector.register(this, owningHandle_);
+                RocksLeakDetector.register(this, "cf-options", owningHandle_);
               }
             };
             refs.add(defaultColumnOptions);
@@ -607,7 +607,7 @@ public class RocksDBLoader {
                 List<String> existingColumnFamilies;
                 try (var options = new Options() {
                   {
-                    RocksLeakDetector.register(this, owningHandle_);
+                    RocksLeakDetector.register(this, "options", owningHandle_);
                   }
                 }) {
                     options.setCreateIfMissing(true);
@@ -636,7 +636,7 @@ public class RocksDBLoader {
             } else {
                 var transactionOptions = new TransactionDBOptions() {
                   {
-                    RocksLeakDetector.register(this, owningHandle_);
+                    RocksLeakDetector.register(this, "transaction-db-options", owningHandle_);
                   }
                 }
                     .setWritePolicy(TxnDBWritePolicy.WRITE_COMMITTED)
@@ -689,7 +689,7 @@ public class RocksDBLoader {
         var compressionType = levelOptions.compression();
         var compressionOptions = new CompressionOptions() {
           {
-            RocksLeakDetector.register(this, owningHandle_);
+            RocksLeakDetector.register(this, "get-rocks-level-options-compression-options", owningHandle_);
           }
         };
         refs.add(compressionOptions);
