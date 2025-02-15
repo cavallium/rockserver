@@ -90,6 +90,7 @@ import org.rocksdb.WriteOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
@@ -1388,63 +1389,78 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 										   long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		LongAdder totalTime =  new LongAdder();
 		record Resources(ColumnInstance col, ReadOptions ro, AbstractSlice<?> startKeySlice,
-						 AbstractSlice<?> endKeySlice, RocksIterator it) {
+										 AbstractSlice<?> endKeySlice, RocksIterator it) {
 			public void close() {
-				ro.close();
-				if (startKeySlice != null) startKeySlice.close();
-				if (endKeySlice != null) endKeySlice.close();
 				it.close();
+				ro.close();
+				if (endKeySlice != null) endKeySlice.close();
+				if (startKeySlice != null) startKeySlice.close();
 			}
 		}
-		return Flux.using(() -> {
+		return Flux.<T, Resources>generate(() -> {
 			var initializationStartTime = System.nanoTime();
 			var col = getColumn(columnId);
 
 			if (requestType instanceof RequestType.RequestGetAllInRange<?>) {
 				if (col.hasBuckets()) {
 					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.UNSUPPORTED_COLUMN_TYPE,
-							"Can't get the range elements of a column with buckets");
+							"Can't get the range elements of a column with buckets"
+					);
 				}
 			}
 
-			var ro = newReadOptions();
-			try {
-				Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(startKeysInclusive.keys()) : null;
-				Buf calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(endKeysExclusive.keys()) : null;
-				var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
-				try {
-					var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null;
-					try {
-						if (startKeySlice != null) {
-							ro.setIterateLowerBound(startKeySlice);
-						}
-						if (endKeySlice != null) {
-							ro.setIterateUpperBound(endKeySlice);
-						}
+			Resources res;
 
-						RocksIterator it;
-						if (transactionId > 0L) {
-							//noinspection resource
-							it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
-						} else {
-							it = db.get().newIterator(col.cfh(), ro);
+			var iteratorScheduler = Schedulers.single(scheduler.read());
+			try {
+				var ro = newReadOptions();
+				try {
+					Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(
+							startKeysInclusive.keys()) : null;
+					Buf calculatedEndKey =
+							endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(endKeysExclusive.keys()) : null;
+					var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
+					try {
+						var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null;
+						try {
+							if (startKeySlice != null) {
+								ro.setIterateLowerBound(startKeySlice);
+							}
+							if (endKeySlice != null) {
+								ro.setIterateUpperBound(endKeySlice);
+							}
+
+							RocksIterator it;
+							if (transactionId > 0L) {
+								//noinspection resource
+								it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+							} else {
+								it = db.get().newIterator(col.cfh(), ro);
+							}
+							res = new Resources(col, ro, startKeySlice, endKeySlice, it);
+						} catch (Throwable ex) {
+							if (endKeySlice != null) {
+								endKeySlice.close();
+							}
+							throw ex;
 						}
-						return new Resources(col, ro, startKeySlice, endKeySlice, it);
 					} catch (Throwable ex) {
-						if (endKeySlice != null) endKeySlice.close();
+						if (startKeySlice != null) {
+							startKeySlice.close();
+						}
 						throw ex;
 					}
 				} catch (Throwable ex) {
-					if (startKeySlice != null) startKeySlice.close();
+					ro.close();
 					throw ex;
 				}
 			} catch (Throwable ex) {
-				ro.close();
+				iteratorScheduler.dispose();
 				throw ex;
 			} finally {
 				totalTime.add(System.nanoTime() - initializationStartTime);
 			}
-		}, res -> Flux.<T, RocksIterator>generate(() -> {
+
 			var seekStartTime = System.nanoTime();
 			try {
 				if (!reverse) {
@@ -1452,18 +1468,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				} else {
 					res.it.seekToLast();
 				}
-				return res.it;
+				return res;
 			} finally {
 				totalTime.add(System.nanoTime() - seekStartTime);
 			}
-		}, (it, sink) -> {
+		}, (res, sink) -> {
 			var nextTime = System.nanoTime();
 			try {
-				if (!it.isValid()) {
+				if (!res.it.isValid()) {
 					sink.complete();
 				} else {
-					var calculatedKey = toBuf(it.key());
-					var calculatedValue = res.col.schema().hasValue() ? toBuf(it.value()) : emptyBuf();
+					var calculatedKey = toBuf(res.it.key());
+					var calculatedValue = res.col.schema().hasValue() ? toBuf(res.it.value()) : emptyBuf();
 					if (!reverse) {
 						res.it.next();
 					} else {
@@ -1474,11 +1490,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					//noinspection unchecked
 					sink.next((T) kv);
 				}
-				return it;
+				return res;
 			} finally {
 				totalTime.add(System.nanoTime() - nextTime);
 			}
-		}), resources -> {
+		}, resources -> {
 			var closeTime = System.nanoTime();
 			try {
 				resources.close();
@@ -1486,7 +1502,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				totalTime.add(System.nanoTime() - closeTime);
 			}
 		})
-		.subscribeOn(scheduler.read())
+
+		// Create a safe scheduler in which a cancel signal will not cause a race condition, avoiding SIGSEGV crashes
+		.transformDeferred(flux -> {
+			var singleReadScheduler = Schedulers.single(scheduler.read());
+			return flux
+					.cancelOn(singleReadScheduler)
+					.subscribeOn(singleReadScheduler)
+					.doFinally(_ -> singleReadScheduler.dispose());
+		})
+
 		.doFirst(ops::beginOp)
 		.doFinally(_ -> {
 			ops.endOp();
