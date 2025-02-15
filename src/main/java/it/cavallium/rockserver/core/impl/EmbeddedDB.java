@@ -1486,9 +1486,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		.transformDeferred(flux -> {
 			var singleReadScheduler = Schedulers.single(scheduler.read());
 			return flux
+					.doFinally(_ -> singleReadScheduler.dispose())
 					.cancelOn(singleReadScheduler)
-					.subscribeOn(singleReadScheduler)
-					.doFinally(_ -> singleReadScheduler.dispose());
+					.subscribeOn(singleReadScheduler);
 		})
 
 		.doFirst(ops::beginOp)
