@@ -144,7 +144,7 @@ public class Utils {
 	public static Buf fromHeapByteBuffer(ByteBuffer resultBuffer) {
 		if (resultBuffer == null) return null;
 		var arrayOffset = resultBuffer.arrayOffset();
-		return Buf.wrap(resultBuffer.array(), arrayOffset, arrayOffset + resultBuffer.limit());
+		return Buf.wrap(resultBuffer.array(), arrayOffset + resultBuffer.position(), arrayOffset + resultBuffer.limit());
 	}
 
 	public static Buf fromByteBuffer(ByteBuffer resultBuffer) {
