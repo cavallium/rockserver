@@ -59,6 +59,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.StampedLock;
 import java.util.stream.Stream;
 
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
@@ -1370,16 +1371,47 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 										   RequestType.RequestGetRange<? super KV, T> requestType,
 										   long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		LongAdder totalTime =  new LongAdder();
-		record Resources(ColumnInstance col, ReadOptions ro, AbstractSlice<?> startKeySlice,
-										 AbstractSlice<?> endKeySlice, RocksIterator it) {
-			public void close() {
-				it.close();
-				ro.close();
-				if (endKeySlice != null) endKeySlice.close();
-				if (startKeySlice != null) startKeySlice.close();
+
+		final class IteratorResources {
+
+			private final ColumnInstance col;
+			private final ReadOptions ro;
+			private final AbstractSlice<?> startKeySlice;
+			private final AbstractSlice<?> endKeySlice;
+			private final RocksIterator it;
+			private final StampedLock resourceLock = new StampedLock();
+
+			IteratorResources(ColumnInstance col,
+					ReadOptions ro,
+					AbstractSlice<?> startKeySlice,
+					AbstractSlice<?> endKeySlice,
+					RocksIterator it) {
+				this.col = col;
+				this.ro = ro;
+				this.startKeySlice = startKeySlice;
+				this.endKeySlice = endKeySlice;
+				this.it = it;
 			}
+
+			public void close() {
+				var wl = resourceLock.writeLock();
+				try {
+					it.close();
+					ro.close();
+					if (endKeySlice != null) {
+						endKeySlice.close();
+					}
+					if (startKeySlice != null) {
+						startKeySlice.close();
+					}
+				} finally {
+					resourceLock.unlockWrite(wl);
+				}
+			}
+
 		}
-		return Flux.<T, Resources>generate(() -> {
+
+		return Flux.<T, IteratorResources>generate(() -> {
 			var initializationStartTime = System.nanoTime();
 			var col = getColumn(columnId);
 
@@ -1391,7 +1423,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 
-			Resources res;
+			IteratorResources res;
 
 			var ro = newReadOptions("get-range-async-read-options");
 			try {
@@ -1417,7 +1449,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						} else {
 							it = db.get().newIterator(col.cfh(), ro);
 						}
-						res = new Resources(col, ro, startKeySlice, endKeySlice, it);
+						res = new IteratorResources(col, ro, startKeySlice, endKeySlice, it);
 					} catch (Throwable ex) {
 						if (endKeySlice != null) {
 							endKeySlice.close();
@@ -1452,10 +1484,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				totalTime.add(System.nanoTime() - seekStartTime);
 			}
 		}, (res, sink) -> {
+			T nextResult;
 			var nextTime = System.nanoTime();
+			var readLock = res.resourceLock.readLock();
 			try {
-				if (!res.it.isValid()) {
-					sink.complete();
+				boolean invalid = !res.it.isValid();
+				if (invalid) {
+					nextResult = null;
 				} else {
 					var calculatedKey = toBuf(res.it.key());
 					var calculatedValue = res.col.schema().hasValue() ? toBuf(res.it.value()) : emptyBuf();
@@ -1465,14 +1500,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						res.it.prev();
 					}
 					var kv = decodeKVNoBuckets(res.col, calculatedKey, calculatedValue);
-
 					//noinspection unchecked
-					sink.next((T) kv);
+					nextResult = (T) Objects.requireNonNull(kv);
 				}
-				return res;
 			} finally {
+				res.resourceLock.unlockRead(readLock);
 				totalTime.add(System.nanoTime() - nextTime);
 			}
+
+			if (nextResult != null) {
+				sink.next(nextResult);
+			} else {
+				sink.complete();
+			}
+			return res;
 		}, res -> {
 			var closeTime = System.nanoTime();
 			try {
@@ -1481,16 +1522,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				totalTime.add(System.nanoTime() - closeTime);
 			}
 		})
-
-		// Create a safe scheduler in which a cancel signal will not cause a race condition, avoiding SIGSEGV crashes
-		.transformDeferred(flux -> {
-			var singleReadScheduler = Schedulers.single(scheduler.read());
-			return flux
-					.doFinally(_ -> singleReadScheduler.dispose())
-					.cancelOn(singleReadScheduler)
-					.subscribeOn(singleReadScheduler);
-		})
-
+		.subscribeOn(scheduler.read())
 		.doFirst(ops::beginOp)
 		.doFinally(_ -> {
 			ops.endOp();
