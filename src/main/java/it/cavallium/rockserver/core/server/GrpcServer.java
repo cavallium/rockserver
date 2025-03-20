@@ -603,6 +603,7 @@ public class GrpcServer extends Server {
 					case XXHASH32 -> ColumnHashType.XXHASH32;
 					case XXHASH8 -> ColumnHashType.XXHASH8;
 					case ALLSAME8 -> ColumnHashType.ALLSAME8;
+					case FIXEDINTEGER32 -> ColumnHashType.FIXEDINTEGER32;
 					case UNRECOGNIZED -> throw new UnsupportedOperationException();
 				});
 			}

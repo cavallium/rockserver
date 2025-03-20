@@ -10,7 +10,8 @@ package it.cavallium.rockserver.core.common.api;
 public enum ColumnHashType implements org.apache.thrift.TEnum {
   XXHASH32(1),
   XXHASH8(2),
-  ALLSAME8(3);
+  ALLSAME8(3),
+  FIXEDINTEGER32(4);
 
   private final int value;
 
@@ -39,6 +40,8 @@ public enum ColumnHashType implements org.apache.thrift.TEnum {
         return XXHASH8;
       case 3:
         return ALLSAME8;
+      case 4:
+        return FIXEDINTEGER32;
       default:
         return null;
     }

@@ -15,6 +15,7 @@ enum ColumnHashType {
   XXHASH32 = 0;
   XXHASH8 = 1;
   ALLSAME8 = 2;
+  FIXEDINTEGER32 = 3;
 }
 
 enum Operation {

@@ -557,6 +557,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				case XXHASH32 -> ColumnHashType.XXHASH32;
 				case XXHASH8 -> ColumnHashType.XXHASH8;
 				case ALLSAME8 -> ColumnHashType.ALLSAME8;
+				case FIXEDINTEGER32 -> ColumnHashType.FIXEDINTEGER32;
 			});
 		}
 		return result;

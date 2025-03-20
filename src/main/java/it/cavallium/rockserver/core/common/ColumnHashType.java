@@ -10,7 +10,14 @@ public enum ColumnHashType implements HashFunction {
 		var xxHash = XXHash32.getInstance().hash(Utils.toByteArray(inputData), 0, inputData.size(), 0);
 		hashResult.setByte(0, (byte) xxHash);
 	}),
-	ALLSAME8(Byte.BYTES, (inputData, hashResult) -> hashResult.setByte(0, (byte) 0));
+	ALLSAME8(Byte.BYTES, (inputData, hashResult) -> hashResult.setByte(0, (byte) 0)),
+	FIXEDINTEGER32(Integer.BYTES, (inputData, hashResult) -> {
+		if (inputData.size() != Integer.BYTES) {
+			throw new UnsupportedOperationException("Input type is not 32 bits");
+		}
+		var i = inputData.getInt(0);
+		hashResult.setInt(0, i);
+	});
 
 	private final int bytes;
 	private final HashFunction hashFunction;

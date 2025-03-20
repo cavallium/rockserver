@@ -9,7 +9,8 @@ struct ColumnSchema {
 enum ColumnHashType {
   XXHASH32 = 1,
   XXHASH8 = 2,
-  ALLSAME8 = 3
+  ALLSAME8 = 3,
+  FIXEDINTEGER32 = 4
 }
 
 enum Operation {
