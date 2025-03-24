@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.buffer.Buf;
 import java.util.Arrays;
+import java.util.StringJoiner;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.ColumnFamilyHandle;
@@ -188,5 +189,22 @@ public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int fi
 		return Arrays.copyOfRange(keys,
 				schema.keysCount() - schema.variableLengthKeysCount(),
 				schema.keysCount());
+	}
+
+	@Override
+	public String toString() {
+		return new StringJoiner(", ", ColumnInstance.class.getSimpleName() + "[", "]")
+				.add("cfh=" + getCfhName(cfh))
+				.add("schema=" + schema)
+				.add("finalKeySizeBytes=" + finalKeySizeBytes)
+				.toString();
+	}
+
+	private String getCfhName(ColumnFamilyHandle cfh) {
+		try {
+			return new String(cfh.getName());
+		} catch (org.rocksdb.RocksDBException e) {
+			return cfh.toString();
+		}
 	}
 }
