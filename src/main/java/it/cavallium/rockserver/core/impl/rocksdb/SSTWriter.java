@@ -33,7 +33,6 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
             envOptions
                     .setAllowFallocate(true)
                     .setWritableFileMaxBufferSize(10 * SizeUnit.MB)
-                    .setRandomAccessMaxBufferSize(10 * SizeUnit.MB)
                     .setCompactionReadaheadSize(2 * SizeUnit.MB)
                     .setBytesPerSync(10 * SizeUnit.MB);
         }
