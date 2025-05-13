@@ -7,6 +7,11 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import com.google.protobuf.Message;
 import com.google.protobuf.UnsafeByteOperations;
+import io.grpc.Metadata;
+import io.grpc.ServerCall;
+import io.grpc.ServerCall.Listener;
+import io.grpc.ServerCallHandler;
+import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.StatusException;
@@ -106,6 +111,7 @@ public class GrpcServer extends Server {
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
 				.maxInboundMessageSize(512 * 1024 * 1024)
 				.addService(grpc)
+				.intercept(new GzipCompressorInterceptor())
 				.build();
 		LOG.info("GRPC RocksDB server is listening at " + socketAddress);
 	}
@@ -114,6 +120,18 @@ public class GrpcServer extends Server {
 	public void start() throws IOException {
 		server.start();
 	}
+
+	private static class GzipCompressorInterceptor implements ServerInterceptor {
+
+		@Override
+		public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
+				Metadata headers,
+				ServerCallHandler<ReqT, RespT> next) {
+			call.setCompression("gzip");
+			return next.startCall(call, headers);
+		}
+	}
+
 
 	private final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplBase {
 
