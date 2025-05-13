@@ -209,7 +209,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> putBatch(Flux<PutBatchRequest> request) {
-			return request.switchOnFirst((firstSignal, nextRequests) -> {
+			return request.switchOnFirst((firstSignal, requestFlux) -> {
 				if (firstSignal.isOnNext()) {
 					var firstValue = firstSignal.get();
                     assert firstValue != null;
@@ -226,14 +226,21 @@ public class GrpcServer extends Server {
 						case UNRECOGNIZED -> throw new UnsupportedOperationException("Unrecognized request \"mode\"");
 					};
 
-					var batches = nextRequests.<KVBatch>handle((putBatchRequest, sink) -> {
-						var batch = putBatchRequest.getData();
-						try {
-							sink.next(mapKVBatch(batch.getEntriesCount(), batch::getEntries));
-						} catch (Throwable ex) {
-							sink.error(ex);
-						}
-					});
+					var batches = requestFlux
+							.skip(1) // skip initial request
+							.<KVBatch>handle((putBatchRequest, sink) -> {
+								if (!putBatchRequest.hasData()) {
+									sink.error( RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+											"Multiple initial requests"));
+									return;
+								}
+								var batch = putBatchRequest.getData();
+								try {
+									sink.next(mapKVBatch(batch.getEntriesCount(), batch::getEntries));
+								} catch (Throwable ex) {
+									sink.error(ex);
+								}
+							});
 
 					return Mono
 							.fromFuture(() -> asyncApi.putBatchAsync(initialRequest.getColumnId(), batches, mode))
@@ -242,14 +249,14 @@ public class GrpcServer extends Server {
 					return Mono.just(RocksDBException.of(
 							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
 				} else {
-					return nextRequests;
+					return requestFlux;
 				}
 			}).then(Mono.just(Empty.getDefaultInstance()));
 		}
 
 		@Override
 		public Mono<Empty> putMulti(Flux<PutMultiRequest> request) {
-			return request.switchOnFirst((firstSignal, nextRequests) -> {
+			return request.switchOnFirst((firstSignal, requestsFlux) -> {
 				if (firstSignal.isOnNext()) {
 					var firstValue = firstSignal.get();
 					assert firstValue != null;
@@ -259,9 +266,14 @@ public class GrpcServer extends Server {
 					}
 					var initialRequest = firstValue.getInitialRequest();
 
-                    return nextRequests
+                    return requestsFlux
+												.skip(1) // skip the initial request
 												.publishOn(scheduler.write())
 												.doOnNext(putRequest -> {
+													if (!putRequest.hasData()) {
+														throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+																"Multiple initial requests");
+													}
 														var data = putRequest.getData();
 													api.put(initialRequest.getTransactionOrUpdateId(),
 																	initialRequest.getColumnId(),
@@ -274,7 +286,7 @@ public class GrpcServer extends Server {
 					return Mono.just(RocksDBException.of(
 							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
 				} else {
-					return nextRequests;
+					return requestsFlux;
 				}
 			}).then(Mono.just(Empty.getDefaultInstance()));
 		}
