@@ -232,7 +232,6 @@ public class RocksDBLoader {
                     .map(DataSize::longValue)
                     .ifPresent(columnFamilyOptions::setWriteBufferSize);
 
-            columnFamilyOptions.setMaxWriteBufferNumberToMaintain(1);
             if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
                 blockBasedTableConfig.setVerifyCompression(false);
             }
