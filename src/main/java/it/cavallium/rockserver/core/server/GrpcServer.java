@@ -56,6 +56,7 @@ import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
 import it.cavallium.buffer.Buf;
+import java.io.Serializable;
 import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -66,6 +67,7 @@ import java.util.concurrent.CompletionException;
 import java.util.function.Function;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
@@ -255,6 +257,13 @@ public class GrpcServer extends Server {
 		}
 
 		@Override
+		public Mono<Empty> putMultiList(PutMultiListRequest request) {
+			var initialRequest = request.getInitialRequest();
+			var dataFlux = Flux.fromIterable(request.getDataList());
+			return putMultiDataFlux(initialRequest, dataFlux, "putMultiList");
+		}
+
+		@Override
 		public Mono<Empty> putMulti(Flux<PutMultiRequest> request) {
 			return request.switchOnFirst((firstSignal, requestsFlux) -> {
 				if (firstSignal.isOnNext()) {
@@ -265,23 +274,15 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
-
-                    return requestsFlux
-												.skip(1) // skip the initial request
-												.publishOn(scheduler.write())
-												.doOnNext(putRequest -> {
-													if (!putRequest.hasData()) {
-														throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-																"Multiple initial requests");
-													}
-														var data = putRequest.getData();
-													api.put(initialRequest.getTransactionOrUpdateId(),
-																	initialRequest.getColumnId(),
-																	mapKeys(data.getKeysCount(), data::getKeys),
-																	toBuf(data.getValue()),
-																	new RequestNothing<>());
-												})
-												.transform(this.onErrorMapFluxWithRequestInfo("putMulti", initialRequest));
+					var dataFlux = requestsFlux
+							.skip(1) // skip the initial request
+							.map(putRequest -> {
+								if (!putRequest.hasData()) {
+									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Multiple initial requests");
+								}
+								return putRequest.getData();
+							});
+					return putMultiDataFlux(initialRequest, dataFlux, "putMulti");
 				} else if (firstSignal.isOnComplete()) {
 					return Mono.just(RocksDBException.of(
 							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
@@ -289,6 +290,21 @@ public class GrpcServer extends Server {
 					return requestsFlux;
 				}
 			}).then(Mono.just(Empty.getDefaultInstance()));
+		}
+
+		private Mono<Empty> putMultiDataFlux(PutMultiInitialRequest initialRequest,
+				Flux<KV> dataFlux, String requestName) {
+			return dataFlux
+					.publishOn(scheduler.write())
+					.doOnNext(data -> {
+						api.put(initialRequest.getTransactionOrUpdateId(),
+								initialRequest.getColumnId(),
+								mapKeys(data.getKeysCount(), data::getKeys),
+								toBuf(data.getValue()),
+								new RequestNothing<>());
+					})
+					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
+					.then(Mono.just(Empty.getDefaultInstance()));
 		}
 
 		@Override
