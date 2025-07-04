@@ -64,6 +64,7 @@ import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionException;
 
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -113,6 +114,8 @@ public class GrpcServer extends Server {
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
 				.maxInboundMessageSize(512 * 1024 * 1024)
 				.addService(grpc)
+				.permitKeepAliveWithoutCalls(true)
+				.permitKeepAliveTime(5, TimeUnit.SECONDS)
 				.intercept(new GzipCompressorInterceptor())
 				.build();
 		LOG.info("GRPC RocksDB server is listening at " + socketAddress);
