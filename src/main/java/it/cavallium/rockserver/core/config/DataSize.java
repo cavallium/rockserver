@@ -92,7 +92,7 @@ public final class DataSize extends Number implements Comparable<DataSize> {
 		this.size = (negative ? -1 : 1) * number * scale;
 	}
 
-	private static int getScale(String size, int numberEndOffset) {
+	private static long getScale(String size, int numberEndOffset) {
 		if (size.length() - numberEndOffset > 3) {
 			throw new IllegalArgumentException("Wrong measurement unit");
 		}
@@ -106,8 +106,8 @@ public final class DataSize extends Number implements Comparable<DataSize> {
 		return scale;
 	}
 
-	private static int getScale(boolean powerOf2, char scaleChar) {
-		int k = powerOf2 ? 1024 : 1000;
+	private static long getScale(boolean powerOf2, char scaleChar) {
+		long k = powerOf2 ? 1024L : 1000L;
 		return switch (scaleChar) {
 			case 'B' -> 1;
 			case 'b' -> throw new IllegalArgumentException("Bits are not allowed");

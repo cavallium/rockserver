@@ -17,6 +17,7 @@ class DefaultConfigTest {
 		var ingestBehind = def.global().ingestBehind();
 		Assertions.assertFalse(ingestBehind);
 		Assertions.assertEquals(Path.of("./volume"), def.global().columnOptions()[0].volumes()[0].volumePath());
+		Assertions.assertEquals("10TiB", def.global().columnOptions()[0].volumes()[0].targetSize().toString());
 		Assertions.assertEquals(new DataSize("32KiB"), def.global().fallbackColumnOptions().levels()[6].maxDictBytes());
 	}
 }
