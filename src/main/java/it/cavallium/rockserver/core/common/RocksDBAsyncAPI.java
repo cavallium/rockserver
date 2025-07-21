@@ -2,6 +2,8 @@ package it.cavallium.rockserver.core.common;
 
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
@@ -158,5 +160,15 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 				requestType,
 				timeoutMs
 		));
+	}
+
+	/** See: {@link Flush}. */
+	default CompletableFuture<Void> flushAsync() {
+		return requestAsync(new Flush());
+	}
+
+	/** See: {@link Compact}. */
+	default CompletableFuture<Void> compactAsync() {
+		return requestAsync(new Compact());
 	}
 }

@@ -520,12 +520,12 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param timeoutMs timeout in milliseconds
 		 */
 		record GetRange<T>(long transactionId,
-						   long columnId,
-						   @Nullable Keys startKeysInclusive,
-						   @Nullable Keys endKeysExclusive,
-						   boolean reverse,
-						   RequestType.RequestGetRange<? super KV, T> requestType,
-						   long timeoutMs) implements RocksDBAPICommandStream<T> {
+											 long columnId,
+											 @Nullable Keys startKeysInclusive,
+											 @Nullable Keys endKeysExclusive,
+											 boolean reverse,
+											 RequestType.RequestGetRange<? super KV, T> requestType,
+											 long timeoutMs) implements RocksDBAPICommandStream<T> {
 
 			@Override
 			public Stream<T> handleSync(RocksDBSyncAPI api) {
@@ -557,5 +557,49 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			}
 
 		}
+	}
+	/**
+	 * Flush the database
+	 */
+	record Flush() implements RocksDBAPICommandSingle<Void> {
+
+		@Override
+		public Void handleSync(RocksDBSyncAPI api) {
+			api.flush();
+			return null;
+		}
+
+		@Override
+		public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
+			return api.flushAsync();
+		}
+
+		@Override
+		public boolean isReadOnly() {
+			return true;
+		}
+
+	}
+	/**
+	 * Compacts the database
+	 */
+	record Compact() implements RocksDBAPICommandSingle<Void> {
+
+		@Override
+		public Void handleSync(RocksDBSyncAPI api) {
+			api.compact();
+			return null;
+		}
+
+		@Override
+		public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
+			return api.compactAsync();
+		}
+
+		@Override
+		public boolean isReadOnly() {
+			return true;
+		}
+
 	}
 }

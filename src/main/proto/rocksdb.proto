@@ -100,6 +100,10 @@ message GetRangeRequest {int64 transactionId = 1; int64 columnId = 2; repeated b
 message FirstAndLast {optional KV first = 1; optional KV last = 2;}
 message EntriesCount {int64 count = 1;}
 
+message CompactRequest {}
+
+message FlushRequest {}
+
 service RocksDBService {
   rpc openTransaction(OpenTransactionRequest) returns (OpenTransactionResponse);
   rpc closeTransaction(CloseTransactionRequest) returns (CloseTransactionResponse);
@@ -131,4 +135,6 @@ service RocksDBService {
   rpc reduceRangeFirstAndLast(GetRangeRequest) returns (FirstAndLast);
   rpc reduceRangeEntriesCount(GetRangeRequest) returns (EntriesCount);
   rpc getAllInRange(GetRangeRequest) returns (stream KV);
+  rpc flush(FlushRequest) returns (google.protobuf.Empty);
+  rpc compact(CompactRequest) returns (google.protobuf.Empty);
 }

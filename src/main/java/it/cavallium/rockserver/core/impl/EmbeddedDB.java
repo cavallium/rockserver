@@ -15,6 +15,8 @@ import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestEntriesCount;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
@@ -79,8 +81,11 @@ import org.rocksdb.Cache;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.CompactRangeOptions;
+import org.rocksdb.CompactRangeOptions.BottommostLevelCompaction;
 import org.rocksdb.DBOptions;
 import org.rocksdb.DirectSlice;
+import org.rocksdb.FlushOptions;
 import org.rocksdb.Holder;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
@@ -136,6 +141,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer subsequentTimer;
 	private final Timer reduceRangeTimer;
 	private final Timer getRangeTimer;
+	private final Timer flushTimer;
+	private final Timer compactTimer;
 	private final RocksDBStatistics rocksDBStatistics;
 	private final boolean fastGet;
 	private Path tempSSTsPath;
@@ -169,6 +176,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.subsequentTimer = createActionTimer(Subsequent.class);
 		this.reduceRangeTimer = createActionTimer(ReduceRange.class);
 		this.getRangeTimer = createActionTimer(GetRange.class);
+		this.flushTimer = createActionTimer(Flush.class);
+		this.compactTimer = createActionTimer(Compact.class);
 
 		var beforeLoad = Instant.now();
 		this.config = config;
@@ -1574,6 +1583,56 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			ops.endOp();
 			getRangeTimer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
 		});
+	}
+
+	@Override
+	public void flush() {
+		var start = System.nanoTime();
+		ops.beginOp();
+		try {
+			db.get().flushWal(true);
+			try (var fo = new FlushOptions()) {
+				db.get().flush(fo, columns.values().stream()
+						.map(ColumnInstance::cfh)
+						.filter(AbstractImmutableNativeReference::isOwningHandle)
+						.toList());
+			}
+		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
+		} finally {
+			ops.endOp();
+			var end = System.nanoTime();
+			flushTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	@Override
+	public void compact() {
+		var start = System.nanoTime();
+		ops.beginOp();
+		try {
+			for (ColumnInstance value : columns.values()) {
+				if (value.cfh().isOwningHandle()) {
+					try (var cro = new CompactRangeOptions()
+							.setAllowWriteStall(true)
+							.setExclusiveManualCompaction(true)
+							.setChangeLevel(false)
+							.setBottommostLevelCompaction(BottommostLevelCompaction.kForceOptimized)) {
+						db.get().compactRange(value.cfh(), null, null, cro);
+					}
+				}
+			}
+		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
+		} finally {
+			ops.endOp();
+			var end = System.nanoTime();
+			compactTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
 	}
 
 	private Buf dbGet(Tx tx,

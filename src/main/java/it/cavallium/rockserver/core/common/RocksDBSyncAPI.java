@@ -3,6 +3,8 @@ package it.cavallium.rockserver.core.common;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
@@ -138,5 +140,15 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 								   @NotNull RequestType.RequestGetRange<? super KV, T> requestType,
 								   long timeoutMs) throws RocksDBException {
 		return requestSync(new GetRange<>(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
+	}
+
+	/** See: {@link Flush}. */
+	default void flush() {
+		requestSync(new Flush());
+	}
+
+	/** See: {@link Compact}. */
+	default void compact() {
+		requestSync(new Compact());
 	}
 }

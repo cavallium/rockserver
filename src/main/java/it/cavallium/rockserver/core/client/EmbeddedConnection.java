@@ -182,6 +182,16 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public void flush() {
+		db.flush();
+	}
+
+	@Override
+	public void compact() {
+		db.compact();
+	}
+
+	@Override
 	public RWScheduler getScheduler() {
 		return db.getScheduler();
 	}

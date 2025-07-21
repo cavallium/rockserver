@@ -545,6 +545,21 @@ public class GrpcServer extends Server {
 					.transform(this.onErrorMapFluxWithRequestInfo("getAllInRange", request));
 		}
 
+		@Override
+		public Mono<Empty> flush(FlushRequest request) {
+			return executeSync(() -> {
+				api.flush();
+				return Empty.getDefaultInstance();
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("flush", request));
+		}
+
+		@Override
+		public Mono<Empty> compact(CompactRequest request) {
+			return executeSync(() -> {
+				api.compact();
+				return Empty.getDefaultInstance();
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("compact", request));
+		}
 
 		// utils
 
