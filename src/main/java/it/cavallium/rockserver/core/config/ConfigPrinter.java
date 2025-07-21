@@ -145,9 +145,9 @@ public class ConfigPrinter {
 	private static String stringifyVolume(VolumeConfig o) throws GestaltException {
 		return """
 				{
-				      "volume-path": "%s",
-				      "target-size-bytes": "%s"
-				    }\
+				        "volume-path": "%s",
+				        "target-size-bytes": "%s"
+				      }\
 				""".formatted(o.volumePath(),
 				o.targetSize()
 		);
