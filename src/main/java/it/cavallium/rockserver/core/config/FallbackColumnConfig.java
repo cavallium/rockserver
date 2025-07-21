@@ -7,6 +7,12 @@ public interface FallbackColumnConfig {
 
 	VolumeConfig[] volumes() throws GestaltException;
 
+	@Nullable
+	DataSize firstLevelSstSize() throws GestaltException;
+
+	@Nullable
+	DataSize maxLastLevelSstSize() throws GestaltException;
+
 	ColumnLevelConfig[] levels() throws GestaltException;
 
 	@Nullable

@@ -165,13 +165,15 @@ public class ConfigPrinter {
 			String s = stringifyBloomFilter(value);
 			if (s != null) bloom = s;
 		}
-		StringJoiner result = new StringJoiner(",", "[", "]");
+		StringJoiner volumesStr = new StringJoiner(",", "[", "]");
 		for (VolumeConfig volumeConfig : getVolumeConfigs(o)) {
 			String s = stringifyVolume(volumeConfig);
-			result.add(s);
+			volumesStr.add(s);
 		}
 		return """
 				{
+				      "first-level-sst-size": %s,
+				      "max-last-level-sst-size": %s,
 				      "volumes": %s,
 				      "levels": %s,
 				      "memtable-memory-budget-bytes": "%s",
@@ -181,7 +183,10 @@ public class ConfigPrinter {
 				      "block-size": "%s",
 				      "write-buffer-size": "%s"
 				    }\
-				""".formatted(result.toString(),
+				""".formatted(
+				o.firstLevelSstSize(),
+				o.maxLastLevelSstSize(),
+				volumesStr.toString(),
 				joiner.toString(),
 				o.memtableMemoryBudgetBytes(),
 				o.cacheIndexAndFilterBlocks(),
@@ -204,9 +209,17 @@ public class ConfigPrinter {
 			String s = stringifyBloomFilter(value);
 			if (s != null) bloom = s;
 		}
+		StringJoiner volumesStr = new StringJoiner(",", "[", "]");
+		for (VolumeConfig volumeConfig : getVolumeConfigs(o)) {
+			String s = stringifyVolume(volumeConfig);
+			volumesStr.add(s);
+		}
 		return """
 				{
 				      "name": "%s",
+				      "first-level-sst-size": %s,
+				      "max-last-level-sst-size": %s,
+				      "volumes": %s,
 				      "levels": %s,
 				      "memtable-memory-budget-bytes": "%s",
 				      "cache-index-and-filter-blocks": %b,
@@ -216,6 +229,9 @@ public class ConfigPrinter {
 				      "write-buffer-size": "%s"
 				    }\
 				""".formatted(o.name(),
+				o.firstLevelSstSize(),
+				o.maxLastLevelSstSize(),
+				volumesStr.toString(),
 				joiner.toString(),
 				o.memtableMemoryBudgetBytes(),
 				o.cacheIndexAndFilterBlocks(),
