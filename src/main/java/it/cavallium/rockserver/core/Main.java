@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core;
 import static it.cavallium.rockserver.core.client.EmbeddedConnection.PRIVATE_MEMORY_URL;
 import static java.util.Objects.requireNonNull;
 
+import io.vertx.core.file.impl.FileSystemImpl;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
@@ -71,6 +72,8 @@ public class Main {
 
 		LOG.info("Starting...");
 		RocksDBLoader.loadLibrary();
+		// Preload classes
+		try {FileSystemImpl.delete(Path.of(".nonexistent-file"), false);} catch (Throwable ex) {} // preload FileSystemImpl
 
 		LOG.info("RocksDB version: {}", RocksDB.rocksdbVersion());
 
