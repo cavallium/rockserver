@@ -44,6 +44,7 @@ import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -85,6 +86,7 @@ import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.Slice;
+import org.rocksdb.Status;
 import org.rocksdb.Status.Code;
 import org.rocksdb.TableProperties;
 import org.slf4j.Logger;
@@ -684,17 +686,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	/**
 	 * Return long property, aggregated for all columns
 	 */
-	private Long getLongProperty(String name) {
+	private BigInteger getLongProperty(String name) {
 		ops.beginOp();
 		try {
-			long val = 0;
+			var val = BigInteger.ZERO;
 			for (Entry<Long, ColumnInstance> entry : columns.entrySet()) {
 				ColumnInstance ci = entry.getValue();
-				val += db.get().getLongProperty(ci.cfh(), name);
+				try {
+					val = val.add(new BigInteger(Long.toUnsignedString(db.get().getLongProperty(ci.cfh(), name))));
+				} catch (org.rocksdb.RocksDBException e) {
+					if (e.getStatus().getCode() == Code.NotFound) {
+						val = val.add(BigInteger.ZERO);
+					} else {
+						throw new RuntimeException(e);
+					}
+				}
 			}
 			return val;
-		} catch (org.rocksdb.RocksDBException e) {
-			throw new RuntimeException(e);
 		} finally {
 			ops.endOp();
 		}

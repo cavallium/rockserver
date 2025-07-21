@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MultiGauge;
 import io.micrometer.core.instrument.MultiGauge.Row;
 import io.micrometer.core.instrument.Tags;
+import java.math.BigInteger;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.EnumMap;
@@ -42,7 +43,7 @@ public class RocksDBStatistics {
 			Statistics statistics,
 			MetricsManager metrics,
 			@Nullable Cache cache,
-			ToLongFunction<String> longPropertyAllColumnsGetter) {
+			Function<String, BigInteger> longPropertyAllColumnsGetter) {
 		this.statistics = statistics;
 		this.metrics = metrics;
 		this.tickerMap = new EnumMap<>(Arrays
@@ -67,7 +68,7 @@ public class RocksDBStatistics {
 				.stream(RocksDBLongProperty.values())
 				.collect(Collectors.toMap(Function.identity(),
 						longProperty -> Gauge
-								.builder("rocksdb.property.long", () -> longPropertyAllColumnsGetter.applyAsLong(longProperty.getName()))
+								.builder("rocksdb.property.long", () -> longPropertyAllColumnsGetter.apply(longProperty.getName()))
 								.tag("database", name)
 								.tag("property_name", longProperty.getName())
 								.register(metrics.getRegistry())

@@ -35,6 +35,7 @@ import it.cavallium.rockserver.core.config.DatabaseConfig;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map.Entry;
+import java.util.Objects;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -179,7 +180,7 @@ public class MetricsManager implements AutoCloseable {
 				this.httpClient = null;
 			}
 
-			compositeRegistry.config().commonTags("appname", "rockserver");
+			compositeRegistry.config().commonTags("appname", "rockserver", "database-name", Objects.requireNonNullElse(config.metrics().databaseName(), "default"));
 
 			new JvmCompilationMetrics().bindTo(compositeRegistry);
 			new JvmMemoryMetrics().bindTo(compositeRegistry);

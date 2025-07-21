@@ -105,10 +105,13 @@ public class ConfigPrinter {
 	public static String stringifyMetrics(MetricsConfig o) throws GestaltException {
 		return """
 				{
+				    "database-name": %s,
 				    "influx": %s,
 				    "jmx": %s
 				  }\
-				""".formatted(stringifyInflux(o.influx()),
+				""".formatted(
+				o.databaseName(),
+				stringifyInflux(o.influx()),
 				stringifyJmx(o.jmx())
 		);
 	}
