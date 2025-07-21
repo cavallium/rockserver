@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl;
 
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MultiGauge;
 import io.micrometer.core.instrument.MultiGauge.Row;
 import io.micrometer.core.instrument.Tags;
@@ -8,8 +9,10 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -29,12 +32,17 @@ public class RocksDBStatistics {
 	private final MetricsManager metrics;
 	private final EnumMap<TickerType, Counter> tickerMap;
 	private final EnumMap<HistogramType, MultiGauge> histogramMap;
+	private final EnumMap<RocksDBLongProperty, Gauge> longPropertyMap;
 	private final Thread executor;
 	private final MultiGauge cacheStats;
 
 	private volatile boolean stopRequested = false;
 
-	public RocksDBStatistics(String name, Statistics statistics, MetricsManager metrics, @Nullable Cache cache) {
+	public RocksDBStatistics(String name,
+			Statistics statistics,
+			MetricsManager metrics,
+			@Nullable Cache cache,
+			ToLongFunction<String> longPropertyAllColumnsGetter) {
 		this.statistics = statistics;
 		this.metrics = metrics;
 		this.tickerMap = new EnumMap<>(Arrays
@@ -53,6 +61,15 @@ public class RocksDBStatistics {
 								.builder("rocksdb.statistics")
 								.tag("database", name)
 								.tag("histogram_name", histogramType.name())
+								.register(metrics.getRegistry())
+				)));
+		this.longPropertyMap = new EnumMap<>(Arrays
+				.stream(RocksDBLongProperty.values())
+				.collect(Collectors.toMap(Function.identity(),
+						longProperty -> Gauge
+								.builder("rocksdb.property.long", () -> longPropertyAllColumnsGetter.applyAsLong(longProperty.getName()))
+								.tag("database", name)
+								.tag("property_name", longProperty.getName())
 								.register(metrics.getRegistry())
 				)));
 		this.cacheStats = MultiGauge

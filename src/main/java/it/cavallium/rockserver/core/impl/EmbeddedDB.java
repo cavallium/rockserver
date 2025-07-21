@@ -51,6 +51,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.Map.Entry;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -175,7 +176,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.refs = loadedDb.refs();
 		this.cache = loadedDb.cache();
 		this.definitiveDbPath = loadedDb.definitiveDbPath();
-		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache);
+		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache, this::getLongProperty);
 		try {
 			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
 			int writeCap = Objects.requireNonNullElse(config.parallelism().write(), Runtime.getRuntime().availableProcessors());
@@ -677,6 +678,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return null;
 		} else {
 			return columnId;
+		}
+	}
+
+	/**
+	 * Return long property, aggregated for all columns
+	 */
+	private Long getLongProperty(String name) {
+		ops.beginOp();
+		try {
+			long val = 0;
+			for (Entry<Long, ColumnInstance> entry : columns.entrySet()) {
+				ColumnInstance ci = entry.getValue();
+				val += db.get().getLongProperty(ci.cfh(), name);
+			}
+			return val;
+		} catch (org.rocksdb.RocksDBException e) {
+			throw new RuntimeException(e);
+		} finally {
+			ops.endOp();
 		}
 	}
 
