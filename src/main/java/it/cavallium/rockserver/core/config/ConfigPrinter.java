@@ -45,7 +45,7 @@ public class ConfigPrinter {
 				""".formatted(o.compression(), o.maxDictBytes());
 	}
 
-	public static List<VolumeConfig> getVolumeConfigs(GlobalDatabaseConfig g) throws GestaltException {
+	public static List<VolumeConfig> getVolumeConfigs(FallbackColumnConfig g) throws GestaltException {
 		return List.of(g.volumes());
 	}
 
@@ -54,11 +54,6 @@ public class ConfigPrinter {
 		for (NamedColumnConfig namedColumnConfig : Objects.requireNonNullElse(o.columnOptions(), new NamedColumnConfig[0])) {
 			String s = stringifyNamedColumn(namedColumnConfig);
 			joiner.add(s);
-		}
-		StringJoiner result = new StringJoiner(",", "[", "]");
-		for (VolumeConfig volumeConfig : getVolumeConfigs(o)) {
-			String s = stringifyVolume(volumeConfig);
-			result.add(s);
 		}
 		return """
 				{
@@ -75,7 +70,6 @@ public class ConfigPrinter {
 				    "wal-path": "%s",
 				    "absolute-consistency": %b,
 				    "ingest-behind": %b,
-				    "volumes": %s,
 				    "fallback-column-options": %s,
 				    "column-options": %s
 				  }\
@@ -92,7 +86,6 @@ public class ConfigPrinter {
 				o.walPath(),
 				o.absoluteConsistency(),
 				o.ingestBehind(),
-				result.toString(),
 				stringifyFallbackColumn(o.fallbackColumnOptions()),
 				joiner.toString()
 		);
@@ -172,8 +165,14 @@ public class ConfigPrinter {
 			String s = stringifyBloomFilter(value);
 			if (s != null) bloom = s;
 		}
+		StringJoiner result = new StringJoiner(",", "[", "]");
+		for (VolumeConfig volumeConfig : getVolumeConfigs(o)) {
+			String s = stringifyVolume(volumeConfig);
+			result.add(s);
+		}
 		return """
 				{
+				      "volumes": %s,
 				      "levels": %s,
 				      "memtable-memory-budget-bytes": "%s",
 				      "cache-index-and-filter-blocks": %b,
@@ -182,7 +181,8 @@ public class ConfigPrinter {
 				      "block-size": "%s",
 				      "write-buffer-size": "%s"
 				    }\
-				""".formatted(joiner.toString(),
+				""".formatted(result.toString(),
+				joiner.toString(),
 				o.memtableMemoryBudgetBytes(),
 				o.cacheIndexAndFilterBlocks(),
 				o.partitionFilters(),

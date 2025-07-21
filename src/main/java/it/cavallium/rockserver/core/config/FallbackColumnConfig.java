@@ -5,6 +5,8 @@ import org.jetbrains.annotations.Nullable;
 
 public interface FallbackColumnConfig {
 
+	VolumeConfig[] volumes() throws GestaltException;
+
 	ColumnLevelConfig[] levels() throws GestaltException;
 
 	@Nullable

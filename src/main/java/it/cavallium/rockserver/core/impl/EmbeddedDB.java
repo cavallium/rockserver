@@ -98,6 +98,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
 	private final Logger logger;
 	private final @Nullable Path path;
+	private final @NotNull Path definitiveDbPath;
 	private final TransactionalDB db;
 	private final DBOptions dbOptions;
 	private final RWScheduler scheduler;
@@ -173,6 +174,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.dbOptions = loadedDb.dbOptions();
 		this.refs = loadedDb.refs();
 		this.cache = loadedDb.cache();
+		this.definitiveDbPath = loadedDb.definitiveDbPath();
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache);
 		try {
 			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
@@ -606,7 +608,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				} else {
 					try {
-						var options = RocksDBLoader.getColumnOptions(name, this.config.global(),
+						var options = RocksDBLoader.getColumnOptions(name, path, definitiveDbPath, this.config.global(),
 								logger, this.refs, path == null, cache);
 						var prev = columnsConifg.put(name, options);
 						if (prev != null) {
@@ -860,10 +862,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
 				refs = new RocksDBObjects();
 				if (globalDatabaseConfigOverride != null) {
-					columnConifg = RocksDBLoader.getColumnOptions(name, globalDatabaseConfigOverride, logger, refs, false, null);
+					columnConifg = RocksDBLoader.getColumnOptions(name,
+							path,
+							definitiveDbPath,
+							globalDatabaseConfigOverride,
+							logger,
+							refs,
+							false,
+							null
+					);
 				} else {
 					try {
-						columnConifg = RocksDBLoader.getColumnOptions(name, this.config.global(), logger, refs, false, null);
+						columnConifg = RocksDBLoader.getColumnOptions(name,
+								path,
+								definitiveDbPath,
+								this.config.global(),
+								logger,
+								refs,
+								false,
+								null
+						);
 					} catch (GestaltException e) {
 						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
 					}

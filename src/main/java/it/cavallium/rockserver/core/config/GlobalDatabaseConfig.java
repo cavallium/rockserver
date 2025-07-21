@@ -40,8 +40,6 @@ public interface GlobalDatabaseConfig {
 
 	boolean unorderedWrite() throws GestaltException;
 
-	VolumeConfig[] volumes() throws GestaltException;
-
 	FallbackColumnConfig fallbackColumnOptions() throws GestaltException;
 
 	NamedColumnConfig[] columnOptions() throws GestaltException;

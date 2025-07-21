@@ -99,11 +99,13 @@ public class RocksDBLoader {
         throw new RuntimeException("rocksdb was not found inside JAR.");
     }
 
-    public record LoadedDb(TransactionalDB db, DBOptions dbOptions,
-                           Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap, RocksDBObjects refs,
-                           @Nullable Cache cache) {}
+    public record LoadedDb(TransactionalDB db, @Nullable Path path, @NotNull Path definitiveDbPath,
+                           DBOptions dbOptions, Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap,
+                           RocksDBObjects refs, @Nullable Cache cache) {}
 
     public static ColumnFamilyOptions getColumnOptions(String name,
+        @Nullable Path path,
+        @NotNull Path definitiveDbPath,
         GlobalDatabaseConfig globalDatabaseConfig,
         Logger logger,
         RocksDBObjects refs,
@@ -145,10 +147,28 @@ public class RocksDBLoader {
                 logger.error("Failed to set prepopulate blob cache", ex);
             }
 
+            // Get databases directory path
+            Path parentPath;
+            if (path != null) {
+                parentPath = path.toAbsolutePath().getParent();
+            } else {
+                parentPath = null;
+            }
+
+            List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, columnOptions);
+            if (parentPath != null) {
+                requireNonNull(parentPath);
+                requireNonNull(path.getFileName());
+                List<DbPath> paths = mapList(volumeConfigs, p -> new DbPath(p.path, p.targetSize));
+                columnFamilyOptions.setCfPaths(paths);
+            } else if (!volumeConfigs.isEmpty() && (volumeConfigs.size() > 1 || definitiveDbPath.relativize(volumeConfigs.getFirst().path).isAbsolute())) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "in-memory databases should not have any volume configured");
+            }
+
             // This option is not supported with multiple db paths
             // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
             // https://github.com/facebook/rocksdb/wiki/Tuning-RocksDB-on-Spinning-Disks
-            boolean dynamicLevelBytes = (globalDatabaseConfig.volumes() == null || globalDatabaseConfig.volumes().length <= 1)
+            boolean dynamicLevelBytes = (columnOptions.volumes() == null || columnOptions.volumes().length <= 1)
                     && !globalDatabaseConfig.ingestBehind();
             if (dynamicLevelBytes) {
                 columnFamilyOptions.setLevelCompactionDynamicLevelBytes(true);
@@ -350,16 +370,6 @@ public class RocksDBLoader {
         RocksDBObjects refs,
         Logger logger) {
         try {
-            // Get databases directory path
-            Path parentPath;
-            if (path != null) {
-                parentPath = path.toAbsolutePath().getParent();
-            } else {
-                parentPath = null;
-            }
-
-            List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, databaseOptions);
-
             // the Options class contains a set of configurable DB options
             // that determines the behaviour of the database.
             var options = new DBOptions() {
@@ -416,14 +426,6 @@ public class RocksDBLoader {
             options.setDeleteObsoleteFilesPeriodMicros(20 * 1000000); // 20 seconds
             options.setKeepLogFileNum(10);
 
-            if (parentPath != null) {
-                requireNonNull(parentPath);
-                requireNonNull(path.getFileName());
-                List<DbPath> paths = mapList(volumeConfigs, p -> new DbPath(p.path, p.targetSize));
-                options.setDbPaths(paths);
-            } else if (!volumeConfigs.isEmpty() && (volumeConfigs.size() > 1 || definitiveDbPath.relativize(volumeConfigs.getFirst().path).isAbsolute())) {
-                throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR, "in-memory databases should not have any volume configured");
-            }
             options.setMaxOpenFiles(Optional.ofNullable(databaseOptions.global().maximumOpenFiles()).orElse(-1));
             options.setMaxFileOpeningThreads(Runtime.getRuntime().availableProcessors());
             if (databaseOptions.global().spinning()) {
@@ -540,10 +542,10 @@ public class RocksDBLoader {
             .map(definitiveDbPath::resolve);
     }
 
-    public static List<DbPathRecord> getVolumeConfigs(@NotNull Path definitiveDbPath, DatabaseConfig databaseOptions)
+    public static List<DbPathRecord> getVolumeConfigs(@NotNull Path definitiveDbPath, FallbackColumnConfig columnConfig)
         throws GestaltException {
         return ConfigPrinter
-            .getVolumeConfigs(databaseOptions.global())
+            .getVolumeConfigs(columnConfig)
             .stream()
             .map(volumeConfig -> {
                 try {
@@ -564,7 +566,6 @@ public class RocksDBLoader {
         var rocksdbOptions = optionsWithCache.options();
         Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap = new HashMap<>();
         try {
-            List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, databaseOptions);
             List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
             var walPath = getWalDir(definitiveDbPath, databaseOptions);
             var logPath = getLogPath(definitiveDbPath, databaseOptions);
@@ -572,11 +573,6 @@ public class RocksDBLoader {
             // Create base directories
             if (Files.notExists(definitiveDbPath)) {
                 Files.createDirectories(definitiveDbPath);
-            }
-            for (DbPathRecord volumeConfig : volumeConfigs) {
-                if (Files.notExists(volumeConfig.path)) {
-                    Files.createDirectories(volumeConfig.path);
-                }
             }
             if (walPath.isPresent() && Files.notExists(walPath.get())) {
                 Files.createDirectories(walPath.get());
@@ -619,9 +615,17 @@ public class RocksDBLoader {
 
             for (Map.Entry<String, FallbackColumnConfig> entry : columnConfigMap.entrySet()) {
                 String name = entry.getKey();
-                var columnFamilyOptions = getColumnOptions(name, databaseOptions.global(),
+                var columnFamilyOptions = getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
                         logger, refs, path == null, optionsWithCache.standardCache());
                 refs.add(columnFamilyOptions);
+
+                // Create base directories
+                List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, entry.getValue());
+                for (DbPathRecord volumeConfig : volumeConfigs) {
+                    if (Files.notExists(volumeConfig.path)) {
+                        Files.createDirectories(volumeConfig.path);
+                    }
+                }
 
                 descriptors.add(new ColumnFamilyDescriptor(name.getBytes(StandardCharsets.US_ASCII), columnFamilyOptions));
                 definitiveColumnFamilyOptionsMap.put(name, columnFamilyOptions);
@@ -664,7 +668,7 @@ public class RocksDBLoader {
 
             var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
             var dbTasks = new DatabaseTasks(db, inMemory, delayWalFlushConfig);
-            return new LoadedDb(TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks), rocksdbOptions, definitiveColumnFamilyOptionsMap, refs, optionsWithCache.standardCache());
+            return new LoadedDb(TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks), path, definitiveDbPath, rocksdbOptions, definitiveColumnFamilyOptionsMap, refs, optionsWithCache.standardCache());
         } catch (IOException | RocksDBException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {
