@@ -453,6 +453,20 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		};
 	}
 
+	@Override
+	public CompletableFuture<Void> flushAsync() {
+		var request = FlushRequest.newBuilder()
+				.build();
+		return toResponse(this.futureStub.flush(request), _ -> null);
+	}
+
+	@Override
+	public CompletableFuture<Void> compactAsync() {
+		var request = CompactRequest.newBuilder()
+				.build();
+		return toResponse(this.futureStub.compact(request), _ -> null);
+	}
+
 	private static it.cavallium.rockserver.core.common.Delta<Buf> mapDelta(Delta x) {
 		return new it.cavallium.rockserver.core.common.Delta<>(
 				x.hasPrevious() ? mapByteString(x.getPrevious()) : null,
