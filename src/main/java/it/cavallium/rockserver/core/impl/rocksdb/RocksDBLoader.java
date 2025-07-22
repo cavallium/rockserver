@@ -187,6 +187,8 @@ public class RocksDBLoader {
                 // ArangoDB uses a value of 2: https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
                 // Higher values speed up writes, but slow down reads
                 columnFamilyOptions.setLevel0FileNumCompactionTrigger(2);
+            } else {
+                columnFamilyOptions.setLevel0FileNumCompactionTrigger(10);
             }
             if (isDisableSlowdown()) {
                 columnFamilyOptions.setLevel0SlowdownWritesTrigger(-1);
