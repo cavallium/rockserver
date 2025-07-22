@@ -179,7 +179,7 @@ public class RocksDBLoader {
             columnFamilyOptions
                     .setTargetFileSizeBase(firstLevelSstSize)
                     .setMaxBytesForLevelBase(firstLevelSstSize * 10)
-                    .setTargetFileSizeMultiplier(10);
+                    .setTargetFileSizeMultiplier(2);
 
             if (isDisableAutoCompactions()) {
                 columnFamilyOptions.setLevel0FileNumCompactionTrigger(-1);
@@ -188,7 +188,7 @@ public class RocksDBLoader {
                 // Higher values speed up writes, but slow down reads
                 columnFamilyOptions.setLevel0FileNumCompactionTrigger(2);
             } else {
-                columnFamilyOptions.setLevel0FileNumCompactionTrigger(10);
+                columnFamilyOptions.setLevel0FileNumCompactionTrigger(4);
             }
             if (isDisableSlowdown()) {
                 columnFamilyOptions.setLevel0SlowdownWritesTrigger(-1);
