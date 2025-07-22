@@ -176,10 +176,10 @@ public class RocksDBLoader {
 
             // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
             var firstLevelSstSize = Objects.requireNonNullElse(columnOptions.firstLevelSstSize(), new DataSize("64MiB")).longValue();
-            var maxSstSize = Objects.requireNonNullElse(columnOptions.maxLastLevelSstSize(), new DataSize("256MiB")).longValue();
             columnFamilyOptions
                     .setTargetFileSizeBase(firstLevelSstSize)
-                    .setMaxBytesForLevelBase(maxSstSize);
+                    .setMaxBytesForLevelBase(firstLevelSstSize * 10)
+                    .setTargetFileSizeMultiplier(10);
 
             if (isDisableAutoCompactions()) {
                 columnFamilyOptions.setLevel0FileNumCompactionTrigger(-1);
