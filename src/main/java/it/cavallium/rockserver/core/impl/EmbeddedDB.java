@@ -1616,9 +1616,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			for (ColumnInstance value : columns.values()) {
 				if (value.cfh().isOwningHandle()) {
 					try (var cro = new CompactRangeOptions()
-							.setAllowWriteStall(true)
+							.setAllowWriteStall(false)
 							.setExclusiveManualCompaction(true)
 							.setChangeLevel(false)
+							.setMaxSubcompactions(16)
 							.setBottommostLevelCompaction(BottommostLevelCompaction.kForceOptimized)) {
 						db.get().compactRange(value.cfh(), null, null, cro);
 					}
