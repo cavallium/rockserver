@@ -178,7 +178,7 @@ public class RocksDBLoader {
             var firstLevelSstSize = Objects.requireNonNullElse(columnOptions.firstLevelSstSize(), new DataSize("64MiB")).longValue();
             columnFamilyOptions
                     .setTargetFileSizeBase(firstLevelSstSize)
-                    .setMaxBytesForLevelBase(firstLevelSstSize * 10)
+                    .setMaxBytesForLevelBase(firstLevelSstSize * 8)
                     .setTargetFileSizeMultiplier(2);
 
             if (isDisableAutoCompactions()) {

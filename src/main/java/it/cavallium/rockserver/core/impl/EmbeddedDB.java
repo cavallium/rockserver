@@ -1613,6 +1613,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
+			var db = this.db.get();
 			for (ColumnInstance value : columns.values()) {
 				if (value.cfh().isOwningHandle()) {
 					try (var cro = new CompactRangeOptions()
@@ -1621,7 +1622,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							.setChangeLevel(false)
 							.setMaxSubcompactions(16)
 							.setBottommostLevelCompaction(BottommostLevelCompaction.kForceOptimized)) {
-						db.get().compactRange(value.cfh(), null, null, cro);
+						var cfhOpts = db.getOptions(value.cfh());
+						var autoCompactionsEnabled = !cfhOpts.disableAutoCompactions();
+						if (autoCompactionsEnabled) {
+							cfhOpts.setDisableAutoCompactions(true);
+						}
+						db.compactRange(value.cfh(), null, null, cro);
+						if (autoCompactionsEnabled) {
+							cfhOpts.setDisableAutoCompactions(false);
+						}
 					}
 				}
 			}
