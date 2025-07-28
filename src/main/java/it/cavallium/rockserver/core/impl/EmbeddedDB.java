@@ -1196,8 +1196,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 
 			try {
-				return get(tx, updateId, col, keys, requestType);
+				var result = get(tx, updateId, col, keys, requestType);
+				actionLogger.logAction("Get (result)", start, columnId, keys, result, transactionOrUpdateId, null, null, requestType);
+				return result;
 			} catch (Throwable ex) {
+				actionLogger.logAction("Get (result)", start, columnId, keys, "failure (exception)", transactionOrUpdateId, null, null, requestType);
 				if (tx != prevTx) {
 					closeTransaction(updateId, false);
 				}
