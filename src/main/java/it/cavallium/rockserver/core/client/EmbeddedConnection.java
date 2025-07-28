@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import java.util.concurrent.CompletableFuture;
@@ -189,6 +190,11 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	@Override
 	public void compact() {
 		db.compact();
+	}
+
+	@Override
+	public Map<String, ColumnSchema> getAllColumnDefinitions() throws RocksDBException {
+		return db.getAllColumnDefinitions();
 	}
 
 	@Override

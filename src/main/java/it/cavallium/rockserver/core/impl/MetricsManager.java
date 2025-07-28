@@ -22,12 +22,12 @@ import io.micrometer.influx.InfluxMeterRegistry;
 import io.micrometer.jmx.JmxConfig;
 import io.micrometer.jmx.JmxMeterRegistry;
 import io.vertx.core.MultiMap;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpVersion;
 import io.vertx.core.http.RequestOptions;
 import io.vertx.rxjava3.core.Vertx;
-import io.vertx.rxjava3.core.buffer.Buffer;
 import io.vertx.rxjava3.core.http.HttpClient;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -84,7 +84,7 @@ public class MetricsManager implements AutoCloseable {
 					this.httpClient = Vertx.vertx().createHttpClient(new HttpClientOptions()
 							.setTrustAll(config.metrics().influx().allowInsecureCertificates())
 							.setVerifyHost(!config.metrics().influx().allowInsecureCertificates())
-							.setTryUseCompression(true)
+							.setDecompressionSupported(true)
 							.setProtocolVersion(HttpVersion.HTTP_2)
 							.setUseAlpn(true)
 							.setConnectTimeout(1000)

@@ -17,6 +17,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetAllColumnDefinitions;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
@@ -64,6 +65,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
@@ -91,13 +93,12 @@ import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.Slice;
-import org.rocksdb.Status;
 import org.rocksdb.Status.Code;
 import org.rocksdb.TableProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MarkerFactory;
 import reactor.core.publisher.Flux;
-import reactor.core.scheduler.Schedulers;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
@@ -105,6 +106,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
 	private final Logger logger;
+	private final ActionLoggerConsumer actionLogger;
 	private final @Nullable Path path;
 	private final @NotNull Path definitiveDbPath;
 	private final TransactionalDB db;
@@ -143,6 +145,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer getRangeTimer;
 	private final Timer flushTimer;
 	private final Timer compactTimer;
+	private final Timer getAllColumnDefinitionsTimer;
 	private final RocksDBStatistics rocksDBStatistics;
 	private final boolean fastGet;
 	private Path tempSSTsPath;
@@ -178,6 +181,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.getRangeTimer = createActionTimer(GetRange.class);
 		this.flushTimer = createActionTimer(Flush.class);
 		this.compactTimer = createActionTimer(Compact.class);
+		this.getAllColumnDefinitionsTimer = createActionTimer(GetAllColumnDefinitions.class);
+
+		if (Boolean.getBoolean("rockserver.core.print-actions")) {
+			var m = MarkerFactory.getMarker("ACTION");
+			this.actionLogger = (actionName, actionId, column, key, value, txId, commit, timeoutMs, requestType) -> logger.info(m, "DB: {} Action: {} Action ID: {} Column: {} Key: {} Value (or end key): {} TxId: {} Commit: {} Timeout (ms): {} Request type: {}", name, actionId, column, actionName, key, value, txId, commit, timeoutMs, requestType);
+		} else {
+			this.actionLogger = (_, _, _, _, _, _, _, _, _) -> {};
+		}
 
 		var beforeLoad = Instant.now();
 		this.config = config;
@@ -473,6 +484,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public long openTransaction(long timeoutMs) {
 		var start = System.nanoTime();
+		actionLogger.logAction("OpenTransaction", start, null, null, null, null, null, timeoutMs, null);
 		try {
 			return allocateTransactionInternal(openTransactionInternal(timeoutMs, false));
 		} finally {
@@ -509,6 +521,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Contract("_, false -> true; _, true -> _")
 	public boolean closeTransaction(long transactionId, boolean commit) {
 		var start = System.nanoTime();
+		actionLogger.logAction("CloseTransaction", start, null, null, null, transactionId, commit, null, null);
 		try {
 			return closeTransactionInternal(transactionId, commit);
 		} finally {
@@ -594,6 +607,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public void closeFailedUpdate(long updateId) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
+		actionLogger.logAction("CloseFailedUpdate", start, null, null, null, updateId, null, null, null);
 		try {
 			closeTransactionInternal(updateId, false);
 		} finally {
@@ -605,6 +619,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public long createColumn(String name, @NotNull ColumnSchema schema) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
+		actionLogger.logAction("CreateColumn", start, name, null, schema, null, null, null, null);
 		ops.beginOp();
 		try {
 			synchronized (columnEditLock) {
@@ -647,6 +662,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public void deleteColumn(long columnId) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
+		actionLogger.logAction("DeleteColumn", start, columnId, null, null, null, null, null, null);
 		ops.beginOp();
 		try {
 			synchronized (columnEditLock) {
@@ -668,6 +684,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public long getColumnId(@NotNull String name) {
 		var start = System.nanoTime();
+		actionLogger.logAction("GetColumnId", start, name, null, null, null, null, null, null);
 		try {
 			var columnId = getColumnIdOrNull(name);
 			if (columnId == null) {
@@ -724,6 +741,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Buf value,
 			RequestPut<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
+		actionLogger.logAction("Put", start, columnId, keys, value, transactionOrUpdateId, null, null, requestType);
 		ops.beginOp();
 		try {
 			// Column id
@@ -750,17 +768,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
-			@NotNull List<Keys> keys,
-			@NotNull List<@NotNull Buf> values,
+			@NotNull List<Keys> keysList,
+			@NotNull List<@NotNull Buf> valueList,
 			RequestPut<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
 		try {
-			if (keys.size() != values.size()) {
-				throw new IllegalArgumentException("keys length is different than values length: " + keys.size() + " != " + values.size());
+			actionLogger.logAction("putMulti (begin)", start, columnId, keysList.size(), valueList.size(), transactionOrUpdateId, null, null, requestType);
+			if (keysList.size() != valueList.size()) {
+				throw new IllegalArgumentException("keys length is different than values length: " + keysList.size() + " != " + valueList.size());
 			}
-			List<T> responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keys.size());
-			for (int i = 0; i < keys.size(); i++) {
-				var result = put(transactionOrUpdateId, columnId, keys.get(i), values.get(i), requestType);
+			List<T> responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+			for (int i = 0; i < keysList.size(); i++) {
+				var keys = keysList.get(i);
+				var value = valueList.get(i);
+				actionLogger.logAction("putMulti (next)", start, columnId, keys, value, transactionOrUpdateId, null, null, requestType);
+				var result = put(transactionOrUpdateId, columnId, keys, value, requestType);
 				if (responses != null) {
 					responses.add(result);
 				}
@@ -775,7 +797,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public CompletableFuture<Void> putBatchInternal(long columnId,
 						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 						 @NotNull PutBatchMode mode) throws it.cavallium.rockserver.core.common.RocksDBException {
+		var start = System.nanoTime();
 		try {
+			actionLogger.logAction("PutBatch (begin)", start, columnId, "multiple (async)", "multiple (async)", null, null, null, mode);
 			var cf = new CompletableFuture<Void>();
 			batchPublisher.subscribe(new Subscriber<>() {
 				private boolean stopped;
@@ -821,9 +845,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					var valueIt = kvBatch.values().iterator();
 					try {
 						while (keyIt.hasNext()) {
-							var key = keyIt.next();
+							var keys = keyIt.next();
 							var value = valueIt.next();
-							put(writer, col, 0, key, value, RequestType.none());
+							actionLogger.logAction("PutBatch (next)", start, columnId, keys, value, null, null, null, mode);
+							put(writer, col, 0, keys, value, RequestType.none());
 						}
 					} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 						doFinally();
@@ -860,28 +885,37 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 
 				private void doFinally() {
-					stopped = true;
-					for (int i = refs.size() - 1; i >= 0; i--) {
-						try {
-							var c = refs.get(i);
-							if (c instanceof AbstractImmutableNativeReference fr) {
-								if (fr.isOwningHandle()) {
+					try {
+						stopped = true;
+						for (int i = refs.size() - 1; i >= 0; i--) {
+							try {
+								var c = refs.get(i);
+								if (c instanceof AbstractImmutableNativeReference fr) {
+									if (fr.isOwningHandle()) {
+										c.close();
+									}
+								} else {
 									c.close();
 								}
-							} else {
-								c.close();
+							} catch (Exception ex) {
+								logger.error("Failed to close reference during batch write", ex);
 							}
-						} catch (Exception ex) {
-							logger.error("Failed to close reference during batch write", ex);
 						}
+					} finally {
+						ops.endOp();
+						var end = System.nanoTime();
+						putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
 					}
-					ops.endOp();
 				}
 			});
 			return cf;
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+			var end = System.nanoTime();
+			putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
 			throw ex;
 		} catch (Exception ex) {
+			var end = System.nanoTime();
+			putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		}
 	}
@@ -943,16 +977,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public void putBatch(long columnId,
 						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 						 @NotNull PutBatchMode mode) throws it.cavallium.rockserver.core.common.RocksDBException {
-		var start = System.nanoTime();
 		try {
 			putBatchInternal(columnId, batchPublisher, mode).get();
 		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			var end = System.nanoTime();
-			putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
 	}
 
@@ -1124,6 +1154,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			RequestGet<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
 		var start = System.nanoTime();
 		try {
+			actionLogger.logAction("Get", start, columnId, keys, null, transactionOrUpdateId, null, null, requestType);
 			// Column id
 			var col = getColumn(columnId);
 			Tx prevTx = transactionOrUpdateId != 0 ? getTransaction(transactionOrUpdateId, true) : null;
@@ -1239,6 +1270,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		// Open an operation that ends when the iterator is closed
 		ops.beginOp();
 		try {
+			actionLogger.logAction("OpenIterator", start, columnId, null, null, null, null, timeoutMs, null); // todo: improve logging
 			var expirationTimestamp = timeoutMs + System.currentTimeMillis();
 			var col = getColumn(columnId);
 			RocksIterator it;
@@ -1264,6 +1296,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
+			actionLogger.logAction("CloseIterator", start, null, null, null, null, null, null, null); // todo: improve logging
 			// Should close the iterator operation
 			throw new UnsupportedOperationException();
 		} finally {
@@ -1279,6 +1312,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
+			actionLogger.logAction("SeekTo", start, null, null, null, null, null, null, null); // todo: improve logging
 			throw new UnsupportedOperationException();
 		} finally {
 			ops.endOp();
@@ -1295,6 +1329,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
+			actionLogger.logAction("Subsequent", start, null, null, null, null, null, null, null); // todo: improve logging
 			throw new UnsupportedOperationException();
 		} finally {
 			ops.endOp();
@@ -1315,6 +1350,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
+			actionLogger.logAction("ReduceRange", start, columnId, startKeysInclusive, endKeysExclusive, transactionId, null, timeoutMs, requestType); // todo: log if reversed or not
 			var col = getColumn(columnId);
 
 			if (requestType instanceof RequestType.RequestGetFirstAndLast<?>
@@ -1426,6 +1462,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 										   RequestType.RequestGetRange<? super KV, T> requestType,
 										   long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
 		LongAdder totalTime =  new LongAdder();
+		long start = System.nanoTime();
+		actionLogger.logAction("GetRange (begin)", start, columnId, startKeysInclusive, endKeysExclusive, transactionId, null, timeoutMs, requestType); // todo: log if reversed or not
 
 		final class IteratorResources {
 
@@ -1590,6 +1628,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
+			actionLogger.logAction("Flush", start, null, null, null, null, null, null, null);
 			db.get().flushWal(true);
 			try (var fo = new FlushOptions()) {
 				db.get().flush(fo, columns.values().stream()
@@ -1613,6 +1652,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
+			actionLogger.logAction("Compact", start, null, null, null, null, null, null, null);
 			var db = this.db.get();
 			for (ColumnInstance value : columns.values()) {
 				if (value.cfh().isOwningHandle()) {
@@ -1642,6 +1682,24 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			ops.endOp();
 			var end = System.nanoTime();
 			compactTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	@Override
+	public Map<String, ColumnSchema> getAllColumnDefinitions() throws RocksDBException {
+		var start = System.nanoTime();
+		ops.beginOp();
+		try {
+			actionLogger.logAction("GetAllColumnDefinitions", start, null, null, null, null, null, null, null);
+			return columnNamesIndex.entrySet().stream().collect(Collectors.toMap(Entry::getKey, e -> columns.get(e.getValue()).schema()));
+		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
+		} finally {
+			ops.endOp();
+			var end = System.nanoTime();
+			getAllColumnDefinitionsTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
 	}
 
@@ -1781,6 +1839,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public RWScheduler getScheduler() {
 		return scheduler;
+	}
+
+	private static interface ActionLoggerConsumer {
+		void logAction(String action, long actionId, Object column, Object key, Object valueOrEndKey, Object txOrUpdateId, Object commit, Object timeoutMs, Object requestType);
 	}
 
 }

@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetAllColumnDefinitions;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
@@ -22,6 +23,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
 import it.cavallium.buffer.Buf;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -170,5 +172,10 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	/** See: {@link Compact}. */
 	default CompletableFuture<Void> compactAsync() {
 		return requestAsync(new Compact());
+	}
+
+	/** See: {@link GetAllColumnDefinitions}. */
+	default CompletableFuture<Map<String, ColumnSchema>> getAllColumnDefinitionsAsync() {
+		return requestAsync(new GetAllColumnDefinitions());
 	}
 }

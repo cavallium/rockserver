@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Stream;
 
@@ -594,6 +595,27 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		@Override
 		public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
 			return api.compactAsync();
+		}
+
+		@Override
+		public boolean isReadOnly() {
+			return true;
+		}
+
+	}
+	/**
+	 * Returns all column definitions
+	 */
+	record GetAllColumnDefinitions() implements RocksDBAPICommandSingle<Map<String, ColumnSchema>> {
+
+		@Override
+		public Map<String, ColumnSchema> handleSync(RocksDBSyncAPI api) {
+			return api.getAllColumnDefinitions();
+		}
+
+		@Override
+		public CompletableFuture<Map<String, ColumnSchema>> handleAsync(RocksDBAsyncAPI api) {
+			return api.getAllColumnDefinitionsAsync();
 		}
 
 		@Override

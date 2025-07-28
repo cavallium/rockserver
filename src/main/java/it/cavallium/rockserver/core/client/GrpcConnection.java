@@ -41,9 +41,13 @@ import it.cavallium.rockserver.core.common.api.proto.Delta;
 import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceFutureStub;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceStub;
+import it.unimi.dsi.fastutil.ints.Int2IntFunction;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.cavallium.buffer.Buf;
+import it.unimi.dsi.fastutil.ints.IntList;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URI;
@@ -52,12 +56,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
@@ -467,6 +473,15 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return toResponse(this.futureStub.compact(request), _ -> null);
 	}
 
+	@Override
+	public CompletableFuture<Map<String, ColumnSchema>> getAllColumnDefinitionsAsync() {
+		var request = GetAllColumnDefinitionsRequest.newBuilder()
+				.build();
+		return toResponse(this.futureStub.getAllColumnDefinitions(request),
+				response -> response.getColumnsList().stream()
+						.collect(Collectors.toMap(Column::getName, col -> unmapColumnSchema(col.getSchema()))));
+	}
+
 	private static it.cavallium.rockserver.core.common.Delta<Buf> mapDelta(Delta x) {
 		return new it.cavallium.rockserver.core.common.Delta<>(
 				x.hasPrevious() ? mapByteString(x.getPrevious()) : null,
@@ -554,6 +569,35 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.addAllVariableTailKeys(mapVariableTailKeys(schema))
 				.setHasValue(schema.hasValue())
 				.build();
+	}
+
+	private static ColumnSchema unmapColumnSchema(it.cavallium.rockserver.core.common.api.proto.ColumnSchema schema) {
+		return ColumnSchema.of(unmapKeysLength(schema.getFixedKeysCount(), schema::getFixedKeys),
+				unmapVariableTailKeys(schema.getVariableTailKeysCount(), schema::getVariableTailKeys),
+				schema.getHasValue()
+		);
+	}
+	private static IntList unmapKeysLength(int count, Int2IntFunction keyGetterAt) {
+		var l = new IntArrayList(count);
+		for (int i = 0; i < count; i++) {
+			l.add((int) keyGetterAt.apply(i));
+		}
+		return l;
+	}
+
+	private static ObjectList<it.cavallium.rockserver.core.common.ColumnHashType> unmapVariableTailKeys(int count,
+			Int2ObjectFunction<it.cavallium.rockserver.core.common.api.proto.ColumnHashType> variableTailKeyGetterAt) {
+		var l = new ObjectArrayList<it.cavallium.rockserver.core.common.ColumnHashType>(count);
+		for (int i = 0; i < count; i++) {
+			l.add(switch (variableTailKeyGetterAt.apply(i)) {
+				case XXHASH32 -> it.cavallium.rockserver.core.common.ColumnHashType.XXHASH32;
+				case XXHASH8 -> it.cavallium.rockserver.core.common.ColumnHashType.XXHASH8;
+				case ALLSAME8 -> it.cavallium.rockserver.core.common.ColumnHashType.ALLSAME8;
+				case FIXEDINTEGER32 -> it.cavallium.rockserver.core.common.ColumnHashType.FIXEDINTEGER32;
+				case UNRECOGNIZED -> throw new UnsupportedOperationException();
+			});
+		}
+		return l;
 	}
 
 	private static Iterable<Integer> mapFixedKeys(@NotNull ColumnSchema schema) {

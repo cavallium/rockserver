@@ -60,6 +60,7 @@ import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map.Entry;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionException;
 
@@ -561,6 +562,18 @@ public class GrpcServer extends Server {
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("compact", request));
 		}
 
+		@Override
+		public Mono<GetAllColumnDefinitionsResponse> getAllColumnDefinitions(GetAllColumnDefinitionsRequest request) {
+			return executeSync(() -> {
+				var definitions = api.getAllColumnDefinitions();
+				var builder = GetAllColumnDefinitionsResponse.newBuilder();
+				for (Entry<String, ColumnSchema> e : definitions.entrySet()) {
+					builder.addColumns(Column.newBuilder().setName(e.getKey()).setSchema(unmapColumnSchema(e.getValue())));
+				}
+				return builder.build();
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("getAllColumnDefinitions", request));
+		}
+
 		// utils
 
 		private <T> Mono<T> executeSync(Callable<T> callable, boolean isReadOnly) {
@@ -647,6 +660,35 @@ public class GrpcServer extends Server {
 					mapVariableTailKeys(schema.getVariableTailKeysCount(), schema::getVariableTailKeys),
 					schema.getHasValue()
 			);
+		}
+
+		private static it.cavallium.rockserver.core.common.api.proto.ColumnSchema unmapColumnSchema(@NotNull ColumnSchema schema) {
+			return it.cavallium.rockserver.core.common.api.proto.ColumnSchema.newBuilder()
+					.addAllFixedKeys(unmapFixedKeys(schema))
+					.addAllVariableTailKeys(unmapVariableTailKeys(schema))
+					.setHasValue(schema.hasValue())
+					.build();
+		}
+
+		private static Iterable<Integer> unmapFixedKeys(@NotNull ColumnSchema schema) {
+			var result = new IntArrayList(schema.fixedLengthKeysCount());
+			for (int i = 0; i < schema.fixedLengthKeysCount(); i++) {
+				result.add(schema.key(i));
+			}
+			return result;
+		}
+
+		private static Iterable<it.cavallium.rockserver.core.common.api.proto.ColumnHashType> unmapVariableTailKeys(@NotNull ColumnSchema schema) {
+			var result = new ArrayList<it.cavallium.rockserver.core.common.api.proto.ColumnHashType>(schema.variableTailKeys().size());
+			for (it.cavallium.rockserver.core.common.ColumnHashType variableTailKey : schema.variableTailKeys()) {
+				result.add(switch (variableTailKey) {
+					case XXHASH32 -> it.cavallium.rockserver.core.common.api.proto.ColumnHashType.XXHASH32;
+					case XXHASH8 -> it.cavallium.rockserver.core.common.api.proto.ColumnHashType.XXHASH8;
+					case ALLSAME8 -> it.cavallium.rockserver.core.common.api.proto.ColumnHashType.ALLSAME8;
+					case FIXEDINTEGER32 -> it.cavallium.rockserver.core.common.api.proto.ColumnHashType.FIXEDINTEGER32;
+				});
+			}
+			return result;
 		}
 
 		private static IntList mapKeysLength(int count, Int2IntFunction keyGetterAt) {

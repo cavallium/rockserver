@@ -11,6 +11,11 @@ message ColumnSchema {
   bool hasValue = 3;
 }
 
+message Column {
+  string name = 1;
+  ColumnSchema schema = 2;
+}
+
 enum ColumnHashType {
   XXHASH32 = 0;
   XXHASH8 = 1;
@@ -104,6 +109,9 @@ message CompactRequest {}
 
 message FlushRequest {}
 
+message GetAllColumnDefinitionsRequest {}
+message GetAllColumnDefinitionsResponse {repeated Column columns = 1;}
+
 service RocksDBService {
   rpc openTransaction(OpenTransactionRequest) returns (OpenTransactionResponse);
   rpc closeTransaction(CloseTransactionRequest) returns (CloseTransactionResponse);
@@ -137,4 +145,5 @@ service RocksDBService {
   rpc getAllInRange(GetRangeRequest) returns (stream KV);
   rpc flush(FlushRequest) returns (google.protobuf.Empty);
   rpc compact(CompactRequest) returns (google.protobuf.Empty);
+  rpc getAllColumnDefinitions(GetAllColumnDefinitionsRequest) returns (GetAllColumnDefinitionsResponse);
 }
