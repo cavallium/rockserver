@@ -14,7 +14,9 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestEntriesCount;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
+import it.cavallium.rockserver.core.common.RequestType.RequestGetRange;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RequestType.RequestReduceRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetAllColumnDefinitions;
@@ -185,7 +187,27 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		if (Boolean.getBoolean("rockserver.core.print-actions")) {
 			var m = MarkerFactory.getMarker("ACTION");
-			this.actionLogger = (actionName, actionId, column, key, value, txId, commit, timeoutMs, requestType) -> logger.info(m, "DB: {} Action: {} Action ID: {} Column: {} Key: {} Value (or end key): {} TxId: {} Commit: {} Timeout (ms): {} Request type: {}", name, actionId, column, actionName, key, value, txId, commit, timeoutMs, requestType);
+			this.actionLogger = (actionName, actionId, column, key, value, txId, commit, timeoutMs, requestType) -> {
+				if (column != null) {
+					var c = columns.get(column);
+					if (c != null) {
+						try {
+							column = new String(c.cfh().getName(), StandardCharsets.UTF_8);
+						} catch (org.rocksdb.RocksDBException e) {
+						}
+					}
+				}
+				if (key instanceof Keys keys && keys.keys().length == 1) {
+					var key0 = keys.keys()[0];
+					var size = key0.size();
+					key = switch (size) {
+						case Long.BYTES -> key0 + "(" + key0.getLong(0) + ")";
+						case Integer.BYTES -> key0 + "(" + key0.getInt(0) + ")";
+						default -> key;
+					};
+				}
+				logger.info(m, "DB: {} Action: {} Action ID: {} Column: {} Key: {} Value (or end key): {} TxId: {} Commit: {} Timeout (ms): {} Request type: {}", name, actionName, actionId, column, key, value, txId, commit, timeoutMs, requestType);
+			};
 		} else {
 			this.actionLogger = (_, _, _, _, _, _, _, _, _) -> {};
 		}
@@ -205,7 +227,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.scheduler = new RWScheduler(readCap, writeCap, "db");
 			this.fastGet = config.global().enableFastGet();
 		} catch (GestaltException e) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get the scheduler parallelism");
+			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get the scheduler parallelism");
 		}
 		this.leakScheduler = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("db-leak-scheduler"));
 
@@ -284,7 +306,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
         try {
             this.tempSSTsPath = config.global().tempSstPath();
         } catch (GestaltException e) {
-            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get wal path");
+            throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get wal path");
         }
         var existingColumnSchemasColumnDescriptorOptional = db
 				.getStartupColumns()
@@ -595,7 +617,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} catch (org.rocksdb.RocksDBException e) {
 			// Close the transaction operation
 			ops.endOp();
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
+			throw RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
 		} catch (Throwable ex) {
 			ops.endOp();
 			throw  ex;
@@ -605,7 +627,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public void closeFailedUpdate(long updateId) throws it.cavallium.rockserver.core.common.RocksDBException {
+	public void closeFailedUpdate(long updateId) throws RocksDBException {
 		var start = System.nanoTime();
 		actionLogger.logAction("CloseFailedUpdate", start, null, null, null, updateId, null, null, null);
 		try {
@@ -617,7 +639,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public long createColumn(String name, @NotNull ColumnSchema schema) throws it.cavallium.rockserver.core.common.RocksDBException {
+	public long createColumn(String name, @NotNull ColumnSchema schema) throws RocksDBException {
 		var start = System.nanoTime();
 		actionLogger.logAction("CreateColumn", start, name, null, schema, null, null, null, null);
 		ops.beginOp();
@@ -629,7 +651,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (schema.equals(col.schema())) {
 						return colId;
 					} else {
-						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_EXISTS,
+						throw RocksDBException.of(RocksDBErrorType.COLUMN_EXISTS,
 								"Column exists, with a different schema: " + name
 						);
 					}
@@ -639,7 +661,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								logger, this.refs, path == null, cache);
 						var prev = columnsConifg.put(name, options);
 						if (prev != null) {
-							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL,
+							throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL,
 									"ColumnsConfig already exists with name \"" + name + "\"");
 						}
 						byte[] key = name.getBytes(StandardCharsets.UTF_8);
@@ -648,7 +670,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						db.get().put(columnSchemasColumnDescriptorHandle, key, value);
 						return registerColumn(new ColumnInstance(cf, schema));
 					} catch (org.rocksdb.RocksDBException | GestaltException e) {
-						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, e);
+						throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, e);
 					}
 				}
 			}
@@ -660,7 +682,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public void deleteColumn(long columnId) throws it.cavallium.rockserver.core.common.RocksDBException {
+	public void deleteColumn(long columnId) throws RocksDBException {
 		var start = System.nanoTime();
 		actionLogger.logAction("DeleteColumn", start, columnId, null, null, null, null, null, null);
 		ops.beginOp();
@@ -671,7 +693,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					db.get().dropColumnFamily(col.cfh());
 					unregisterColumn(columnId).close();
 				} catch (org.rocksdb.RocksDBException e) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_DELETE_FAIL, e);
+					throw RocksDBException.of(RocksDBErrorType.COLUMN_DELETE_FAIL, e);
 				}
 			}
 		} finally {
@@ -688,7 +710,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			var columnId = getColumnIdOrNull(name);
 			if (columnId == null) {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_NOT_FOUND,
+				throw RocksDBException.of(RocksDBErrorType.COLUMN_NOT_FOUND,
 						"Column not found: " + name);
 			} else {
 				return columnId;
@@ -739,7 +761,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long columnId,
 			@NotNull Keys keys,
 			@NotNull Buf value,
-			RequestPut<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		var start = System.nanoTime();
 		actionLogger.logAction("Put", start, columnId, keys, value, transactionOrUpdateId, null, null, requestType);
 		ops.beginOp();
@@ -754,10 +776,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
 			return put(tx, col, updateId, keys, value, requestType);
-		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		} finally {
 			ops.endOp();
 			var end = System.nanoTime();
@@ -770,7 +792,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long columnId,
 			@NotNull List<Keys> keysList,
 			@NotNull List<@NotNull Buf> valueList,
-			RequestPut<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		var start = System.nanoTime();
 		try {
 			actionLogger.logAction("putMulti (begin)", start, columnId, keysList.size(), valueList.size(), transactionOrUpdateId, null, null, requestType);
@@ -796,7 +818,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	public CompletableFuture<Void> putBatchInternal(long columnId,
 						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
-						 @NotNull PutBatchMode mode) throws it.cavallium.rockserver.core.common.RocksDBException {
+						 @NotNull PutBatchMode mode) throws RocksDBException {
 		var start = System.nanoTime();
 		try {
 			actionLogger.logAction("PutBatch (begin)", start, columnId, "multiple (async)", "multiple (async)", null, null, null, mode);
@@ -850,13 +872,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							actionLogger.logAction("PutBatch (next)", start, columnId, keys, value, null, null, null, mode);
 							put(writer, col, 0, keys, value, RequestType.none());
 						}
-					} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+					} catch (RocksDBException ex) {
 						doFinally();
 						cf.completeExceptionally(ex);
 						return;
 					} catch (Throwable ex) {
 						doFinally();
-						var ex2 = it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+						var ex2 = RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 						cf.completeExceptionally(ex2);
 						return;
 					}
@@ -909,14 +931,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			});
 			return cf;
-		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+		} catch (RocksDBException ex) {
 			var end = System.nanoTime();
 			putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
 			throw ex;
 		} catch (Exception ex) {
 			var end = System.nanoTime();
 			putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		}
 	}
 
@@ -924,7 +946,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public SSTWriter getSSTWriter(long colId,
 								  @Nullable GlobalDatabaseConfig globalDatabaseConfigOverride,
 								  boolean forceNoOptions,
-								  boolean ingestBehind) throws it.cavallium.rockserver.core.common.RocksDBException {
+								  boolean ingestBehind) throws RocksDBException {
 		try {
 			var col = getColumn(colId);
 			ColumnFamilyOptions columnConifg;
@@ -954,7 +976,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								null
 						);
 					} catch (GestaltException e) {
-						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
+						throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
 					}
 					refs = null;
 				}
@@ -967,22 +989,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			return SSTWriter.open(tempSSTsPath, db, col, columnConifg, forceNoOptions, ingestBehind, refs);
 		} catch (IOException ex) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.SST_WRITE_2, ex);
+			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_2, ex);
 		} catch (org.rocksdb.RocksDBException ex) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.SST_WRITE_3, ex);
+			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_3, ex);
 		}
 	}
 
 	@Override
 	public void putBatch(long columnId,
 						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
-						 @NotNull PutBatchMode mode) throws it.cavallium.rockserver.core.common.RocksDBException {
+						 @NotNull PutBatchMode mode) throws RocksDBException {
 		try {
 			putBatchInternal(columnId, batchPublisher, mode).get();
-		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		}
 	}
 
@@ -991,7 +1013,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long updateId,
 			@NotNull Keys keys,
 			@NotNull Buf value,
-			RequestPut<? super Buf, U> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestPut<? super Buf, U> callback) throws RocksDBException {
 		// Check for null value
 		col.checkNullableValue(value);
 		try {
@@ -1001,15 +1023,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					|| requirePreviousValue
 					|| requirePreviousPresence;
 			if (optionalDbWriter instanceof Tx tx && tx.isFromGetForUpdate() && (requirePreviousValue || requirePreviousPresence)) {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"You can't get the previous value or delta, when you are already updating that value");
 			}
 			if (updateId != 0L && !(optionalDbWriter instanceof Tx)) {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Update id must be accompanied with a valid transaction");
 			}
 			if (col.hasBuckets() && (optionalDbWriter != null && !(optionalDbWriter instanceof Tx))) {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Column with buckets don't support write batches");
 			}
 
@@ -1043,7 +1065,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							var v = Utils.toByteArray(bucket.toSegment());
 							((Tx) newTx).val().put(col.cfh(), k, v);
 						} catch (org.rocksdb.RocksDBException e) {
-							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_1, e);
+							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
 						}
 					} else {
 						if (RequestType.requiresGettingPreviousValue(callback)) {
@@ -1054,7 +1076,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								didGetForUpdateInternally = true;
 								previousValue = transformResultValue(col, toBuf(previousValueByteArray));
 							} catch (org.rocksdb.RocksDBException e) {
-								throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
+								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
 							}
 						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
 							// todo: in the future this should be replaced with just keyExists
@@ -1063,9 +1085,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
 								didGetForUpdateInternally = true;
-								previousValue = previousValueByteArray != null ? Utils.emptyBuf() : null;
+								previousValue = previousValueByteArray != null ? emptyBuf() : null;
 							} catch (org.rocksdb.RocksDBException e) {
-								throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
+								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
 							}
 						} else {
 							previousValue = null;
@@ -1135,10 +1157,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (updateId != 0L && !(ex instanceof RocksDBRetryException)) {
 				closeTransaction(updateId, false);
 			}
-			if (ex instanceof it.cavallium.rockserver.core.common.RocksDBException rocksDBException) {
+			if (ex instanceof RocksDBException rocksDBException) {
 				throw rocksDBException;
 			} else {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+				throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 			}
 		}
 	}
@@ -1151,7 +1173,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public <T> T get(long transactionOrUpdateId,
 			long columnId,
 			Keys keys,
-			RequestGet<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestGet<? super Buf, T> requestType) throws RocksDBException {
 		var start = System.nanoTime();
 		try {
 			actionLogger.logAction("Get", start, columnId, keys, null, transactionOrUpdateId, null, null, requestType);
@@ -1191,11 +1213,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long updateId,
 			ColumnInstance col,
 			Keys keys,
-			RequestGet<? super Buf, T> callback) throws it.cavallium.rockserver.core.common.RocksDBException {
+			RequestGet<? super Buf, T> callback) throws RocksDBException {
 		ops.beginOp();
 		try {
 			if (!col.schema().hasValue() && RequestType.requiresGettingCurrentValue(callback)) {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
+				throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
 						"The specified callback requires a return value, but this column does not have values!");
 			}
 			Buf foundValue;
@@ -1214,7 +1236,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					existsValue = foundValue != null;
 				} catch (org.rocksdb.RocksDBException e) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.GET_1, e);
+					throw RocksDBException.of(RocksDBErrorType.GET_1, e);
 				}
 			} else {
 				boolean shouldGetCurrent = RequestType.requiresGettingCurrentValue(callback)
@@ -1224,7 +1246,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						foundValue = dbGet(tx, col, readOptions, calculatedKey);
 						existsValue = foundValue != null;
 					} catch (org.rocksdb.RocksDBException e) {
-						throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_2, e);
+						throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
 					}
 				} else if (callback instanceof RequestType.RequestExists<?>) {
 					// tx is always null here
@@ -1250,10 +1272,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 				case RequestType.RequestExists<?> ignored -> existsValue;
 			});
-		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		} finally {
 			ops.endOp();
 		}
@@ -1265,7 +1287,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
-			long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
+			long timeoutMs) throws RocksDBException {
 		var start = System.nanoTime();
 		// Open an operation that ends when the iterator is closed
 		ops.beginOp();
@@ -1292,7 +1314,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public void closeIterator(long iteratorId) throws it.cavallium.rockserver.core.common.RocksDBException {
+	public void closeIterator(long iteratorId) throws RocksDBException {
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
@@ -1308,7 +1330,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@Override
 	public void seekTo(long iterationId, @NotNull Keys keys)
-			throws it.cavallium.rockserver.core.common.RocksDBException {
+			throws RocksDBException {
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
@@ -1325,7 +1347,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public <T> T subsequent(long iterationId,
 			long skipCount,
 			long takeCount,
-			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws it.cavallium.rockserver.core.common.RocksDBException {
+			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws RocksDBException {
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
@@ -1345,8 +1367,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							 @Nullable Keys startKeysInclusive,
 							 @Nullable Keys endKeysExclusive,
 							 boolean reverse,
-							 RequestType.@NotNull RequestReduceRange<? super KV, T> requestType,
-							 long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
+							 @NotNull RequestReduceRange<? super KV, T> requestType,
+							 long timeoutMs) throws RocksDBException {
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
@@ -1356,7 +1378,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (requestType instanceof RequestType.RequestGetFirstAndLast<?>
 					|| requestType instanceof RequestType.RequestEntriesCount<?>) {
 				if (col.hasBuckets()) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.UNSUPPORTED_COLUMN_TYPE,
+					throw RocksDBException.of(RocksDBErrorType.UNSUPPORTED_COLUMN_TYPE,
 							"Can't execute this request type on a column with buckets");
 				}
 			}
@@ -1447,20 +1469,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
-			long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
+			long timeoutMs) throws RocksDBException {
 		return Flux
 				.from(this.getRangeAsyncInternal(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs))
 				.toStream();
 	}
 
-	/** See: {@link it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange}. */
+	/** See: {@link GetRange}. */
 	public <T> Publisher<T> getRangeAsyncInternal(long transactionId,
 										   long columnId,
 										   @Nullable Keys startKeysInclusive,
 										   @Nullable Keys endKeysExclusive,
 										   boolean reverse,
-										   RequestType.RequestGetRange<? super KV, T> requestType,
-										   long timeoutMs) throws it.cavallium.rockserver.core.common.RocksDBException {
+										   RequestGetRange<? super KV, T> requestType,
+										   long timeoutMs) throws RocksDBException {
 		LongAdder totalTime =  new LongAdder();
 		long start = System.nanoTime();
 		actionLogger.logAction("GetRange (begin)", start, columnId, startKeysInclusive, endKeysExclusive, transactionId, null, timeoutMs, requestType); // todo: log if reversed or not
@@ -1510,7 +1532,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			if (requestType instanceof RequestType.RequestGetAllInRange<?>) {
 				if (col.hasBuckets()) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.UNSUPPORTED_COLUMN_TYPE,
+					throw RocksDBException.of(RocksDBErrorType.UNSUPPORTED_COLUMN_TYPE,
 							"Can't get the range elements of a column with buckets"
 					);
 				}
@@ -1636,10 +1658,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						.filter(AbstractImmutableNativeReference::isOwningHandle)
 						.toList());
 			}
-		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
 		} finally {
 			ops.endOp();
 			var end = System.nanoTime();
@@ -1674,10 +1696,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				}
 			}
-		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
 		} finally {
 			ops.endOp();
 			var end = System.nanoTime();
@@ -1692,10 +1714,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			actionLogger.logAction("GetAllColumnDefinitions", start, null, null, null, null, null, null, null);
 			return columnNamesIndex.entrySet().stream().collect(Collectors.toMap(Entry::getKey, e -> columns.get(e.getValue()).schema()));
-		} catch (it.cavallium.rockserver.core.common.RocksDBException ex) {
+		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
 		} finally {
 			ops.endOp();
 			var end = System.nanoTime();
@@ -1784,7 +1806,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		if (col != null) {
 			return col;
 		} else {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_NOT_FOUND,
+			throw RocksDBException.of(RocksDBErrorType.COLUMN_NOT_FOUND,
 					"No column with id " + columnId);
 		}
 	}
@@ -1793,7 +1815,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var tx = txs.get(transactionId);
 		if (tx != null) {
 			if (!allowGetForUpdate && tx.isFromGetForUpdate()) {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.RESTRICTED_TRANSACTION,
+				throw RocksDBException.of(RocksDBErrorType.RESTRICTED_TRANSACTION,
 						"Can't get this transaction, it's for internal use only");
 			}
 			return tx;
@@ -1832,7 +1854,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private KV decodeKV(ColumnInstance col, Buf calculatedKey, Buf calculatedValue) {
 		var keys = col.decodeKeys(calculatedKey, calculatedValue);
 		// todo: implement
-		throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
+		throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
 				"Bucket column type not implemented, implement them");
 	}
 
