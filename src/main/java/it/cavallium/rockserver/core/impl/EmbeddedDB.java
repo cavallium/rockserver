@@ -1794,7 +1794,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var keyMayExist = this.db.get().keyMayExist(cfh, readOptions, calculatedKey.getBackingByteArray(), calculatedKey.getBackingByteArrayOffset(), calculatedKey.getBackingByteArrayLength(), valueHolder);
 		if (keyMayExist) {
 			var value = valueHolder.getValue();
-			if (value != null) {
+			if (value != null
+					&& value.length != 0 // todo: this is put in place to bypass a bug in rocksdb keyMayExist. It may return a 0-length array even if a value has some data...
+			) {
 				return Buf.wrap(value);
 			} else {
 				return toBuf(this.db.get().get(cfh, readOptions, calculatedKey.getBackingByteArray(), calculatedKey.getBackingByteArrayOffset(), calculatedKey.getBackingByteArrayLength()));
