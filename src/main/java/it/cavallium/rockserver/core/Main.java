@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnixDomainSocketAddress;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import net.sourceforge.argparse4j.ArgumentParsers;
@@ -113,6 +114,8 @@ public class Main {
 		buildServerAddress(grpcServerBuilder, grpcListenUrl, false);
 
 		clientBuilder.setName(name);
+
+		LOG.info("Connecting...");
 		try (var connection = clientBuilder.build()) {
 			try {
 				LOG.info("Connected to {}", connection);

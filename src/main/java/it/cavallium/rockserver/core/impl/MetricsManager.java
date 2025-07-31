@@ -81,6 +81,8 @@ public class MetricsManager implements AutoCloseable {
 			}
 			if (config.metrics().influx().enabled()) {
 				try {
+					preloadClasses();
+
 					this.httpClient = Vertx.vertx().createHttpClient(new HttpClientOptions()
 							.setTrustAll(config.metrics().influx().allowInsecureCertificates())
 							.setVerifyHost(!config.metrics().influx().allowInsecureCertificates())
@@ -204,6 +206,13 @@ public class MetricsManager implements AutoCloseable {
 		} catch (GestaltException e) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Failed to parse metrics configuration", e);
 		}
+	}
+
+	private void preloadClasses() {
+		// Preload file deletion method, used during shutdown
+		var fs = Vertx.vertx().fileSystem();
+		var tmpDir = fs.createTempDirectoryBlocking("tmp");
+		fs.deleteRecursiveBlocking(tmpDir);
 	}
 
 	private long getStartTime() {
