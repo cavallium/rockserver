@@ -12,16 +12,29 @@ public class MyStringAppendOperator extends FFMByteArrayMergeOperator {
 
 	@Override
 	public byte[] merge(byte[] key, byte[] existingValue, List<byte[]> operands) {
-		StringBuilder sb = new StringBuilder();
-
-		// Handle existing value
+		int elementCount = operands.size() + (existingValue != null ? 1 : 0);
+		int estimatedLength = Math.max(elementCount - 1, 0);
 		if (existingValue != null) {
-			sb.append(new String(existingValue, StandardCharsets.UTF_8));
+			estimatedLength += existingValue.length;
+		}
+		for (byte[] op : operands) {
+			estimatedLength += op.length;
 		}
 
-		// Append all operands
+		StringBuilder sb = new StringBuilder(estimatedLength);
+		boolean first = true;
+
+		if (existingValue != null) {
+			sb.append(new String(existingValue, StandardCharsets.UTF_8));
+			first = false;
+		}
+
 		for (byte[] op : operands) {
-			sb.append(",").append(new String(op, StandardCharsets.UTF_8));
+			if (!first) {
+				sb.append(',');
+			}
+			sb.append(new String(op, StandardCharsets.UTF_8));
+			first = false;
 		}
 
 		return sb.toString().getBytes(StandardCharsets.UTF_8);
