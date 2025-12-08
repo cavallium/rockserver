@@ -14,6 +14,7 @@ module rockserver.core.test {
 	requires io.grpc;
 	requires org.checkerframework.checker.qual;
 	requires reactor.core;
+	requires jdk.unsupported;
 	opens it.cavallium.rockserver.core.test;
 	opens it.cavallium.rockserver.core.impl.test;
 }
