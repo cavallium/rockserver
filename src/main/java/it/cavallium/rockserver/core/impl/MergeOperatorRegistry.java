@@ -176,6 +176,15 @@ public class MergeOperatorRegistry implements Closeable {
 
     @Override
     public void close() {
+        for (Map<Long, FFMAbstractMergeOperator> versions : cache.values()) {
+            for (FFMAbstractMergeOperator op : versions.values()) {
+                try {
+                    op.close();
+                } catch (Exception e) {
+                    LOG.error("Failed to close merge operator", e);
+                }
+            }
+        }
         cache.clear();
     }
 

@@ -26,12 +26,20 @@ public class RocksDBObjects implements AutoCloseable {
 
 	@Override
 	public void close() {
+		RuntimeException exception = null;
 		for (int i = refs.size() - 1; i >= 0; i--) {
 			try {
 				refs.get(i).close();
 			} catch (Exception e) {
-				throw new RuntimeException(e);
+				if (exception == null) {
+					exception = new RuntimeException(e);
+				} else {
+					exception.addSuppressed(e);
+				}
 			}
+		}
+		if (exception != null) {
+			throw exception;
 		}
 	}
 }

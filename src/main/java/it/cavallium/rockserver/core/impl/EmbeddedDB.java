@@ -256,6 +256,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							if (tx.val().isOwningHandle()) {
 								tx.val().rollback();
 							}
+						} catch (Throwable ex) {
+							logger.error("Failed to rollback a transaction", ex);
+						}
+						try {
 							tx.close();
 						} catch (Throwable ex) {
 							logger.error("Failed to close a transaction", ex);
@@ -542,6 +546,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			ops.closeAndWait(MAX_TRANSACTION_DURATION_MS);
 			columnSchemasColumnDescriptorHandle.close();
+			mergeOperatorsColumnDescriptorHandle.close();
+			mergeOperatorRegistry.close();
 			db.close();
 			refs.close();
 			if (path == null) {
@@ -678,10 +684,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			ops.endOp();
 			return true;
 		} catch (org.rocksdb.RocksDBException e) {
+			try {
+				tx.close();
+			} catch (Throwable t) {
+				e.addSuppressed(t);
+			}
 			// Close the transaction operation
 			ops.endOp();
 			throw RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
 		} catch (Throwable ex) {
+			try {
+				tx.close();
+			} catch (Throwable t) {
+				ex.addSuppressed(t);
+			}
 			ops.endOp();
 			throw  ex;
 		} finally {

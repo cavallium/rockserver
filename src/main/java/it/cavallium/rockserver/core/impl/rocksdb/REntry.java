@@ -9,7 +9,10 @@ public record REntry<T extends AbstractNativeReference>(T val, @Nullable Long ex
 
 	@Override
 	public void close() {
-		val.close();
-		objs.close();
+		try {
+			val.close();
+		} finally {
+			objs.close();
+		}
 	}
 }

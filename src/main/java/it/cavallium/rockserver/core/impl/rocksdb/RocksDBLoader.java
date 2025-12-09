@@ -146,6 +146,7 @@ public class RocksDBLoader {
                     @SuppressWarnings("unchecked")
                     Class<? extends FFMAbstractMergeOperator> typed = (Class<? extends FFMAbstractMergeOperator>) clazz;
                     mergeOperator = typed.getConstructor().newInstance();
+                    refs.add(mergeOperator);
                     columnFamilyOptions.setMergeOperator(mergeOperator);
                 } catch (ReflectiveOperationException e) {
                     throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
@@ -645,7 +646,6 @@ public class RocksDBLoader {
                 String name = entry.getKey();
                 var columnFamilyOptions = getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
                         logger, refs, path == null, optionsWithCache.standardCache());
-                refs.add(columnFamilyOptions.options());
 
                 // Create base directories
                 List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, entry.getValue());

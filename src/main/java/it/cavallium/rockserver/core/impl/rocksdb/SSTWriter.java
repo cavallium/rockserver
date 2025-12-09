@@ -63,9 +63,9 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                         .setMaxOpenFiles(-1)
                         .setCompressionPerLevel(columnConifg.compressionPerLevel())
                         .setCompressionType(columnConifg.compressionType())
-                        .setCompressionOptions(cloneCompressionOptions(columnConifg.compressionOptions()))
+                        .setCompressionOptions(cloneCompressionOptions(columnConifg.compressionOptions(), refs))
                         .setBottommostCompressionType(columnConifg.bottommostCompressionType())
-                        .setBottommostCompressionOptions(cloneCompressionOptions(columnConifg.bottommostCompressionOptions()));
+                        .setBottommostCompressionOptions(cloneCompressionOptions(columnConifg.bottommostCompressionOptions(), refs));
                 if (columnConifg.memTableConfig() != null) {
                         options.setMemTableConfig(columnConifg.memTableConfig());
                 }
@@ -92,8 +92,8 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
         return sstWriter;
     }
 
-    private static CompressionOptions cloneCompressionOptions(CompressionOptions compressionOptions) {
-        return new CompressionOptions() {
+    private static CompressionOptions cloneCompressionOptions(CompressionOptions compressionOptions, RocksDBObjects refs) {
+        var co = new CompressionOptions() {
 					{
 						RocksLeakDetector.register(this, "clone-compression-options-compression-options", owningHandle_);
 					}
@@ -104,6 +104,8 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                 .setStrategy(compressionOptions.strategy())
                 .setZStdMaxTrainBytes(compressionOptions.zstdMaxTrainBytes())
                 .setWindowBits(compressionOptions.windowBits());
+        refs.add(co);
+        return co;
     }
 
     public void put(byte[] key, byte[] value) throws RocksDBException {

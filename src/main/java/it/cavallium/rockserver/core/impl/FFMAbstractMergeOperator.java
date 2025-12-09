@@ -51,14 +51,24 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
         LOOKUP = name -> SymbolLookup.loaderLookup().find(name)
                 .or(() -> LINKER.defaultLookup().find(name));
 
+        // Try to find jemalloc first to match RocksDB's internal allocator (if linked with jemalloc)
+        // This prevents memory leaks caused by allocator mismatch (malloc vs je_free).
+        MemorySegment mallocAddr = LOOKUP.find("je_malloc")
+                .or(() -> LOOKUP.find("malloc"))
+                .orElseThrow(() -> new UnsatisfiedLinkError("Native symbol not found: malloc"));
+
         MALLOC = LINKER.downcallHandle(
-                findOrThrow("malloc"),
+                mallocAddr,
                 FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG),
                 Linker.Option.critical(false)
         );
 
+        MemorySegment freeAddr = LOOKUP.find("je_free")
+                .or(() -> LOOKUP.find("free"))
+                .orElseThrow(() -> new UnsatisfiedLinkError("Native symbol not found: free"));
+
         FREE = LINKER.downcallHandle(
-                findOrThrow("free"),
+                freeAddr,
                 FunctionDescriptor.ofVoid(ValueLayout.ADDRESS),
                 Linker.Option.critical(false)
         );
@@ -90,6 +100,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
     @SuppressWarnings("FieldCanBeLocal") private final MemorySegment destructorStub;
     @SuppressWarnings("FieldCanBeLocal") private final MemorySegment fullMergeStub;
     @SuppressWarnings("FieldCanBeLocal") private final MemorySegment partialMergeStub;
+    @SuppressWarnings("FieldCanBeLocal") private final MemorySegment deleteValueStub;
 
     public FFMAbstractMergeOperator(String name) {
         super(0);
@@ -101,13 +112,14 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
             this.destructorStub = createNoOpCallback();
             this.fullMergeStub = createFullMergeCallback();
             this.partialMergeStub = createPartialMergeCallback();
+            this.deleteValueStub = createDeleteValueCallback();
 
             MemorySegment rawCpObject = (MemorySegment) CREATE_OP.invokeExact(
                     MemorySegment.NULL,
                     destructorStub,
                     fullMergeStub,
                     partialMergeStub,
-                    MemorySegment.NULL,
+                    deleteValueStub,
                     nameStub
             );
 
@@ -386,6 +398,29 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
         } catch (Throwable t) {
             handleMergeError(t, true, key);
             return MemorySegment.NULL;
+        }
+    }
+
+    private MemorySegment createDeleteValueCallback() {
+        FunctionDescriptor desc = FunctionDescriptor.ofVoid(ValueLayout.ADDRESS,
+                ValueLayout.ADDRESS, ValueLayout.JAVA_LONG);
+        try {
+            MethodHandle mh = MethodHandles.lookup().findVirtual(
+                FFMAbstractMergeOperator.class,
+                "deleteValueCb",
+                MethodType.methodType(void.class, MemorySegment.class, MemorySegment.class, long.class)
+            ).bindTo(this);
+            return LINKER.upcallStub(mh, desc, STUB_ARENA);
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
+
+    private void deleteValueCb(MemorySegment state, MemorySegment valuePtr, long len) {
+        try {
+            if (!valuePtr.equals(MemorySegment.NULL)) {
+                FREE.invokeExact(valuePtr);
+            }
+        } catch (Throwable t) {
+            // suppress
         }
     }
 
