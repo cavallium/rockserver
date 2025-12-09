@@ -15,6 +15,7 @@ import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestEntriesCount;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestGetRange;
+import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RequestType.RequestReduceRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
@@ -32,6 +33,9 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Put;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Merge;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.MergeMulti;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
@@ -107,6 +111,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
+	private static final byte[] MERGE_OPERATORS_COLUMN = "_merge_operators_".getBytes(StandardCharsets.UTF_8);
 	private final Logger logger;
 	private final ActionLoggerConsumer actionLogger;
 	private final @Nullable Path path;
@@ -116,6 +121,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final RWScheduler scheduler;
 	private final ScheduledExecutorService leakScheduler;
 	private final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
+	private final ColumnFamilyHandle mergeOperatorsColumnDescriptorHandle;
+	private final MergeOperatorRegistry mergeOperatorRegistry;
 	private final NonBlockingHashMapLong<ColumnInstance> columns;
 	private final Map<String, ColumnFamilyOptions> columnsConifg;
 	private final ConcurrentMap<String, Long> columnNamesIndex;
@@ -146,9 +153,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer reduceRangeTimer;
 	private final Timer getRangeTimer;
 	private final Timer flushTimer;
-	private final Timer compactTimer;
-	private final Timer getAllColumnDefinitionsTimer;
-	private final RocksDBStatistics rocksDBStatistics;
+ private final Timer compactTimer;
+ private final Timer getAllColumnDefinitionsTimer;
+ private final RocksDBStatistics rocksDBStatistics;
 	private final boolean fastGet;
 	private Path tempSSTsPath;
 
@@ -215,11 +222,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var beforeLoad = Instant.now();
 		this.config = config;
 		var loadedDb = RocksDBLoader.load(path, config, logger);
-		this.db = loadedDb.db();
-		this.dbOptions = loadedDb.dbOptions();
-		this.refs = loadedDb.refs();
-		this.cache = loadedDb.cache();
-		this.definitiveDbPath = loadedDb.definitiveDbPath();
+  this.db = loadedDb.db();
+  this.dbOptions = loadedDb.dbOptions();
+  this.refs = loadedDb.refs();
+  this.cache = loadedDb.cache();
+  this.definitiveDbPath = loadedDb.definitiveDbPath();
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache, this::getLongProperty);
 		try {
 			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
@@ -324,21 +331,48 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} else {
 			this.columnSchemasColumnDescriptorHandle = existingColumnSchemasColumnDescriptorOptional.get().getValue();
 		}
+
+		var existingMergeOperatorsColumnDescriptorOptional = db
+				.getStartupColumns()
+				.entrySet()
+				.stream()
+				.filter(e -> Arrays.equals(e.getKey().getName(), MERGE_OPERATORS_COLUMN))
+				.findAny();
+		if (existingMergeOperatorsColumnDescriptorOptional.isEmpty()) {
+			var mergeOperatorsColumnDescriptor = new ColumnFamilyDescriptor(MERGE_OPERATORS_COLUMN);
+			try {
+				mergeOperatorsColumnDescriptorHandle = db.get().createColumnFamily(mergeOperatorsColumnDescriptor);
+			} catch (org.rocksdb.RocksDBException e) {
+				throw new IOException("Cannot create system column", e);
+			}
+		} else {
+			this.mergeOperatorsColumnDescriptorHandle = existingMergeOperatorsColumnDescriptorOptional.get().getValue();
+		}
+		this.mergeOperatorRegistry = new MergeOperatorRegistry(db.get(), mergeOperatorsColumnDescriptorHandle);
+
 		try (var it = this.db.get().newIterator(columnSchemasColumnDescriptorHandle)) {
 			it.seekToFirst();
 			while (it.isValid()) {
 				var key = it.key();
 				ColumnSchema value = decodeColumnSchema(it.value());
-				this.db
-						.getStartupColumns()
-						.entrySet()
-						.stream()
-						.filter(entry -> Arrays.equals(entry.getKey().getName(), key))
-						.findAny()
-						.ifPresent(entry -> registerColumn(new ColumnInstance(entry.getValue(), value)));
-				it.next();
-			}
-		}
+                this.db
+                        .getStartupColumns()
+                        .entrySet()
+                        .stream()
+                        .filter(entry -> Arrays.equals(entry.getKey().getName(), key))
+                        .findAny()
+                        .ifPresent(entry -> {
+                            FFMAbstractMergeOperator mergeOp = null;
+                            if (value.mergeOperatorName() != null && value.mergeOperatorVersion() != null) {
+                                mergeOp = mergeOperatorRegistry.get(value.mergeOperatorName(), value.mergeOperatorVersion());
+                            } else {
+                                mergeOp = loadedDb.mergeOperators().get(new String(entry.getKey().getName(), StandardCharsets.UTF_8));
+                            }
+                            registerColumn(new ColumnInstance(entry.getValue(), value, mergeOp));
+                        });
+                it.next();
+            }
+        }
 		if (Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
 			logger.info("Database configuration: {}", ConfigPrinter.stringify(config));
 		}
@@ -366,19 +400,37 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private ColumnSchema decodeColumnSchema(byte[] value) {
 		try (var is = new ByteArrayInputStream(value); var dis = new DataInputStream(is)) {
 			var check = dis.readByte();
-			assert check == 2;
-			var size = dis.readInt();
-			var keys = new IntArrayList(size);
-			for (int i = 0; i < size; i++) {
-				keys.add(dis.readInt());
+			if (check == 2) {
+				var size = dis.readInt();
+				var keys = new IntArrayList(size);
+				for (int i = 0; i < size; i++) {
+					keys.add(dis.readInt());
+				}
+				size = dis.readInt();
+				var colHashTypes = new ObjectArrayList<ColumnHashType>(size);
+				for (int i = 0; i < size; i++) {
+					colHashTypes.add(ColumnHashType.values()[dis.readUnsignedByte()]);
+				}
+				var hasValue = dis.readBoolean();
+				return ColumnSchema.of(keys, colHashTypes, hasValue, null, null);
+			} else if (check == 3) {
+				var size = dis.readInt();
+				var keys = new IntArrayList(size);
+				for (int i = 0; i < size; i++) {
+					keys.add(dis.readInt());
+				}
+				size = dis.readInt();
+				var colHashTypes = new ObjectArrayList<ColumnHashType>(size);
+				for (int i = 0; i < size; i++) {
+					colHashTypes.add(ColumnHashType.values()[dis.readUnsignedByte()]);
+				}
+				var hasValue = dis.readBoolean();
+				String mergeOperatorName = dis.readBoolean() ? dis.readUTF() : null;
+				Long mergeOperatorVersion = dis.readBoolean() ? dis.readLong() : null;
+				return ColumnSchema.of(keys, colHashTypes, hasValue, mergeOperatorName, mergeOperatorVersion);
+			} else {
+				throw new IllegalStateException("Unknown schema version: " + check);
 			}
-			size = dis.readInt();
-			var colHashTypes = new ObjectArrayList<ColumnHashType>(size);
-			for (int i = 0; i < size; i++) {
-				colHashTypes.add(ColumnHashType.values()[dis.readUnsignedByte()]);
-			}
-			var hasValue = dis.readBoolean();
-			return new ColumnSchema(keys, colHashTypes, hasValue);
 		} catch (IOException e) {
 			throw new RuntimeException(e);
 		}
@@ -386,7 +438,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private byte[] encodeColumnSchema(ColumnSchema schema) {
 		try (var baos = new ByteArrayOutputStream(); var daos = new DataOutputStream(baos)) {
-			daos.writeByte(2);
+			daos.writeByte(3);
 			daos.writeInt(schema.keys().size());
 			for (int key : schema.keys()) {
 				daos.writeInt(key);
@@ -396,12 +448,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				daos.writeByte(variableTailKey.ordinal());
 			}
 			daos.writeBoolean(schema.hasValue());
+			var mergeOperatorName = schema.mergeOperatorName();
+			var mergeOperatorVersion = schema.mergeOperatorVersion();
+			daos.writeBoolean(mergeOperatorName != null);
+			if (mergeOperatorName != null) {
+				daos.writeUTF(mergeOperatorName);
+			}
+			daos.writeBoolean(mergeOperatorVersion != null);
+			if (mergeOperatorVersion != null) {
+				daos.writeLong(mergeOperatorVersion);
+			}
 			baos.close();
 			return baos.toByteArray();
 		} catch (IOException e) {
 			throw new RuntimeException(e);
 		}
 	}
+
 
 	/**
 	 * The column must be registered once!!!
@@ -639,7 +702,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public long createColumn(String name, @NotNull ColumnSchema schema) throws RocksDBException {
+	public long createColumn(String name,
+							 @NotNull ColumnSchema schema) throws RocksDBException {
 		var start = System.nanoTime();
 		actionLogger.logAction("CreateColumn", start, name, null, schema, null, null, null, null);
 		ops.beginOp();
@@ -657,18 +721,35 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				} else {
 					try {
+						FFMAbstractMergeOperator mergeOp = null;
+						String mergeOperatorName = schema.mergeOperatorName();
+						Long mergeOperatorVersion = schema.mergeOperatorVersion();
+						if (mergeOperatorName != null) {
+							if (mergeOperatorVersion == null) {
+								throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Merge operator version must be specified");
+							}
+							mergeOp = mergeOperatorRegistry.get(mergeOperatorName, mergeOperatorVersion);
+						}
+
 						var options = RocksDBLoader.getColumnOptions(name, path, definitiveDbPath, this.config.global(),
 								logger, this.refs, path == null, cache);
-						var prev = columnsConifg.put(name, options);
+
+						if (mergeOp != null) {
+							options.options().setMergeOperator(mergeOp);
+						} else {
+							mergeOp = options.mergeOperator();
+						}
+
+						var prev = columnsConifg.put(name, options.options());
 						if (prev != null) {
 							throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL,
 									"ColumnsConfig already exists with name \"" + name + "\"");
 						}
 						byte[] key = name.getBytes(StandardCharsets.UTF_8);
-						var cf = db.get().createColumnFamily(new ColumnFamilyDescriptor(key, options));
+						var cf = db.get().createColumnFamily(new ColumnFamilyDescriptor(key, options.options()));
 						byte[] value = encodeColumnSchema(schema);
 						db.get().put(columnSchemasColumnDescriptorHandle, key, value);
-						return registerColumn(new ColumnInstance(cf, schema));
+						return registerColumn(new ColumnInstance(cf, schema, mergeOp));
 					} catch (org.rocksdb.RocksDBException | GestaltException e) {
 						throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, e);
 					}
@@ -679,6 +760,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var end = System.nanoTime();
 			createColumnTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
+	}
+
+	@Override
+	public long uploadMergeOperator(String name, String className, byte[] jarData) {
+		return mergeOperatorRegistry.upload(name, className, jarData);
 	}
 
 	@Override
@@ -788,6 +874,30 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
+	public <T> T merge(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		var start = System.nanoTime();
+		actionLogger.logAction("Merge", start, columnId, keys, value, transactionOrUpdateId, null, null, requestType);
+		ops.beginOp();
+		try {
+			var col = getColumn(columnId);
+			Tx tx = transactionOrUpdateId != 0 ? getTransaction(transactionOrUpdateId, true) : null;
+			return merge(tx, col, keys, value, requestType);
+		} catch (RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+		} finally {
+			ops.endOp();
+			var end = System.nanoTime();
+			putTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	@Override
 	public <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keysList,
@@ -805,6 +915,35 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var value = valueList.get(i);
 				actionLogger.logAction("putMulti (next)", start, columnId, keys, value, transactionOrUpdateId, null, null, requestType);
 				var result = put(transactionOrUpdateId, columnId, keys, value, requestType);
+				if (responses != null) {
+					responses.add(result);
+				}
+			}
+			return responses != null ? responses : List.of();
+		} finally {
+			var end = System.nanoTime();
+			putMultiTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	@Override
+	public <T> List<T> mergeMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keysList,
+			@NotNull List<@NotNull Buf> valueList,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		var start = System.nanoTime();
+		try {
+			actionLogger.logAction("mergeMulti (begin)", start, columnId, keysList.size(), valueList.size(), transactionOrUpdateId, null, null, requestType);
+			if (keysList.size() != valueList.size()) {
+				throw new IllegalArgumentException("keys length is different than values length: " + keysList.size() + " != " + valueList.size());
+			}
+			List<T> responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+			for (int i = 0; i < keysList.size(); i++) {
+				var keys = keysList.get(i);
+				var value = valueList.get(i);
+				actionLogger.logAction("mergeMulti (next)", start, columnId, keys, value, transactionOrUpdateId, null, null, requestType);
+				var result = merge(transactionOrUpdateId, columnId, keys, value, requestType);
 				if (responses != null) {
 					responses.add(result);
 				}
@@ -942,14 +1081,220 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	public CompletableFuture<Void> mergeBatchInternal(long columnId,
+							 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
+							 @NotNull MergeBatchMode mode) throws RocksDBException {
+		final boolean ingestBehindEnabled;
+		try {
+			ingestBehindEnabled = config.global().ingestBehind();
+		} catch (GestaltException e) {
+			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
+		}
+		var start = System.nanoTime();
+		try {
+			actionLogger.logAction("MergeBatch (begin)", start, columnId, "multiple (async)", "multiple (async)", null, null, null, mode);
+			var cf = new CompletableFuture<Void>();
+			batchPublisher.subscribe(new Subscriber<>() {
+				private boolean stopped;
+				private Subscription subscription;
+				private ColumnInstance col;
+				private ArrayList<AutoCloseable> refs;
+				private DBWriter writer;
+				private ArrayList<Map.Entry<Keys, Buf>> pendingSstEntries;
+
+				@Override
+				public void onSubscribe(Subscription subscription) {
+					ops.beginOp();
+
+					try {
+						col = getColumn(columnId);
+						refs = new ArrayList<>();
+						writer = switch (mode) {
+							case MERGE_WRITE_BATCH -> {
+								if (col.hasBuckets()) {
+									var tx = openTransactionInternal(120_000, false);
+									refs.add(tx);
+									yield tx;
+								}
+								var wb = new WB(db.get(), new LeakSafeWriteBatch(), false);
+								refs.add(wb);
+								yield wb;
+							}
+							case MERGE_WRITE_BATCH_NO_WAL -> {
+								if (col.hasBuckets()) {
+									var tx = openTransactionInternal(120_000, false);
+									refs.add(tx);
+									yield tx;
+								}
+								var wb = new WB(db.get(), new LeakSafeWriteBatch(), true);
+								refs.add(wb);
+								yield wb;
+							}
+							case MERGE_SST_INGESTION -> {
+								var sst = getSSTWriter(columnId, null, false, false);
+								refs.add(sst);
+								pendingSstEntries = new ArrayList<>();
+								yield sst;
+							}
+							case MERGE_SST_INGEST_BEHIND -> {
+								if (!ingestBehindEnabled) {
+									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+										"MERGE_SST_INGEST_BEHIND requires database.global.ingest-behind=true");
+								}
+								var sst = getSSTWriter(columnId, null, false, true);
+								refs.add(sst);
+								pendingSstEntries = new ArrayList<>();
+								yield sst;
+							}
+						};
+					} catch (Throwable ex) {
+						doFinally();
+						throw ex;
+					}
+					this.subscription = subscription;
+					subscription.request(1);
+				}
+
+				@Override
+				public void onNext(KVBatch kvBatch) {
+					if (stopped) {
+						return;
+					}
+					var keyIt = kvBatch.keys().iterator();
+					var valueIt = kvBatch.values().iterator();
+					try {
+						while (keyIt.hasNext()) {
+							var keys = keyIt.next();
+							var value = valueIt.next();
+							actionLogger.logAction("MergeBatch (next)", start, columnId, keys, value, null, null, null, mode);
+							switch (writer) {
+								case SSTWriter ignored -> pendingSstEntries.add(Map.entry(keys, value));
+								default -> merge(writer, col, keys, value, RequestType.none());
+							}
+						}
+					} catch (RocksDBException ex) {
+						doFinally();
+						cf.completeExceptionally(ex);
+						return;
+					} catch (Throwable ex) {
+						doFinally();
+						var ex2 = RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+						cf.completeExceptionally(ex2);
+						return;
+					}
+					subscription.request(1);
+				}
+
+				@Override
+				public void onError(Throwable throwable) {
+					cf.completeExceptionally(throwable);
+					doFinally();
+				}
+
+				@Override
+				public void onComplete() {
+					try {
+						switch (writer) {
+							case WB wb -> wb.writePending();
+							case Tx tx -> closeTransactionInternal(tx, true);
+							case SSTWriter sst -> {
+								writeSstEntries(col, sst, pendingSstEntries, mode == MergeBatchMode.MERGE_SST_INGEST_BEHIND);
+								sst.writePending();
+							}
+							case null -> {}
+						}
+						cf.complete(null);
+					} catch (Throwable ex) {
+						cf.completeExceptionally(ex);
+					} finally {
+						doFinally();
+					}
+				}
+
+				private void doFinally() {
+					if (!stopped) {
+						stopped = true;
+						ops.endOp();
+						if (subscription != null) {
+							subscription.cancel();
+						}
+						if (refs != null) {
+							for (var ref : refs) {
+								try {
+									ref.close();
+								} catch (Exception ignored) {}
+							}
+						}
+					}
+				}
+			});
+			return cf;
+		} catch (RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+		}
+	}
+
+	private void writeSstEntries(ColumnInstance col,
+			SSTWriter sst,
+			@Nullable List<Map.Entry<Keys, Buf>> entries,
+			boolean ingestBehind) throws RocksDBException {
+		if (entries == null || entries.isEmpty()) {
+			return;
+		}
+		entries.sort((a, b) -> {
+			var ka = col.calculateKey(a.getKey().keys()).toByteArray();
+			var kb = col.calculateKey(b.getKey().keys()).toByteArray();
+			return Arrays.compareUnsigned(ka, kb);
+		});
+		try (var ro = newReadOptions(null)) {
+			for (var entry : entries) {
+				var keys = entry.getKey();
+				var value = entry.getValue();
+				Buf calculatedKey = col.calculateKey(keys.keys());
+				byte[] keyBytes = Utils.toByteArray(calculatedKey);
+				if (col.hasBuckets()) {
+					var existingRawBucket = dbGet(null, col, ro, calculatedKey);
+					var bucket = existingRawBucket != null ? new Bucket(col, existingRawBucket) : new Bucket(col);
+					var bucketElementKeys = col.getBucketElementKeys(keys.keys());
+					var existing = bucket.getElement(bucketElementKeys);
+					Buf mergedValue;
+					if (existing != null) {
+						var mergedRes = col.mergeOperator().merge(calculatedKey, existing, List.of(value));
+						mergedValue = mergedRes != null ? mergedRes : existing;
+					} else {
+						mergedValue = value;
+					}
+					bucket.addElement(bucketElementKeys, mergedValue);
+					byte[] valBytes = Utils.toByteArray(bucket.toSegment());
+					sst.put(keyBytes, valBytes);
+				} else {
+					Buf existing = dbGet(null, col, ro, calculatedKey);
+					var mergeOp = col.mergeOperator();
+					if (mergeOp == null) {
+						throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "MergeBatch SST requires a merge operator");
+					}
+					Buf merged = existing != null ? mergeOp.merge(calculatedKey, existing, List.of(value)) : value;
+					if (merged != null) {
+						byte[] valBytes = Utils.toByteArray(merged);
+						sst.put(keyBytes, valBytes);
+					}
+				}
+			}
+		} catch (org.rocksdb.RocksDBException e) {
+			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_3, e);
+		}
+	}
+
 	@VisibleForTesting
 	public SSTWriter getSSTWriter(long colId,
-								  @Nullable GlobalDatabaseConfig globalDatabaseConfigOverride,
-								  boolean forceNoOptions,
-								  boolean ingestBehind) throws RocksDBException {
+							  @Nullable GlobalDatabaseConfig globalDatabaseConfigOverride,
+							  boolean forceNoOptions,
+							  boolean ingestBehind) throws RocksDBException {
 		try {
 			var col = getColumn(colId);
-			ColumnFamilyOptions columnConifg;
+			RocksDBLoader.ColumnOptionsWithMerge columnConifg;
 			RocksDBObjects refs;
 			if (!forceNoOptions) {
 				var name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
@@ -987,7 +1332,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (Files.notExists(tempSSTsPath)) {
 				Files.createDirectories(tempSSTsPath);
 			}
-			return SSTWriter.open(tempSSTsPath, db, col, columnConifg, forceNoOptions, ingestBehind, refs);
+			return SSTWriter.open(tempSSTsPath, db, col, columnConifg != null ? columnConifg.options() : null, forceNoOptions, ingestBehind, refs);
 		} catch (IOException ex) {
 			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_2, ex);
 		} catch (org.rocksdb.RocksDBException ex) {
@@ -997,10 +1342,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@Override
 	public void putBatch(long columnId,
-						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
-						 @NotNull PutBatchMode mode) throws RocksDBException {
+					 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
+					 @NotNull PutBatchMode mode) throws RocksDBException {
 		try {
 			putBatchInternal(columnId, batchPublisher, mode).get();
+		} catch (RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+		}
+	}
+
+	@Override
+	public void mergeBatch(long columnId,
+				  @NotNull Publisher<@NotNull KVBatch> batchPublisher,
+				  @NotNull MergeBatchMode mode) throws RocksDBException {
+		try {
+			mergeBatchInternal(columnId, batchPublisher, mode).get();
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -1157,6 +1515,80 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (updateId != 0L && !(ex instanceof RocksDBRetryException)) {
 				closeTransaction(updateId, false);
 			}
+			if (ex instanceof RocksDBException rocksDBException) {
+				throw rocksDBException;
+			} else {
+				throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			}
+		}
+	}
+
+	private <U> U merge(@Nullable DBWriter optionalDbWriter,
+			ColumnInstance col,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestMerge<? super Buf, U> callback) throws RocksDBException {
+		try {
+			boolean needsTx = col.hasBuckets() || !(callback instanceof RequestType.RequestNothing<?>);
+			DBWriter writer = needsTx && optionalDbWriter == null ? this.openTransactionInternal(120_000, false) : optionalDbWriter;
+			boolean owningTx = needsTx && optionalDbWriter == null;
+			U result;
+			try {
+				Buf calculatedKey = col.calculateKey(keys.keys());
+				if (col.hasBuckets()) {
+					assert writer instanceof Tx;
+					var bucketElementKeys = col.getBucketElementKeys(keys.keys());
+					try (var readOptions = newReadOptions(null)) {
+						var previousRawBucketByteArray = ((Tx) writer).val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
+						Buf previousRawBucket = toBuf(previousRawBucketByteArray);
+						var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
+						var existing = bucket.getElement(bucketElementKeys);
+						Buf mergedValue;
+						if (existing != null) {
+							var mergedRes = col.mergeOperator().merge(calculatedKey, existing, List.of(value));
+							mergedValue = mergedRes != null ? mergedRes : existing;
+						} else {
+							mergedValue = value;
+						}
+						bucket.addElement(bucketElementKeys, mergedValue);
+						var k = Utils.toByteArray(calculatedKey);
+						var v = Utils.toByteArray(bucket.toSegment());
+						((Tx) writer).val().put(col.cfh(), k, v);
+						if (callback instanceof RequestType.RequestMerged<?>) {
+							var merged = bucket.getElement(col.getBucketElementKeys(keys.keys()));
+							result = RequestType.safeCast(transformResultValue(col, merged));
+						} else {
+							result = null;
+						}
+					}
+				} else {
+					switch (writer) {
+						case WB wb -> wb.wb().merge(col.cfh(), calculatedKey.toByteArray(), value.toByteArray());
+						case SSTWriter ignored -> throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Merge not supported with SST writer");
+						case Tx t -> t.val().merge(col.cfh(), calculatedKey.toByteArray(), value.toByteArray());
+						case null -> {
+							try (var w = new LeakSafeWriteOptions(null)) {
+								db.get().merge(col.cfh(), w, calculatedKey.toByteArray(), value.toByteArray());
+							}
+						}
+					}
+					if (callback instanceof RequestType.RequestMerged<?>) {
+						Buf merged;
+						try (var readOptions = newReadOptions(null)) {
+							merged = dbGet(writer instanceof Tx ? (Tx) writer : null, col, readOptions, calculatedKey);
+						}
+						result = RequestType.safeCast(merged);
+					} else {
+						result = null;
+					}
+				}
+			} finally {
+				if (owningTx && writer instanceof Tx t) {
+					this.closeTransactionInternal(t, true);
+				}
+			}
+			return result;
+		} catch (Exception ex) {
 			if (ex instanceof RocksDBException rocksDBException) {
 				throw rocksDBException;
 			} else {

@@ -5,6 +5,9 @@ import org.jetbrains.annotations.Nullable;
 
 public interface FallbackColumnConfig {
 
+	@Nullable
+	String mergeOperatorClass() throws GestaltException;
+
 	VolumeConfig[] volumes() throws GestaltException;
 
 	@Nullable

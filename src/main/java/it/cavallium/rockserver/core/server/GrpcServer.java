@@ -32,6 +32,7 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.PutBatchMode;
+import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
@@ -41,6 +42,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestMulti;
 import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
+import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
@@ -212,6 +214,19 @@ public class GrpcServer extends Server {
 		}
 
 		@Override
+		public Mono<Empty> merge(MergeRequest request) {
+			return executeSync(() -> {
+				api.merge(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						toBuf(request.getData().getValue()),
+						new RequestNothing<>()
+				);
+				return Empty.getDefaultInstance();
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("merge", request));
+		}
+
+		@Override
 		public Mono<Empty> putBatch(Flux<PutBatchRequest> request) {
 			return request.switchOnFirst((firstSignal, requestFlux) -> {
 				if (firstSignal.isOnNext()) {
@@ -259,10 +274,155 @@ public class GrpcServer extends Server {
 		}
 
 		@Override
+		public Mono<Empty> mergeBatch(Flux<MergeBatchRequest> request) {
+			return request.switchOnFirst((firstSignal, requestFlux) -> {
+				if (firstSignal.isOnNext()) {
+					var firstValue = firstSignal.get();
+					assert firstValue != null;
+					if (!firstValue.hasInitialRequest()) {
+						return Mono.<Empty>error(RocksDBException.of(
+								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+					}
+					var initialRequest = firstValue.getInitialRequest();
+					var mode = switch (initialRequest.getMode()) {
+						case MERGE_WRITE_BATCH -> MergeBatchMode.MERGE_WRITE_BATCH;
+						case MERGE_WRITE_BATCH_NO_WAL -> MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL;
+						case MERGE_SST_INGESTION -> MergeBatchMode.MERGE_SST_INGESTION;
+						case MERGE_SST_INGEST_BEHIND -> MergeBatchMode.MERGE_SST_INGEST_BEHIND;
+						case UNRECOGNIZED -> throw new UnsupportedOperationException("Unrecognized request \"mode\"");
+					};
+
+					var batches = requestFlux
+							.skip(1) // skip initial request
+							.<KVBatch>handle((mergeBatchRequest, sink) -> {
+								if (!mergeBatchRequest.hasData()) {
+									sink.error( RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+											"Multiple initial requests"));
+									return;
+								}
+								var batch = mergeBatchRequest.getData();
+								try {
+									sink.next(mapKVBatch(batch.getEntriesCount(), batch::getEntries));
+								} catch (Throwable ex) {
+									sink.error(ex);
+								}
+							});
+
+  			return Mono
+  					.fromFuture(() -> asyncApi.mergeBatchAsync(initialRequest.getColumnId(), batches, mode))
+  					.transform(this.onErrorMapMonoWithRequestInfo("mergeBatch", initialRequest));
+  			} else if (firstSignal.isOnComplete()) {
+  				return Mono.just(RocksDBException.of(
+  						RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+  			} else {
+  				return requestFlux;
+  			}
+  		}).then(Mono.just(Empty.getDefaultInstance()));
+  	}
+
+  		@Override
+  		public Mono<Merged> mergeGetMerged(MergeRequest request) {
+  			return executeSync(() -> {
+  				var merged = api.merge(request.getTransactionOrUpdateId(),
+  						request.getColumnId(),
+  						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+  						toBuf(request.getData().getValue()),
+  						RequestType.merged());
+  				return Merged.newBuilder()
+  						.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
+  						.build();
+  			}, false).transform(this.onErrorMapMonoWithRequestInfo("mergeGetMerged", request));
+  		}
+
+		@Override
 		public Mono<Empty> putMultiList(PutMultiListRequest request) {
 			var initialRequest = request.getInitialRequest();
 			var dataFlux = Flux.fromIterable(request.getDataList());
 			return putMultiDataFlux(initialRequest, dataFlux, "putMultiList");
+		}
+
+		@Override
+		public Mono<Empty> mergeMulti(Flux<MergeMultiRequest> request) {
+			return request.switchOnFirst((firstSignal, requestsFlux) -> {
+				if (firstSignal.isOnNext()) {
+					var firstValue = firstSignal.get();
+					assert firstValue != null;
+					if (!firstValue.hasInitialRequest()) {
+						return Mono.<Empty>error(RocksDBException.of(
+								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+					}
+					var initialRequest = firstValue.getInitialRequest();
+					var dataFlux = requestsFlux
+							.skip(1) // skip the initial request
+							.map(mergeRequest -> {
+								if (!mergeRequest.hasData()) {
+									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Multiple initial requests");
+								}
+								return mergeRequest.getData();
+							});
+					return mergeMultiDataFlux(initialRequest, dataFlux, "mergeMulti");
+				} else if (firstSignal.isOnComplete()) {
+					return Mono.just(RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+				} else {
+					return requestsFlux;
+				}
+			}).then(Mono.just(Empty.getDefaultInstance()));
+		}
+
+		@Override
+		public Flux<Merged> mergeMultiGetMerged(Flux<MergeMultiRequest> request) {
+			return request.switchOnFirst((firstSignal, requestsFlux) -> {
+				if (firstSignal.isOnNext()) {
+					var firstValue = firstSignal.get();
+					assert firstValue != null;
+					if (!firstValue.hasInitialRequest()) {
+						return Flux.error(RocksDBException.of(
+								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+					}
+					var initialRequest = firstValue.getInitialRequest();
+					var dataFlux = requestsFlux
+							.skip(1) // skip the initial request
+							.map(mergeRequest -> {
+								if (!mergeRequest.hasData()) {
+									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Multiple initial requests");
+								}
+								return mergeRequest.getData();
+							});
+
+					return dataFlux
+							.publishOn(scheduler.write())
+							.map(data -> {
+								var merged = api.merge(initialRequest.getTransactionOrUpdateId(),
+										initialRequest.getColumnId(),
+										mapKeys(data.getKeysCount(), data::getKeys),
+										toBuf(data.getValue()),
+										RequestType.merged());
+								return Merged.newBuilder()
+										.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
+										.build();
+							})
+							.onErrorMap(ex -> this.handleError(ex).asRuntimeException());
+				} else {
+					return Flux.error(RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+				}
+			});
+		}
+
+		private Mono<Empty> mergeMultiDataFlux(MergeMultiInitialRequest initialRequest,
+				Flux<KV> dataFlux, String requestName) {
+			return dataFlux
+					.publishOn(scheduler.write())
+					.doOnNext(data -> {
+						api.merge(initialRequest.getTransactionOrUpdateId(),
+								initialRequest.getColumnId(),
+								mapKeys(data.getKeysCount(), data::getKeys),
+								toBuf(data.getValue()),
+								new RequestNothing<>());
+					})
+					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
+					.then(Mono.just(Empty.getDefaultInstance()));
 		}
 
 		@Override
@@ -570,8 +730,16 @@ public class GrpcServer extends Server {
 				for (Entry<String, ColumnSchema> e : definitions.entrySet()) {
 					builder.addColumns(Column.newBuilder().setName(e.getKey()).setSchema(unmapColumnSchema(e.getValue())));
 				}
-				return builder.build();
+ 			return builder.build();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("getAllColumnDefinitions", request));
+		}
+
+		@Override
+		public Mono<UploadMergeOperatorResponse> uploadMergeOperator(UploadMergeOperatorRequest request) {
+			return executeSync(() -> {
+				var version = api.uploadMergeOperator(request.getOperatorName(), request.getClassName(), request.getJarPayload().toByteArray());
+				return UploadMergeOperatorResponse.newBuilder().setVersion(version).build();
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("uploadMergeOperator", request));
 		}
 
 		// utils
@@ -658,16 +826,24 @@ public class GrpcServer extends Server {
 		private static ColumnSchema mapColumnSchema(it.cavallium.rockserver.core.common.api.proto.ColumnSchema schema) {
 			return ColumnSchema.of(mapKeysLength(schema.getFixedKeysCount(), schema::getFixedKeys),
 					mapVariableTailKeys(schema.getVariableTailKeysCount(), schema::getVariableTailKeys),
-					schema.getHasValue()
+					schema.getHasValue(),
+					schema.hasMergeOperatorName() ? schema.getMergeOperatorName() : null,
+					schema.hasMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null
 			);
 		}
 
 		private static it.cavallium.rockserver.core.common.api.proto.ColumnSchema unmapColumnSchema(@NotNull ColumnSchema schema) {
-			return it.cavallium.rockserver.core.common.api.proto.ColumnSchema.newBuilder()
+			var builder = it.cavallium.rockserver.core.common.api.proto.ColumnSchema.newBuilder()
 					.addAllFixedKeys(unmapFixedKeys(schema))
 					.addAllVariableTailKeys(unmapVariableTailKeys(schema))
-					.setHasValue(schema.hasValue())
-					.build();
+					.setHasValue(schema.hasValue());
+			if (schema.mergeOperatorName() != null) {
+				builder.setMergeOperatorName(schema.mergeOperatorName());
+			}
+			if (schema.mergeOperatorVersion() != null) {
+				builder.setMergeOperatorVersion(schema.mergeOperatorVersion());
+			}
+			return builder.build();
 		}
 
 		private static Iterable<Integer> unmapFixedKeys(@NotNull ColumnSchema schema) {

@@ -106,7 +106,8 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param name   column name
 		 * @param schema column key-value schema
 		 */
-		record CreateColumn(String name, @NotNull ColumnSchema schema) implements RocksDBAPICommandSingle<Long> {
+		record CreateColumn(String name,
+							@NotNull ColumnSchema schema) implements RocksDBAPICommandSingle<Long> {
 
 			@Override
 			public Long handleSync(RocksDBSyncAPI api) {
@@ -123,6 +124,34 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return false;
 			}
 
+		}
+		/**
+		 * Upload a merge operator
+		 * @param name operator name
+		 * @param className class name
+		 * @param jarData jar payload
+		 */
+		record UploadMergeOperator(String name, String className, byte[] jarData) implements RocksDBAPICommandSingle<Long> {
+
+			@Override
+			public Long handleSync(RocksDBSyncAPI api) {
+				return api.uploadMergeOperator(name, className, jarData);
+			}
+
+			@Override
+			public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
+				return api.uploadMergeOperatorAsync(name, className, jarData);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
+			@Override
+			public String toString() {
+				return "UPLOAD_MERGE_OPERATOR name:" + name + " class:" + className;
+			}
 		}
 		/**
 		 * Delete a column
@@ -269,8 +298,8 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param mode put batch mode
 		 */
 		record PutBatch(long columnId,
-						@NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
-						@NotNull PutBatchMode mode) implements RocksDBAPICommandSingle<Void> {
+					@NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+					@NotNull PutBatchMode mode) implements RocksDBAPICommandSingle<Void> {
 
 			@Override
 			public Void handleSync(RocksDBSyncAPI api) {
@@ -291,6 +320,131 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public String toString() {
 				var sb = new StringBuilder("PUT_BATCH");
+				sb.append(" column:").append(columnId);
+				sb.append(" mode:").append(mode);
+				sb.append(" batch:[...]");
+				return sb.toString();
+			}
+		}
+		/**
+		 * Merge an element with the specified position
+		 *
+		 * @param transactionOrUpdateId transaction id, update id, or 0
+		 * @param columnId              column id
+		 * @param keys                  column keys, or empty array if not needed
+		 * @param value                 operand value
+		 * @param requestType           determines whether to return the merged value
+		 */
+		record Merge<T>(long transactionOrUpdateId,
+				  long columnId,
+				  Keys keys,
+				  @NotNull Buf value,
+				  RequestType.RequestMerge<? super Buf, T> requestType) implements RocksDBAPICommandSingle<T> {
+
+			@Override
+			public T handleSync(RocksDBSyncAPI api) {
+				return api.merge(transactionOrUpdateId, columnId, keys, value, requestType);
+			}
+
+			@Override
+			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
+				return api.mergeAsync(transactionOrUpdateId, columnId, keys, value, requestType);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
+			@Override
+			public String toString() {
+				var sb = new StringBuilder("MERGE");
+				if (transactionOrUpdateId != 0) {
+					sb.append(" tx:").append(transactionOrUpdateId);
+				}
+				sb.append(" column:").append(columnId);
+				sb.append(" keys:").append(keys);
+				sb.append(" value:").append(Utils.toPrettyString(value));
+				sb.append(" expected:").append(requestType.getRequestTypeId());
+				return sb.toString();
+			}
+		}
+		/**
+		 * Merge multiple elements into the specified positions
+		 *
+		 * @param transactionOrUpdateId transaction id, update id, or 0
+		 * @param columnId              column id
+		 * @param keys                  multiple lists of column keys
+		 * @param values                multiple values
+		 * @param requestType           determines whether to return merged values
+		 */
+		record MergeMulti<T>(long transactionOrUpdateId, long columnId,
+						 @NotNull List<Keys> keys,
+						 @NotNull List<@NotNull Buf> values,
+						 RequestType.RequestMerge<? super Buf, T> requestType) implements RocksDBAPICommandSingle<List<T>> {
+
+			@Override
+			public List<T> handleSync(RocksDBSyncAPI api) {
+				return api.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType);
+			}
+
+			@Override
+			public CompletableFuture<List<T>> handleAsync(RocksDBAsyncAPI api) {
+				return api.mergeMultiAsync(transactionOrUpdateId, columnId, keys, values, requestType);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
+			@Override
+			public String toString() {
+				var sb = new StringBuilder("MERGE_MULTI");
+				if (transactionOrUpdateId != 0) {
+					sb.append(" tx:").append(transactionOrUpdateId);
+				}
+				sb.append(" column:").append(columnId);
+				sb.append(" expected:").append(requestType.getRequestTypeId());
+				sb.append(" multi:[");
+				for (int i = 0; i < keys.size(); i++) {
+					if (i > 0) sb.append(",");
+					sb.append(" keys:").append(keys.get(i));
+					sb.append(" value:").append(Utils.toPrettyString(values.get(i)));
+				}
+				sb.append("]");
+				return sb.toString();
+			}
+		}
+		/**
+		 * Merge multiple elements using a publisher of batches
+		 * @param columnId column id
+		 * @param batchPublisher publisher of batches of keys and values
+		 * @param mode merge batch mode
+		 */
+		record MergeBatch(long columnId,
+					 @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+					 @NotNull MergeBatchMode mode) implements RocksDBAPICommandSingle<Void> {
+
+			@Override
+			public Void handleSync(RocksDBSyncAPI api) {
+				api.mergeBatch(columnId, batchPublisher, mode);
+				return null;
+			}
+
+			@Override
+			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
+				return api.mergeBatchAsync(columnId, batchPublisher, mode);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
+			@Override
+			public String toString() {
+				var sb = new StringBuilder("MERGE_BATCH");
 				sb.append(" column:").append(columnId);
 				sb.append(" mode:").append(mode);
 				sb.append(" batch:[...]");

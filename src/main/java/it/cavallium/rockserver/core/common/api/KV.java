@@ -7,19 +7,22 @@
 package it.cavallium.rockserver.core.common.api;
 
 @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
-public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, OptionalBinary._Fields>, java.io.Serializable, Cloneable, Comparable<OptionalBinary> {
-  private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("OptionalBinary");
+public class KV implements org.apache.thrift.TBase<KV, KV._Fields>, java.io.Serializable, Cloneable, Comparable<KV> {
+  private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("KV");
 
-  private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)1);
+  private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)1);
+  private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)2);
 
-  private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new OptionalBinaryStandardSchemeFactory();
-  private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new OptionalBinaryTupleSchemeFactory();
+  private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new KVStandardSchemeFactory();
+  private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new KVTupleSchemeFactory();
 
-  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // optional
+  public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
+  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-    VALUE((short)1, "value");
+    KEYS((short)1, "keys"),
+    VALUE((short)2, "value");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -35,7 +38,9 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
     @org.apache.thrift.annotation.Nullable
     public static _Fields findByThriftId(int fieldId) {
       switch(fieldId) {
-        case 1: // VALUE
+        case 1: // KEYS
+          return KEYS;
+        case 2: // VALUE
           return VALUE;
         default:
           return null;
@@ -80,36 +85,93 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
   }
 
   // isset id assignments
-  private static final _Fields[] optionals = {_Fields.VALUE};
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
-    tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+    tmpMap.put(_Fields.KEYS, new org.apache.thrift.meta_data.FieldMetaData("keys", org.apache.thrift.TFieldRequirementType.DEFAULT, 
+        new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST, 
+            new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING            , true))));
+    tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.DEFAULT, 
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
-    org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(OptionalBinary.class, metaDataMap);
+    org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(KV.class, metaDataMap);
   }
 
-  public OptionalBinary() {
+  public KV() {
+  }
+
+  public KV(
+    java.util.List<java.nio.ByteBuffer> keys,
+    java.nio.ByteBuffer value)
+  {
+    this();
+    this.keys = keys;
+    this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
   }
 
   /**
    * Performs a deep copy on <i>other</i>.
    */
-  public OptionalBinary(OptionalBinary other) {
+  public KV(KV other) {
+    if (other.isSetKeys()) {
+      java.util.List<java.nio.ByteBuffer> __this__keys = new java.util.ArrayList<java.nio.ByteBuffer>(other.keys);
+      this.keys = __this__keys;
+    }
     if (other.isSetValue()) {
       this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
     }
   }
 
   @Override
-  public OptionalBinary deepCopy() {
-    return new OptionalBinary(this);
+  public KV deepCopy() {
+    return new KV(this);
   }
 
   @Override
   public void clear() {
+    this.keys = null;
     this.value = null;
+  }
+
+  public int getKeysSize() {
+    return (this.keys == null) ? 0 : this.keys.size();
+  }
+
+  @org.apache.thrift.annotation.Nullable
+  public java.util.Iterator<java.nio.ByteBuffer> getKeysIterator() {
+    return (this.keys == null) ? null : this.keys.iterator();
+  }
+
+  public void addToKeys(java.nio.ByteBuffer elem) {
+    if (this.keys == null) {
+      this.keys = new java.util.ArrayList<java.nio.ByteBuffer>();
+    }
+    this.keys.add(elem);
+  }
+
+  @org.apache.thrift.annotation.Nullable
+  public java.util.List<java.nio.ByteBuffer> getKeys() {
+    return this.keys;
+  }
+
+  public KV setKeys(@org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys) {
+    this.keys = keys;
+    return this;
+  }
+
+  public void unsetKeys() {
+    this.keys = null;
+  }
+
+  /** Returns true if field keys is set (has been assigned a value) and false otherwise */
+  public boolean isSetKeys() {
+    return this.keys != null;
+  }
+
+  public void setKeysIsSet(boolean value) {
+    if (!value) {
+      this.keys = null;
+    }
   }
 
   public byte[] getValue() {
@@ -121,12 +183,12 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
     return org.apache.thrift.TBaseHelper.copyBinary(value);
   }
 
-  public OptionalBinary setValue(byte[] value) {
+  public KV setValue(byte[] value) {
     this.value = value == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(value.clone());
     return this;
   }
 
-  public OptionalBinary setValue(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value) {
+  public KV setValue(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value) {
     this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
     return this;
   }
@@ -149,6 +211,14 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
+    case KEYS:
+      if (value == null) {
+        unsetKeys();
+      } else {
+        setKeys((java.util.List<java.nio.ByteBuffer>)value);
+      }
+      break;
+
     case VALUE:
       if (value == null) {
         unsetValue();
@@ -168,6 +238,9 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
   @Override
   public java.lang.Object getFieldValue(_Fields field) {
     switch (field) {
+    case KEYS:
+      return getKeys();
+
     case VALUE:
       return getValue();
 
@@ -183,6 +256,8 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
     }
 
     switch (field) {
+    case KEYS:
+      return isSetKeys();
     case VALUE:
       return isSetValue();
     }
@@ -191,16 +266,25 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
 
   @Override
   public boolean equals(java.lang.Object that) {
-    if (that instanceof OptionalBinary)
-      return this.equals((OptionalBinary)that);
+    if (that instanceof KV)
+      return this.equals((KV)that);
     return false;
   }
 
-  public boolean equals(OptionalBinary that) {
+  public boolean equals(KV that) {
     if (that == null)
       return false;
     if (this == that)
       return true;
+
+    boolean this_present_keys = true && this.isSetKeys();
+    boolean that_present_keys = true && that.isSetKeys();
+    if (this_present_keys || that_present_keys) {
+      if (!(this_present_keys && that_present_keys))
+        return false;
+      if (!this.keys.equals(that.keys))
+        return false;
+    }
 
     boolean this_present_value = true && this.isSetValue();
     boolean that_present_value = true && that.isSetValue();
@@ -218,6 +302,10 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
   public int hashCode() {
     int hashCode = 1;
 
+    hashCode = hashCode * 8191 + ((isSetKeys()) ? 131071 : 524287);
+    if (isSetKeys())
+      hashCode = hashCode * 8191 + keys.hashCode();
+
     hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
     if (isSetValue())
       hashCode = hashCode * 8191 + value.hashCode();
@@ -226,13 +314,23 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
   }
 
   @Override
-  public int compareTo(OptionalBinary other) {
+  public int compareTo(KV other) {
     if (!getClass().equals(other.getClass())) {
       return getClass().getName().compareTo(other.getClass().getName());
     }
 
     int lastComparison = 0;
 
+    lastComparison = java.lang.Boolean.compare(isSetKeys(), other.isSetKeys());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetKeys()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keys, other.keys);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
     lastComparison = java.lang.Boolean.compare(isSetValue(), other.isSetValue());
     if (lastComparison != 0) {
       return lastComparison;
@@ -264,18 +362,24 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
 
   @Override
   public java.lang.String toString() {
-    java.lang.StringBuilder sb = new java.lang.StringBuilder("OptionalBinary(");
+    java.lang.StringBuilder sb = new java.lang.StringBuilder("KV(");
     boolean first = true;
 
-    if (isSetValue()) {
-      sb.append("value:");
-      if (this.value == null) {
-        sb.append("null");
-      } else {
-        org.apache.thrift.TBaseHelper.toString(this.value, sb);
-      }
-      first = false;
+    sb.append("keys:");
+    if (this.keys == null) {
+      sb.append("null");
+    } else {
+      org.apache.thrift.TBaseHelper.toString(this.keys, sb);
     }
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("value:");
+    if (this.value == null) {
+      sb.append("null");
+    } else {
+      org.apache.thrift.TBaseHelper.toString(this.value, sb);
+    }
+    first = false;
     sb.append(")");
     return sb.toString();
   }
@@ -301,17 +405,17 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
     }
   }
 
-  private static class OptionalBinaryStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+  private static class KVStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
     @Override
-    public OptionalBinaryStandardScheme getScheme() {
-      return new OptionalBinaryStandardScheme();
+    public KVStandardScheme getScheme() {
+      return new KVStandardScheme();
     }
   }
 
-  private static class OptionalBinaryStandardScheme extends org.apache.thrift.scheme.StandardScheme<OptionalBinary> {
+  private static class KVStandardScheme extends org.apache.thrift.scheme.StandardScheme<KV> {
 
     @Override
-    public void read(org.apache.thrift.protocol.TProtocol iprot, OptionalBinary struct) throws org.apache.thrift.TException {
+    public void read(org.apache.thrift.protocol.TProtocol iprot, KV struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TField schemeField;
       iprot.readStructBegin();
       while (true)
@@ -321,7 +425,25 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
           break;
         }
         switch (schemeField.id) {
-          case 1: // VALUE
+          case 1: // KEYS
+            if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
+              {
+                org.apache.thrift.protocol.TList _list16 = iprot.readListBegin();
+                struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list16.size);
+                @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem17;
+                for (int _i18 = 0; _i18 < _list16.size; ++_i18)
+                {
+                  _elem17 = iprot.readBinary();
+                  struct.keys.add(_elem17);
+                }
+                iprot.readListEnd();
+              }
+              struct.setKeysIsSet(true);
+            } else { 
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 2: // VALUE
             if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
               struct.value = iprot.readBinary();
               struct.setValueIsSet(true);
@@ -341,16 +463,26 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
     }
 
     @Override
-    public void write(org.apache.thrift.protocol.TProtocol oprot, OptionalBinary struct) throws org.apache.thrift.TException {
+    public void write(org.apache.thrift.protocol.TProtocol oprot, KV struct) throws org.apache.thrift.TException {
       struct.validate();
 
       oprot.writeStructBegin(STRUCT_DESC);
-      if (struct.value != null) {
-        if (struct.isSetValue()) {
-          oprot.writeFieldBegin(VALUE_FIELD_DESC);
-          oprot.writeBinary(struct.value);
-          oprot.writeFieldEnd();
+      if (struct.keys != null) {
+        oprot.writeFieldBegin(KEYS_FIELD_DESC);
+        {
+          oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
+          for (java.nio.ByteBuffer _iter19 : struct.keys)
+          {
+            oprot.writeBinary(_iter19);
+          }
+          oprot.writeListEnd();
         }
+        oprot.writeFieldEnd();
+      }
+      if (struct.value != null) {
+        oprot.writeFieldBegin(VALUE_FIELD_DESC);
+        oprot.writeBinary(struct.value);
+        oprot.writeFieldEnd();
       }
       oprot.writeFieldStop();
       oprot.writeStructEnd();
@@ -358,33 +490,58 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
 
   }
 
-  private static class OptionalBinaryTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+  private static class KVTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
     @Override
-    public OptionalBinaryTupleScheme getScheme() {
-      return new OptionalBinaryTupleScheme();
+    public KVTupleScheme getScheme() {
+      return new KVTupleScheme();
     }
   }
 
-  private static class OptionalBinaryTupleScheme extends org.apache.thrift.scheme.TupleScheme<OptionalBinary> {
+  private static class KVTupleScheme extends org.apache.thrift.scheme.TupleScheme<KV> {
 
     @Override
-    public void write(org.apache.thrift.protocol.TProtocol prot, OptionalBinary struct) throws org.apache.thrift.TException {
+    public void write(org.apache.thrift.protocol.TProtocol prot, KV struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       java.util.BitSet optionals = new java.util.BitSet();
-      if (struct.isSetValue()) {
+      if (struct.isSetKeys()) {
         optionals.set(0);
       }
-      oprot.writeBitSet(optionals, 1);
+      if (struct.isSetValue()) {
+        optionals.set(1);
+      }
+      oprot.writeBitSet(optionals, 2);
+      if (struct.isSetKeys()) {
+        {
+          oprot.writeI32(struct.keys.size());
+          for (java.nio.ByteBuffer _iter20 : struct.keys)
+          {
+            oprot.writeBinary(_iter20);
+          }
+        }
+      }
       if (struct.isSetValue()) {
         oprot.writeBinary(struct.value);
       }
     }
 
     @Override
-    public void read(org.apache.thrift.protocol.TProtocol prot, OptionalBinary struct) throws org.apache.thrift.TException {
+    public void read(org.apache.thrift.protocol.TProtocol prot, KV struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
-      java.util.BitSet incoming = iprot.readBitSet(1);
+      java.util.BitSet incoming = iprot.readBitSet(2);
       if (incoming.get(0)) {
+        {
+          org.apache.thrift.protocol.TList _list21 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list21.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem22;
+          for (int _i23 = 0; _i23 < _list21.size; ++_i23)
+          {
+            _elem22 = iprot.readBinary();
+            struct.keys.add(_elem22);
+          }
+        }
+        struct.setKeysIsSet(true);
+      }
+      if (incoming.get(1)) {
         struct.value = iprot.readBinary();
         struct.setValueIsSet(true);
       }

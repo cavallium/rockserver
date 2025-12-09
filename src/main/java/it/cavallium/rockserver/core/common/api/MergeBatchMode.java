@@ -7,20 +7,15 @@
 package it.cavallium.rockserver.core.common.api;
 
 
-public enum Operation implements org.apache.thrift.TEnum {
-  NOTHING(1),
-  PREVIOUS(2),
-  CURRENT(3),
-  FOR_UPDATE(4),
-  EXISTS(5),
-  DELTA(6),
-  MULTI(7),
-  CHANGED(8),
-  PREVIOUS_PRESENCE(9);
+public enum MergeBatchMode implements org.apache.thrift.TEnum {
+  MERGE_WRITE_BATCH(0),
+  MERGE_WRITE_BATCH_NO_WAL(1),
+  MERGE_SST_INGESTION(2),
+  MERGE_SST_INGEST_BEHIND(3);
 
   private final int value;
 
-  private Operation(int value) {
+  private MergeBatchMode(int value) {
     this.value = value;
   }
 
@@ -37,26 +32,16 @@ public enum Operation implements org.apache.thrift.TEnum {
    * @return null if the value is not found.
    */
   @org.apache.thrift.annotation.Nullable
-  public static Operation findByValue(int value) { 
+  public static MergeBatchMode findByValue(int value) { 
     switch (value) {
+      case 0:
+        return MERGE_WRITE_BATCH;
       case 1:
-        return NOTHING;
+        return MERGE_WRITE_BATCH_NO_WAL;
       case 2:
-        return PREVIOUS;
+        return MERGE_SST_INGESTION;
       case 3:
-        return CURRENT;
-      case 4:
-        return FOR_UPDATE;
-      case 5:
-        return EXISTS;
-      case 6:
-        return DELTA;
-      case 7:
-        return MULTI;
-      case 8:
-        return CHANGED;
-      case 9:
-        return PREVIOUS_PRESENCE;
+        return MERGE_SST_INGEST_BEHIND;
       default:
         return null;
     }

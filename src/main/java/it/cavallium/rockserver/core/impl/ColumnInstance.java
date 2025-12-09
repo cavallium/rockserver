@@ -14,12 +14,19 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.ColumnFamilyHandle;
 
-public record ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, int finalKeySizeBytes) implements AutoCloseable {
+public record ColumnInstance(ColumnFamilyHandle cfh,
+				    ColumnSchema schema,
+				    int finalKeySizeBytes,
+				    @Nullable FFMAbstractMergeOperator mergeOperator) implements AutoCloseable {
 
 	private static final Buf[] EMPTY_BUF_ARRAY = new Buf[0];
 
 	public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema) {
-		this(cfh, schema, calculateFinalKeySizeBytes(schema));
+		this(cfh, schema, calculateFinalKeySizeBytes(schema), null);
+	}
+
+	public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, @Nullable FFMAbstractMergeOperator mergeOperator) {
+		this(cfh, schema, calculateFinalKeySizeBytes(schema), mergeOperator);
 	}
 
 	private static int calculateFinalKeySizeBytes(ColumnSchema schema) {

@@ -18,6 +18,7 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		MULTI(new RequestMulti()),
 		CHANGED(new RequestChanged()),
 		PREVIOUS_PRESENCE(new RequestPreviousPresence()),
+		MERGED(new RequestMerged()),
 		FIRST_AND_LAST(new RequestGetFirstAndLast()),
 		ALL_IN_RANGE(new RequestGetAllInRange()),
 		ENTRIES_COUNT(new RequestEntriesCount());
@@ -96,6 +97,11 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 	}
 
 	@SuppressWarnings("unchecked")
+	static <T> RequestMerged<T> merged() {
+		return (RequestMerged<T>) RequestMerged.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
 	static <T> RequestGetFirstAndLast<T> firstAndLast() {
 		return (RequestGetFirstAndLast<T>) RequestGetFirstAndLast.INSTANCE;
 	}
@@ -127,8 +133,10 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 
 	sealed interface RequestIterate<T, U> extends RequestType<T, U> {}
 
-	record RequestNothing<T>() implements RequestPut<T, Void>, RequestPatch<T, Void>, RequestIterate<T, Void>,
-			RequestGet<T, Void> {
+	sealed interface RequestMerge<T, U> extends RequestType<T, U> {}
+
+ record RequestNothing<T>() implements RequestPut<T, Void>, RequestPatch<T, Void>, RequestIterate<T, Void>,
+            RequestGet<T, Void>, RequestMerge<T, Void> {
 
 		private static final RequestNothing<Object> INSTANCE = new RequestNothing<>();
 
@@ -208,7 +216,7 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		}
 	}
 
-	record RequestPreviousPresence<T>() implements RequestPut<T, Boolean>, RequestPatch<T, Boolean> {
+ record RequestPreviousPresence<T>() implements RequestPut<T, Boolean>, RequestPatch<T, Boolean> {
 
 		private static final RequestPreviousPresence<Object> INSTANCE = new RequestPreviousPresence<>();
 
@@ -245,6 +253,16 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		@Override
 		public RequestTypeId getRequestTypeId() {
 			return RequestTypeId.ALL_IN_RANGE;
+		}
+	}
+
+	record RequestMerged<T>() implements RequestMerge<T, @Nullable T> {
+
+		private static final RequestMerged<Object> INSTANCE = new RequestMerged<>();
+
+		@Override
+		public RequestTypeId getRequestTypeId() {
+			return RequestTypeId.MERGED;
 		}
 	}
 }

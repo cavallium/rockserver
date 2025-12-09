@@ -15,6 +15,7 @@ import it.cavallium.rockserver.core.server.ThriftServer;
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.stream.Stream;
@@ -42,18 +43,24 @@ public class TestDB implements AutoCloseable {
 					yield this.db;
 				}
 				case GRPC -> {
-					var grpcServer = new GrpcServer(this.db, new InetSocketAddress("127.0.0.1", 8123));
+					int port = findFreePort();
+					var grpcServer = new GrpcServer(this.db, new InetSocketAddress("127.0.0.1", port));
 					grpcServer.start();
-					var grpcClient = GrpcConnection.forHostAndPort("test", new HostAndPort("127.0.0.1", 8123));
+					var grpcClient = GrpcConnection.forHostAndPort("test", new HostAndPort("127.0.0.1", port));
 
 					this.api = new ForceAPIType(type, grpcClient);
 					yield grpcServer;
 				}
 				case THRIFT -> {
-					var thriftServer = new ThriftServer(this.db, "127.0.0.1", 8123);
+					int port = findFreePort();
+					var thriftServer = new ThriftServer(this.db, "127.0.0.1", port);
 					thriftServer.start();
-					// todo: implement a thrift client
-					var thriftClient = this.db;
+					it.cavallium.rockserver.core.client.ThriftConnection thriftClient;
+					try {
+						thriftClient = new it.cavallium.rockserver.core.client.ThriftConnection("test", "127.0.0.1", port);
+					} catch (org.apache.thrift.TException e) {
+						throw new IOException(e);
+					}
 
 					this.api = new ForceAPIType(type, thriftClient);
 					yield thriftServer;
@@ -65,6 +72,13 @@ public class TestDB implements AutoCloseable {
 			} catch (IOException ex) {
 			}
 			throw new RuntimeException(e);
+		}
+	}
+
+	private static int findFreePort() throws IOException {
+		try (ServerSocket socket = new ServerSocket(0)) {
+			socket.setReuseAddress(true);
+			return socket.getLocalPort();
 		}
 	}
 

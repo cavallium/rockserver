@@ -5,9 +5,11 @@ import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 
-public record ColumnSchema(IntList keys, ObjectList<ColumnHashType> variableTailKeys, boolean hasValue) {
+import org.jetbrains.annotations.Nullable;
 
-	public static ColumnSchema of(IntList fixedKeys, ObjectList<ColumnHashType> variableTailKeys, boolean hasValue) {
+public record ColumnSchema(IntList keys, ObjectList<ColumnHashType> variableTailKeys, boolean hasValue, @Nullable String mergeOperatorName, @Nullable Long mergeOperatorVersion) {
+
+	public static ColumnSchema of(IntList fixedKeys, ObjectList<ColumnHashType> variableTailKeys, boolean hasValue, @Nullable String mergeOperatorName, @Nullable Long mergeOperatorVersion) {
 		IntList keys;
 		if (!variableTailKeys.isEmpty()) {
 			keys = new IntArrayList(fixedKeys.size() + variableTailKeys.size());
@@ -18,7 +20,11 @@ public record ColumnSchema(IntList keys, ObjectList<ColumnHashType> variableTail
 		} else {
 			keys = fixedKeys;
 		}
-		return new ColumnSchema(keys, variableTailKeys, hasValue);
+		return new ColumnSchema(keys, variableTailKeys, hasValue, mergeOperatorName, mergeOperatorVersion);
+	}
+
+	public static ColumnSchema of(IntList fixedKeys, ObjectList<ColumnHashType> variableTailKeys, boolean hasValue) {
+		return of(fixedKeys, variableTailKeys, hasValue, null, null);
 	}
 
 	public ColumnSchema {

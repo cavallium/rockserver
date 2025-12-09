@@ -175,6 +175,7 @@ public class ConfigPrinter {
 		}
 		return """
 				{
+				      "merge-operator-class": %s,
 				      "first-level-sst-size": %s,
 				      "max-last-level-sst-size": %s,
 				      "volumes": %s,
@@ -185,8 +186,9 @@ public class ConfigPrinter {
 				      "bloom-filter": %s,
 				      "block-size": "%s",
 				      "write-buffer-size": "%s"
-				    }\
-				""".formatted(
+			    }\
+			""".formatted(
+				o.mergeOperatorClass(),
 				o.firstLevelSstSize(),
 				o.maxLastLevelSstSize(),
 				volumesStr.toString(),
@@ -219,6 +221,7 @@ public class ConfigPrinter {
 		}
 		return """
 				{
+				      "merge-operator-class": %s,
 				      "name": "%s",
 				      "first-level-sst-size": %s,
 				      "max-last-level-sst-size": %s,
@@ -230,8 +233,9 @@ public class ConfigPrinter {
 				      "bloom-filter": %s,
 				      "block-size": "%s",
 				      "write-buffer-size": "%s"
-				    }\
-				""".formatted(o.name(),
+			    }\
+			""".formatted(o.name(),
+				o.mergeOperatorClass(),
 				o.firstLevelSstSize(),
 				o.maxLastLevelSstSize(),
 				volumesStr.toString(),

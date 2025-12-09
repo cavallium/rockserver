@@ -124,28 +124,47 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
 
     @Override
     public void writePending() throws it.cavallium.rockserver.core.common.RocksDBException {
-        try {
-            checkOwningHandle();
-            try (this) {
-                sstFileWriter.finish();
-                try (var ingestOptions = new IngestExternalFileOptions() {
-									{
-										RocksLeakDetector.register(this, "ingest-external-file-options", owningHandle_);
-									}
-                }) {
-                    ingestOptions
-                            .setIngestBehind(ingestBehind)
-                            .setAllowBlockingFlush(true)
-                            .setMoveFiles(true)
-                            .setAllowGlobalSeqNo(true)
-                            .setWriteGlobalSeqno(false)
-                            .setSnapshotConsistency(false);
-                    db.ingestExternalFile(col.cfh(), List.of(path.toString()), ingestOptions);
+        checkOwningHandle();
+        try (this) {
+            sstFileWriter.finish();
+            try {
+                ingest(false);
+            } catch (org.rocksdb.RocksDBException e) {
+                if (ingestBehind && isIngestBehindPlacementError(e)) {
+                    try {
+                        ingest(true);
+                        return;
+                    } catch (org.rocksdb.RocksDBException retryEx) {
+                        throw RocksDBException.of(RocksDBException.RocksDBErrorType.SST_WRITE_1, retryEx);
+                    }
                 }
+                throw RocksDBException.of(RocksDBException.RocksDBErrorType.SST_WRITE_1, e);
             }
         } catch (org.rocksdb.RocksDBException e) {
             throw RocksDBException.of(RocksDBException.RocksDBErrorType.SST_WRITE_1, e);
         }
+    }
+
+    private void ingest(boolean forceForeground) throws org.rocksdb.RocksDBException {
+        try (var ingestOptions = new IngestExternalFileOptions() {
+                            {
+                                RocksLeakDetector.register(this, "ingest-external-file-options", owningHandle_);
+                            }
+        }) {
+            ingestOptions
+                    .setIngestBehind(!forceForeground && ingestBehind)
+                    .setAllowBlockingFlush(true)
+                    .setMoveFiles(true)
+                    .setAllowGlobalSeqNo(true)
+                    .setWriteGlobalSeqno(false)
+                    .setSnapshotConsistency(false);
+            db.ingestExternalFile(col.cfh(), List.of(path.toString()), ingestOptions);
+        }
+    }
+
+    private boolean isIngestBehindPlacementError(org.rocksdb.RocksDBException e) {
+        var msg = e.getMessage();
+        return msg != null && msg.contains("ingest_behind") || msg != null && msg.contains("ingest behind");
     }
 
     private void checkOwningHandle() {

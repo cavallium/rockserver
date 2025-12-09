@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
+import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
 import java.io.InputStream;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
@@ -101,9 +102,12 @@ public class RocksDBLoader {
 
     public record LoadedDb(TransactionalDB db, @Nullable Path path, @NotNull Path definitiveDbPath,
                            DBOptions dbOptions, Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap,
+                           Map<String, @Nullable FFMAbstractMergeOperator> mergeOperators,
                            RocksDBObjects refs, @Nullable Cache cache) {}
 
-    public static ColumnFamilyOptions getColumnOptions(String name,
+    public record ColumnOptionsWithMerge(@NotNull ColumnFamilyOptions options, @Nullable FFMAbstractMergeOperator mergeOperator) {}
+
+    public static ColumnOptionsWithMerge getColumnOptions(String name,
         @Nullable Path path,
         @NotNull Path definitiveDbPath,
         GlobalDatabaseConfig globalDatabaseConfig,
@@ -128,6 +132,25 @@ public class RocksDBLoader {
             }
             if (columnOptions == null) {
                 columnOptions = globalDatabaseConfig.fallbackColumnOptions();
+            }
+
+            FFMAbstractMergeOperator mergeOperator = null;
+            var mergeOperatorClass = columnOptions.mergeOperatorClass();
+            if (mergeOperatorClass != null && !mergeOperatorClass.isBlank()) {
+                try {
+                    Class<?> clazz = Class.forName(mergeOperatorClass);
+                    if (!FFMAbstractMergeOperator.class.isAssignableFrom(clazz)) {
+                        throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                                "Merge operator class does not extend FFMAbstractMergeOperator: " + mergeOperatorClass);
+                    }
+                    @SuppressWarnings("unchecked")
+                    Class<? extends FFMAbstractMergeOperator> typed = (Class<? extends FFMAbstractMergeOperator>) clazz;
+                    mergeOperator = typed.getConstructor().newInstance();
+                    columnFamilyOptions.setMergeOperator(mergeOperator);
+                } catch (ReflectiveOperationException e) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                            "Failed to instantiate merge operator: " + mergeOperatorClass, e);
+                }
             }
 
             //noinspection ConstantConditions
@@ -337,7 +360,7 @@ public class RocksDBLoader {
                 if (value != null) optimizeForHits = value;
                 columnFamilyOptions.setOptimizeFiltersForHits(optimizeForHits);
             }
-            return columnFamilyOptions;
+            return new ColumnOptionsWithMerge(columnFamilyOptions, mergeOperator);
         } catch (GestaltException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, ex);
         }
@@ -569,6 +592,7 @@ public class RocksDBLoader {
         var inMemory = path == null;
         var rocksdbOptions = optionsWithCache.options();
         Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap = new HashMap<>();
+        Map<String, FFMAbstractMergeOperator> mergeOperators = new HashMap<>();
         try {
             List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
             var walPath = getWalDir(definitiveDbPath, databaseOptions);
@@ -621,7 +645,7 @@ public class RocksDBLoader {
                 String name = entry.getKey();
                 var columnFamilyOptions = getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
                         logger, refs, path == null, optionsWithCache.standardCache());
-                refs.add(columnFamilyOptions);
+                refs.add(columnFamilyOptions.options());
 
                 // Create base directories
                 List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, entry.getValue());
@@ -631,8 +655,9 @@ public class RocksDBLoader {
                     }
                 }
 
-                descriptors.add(new ColumnFamilyDescriptor(name.getBytes(StandardCharsets.US_ASCII), columnFamilyOptions));
-                definitiveColumnFamilyOptionsMap.put(name, columnFamilyOptions);
+                descriptors.add(new ColumnFamilyDescriptor(name.getBytes(StandardCharsets.US_ASCII), columnFamilyOptions.options()));
+                definitiveColumnFamilyOptionsMap.put(name, columnFamilyOptions.options());
+                mergeOperators.put(name, columnFamilyOptions.mergeOperator());
             }
 
             var handles = new ArrayList<ColumnFamilyHandle>();
@@ -672,7 +697,7 @@ public class RocksDBLoader {
 
             var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
             var dbTasks = new DatabaseTasks(db, inMemory, delayWalFlushConfig);
-            return new LoadedDb(TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks), path, definitiveDbPath, rocksdbOptions, definitiveColumnFamilyOptionsMap, refs, optionsWithCache.standardCache());
+            return new LoadedDb(TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks), path, definitiveDbPath, rocksdbOptions, definitiveColumnFamilyOptionsMap, mergeOperators, refs, optionsWithCache.standardCache());
         } catch (IOException | RocksDBException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {

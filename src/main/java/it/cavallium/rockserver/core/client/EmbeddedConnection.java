@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.client;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
+import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.InternalConnection;
@@ -72,6 +73,12 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 		return db.createColumn(name, schema);
 	}
 
+
+	@Override
+	public long uploadMergeOperator(String name, String className, byte[] jarData) throws RocksDBException {
+		return db.uploadMergeOperator(name, className, jarData);
+	}
+
 	@Override
 	public void deleteColumn(long columnId) throws RocksDBException {
 		db.deleteColumn(columnId);
@@ -109,6 +116,15 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public <T> T merge(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		return db.merge(transactionOrUpdateId, columnId, keys, value, requestType);
+	}
+
+	@Override
 	public <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
@@ -118,17 +134,40 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public <T> List<T> mergeMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			@NotNull List<@NotNull Buf> values,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		return db.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType);
+	}
+
+	@Override
 	public CompletableFuture<Void> putBatchAsync(long columnId,
-												 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
-												 @NotNull PutBatchMode mode) throws RocksDBException {
+											 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
+											 @NotNull PutBatchMode mode) throws RocksDBException {
 		return db.putBatchInternal(columnId, batchPublisher, mode);
 	}
 
 	@Override
+	public CompletableFuture<Void> mergeBatchAsync(long columnId,
+											@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+											@NotNull MergeBatchMode mode) throws RocksDBException {
+		return db.mergeBatchInternal(columnId, batchPublisher, mode);
+	}
+
+	@Override
 	public void putBatch(long columnId,
-						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
-						 @NotNull PutBatchMode mode) throws RocksDBException {
+					 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
+					 @NotNull PutBatchMode mode) throws RocksDBException {
 		db.putBatch(columnId, batchPublisher, mode);
+	}
+
+	@Override
+	public void mergeBatch(long columnId,
+				   @NotNull Publisher<@NotNull KVBatch> batchPublisher,
+				   @NotNull MergeBatchMode mode) throws RocksDBException {
+		db.mergeBatch(columnId, batchPublisher, mode);
 	}
 
 	@Override

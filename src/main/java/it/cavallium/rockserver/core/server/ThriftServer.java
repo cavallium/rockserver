@@ -3,16 +3,23 @@ package it.cavallium.rockserver.core.server;
 import static it.cavallium.rockserver.core.common.Utils.asByteBuffer;
 
 import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.api.Column;
 import it.cavallium.rockserver.core.common.api.ColumnHashType;
 import it.cavallium.rockserver.core.common.api.ColumnSchema;
 import it.cavallium.rockserver.core.common.api.Delta;
+import it.cavallium.rockserver.core.common.api.FirstAndLast;
+import it.cavallium.rockserver.core.common.api.KV;
+import it.cavallium.rockserver.core.common.api.MergeBatchMode;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
+import it.cavallium.rockserver.core.common.api.PutBatchMode;
 import it.cavallium.rockserver.core.common.api.RocksDB.Iface;
 import it.cavallium.rockserver.core.common.api.RocksDB.Processor;
+import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
@@ -20,7 +27,9 @@ import java.io.IOException;
 import it.cavallium.buffer.Buf;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 import org.apache.thrift.TException;
 import org.apache.thrift.server.TThreadedSelectorServer;
 import org.apache.thrift.transport.TNonblockingServerSocket;
@@ -28,6 +37,7 @@ import org.apache.thrift.transport.TTransportException;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 
 public class ThriftServer extends Server {
 
@@ -85,8 +95,26 @@ public class ThriftServer extends Server {
 	private static it.cavallium.rockserver.core.common.ColumnSchema columnSchemaToRecord(ColumnSchema schema) {
 		return it.cavallium.rockserver.core.common.ColumnSchema.of(new IntArrayList(schema.getFixedKeys()),
 				hashTypesToRecord(schema.getVariableTailKeys()),
-				schema.isHasValue()
+				schema.isHasValue(),
+				schema.isSetMergeOperatorName() ? schema.getMergeOperatorName() : null,
+				schema.isSetMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null
 		);
+	}
+
+	private static ColumnSchema mapSchemaToThrift(it.cavallium.rockserver.core.common.ColumnSchema schema) {
+		ColumnSchema s = new ColumnSchema();
+		s.setFixedKeys(new ArrayList<>(schema.keys()));
+		s.setVariableTailKeys(schema.variableTailKeys().stream()
+				.map(t -> ColumnHashType.valueOf(t.name()))
+				.collect(Collectors.toList()));
+		s.setHasValue(schema.hasValue());
+		if (schema.mergeOperatorName() != null) {
+			s.setMergeOperatorName(schema.mergeOperatorName());
+		}
+		if (schema.mergeOperatorVersion() != null) {
+			s.setMergeOperatorVersion(schema.mergeOperatorVersion());
+		}
+		return s;
 	}
 
 	private static ObjectArrayList<it.cavallium.rockserver.core.common.ColumnHashType> hashTypesToRecord(List<ColumnHashType> variableTailKeys) {
@@ -122,6 +150,20 @@ public class ThriftServer extends Server {
 		return multi.stream().map(ThriftServer::mapResult).toList();
 	}
 
+	private static KV mapKV(it.cavallium.rockserver.core.common.KV kv) {
+		List<ByteBuffer> keys = new ArrayList<>();
+		for (Buf b : kv.keys().keys()) {
+			keys.add(asByteBuffer(b));
+		}
+		return new KV(keys, asByteBuffer(kv.value()));
+	}
+
+	private static FirstAndLast mapFirstAndLast(it.cavallium.rockserver.core.common.FirstAndLast<it.cavallium.rockserver.core.common.KV> fl) {
+		return new FirstAndLast()
+				.setFirst(fl.first() != null ? mapKV(fl.first()) : null)
+				.setLast(fl.last() != null ? mapKV(fl.last()) : null);
+	}
+
 	private static class ThriftHandler implements Iface {
 
 		private final RocksDBConnection client;
@@ -130,35 +172,65 @@ public class ThriftServer extends Server {
 			this.client = client;
 		}
 
-
-		@Override
-		public long openTransaction(long timeoutMs) {
-			return client.getSyncApi().openTransaction(timeoutMs);
+		private RocksDBThriftException mapException(it.cavallium.rockserver.core.common.RocksDBException e) {
+			return new RocksDBThriftException(
+					it.cavallium.rockserver.core.common.api.RocksDBErrorType.valueOf(e.getErrorUniqueId().name()),
+					e.getMessage()
+			);
 		}
 
 		@Override
-		public boolean closeTransaction(long transactionId, boolean commit) throws TException {
-			return client.getSyncApi().closeTransaction(transactionId, commit);
+		public long openTransaction(long timeoutMs) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().openTransaction(timeoutMs);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
-		public void closeFailedUpdate(long updateId) {
-			client.getSyncApi().closeFailedUpdate(updateId);
+		public boolean closeTransaction(long transactionId, boolean commit) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().closeTransaction(transactionId, commit);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
-		public long createColumn(String name, ColumnSchema schema) {
-			return client.getSyncApi().createColumn(name, columnSchemaToRecord(schema));
+		public void closeFailedUpdate(long updateId) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().closeFailedUpdate(updateId);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
-		public void deleteColumn(long columnId) {
-			client.getSyncApi().deleteColumn(columnId);
+		public long createColumn(String name, ColumnSchema schema) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().createColumn(name, columnSchemaToRecord(schema));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
-		public long getColumnId(String name) {
-			return client.getSyncApi().getColumnId(name);
+		public void deleteColumn(long columnId) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().deleteColumn(columnId);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public long getColumnId(String name) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().getColumnId(name);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
@@ -166,77 +238,117 @@ public class ThriftServer extends Server {
 				long columnId,
 				List<ByteBuffer> keys,
 				ByteBuffer value) {
-			this.put(transactionOrUpdateId, columnId, keys, value);
+			try {
+				this.put(transactionOrUpdateId, columnId, keys, value);
+			} catch (Exception e) {
+				// Oneway cannot throw exception
+				LOG.error("Error in putFast", e);
+			}
 		}
 
 		@Override
 		public void put(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) {
-			client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.none());
+				ByteBuffer value) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.none());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public void putMulti(long transactionOrUpdateId,
 				long columnId,
 				List<List<ByteBuffer>> keysMulti,
-				List<ByteBuffer> valueMulti) {
-			client.getSyncApi().putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(
-					valueMulti), RequestType.none());
+				List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.none());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public OptionalBinary putGetPrevious(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) {
-			return ThriftServer.mapResult(client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.previous()));
+				ByteBuffer value) throws RocksDBThriftException {
+			try {
+				return ThriftServer.mapResult(client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.previous()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public Delta putGetDelta(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) {
-			return ThriftServer.mapResult(client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.delta()));
+				ByteBuffer value) throws RocksDBThriftException {
+			try {
+				return ThriftServer.mapResult(client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.delta()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public boolean putGetChanged(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) {
-			return client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.changed());
+				ByteBuffer value) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.changed());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public boolean putGetPreviousPresence(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) {
-			return client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.previousPresence());
+				ByteBuffer value) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.previousPresence());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public OptionalBinary get(long transactionOrUpdateId,
 				long columnId,
-				List<ByteBuffer> keys) {
-			return ThriftServer.mapResult(client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.current()));
+				List<ByteBuffer> keys) throws RocksDBThriftException {
+			try {
+				return ThriftServer.mapResult(client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.current()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public UpdateBegin getForUpdate(long transactionOrUpdateId,
 				long columnId,
-				List<ByteBuffer> keys) {
-			return mapResult(client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.forUpdate()));
+				List<ByteBuffer> keys) throws RocksDBThriftException {
+			try {
+				return mapResult(client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.forUpdate()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public boolean exists(long transactionOrUpdateId,
 				long columnId,
-				List<ByteBuffer> keys) {
-			return client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.exists());
+				List<ByteBuffer> keys) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.exists());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
@@ -245,39 +357,250 @@ public class ThriftServer extends Server {
 				List<ByteBuffer> startKeysInclusive,
 				List<ByteBuffer> endKeysExclusive,
 				boolean reverse,
-				long timeoutMs) {
-			return client.getSyncApi().openIterator(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(
-					endKeysExclusive), reverse, timeoutMs);
+				long timeoutMs) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().openIterator(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, timeoutMs);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
-		public void closeIterator(long iteratorId) {
-			client.getSyncApi().closeIterator(iteratorId);
+		public void closeIterator(long iteratorId) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().closeIterator(iteratorId);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
-		public void seekTo(long iterationId, List<ByteBuffer> keys) {
-			client.getSyncApi().seekTo(iterationId, keysToRecord(keys));
+		public void seekTo(long iterationId, List<ByteBuffer> keys) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().seekTo(iterationId, keysToRecord(keys));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
-		public void subsequent(long iterationId, long skipCount, long takeCount) {
-			client.getSyncApi().subsequent(iterationId, skipCount, takeCount, RequestType.none());
+		public void subsequent(long iterationId, long skipCount, long takeCount) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().subsequent(iterationId, skipCount, takeCount, RequestType.none());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public boolean subsequentExists(long iterationId,
 				long skipCount,
-				long takeCount) {
-			return client.getSyncApi().subsequent(iterationId, skipCount, takeCount, RequestType.exists());
+				long takeCount) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().subsequent(iterationId, skipCount, takeCount, RequestType.exists());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
 
 		@Override
 		public List<OptionalBinary> subsequentMultiGet(long iterationId,
 				long skipCount,
-				long takeCount) {
-			return mapResult(client.getSyncApi().subsequent(iterationId, skipCount, takeCount, RequestType.multi()));
+				long takeCount) throws RocksDBThriftException {
+			try {
+				return mapResult(client.getSyncApi().subsequent(iterationId, skipCount, takeCount, RequestType.multi()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
 		}
+
+		@Override
+		public void putBatch(long columnId, List<KV> data, PutBatchMode mode) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().putBatch(columnId, kvToBatch(data), mapPutBatchMode(mode));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void merge(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys, ByteBuffer value) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().merge(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.none());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void mergeMulti(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().mergeMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.none());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void mergeBatch(long columnId, List<KV> data, MergeBatchMode mode) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().mergeBatch(columnId, kvToBatch(data), mapMergeBatchMode(mode));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public OptionalBinary mergeGetMerged(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys, ByteBuffer value) throws RocksDBThriftException {
+			try {
+				return ThriftServer.mapResult(client.getSyncApi().merge(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.merged()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<OptionalBinary> mergeMultiGetMerged(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			try {
+				return ThriftServer.mapResult(client.getSyncApi().mergeMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.merged()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public long uploadMergeOperator(String operatorName, String className, ByteBuffer jarPayload) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().uploadMergeOperator(operatorName, className, Utils.toByteArray(Utils.fromByteBuffer(jarPayload)));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public FirstAndLast reduceRangeFirstAndLast(long transactionId, long columnId, List<ByteBuffer> startKeysInclusive, List<ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException {
+			try {
+				return mapFirstAndLast(client.getSyncApi().reduceRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.firstAndLast(), timeoutMs));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public long reduceRangeEntriesCount(long transactionId, long columnId, List<ByteBuffer> startKeysInclusive, List<ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().reduceRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.entriesCount(), timeoutMs);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<KV> getAllInRange(long transactionId, long columnId, List<ByteBuffer> startKeysInclusive, List<ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().getRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.allInRange(), timeoutMs)
+						.map(ThriftServer::mapKV)
+						.collect(Collectors.toList());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<OptionalBinary> putMultiGetPrevious(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			try {
+				return mapResult(client.getSyncApi().putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.previous()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<Delta> putMultiGetDelta(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.delta())
+						.stream().map(ThriftServer::mapResult).collect(Collectors.toList());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<Boolean> putMultiGetChanged(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.changed());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<Boolean> putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.previousPresence());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void flush() throws RocksDBThriftException {
+			try {
+				client.getSyncApi().flush();
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void compact() throws RocksDBThriftException {
+			try {
+				client.getSyncApi().compact();
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<Column> getAllColumnDefinitions() throws RocksDBThriftException {
+			try {
+				var map = client.getSyncApi().getAllColumnDefinitions();
+				List<Column> columns = new ArrayList<>();
+				map.forEach((name, schema) -> columns.add(new Column(name, mapSchemaToThrift(schema))));
+				return columns;
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+	}
+
+	private static Flux<it.cavallium.rockserver.core.common.KVBatch> kvToBatch(List<KV> data) {
+		if (data == null || data.isEmpty()) return Flux.empty();
+		List<Keys> keysList = new ArrayList<>(data.size());
+		List<Buf> valuesList = new ArrayList<>(data.size());
+		for (KV kv : data) {
+			keysList.add(keysToRecord(kv.getKeys()));
+			valuesList.add(keyToRecord(kv.bufferForValue()));
+		}
+		return Flux.just(new KVBatchRef(keysList, valuesList));
+	}
+
+	private static it.cavallium.rockserver.core.common.MergeBatchMode mapMergeBatchMode(MergeBatchMode mode) {
+		return switch (mode) {
+			case MERGE_WRITE_BATCH -> it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH;
+			case MERGE_WRITE_BATCH_NO_WAL -> it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL;
+			case MERGE_SST_INGESTION -> it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_SST_INGESTION;
+			case MERGE_SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_SST_INGEST_BEHIND;
+		};
+	}
+
+	private static it.cavallium.rockserver.core.common.PutBatchMode mapPutBatchMode(PutBatchMode mode) {
+		return switch (mode) {
+			case WRITE_BATCH -> it.cavallium.rockserver.core.common.PutBatchMode.WRITE_BATCH;
+			case WRITE_BATCH_NO_WAL -> it.cavallium.rockserver.core.common.PutBatchMode.WRITE_BATCH_NO_WAL;
+			case SST_INGESTION -> it.cavallium.rockserver.core.common.PutBatchMode.SST_INGESTION;
+			case SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.PutBatchMode.SST_INGEST_BEHIND;
+		};
 	}
 
 	@Override

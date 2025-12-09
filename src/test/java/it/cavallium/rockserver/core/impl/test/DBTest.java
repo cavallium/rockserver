@@ -3,31 +3,33 @@ package it.cavallium.rockserver.core.impl.test;
 import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
 import static it.cavallium.rockserver.core.common.Utils.toBufSimple;
 
+import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
+import it.cavallium.rockserver.core.impl.MyStringAppendOperator;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.io.IOException;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.foreign.Arena;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
-
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.*;
-
-import java.io.IOException;
-import it.cavallium.buffer.Buf;
-import java.util.stream.Collectors;
-
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
+import reactor.core.publisher.Flux;
 
 @TestMethodOrder(MethodOrderer.MethodName.class)
 abstract class DBTest {
@@ -41,6 +43,7 @@ abstract class DBTest {
 	protected Keys key2;
 	protected Buf value1;
 	protected Buf value2;
+	private Path configFile;
 
 	protected enum ConnectionMethod {
 		EMBEDDED,
@@ -79,8 +82,19 @@ abstract class DBTest {
 		if (System.getProperty("rockserver.core.print-config", null) == null) {
 			System.setProperty("rockserver.core.print-config", "false");
 		}
+		configFile = Files.createTempFile("dbtest-merge", ".conf");
+		Files.writeString(configFile, """
+database: {
+  global: {
+    ingest-behind: true
+    fallback-column-options: {
+      merge-operator-class: "it.cavallium.rockserver.core.impl.MyStringAppendOperator"
+    }
+  }
+}
+""");
 		arena = Arena.ofShared();
-		db = new EmbeddedConnection(null, "test", null);
+		db = new EmbeddedConnection(null, "test", configFile);
 		createStandardColumn();
 
 		bigValue = getBigValue();
@@ -210,6 +224,7 @@ abstract class DBTest {
 		db.deleteColumn(colId);
 		db.close();
 		arena.close();
+		Files.deleteIfExists(configFile);
 	}
 
 	@SuppressWarnings("DataFlowIssue")
@@ -594,6 +609,136 @@ abstract class DBTest {
 
 			}
 		}
+	}
+
+	@TestAllImplementations
+	void mergeSingleMergedValue(String name, ConnectionConfig connection) {
+		if (!getHasValues()) {
+			return;
+		}
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			var key = getKey1();
+			Buf merged;
+
+			merged = api.merge(0, colId, key, value1, RequestType.merged());
+			assertSegmentEquals(value1, merged);
+			assertSegmentEquals(value1, api.get(0, colId, key, RequestType.current()));
+
+			merged = api.merge(0, colId, key, value2, RequestType.merged());
+			var expected = mergeExpect(value1, value2);
+			assertSegmentEquals(expected, merged);
+			assertSegmentEquals(expected, api.get(0, colId, key, RequestType.current()));
+
+			Assertions.assertNull(api.merge(0, colId, key, value1, RequestType.none()));
+			var expected3 = mergeExpect(expected, value1);
+			assertSegmentEquals(expected3, api.get(0, colId, key, RequestType.current()));
+		}
+	}
+
+	@TestAllImplementations
+	void mergeMultiReturnsMerged(String name, ConnectionConfig connection) {
+		if (!getHasValues()) {
+			return;
+		}
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			var keys = List.of(getKey1(), getKey2());
+			var merged = api.mergeMulti(0, colId, keys, List.of(value1, value2), RequestType.merged());
+			Assertions.assertEquals(List.of(value1, value2), merged);
+
+			var more = List.of(bigValue, value1);
+			var merged2 = api.mergeMulti(0, colId, keys, more, RequestType.merged());
+			Assertions.assertEquals(2, merged2.size());
+			assertSegmentEquals(mergeExpect(value1, bigValue), merged2.getFirst());
+			assertSegmentEquals(mergeExpect(value2, value1), merged2.getLast());
+		}
+	}
+
+	@TestAllImplementations
+	void mergeBatchAppends(String name, ConnectionConfig connection) {
+		if (!getHasValues() || !getSchemaVarKeys().isEmpty()) {
+			return; // mergeBatch not supported for bucketed columns
+		}
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			var keys = List.of(getKey1(), getKey2());
+			var batch1 = new KVBatchRef(keys, List.of(value1, value2));
+			api.mergeBatch(colId, Flux.just(batch1), MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL);
+
+			var batch2 = new KVBatchRef(keys, List.of(bigValue, value1));
+			api.mergeBatch(colId, Flux.just(batch2), MergeBatchMode.MERGE_WRITE_BATCH);
+
+			assertSegmentEquals(mergeExpect(value1, bigValue), api.get(0, colId, getKey1(), RequestType.current()));
+			assertSegmentEquals(mergeExpect(value2, value1), api.get(0, colId, getKey2(), RequestType.current()));
+		}
+	}
+
+	@TestAllImplementations
+	void mergeBatchSstModes(String name, ConnectionConfig connection) {
+		// Requires value schema and non-bucketed column
+		if (!getHasValues()) {
+			return;
+		}
+		var nonBucketSchema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
+		createColumn(nonBucketSchema);
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			var keyA = new Keys(toBufSimple(21));
+			var keyB = new Keys(toBufSimple(22));
+			var batch1 = new KVBatchRef(List.of(keyA, keyB), List.of(toBufSimple(1), toBufSimple(2)));
+			api.mergeBatch(colId, Flux.just(batch1), MergeBatchMode.MERGE_SST_INGESTION);
+
+			var batch2 = new KVBatchRef(List.of(keyA, keyB), List.of(toBufSimple(3), toBufSimple(4)));
+			api.mergeBatch(colId, Flux.just(batch2), MergeBatchMode.MERGE_SST_INGEST_BEHIND);
+
+			assertSegmentEquals(mergeExpect(toBufSimple(1), toBufSimple(3)), api.get(0, colId, keyA, RequestType.current()));
+			assertSegmentEquals(mergeExpect(toBufSimple(2), toBufSimple(4)), api.get(0, colId, keyB, RequestType.current()));
+		}
+	}
+
+	@TestAllImplementations
+	void mergeBatchBucketed(String name, ConnectionConfig connection) {
+		if (!getHasValues() || getSchemaVarKeys().isEmpty()) {
+			return;
+		}
+		// Ensure bucketed column
+		createColumn(getSchema());
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			var keys = List.of(getKey1(), getCollidingKey1());
+			var batch1 = new KVBatchRef(keys, List.of(value1, value2));
+			api.mergeBatch(colId, Flux.just(batch1), MergeBatchMode.MERGE_WRITE_BATCH);
+
+			var batch2 = new KVBatchRef(keys, List.of(bigValue, value1));
+			api.mergeBatch(colId, Flux.just(batch2), MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL);
+
+			assertSegmentEquals(mergeExpect(value1, bigValue), api.get(0, colId, getKey1(), RequestType.current()));
+			assertSegmentEquals(mergeExpect(value2, value1), api.get(0, colId, getCollidingKey1(), RequestType.current()));
+		}
+	}
+
+	@TestAllImplementations
+	void mergeBucketedMergedValue(String name, ConnectionConfig connection) {
+		if (getSchemaVarKeys().isEmpty() || !getHasValues()) {
+			return;
+		}
+		createColumn(ColumnSchema.of(getSchemaFixedKeys(), getSchemaVarKeys(), getHasValues()));
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			var key = getKey1();
+			Buf merged = api.merge(0, colId, key, value1, RequestType.merged());
+			assertSegmentEquals(value1, merged);
+
+			merged = api.merge(0, colId, key, value2, RequestType.merged());
+			assertSegmentEquals(mergeExpect(value1, value2), merged);
+		}
+	}
+
+	private Buf mergeExpect(@Nullable Buf existing, Buf operand) {
+		var op = new MyStringAppendOperator();
+		byte[] res = op.merge(null, existing != null ? existing.asArray() : null, List.of(operand.asArray()));
+		return Buf.wrap(res);
 	}
 
 	@TestAllImplementations

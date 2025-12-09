@@ -31,6 +31,8 @@ import it.cavallium.rockserver.core.common.RequestType.RequestMulti;
 import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
+import it.cavallium.rockserver.core.common.MergeBatchMode;
+import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RequestType.RequestReduceRange;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -193,12 +195,22 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
-	public CompletableFuture<Long> createColumnAsync(String name, @NotNull ColumnSchema schema) throws RocksDBException {
-		var request = CreateColumnRequest.newBuilder()
+	public CompletableFuture<Long> createColumnAsync(String name,
+													 @NotNull ColumnSchema schema) throws RocksDBException {
+		var requestBuilder = CreateColumnRequest.newBuilder()
 				.setName(name)
-				.setSchema(mapColumnSchema(schema))
-				.build();
+				.setSchema(mapColumnSchema(schema));
+		var request = requestBuilder.build();
 		return toResponse(this.futureStub.createColumn(request), CreateColumnResponse::getColumnId);
+	}
+
+	@Override
+	public CompletableFuture<Long> uploadMergeOperatorAsync(String name, String className, byte[] jarData) {
+		return toResponse(futureStub.uploadMergeOperator(UploadMergeOperatorRequest.newBuilder()
+				.setOperatorName(name)
+				.setClassName(className)
+				.setJarPayload(ByteString.copyFrom(jarData))
+				.build()), UploadMergeOperatorResponse::getVersion);
 	}
 
 	@Override
@@ -247,6 +259,29 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
+	public <T> CompletableFuture<T> mergeAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		var request = MergeRequest.newBuilder()
+				.setTransactionOrUpdateId(transactionOrUpdateId)
+				.setColumnId(columnId)
+				.setData(mapKV(keys, value))
+				.build();
+		if (requestType == null) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Null request type");
+		}
+		return (CompletableFuture<T>) switch (requestType) {
+			case RequestNothing<?> _ -> toResponse(this.futureStub.merge(request), _ -> null);
+			case RequestType.RequestMerged<?> _ ->
+					toResponse(this.futureStub.mergeGetMerged(request), x ->
+							x.hasMerged() ? mapByteString(x.getMerged()) : null);
+		};
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
 	public <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<@NotNull Keys> allKeys,
@@ -280,28 +315,73 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return (CompletableFuture<List<T>>) (switch (requestType) {
 			case RequestNothing<?> _ ->
 					toResponse(this.reactiveStub.putMulti(inputRequests)
-							.ignoreElement()
-							.toFuture());
+						.ignoreElement()
+						.toFuture());
 			case RequestPrevious<?> _ ->
 					toResponse(this.reactiveStub.putMultiGetPrevious(inputRequests)
-							.collect(() -> new ArrayList<@Nullable Buf>(),
-									(list, value) -> list.add(GrpcConnection.mapPrevious(value)))
-							.toFuture());
+						.collect(() -> new ArrayList<@Nullable Buf>(),
+								(list, value) -> list.add(GrpcConnection.mapPrevious(value)))
+						.toFuture());
 			case RequestDelta<?> _ ->
 					toResponse(this.reactiveStub.putMultiGetDelta(inputRequests)
-							.map(GrpcConnection::mapDelta)
-							.collectList()
-							.toFuture());
+						.map(GrpcConnection::mapDelta)
+						.collectList()
+						.toFuture());
 			case RequestChanged<?> _ ->
 					toResponse(this.reactiveStub.putMultiGetChanged(inputRequests)
-							.map(Changed::getChanged)
-							.collectList()
-							.toFuture());
+						.map(Changed::getChanged)
+						.collectList()
+						.toFuture());
 			case RequestPreviousPresence<?> _ ->
 					toResponse(this.reactiveStub.putMultiGetPreviousPresence(inputRequests)
-							.map(PreviousPresence::getPresent)
-							.collectList()
-							.toFuture());
+						.map(PreviousPresence::getPresent)
+						.collectList()
+						.toFuture());
+		});
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> CompletableFuture<List<T>> mergeMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<@NotNull Keys> allKeys,
+			@NotNull List<@NotNull Buf> allValues,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		var count = allKeys.size();
+		if (count != allValues.size()) {
+			throw new IllegalArgumentException("Keys length is different than values length! "
+					+ count + " != " + allValues.size());
+		}
+
+		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L) {
+			return mergeBatchAsync(columnId, Flux.just(new KVBatchRef(allKeys, allValues)), it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH)
+					.thenApply(_ -> List.of());
+		}
+
+		var initialRequest = MergeMultiRequest.newBuilder()
+				.setInitialRequest(MergeMultiInitialRequest.newBuilder()
+						.setTransactionOrUpdateId(transactionOrUpdateId)
+						.setColumnId(columnId)
+						.build())
+				.build();
+
+		Mono<MergeMultiRequest> initialRequestMono = Mono.just(initialRequest);
+		Flux<MergeMultiRequest> dataRequestsFlux = Flux.fromIterable(() -> GrpcConnection
+				.map(allKeys.iterator(), allValues.iterator(), (keys, value) -> MergeMultiRequest.newBuilder()
+						.setData(mapKV(keys, value))
+						.build()));
+		var inputRequests = initialRequestMono.concatWith(dataRequestsFlux);
+
+		return (CompletableFuture<List<T>>) (switch (requestType) {
+			case RequestNothing<?> _ ->
+					toResponse(this.reactiveStub.mergeMulti(inputRequests)
+						.ignoreElement()
+						.toFuture());
+			case RequestType.RequestMerged<?> _ ->
+					toResponse(this.reactiveStub.mergeMultiGetMerged(inputRequests)
+						.map(v -> v.hasMerged() ? mapByteString(v.getMerged()) : null)
+						.collectList()
+						.toFuture());
 		});
 	}
 
@@ -327,6 +407,30 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		});
 		var inputFlux = initialRequest.concatWith(nextRequests);
 		return toResponse(reactiveStub.putBatch(inputFlux).then().toFuture());
+	}
+
+	@Override
+	public CompletableFuture<Void> mergeBatchAsync(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull it.cavallium.rockserver.core.common.MergeBatchMode mode) throws RocksDBException {
+		var initialRequest = Mono.just(MergeBatchRequest.newBuilder()
+				.setInitialRequest(MergeBatchInitialRequest.newBuilder()
+						.setColumnId(columnId)
+						.setMode(switch (mode) {
+							case MERGE_WRITE_BATCH -> it.cavallium.rockserver.core.common.api.proto.MergeBatchMode.MERGE_WRITE_BATCH;
+							case MERGE_WRITE_BATCH_NO_WAL -> it.cavallium.rockserver.core.common.api.proto.MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL;
+							case MERGE_SST_INGESTION -> it.cavallium.rockserver.core.common.api.proto.MergeBatchMode.MERGE_SST_INGESTION;
+							case MERGE_SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.proto.MergeBatchMode.MERGE_SST_INGEST_BEHIND;
+						})
+						.build())
+				.build());
+		var nextRequests = Flux.from(batchPublisher).map(batch -> {
+			var request = MergeBatchRequest.newBuilder();
+			request.setData(mapKVBatch(batch));
+			return request.build();
+		});
+		var inputFlux = initialRequest.concatWith(nextRequests);
+		return toResponse(reactiveStub.mergeBatch(inputFlux).then().toFuture());
 	}
 
 	@SuppressWarnings("unchecked")
@@ -564,17 +668,25 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	private static it.cavallium.rockserver.core.common.api.proto.ColumnSchema mapColumnSchema(@NotNull ColumnSchema schema) {
-		return it.cavallium.rockserver.core.common.api.proto.ColumnSchema.newBuilder()
+		var builder = it.cavallium.rockserver.core.common.api.proto.ColumnSchema.newBuilder()
 				.addAllFixedKeys(mapFixedKeys(schema))
 				.addAllVariableTailKeys(mapVariableTailKeys(schema))
-				.setHasValue(schema.hasValue())
-				.build();
+				.setHasValue(schema.hasValue());
+		if (schema.mergeOperatorName() != null) {
+			builder.setMergeOperatorName(schema.mergeOperatorName());
+		}
+		if (schema.mergeOperatorVersion() != null) {
+			builder.setMergeOperatorVersion(schema.mergeOperatorVersion());
+		}
+		return builder.build();
 	}
 
 	private static ColumnSchema unmapColumnSchema(it.cavallium.rockserver.core.common.api.proto.ColumnSchema schema) {
 		return ColumnSchema.of(unmapKeysLength(schema.getFixedKeysCount(), schema::getFixedKeys),
 				unmapVariableTailKeys(schema.getVariableTailKeysCount(), schema::getVariableTailKeys),
-				schema.getHasValue()
+				schema.getHasValue(),
+				schema.hasMergeOperatorName() ? schema.getMergeOperatorName() : null,
+				schema.hasMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null
 		);
 	}
 	private static IntList unmapKeysLength(int count, Int2IntFunction keyGetterAt) {

@@ -2,6 +2,25 @@ syntax = "proto3";
 
 import "google/protobuf/empty.proto";
 
+message UploadMergeOperatorRequest {
+  // Name used to reference the operator when creating columns
+  string operatorName = 1;
+  // Fully qualified class name implementing FFMAbstractMergeOperator
+  string className = 2;
+  // Jar payload containing the operator class and its dependencies
+  bytes jarPayload = 3;
+}
+
+message UploadMergeOperatorResponse {
+  // Incrementing version for this operatorName
+  int64 version = 1;
+}
+
+message MergeOperatorReference {
+  string operatorName = 1;
+  int64 version = 2;
+}
+
 option java_multiple_files = true;
 package it.cavallium.rockserver.core.common.api.proto;
 
@@ -9,6 +28,8 @@ message ColumnSchema {
   repeated int32 fixedKeys = 1;
   repeated ColumnHashType variableTailKeys = 2;
   bool hasValue = 3;
+  optional string mergeOperatorName = 4;
+  optional int64 mergeOperatorVersion = 5;
 }
 
 message Column {
@@ -33,6 +54,7 @@ enum Operation {
   MULTI = 6;
   CHANGED = 7;
   PREVIOUS_PRESENCE = 8;
+  MERGED = 9;
 }
 
 enum PutBatchMode {
@@ -42,6 +64,13 @@ enum PutBatchMode {
   SST_INGEST_BEHIND = 3;
 }
 
+enum MergeBatchMode {
+  MERGE_WRITE_BATCH = 0;
+  MERGE_WRITE_BATCH_NO_WAL = 1;
+  MERGE_SST_INGESTION = 2;
+  MERGE_SST_INGEST_BEHIND = 3;
+}
+
 message Delta {
   optional bytes previous = 1;
   optional bytes current = 2;
@@ -49,6 +78,7 @@ message Delta {
 message Previous {optional bytes previous = 1;}
 message Changed {bool changed = 1;}
 message PreviousPresence {bool present = 1;}
+message Merged {optional bytes merged = 1;}
 
 message UpdateBegin {
   optional bytes previous = 1;
@@ -82,12 +112,20 @@ message GetColumnIdResponse {int64 columnId = 1;}
 
 message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
 
+message MergeRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
+
 message PutBatchInitialRequest {int64 columnId = 1; PutBatchMode mode = 2;}
 message PutBatchRequest {oneof putBatchRequestType {PutBatchInitialRequest initialRequest = 1;KVBatch data = 2;}}
+
+message MergeBatchInitialRequest {int64 columnId = 1; MergeBatchMode mode = 2;}
+message MergeBatchRequest {oneof mergeBatchRequestType {MergeBatchInitialRequest initialRequest = 1;KVBatch data = 2;}}
 
 message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
 message PutMultiRequest {oneof putMultiRequestType {PutMultiInitialRequest initialRequest = 1;KV data = 2;}}
 message PutMultiListRequest {PutMultiInitialRequest initialRequest = 1; repeated KV data = 2;}
+
+message MergeMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
+message MergeMultiRequest {oneof mergeMultiRequestType {MergeMultiInitialRequest initialRequest = 1;KV data = 2;}}
 
 message GetRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3;}
 message GetResponse {optional bytes value = 1;}
@@ -131,6 +169,11 @@ service RocksDBService {
   rpc putMultiGetChanged(stream PutMultiRequest) returns (stream Changed);
   rpc putGetPreviousPresence(PutRequest) returns (PreviousPresence);
   rpc putMultiGetPreviousPresence(stream PutMultiRequest) returns (stream PreviousPresence);
+  rpc merge(MergeRequest) returns (google.protobuf.Empty);
+  rpc mergeBatch(stream MergeBatchRequest) returns (google.protobuf.Empty);
+  rpc mergeMulti(stream MergeMultiRequest) returns (google.protobuf.Empty);
+  rpc mergeGetMerged(MergeRequest) returns (Merged);
+  rpc mergeMultiGetMerged(stream MergeMultiRequest) returns (stream Merged);
   rpc get(GetRequest) returns (GetResponse);
   rpc getForUpdate(GetRequest) returns (UpdateBegin);
   rpc exists(GetRequest) returns (PreviousPresence);
@@ -146,4 +189,5 @@ service RocksDBService {
   rpc flush(FlushRequest) returns (google.protobuf.Empty);
   rpc compact(CompactRequest) returns (google.protobuf.Empty);
   rpc getAllColumnDefinitions(GetAllColumnDefinitionsRequest) returns (GetAllColumnDefinitionsResponse);
+  rpc uploadMergeOperator(UploadMergeOperatorRequest) returns (UploadMergeOperatorResponse);
 }

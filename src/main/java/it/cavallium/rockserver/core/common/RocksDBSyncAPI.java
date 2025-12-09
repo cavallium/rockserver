@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.common;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
+import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
@@ -19,8 +20,12 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Put;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Merge;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.MergeMulti;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.UploadMergeOperator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
 import java.util.List;
 import java.util.Map;
@@ -51,6 +56,11 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new CreateColumn(name, schema));
 	}
 
+	/** See: {@link UploadMergeOperator}. */
+	default long uploadMergeOperator(String name, String className, byte[] jarData) throws RocksDBException {
+		return requestSync(new UploadMergeOperator(name, className, jarData));
+	}
+
 	/** See: {@link DeleteColumn}. */
 	default void deleteColumn(long columnId) throws RocksDBException {
 		requestSync(new DeleteColumn(columnId));
@@ -70,6 +80,15 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new Put<>(transactionOrUpdateId, columnId, keys, value, requestType));
 	}
 
+	/** See: {@link Merge}. */
+	default <T> T merge(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			@NotNull Buf value,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		return requestSync(new Merge<>(transactionOrUpdateId, columnId, keys, value, requestType));
+	}
+
 	/** See: {@link PutMulti}. */
 	default <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
@@ -79,11 +98,27 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new PutMulti<>(transactionOrUpdateId, columnId, keys, values, requestType));
 	}
 
+	/** See: {@link MergeMulti}. */
+	default <T> List<T> mergeMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			@NotNull List<@NotNull Buf> values,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		return requestSync(new MergeMulti<>(transactionOrUpdateId, columnId, keys, values, requestType));
+	}
+
 	/** See: {@link PutBatch}. */
 	default void putBatch(long columnId,
-						  @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
-						  @NotNull PutBatchMode mode) throws RocksDBException {
+					  @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+					  @NotNull PutBatchMode mode) throws RocksDBException {
 		requestSync(new PutBatch(columnId, batchPublisher, mode));
+	}
+
+	/** See: {@link MergeBatch}. */
+	default void mergeBatch(long columnId,
+				   @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+				   @NotNull MergeBatchMode mode) throws RocksDBException {
+		requestSync(new MergeBatch(columnId, batchPublisher, mode));
 	}
 
 	/** See: {@link Get}. */
