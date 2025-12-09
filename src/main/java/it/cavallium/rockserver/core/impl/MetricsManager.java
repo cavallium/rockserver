@@ -22,6 +22,7 @@ import io.micrometer.influx.InfluxMeterRegistry;
 import io.micrometer.jmx.JmxConfig;
 import io.micrometer.jmx.JmxMeterRegistry;
 import io.vertx.core.MultiMap;
+import io.vertx.core.VertxOptions;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpMethod;
@@ -49,7 +50,8 @@ public class MetricsManager implements AutoCloseable {
 	private final JvmHeapPressureMetrics heapPressureMetrics;
 	private final CompositeMeterRegistry compositeRegistry;
 	private final long startTime;
-	private HttpClient httpClient;
+ private HttpClient httpClient;
+ private Vertx vertx;
 
 	public MetricsManager(DatabaseConfig config) {
 		try {
@@ -79,18 +81,20 @@ public class MetricsManager implements AutoCloseable {
 					LOG.error("Failed to initialize jmx metrics");
 				}
 			}
-			if (config.metrics().influx().enabled()) {
-				try {
-					preloadClasses();
+   if (config.metrics().influx().enabled()) {
+                try {
+                    preloadClasses();
 
-					this.httpClient = Vertx.vertx().createHttpClient(new HttpClientOptions()
-							.setTrustAll(config.metrics().influx().allowInsecureCertificates())
-							.setVerifyHost(!config.metrics().influx().allowInsecureCertificates())
-							.setDecompressionSupported(true)
-							.setProtocolVersion(HttpVersion.HTTP_2)
-							.setUseAlpn(true)
-							.setConnectTimeout(1000)
-							.setReadIdleTimeout(10000));
+                    // Create a dedicated Vertx instance for metrics HTTP client
+                    this.vertx = Vertx.vertx(new VertxOptions().setUseDaemonThread(true));
+                    this.httpClient = vertx.createHttpClient(new HttpClientOptions()
+                            .setTrustAll(config.metrics().influx().allowInsecureCertificates())
+                            .setVerifyHost(!config.metrics().influx().allowInsecureCertificates())
+                            .setDecompressionSupported(true)
+                            .setProtocolVersion(HttpVersion.HTTP_2)
+                            .setUseAlpn(true)
+                            .setConnectTimeout(1000)
+                            .setReadIdleTimeout(10000));
 					var influxUrl = config.metrics().influx().url();
 					var bucket = config.metrics().influx().bucket();
 					var userName = config.metrics().influx().user();
@@ -175,12 +179,13 @@ public class MetricsManager implements AutoCloseable {
 							.threadFactory(new NamedThreadFactory("influx-metrics-publisher"))
 							.build();
 					compositeRegistry.add(influxMeterRegistry);
-				} catch (Throwable ex) {
-					LOG.error("Failed to initialize influx metrics");
-				}
-			} else {
-				this.httpClient = null;
-			}
+    } catch (Throwable ex) {
+                    LOG.error("Failed to initialize influx metrics");
+                }
+            } else {
+                this.httpClient = null;
+                this.vertx = null;
+            }
 
 			compositeRegistry.config().commonTags("appname", "rockserver", "database-name", Objects.requireNonNullElse(config.metrics().databaseName(), "default"));
 
@@ -208,26 +213,37 @@ public class MetricsManager implements AutoCloseable {
 		}
 	}
 
-	private void preloadClasses() {
-		// Preload file deletion method, used during shutdown
-		var fs = Vertx.vertx().fileSystem();
-		var tmpDir = fs.createTempDirectoryBlocking("tmp");
-		fs.deleteRecursiveBlocking(tmpDir);
-	}
+ private void preloadClasses() {
+        try {
+					// Preload file deletion method, used during shutdown
+					var fs = Vertx.vertx().fileSystem();
+					var tmpDir = fs.createTempDirectoryBlocking("tmp");
+					fs.deleteRecursiveBlocking(tmpDir);
+        } catch (Throwable ignored) {
+            // best-effort; this is only to trigger classloading
+        }
+    }
 
 	private long getStartTime() {
 		return startTime;
 	}
 
-	@Override
-	public void close() {
-		if (httpClient != null) {
-			httpClient.rxClose().blockingAwait();
-		}
-		gcMetrics.close();
-		heapPressureMetrics.close();
-		compositeRegistry.close();
-	}
+ @Override
+ public void close() {
+     if (httpClient != null) {
+         httpClient.rxClose().blockingAwait();
+     }
+     if (vertx != null) {
+         try {
+             vertx.rxClose().blockingAwait();
+         } catch (Throwable t) {
+             LOG.warn("Failed to close Vertx instance for metrics", t);
+         }
+     }
+     gcMetrics.close();
+     heapPressureMetrics.close();
+     compositeRegistry.close();
+ }
 
 	public MeterRegistry getRegistry() {
 		return compositeRegistry;

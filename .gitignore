@@ -1,6 +1,7 @@
 .idea/
 target/
 tmp-rockserver-db/
+test-native-merge-db/
 .directory
 *.iml
 hs_err_pid*.log

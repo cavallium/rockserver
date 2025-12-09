@@ -683,7 +683,7 @@ public class RocksDBLoader {
                 );
             }
 
-            handles.forEach(refs::add);
+					handles.forEach(refs::add);
 
             try {
                 for (ColumnFamilyHandle cfh : handles) {

@@ -84,6 +84,24 @@ public class MergeOperatorRegistry implements Closeable {
                     .computeIfAbsent(version, v -> loadFromDb(name, v));
     }
 
+    /**
+     * Returns the number of distinct operator names currently cached.
+     */
+    public int getOperatorsCount() {
+        return cache.size();
+    }
+
+    /**
+     * Returns the total number of cached operator instances across all versions.
+     */
+    public int getTotalVersionsCount() {
+        int total = 0;
+        for (Map<Long, FFMAbstractMergeOperator> versions : cache.values()) {
+            total += versions.size();
+        }
+        return total;
+    }
+
     private FFMAbstractMergeOperator loadFromDb(String name, long version) {
         try {
             byte[] key = encodeKey(name, version);
@@ -179,9 +197,17 @@ public class MergeOperatorRegistry implements Closeable {
         for (Map<Long, FFMAbstractMergeOperator> versions : cache.values()) {
             for (FFMAbstractMergeOperator op : versions.values()) {
                 try {
-                    op.close();
-                } catch (Exception e) {
-                    LOG.error("Failed to close merge operator", e);
+                    if (op != null) {
+                        // Close only if this Java reference still owns the native handle.
+                        // ColumnFamilyOptions takes ownership when setMergeOperator is called and
+                        // will close the operator when options are closed. In that case, calling
+                        // close() here could double-free. Guard with isOwningHandle().
+                        if (op.isOwningHandle()) {
+                            op.close();
+                        }
+                    }
+                } catch (Throwable e) {
+                    LOG.debug("Ignoring error while closing merge operator", e);
                 }
             }
         }

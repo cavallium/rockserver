@@ -236,8 +236,13 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 		return db.getAllColumnDefinitions();
 	}
 
-	@Override
-	public RWScheduler getScheduler() {
-		return db.getScheduler();
-	}
+    @Override
+    public RWScheduler getScheduler() {
+        return db.getScheduler();
+    }
+
+    @org.jetbrains.annotations.VisibleForTesting
+    public EmbeddedDB getInternalDB() {
+        return db;
+    }
 }

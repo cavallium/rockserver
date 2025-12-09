@@ -7,6 +7,7 @@ import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
 import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
 import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.util.NamedThreadFactory;
@@ -192,6 +193,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.compactTimer = createActionTimer(Compact.class);
 		this.getAllColumnDefinitionsTimer = createActionTimer(GetAllColumnDefinitions.class);
 
+		// Expose gauges to help detect potential resource leaks at runtime
+		try {
+			var registry = metrics.getRegistry();
+			meters.add(Gauge
+					.builder("rockserver.open.transactions", txs, m -> (double) m.size())
+					.tag("db", name)
+					.register(registry));
+			meters.add(Gauge
+					.builder("rockserver.open.iterators", its, m -> (double) m.size())
+					.tag("db", name)
+					.register(registry));
+			meters.add(Gauge
+					.builder("rockserver.pending.ops", ops, m -> (double) m.getPendingOpsCount())
+					.tag("db", name)
+					.register(registry));
+		} catch (Throwable ex) {
+			logger.error("Failed to load metrics", ex);
+		}
+
 		if (Boolean.getBoolean("rockserver.core.print-actions")) {
 			var m = MarkerFactory.getMarker("ACTION");
 			this.actionLogger = (actionName, actionId, column, key, value, txId, commit, timeoutMs, requestType) -> {
@@ -239,14 +259,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.leakScheduler = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("db-leak-scheduler"));
 
 		leakScheduler.scheduleWithFixedDelay(() -> {
+			// Skip if shutdown in progress to avoid IllegalStateException from SafeShutdown.beginOp()
+			if (!ops.isOpen()) return;
 			logger.debug("Cleaning expired transactions...");
 			var idsToRemove = new LongArrayList();
+			var sampleOverdues = new ArrayList<String>(8);
 			var startTime = System.currentTimeMillis();
-			ops.beginOp();
+			try {
+				ops.beginOp();
+			} catch (IllegalStateException closed) {
+				return; // shutting down
+			}
 			try {
 				EmbeddedDB.this.txs.forEach(((txId, tx) -> {
 					if (startTime >= tx.expirationTimestamp()) {
 						idsToRemove.add((long) txId);
+						long overdue = startTime - tx.expirationTimestamp();
+						if (sampleOverdues.size() < 16) {
+							// Capture a small sample: id, overdueMs, isForUpdate
+							sampleOverdues.add("id=" + txId + ", overdueMs=" + overdue + ", forUpdate=" + tx.isFromGetForUpdate());
+						}
 					}
 				}));
 				idsToRemove.forEach(id -> {
@@ -271,8 +303,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			var endTime = System.currentTimeMillis();
 			var removedCount = idsToRemove.size();
-			if (removedCount > 2) {
-				logger.info("Cleaned {} expired transactions in {}, please debug leaked transactions if this number is too high",
+			if (removedCount > 10) {
+				logger.info("Cleaned {} expired transactions in {}. Sample: {}",
+						removedCount, Duration.ofMillis(endTime - startTime), String.join(" | ", sampleOverdues));
+			} else if (removedCount > 2) {
+				logger.info("Cleaned {} expired transactions in {}",
 						removedCount, Duration.ofMillis(endTime - startTime));
 			} else {
 				logger.debug("Cleaned {} expired transactions in {}", removedCount, Duration.ofMillis(endTime - startTime));
@@ -280,14 +315,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}, 1, 1, TimeUnit.MINUTES);
 
 		leakScheduler.scheduleWithFixedDelay(() -> {
+			// Skip if shutdown in progress to avoid IllegalStateException from SafeShutdown.beginOp()
+			if (!ops.isOpen()) return;
 			logger.debug("Cleaning expired iterators...");
 			var idsToRemove = new LongArrayList();
+			var sampleOverdues = new ArrayList<String>(8);
 			var startTime = System.currentTimeMillis();
-			ops.beginOp();
+			try {
+				ops.beginOp();
+			} catch (IllegalStateException closed) {
+				return; // shutting down
+			}
 			try {
 				EmbeddedDB.this.its.forEach(((itId, entry) -> {
 					if (entry.expirationTimestamp() != null && startTime >= entry.expirationTimestamp()) {
 						idsToRemove.add((long) itId);
+						long overdue = startTime - entry.expirationTimestamp();
+						if (sampleOverdues.size() < 16) {
+							sampleOverdues.add("id=" + itId + ", overdueMs=" + overdue);
+						}
 					}
 				}));
 				idsToRemove.forEach(id -> {
@@ -305,8 +351,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			var endTime = System.currentTimeMillis();
 			var removedCount = idsToRemove.size();
-			if (removedCount > 2) {
-				logger.info("Cleaned {} expired iterators in {}, please debug leaked iterators if this number is too high",
+			if (removedCount > 10) {
+				logger.info("Cleaned {} expired iterators in {}. Sample: {}",
+						removedCount, Duration.ofMillis(endTime - startTime), String.join(" | ", sampleOverdues));
+			} else if (removedCount > 2) {
+				logger.info("Cleaned {} expired iterators in {}",
 						removedCount, Duration.ofMillis(endTime - startTime));
 			} else {
 				logger.debug("Cleaned {} expired iterators in {}", removedCount, Duration.ofMillis(endTime - startTime));
@@ -352,7 +401,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} else {
 			this.mergeOperatorsColumnDescriptorHandle = existingMergeOperatorsColumnDescriptorOptional.get().getValue();
 		}
-		this.mergeOperatorRegistry = new MergeOperatorRegistry(db.get(), mergeOperatorsColumnDescriptorHandle);
+  this.mergeOperatorRegistry = new MergeOperatorRegistry(db.get(), mergeOperatorsColumnDescriptorHandle);
+
+		// Metrics for merge-operator cache sizes (diagnostics to detect leaks in uploaded operators)
+		try {
+			var registry = metrics.getRegistry();
+			meters.add(Gauge
+					.builder("rockserver.merge.operator.names", mergeOperatorRegistry, r -> (double) r.getOperatorsCount())
+					.tag("db", name)
+					.register(registry));
+			meters.add(Gauge
+					.builder("rockserver.merge.operator.versions", mergeOperatorRegistry, r -> (double) r.getTotalVersionsCount())
+					.tag("db", name)
+					.register(registry));
+		} catch (Throwable ex) {
+			logger.error("Failed to load metrics", ex);
+		}
 
 		try (var it = this.db.get().newIterator(columnSchemasColumnDescriptorHandle)) {
 			it.seekToFirst();
@@ -540,31 +604,213 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	@Override
-	public void close() throws IOException {
-		// Wait for 10 seconds
-		try {
-			ops.closeAndWait(MAX_TRANSACTION_DURATION_MS);
-			columnSchemasColumnDescriptorHandle.close();
-			mergeOperatorsColumnDescriptorHandle.close();
-			mergeOperatorRegistry.close();
-			db.close();
-			refs.close();
-			if (path == null) {
-				Utils.deleteDirectory(db.getPath());
-			}
-			for (Meter meter : meters) {
-				meter.close();
-			}
-			rocksDBStatistics.close();
-			if (metrics != null) {
-				metrics.close();
-			}
-			leakScheduler.close();
-		} catch (TimeoutException e) {
-			logger.error("Some operations lasted more than 10 seconds, forcing database shutdown...");
-		}
-	}
+ @Override
+ public void close() throws IOException {
+     // Wait for 10 seconds
+     try {
+         ops.closeAndWait(MAX_TRANSACTION_DURATION_MS);
+         // Normal shutdown path
+         closeResources(false);
+     } catch (TimeoutException e) {
+         logger.error("Some operations lasted more than 10 seconds, forcing database shutdown... pendingOps={}, openTxs={}, openIterators={}",
+                 ops.getPendingOpsCount(), txs.size(), its.size());
+         // Best-effort forced cleanup of leaked resources to avoid native memory retention
+         forceCloseLeakedResources();
+         // After forcing close of leaked resources, proceed to close DB/native resources defensively
+         closeResources(true);
+     } finally {
+         // Ensure scheduler and leak-scheduler are always torn down
+         try {
+             if (scheduler != null) {
+                 scheduler.dispose();
+             }
+         } catch (Throwable t) {
+             logger.warn("Failed to dispose RWScheduler", t);
+         }
+         try {
+             shutdownExecutor(leakScheduler);
+         } catch (Throwable t) {
+             logger.warn("Failed to shutdown leak scheduler", t);
+         }
+     }
+ }
+
+ /**
+  * Close all resources in a safe order. Each step is individually protected
+  * so that failure to close one resource does not prevent others from closing.
+  * This method is idempotent with respect to Rocks native handles: close()
+  * calls are wrapped and exceptions are logged.
+  */
+ private void closeResources(boolean forced) {
+     // System column handles
+     try { columnSchemasColumnDescriptorHandle.close(); } catch (Throwable t) { logger.error("Error closing columnSchemas handle{}", forced ? " (forced)" : "", t); }
+     try { mergeOperatorsColumnDescriptorHandle.close(); } catch (Throwable t) { logger.error("Error closing mergeOperators handle{}", forced ? " (forced)" : "", t); }
+
+     // DB and native refs
+     try { db.close(); } catch (Throwable t) { logger.error("Error closing DB{}", forced ? " (forced)" : "", t); }
+     try { refs.close(); } catch (Throwable t) { logger.error("Error closing refs{}", forced ? " (forced)" : "", t); }
+
+     // Close merge-operator registry AFTER DB/ColumnFamilyOptions so that ownership
+     // of merge operators is released by ColumnFamilyOptions first (avoids double-close)
+     try { mergeOperatorRegistry.close(); } catch (Throwable t) { logger.error("Error closing mergeOperatorRegistry{}", forced ? " (forced)" : "", t); }
+
+     // Drop strong references to ColumnFamilyOptions to help GC and avoid holding onto closed natives
+     try { columnsConifg.clear(); } catch (Throwable ignored) { }
+
+     // For in-memory DBs, delete the temporary directory
+     try {
+         if (path == null) {
+             Utils.deleteDirectory(db.getPath());
+         }
+     } catch (Throwable t) { logger.error("Error deleting in-memory DB directory{}", forced ? " (forced)" : "", t); }
+
+     // Meters and statistics
+     try {
+         for (Meter meter : meters) {
+             try {
+                 meter.close();
+             } catch (Throwable mt) {
+                 logger.error("Error closing meter{}", forced ? " (forced)" : "", mt);
+             }
+         }
+     } catch (Throwable t) { logger.error("Error while closing meters collection{}", forced ? " (forced)" : "", t); }
+     try { rocksDBStatistics.close(); } catch (Throwable t) { logger.error("Error closing rocksDBStatistics{}", forced ? " (forced)" : "", t); }
+     try { if (metrics != null) metrics.close(); } catch (Throwable t) { logger.error("Error closing metrics manager{}", forced ? " (forced)" : "", t); }
+ }
+
+    /**
+     * Force-close any remaining transactions/iterators and balance pending ops.
+     * Invoked during shutdown if SafeShutdown times out.
+     */
+    private void forceCloseLeakedResources() {
+        int closedTx = 0;
+        int closedIts = 0;
+        try {
+            // Transactions
+            for (var tx : txs.values()) {
+                try {
+                    tx.close();
+                } catch (Throwable t) {
+                    logger.warn("Failed to close transaction during forced shutdown", t);
+                } finally {
+                    // Balance the beginOp done at transaction open
+                    ops.endOp();
+                    closedTx++;
+                }
+            }
+            txs.clear();
+
+            // Iterators
+            for (var it : its.values()) {
+                try {
+                    it.close();
+                } catch (Throwable t) {
+                    logger.warn("Failed to close iterator during forced shutdown", t);
+                } finally {
+                    // Balance the beginOp done at iterator open
+                    ops.endOp();
+                    closedIts++;
+                }
+            }
+            its.clear();
+
+            try {
+                ops.waitForExit(2_000);
+            } catch (TimeoutException te) {
+                logger.warn("Pending operations still not zero after forced shutdown: {}", ops.getPendingOpsCount());
+            }
+        } catch (Throwable t) {
+            logger.warn("forceCloseLeakedResources encountered an error", t);
+        } finally {
+            logger.info("Forced closed resources. Transactions: {}, Iterators: {}", closedTx, closedIts);
+        }
+    }
+
+    private void shutdownExecutor(ScheduledExecutorService exec) {
+        if (exec == null) return;
+        exec.shutdownNow();
+        try {
+            if (!exec.awaitTermination(10, TimeUnit.SECONDS)) {
+                logger.warn("Leak scheduler did not terminate within timeout");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+      /**
+       * Test-only helper to run the transactions leak-cleaner logic immediately.
+       * Does nothing in production flows; intended for unit tests that need
+       * deterministic cleanup of expired transactions without waiting for the
+       * scheduler tick.
+       */
+      @VisibleForTesting
+      void cleanupExpiredTransactionsNow() {
+          // Mirror the scheduled task logic
+          if (!ops.isOpen()) return;
+          long startTime = System.currentTimeMillis();
+          try {
+              ops.beginOp();
+          } catch (IllegalStateException closed) {
+              return;
+          }
+          try {
+              var idsToRemove = new LongArrayList();
+              this.txs.forEach(((txId, tx) -> {
+                  if (startTime >= tx.expirationTimestamp()) {
+                      idsToRemove.add((long) txId);
+                  }
+              }));
+              idsToRemove.forEach(id -> {
+                  var tx = this.txs.remove(id);
+                  if (tx != null) {
+                      try {
+                          if (tx.val().isOwningHandle()) {
+                              tx.val().rollback();
+                          }
+                      } catch (Throwable ignored) {}
+                      try { tx.close(); } catch (Throwable ignored) {}
+                      ops.endOp();
+                  }
+              });
+          } finally {
+              ops.endOp();
+          }
+      }
+
+      /**
+       * Test-only helper to run the iterators leak-cleaner logic immediately.
+       * Does nothing in production flows; intended for unit tests that need
+       * deterministic cleanup of expired iterators without waiting for the
+       * scheduler tick.
+       */
+      @VisibleForTesting
+      void cleanupExpiredIteratorsNow() {
+          if (!ops.isOpen()) return;
+          long startTime = System.currentTimeMillis();
+          try {
+              ops.beginOp();
+          } catch (IllegalStateException closed) {
+              return;
+          }
+          try {
+              var idsToRemove = new LongArrayList();
+              this.its.forEach(((itId, entry) -> {
+                  if (entry.expirationTimestamp() != null && startTime >= entry.expirationTimestamp()) {
+                      idsToRemove.add((long) itId);
+                  }
+              }));
+              idsToRemove.forEach(id -> {
+                  var it = this.its.remove(id);
+                  if (it != null) {
+                      try { it.close(); } catch (Throwable ignored) {}
+                      ops.endOp();
+                  }
+              });
+          } finally {
+              ops.endOp();
+          }
+      }
 
 	private ReadOptions newReadOptions(String label) {
 		var ro = new LeakSafeReadOptions(label);
@@ -652,58 +898,59 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	/**
 	 * @return false if failed optimistic commit
 	 */
-	@Contract("_, false -> true; _, true -> _")
-	private boolean closeTransactionInternal(@NotNull Tx tx, boolean commit) {
+ @Contract("_, false -> true; _, true -> _")
+ private boolean closeTransactionInternal(@NotNull Tx tx, boolean commit) {
 		ops.beginOp();
-		// Transaction found
-		try {
-			if (commit) {
-				boolean succeeded;
-				try {
-					tx.val().commit();
-					succeeded = true;
-				} catch (org.rocksdb.RocksDBException ex) {
-					var status = ex.getStatus() != null ? ex.getStatus().getCode() : Code.Ok;
-					if (status == Code.Busy || status == Code.TryAgain) {
-						succeeded = false;
-					} else {
-						throw ex;
-					}
-				}
-				if (!succeeded) {
-					// Do not call endOp here, since the transaction is still open
-					return false;
-				}
-			} else {
-				if (tx.val().isOwningHandle()) {
-					tx.val().rollback();
-				}
-			}
-			tx.close();
-			// Close the transaction operation
-			ops.endOp();
-			return true;
-		} catch (org.rocksdb.RocksDBException e) {
-			try {
-				tx.close();
-			} catch (Throwable t) {
-				e.addSuppressed(t);
-			}
-			// Close the transaction operation
-			ops.endOp();
-			throw RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
-		} catch (Throwable ex) {
-			try {
-				tx.close();
-			} catch (Throwable t) {
-				ex.addSuppressed(t);
-			}
-			ops.endOp();
+     // Transaction found
+     try {
+         if (commit) {
+             boolean succeeded;
+             try {
+                 tx.val().commit();
+                 succeeded = true;
+             } catch (org.rocksdb.RocksDBException ex) {
+                 var status = ex.getStatus() != null ? ex.getStatus().getCode() : Code.Ok;
+                 if (status == Code.Busy || status == Code.TryAgain) {
+                     succeeded = false;
+                 } else {
+                     throw ex;
+                 }
+             }
+             if (!succeeded) {
+                 // Do not call endOp here, since the transaction is still open
+                 return false;
+             }
+         } else {
+             if (tx.val().isOwningHandle()) {
+                 tx.val().rollback();
+             }
+         }
+         tx.close();
+         // Close the transaction operation started on open
+         ops.endOp();
+         return true;
+     } catch (org.rocksdb.RocksDBException e) {
+         try {
+             tx.close();
+         } catch (Throwable t) {
+             e.addSuppressed(t);
+         }
+         // Balance the open op
+         ops.endOp();
+         throw RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
+     } catch (Throwable ex) {
+         try {
+             tx.close();
+         } catch (Throwable t) {
+             ex.addSuppressed(t);
+         }
+         // Balance the open op
+         ops.endOp();
 			throw  ex;
 		} finally {
 			ops.endOp();
-		}
-	}
+     }
+ }
 
 	@Override
 	public void closeFailedUpdate(long updateId) throws RocksDBException {
@@ -1767,13 +2014,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public void closeIterator(long iteratorId) throws RocksDBException {
 		var start = System.nanoTime();
-		ops.beginOp();
 		try {
 			actionLogger.logAction("CloseIterator", start, null, null, null, null, null, null, null); // todo: improve logging
-			// Should close the iterator operation
-			throw new UnsupportedOperationException();
+			var entry = its.remove(iteratorId);
+			if (entry != null) {
+				try {
+					entry.close();
+				} finally {
+					// Balance the pending op started in openIterator
+					ops.endOp();
+				}
+			} else {
+				// If iterator not found, ignore
+			}
 		} finally {
-			ops.endOp();
 			var end = System.nanoTime();
 			closeIteratorTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
@@ -2087,8 +2341,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			} finally {
 				totalTime.add(System.nanoTime() - closeTime);
 			}
-		})
-		.subscribeOn(scheduler.read())
+  })
+  .subscribeOn(scheduler.read())
 		.doFirst(ops::beginOp)
 		.doFinally(_ -> {
 			ops.endOp();
@@ -2284,6 +2538,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public TransactionalDB getDb() {
 		return db;
+	}
+
+	@VisibleForTesting
+	public long getPendingOpsCount() {
+		return ops.getPendingOpsCount();
+	}
+
+	@VisibleForTesting
+	public int getOpenTransactionsCount() {
+		return txs.size();
+	}
+
+	@VisibleForTesting
+	public int getOpenIteratorsCount() {
+		return its.size();
 	}
 
 	@VisibleForTesting

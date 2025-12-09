@@ -2,6 +2,8 @@ package it.cavallium.rockserver.core.impl;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.buffer.MemorySegmentBuf;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.jetbrains.annotations.VisibleForTesting;
 import org.rocksdb.MergeOperator;
 import org.rocksdb.RocksDB;
@@ -31,12 +33,15 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
 
     // --- Native Linker Setup ---
     private static final Linker LINKER = Linker.nativeLinker();
-    private static final Arena STUB_ARENA = Arena.global();
+    // Upcall stubs are allocated on a per-instance Arena so they are freed when the operator
+    // is disposed, preventing native stub memory from accumulating across operator rotations.
     private static final SymbolLookup LOOKUP;
+    private static final Logger LOG = LoggerFactory.getLogger(FFMAbstractMergeOperator.class);
     
     // Critical Downcalls for speed
     private static final MethodHandle MALLOC;
     private static final MethodHandle FREE;
+    private static final String ALLOCATOR_TYPE;
     
     private static final MethodHandle CREATE_OP;
     private static final MethodHandle DESTROY_OP;
@@ -51,11 +56,24 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
         LOOKUP = name -> SymbolLookup.loaderLookup().find(name)
                 .or(() -> LINKER.defaultLookup().find(name));
 
-        // Try to find jemalloc first to match RocksDB's internal allocator (if linked with jemalloc)
-        // This prevents memory leaks caused by allocator mismatch (malloc vs je_free).
-        MemorySegment mallocAddr = LOOKUP.find("je_malloc")
-                .or(() -> LOOKUP.find("malloc"))
-                .orElseThrow(() -> new UnsatisfiedLinkError("Native symbol not found: malloc"));
+        // Try to find jemalloc first to match RocksDB's internal allocator (if linked with jemalloc).
+        // Ensure both je_malloc and je_free are present; otherwise fall back to standard malloc/free
+        // to avoid allocator mismatch.
+        MemorySegment mallocAddr;
+        MemorySegment freeAddr;
+        var jeMallocOpt = LOOKUP.find("je_malloc");
+        var jeFreeOpt = LOOKUP.find("je_free");
+        if (jeMallocOpt.isPresent() && jeFreeOpt.isPresent()) {
+            mallocAddr = jeMallocOpt.get();
+            freeAddr = jeFreeOpt.get();
+            ALLOCATOR_TYPE = "jemalloc";
+        } else {
+            mallocAddr = LOOKUP.find("malloc")
+                    .orElseThrow(() -> new UnsatisfiedLinkError("Native symbol not found: malloc"));
+            freeAddr = LOOKUP.find("free")
+                    .orElseThrow(() -> new UnsatisfiedLinkError("Native symbol not found: free"));
+            ALLOCATOR_TYPE = "libc";
+        }
 
         MALLOC = LINKER.downcallHandle(
                 mallocAddr,
@@ -63,15 +81,17 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 Linker.Option.critical(false)
         );
 
-        MemorySegment freeAddr = LOOKUP.find("je_free")
-                .or(() -> LOOKUP.find("free"))
-                .orElseThrow(() -> new UnsatisfiedLinkError("Native symbol not found: free"));
-
         FREE = LINKER.downcallHandle(
                 freeAddr,
                 FunctionDescriptor.ofVoid(ValueLayout.ADDRESS),
                 Linker.Option.critical(false)
         );
+
+        try {
+            LOG.info("FFM merge-operator allocator: {}", ALLOCATOR_TYPE);
+        } catch (Throwable ignored) {
+            // Logging must not fail class initialization
+        }
 
         CREATE_OP = LINKER.downcallHandle(
                 findOrThrow("rocksdb_mergeoperator_create"),
@@ -226,7 +246,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 "nameCallback", 
                 MethodType.methodType(MemorySegment.class, MemorySegment.class)
             ).bindTo(this);
-            return LINKER.upcallStub(mh, desc, STUB_ARENA);
+            return LINKER.upcallStub(mh, desc, instanceArena);
         } catch (Exception e) { throw new RuntimeException(e); }
     }
 
@@ -242,7 +262,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 "noOpCallback", 
                 MethodType.methodType(void.class, MemorySegment.class)
             );
-            return LINKER.upcallStub(mh, desc, STUB_ARENA);
+            return LINKER.upcallStub(mh, desc, instanceArena);
         } catch (Exception e) { throw new RuntimeException(e); }
     }
 
@@ -265,7 +285,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                             MemorySegment.class, long.class, MemorySegment.class, MemorySegment.class, int.class,
                             MemorySegment.class, MemorySegment.class)
             ).bindTo(this);
-            return LINKER.upcallStub(mh, desc, STUB_ARENA);
+            return LINKER.upcallStub(mh, desc, instanceArena);
         } catch (Exception e) { throw new RuntimeException(e); }
     }
 
@@ -344,7 +364,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                             MemorySegment.class, MemorySegment.class, int.class,
                             MemorySegment.class, MemorySegment.class)
             ).bindTo(this);
-            return LINKER.upcallStub(mh, desc, STUB_ARENA);
+            return LINKER.upcallStub(mh, desc, instanceArena);
         } catch (Exception e) { throw new RuntimeException(e); }
     }
 
@@ -410,7 +430,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 "deleteValueCb",
                 MethodType.methodType(void.class, MemorySegment.class, MemorySegment.class, long.class)
             ).bindTo(this);
-            return LINKER.upcallStub(mh, desc, STUB_ARENA);
+            return LINKER.upcallStub(mh, desc, instanceArena);
         } catch (Exception e) { throw new RuntimeException(e); }
     }
 
