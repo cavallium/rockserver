@@ -806,23 +806,23 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 	/**
 	 * Create or update a CDC subscription
 	 */
-	record CdcCreate(String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) implements RocksDBAPICommandSingle<Long> {
+ record CdcCreate(String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) implements RocksDBAPICommandSingle<Long> {
 
-		@Override
-		public Long handleSync(RocksDBSyncAPI api) {
-			return api.cdcCreate(id, fromSeq, columnIds);
-		}
+        @Override
+        public Long handleSync(RocksDBSyncAPI api) {
+            return api.cdcCreate(id, fromSeq, columnIds, resolvedValues);
+        }
 
-		@Override
-		public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
-			return api.cdcCreateAsync(id, fromSeq, columnIds);
-		}
+        @Override
+        public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
+            return api.cdcCreateAsync(id, fromSeq, columnIds, resolvedValues);
+        }
 
-		@Override
-		public boolean isReadOnly() {
-			return false;
-		}
-	}
+        @Override
+        public boolean isReadOnly() {
+            return false;
+        }
+    }
 
 	/**
 	 * Delete a CDC subscription

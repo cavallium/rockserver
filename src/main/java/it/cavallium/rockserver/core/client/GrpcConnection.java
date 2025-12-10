@@ -580,6 +580,15 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
     }
 
     @Override
+    public CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
+        var builder = CdcCreateRequest.newBuilder().setId(id);
+        if (fromSeq != null) builder.setFromSeq(fromSeq);
+        if (columnIds != null) builder.addAllColumnIds(columnIds);
+        if (resolvedValues != null) builder.setResolvedValues(resolvedValues);
+        return toResponse(futureStub.cdcCreate(builder.build()), CdcCreateResponse::getStartSeq);
+    }
+
+    @Override
     public CompletableFuture<Void> cdcDeleteAsync(@NotNull String id) throws RocksDBException {
         return toResponse(futureStub.cdcDelete(CdcDeleteRequest.newBuilder().setId(id).build()), _ -> null);
     }

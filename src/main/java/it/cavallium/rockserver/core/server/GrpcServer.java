@@ -754,7 +754,8 @@ public class GrpcServer extends Server {
                 return executeSync(() -> {
                     Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
                     var cols = request.getColumnIdsCount() > 0 ? request.getColumnIdsList().stream().map(Long::valueOf).toList() : null;
-                    long startSeq = api.cdcCreate(request.getId(), fromSeq, cols);
+                    Boolean resolvedValues = request.hasResolvedValues() ? request.getResolvedValues() : null;
+                    long startSeq = api.cdcCreate(request.getId(), fromSeq, cols, resolvedValues);
                     return CdcCreateResponse.newBuilder().setStartSeq(startSeq).build();
                 }, false).transform(this.onErrorMapMonoWithRequestInfo("cdcCreate", request));
             }

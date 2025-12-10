@@ -13,5 +13,10 @@ public enum CdcCommitMode {
      * This ensures minimizing duplicates upon restart (resume from last processed event),
      * but incurs significantly higher latency due to frequent commit calls.
      */
-    PER_EVENT
+    PER_EVENT,
+
+    /**
+     * Do not automatically commit. The caller can manage commits with explicit cdcCommit calls.
+     */
+    NONE
 }

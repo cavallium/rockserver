@@ -208,6 +208,9 @@ message CdcCreateRequest {
   optional int64 fromSeq = 2;
   // Optional filter of column ids. Empty means all columns.
   repeated int64 columnIds = 3;
+  // If true, CDC will emit the resolved current values as seen by readers (post-merge),
+  // instead of raw operands for MERGE operations. Defaults to false if not set.
+  optional bool resolvedValues = 4;
 }
 
 message CdcCreateResponse {

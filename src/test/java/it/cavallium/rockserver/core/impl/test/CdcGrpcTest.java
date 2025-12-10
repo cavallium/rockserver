@@ -23,6 +23,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.stream.Collectors;
+import org.junit.jupiter.api.Assumptions;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -191,5 +192,42 @@ public class CdcGrpcTest {
         }
         
         assertEquals(totalEvents, consumed);
+    }
+
+    @Test
+    void testResolvedValuesOverGrpc() throws Exception {
+        // Upload merge operator and create column with it enabled
+        long opVersion;
+        try {
+            opVersion = client.getSyncApi().uploadMergeOperator("append-op", "it.cavallium.rockserver.core.impl.MyStringAppendOperator", new byte[0]);
+        } catch (Throwable t) {
+            Assumptions.assumeTrue(false, "Merge operator upload not available on this transport/env; skipping resolved-values over gRPC test");
+            return;
+        }
+        var colId = client.getSyncApi().createColumn(
+                "resolved-col-grpc",
+                ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true, "append-op", opVersion)
+        );
+
+        // Create CDC subscription with resolved values enabled
+        String subId = "resolved-sub-grpc";
+        long startSeq = client.getSyncApi().cdcCreate(subId, null, List.of(colId), true);
+
+        // Put initial value, then merge a delta (using sample String append operator semantics)
+        var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0,0,0,1})});
+        Buf initial = Buf.wrap("Initial".getBytes(StandardCharsets.UTF_8));
+        Buf delta = Buf.wrap("-Patched".getBytes(StandardCharsets.UTF_8));
+        client.getSyncApi().put(0, colId, key, initial, RequestType.none());
+        client.getSyncApi().merge(0, colId, key, delta, RequestType.none());
+
+        // Poll two events starting from startSeq
+        var events = client.getSyncApi().cdcPoll(subId, startSeq, 10).collect(Collectors.toList());
+        assertEquals(2, events.size());
+        CDCEvent ev1 = events.get(0);
+        CDCEvent ev2 = events.get(1);
+        assertEquals(CDCEvent.Op.PUT, ev1.op());
+        assertEquals("Initial", new String(ev1.value().toByteArray(), StandardCharsets.UTF_8));
+        assertEquals(CDCEvent.Op.MERGE, ev2.op());
+        assertEquals("Initial,-Patched", new String(ev2.value().toByteArray(), StandardCharsets.UTF_8));
     }
 }

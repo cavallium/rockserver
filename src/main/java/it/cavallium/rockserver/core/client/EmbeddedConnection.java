@@ -251,7 +251,11 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
     // CDC API implementation stubs delegating to EmbeddedDB
     public long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-        return db.cdcCreate(id, fromSeq, columnIds);
+        return db.cdcCreate(id, fromSeq, columnIds, null);
+    }
+
+    public long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
+        return db.cdcCreate(id, fromSeq, columnIds, resolvedValues);
     }
 
     public void cdcDelete(@NotNull String id) throws RocksDBException {

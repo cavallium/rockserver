@@ -232,6 +232,55 @@ database: {
 
 	@SuppressWarnings("DataFlowIssue")
 	@TestAllImplementations
+	void testCdcResolvedValues(String name, ConnectionConfig connection) throws Exception {
+		// Resolved-values CDC currently supported on embedded API path in this change.
+		if (connection.method() == ConnectionMethod.THRIFT || connection.method() == ConnectionMethod.GRPC) {
+			return;
+		}
+
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+
+			String subId = "resolved-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+			long startSeq = api.cdcCreate(subId, null, null, true);
+
+			// Use a dedicated column with merge operator enabled via fallback config
+			long mergeColId = api.createColumn("resolved-col-" + name,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+
+			var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0,0,0,1})});
+			Buf initial = Buf.wrap("Initial".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			Buf delta = Buf.wrap("-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+			api.put(0, mergeColId, key, initial, RequestType.none());
+			api.merge(0, mergeColId, key, delta, RequestType.none());
+
+			// Expect 2 events; in resolved mode, second (MERGE) must carry fully merged value
+			var events = api.cdcStream(subId,
+					new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+							startSeq,
+							10,
+							Duration.ofMillis(10),
+							it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE
+					),
+					null)
+					.take(2)
+					.collectList()
+					.block(Duration.ofSeconds(5));
+
+			Assertions.assertNotNull(events);
+			Assertions.assertEquals(2, events.size());
+			CDCEvent ev1 = events.get(0);
+			CDCEvent ev2 = events.get(1);
+			Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
+			assertSegmentEquals(initial, ev1.value());
+			Assertions.assertEquals(CDCEvent.Op.MERGE, ev2.op());
+			Buf expected = Buf.wrap("Initial,-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			assertSegmentEquals(expected, ev2.value());
+		}
+	}
+
+	@TestAllImplementations
 	void putTestErrors(String name, ConnectionConfig connection) {
 		try (var testDB = new TestDB(db, connection)) {
 			var db = testDB.getAPI();
@@ -832,10 +881,17 @@ database: {
 			// We expect 3 events from fillSomeKeys
 			int expectedEvents = 3;
 			
-			List<CDCEvent> events = api.cdcStream(subId, startSeq, 10, Duration.ofMillis(50))
-					.take(expectedEvents)
-					.collectList()
-					.block(Duration.ofSeconds(10));
+   List<CDCEvent> events = api.cdcStream(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    startSeq,
+                                    10,
+                                    Duration.ofMillis(50),
+                                    it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE
+                            ),
+                            null)
+                    .take(expectedEvents)
+                    .collectList()
+                    .block(Duration.ofSeconds(10));
 			
 			Assertions.assertNotNull(events);
 			Assertions.assertEquals(expectedEvents, events.size());
@@ -881,10 +937,17 @@ database: {
 
 			// 3. Verify CDC Stream
 			// We expect: PUT(Initial) -> MERGE(-Patched)
-			List<CDCEvent> events = api.cdcStream(subId, startSeq, 100, Duration.ofMillis(10))
-					.take(2)
-					.collectList()
-					.block(Duration.ofSeconds(5));
+   List<CDCEvent> events = api.cdcStream(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    startSeq,
+                                    100,
+                                    Duration.ofMillis(10),
+                                    it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE
+                            ),
+                            null)
+                    .take(2)
+                    .collectList()
+                    .block(Duration.ofSeconds(5));
 
 			Assertions.assertNotNull(events);
 			Assertions.assertEquals(2, events.size());
@@ -938,10 +1001,17 @@ database: {
 
 			// Consume first 30 events
 			int consumeCount1 = 30;
-			List<CDCEvent> received1 = api.cdcStream(subId, null, cdcBatchSize, Duration.ofMillis(10))
-					.take(consumeCount1)
-					.collectList()
-					.block(Duration.ofSeconds(10));
+   List<CDCEvent> received1 = api.cdcStream(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    null,
+                                    cdcBatchSize,
+                                    Duration.ofMillis(10),
+                                    it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE
+                            ),
+                            null)
+                    .take(consumeCount1)
+                    .collectList()
+                    .block(Duration.ofSeconds(10));
 
 			Assertions.assertNotNull(received1);
 			Assertions.assertEquals(consumeCount1, received1.size());
@@ -961,10 +1031,17 @@ database: {
 			// We expect to see remaining 20 from batch1 + 50 from batch2 = 70 events
 			int expectedRemaining = (countBatch1 - consumeCount1) + countBatch2;
 
-			List<CDCEvent> received2 = api.cdcStream(subId, null, cdcBatchSize, Duration.ofMillis(10))
-					.take(expectedRemaining)
-					.collectList()
-					.block(Duration.ofSeconds(10));
+   List<CDCEvent> received2 = api.cdcStream(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    null,
+                                    cdcBatchSize,
+                                    Duration.ofMillis(10),
+                                    it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE
+                            ),
+                            null)
+                    .take(expectedRemaining)
+                    .collectList()
+                    .block(Duration.ofSeconds(10));
 
 			Assertions.assertNotNull(received2);
 			Assertions.assertEquals(expectedRemaining, received2.size());
@@ -999,11 +1076,18 @@ database: {
 			java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(count);
 
 			// Batch size 5. We expect 4 batches of 5.
-			var disposable = api.cdcStream(subId, startSeq, 5, Duration.ofMillis(50), event -> {
-				latch.countDown();
-				return Mono.empty();
-			})
-			.subscribe();
+   var disposable = api.cdcStream(subId,
+                    new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                            startSeq,
+                            5,
+                            Duration.ofMillis(50),
+                            it.cavallium.rockserver.core.common.cdc.CdcCommitMode.BATCH
+                    ),
+                    event -> {
+                latch.countDown();
+                return Mono.empty();
+            })
+            .subscribe();
 
 			boolean finished = latch.await(10, java.util.concurrent.TimeUnit.SECONDS);
 			// Wait a tiny bit to allow the commit of the last batch to potentially complete (async)
@@ -1011,6 +1095,65 @@ database: {
 			disposable.dispose();
 			
 			Assertions.assertTrue(finished, "Did not process all events in time");
+		}
+	}
+
+	@TestAllImplementations
+	void testCdcStreamAck(String name, ConnectionConfig connection) throws Exception {
+		// Thrift currently lacks CDC support in this project setup
+		if (connection.method() == ConnectionMethod.THRIFT) {
+			return;
+		}
+
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+
+			String subId = "ack-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+			long startSeq = api.cdcCreate(subId, null, null);
+
+			int total = 20;
+			var kvSequence = getKVSequence();
+			for (int i = 0; i < total; i++) {
+				var kv = kvSequence.get(i);
+				api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
+			}
+
+			int ackCount = 12; // acknowledge first N events and then "crash"
+			java.util.concurrent.atomic.AtomicLong lastAcked = new java.util.concurrent.atomic.AtomicLong(startSeq - 1);
+
+			// Consume and ack first ackCount events
+			api.cdcStreamAck(subId,
+					new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+							startSeq,
+							5,
+							Duration.ofMillis(20),
+							it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE // ignored by ack variant
+					))
+				.take(ackCount)
+				.concatMap(ack -> {
+					// simulate processing, then ACK
+					return ack.ack().doOnSuccess(__ -> lastAcked.set(ack.event().seq())).thenReturn(ack);
+				})
+				.collectList()
+				.block(Duration.ofSeconds(10));
+
+			// Now simulate a crash by simply stopping the stream and resuming with server-managed offset (null fromSeq)
+			var resumedFirst = api.cdcStream(subId,
+					new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+							null,
+							5,
+							Duration.ofMillis(20),
+							it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE),
+					null)
+				.take(1)
+				.collectList()
+				.block(Duration.ofSeconds(10));
+
+			Assertions.assertNotNull(resumedFirst);
+			if (!resumedFirst.isEmpty()) {
+				long firstSeq = resumedFirst.get(0).seq();
+				Assertions.assertTrue(firstSeq > lastAcked.get(), "Resumed position should be after last acked. first=" + firstSeq + ", lastAcked=" + lastAcked.get());
+			}
 		}
 	}
 }

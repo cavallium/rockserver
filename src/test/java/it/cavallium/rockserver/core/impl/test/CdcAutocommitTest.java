@@ -48,7 +48,14 @@ public class CdcAutocommitTest {
             java.util.concurrent.atomic.AtomicReference<Long> firstEventSeq = new java.util.concurrent.atomic.AtomicReference<>();
             java.util.concurrent.atomic.AtomicReference<Long> lastProcessedSeq = new java.util.concurrent.atomic.AtomicReference<>();
 
-            db.getAsyncApi().cdcStream(subId, startSeq, 10, Duration.ofMillis(10), CdcCommitMode.PER_EVENT, ev -> {
+            db.getAsyncApi().cdcStream(subId,
+                    new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                            startSeq,
+                            10,
+                            Duration.ofMillis(10),
+                            CdcCommitMode.PER_EVENT
+                    ),
+                    ev -> {
                 int p = processed.incrementAndGet();
                 if (p == 1) firstEventSeq.set(ev.seq());
                 if (p == 5) {
@@ -66,7 +73,14 @@ public class CdcAutocommitTest {
             Thread.sleep(100); // Wait for potential async commits
 
             // Resume
-            List<CDCEvent> resumed = db.getAsyncApi().cdcStream(subId, null, 10, Duration.ofMillis(10))
+            List<CDCEvent> resumed = db.getAsyncApi().cdcStream(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    null,
+                                    10,
+                                    Duration.ofMillis(10),
+                                    CdcCommitMode.NONE
+                            ),
+                            null)
                 .take(1)
                 .collectList()
                 .block(Duration.ofSeconds(5));

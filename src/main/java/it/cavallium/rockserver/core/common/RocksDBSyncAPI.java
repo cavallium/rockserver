@@ -198,7 +198,12 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
     // CDC API
     /** Create or update a CDC subscription. Returns the start sequence. */
     default long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-        return requestSync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds));
+        return requestSync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds, null));
+    }
+
+    /** Create or update a CDC subscription. Returns the start sequence. */
+    default long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
+        return requestSync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds, resolvedValues));
     }
 
     /** Delete a CDC subscription */
