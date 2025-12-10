@@ -4,6 +4,7 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
+import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -712,6 +713,29 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			}
 
 		}
+
+		/**
+		 * CDC poll streaming command
+		 */
+		record CdcPoll(String id,
+				   @Nullable Long fromSeq,
+				   long maxEvents) implements RocksDBAPICommandStream<CDCEvent> {
+
+			@Override
+			public Stream<CDCEvent> handleSync(RocksDBSyncAPI api) {
+				return api.cdcPoll(id, fromSeq, maxEvents);
+			}
+
+			@Override
+			public Publisher<CDCEvent> handleAsync(RocksDBAsyncAPI api) {
+				return api.cdcPollAsync(id, fromSeq, maxEvents);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
+			}
+		}
 	}
 	/**
 	 * Flush the database
@@ -777,5 +801,70 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			return true;
 		}
 
+	}
+
+	/**
+	 * Create or update a CDC subscription
+	 */
+	record CdcCreate(String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) implements RocksDBAPICommandSingle<Long> {
+
+		@Override
+		public Long handleSync(RocksDBSyncAPI api) {
+			return api.cdcCreate(id, fromSeq, columnIds);
+		}
+
+		@Override
+		public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
+			return api.cdcCreateAsync(id, fromSeq, columnIds);
+		}
+
+		@Override
+		public boolean isReadOnly() {
+			return false;
+		}
+	}
+
+	/**
+	 * Delete a CDC subscription
+	 */
+	record CdcDelete(String id) implements RocksDBAPICommandSingle<Void> {
+
+		@Override
+		public Void handleSync(RocksDBSyncAPI api) {
+			api.cdcDelete(id);
+			return null;
+		}
+
+		@Override
+		public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
+			return api.cdcDeleteAsync(id);
+		}
+
+		@Override
+		public boolean isReadOnly() {
+			return false;
+		}
+	}
+
+	/**
+	 * Commit CDC sequence for a subscription
+	 */
+	record CdcCommit(String id, long seq) implements RocksDBAPICommandSingle<Void> {
+
+		@Override
+		public Void handleSync(RocksDBSyncAPI api) {
+			api.cdcCommit(id, seq);
+			return null;
+		}
+
+		@Override
+		public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
+			return api.cdcCommitAsync(id, seq);
+		}
+
+		@Override
+		public boolean isReadOnly() {
+			return false;
+		}
 	}
 }

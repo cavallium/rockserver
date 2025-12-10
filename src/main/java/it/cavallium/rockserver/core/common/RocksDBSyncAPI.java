@@ -27,6 +27,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.UploadMergeOperator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
+import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -193,4 +194,25 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	default Map<String, ColumnSchema> getAllColumnDefinitions() throws RocksDBException {
 		return requestSync(new GetAllColumnDefinitions());
 	}
+
+    // CDC API
+    /** Create or update a CDC subscription. Returns the start sequence. */
+    default long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
+        return requestSync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds));
+    }
+
+    /** Delete a CDC subscription */
+    default void cdcDelete(@NotNull String id) throws RocksDBException {
+        requestSync(new RocksDBAPICommand.CdcDelete(id));
+    }
+
+    /** Commit the last processed CDC sequence for a subscription */
+    default void cdcCommit(@NotNull String id, long seq) throws RocksDBException {
+        requestSync(new RocksDBAPICommand.CdcCommit(id, seq));
+    }
+
+    /** Poll CDC events as a blocking Stream */
+    default Stream<CDCEvent> cdcPoll(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
+        return requestSync(new RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll(id, fromSeq, maxEvents));
+    }
 }

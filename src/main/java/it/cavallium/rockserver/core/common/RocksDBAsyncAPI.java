@@ -27,12 +27,18 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.UploadMergeOperator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
 import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.cdc.CDCEvent;
+import it.cavallium.rockserver.core.common.cdc.CdcCommitMode;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 
@@ -213,4 +219,140 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	default CompletableFuture<Map<String, ColumnSchema>> getAllColumnDefinitionsAsync() {
 		return requestAsync(new GetAllColumnDefinitions());
 	}
+
+    // CDC API
+    default CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
+        return requestAsync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds));
+    }
+
+    default CompletableFuture<Void> cdcDeleteAsync(@NotNull String id) throws RocksDBException {
+        return requestAsync(new RocksDBAPICommand.CdcDelete(id));
+    }
+
+    default CompletableFuture<Void> cdcCommitAsync(@NotNull String id, long seq) throws RocksDBException {
+        return requestAsync(new RocksDBAPICommand.CdcCommit(id, seq));
+    }
+
+    default Publisher<CDCEvent> cdcPollAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
+        return requestAsync(new RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll(id, fromSeq, maxEvents));
+    }
+
+    /**
+     * Returns a continuous stream of CDC events.
+     * <p>
+     * This method automatically handles the polling loop, fetching batches of events
+     * using {@link #cdcPollAsync(String, Long, long)}.
+     * <p>
+     * If the stream catches up (polling returns empty), it waits for the specified {@code pollInterval}
+     * before polling again.
+     *
+     * @param id           CDC subscription ID
+     * @param fromSeq      Start sequence. If null, starts from the server's default (usually last committed + 1).
+     * @param batchSize    Max events per poll
+     * @param pollInterval Wait time when no events are available. If null/zero, defaults to 100ms.
+     * @return A Flux of CDC events
+     */
+    default Flux<CDCEvent> cdcStream(@NotNull String id, @Nullable Long fromSeq, long batchSize, @Nullable Duration pollInterval) {
+        return Flux.defer(() -> {
+            AtomicReference<Long> cursor = new AtomicReference<>(fromSeq);
+            return Flux.generate(sink -> sink.next(cursor))
+                    .concatMap(state -> {
+                        @SuppressWarnings("unchecked")
+                        AtomicReference<Long> c = (AtomicReference<Long>) state;
+                        Long seq = c.get();
+                        return Flux.from(cdcPollAsync(id, seq, batchSize))
+                                .doOnNext(e -> c.set(e.seq() + 1))
+                                .switchIfEmpty(
+                                        (pollInterval != null && !pollInterval.isZero()
+                                                ? Mono.delay(pollInterval)
+                                                : Mono.delay(Duration.ofMillis(100)))
+                                                .then(Mono.empty())
+                                );
+                    });
+        });
+    }
+
+    /**
+     * Returns a continuous stream of CDC processing results with configurable commit mode.
+     * <p>
+     * This method automatically handles the polling loop, processing of events using the provided processor,
+     * and committing the offset based on the {@code commitMode}.
+     * <p>
+     * Events within a batch are processed sequentially to maintain ordering.
+     *
+     * @param id           CDC subscription ID
+     * @param fromSeq      Start sequence. If null, starts from the server's default.
+     * @param batchSize    Max events per poll
+     * @param pollInterval Wait time when no events are available. If null/zero, defaults to 100ms.
+     * @param commitMode   Commit mode (BATCH or PER_EVENT).
+     * @param processor    Function to process each event. Must return a Mono<Void> that completes when processing is done.
+     * @return A Flux<Void> that runs indefinitely (until error or cancellation).
+     */
+    default Flux<Void> cdcStream(@NotNull String id, @Nullable Long fromSeq, long batchSize, @Nullable Duration pollInterval, @NotNull CdcCommitMode commitMode, @NotNull java.util.function.Function<CDCEvent, Mono<Void>> processor) {
+        return Flux.defer(() -> {
+            AtomicReference<Long> cursor = new AtomicReference<>(fromSeq);
+            return Flux.generate(sink -> sink.next(cursor))
+                    .concatMap(state -> {
+                        @SuppressWarnings("unchecked")
+                        AtomicReference<Long> c = (AtomicReference<Long>) state;
+                        Long seq = c.get();
+                        return Flux.from(cdcPollAsync(id, seq, batchSize))
+                                .collectList()
+                                .flatMap(events -> {
+                                    if (events.isEmpty()) {
+                                        return (pollInterval != null && !pollInterval.isZero()
+                                                ? Mono.delay(pollInterval)
+                                                : Mono.delay(Duration.ofMillis(100)))
+                                                .then(Mono.empty());
+                                    }
+                                    long lastSeq = events.get(events.size() - 1).seq();
+                                    c.set(lastSeq + 1);
+
+                                    return Flux.fromIterable(events)
+                                            .concatMap(event -> {
+                                                Mono<Void> p = processor.apply(event);
+                                                if (commitMode == CdcCommitMode.PER_EVENT) {
+                                                    return p.then(Mono.defer(() -> {
+                                                        try {
+                                                            return Mono.fromFuture(cdcCommitAsync(id, event.seq()));
+                                                        } catch (RocksDBException e) {
+                                                            return Mono.error(e);
+                                                        }
+                                                    }));
+                                                }
+                                                return p;
+                                            })
+                                            .then(Mono.defer(() -> {
+                                                if (commitMode == CdcCommitMode.BATCH) {
+                                                    try {
+                                                        return Mono.fromFuture(cdcCommitAsync(id, lastSeq));
+                                                    } catch (RocksDBException e) {
+                                                        return Mono.error(e);
+                                                    }
+                                                }
+                                                return Mono.empty();
+                                            }));
+                                });
+                    });
+        });
+    }
+
+    /**
+     * Returns a continuous stream of CDC processing results.
+     * <p>
+     * This method automatically handles the polling loop, processing of events using the provided processor,
+     * and committing the offset after each batch is successfully processed ({@link CdcCommitMode#BATCH}).
+     * <p>
+     * Events within a batch are processed sequentially to maintain ordering.
+     *
+     * @param id           CDC subscription ID
+     * @param fromSeq      Start sequence. If null, starts from the server's default.
+     * @param batchSize    Max events per poll
+     * @param pollInterval Wait time when no events are available. If null/zero, defaults to 100ms.
+     * @param processor    Function to process each event. Must return a Mono<Void> that completes when processing is done.
+     * @return A Flux<Void> that runs indefinitely (until error or cancellation).
+     */
+    default Flux<Void> cdcStream(@NotNull String id, @Nullable Long fromSeq, long batchSize, @Nullable Duration pollInterval, @NotNull java.util.function.Function<CDCEvent, Mono<Void>> processor) {
+        return cdcStream(id, fromSeq, batchSize, pollInterval, CdcCommitMode.BATCH, processor);
+    }
 }

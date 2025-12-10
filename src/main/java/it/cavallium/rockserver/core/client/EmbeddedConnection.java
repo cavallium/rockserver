@@ -8,6 +8,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Path;
@@ -21,6 +22,7 @@ import java.util.stream.Stream;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
 
 public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, InternalConnection {
 
@@ -96,15 +98,16 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@SuppressWarnings("unchecked")
     @Override
-	public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> req) {
-		return (RA) switch (req) {
-			case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
-			case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
-			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> CompletableFuture.supplyAsync(() -> req.handleSync(this),
-					(req.isReadOnly() ? db.getScheduler().readExecutor() : db.getScheduler().writeExecutor()));
-			case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
-		};
-	}
+    public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> req) {
+        return (RA) switch (req) {
+            case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
+            case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
+            case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
+            case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> CompletableFuture.supplyAsync(() -> req.handleSync(this),
+                    (req.isReadOnly() ? db.getScheduler().readExecutor() : db.getScheduler().writeExecutor()));
+            case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
+        };
+    }
 
 	@Override
 	public <T> T put(long transactionOrUpdateId,
@@ -232,9 +235,9 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public Map<String, ColumnSchema> getAllColumnDefinitions() throws RocksDBException {
-		return db.getAllColumnDefinitions();
-	}
+ public Map<String, ColumnSchema> getAllColumnDefinitions() throws RocksDBException {
+        return db.getAllColumnDefinitions();
+    }
 
     @Override
     public RWScheduler getScheduler() {
@@ -244,5 +247,27 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
     @org.jetbrains.annotations.VisibleForTesting
     public EmbeddedDB getInternalDB() {
         return db;
+    }
+
+    // CDC API implementation stubs delegating to EmbeddedDB
+    public long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
+        return db.cdcCreate(id, fromSeq, columnIds);
+    }
+
+    public void cdcDelete(@NotNull String id) throws RocksDBException {
+        db.cdcDelete(id);
+    }
+
+    public void cdcCommit(@NotNull String id, long seq) throws RocksDBException {
+        db.cdcCommit(id, seq);
+    }
+
+    public @NotNull java.util.stream.Stream<CDCEvent> cdcPoll(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
+        return db.cdcPoll(id, fromSeq, maxEvents);
+    }
+
+    public @NotNull Publisher<CDCEvent> cdcPollAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
+        // Default: defer to DB implementation; fallback to blocking stream if async is not supported
+        return db.cdcPollAsyncInternal(id, fromSeq, maxEvents);
     }
 }

@@ -73,6 +73,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
@@ -167,6 +168,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				yield Flux.from(asyncResponse).toStream();
 			}
 		};
+	}
+
+	@Override
+	public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> req) {
+		return req.handleAsync(this);
 	}
 
 	@Override
@@ -562,6 +568,43 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 					.map(kv -> mapKV(kv)));
 		};
 	}
+
+    // ============ CDC Async API ============
+
+    @Override
+    public CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
+        var builder = CdcCreateRequest.newBuilder().setId(id);
+        if (fromSeq != null) builder.setFromSeq(fromSeq);
+        if (columnIds != null) builder.addAllColumnIds(columnIds);
+        return toResponse(futureStub.cdcCreate(builder.build()), CdcCreateResponse::getStartSeq);
+    }
+
+    @Override
+    public CompletableFuture<Void> cdcDeleteAsync(@NotNull String id) throws RocksDBException {
+        return toResponse(futureStub.cdcDelete(CdcDeleteRequest.newBuilder().setId(id).build()), _ -> null);
+    }
+
+    @Override
+    public CompletableFuture<Void> cdcCommitAsync(@NotNull String id, long seq) throws RocksDBException {
+        return toResponse(futureStub.cdcCommit(CdcCommitRequest.newBuilder().setId(id).setSeq(seq).build()), _ -> null);
+    }
+
+    @Override
+    public Publisher<CDCEvent> cdcPollAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
+        var builder = CdcPollRequest.newBuilder().setId(id).setMaxEvents(maxEvents);
+        if (fromSeq != null) builder.setFromSeq(fromSeq);
+        return reactiveStub.cdcPoll(builder.build()).map(GrpcConnection::mapCDCEvent);
+    }
+
+    private static CDCEvent mapCDCEvent(it.cavallium.rockserver.core.common.api.proto.CDCEvent ev) {
+        var op = switch (ev.getOp()) {
+            case PUT -> CDCEvent.Op.PUT;
+            case DELETE -> CDCEvent.Op.DELETE;
+            case MERGE -> CDCEvent.Op.MERGE;
+            case UNRECOGNIZED -> CDCEvent.Op.PUT;
+        };
+        return new CDCEvent(ev.getSeq(), ev.getColumnId(), mapByteString(ev.getKey()), mapByteString(ev.getValue()), op);
+    }
 
 	@Override
 	public CompletableFuture<Void> flushAsync() {

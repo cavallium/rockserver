@@ -75,6 +75,7 @@ import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
+import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 
 public class GrpcServer extends Server {
 
@@ -125,6 +126,10 @@ public class GrpcServer extends Server {
 	@Override
 	public void start() throws IOException {
 		server.start();
+	}
+
+	public int getPort() {
+		return server.getPort();
 	}
 
 	private static class GzipCompressorInterceptor implements ServerInterceptor {
@@ -741,6 +746,61 @@ public class GrpcServer extends Server {
 				return UploadMergeOperatorResponse.newBuilder().setVersion(version).build();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("uploadMergeOperator", request));
 		}
+
+            // ============ CDC RPCs ============
+
+            @Override
+            public Mono<CdcCreateResponse> cdcCreate(CdcCreateRequest request) {
+                return executeSync(() -> {
+                    Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
+                    var cols = request.getColumnIdsCount() > 0 ? request.getColumnIdsList().stream().map(Long::valueOf).toList() : null;
+                    long startSeq = api.cdcCreate(request.getId(), fromSeq, cols);
+                    return CdcCreateResponse.newBuilder().setStartSeq(startSeq).build();
+                }, false).transform(this.onErrorMapMonoWithRequestInfo("cdcCreate", request));
+            }
+
+            @Override
+            public Mono<Empty> cdcDelete(CdcDeleteRequest request) {
+                return executeSync(() -> {
+                    api.cdcDelete(request.getId());
+                    return Empty.getDefaultInstance();
+                }, false).transform(this.onErrorMapMonoWithRequestInfo("cdcDelete", request));
+            }
+
+            @Override
+            public Flux<it.cavallium.rockserver.core.common.api.proto.CDCEvent> cdcPoll(CdcPollRequest request) {
+                long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
+                Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
+                return Flux
+                        .from(asyncApi.cdcPollAsync(request.getId(), fromSeq, maxEvents))
+                        .map(GrpcServerImpl::mapCDCEvent)
+                        .transform(this.onErrorMapFluxWithRequestInfo("cdcPoll", request));
+            }
+
+            @Override
+            public Mono<Empty> cdcCommit(CdcCommitRequest request) {
+                return executeSync(() -> {
+                    api.cdcCommit(request.getId(), request.getSeq());
+                    return Empty.getDefaultInstance();
+                }, false).transform(this.onErrorMapMonoWithRequestInfo("cdcCommit", request));
+            }
+
+            private static it.cavallium.rockserver.core.common.api.proto.CDCEvent mapCDCEvent(CDCEvent ev) {
+                var builder = it.cavallium.rockserver.core.common.api.proto.CDCEvent.newBuilder()
+                        .setSeq(ev.seq())
+                        .setColumnId(ev.columnId())
+                        .setKey(Utils.toByteString(ev.key()));
+                if (ev.value() != null && !ev.value().isEmpty()) {
+                    builder.setValue(Utils.toByteString(ev.value()));
+                }
+                var op = switch (ev.op()) {
+                    case PUT -> it.cavallium.rockserver.core.common.api.proto.CDCEvent.Op.PUT;
+                    case DELETE -> it.cavallium.rockserver.core.common.api.proto.CDCEvent.Op.DELETE;
+                    case MERGE -> it.cavallium.rockserver.core.common.api.proto.CDCEvent.Op.MERGE;
+                };
+                builder.setOp(op);
+                return builder.build();
+            }
 
 		// utils
 

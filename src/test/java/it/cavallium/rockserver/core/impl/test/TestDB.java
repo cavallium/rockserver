@@ -88,19 +88,19 @@ public class TestDB implements AutoCloseable {
 
 	@Override
 	public void close() {
-		try {
-			if (!(server instanceof EmbeddedConnection)) {
+		if (api instanceof AutoCloseable autoCloseable && !(api instanceof EmbeddedConnection)) {
+			try {
+				autoCloseable.close();
+			} catch (Exception e) {
+				// Ignore exceptions during close
+			}
+		}
+		if (!(server instanceof EmbeddedConnection)) {
+			try {
 				this.server.close();
+			} catch (Exception e) {
+				// Ignore exceptions during close
 			}
-			if (api instanceof AutoCloseable autoCloseable && !(api instanceof EmbeddedConnection)) {
-				try {
-					autoCloseable.close();
-				} catch (Exception e) {
-					throw new RuntimeException(e);
-				}
-			}
-		} catch (IOException e) {
-			throw new RuntimeException(e);
 		}
 	}
 

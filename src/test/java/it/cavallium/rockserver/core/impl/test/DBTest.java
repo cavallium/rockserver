@@ -7,6 +7,7 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
+import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.impl.MyStringAppendOperator;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -16,6 +17,7 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
@@ -30,6 +32,7 @@ import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 @TestMethodOrder(MethodOrderer.MethodName.class)
 abstract class DBTest {
@@ -801,6 +804,213 @@ database: {
 					() -> Utils.valueEquals(value1, db.get(1, colId, key1, RequestType.current()))
 			);
 			Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(0, colId, key1, null)));
+		}
+	}
+
+	@TestAllImplementations
+	void testCdcStream(String name, ConnectionConfig connection) throws Exception {
+		// Skip for THRIFT if CDC is not implemented there (it's not implemented in Thrift yet based on previous steps)
+		// But connection config might cover Thrift.
+		// Let's assume only GRPC and EMBEDDED support CDC for now.
+		// The error "Method not found" or similar might occur.
+		if (connection.method() == ConnectionMethod.THRIFT) {
+			return;
+		}
+
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			
+			// 1. Create CDC subscription
+			// Use a unique ID to avoid conflicts if parallel tests run (though DBTest usually sequential per instance)
+			String subId = "sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+			long startSeq = api.cdcCreate(subId, null, null);
+			
+			// 2. Put data
+			fillSomeKeys();
+			
+			// 3. Consume via stream
+			// We expect 3 events from fillSomeKeys
+			int expectedEvents = 3;
+			
+			List<CDCEvent> events = api.cdcStream(subId, startSeq, 10, Duration.ofMillis(50))
+					.take(expectedEvents)
+					.collectList()
+					.block(Duration.ofSeconds(10));
+			
+			Assertions.assertNotNull(events);
+			Assertions.assertEquals(expectedEvents, events.size());
+			
+			// Verify sequence strictly increasing
+			long lastSeq = startSeq - 1;
+			for (CDCEvent ev : events) {
+				Assertions.assertTrue(ev.seq() > lastSeq, "Sequence should increase: " + ev.seq() + " > " + lastSeq);
+				lastSeq = ev.seq();
+				Assertions.assertEquals(colId, ev.columnId());
+				Assertions.assertEquals(CDCEvent.Op.PUT, ev.op());
+			}
+			
+			// 4. Commit last
+			api.cdcCommit(subId, lastSeq);
+		}
+	}
+
+	@TestAllImplementations
+	void testCdcWithMergeAndReactiveClient(String name, ConnectionConfig connection) throws Exception {
+		if (connection.method() == ConnectionMethod.THRIFT) {
+			return;
+		}
+
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			// Use fallback options which include MyStringAppendOperator
+			long mergeColId = api.createColumn("messages-merge-" + name,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+
+			String subId = "merge-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+			long startSeq = api.cdcCreate(subId, null, null);
+
+			var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
+			var val1 = Buf.wrap("Initial".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+			// 1. Initial Put
+			api.putAsync(0, mergeColId, key1, val1, RequestType.none()).join();
+
+			// 2. Merge (Patch)
+			var patchVal = Buf.wrap("-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			api.mergeAsync(0, mergeColId, key1, patchVal, RequestType.none()).join();
+
+			// 3. Verify CDC Stream
+			// We expect: PUT(Initial) -> MERGE(-Patched)
+			List<CDCEvent> events = api.cdcStream(subId, startSeq, 100, Duration.ofMillis(10))
+					.take(2)
+					.collectList()
+					.block(Duration.ofSeconds(5));
+
+			Assertions.assertNotNull(events);
+			Assertions.assertEquals(2, events.size());
+
+			// Event 1: PUT
+			CDCEvent ev1 = events.get(0);
+			Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
+			assertSegmentEquals(val1, ev1.value());
+
+			// Event 2: MERGE
+			CDCEvent ev2 = events.get(1);
+			Assertions.assertEquals(CDCEvent.Op.MERGE, ev2.op());
+			// In CDC MERGE event, value is the operand (patch)
+			assertSegmentEquals(patchVal, ev2.value());
+
+			// 4. Verify Final State in DB
+			Buf current = api.get(0, mergeColId, key1, RequestType.current());
+			// MyStringAppendOperator appends with a comma separator
+			Buf expected = Buf.wrap("Initial,-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			assertSegmentEquals(expected, current);
+
+			// 5. Commit
+			api.cdcCommit(subId, ev2.seq());
+		}
+	}
+
+	@TestAllImplementations
+	void testCdcRobustness(String name, ConnectionConfig connection) throws Exception {
+		if (connection.method() == ConnectionMethod.THRIFT) {
+			return;
+		}
+
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			String subId = "robust-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+			long startSeq = api.cdcCreate(subId, null, null);
+
+			int countBatch1 = 50;
+			int countBatch2 = 50;
+			var kvSequence = getKVSequence();
+			
+			// 1. Put batch 1
+			for (int i = 0; i < countBatch1; i++) {
+				var kv = kvSequence.get(i);
+				api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
+			}
+
+			// 2. Consume with stream (backpressure check via limit/iterator)
+			// Use small internal batch size to force multiple fetches
+			long cdcBatchSize = 10;
+
+			// Consume first 30 events
+			int consumeCount1 = 30;
+			List<CDCEvent> received1 = api.cdcStream(subId, null, cdcBatchSize, Duration.ofMillis(10))
+					.take(consumeCount1)
+					.collectList()
+					.block(Duration.ofSeconds(10));
+
+			Assertions.assertNotNull(received1);
+			Assertions.assertEquals(consumeCount1, received1.size());
+			Assertions.assertTrue(received1.get(0).seq() >= startSeq, "First event seq " + received1.get(0).seq() + " should be >= startSeq " + startSeq);
+			long lastSeq = received1.get(received1.size() - 1).seq();
+
+			// 3. Commit the last processed sequence
+			api.cdcCommit(subId, lastSeq);
+
+			// 4. Put batch 2
+			for (int i = 0; i < countBatch2; i++) {
+				var kv = kvSequence.get(countBatch1 + i);
+				api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
+			}
+
+			// 5. Resume stream (from null -> should pick up from commit)
+			// We expect to see remaining 20 from batch1 + 50 from batch2 = 70 events
+			int expectedRemaining = (countBatch1 - consumeCount1) + countBatch2;
+
+			List<CDCEvent> received2 = api.cdcStream(subId, null, cdcBatchSize, Duration.ofMillis(10))
+					.take(expectedRemaining)
+					.collectList()
+					.block(Duration.ofSeconds(10));
+
+			Assertions.assertNotNull(received2);
+			Assertions.assertEquals(expectedRemaining, received2.size());
+
+			// Verify strictly increasing
+			long prev = lastSeq;
+			for (CDCEvent ev : received2) {
+				Assertions.assertTrue(ev.seq() > prev, "Seq increasing: " + ev.seq() + " > " + prev);
+				prev = ev.seq();
+			}
+		}
+	}
+
+	@TestAllImplementations
+	void testCdcStreamWithProcessor(String name, ConnectionConfig connection) throws Exception {
+		if (connection.method() == ConnectionMethod.THRIFT) {
+			return;
+		}
+
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+			String subId = "proc-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+			long startSeq = api.cdcCreate(subId, null, null);
+
+			int count = 20;
+			var kvSequence = getKVSequence();
+			for (int i = 0; i < count; i++) {
+				var kv = kvSequence.get(i);
+				api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
+			}
+
+			java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(count);
+
+			// Batch size 5. We expect 4 batches of 5.
+			var disposable = api.cdcStream(subId, startSeq, 5, Duration.ofMillis(50), event -> {
+				latch.countDown();
+				return Mono.empty();
+			})
+			.subscribe();
+
+			boolean finished = latch.await(10, java.util.concurrent.TimeUnit.SECONDS);
+			// Wait a tiny bit to allow the commit of the last batch to potentially complete (async)
+			Thread.sleep(200);
+			disposable.dispose();
+			
+			Assertions.assertTrue(finished, "Did not process all events in time");
 		}
 	}
 }

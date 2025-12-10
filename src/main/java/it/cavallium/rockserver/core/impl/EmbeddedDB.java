@@ -106,14 +106,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MarkerFactory;
 import reactor.core.publisher.Flux;
+import it.cavallium.rockserver.core.common.cdc.CDCEvent;
+import org.rocksdb.TransactionLogIterator;
+import org.rocksdb.WriteBatch;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.IntFunction;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
 	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
-	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
-	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
-	private static final byte[] MERGE_OPERATORS_COLUMN = "_merge_operators_".getBytes(StandardCharsets.UTF_8);
-	private final Logger logger;
+ public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
+ private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
+ private static final byte[] MERGE_OPERATORS_COLUMN = "_merge_operators_".getBytes(StandardCharsets.UTF_8);
+ private static final byte[] CDC_META_COLUMN = "_cdc_meta_".getBytes(StandardCharsets.UTF_8);
+ private final Logger logger;
 	private final ActionLoggerConsumer actionLogger;
 	private final @Nullable Path path;
 	private final @NotNull Path definitiveDbPath;
@@ -123,6 +129,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final ScheduledExecutorService leakScheduler;
 	private final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
 	private final ColumnFamilyHandle mergeOperatorsColumnDescriptorHandle;
+	private final ColumnFamilyHandle cdcMetaColumnDescriptorHandle;
 	private final MergeOperatorRegistry mergeOperatorRegistry;
 	private final NonBlockingHashMapLong<ColumnInstance> columns;
 	private final Map<String, ColumnFamilyOptions> columnsConifg;
@@ -156,11 +163,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer flushTimer;
  private final Timer compactTimer;
  private final Timer getAllColumnDefinitionsTimer;
- private final RocksDBStatistics rocksDBStatistics;
+	private final RocksDBStatistics rocksDBStatistics;
 	private final boolean fastGet;
 	private Path tempSSTsPath;
+    // Cache mapping from RocksDB internal CF id -> rockserver columnId
+    private final ConcurrentHashMap<Integer, Long> cfIdToColumnId = new ConcurrentHashMap<>();
 
-	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
+ public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
 		this.path = path;
 		this.name = name;
 		this.logger = LoggerFactory.getLogger("db." + name);
@@ -401,7 +410,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} else {
 			this.mergeOperatorsColumnDescriptorHandle = existingMergeOperatorsColumnDescriptorOptional.get().getValue();
 		}
-  this.mergeOperatorRegistry = new MergeOperatorRegistry(db.get(), mergeOperatorsColumnDescriptorHandle);
+		this.mergeOperatorRegistry = new MergeOperatorRegistry(db.get(), mergeOperatorsColumnDescriptorHandle);
+
+		// Ensure CDC meta column-family exists
+		var existingCdcMetaColumnDescriptorOptional = db
+				.getStartupColumns()
+				.entrySet()
+				.stream()
+				.filter(e -> Arrays.equals(e.getKey().getName(), CDC_META_COLUMN))
+				.findAny();
+		if (existingCdcMetaColumnDescriptorOptional.isEmpty()) {
+			var cdcMetaDescriptor = new ColumnFamilyDescriptor(CDC_META_COLUMN);
+			try {
+				cdcMetaColumnDescriptorHandle = db.get().createColumnFamily(cdcMetaDescriptor);
+			} catch (org.rocksdb.RocksDBException e) {
+				throw new IOException("Cannot create CDC meta column", e);
+			}
+		} else {
+			this.cdcMetaColumnDescriptorHandle = existingCdcMetaColumnDescriptorOptional.get().getValue();
+		}
 
 		// Metrics for merge-operator cache sizes (diagnostics to detect leaks in uploaded operators)
 		try {
@@ -416,9 +443,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					.register(registry));
 		} catch (Throwable ex) {
 			logger.error("Failed to load metrics", ex);
-		}
+  }
 
-		try (var it = this.db.get().newIterator(columnSchemasColumnDescriptorHandle)) {
+  try (var it = this.db.get().newIterator(columnSchemasColumnDescriptorHandle)) {
 			it.seekToFirst();
 			while (it.isValid()) {
 				var key = it.key();
@@ -441,12 +468,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
                 it.next();
             }
         }
-		if (Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
-			logger.info("Database configuration: {}", ConfigPrinter.stringify(config));
-		}
-		var afterLoad = Instant.now();
+  if (Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
+            logger.info("Database configuration: {}", ConfigPrinter.stringify(config));
+        }
+        var afterLoad = Instant.now();
 
-		loadTimer.record(Duration.between(beforeLoad, afterLoad));
+        loadTimer.record(Duration.between(beforeLoad, afterLoad));
 	}
 
 	private Timer createActionTimer(Class<? extends RocksDBAPICommand> className) {
@@ -538,33 +565,40 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * The column must be registered once!!!
 	 * Do not try to register a column that may already be registered
 	 */
-	private long registerColumn(@NotNull ColumnInstance column) {
-		synchronized (columnEditLock) {
-			try {
-				var columnName = new String(column.cfh().getName(), StandardCharsets.UTF_8);
-				long hashCode = columnName.hashCode();
-				long id;
-				if (Objects.equals(this.columnNamesIndex.get(columnName), hashCode)) {
-					id = hashCode;
-				} else if (this.columns.get(hashCode) == null) {
-					id = hashCode;
-					this.columns.put(id, column);
-				} else {
-					id = FastRandomUtils.allocateNewValue(this.columns, column, 1, Long.MAX_VALUE);
-				}
-				Long previous = this.columnNamesIndex.putIfAbsent(columnName, id);
-				if (previous != null) {
-					//noinspection resource
-					this.columns.remove(id);
-					throw new UnsupportedOperationException("Column already registered!");
-				}
-				logger.info("Registered column: " + column);
-				return id;
-			} catch (org.rocksdb.RocksDBException e) {
-				throw new RuntimeException(e);
-			}
-		}
-	}
+ private long registerColumn(@NotNull ColumnInstance column) {
+        synchronized (columnEditLock) {
+            try {
+                var columnName = new String(column.cfh().getName(), StandardCharsets.UTF_8);
+                long hashCode = columnName.hashCode();
+                long id;
+                if (Objects.equals(this.columnNamesIndex.get(columnName), hashCode)) {
+                    id = hashCode;
+                } else if (this.columns.get(hashCode) == null) {
+                    id = hashCode;
+                    this.columns.put(id, column);
+                } else {
+                    id = FastRandomUtils.allocateNewValue(this.columns, column, 1, Long.MAX_VALUE);
+                }
+                Long previous = this.columnNamesIndex.putIfAbsent(columnName, id);
+                if (previous != null) {
+                    //noinspection resource
+                    this.columns.remove(id);
+                    throw new UnsupportedOperationException("Column already registered!");
+                }
+                // Map RocksDB CF internal id to our column id for CDC fallback paths
+                try {
+                    int cfInternalId = column.cfh().getID();
+                    this.cfIdToColumnId.put(cfInternalId, id);
+                } catch (Throwable ignored) {
+                    // Older RocksJava may not expose getID; CDC will use handle-based callbacks instead
+                }
+                logger.info("Registered column: " + column);
+                return id;
+            } catch (org.rocksdb.RocksDBException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
 
 	/**
 	 * The column must be unregistered once!!!
@@ -574,17 +608,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		synchronized (columnEditLock) {
 			var col = this.columns.remove(id);
 			Objects.requireNonNull(col, () -> "Column does not exist: " + id);
-			String name;
-			try {
-				name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
-			} catch (org.rocksdb.RocksDBException e) {
-				throw new RuntimeException(e);
-			}
-			// Unregister the column name from the index avoiding race conditions
-			int retries = 0;
-			while (this.columnNamesIndex.remove(name) == null && retries++ < 5_000) {
-				Thread.yield();
-			}
+   String name;
+   try {
+       name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
+   } catch (org.rocksdb.RocksDBException e) {
+       throw new RuntimeException(e);
+   }
+   // Remove CF id mapping
+   try {
+       int cfInternalId = col.cfh().getID();
+       this.cfIdToColumnId.remove(cfInternalId);
+   } catch (Throwable ignored) {
+   }
+   // Unregister the column name from the index avoiding race conditions
+   int retries = 0;
+   while (this.columnNamesIndex.remove(name) == null && retries++ < 5_000) {
+       Thread.yield();
+   }
 			if (retries >= 5000) {
 				throw new IllegalStateException("Can't find column in column names index: " + name);
 			}
@@ -2585,8 +2625,322 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return scheduler;
 	}
 
-	private static interface ActionLoggerConsumer {
-		void logAction(String action, long actionId, Object column, Object key, Object valueOrEndKey, Object txOrUpdateId, Object commit, Object timeoutMs, Object requestType);
-	}
+ private static interface ActionLoggerConsumer {
+        void logAction(String action, long actionId, Object column, Object key, Object valueOrEndKey, Object txOrUpdateId, Object commit, Object timeoutMs, Object requestType);
+    }
 
+    // ============ CDC API (durable CDC using WAL) ============
+
+    private static final int CDC_OP_INDEX_BITS = 20; // up to ~1M ops per batch
+    private static final long CDC_OP_INDEX_MASK = (1L << CDC_OP_INDEX_BITS) - 1L;
+    private static final long CDC_DEFAULT_MAX_EVENTS = 10_000L;
+
+    private static long composeCdcSeq(long walSeq, int opIndex) {
+        return (walSeq << CDC_OP_INDEX_BITS) | (opIndex & CDC_OP_INDEX_MASK);
+    }
+
+    private static long extractWalSeq(long cdcSeq) {
+        return cdcSeq >>> CDC_OP_INDEX_BITS;
+    }
+
+    private static int extractOpIndex(long cdcSeq) {
+        return (int) (cdcSeq & CDC_OP_INDEX_MASK);
+    }
+
+    private record CdcSubscriptionMeta(long lastCommittedSeq, @Nullable long[] columnFilter) { }
+
+    private byte[] cdcKeyOf(String id) {
+        return ("sub:" + id).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private void saveCdcMeta(String id, CdcSubscriptionMeta meta) throws org.rocksdb.RocksDBException {
+        try (var baos = new ByteArrayOutputStream(); var dos = new DataOutputStream(baos)) {
+            dos.writeByte(1); // version
+            dos.writeLong(meta.lastCommittedSeq);
+            var filter = meta.columnFilter;
+            dos.writeBoolean(filter != null);
+            if (filter != null) {
+                dos.writeInt(filter.length);
+                for (long f : filter) dos.writeLong(f);
+            }
+            dos.flush();
+            db.get().put(cdcMetaColumnDescriptorHandle, cdcKeyOf(id), baos.toByteArray());
+        } catch (IOException e) {
+            throw new org.rocksdb.RocksDBException(e.getMessage());
+        }
+    }
+
+    private @Nullable CdcSubscriptionMeta loadCdcMeta(String id) throws org.rocksdb.RocksDBException {
+        var val = db.get().get(cdcMetaColumnDescriptorHandle, cdcKeyOf(id));
+        if (val == null) return null;
+        try (var dis = new DataInputStream(new ByteArrayInputStream(val))) {
+            int ver = dis.readUnsignedByte();
+            if (ver != 1) throw new IOException("Unknown CDC meta version: " + ver);
+            long lastCommittedSeq = dis.readLong();
+            boolean hasFilter = dis.readBoolean();
+            long[] filter = null;
+            if (hasFilter) {
+                int n = dis.readInt();
+                filter = new long[n];
+                for (int i = 0; i < n; i++) filter[i] = dis.readLong();
+            }
+            return new CdcSubscriptionMeta(lastCommittedSeq, filter);
+        } catch (IOException e) {
+            throw new org.rocksdb.RocksDBException(e.getMessage());
+        }
+    }
+
+    private long findEarliestAvailableWalSeq() {
+        try (TransactionLogIterator it = db.get().getUpdatesSince(0)) {
+            if (it != null && it.isValid()) {
+                return it.getBatch().sequenceNumber();
+            }
+            return db.get().getLatestSequenceNumber() + 1; // empty DB
+        } catch (org.rocksdb.RocksDBException e) {
+            throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+        }
+    }
+
+    @Override
+    public long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
+        Objects.requireNonNull(id, "id");
+        try {
+            var existing = loadCdcMeta(id);
+            // Determine start sequence (CDC-level)
+            long startSeq;
+            if (fromSeq != null) {
+                startSeq = fromSeq == 0L ? composeCdcSeq(findEarliestAvailableWalSeq(), 0) : fromSeq;
+            } else {
+                if (existing != null) {
+                    startSeq = existing.lastCommittedSeq + 1;
+                } else {
+                    // default: latest+1
+                    long latestWal = db.get().getLatestSequenceNumber();
+                    startSeq = composeCdcSeq(latestWal + 1, 0);
+                }
+            }
+
+            // Persist subscription
+            long lastCommittedToPersist;
+            if (existing == null) {
+                lastCommittedToPersist = startSeq - 1;
+            } else {
+                lastCommittedToPersist = existing.lastCommittedSeq;
+            }
+            long[] filter = existing != null ? existing.columnFilter : null;
+            if (columnIds != null) {
+                filter = columnIds.stream().mapToLong(Long::longValue).toArray();
+            }
+            saveCdcMeta(id, new CdcSubscriptionMeta(lastCommittedToPersist, filter));
+            return startSeq;
+        } catch (org.rocksdb.RocksDBException e) {
+            throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+        }
+    }
+
+    @Override
+    public void cdcDelete(@NotNull String id) throws RocksDBException {
+        Objects.requireNonNull(id, "id");
+        try {
+            db.get().delete(cdcMetaColumnDescriptorHandle, cdcKeyOf(id));
+        } catch (org.rocksdb.RocksDBException e) {
+            throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+        }
+    }
+
+    @Override
+    public void cdcCommit(@NotNull String id, long seq) throws RocksDBException {
+        Objects.requireNonNull(id, "id");
+        try {
+            var existing = loadCdcMeta(id);
+            if (existing == null) {
+                throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "CDC subscription not found: " + id);
+            }
+            long newCommitted = Math.max(existing.lastCommittedSeq, seq);
+            saveCdcMeta(id, new CdcSubscriptionMeta(newCommitted, existing.columnFilter));
+        } catch (org.rocksdb.RocksDBException e) {
+            throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+        }
+    }
+
+    private class EventCollector extends WriteBatch.Handler {
+        private final List<CDCEvent> out;
+        private final Map<String, Long> colNameToId;
+        private final @Nullable java.util.Set<Long> filter;
+        private final long walSeq;
+        private final int skipFirstOps;
+        private int seenOps = 0;
+        private long produced = 0;
+        private final long maxToProduce;
+
+        EventCollector(List<CDCEvent> out, Map<String, Long> colNameToId, @Nullable long[] filterArr,
+                       long walSeq, int skipFirstOps, long maxToProduce) {
+            this.out = out;
+            this.colNameToId = colNameToId;
+            this.filter = filterArr == null ? null : new java.util.HashSet<>();
+            if (this.filter != null) for (long f : filterArr) this.filter.add(f);
+            this.walSeq = walSeq;
+            this.skipFirstOps = skipFirstOps;
+            this.maxToProduce = maxToProduce;
+        }
+
+        private void maybeEmit(org.rocksdb.ColumnFamilyHandle cfh, byte[] key, @Nullable byte[] value,
+                               CDCEvent.Op op) {
+            if (produced >= maxToProduce) return;
+            seenOps++;
+            if (seenOps <= skipFirstOps) return;
+            String cfName;
+            try {
+                cfName = new String(cfh.getName(), StandardCharsets.UTF_8);
+            } catch (org.rocksdb.RocksDBException e) {
+                return; // skip on error
+            }
+            Long colId = colNameToId.get(cfName);
+            if (colId == null) return; // skip internal CFs
+            if (filter != null && !filter.contains(colId)) return;
+            int opIndex = seenOps - 1; // zero-based
+            long seq = composeCdcSeq(walSeq, opIndex);
+            // For bucketed columns, expose only the fixed-key portion as CDC key
+            byte[] finalKey = key;
+            var colInstance = EmbeddedDB.this.columns.get(colId);
+            if (colInstance != null && colInstance.hasBuckets()) {
+                int fixedCount = colInstance.schema().fixedLengthKeysCount();
+                int fixedBytes = 0;
+                for (int i = 0; i < fixedCount; i++) fixedBytes += colInstance.schema().key(i);
+                if (fixedBytes < finalKey.length) {
+                    finalKey = java.util.Arrays.copyOf(finalKey, fixedBytes);
+                }
+            }
+            out.add(new CDCEvent(seq, colId, Buf.wrap(finalKey), value != null ? Buf.wrap(value) : emptyBuf(), op));
+            produced++;
+        }
+
+        private void maybeEmitByCfId(int columnFamilyId, byte[] key, @Nullable byte[] value, CDCEvent.Op op) {
+            if (produced >= maxToProduce) return;
+            seenOps++;
+            if (seenOps <= skipFirstOps) return;
+            Long colId = cfIdToColumnId.get(columnFamilyId);
+            if (colId == null) return;
+            if (filter != null && !filter.contains(colId)) return;
+            int opIndex = seenOps - 1;
+            long seq = composeCdcSeq(walSeq, opIndex);
+            byte[] finalKey = key;
+            var colInstance = EmbeddedDB.this.columns.get(colId);
+            if (colInstance != null && colInstance.hasBuckets()) {
+                int fixedCount = colInstance.schema().fixedLengthKeysCount();
+                int fixedBytes = 0;
+                for (int i = 0; i < fixedCount; i++) fixedBytes += colInstance.schema().key(i);
+                if (fixedBytes < finalKey.length) {
+                    finalKey = java.util.Arrays.copyOf(finalKey, fixedBytes);
+                }
+            }
+            out.add(new CDCEvent(seq, colId, Buf.wrap(finalKey), value != null ? Buf.wrap(value) : emptyBuf(), op));
+            produced++;
+        }
+
+        // Methods for RocksJava versions that dispatch with column family handle
+        public void put(org.rocksdb.ColumnFamilyHandle cfh, byte[] key, byte[] value) { maybeEmit(cfh, key, value, CDCEvent.Op.PUT); }
+        public void merge(org.rocksdb.ColumnFamilyHandle cfh, byte[] key, byte[] value) { maybeEmit(cfh, key, value, CDCEvent.Op.MERGE); }
+        public void delete(org.rocksdb.ColumnFamilyHandle cfh, byte[] key) { maybeEmit(cfh, key, null, CDCEvent.Op.DELETE); }
+        public void singleDelete(org.rocksdb.ColumnFamilyHandle cfh, byte[] key) { /* treat as delete */ maybeEmit(cfh, key, null, CDCEvent.Op.DELETE); }
+        public void deleteRange(org.rocksdb.ColumnFamilyHandle cfh, byte[] beginKey, byte[] endKey) { /* no-op for CDC */ }
+        public void putBlobIndex(org.rocksdb.ColumnFamilyHandle cfh, byte[] key, byte[] value) { maybeEmit(cfh, key, value, CDCEvent.Op.PUT); }
+
+        // Fallback methods for RocksJava versions that dispatch with column family id.
+        public void put(int columnFamilyId, byte[] key, byte[] value) { maybeEmitByCfId(columnFamilyId, key, value, CDCEvent.Op.PUT); }
+        public void merge(int columnFamilyId, byte[] key, byte[] value) { maybeEmitByCfId(columnFamilyId, key, value, CDCEvent.Op.MERGE); }
+        public void delete(int columnFamilyId, byte[] key) { maybeEmitByCfId(columnFamilyId, key, null, CDCEvent.Op.DELETE); }
+        public void singleDelete(int columnFamilyId, byte[] key) { maybeEmitByCfId(columnFamilyId, key, null, CDCEvent.Op.DELETE); }
+        public void deleteRange(int columnFamilyId, byte[] beginKey, byte[] endKey) { /* no-op */ }
+        public void putBlobIndex(int columnFamilyId, byte[] key, byte[] value) { /* no-op */ }
+
+        // Default CF methods; we have no reliable mapping for default either, skip by default.
+        public void put(byte[] key, byte[] value) { /* skip */ }
+        public void merge(byte[] key, byte[] value) { /* skip */ }
+        public void delete(byte[] key) { /* skip */ }
+        public void singleDelete(byte[] key) { /* no-op */ }
+        public void deleteRange(byte[] beginKey, byte[] endKey) { /* no-op */ }
+
+        // Optional extra callbacks in newer RocksJava; keep as no-ops for compatibility
+        public void logData(byte[] blob) { /* no-op */ }
+        public void markBeginPrepare() { /* no-op */ }
+        public void markEndPrepare(byte[] xid) { /* no-op */ }
+        public void markCommit(byte[] xid) { /* no-op */ }
+        public void markRollback(byte[] xid) { /* no-op */ }
+        public void markNoop(boolean emptyBatch) { /* no-op */ }
+        public void markCommitWithTimestamp(byte[] xid, byte[] ts) { /* no-op */ }
+    }
+
+    private List<CDCEvent> cdcPollOnce(String id, long fromSeq, long maxEvents) {
+        try {
+            var meta = loadCdcMeta(id);
+            if (meta == null) {
+                throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "CDC subscription not found: " + id);
+            }
+            long effectiveMax = maxEvents > 0 ? maxEvents : CDC_DEFAULT_MAX_EVENTS;
+            long startSeq = fromSeq != 0 ? fromSeq : composeCdcSeq(findEarliestAvailableWalSeq(), 0);
+            long walStart = extractWalSeq(startSeq);
+            int opStart = extractOpIndex(startSeq);
+            long iteratorStartWal = walStart;
+            
+            List<CDCEvent> result = new ArrayList<>((int) Math.min(1024, effectiveMax));
+            // Ensure WAL is flushed to be visible to TransactionLogIterator
+            db.get().flushWal(true);
+            try (TransactionLogIterator it = db.get().getUpdatesSince(iteratorStartWal)) {
+                while (result.size() < effectiveMax && it != null && it.isValid()) {
+                    var br = it.getBatch();
+                    long batchWalSeq = br.sequenceNumber();
+                    if (batchWalSeq < walStart) {
+                        it.next();
+                        continue;
+                    }
+                    var wb = br.writeBatch();
+                    int skipOps = (batchWalSeq == walStart) ? opStart : 0;
+                    var handler = new EventCollector(result, this.columnNamesIndex, meta.columnFilter, batchWalSeq, skipOps, effectiveMax - result.size());
+                    wb.iterate(handler);
+                    if (result.size() >= effectiveMax) break;
+                    it.next();
+                }
+            }
+            return result;
+        } catch (org.rocksdb.RocksDBException e) {
+            throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+        }
+    }
+
+    @Override
+    public @NotNull java.util.stream.Stream<CDCEvent> cdcPoll(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
+        long startSeq;
+        if (fromSeq != null) {
+            startSeq = fromSeq;
+        } else {
+            try {
+                var meta = loadCdcMeta(id);
+                if (meta == null) throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "CDC subscription not found: " + id);
+                startSeq = meta.lastCommittedSeq + 1;
+            } catch (org.rocksdb.RocksDBException e) {
+                throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+            }
+        }
+        var events = cdcPollOnce(id, startSeq, maxEvents);
+        return events.stream();
+    }
+
+    public @NotNull org.reactivestreams.Publisher<CDCEvent> cdcPollAsyncInternal(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
+        long startSeq;
+        if (fromSeq != null) {
+            startSeq = fromSeq;
+        } else {
+            try {
+                var meta = loadCdcMeta(id);
+                if (meta == null) throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "CDC subscription not found: " + id);
+                startSeq = meta.lastCommittedSeq + 1;
+            } catch (org.rocksdb.RocksDBException e) {
+                throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+            }
+        }
+        long maxEv = maxEvents > 0 ? maxEvents : CDC_DEFAULT_MAX_EVENTS;
+        return Flux.defer(() -> Flux.fromIterable(cdcPollOnce(id, startSeq, maxEv)))
+                .subscribeOn(this.scheduler.read());
+    }
 }

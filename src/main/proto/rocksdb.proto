@@ -190,4 +190,50 @@ service RocksDBService {
   rpc compact(CompactRequest) returns (google.protobuf.Empty);
   rpc getAllColumnDefinitions(GetAllColumnDefinitionsRequest) returns (GetAllColumnDefinitionsResponse);
   rpc uploadMergeOperator(UploadMergeOperatorRequest) returns (UploadMergeOperatorResponse);
+  // Change Data Capture (CDC) API
+  // Create or update a CDC subscription. If fromSeq is not provided, it starts from the latest sequence.
+  rpc cdcCreate(CdcCreateRequest) returns (CdcCreateResponse);
+  // Delete a CDC subscription
+  rpc cdcDelete(CdcDeleteRequest) returns (google.protobuf.Empty);
+  // Stream CDC events starting from fromSeq (inclusive). If fromSeq is not provided, starts from last committed + 1
+  rpc cdcPoll(CdcPollRequest) returns (stream CDCEvent);
+  // Commit the last processed sequence for a subscription
+  rpc cdcCommit(CdcCommitRequest) returns (google.protobuf.Empty);
+}
+
+// CDC messages
+message CdcCreateRequest {
+  string id = 1;
+  // Optional start sequence. If not set, server will start from latest sequence number.
+  optional int64 fromSeq = 2;
+  // Optional filter of column ids. Empty means all columns.
+  repeated int64 columnIds = 3;
+}
+
+message CdcCreateResponse {
+  // The starting sequence the server will use for this subscription (committed seq + 1)
+  int64 startSeq = 1;
+}
+
+message CdcDeleteRequest { string id = 1; }
+
+message CdcPollRequest {
+  string id = 1;
+  // Optional override for start sequence. If not set, starts from last committed + 1
+  optional int64 fromSeq = 2;
+  // Max events to try to buffer per request cycle (server may emit fewer based on backpressure)
+  int64 maxEvents = 3;
+}
+
+message CdcCommitRequest { string id = 1; int64 seq = 2; }
+
+message CDCEvent {
+  int64 seq = 1;
+  int64 columnId = 2;
+  // Raw calculated key bytes for the target column family
+  bytes key = 3;
+  // Value bytes; empty for deletes
+  bytes value = 4;
+  enum Op { PUT = 0; DELETE = 1; MERGE = 2; }
+  Op op = 5;
 }
