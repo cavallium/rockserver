@@ -15,5 +15,13 @@ futures = "0.3"
 bytes = "1.0"
 async-stream = "0.3"
 
+[dev-dependencies]
+rust-data-generator = { path = "rust-data-generator" }
+serde = { version = "1.0", features = ["derive"] }
+
 [build-dependencies]
+rust-data-generator = { path = "rust-data-generator" }
 tonic-build = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+heck = "0.4"

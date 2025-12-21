@@ -1,0 +1,3733 @@
+# A type that starts with "-" is an optional type, otherwise it can't be null
+currentVersion: "0.0.13"
+interfacesData:
+  ChatEntityId:
+    commonData:
+      tableId: Int52
+  GroupId:
+    extendInterfaces: [ChatEntityId]
+  MtprotoFileUid:
+    extendInterfaces: [FileUid]
+  FileContainer:
+    commonGetters:
+      fileId: FileUid
+  ChatEntity:
+    commonGetters:
+      id: ChatEntityId
+    commonData:
+      themeName: -String
+      messageTtl: int
+      availableReactions: AvailableReaction[]
+      hasProtectedContent: boolean
+      firstSeen: Timestamp
+  PublicChat:
+    extendInterfaces: [ChatEntity]
+    commonData:
+      usernames: Usernames
+      verified: boolean
+      scam: boolean
+      fake: boolean
+  PublicGroup:
+    extendInterfaces: [ChatEntity]
+    commonData:
+      memberCount: -int
+      status: ChatMemberStatus
+      primaryInviteLink: -ChatInviteLink
+      permissions: ChatPermissions
+      title: String
+  InlineButton:
+    extendInterfaces: [Button]
+    commonData:
+      text: String
+  KeyboardButton:
+    extendInterfaces: [Button]
+    commonData:
+      text: String
+  TdChatFileRequest:
+    extendInterfaces: [TdFileRequest]
+    commonGetters:
+      chatId: ChatEntityId
+  MTFileContainer:
+    commonData:
+      fileId: MTFileUid
+  CaptionedMessageContent:
+    extendInterfaces: [MessageContent]
+    commonData:
+      caption: -FormattedText
+  Minithumbnailable:
+    commonData:
+      minithumbnail: -Minithumbnail
+superTypesData:
+  ChatEntityId: [SuperCollectionId, BasicGroupId, UserId, DeprecatedId, MonoforumId]
+  GroupId: [SuperCollectionId, BasicGroupId, DeprecatedId, MonoforumId]
+  OldChatEntity: [User, OldSupergroup, OldChannel, BasicGroup]
+  ChatEntity: [User, Supergroup, BasicGroup]
+  PublicGroup: [Supergroup, BasicGroup]
+  PublicChat: [Supergroup, User]
+  UserType: [UserTypeUnknown, UserTypeDeleted, UserTypeRegular, UserTypeBot]
+  UserStatus: [
+    UserStatusEmpty,
+    UserStatusRecently,
+    UserStatusOnline,
+    UserStatusOffline,
+    UserStatusLastWeek,
+    UserStatusLastMonth
+  ]
+  ChatType: [ChatTypeUnknown, ChatTypeChannel, ChatTypeUser, ChatTypeGroup, ChatTypeBot, ChatTypeMonoforum]
+  MessageForwardOrigin: [
+    MessageForwardOriginUnknown,
+    MessageForwardOriginUser,
+    MessageForwardOriginHiddenUser,
+    MessageForwardOriginChannel,
+    MessageForwardOriginChat,
+    MessageForwardOriginMessageImport
+  ]
+  ChatMemberStatus: [
+    ChatMemberStatusMember,
+    ChatMemberStatusLeft,
+    ChatMemberStatusAdministrator,
+    ChatMemberStatusBanned,
+    ChatMemberStatusCreator,
+    ChatMemberStatusRestricted,
+    ChatMemberStatusJoinRequested,
+    ChatMemberStatusUnknown
+  ]
+  ReplyMarkup: [
+    ReplyMarkupEmpty,
+    ReplyMarkupForceReply,
+    ReplyMarkupInlineKeyboard,
+    ReplyMarkupRemoveKeyboard,
+    ReplyMarkupShowKeyboard
+  ]
+  # Remember to update Button
+  KeyboardButton: [
+    KeyboardButtonTypeEmpty,
+    KeyboardButtonTypeRequestLocation,
+    KeyboardButtonTypeRequestPhoneNumber,
+    KeyboardButtonTypeRequestPoll,
+    KeyboardButtonTypeText,
+    KeyboardButtonTypeWebApp,
+    KeyboardButtonTypeRequestChat,
+    KeyboardButtonTypeRequestUsers
+  ]
+  # Remember to update KeyboardButton or InlineButton
+  Button: [
+    KeyboardButtonTypeEmpty,
+    KeyboardButtonTypeRequestLocation,
+    KeyboardButtonTypeRequestPhoneNumber,
+    KeyboardButtonTypeRequestPoll,
+    KeyboardButtonTypeText,
+    InlineKeyboardButtonTypeEmpty,
+    InlineKeyboardButtonTypeBuy,
+    InlineKeyboardButtonTypeCallback,
+    InlineKeyboardButtonTypeCallbackGame,
+    InlineKeyboardButtonTypeLoginUrl,
+    InlineKeyboardButtonTypeSwitchInline,
+    InlineKeyboardButtonTypeUrl,
+    InlineKeyboardButtonTypeUser,
+    KeyboardButtonTypeWebApp,
+    InlineKeyboardButtonTypeWebApp,
+    KeyboardButtonTypeRequestChat,
+    KeyboardButtonTypeRequestUsers,
+    InlineKeyboardButtonTypeCallbackWithPassword
+  ]
+  # Remember to update Button
+  InlineButton: [
+    InlineKeyboardButtonTypeEmpty,
+    InlineKeyboardButtonTypeBuy,
+    InlineKeyboardButtonTypeCallback,
+    InlineKeyboardButtonTypeCallbackGame,
+    InlineKeyboardButtonTypeLoginUrl,
+    InlineKeyboardButtonTypeSwitchInline,
+    InlineKeyboardButtonTypeUrl,
+    InlineKeyboardButtonTypeUser,
+    InlineKeyboardButtonTypeCallbackWithPassword,
+    InlineKeyboardButtonTypeWebApp
+  ]
+  TdFileRequest: [TdFileRequestChatMedia, TdFileRequestCachedTdFileId, TdFileRequestChatPhoto, TdFileRequestThumbnailCollection, TdFileRequestUserProfilePhoto, TdFileRequestDiceSticker]
+  TdChatFileRequest: [TdFileRequestChatMedia, TdFileRequestChatPhoto, TdFileRequestThumbnailCollection, TdFileRequestUserProfilePhoto, TdFileRequestDiceSticker]
+  TdThumbnailSourceLocation: [
+    VideoThumbnail, StickerThumbnail, VideoNoteThumbnail, ThumbnailIndex, GameThumbnailIndex,
+    AudioAlbumCoverThumbnail, AnimationThumbnail, DocumentThumbnail, GameAnimationThumbnail
+  ]
+  MessageContent: [
+    MessageEmpty,
+    MessageAnimation,
+    MessageAudio,
+    MessageChatAddMembers,
+    MessageChatChangePhoto,
+    MessageChatChangeTitle,
+    MessageChatCreate,
+    MessageChatDeleteMember,
+    MessageChatDeletePhoto,
+    MessageChatJoinByLink,
+    MessageChatSetMessageAutoDeleteTime,
+    MessageChatUpgradeFrom,
+    MessageChatUpgradeTo,
+    MessageContact,
+    MessageCustomServiceAction,
+    MessageDocument,
+    MessageExpiredPhoto,
+    MessageExpiredVideo,
+    MessageGame,
+    MessageGameScore,
+    MessageLocation,
+    MessagePhoto,
+    MessagePinMessage,
+    MessagePoll,
+    MessageScreenshotTaken,
+    MessageSticker,
+    MessageText,
+    MessageUnsupported,
+    MessageVenue,
+    MessageVideo,
+    MessageVideoNote,
+    MessageVoiceNote,
+    MessageDice,
+    MessageVideoChatStarted,
+    MessageVideoChatEnded,
+    MessageInviteVideoChatParticipants,
+    MessageVideoChatScheduled,
+    MessageAnimatedEmoji,
+    MessageChatJoinByRequest,
+    MessageInvoice,
+    MessageCall,
+    MessageChatSetTheme,
+    MessagePaymentSuccessful,
+    MessagePaymentSuccessfulBot,
+    MessageContactRegistered,
+    MessageWebsiteConnected,
+    MessagePassportDataSent,
+    MessagePassportDataReceived,
+    MessageProximityAlertTriggered,
+    MessageWebAppDataSent,
+    MessageWebAppDataReceived,
+    MessageGiftedPremium,
+    MessageForumTopicCreated,
+    MessageForumTopicEdited,
+    MessageForumTopicIsClosedToggled,
+    MessageForumTopicIsHiddenToggled,
+    MessageBotWriteAccessAllowed,
+    MessageChatSetBackground,
+    MessageStory,
+    MessageSuggestProfilePhoto,
+    MessagePremiumGiftCode,
+    MessagePremiumGiveaway,
+    MessagePremiumGiveawayCreated,
+    MessageChatShared,
+    MessageUsersShared,
+    MessageChatBoost,
+    MessageGiftedStars,
+    MessagePaidMedia,
+    MessagePaymentRefunded,
+    MessagePremiumGiveawayCompleted,
+    MessagePremiumGiveawayWinners,
+    MessageExpiredVideoNote,
+    MessageExpiredVoiceNote
+  ]
+  BrokenMessageContent: [
+    MessageEmpty,
+    MessageAnimation,
+    MessageAudio,
+    MessageChatAddMembers,
+    MessageChatChangePhoto,
+    MessageChatChangeTitle,
+    MessageChatCreate,
+    MessageChatDeleteMember,
+    MessageChatDeletePhoto,
+    MessageChatJoinByLink,
+    MessageChatSetMessageAutoDeleteTime,
+    MessageChatUpgradeFrom,
+    MessageChatUpgradeTo,
+    MessageContact,
+    MessageCustomServiceAction,
+    MessageDocument,
+    MessageExpiredPhoto,
+    MessageExpiredVideo,
+    MessageGame,
+    MessageGameScore,
+    MessageLocation,
+    MessagePhoto,
+    MessagePinMessage,
+    MessagePoll,
+    MessageScreenshotTaken,
+    MessageSticker,
+    MessageText,
+    MessageUnsupported,
+    MessageVenue,
+    MessageVideo,
+    MessageVideoNote,
+    MessageVoiceNote,
+    MessageDice,
+    MessageAnimatedEmoji,
+    MessageChatJoinByRequest,
+    MessageInvoice,
+    MessageCall,
+    MessageChatSetTheme,
+    MessagePaymentSuccessful,
+    MessagePaymentSuccessfulBot,
+    MessageContactRegistered,
+    MessageWebsiteConnected,
+    MessagePassportDataSent,
+    MessagePassportDataReceived,
+    MessageProximityAlertTriggered,
+    MessageWebAppDataSent,
+    MessageWebAppDataReceived,
+    MessageVideoChatScheduled,
+    MessageVideoChatStarted,
+    MessageVideoChatEnded,
+    MessageInviteVideoChatParticipants,
+    MessageGiftedPremium,
+    MessageForumTopicCreated,
+    MessageForumTopicEdited,
+    MessageForumTopicIsClosedToggled,
+    MessageForumTopicIsHiddenToggled
+  ]
+  CaptionedMessageContent: [MessageAnimation, MessageDocument, MessagePhoto, MessageVideo, MessageVoiceNote]
+  FileContainer: [Audio, Animation, PhotoSize, Document, Sticker, Video, VideoNote, VoiceNote]
+  TextEntityType: [
+    TextEntityTypeBold,
+    TextEntityTypeBotCommand,
+    TextEntityTypeCashtag,
+    TextEntityTypeCode,
+    TextEntityTypeEmailAddress,
+    TextEntityTypeHashtag,
+    TextEntityTypeItalic,
+    TextEntityTypeMention,
+    TextEntityTypeMentionName,
+    TextEntityTypePhoneNumber,
+    TextEntityTypePre,
+    TextEntityTypePreCode,
+    TextEntityTypeStrikethrough,
+    TextEntityTypeTextUrl,
+    TextEntityTypeUnderline,
+    TextEntityTypeUrl,
+    TextEntityTypeBankCardNumber,
+    TextEntityTypeMediaTimestamp,
+    TextEntityTypeSpoiler,
+    TextEntityTypeCustomEmoji,
+    TextEntityTypeBlockQuote,
+    TextEntityTypeExpandableBlockQuote
+  ]
+  MaskPoint: [MaskPointChin, MaskPointEyes, MaskPointForehead, MaskPointMouth]
+  PollType: [PollTypeRegular, PollTypeQuiz]
+  FileUid: [UnreachableFileUid, MTFileUid, StoredFileUid, URIFileUid, AudiotFileUid]
+  MtprotoFileUid: [MTFileUid, AudiotFileUid]
+  CallDiscardReason: [CallDiscardReasonEmpty, CallDiscardReasonMissed, CallDiscardReasonDeclined, CallDiscardReasonDisconnected, CallDiscardReasonHungUp]
+  PassportElementType: [
+    PassportElementTypePersonalDetails,
+    PassportElementTypePassport,
+    PassportElementTypeDriverLicense,
+    PassportElementTypeIdentityCard,
+    PassportElementTypeInternalPassport,
+    PassportElementTypeAddress,
+    PassportElementTypeUtilityBill,
+    PassportElementTypeBankStatement,
+    PassportElementTypeRentalAgreement,
+    PassportElementTypePassportRegistration,
+    PassportElementTypeTemporaryRegistration,
+    PassportElementTypePhoneNumber,
+    PassportElementTypeEmailAddress
+  ]
+  ThumbnailFormat: [
+    ThumbnailFormatJpeg,
+    ThumbnailFormatGif,
+    ThumbnailFormatMpeg4,
+    ThumbnailFormatPng,
+    ThumbnailFormatTgs,
+    ThumbnailFormatWebm,
+    ThumbnailFormatWebp
+  ]
+  VectorPathCommand: [VectorPathCommandLine, VectorPathCommandCubicBezierCurve]
+  OldStickerType: [
+    StickerFormatWebp,
+    StickerFormatTgs,
+    StickerFormatWebm,
+    StickerTypeMask
+  ]
+  StickerFormat: [
+    StickerFormatWebp,
+    StickerFormatTgs,
+    StickerFormatWebm
+  ]
+  StickerType: [
+    StickerTypeRegular,
+    StickerTypeMask,
+    StickerTypeCustomEmoji
+  ]
+  Minithumbnailable: [
+    ChatPhoto,
+    Photo,
+    Animation,
+    Document,
+    Video,
+    VideoNote,
+    PaidMediaPreview,
+    Audio
+  ]
+  BotWriteAccessAllowReason: [
+    BotWriteAccessAllowReasonAcceptedRequest,
+    BotWriteAccessAllowReasonAddedToAttachmentMenu,
+    BotWriteAccessAllowReasonConnectedWebsite,
+    BotWriteAccessAllowReasonLaunchedWebApp
+  ]
+  BackgroundFill: [
+    BackgroundFillFreeformGradient,
+    BackgroundFillGradient,
+    BackgroundFillSolid
+  ]
+  ChatPhotoStickerType: [
+    ChatPhotoStickerTypeCustomEmoji,
+    ChatPhotoStickerTypeRegularOrMask
+  ]
+  BackgroundType: [
+    BackgroundTypeFill,
+    BackgroundTypePattern,
+    BackgroundTypeWallpaper,
+    BackgroundTypeChatTheme
+  ]
+  SpeechRecognitionResult: [
+    SpeechRecognitionResultEmpty,
+    SpeechRecognitionResultError,
+    SpeechRecognitionResultPending,
+    SpeechRecognitionResultText
+  ]
+  MessageReplyTo: [
+    MessageReplyToNone,
+    MessageReplyToMessage,
+    MessageReplyToStory
+  ]
+  MessageSelfDestructType: [
+    MessageSelfDestructTypeEmpty,
+    MessageSelfDestructTypeImmediately,
+    MessageSelfDestructTypeTimer
+  ]
+  MessageOrigin: [
+    MessageOriginChannel,
+    MessageOriginChat,
+    MessageOriginUser,
+    MessageOriginHiddenUser,
+    MessageOriginUnknown,
+    MessageOriginOriginal
+  ]
+  TargetChat: [
+    TargetChatCurrent,
+    TargetChatChosen,
+    TargetChatInternalLink
+  ]
+  InternalLinkType: [
+    InternalLinkTypeActiveSessions,
+    InternalLinkTypeAttachmentMenuBot,
+    InternalLinkTypeAuthenticationCode,
+    InternalLinkTypeBackground,
+    InternalLinkTypeBotAddToChannel,
+    InternalLinkTypeBotStart,
+    InternalLinkTypeBotStartInGroup,
+    InternalLinkTypeChangePhoneNumber,
+    InternalLinkTypeChatBoost,
+    InternalLinkTypeChatFolderInvite,
+    InternalLinkTypeChatFolderSettings,
+    InternalLinkTypeChatInvite,
+    InternalLinkTypeDefaultMessageAutoDeleteTimerSettings,
+    InternalLinkTypeEditProfileSettings,
+    InternalLinkTypeGame,
+    InternalLinkTypeInstantView,
+    InternalLinkTypeInvoice,
+    InternalLinkTypeLanguagePack,
+    InternalLinkTypeLanguageSettings,
+    InternalLinkTypeMessage,
+    InternalLinkTypeMessageDraft,
+    InternalLinkTypePassportDataRequest,
+    InternalLinkTypePhoneNumberConfirmation,
+    InternalLinkTypePremiumFeatures,
+    InternalLinkTypePremiumGiftCode,
+    InternalLinkTypePrivacyAndSecuritySettings,
+    InternalLinkTypeProxy,
+    InternalLinkTypePublicChat,
+    InternalLinkTypeQrCodeAuthentication,
+    InternalLinkTypeRestorePurchases,
+    InternalLinkTypeSettings,
+    InternalLinkTypeSideMenuBot,
+    InternalLinkTypeStickerSet,
+    InternalLinkTypeStory,
+    InternalLinkTypeTheme,
+    InternalLinkTypeThemeSettings,
+    InternalLinkTypeUnknownDeepLink,
+    InternalLinkTypeUnsupportedProxy,
+    InternalLinkTypeUserPhoneNumber,
+    InternalLinkTypeUserToken,
+    InternalLinkTypeVideoChat,
+    InternalLinkTypeWebApp,
+    InternalLinkTypeBusinessChat,
+    InternalLinkTypeBuyStars,
+    InternalLinkTypeMainWebApp,
+    InternalLinkTypePremiumGift
+  ]
+  ReactionType: [
+    ReactionTypeEmoji,
+    ReactionTypeCustomEmoji,
+    ReactionTypePaid
+  ]
+  MessageSender: [
+    MessageSenderUser,
+    MessageSenderChat,
+    MessageSenderUnknown
+  ]
+  PaidMedia: [
+    PaidMediaEmpty,
+    PaidMediaUnsupported,
+    PaidMediaPhoto,
+    PaidMediaPreview,
+    PaidMediaVideo
+  ]
+  LinkPreviewType: [
+    LinkPreviewTypeAlbum,
+    LinkPreviewTypeAnimation,
+    LinkPreviewTypeApp,
+    LinkPreviewTypeArticle,
+    LinkPreviewTypeAudio,
+    LinkPreviewTypeBackground,
+    LinkPreviewTypeChannelBoost,
+    LinkPreviewTypeChat,
+    LinkPreviewTypeDocument,
+    LinkPreviewTypeEmbeddedAnimationPlayer,
+    LinkPreviewTypeEmbeddedAudioPlayer,
+    LinkPreviewTypeEmbeddedVideoPlayer,
+    LinkPreviewTypeInvoice,
+    LinkPreviewTypeMessage,
+    LinkPreviewTypePhoto,
+    LinkPreviewTypePremiumGiftCode,
+    LinkPreviewTypeShareableChatFolder,
+    LinkPreviewTypeSticker,
+    LinkPreviewTypeStickerSet,
+    LinkPreviewTypeStory,
+    LinkPreviewTypeSupergroupBoost,
+    LinkPreviewTypeTheme,
+    LinkPreviewTypeUnsupported,
+    LinkPreviewTypeUser,
+    LinkPreviewTypeVideo,
+    LinkPreviewTypeVideoChat,
+    LinkPreviewTypeVideoNote,
+    LinkPreviewTypeVoiceNote,
+    LinkPreviewTypeWebApp
+  ]
+  LinkPreviewAlbumMedia: [
+    LinkPreviewAlbumMediaPhoto,
+    LinkPreviewAlbumMediaVideo
+  ]
+  InviteLinkChatType: [
+    InviteLinkChatTypeBasicGroup,
+    InviteLinkChatTypeSupergroup,
+    InviteLinkChatTypeChannel
+  ]
+customTypesData:
+  LegacyURL:
+    javaClass: java.lang.String
+    serializer: org.yotsuba.oldserializers.LegacyURLSerializer
+  URL:
+    javaClass: java.lang.String
+    serializer: org.yotsuba.oldserializers.URLSerializer
+  IntOpenHashSet:
+    javaClass: it.unimi.dsi.fastutil.ints.IntOpenHashSet
+    serializer: org.yotsuba.oldserializers.IntOpenHashSetSerializer
+  OldUserIdSetV1:
+    javaClass: org.yotsuba.customrecords.Int52Set
+    serializer: org.yotsuba.oldserializers.LegacyUserIdSetSerializer
+  OldUserIdSetV2:
+    javaClass: org.yotsuba.customrecords.Int52Set
+    serializer: org.yotsuba.oldserializers.V003UserIdSet52Serializer
+  UserIdSet:
+    javaClass: org.yotsuba.customrecords.UserIdSet
+    serializer: org.yotsuba.oldserializers.UserIdSet52Serializer
+  ChatEntityIdSet:
+    javaClass: org.yotsuba.customrecords.ChatEntityIdSet
+    serializer: org.yotsuba.oldserializers.ChatEntityIdSet52Serializer
+  PackedIntArray:
+    javaClass: it.unimi.dsi.fastutil.ints.IntOpenHashSet
+    serializer: org.yotsuba.oldserializers.PackedIntArraySerializer
+  FileExtension:
+    javaClass: org.yotsuba.customrecords.FileExtension
+    serializer: org.yotsuba.oldserializers.FileExtensionSerializer
+baseTypesData:
+  BIdentifier: {data: {value: int}}
+  BChatEntityId: {data: {value: ChatEntityId}}
+  BOldChatEntityId:
+    data:
+      oldType: byte
+      oldTableId: int
+  BChatEntity: {data: {value: OldChatEntity}}
+  BUserId: {data: {value: UserId}}
+  BChannelId: {data: {value: SuperCollectionId}}
+  BGroupId: {data: {value: GroupId}}
+  BChatAssociations: {data: {value: "ChatAssociation[]"}}
+  BChatAssociation: {data: {value: ChatAssociation}}
+  BChatAssociationProperties: {data: {value: ChatAssociationProperties}}
+  OldImportedMessage: {data: {value: Message}}
+  ImportedMessage:
+    data:
+      value: Message
+      firstImported: int
+  BMessage: {data: {value: OldImportedMessage}}
+  BBrokenMessage: {data: {value: BrokenImportedMessage}}
+  BrokenImportedMessage:
+    data:
+      value: BrokenMessage
+      firstImported: int
+  BTitle: {data: {value: String}}
+  BChatType: {data: {value: ChatType}}
+  BLongId: {data: {value: long}}
+  BMessageId: {data: {value: int}}
+  BFileLongId: {data: {value: long}}
+  BFileExtension: {data: {value: FileExtension}}
+  BTdFileRequest: {data: {value: TdFileRequest}}
+  # VirtualLoggedChat
+  # Must be exactly 32 bytes.
+  # 0x00 is the terminator, otherwise if the string length is 32 the terminator is not needed.
+  BVirtualLoggedChat: {data: {value: "byte[]"}}
+  BChatMemberStatus: {data: {value: ChatMemberStatus}}
+  UnreachableFileUid:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringFileUid"
+    data: {}
+  MTFileUid:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringFileUid"
+    data:
+      value: "byte[]"
+  StoredFileUid:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringFileUid"
+    data:
+      value: long
+  URIFileUid:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringFileUid"
+    data:
+      value: String
+  FixedFileUid:
+    data:
+      length: byte
+      data24bytes: byte[]
+  AudiotFileUid:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringFileUid"
+    data:
+      value: "byte[]"
+
+  SetNoValue: {data: {}}
+
+  Timestamp: {data: {value: long}}
+  SuperCollectionId:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringUID"
+    data:
+      tableId: int
+  BasicGroupId:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringUID"
+    data:
+      tableId: int
+  UserId:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringUID"
+    data:
+      tableId: int
+  DeprecatedId:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringUID"
+    data:
+      tableId: int
+  MonoforumId:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringUID"
+    data:
+      tableId: Int52
+  ChatAssociationId:
+    data:
+      chatId: ChatEntityId
+      memberId: ChatEntityId
+
+  Score:
+    data:
+      value: double
+
+  MessageEmpty: {data: {}}
+  MessageAnimation:
+    data:
+      animation: Animation
+      caption: -FormattedText
+      isSecret: boolean
+  MessageAudio:
+    data:
+      audio: Audio
+      caption: -FormattedText
+  MessageChatAddMembers:
+    data:
+      memberUserIds: IntOpenHashSet
+  MessageChatChangePhoto:
+    data:
+      photo: Photo
+  MessageChatChangeTitle:
+    data:
+      text: String
+  MessageChatCreate:
+    data:
+      title: String
+  MessageChatDeleteMember:
+    data:
+      userId: int
+  MessageChatDeletePhoto: {data: {}}
+  MessageChatJoinByLink: {data: {}}
+  MessageChatSetMessageAutoDeleteTime:
+    data:
+      ttl: int
+  MessageChatUpgradeFrom:
+    data:
+      id: BasicGroupId
+  MessageChatUpgradeTo:
+    data:
+      id: SuperCollectionId
+  MessageContact:
+    data:
+      contact: Contact
+  MessageCustomServiceAction:
+    data:
+      text: String
+  MessageDocument:
+    data:
+      document: Document
+      caption: -FormattedText
+  MessageExpiredPhoto: {data: {}}
+  MessageExpiredVideo: {data: {}}
+  MessageExpiredVideoNote: {data: {}}
+  MessageExpiredVoiceNote: {data: {}}
+  MessageGame:
+    data:
+      game: Game
+  MessageGameScore:
+    data:
+      gameId: long
+      gameMessageId: long
+      score: int
+  MessageLocation:
+    data:
+      location: Location
+  MessagePhoto:
+    data:
+      photo: Photo
+      caption: -FormattedText
+      isSecret: boolean
+  MessagePinMessage:
+    data:
+      id: long
+  MessagePoll:
+    data:
+      poll: Poll
+  MessageScreenshotTaken: {data: {}}
+  MessageSticker:
+    data:
+      sticker: Sticker
+  MessageText:
+    data:
+      text: FormattedText
+      linkPreview: -LinkPreview
+  MessageUnsupported: {data: {}}
+  MessageVenue:
+    data:
+      venue: Venue
+  MessageVideo:
+    data:
+      video: Video
+      caption: -FormattedText
+      secret: boolean
+  MessageVideoNote:
+    data:
+      videoNote: VideoNote
+      isSecret: boolean
+      isViewed: boolean
+  MessageVoiceNote:
+    data:
+      voiceNote: VoiceNote
+      caption: -FormattedText
+      listened: boolean
+  MessageDice:
+    data:
+      initialStateSticker: Sticker
+      finalStateSticker: Sticker
+      emoji: -String
+      value: int
+      successAnimationFrameNumber: int
+  MessageAnimatedEmoji:
+    data:
+      animatedEmoji: AnimatedEmoji
+      emoji: -String
+  MessageChatJoinByRequest: {data: {}}
+  MessageInvoice:
+    data:
+      title: String
+      description: String
+      photo: -Photo
+      currency: String
+      totalAmount: long
+      startParameter: String
+      test: boolean
+      needShippingAddress: boolean
+      receiptMessageId: long
+  MessageCall:
+    data:
+      video: boolean
+      discardReason: CallDiscardReason
+      duration: int
+  MessageChatSetTheme:
+    data:
+      themeName: -String
+  MessagePaymentSuccessful:
+    data:
+      invoiceChatId: -ChatEntityId
+      invoiceMessageId: long
+      currency: String
+      totalAmount: long
+  MessagePaymentSuccessfulBot:
+    data:
+      currency: String
+      totalAmount: long
+      invoicePayload: byte[]
+      shippingOptionId: -String
+      orderInfo: -OrderInfo
+      telegramPaymentChargeId: String
+      providerPaymentChargeId: String
+  MessagePaymentRefunded:
+    data:
+      ownerId: -ChatEntityId
+      currency: String
+      totalAmount: long
+      invoicePayload: byte[]
+      telegramPaymentChargeId: String
+      providerPaymentChargeId: String
+
+  MessageContactRegistered:
+    data: { }
+  MessageWebsiteConnected:
+    data:
+      domainName: String
+  MessagePassportDataSent:
+    data:
+      types: PassportElementType[]
+  MessagePassportDataReceived:
+    data:
+      elements: EncryptedPassportElement[]
+      credentials: EncryptedCredentials
+  MessageProximityAlertTriggered:
+    data:
+      travelerId: ChatEntityId
+      watcherId: ChatEntityId
+      distance: int
+  MessageWebAppDataSent:
+    data:
+      buttonText: String
+  MessageWebAppDataReceived:
+    data:
+      buttonText: String
+      data: String
+  MessageVideoChatScheduled:
+    data:
+      groupCallId: int
+      startDate: long
+  MessageVideoChatStarted:
+    data:
+      groupCallId: int
+  MessageVideoChatEnded:
+    data:
+      duration: int
+  MessageInviteVideoChatParticipants:
+    data:
+      groupCallId: int
+      userIds: UserId[]
+  MessageGiftedPremium:
+    data:
+      currency: String
+      amount: long
+      monthCount: int
+      sticker: -Sticker
+  MessageGiftedStars:
+    data:
+      amount: long
+      cryptocurrency: String
+      cryptocurrencyAmount: long
+      currency: String
+      gifterUserId: UserId
+      receiverUserId: UserId
+      starCount: long
+      sticker: -Sticker
+      transactionId: -String
+  MessagePaidMedia:
+    data:
+      starCount: long
+      media: PaidMedia[]
+      caption: -FormattedText
+      showCaptionAboveMedia: boolean
+  MessageForumTopicCreated:
+    data:
+      name: String
+      icon: ForumTopicIcon
+  MessageForumTopicEdited:
+    data:
+      name: -String
+      editIconCustomEmojiId: boolean
+      iconCustomEmojiId: -long
+  MessageForumTopicIsClosedToggled:
+    data:
+      closed: boolean
+  MessageForumTopicIsHiddenToggled:
+    data:
+      closed: boolean
+  MessageBotWriteAccessAllowed:
+    data:
+      reason: BotWriteAccessAllowReason
+  MessageChatSetBackground:
+    data:
+      background: ChatBackground
+      oldBackgroundMessageId: long
+  ChatBackground:
+    data:
+      background: Background
+      darkThemeDimming: byte
+  Background:
+    data:
+      document: -Document
+      id: long
+      type: BackgroundType
+      isDark: boolean
+      isDefault: boolean
+      name: String
+  BackgroundTypeFill:
+    data:
+      fill: BackgroundFill
+  BackgroundTypePattern:
+    data:
+      fill: BackgroundFill
+      intensity: byte
+      isInverted: boolean
+      isMoving: boolean
+  BackgroundTypeWallpaper:
+    data:
+      isMoving: boolean
+      isBlurred: boolean
+  BackgroundTypeChatTheme:
+    data:
+      themeName: String
+  MessageChatShared:
+    data:
+      buttonId: int
+      chat: SharedChat
+  MessageChatBoost:
+    data:
+      boostCount: int
+
+  SharedChat:
+    data:
+      chatId: ChatEntityId
+      title: -String
+      username: -String
+      photo: -Photo
+  SharedUser:
+    data:
+      userId: UserId
+      firstName: -String
+      lastName: -String
+      username: -String
+      photo: -Photo
+
+  BotWriteAccessAllowReasonAcceptedRequest: {data: {}}
+  BotWriteAccessAllowReasonAddedToAttachmentMenu: {data: {}}
+  BotWriteAccessAllowReasonConnectedWebsite:
+    data:
+      domainName: String
+  BotWriteAccessAllowReasonLaunchedWebApp:
+    data:
+      webApp: WebApp
+
+  Error:
+    data:
+      code: int
+      message: String
+
+  SpeechRecognitionResultEmpty: {data: {}}
+  SpeechRecognitionResultError:
+    data:
+      error: Error
+  SpeechRecognitionResultPending:
+    data:
+      partialText: String
+  SpeechRecognitionResultText:
+    data:
+      text: String
+
+  EncryptedPassportElement:
+    data:
+      type: PassportElementType
+      data: byte[]
+      frontSide: DatedFile
+      reverseSide: -DatedFile
+      selfie: -DatedFile
+      translation: DatedFile[]
+      files: DatedFile[]
+      value: String
+      hash: String
+  EncryptedCredentials:
+    data:
+      data: byte[]
+      hash: byte[]
+      secret: byte[]
+  DatedFile:
+    data:
+      fileId: FileUid
+      date: int
+
+  CallDiscardReasonEmpty:
+    data: { }
+  CallDiscardReasonMissed:
+    data: { }
+  CallDiscardReasonDeclined:
+    data: { }
+  CallDiscardReasonDisconnected:
+    data: { }
+  CallDiscardReasonHungUp:
+    data: { }
+
+  PassportElementTypePersonalDetails:
+    data: { }
+  PassportElementTypePassport:
+    data: { }
+  PassportElementTypeDriverLicense:
+    data: { }
+  PassportElementTypeIdentityCard:
+    data: { }
+  PassportElementTypeInternalPassport:
+    data: { }
+  PassportElementTypeAddress:
+    data: { }
+  PassportElementTypeUtilityBill:
+    data: { }
+  PassportElementTypeBankStatement:
+    data: { }
+  PassportElementTypeRentalAgreement:
+    data: { }
+  PassportElementTypePassportRegistration:
+    data: { }
+  PassportElementTypeTemporaryRegistration:
+    data: { }
+  PassportElementTypePhoneNumber:
+    data: { }
+  PassportElementTypeEmailAddress:
+    data: { }
+
+  OrderInfo:
+    data:
+      name: String
+      phoneNumber: String
+      emailAddress: String
+      shippingAddress: -Address
+  Address:
+    data:
+      countryCode: String
+      state: String
+      city: String
+      streetLine1: String
+      streetLine2: String
+      postalCode: String
+
+  Audio:
+    data:
+      fileId: long
+      mimeType: -String
+      albumCoverThumbnail: -PhotoSize
+      duration: int
+      fileName: -String
+      performer: -String
+      title: -String
+  Animation:
+    data:
+      fileId: long
+      mimeType: -String
+      duration: int
+      fileName: -String
+      width: int
+      height: int
+      thumbnail: -PhotoSize
+  FormattedText:
+    data:
+      text: String
+      entities: TextEntity[]
+  TextEntity:
+    data:
+      type: TextEntityType
+      offset: int
+      length: int
+  Photo:
+    data:
+      sizes: PhotoSize[]
+      hasSticker: boolean
+  PhotoSize:
+    data:
+      fileId: long
+      type: -String
+      width: int
+      height: int
+  Document:
+    data:
+      fileId: long
+      mimeType: String
+      fileName: -String
+      thumbnail: -PhotoSize
+  Game:
+    data:
+      animation: -Animation
+      description: -String
+      id: long
+      photo: -Photo
+      shortName: String
+      text: -FormattedText
+      title: String
+  Contact:
+    data:
+      firstName: -String
+      lastName: -String
+      phoneNumber: -String
+      userId: int
+      vcard: -String
+  Location:
+    data:
+      latitude: double
+      longitude: double
+  Poll:
+    data:
+      id: long
+      totalVoterCount: int
+      recentVoterUserIds: IntOpenHashSet
+      isAnonymous: boolean
+      type: PollType
+      openPeriod: int
+      closeDate: int
+      isClosed: boolean
+      options: PollOption[]
+  PollTypeRegular:
+    data:
+      allowMultipleAnswers: boolean
+  PollTypeQuiz:
+    data:
+      correctOptionId: int
+      explanation: -FormattedText
+  PollOption:
+    data:
+      isBeingChosen: boolean
+      isChosen: boolean
+      text: String
+      votePercentage: int
+      voterCount: int
+  Sticker:
+    data:
+      emoji: -String
+      width: int
+      height: int
+      isMask: boolean
+      maskPosition: -MaskPosition
+      setId: long
+      fileId: long
+      thumbnail: -PhotoSize
+  MaskPosition:
+    data:
+      point: -MaskPoint
+      scale: double
+      xShift: double
+      yShift: double
+  MaskPointChin: {data: {}}
+  MaskPointEyes: {data: {}}
+  MaskPointForehead: {data: {}}
+  MaskPointMouth: {data: {}}
+  LinkPreview:
+    data:
+      url: String
+      displayUrl: -String
+      type: -String
+      siteName: -String
+      title: -String
+      description: -FormattedText
+      embedUrl: -String
+      embedType: -String
+  Venue:
+    data:
+      address: -String
+      id: -String
+      location: Location
+      provider: -String
+      title: -String
+      type: -String
+  Video:
+    data:
+      duration: int
+      fileName: -String
+      hasStickers: boolean
+      width: int
+      height: int
+      mimeType: -String
+      supportsStreaming: boolean
+      thumbnail: -PhotoSize
+      fileId: long
+  VideoNote:
+    data:
+      fileId: long
+      duration: int
+      length: int
+      thumbnail: -PhotoSize
+  VoiceNote:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringVoiceNote"
+    data:
+      fileId: long
+      mimeType: -String
+      duration: int
+      waveform: byte[]
+  AnimatedEmoji:
+    data:
+      sticker: Sticker
+      colorReplacements: ColorReplacement[]
+      soundFileId: -MTFileUid
+  # If oldColor is -1 then newColor is Fitzpatrick skin tone, from 1 to 6
+  ColorReplacement:
+    data:
+      oldColor: int
+      newColor: int
+
+  TextEntityTypeBold: {data: {}}
+  TextEntityTypeBotCommand: {data: {}}
+  TextEntityTypeCashtag: {data: {}}
+  TextEntityTypeCode: {data: {}}
+  TextEntityTypeEmailAddress: {data: {}}
+  TextEntityTypeHashtag: {data: {}}
+  TextEntityTypeItalic: {data: {}}
+  TextEntityTypeMention: {data: {}}
+  TextEntityTypeMentionName: {data: {userId: UserId}}
+  TextEntityTypePhoneNumber: {data: {}}
+  TextEntityTypePre: {data: {}}
+  TextEntityTypePreCode: {data: {}}
+  TextEntityTypeStrikethrough: {data: {}}
+  TextEntityTypeTextUrl: {data: {url: String}}
+  TextEntityTypeUnderline: {data: {}}
+  TextEntityTypeUrl: {data: {}}
+  TextEntityTypeBankCardNumber: {data: {}}
+  TextEntityTypeBlockQuote: {data: {}}
+  TextEntityTypeMediaTimestamp: {data: {value: Timestamp}}
+  TextEntityTypeSpoiler: {data: {}}
+  TextEntityTypeCustomEmoji:
+    data:
+      customEmojiId: long
+  TextEntityTypeExpandableBlockQuote: {data: {}}
+
+  TdFileRequestChatMedia:
+    data:
+      chatId: ChatEntityId
+      messageId: long
+  TdFileRequestCachedTdFileId:
+    data:
+      tdFileId: int
+  TdFileRequestChatPhoto:
+    data:
+      chatId: ChatEntityId
+      big: boolean
+  TdFileRequestThumbnailCollection:
+    data:
+      chatId: ChatEntityId
+      messageId: long
+      location: TdThumbnailSourceLocation
+  TdFileRequestUserProfilePhoto:
+    data:
+      chatId: UserId
+      big: boolean
+  TdFileRequestDiceSticker:
+    data:
+      chatId: ChatEntityId
+      messageId: long
+      initialSticker: boolean
+
+  VideoThumbnail: {data: {}}
+  StickerThumbnail: {data: {}}
+  VideoNoteThumbnail: {data: {}}
+  ThumbnailIndex: {data: {index: byte}}
+  GameThumbnailIndex: {data: {index: byte}}
+  AudioAlbumCoverThumbnail: {data: {}}
+  AnimationThumbnail: {data: {}}
+  DocumentThumbnail: {data: {}}
+  GameAnimationThumbnail: {data: {}}
+
+  BasicGroup:
+    data:
+      id: BasicGroupId
+      memberCount: int
+      status: ChatMemberStatus
+      inviteLink: -String
+      isActive: boolean
+      upgradedToSupergroup: -SuperCollectionId
+      creatorUserId: UserId
+  OldChannel:
+    data:
+      id: SuperCollectionId
+      memberCount: int
+      status: ChatMemberStatus
+      inviteLink: -String
+      username: -String
+      date: long
+      signMessages: boolean
+      restrictionReason: -String
+      description: -String
+      administratorCount: int
+      restrictedCount: int
+      bannedCount: int
+      upgradedFromBasicGroupId: BasicGroupId
+      upgradedFromMaxMessageId: long
+  ChatAssociation:
+    data:
+      relatedId: ChatEntityId
+      properties: ChatAssociationProperties
+  ChatAssociationProperties:
+    data:
+      inviterUserId: UserId
+      joinedChatDate: int
+      status: ChatMemberStatus
+      botInfo: -BotInfo
+      isLeft: boolean
+  BotInfo:
+    data:
+      description: -String
+      commands: BotCommand[]
+  BotCommand:
+    data:
+      commandName: String
+      commandDescription: -String
+
+  ChatTypeUnknown: {data: {}}
+  ChatTypeChannel: {data: {}}
+  ChatTypeUser: {data: {}}
+  ChatTypeGroup: {data:{}}
+  ChatTypeBot: {data:{}}
+  ChatTypeMonoforum: {data:{}}
+
+  Message:
+    data:
+      senderUserId: UserId
+      id: long
+      chatEntityId: ChatEntityId
+      isChannelPost: boolean
+      date: int
+      editDate: int
+      forwardInfo: -MessageForwardInfo
+      replyToMessageId: long
+      ttl: int
+      ttlExpiresIn: double
+      viaBotUserId: UserId
+      authorSignature: -String
+      interactionInfo: MessageInteractionInfo
+      mediaAlbumId: long
+      content: MessageContent
+      replyMarkup: ReplyMarkup
+      isDeleted: boolean
+  BrokenMessage:
+    data:
+      senderId: ChatEntityId
+      id: long
+      chatEntityId: ChatEntityId
+      isChannelPost: boolean
+      date: int
+      editDate: int
+      forwardInfo: -MessageForwardInfo
+      replyToMessageId: long
+      ttl: int
+      ttlExpiresIn: double
+      viaBotUserId: UserId
+      authorSignature: -String
+      interactionInfo: MessageInteractionInfo
+      mediaAlbumId: long
+      content: BrokenMessageContent
+      replyMarkup: ReplyMarkup
+      isPinned: boolean
+      isDeleted: boolean
+      canBeSaved: boolean
+      hasTimestampedMedia: boolean
+      messageThreadId: long
+      restrictionReason: -String
+      isTopicMessage: boolean
+  MessageInteractionInfo:
+    data:
+      viewCount: -int
+      forwardCount: -int
+      publicReplyCount: -int
+  MessageForwardInfo:
+    data:
+      forwardOrigin: MessageForwardOrigin
+      forwardDate: int
+      fromChatId: ChatEntityId
+      fromMessageId: long
+  MessageForwardOriginUnknown: {data: {}}
+  MessageForwardOriginChannel:
+    data:
+      chatEntityId: SuperCollectionId
+      messageId: -long
+      authorSignature: -String
+  MessageForwardOriginHiddenUser:
+    data:
+      senderName: -String
+  MessageForwardOriginUser:
+    data:
+      senderUserId: UserId
+  MessageForwardOriginChat:
+    data:
+      senderChatId: ChatEntityId
+  MessageForwardOriginMessageImport:
+    data:
+      senderName: String
+  ReplyMarkupEmpty: {data: {}}
+  ReplyMarkupForceReply:
+    data:
+      isPersonal: boolean
+  ReplyMarkupInlineKeyboard:
+    data:
+      rows: InlineButtonRow[]
+  ReplyMarkupRemoveKeyboard:
+    data:
+      isPersonal: boolean
+  ReplyMarkupShowKeyboard:
+    data:
+      isPersonal: boolean
+      rows: KeyboardButtonRow[]
+      resizeKeyboard: boolean
+      oneTime: boolean
+
+  KeyboardButtonRow:
+    data:
+      items: KeyboardButton[]
+  InlineButtonRow:
+    data:
+      items: InlineButton[]
+
+  KeyboardButtonTypeEmpty:
+    data:
+      text: String
+  KeyboardButtonTypeRequestLocation:
+    data:
+      text: String
+  KeyboardButtonTypeRequestPhoneNumber:
+    data:
+      text: String
+  KeyboardButtonTypeRequestPoll:
+    data:
+      text: String
+      forceRegular: boolean
+      forceQuiz: boolean
+  KeyboardButtonTypeText:
+    data:
+      text: String
+  KeyboardButtonTypeWebApp:
+    data:
+      url: URL
+
+  InlineKeyboardButtonTypeEmpty:
+    data:
+      text: String
+  InlineKeyboardButtonTypeBuy:
+    data:
+      text: String
+  InlineKeyboardButtonTypeCallback:
+    data:
+      text: String
+      callback: byte[]
+  InlineKeyboardButtonTypeCallbackGame:
+    data:
+      text: String
+  InlineKeyboardButtonTypeLoginUrl:
+    data:
+      text: String
+      url: LegacyURL
+      id: int
+      forwardText: String
+  InlineKeyboardButtonTypeSwitchInline:
+    data:
+      text: String
+      query: String
+      inCurrentChat: boolean
+  InlineKeyboardButtonTypeUrl:
+    data:
+      text: String
+      url: LegacyURL
+  InlineKeyboardButtonTypeUser:
+    data:
+      userId: Int52
+  InlineKeyboardButtonTypeWebApp:
+    data:
+      url: URL
+  InlineKeyboardButtonTypeCallbackWithPassword:
+    data:
+      text: String
+      data: byte[]
+
+  MessageIdentifier:
+    data:
+      chatEntityId: ChatEntityId
+      messageId: long
+  Identifier:
+    data:
+      value: int
+  LongId:
+    data:
+      value: long
+  OldSupergroup:
+    data:
+      id: SuperCollectionId
+      memberCount: int
+      status: ChatMemberStatus
+      inviteLink: -String
+      username: -String
+      date: long
+      signMessages: boolean
+      restrictionReason: -String
+      description: -String
+      administratorCount: int
+      restrictedCount: int
+      bannedCount: int
+      upgradedFromBasicGroupId: BasicGroupId
+      upgradedFromMaxMessageId: long
+  Supergroup:
+    data:
+      id: SuperCollectionId
+      memberCount: int
+      status: ChatMemberStatus
+      inviteLink: -String
+      username: -String
+      date: long
+      signMessages: boolean
+      restrictionReason: -String
+      description: -String
+      administratorCount: int
+      restrictedCount: int
+      bannedCount: int
+      upgradedFromBasicGroupId: BasicGroupId
+      upgradedFromMaxMessageId: long
+      permissions: ChatPermissions
+      hasProtectedContent: boolean
+      availableReactions: String[]
+      messageTtl: int
+      themeName: -String
+      channel: boolean
+  ChatInviteLink:
+    data:
+      inviteLink: String
+      date: Timestamp
+      editDate: -Timestamp
+      name: String
+      createsJoinRequest: boolean
+      creatorUserId: UserId
+      expirationDate: -Timestamp
+      isPrimary: boolean
+      isRevoked: boolean
+      memberCount: int
+      memberLimit: int
+      pendingJoinRequestCount: int
+  ChatPermissions:
+    data:
+      canSendMessages: boolean
+      canSendMediaMessages: boolean
+      canSendPolls: boolean
+      canSendOtherMessages: boolean
+      canAddLinkPreviews: boolean
+      canChangeInfo: boolean
+      canInviteUsers: boolean
+      canPinMessages: boolean
+
+  ChatReceivers:
+    data:
+      receivers: PackedIntArray
+  UUID:
+    data:
+      msb: long
+      lsb: long
+
+  ChatMemberStatusMember: {data: {}}
+  ChatMemberStatusLeft: {data: {}}
+  ChatMemberStatusAdministrator:
+    data:
+      canBeEdited: boolean
+      canChangeInfo: boolean
+      canPostMessages: boolean
+      canEditMessages: boolean
+      canDeleteMessages: boolean
+      canInviteUsers: boolean
+      canRestrictMembers: boolean
+      canPinMessages: boolean
+      canPromoteMembers: boolean
+  ChatMemberStatusBanned:
+    data:
+      bannedUntilDate: int
+  ChatMemberStatusCreator:
+    data:
+      isMember: boolean
+  ChatMemberStatusRestricted:
+    data:
+      isMember: boolean
+      restrictedUntilDate: int
+      canSendMessages: boolean
+      canSendMediaMessages: boolean
+      canSendOtherMessages: boolean
+      canAddLinkPreviews: boolean
+  ChatMemberStatusJoinRequested:
+    data:
+      date: long
+      shortBio: -String
+  ChatMemberStatusUnknown: { data: { } }
+
+  Usernames:
+    data:
+      editable: -String
+      enabled: String[]
+      disabled: String[]
+  User:
+    data:
+      id: UserId
+      firstName: String
+      lastName: -String
+      username: -String
+      phoneNumber: -String
+      userType: UserType
+      userStatus: UserStatus
+      hasPrivateCalls: boolean
+      bio: -String
+      shortDescription: -String
+      botInfo: -BotInfo
+      haveAccessBots: OldUserIdSetV1
+      firstSeen: long
+  UserTypeUnknown:  {data: {}}
+  UserTypeDeleted: {data: {}}
+  UserTypeRegular: {data: {}}
+  UserTypeBot:
+    data:
+      canJoinGroups: boolean
+      canReadAllGroupMessages: boolean
+      isInline: boolean
+      needLocation: boolean
+      inlineQueryPlaceholder: -String
+  UserStatusEmpty: {data: {}}
+  UserStatusRecently: {data: {}}
+  UserStatusOnline: {data: {expires: int}}
+  UserStatusOffline: {data: {wasOnline: int}}
+  UserStatusLastWeek: {data: {}}
+  UserStatusLastMonth: {data: {}}
+  ByteArray:
+    data:
+      value: byte[]
+  LongHash:
+    data:
+      value: long
+  IntHash:
+    data:
+      value: int
+  ShortHash:
+    data:
+      value: short
+  IPArray:
+    data:
+      values: IP[]
+  UserAgentArray:
+    data:
+      values: UserAgent[]
+  IP:
+    data:
+      value: String
+  IPSnapshot:
+    data:
+      ip: IP
+      timestamp: Timestamp
+  UserAgent:
+    data:
+      value: String
+  UserAgentSnapshot:
+    data:
+      userAgent: UserAgent
+      timestamp: Timestamp
+  PointInTime:
+    data:
+      timestamp: long
+      coordinates: Coordinates
+  Coordinates:
+    data:
+      latitude: float
+      longitude: float
+
+  ChatPhotoUniqueId:
+    data:
+      id: long
+  ChatPhoto:
+    data:
+      id: long
+      addedDate: long
+      sizes: PhotoSize[]
+      animation: -AnimatedChatPhoto
+  AnimatedChatPhoto:
+    data:
+      length: int
+      fileId: MTFileUid
+      mainFrameTimestamp: double
+  ChatUsername:
+    data:
+      username: String
+  ChatMessageIndex:
+    data:
+      value: long
+
+  ChatEntityIdWithTag:
+    data:
+      id: ChatEntityId
+      tag: long
+
+  LastMembersRefreshTimestamps:
+    data:
+      normal: int
+      privileged: int
+      crawler: int
+      unused: int
+  LastChatPhotoRefreshTimestamps:
+    data:
+      usernameScrape: int
+
+  Minithumbnail:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringMinithumbnail"
+    data:
+      width: int
+      height: int
+      data: byte[]
+  StickerSet:
+    data:
+      id: long
+      title: String
+      name: String
+      thumbnail: -Thumbnail
+      thumbnailOutline: ClosedVectorPath[]
+      isOfficial: boolean
+      stickerType: OldStickerType
+      stickers: Sticker[]
+      emojis: Emojis[]
+  Emojis:
+    data:
+      emojis: String[]
+  ClosedVectorPath:
+    data:
+      commands: VectorPathCommand[]
+  VectorPathCommandLine:
+    data:
+      endPoint: Point
+  VectorPathCommandCubicBezierCurve:
+    data:
+      startControlPoint: Point
+      endControlPoint: Point
+      endPoint: Point
+  Point:
+    data:
+      x: double
+      y: double
+  Thumbnail:
+    data:
+      format: ThumbnailFormat
+      width: int
+      height: int
+      fileId: FileUid
+  ThumbnailFormatJpeg: { data: { } }
+  ThumbnailFormatGif: { data: { } }
+  ThumbnailFormatMpeg4: { data: { } }
+  ThumbnailFormatPng: { data: { } }
+  ThumbnailFormatTgs: { data: { } }
+  ThumbnailFormatWebm: { data: { } }
+  ThumbnailFormatWebp: { data: { } }
+  StickerFormatWebp: { data: { } }
+  StickerFormatTgs: { data: { } }
+  StickerFormatWebm: { data: { } }
+  StickerTypeRegular: { data: { } }
+  StickerTypeMask:
+    data:
+      maskPosition: MaskPosition
+  StickerTypeCustomEmoji: { data: { } }
+  StickerSetInfo:
+    data:
+      type: StickerType
+      format: StickerFormat
+  StickerInfo:
+    data:
+      type: StickerType
+      format: StickerFormat
+      maskPosition: -MaskPosition
+  ChatLocation:
+    data:
+      location: Location
+      address: String
+  ChatAdministratorRights:
+    data:
+      canManageChat: boolean
+      canChangeInfo: boolean
+      canPostMessages: boolean
+      canEditMessages: boolean
+      canDeleteMessages: boolean
+      canInviteUsers: boolean
+      canRestrictMembers: boolean
+      canPinMessages: boolean
+      canPromoteMembers: boolean
+      canManageVideoChats: boolean
+      isAnonymous: boolean
+  WebAppInfo:
+    data:
+      launchId: long
+      url: URL
+  WebApp:
+    data:
+      animation: -Animation
+      description: String
+      photo: Photo
+      title: String
+      shortName: String
+  ChatPhotoSticker:
+    data:
+      type: ChatPhotoStickerType
+      backgroundFill: BackgroundFill
+  BackgroundFillFreeformGradient:
+    data:
+      colors: int[]
+  BackgroundFillGradient:
+    data:
+      bottomColor: int
+      rotationAngle: int
+      topColor: int
+  BackgroundFillSolid:
+    data:
+      color: int
+  ChatPhotoStickerTypeCustomEmoji:
+    data:
+      customEmojiId: long
+  ChatPhotoStickerTypeRegularOrMask:
+    data:
+      stickerId: long
+      stickerSetId: long
+  BotMenuButton:
+    data:
+      text: String
+      url: URL
+  AvailableReaction:
+    data:
+      reaction: String
+      premium: boolean
+  ForumTopicIcon:
+    data:
+      color: int
+      customEmojiId: -long
+  ForumTopicInfo:
+    data:
+      messageThreadId: Int52
+      name: String
+      icon: ForumTopicIcon
+      creationDate: Int52
+      creatorId: ChatEntityId
+      outgoing: boolean
+      closed: boolean
+      isGeneral: boolean
+      isHidden: boolean
+  PaidMediaEmpty: {data: {}}
+  PaidMediaUnsupported:
+    data:
+      caption: FormattedText
+  PaidMediaPhoto:
+    data:
+      caption: FormattedText
+      photo: Photo
+  PaidMediaPreview:
+    data:
+      caption: FormattedText
+      duration: int
+      width: int
+      height: int
+      minithumbnail: -Minithumbnail
+  PaidMediaVideo:
+    data:
+      caption: FormattedText
+      video: Video
+  MessageStory:
+    data:
+      storyId: int
+      storySenderChatId: ChatEntityId
+      viaMention: boolean
+  MessageSuggestProfilePhoto:
+    data:
+      photo: ChatPhoto
+  LinkPreviewOptions:
+    data:
+      forceLargeMedia: boolean
+      url: -String
+      forceSmallMedia: boolean
+      showAboveText: boolean
+      isDisabled: boolean
+  MessageUsersShared:
+    data:
+      buttonId: int
+      users: SharedUser[]
+  MessagePremiumGiftCode:
+    data:
+      code: String
+      sticker: -Sticker
+      monthCount: int
+      creatorId: ChatEntityId
+      isFromGiveaway: boolean
+      isUnclaimed: boolean
+  MessagePremiumGiveaway:
+    data:
+      monthCount: int
+      sticker: -Sticker
+      parameters: PremiumGiveawayParameters
+      winnerCount: int
+  PremiumGiveawayParameters:
+    data:
+      additionalChatIds: ChatEntityIdSet
+      boostedChatId: ChatEntityId
+      countryCodes: String[]
+      onlyNewMembers: boolean
+      winnersSelectionDate: int
+  MessagePremiumGiveawayCreated: {data: {}}
+  MessagePremiumGiveawayCompleted:
+    data:
+      giveawayMessageId: long
+      winnerCount: int
+      unclaimedPrizeCount: int
+  MessagePremiumGiveawayWinners:
+    data:
+      boostedChatId: ChatEntityId
+      giveawayMessageId: long
+      additionalChatCount: int
+      actualWinnersSelectionDate: Timestamp
+      onlyNewMembers: boolean
+      wasRefunded: boolean
+      monthCount: int
+      prizeDescription: String
+      winnerCount: int
+      winnerUserIds: UserIdSet
+      unclaimedPrizeCount: int
+  MessageImportInfo:
+    data:
+      date: Timestamp
+      senderName: String
+  MessageReplyToNone: {data: {}}
+  MessageReplyToMessage:
+    data:
+      messageId: -long
+      chatId: -ChatEntityId
+      content: -MessageContent
+      isQuoteManual: boolean
+      origin: -MessageOrigin
+      originSendDate: -Timestamp
+      quote: -FormattedText
+  MessageReplyToStory:
+    data:
+      storyId: int
+      storySenderChatId: ChatEntityId
+  MessageOriginChannel:
+    data:
+      messageId: long
+      chatId: ChatEntityId
+      authorSignature: -String
+  MessageOriginChat:
+    data:
+      senderChatId: ChatEntityId
+      authorSignature: -String
+  MessageOriginUser:
+    data:
+      senderUserId: UserId
+  MessageOriginHiddenUser:
+    data:
+      senderName: String
+  MessageOriginUnknown: {data: {}}
+  MessageOriginOriginal: {data: {}}
+  MessageSelfDestructTypeEmpty: {data: {}}
+  MessageSelfDestructTypeImmediately: {data: {}}
+  MessageSelfDestructTypeTimer:
+    data:
+      selfDestructTime: int
+  KeyboardButtonTypeRequestChat:
+    data:
+      text: String
+      id: int
+      botAdministratorRights: -ChatAdministratorRights
+      chatIsChannel: boolean
+      chatIsCreated: boolean
+      chatIsForum: boolean
+      botIsMember: boolean
+      chatHasUsername: boolean
+      restrictChatHasUsername: boolean
+      restrictChatIsForum: boolean
+      userAdministratorRights: -ChatAdministratorRights
+  KeyboardButtonTypeRequestUsers:
+    data:
+      text: String
+      id: int
+      userIsBot: boolean
+      restrictUserIsBot: boolean
+      userIsPremium: boolean
+      restrictUserIsPremium: boolean
+  TargetChatCurrent: { data: { } }
+  TargetChatChosen:
+    data:
+      allowBotChats: boolean
+      allowChannelChats: boolean
+      allowGroupChats: boolean
+      allowUserChats: boolean
+  TargetChatInternalLink:
+    data:
+      link: InternalLinkType
+  InternalLinkTypeActiveSessions: { data: {} }
+  InternalLinkTypeAttachmentMenuBot: { data: {} }
+  InternalLinkTypeAuthenticationCode: { data: {} }
+  InternalLinkTypeBackground: { data: {} }
+  InternalLinkTypeBotAddToChannel: { data: {} }
+  InternalLinkTypeBotStart: { data: {} }
+  InternalLinkTypeBotStartInGroup: { data: {} }
+  InternalLinkTypeChangePhoneNumber: { data: {} }
+  InternalLinkTypeChatBoost: { data: {} }
+  InternalLinkTypeChatFolderInvite: { data: {} }
+  InternalLinkTypeChatFolderSettings: { data: {} }
+  InternalLinkTypeChatInvite: { data: {} }
+  InternalLinkTypeDefaultMessageAutoDeleteTimerSettings: { data: {} }
+  InternalLinkTypeEditProfileSettings: { data: {} }
+  InternalLinkTypeGame: { data: {} }
+  InternalLinkTypeInstantView: { data: {} }
+  InternalLinkTypeInvoice: { data: {} }
+  InternalLinkTypeLanguagePack: { data: {} }
+  InternalLinkTypeLanguageSettings: { data: {} }
+  InternalLinkTypeMessage: { data: {} }
+  InternalLinkTypeMessageDraft: { data: {} }
+  InternalLinkTypePassportDataRequest: { data: {} }
+  InternalLinkTypePhoneNumberConfirmation: { data: {} }
+  InternalLinkTypePremiumFeatures: { data: {} }
+  InternalLinkTypePremiumGiftCode: { data: {} }
+  InternalLinkTypePrivacyAndSecuritySettings: { data: {} }
+  InternalLinkTypeProxy: { data: {} }
+  InternalLinkTypePublicChat: { data: {} }
+  InternalLinkTypeQrCodeAuthentication: { data: {} }
+  InternalLinkTypeRestorePurchases: { data: {} }
+  InternalLinkTypeSettings: { data: {} }
+  InternalLinkTypeSideMenuBot: { data: {} }
+  InternalLinkTypeStickerSet: { data: {} }
+  InternalLinkTypeStory: { data: {} }
+  InternalLinkTypeTheme: { data: {} }
+  InternalLinkTypeThemeSettings: { data: {} }
+  InternalLinkTypeUnknownDeepLink: { data: {} }
+  InternalLinkTypeUnsupportedProxy: { data: {} }
+  InternalLinkTypeUserPhoneNumber: { data: {} }
+  InternalLinkTypeUserToken: { data: {} }
+  InternalLinkTypeVideoChat: { data: {} }
+  InternalLinkTypeWebApp: { data: {} }
+  InternalLinkTypeBusinessChat:
+    data:
+      linkName: String
+  InternalLinkTypeBuyStars: { data: {} }
+  InternalLinkTypeMainWebApp: { data: {} }
+  InternalLinkTypePremiumGift: { data: {} }
+
+  MessageReplyInfo:
+    data:
+      replyCount: int
+      recentReplierIds: ChatEntityIdSet
+      lastMessageId: long
+  MessageReaction:
+    data:
+      type: ReactionType
+      totalCount: int
+      isChosen: boolean
+
+  ReactionTypeEmoji:
+    data:
+      emoji: String
+  ReactionTypeCustomEmoji:
+    data:
+      customEmojiId: long
+  ReactionTypePaid: { data: {} }
+
+  ForwardSource:
+    data:
+      chatId: ChatEntityId
+      messageId: long
+      senderId: -ChatEntityId
+      senderName: -String
+      date: Timestamp
+      isOutgoing: boolean
+  MessageSenderUser:
+    data:
+      userId: UserId
+  MessageSenderChat:
+    data:
+      chatId: ChatEntityId
+  MessageSenderUnknown: {data: {}}
+
+  FactCheck:
+    data:
+      text: FormattedText
+      countryCode: String
+  TextQuote:
+    data:
+      text: FormattedText
+      position: int
+      isManual: boolean
+  MessageReactions:
+    data:
+      reactions: MessageReaction[]
+      areTags: boolean
+      paidReactors: PaidReactor[]
+  PaidReactor:
+    data:
+      senderId: ChatEntityId
+      starCount: int
+      isTop: boolean
+      isAnonymous: boolean
+
+  ProductInfo:
+    data:
+      title: String
+      description: FormattedText
+      photo: -Photo
+
+  LinkPreviewTypeAlbum:
+    data:
+      media: LinkPreviewAlbumMedia[]
+      caption: -String
+  LinkPreviewTypeAnimation:
+    data:
+      animation: Animation
+      author: -String
+  LinkPreviewTypeApp:
+    data:
+      photo: Photo
+      author: -String
+  LinkPreviewTypeArticle:
+    data:
+      photo: -Photo
+      author: -String
+  LinkPreviewTypeAudio:
+    data:
+      url: -String
+      mimeType: String
+      audio: -Audio
+      duration: int
+      author: -String
+  LinkPreviewTypeBackground:
+    data:
+      backgroundType: -BackgroundType
+      document: -Document
+  LinkPreviewTypeChannelBoost:
+    data:
+      photo: -ChatPhoto
+  LinkPreviewTypeChat:
+    data:
+      createJoinRequest: boolean
+      photo: -ChatPhoto
+      type: InviteLinkChatType
+  LinkPreviewTypeDocument:
+    data:
+      document: Document
+      author: -String
+  LinkPreviewTypeEmbeddedAnimationPlayer:
+    data:
+      url: String
+      thumbnail: -Photo
+      duration: int
+      author: String
+      width: int
+      height: int
+  LinkPreviewTypeEmbeddedAudioPlayer:
+    data:
+      url: String
+      thumbnail: -Photo
+      duration: int
+      author: String
+      width: int
+      height: int
+  LinkPreviewTypeEmbeddedVideoPlayer:
+    data:
+      url: String
+      thumbnail: -Photo
+      duration: int
+      author: String
+      width: int
+      height: int
+  LinkPreviewTypeInvoice: {data:{}}
+  LinkPreviewTypeMessage: {data:{}}
+  LinkPreviewTypePhoto:
+    data:
+      photo: Photo
+      author: -String
+  LinkPreviewTypePremiumGiftCode: {data:{}}
+  LinkPreviewTypeShareableChatFolder: {data:{}}
+  LinkPreviewTypeSticker:
+    data:
+      sticker: Sticker
+  LinkPreviewTypeStickerSet:
+    data:
+      stickers: Sticker[]
+  LinkPreviewTypeStory:
+    data:
+      storySenderChatId: ChatEntityId
+      storyId: int
+  LinkPreviewTypeSupergroupBoost:
+    data:
+      photo: ChatPhoto
+  LinkPreviewTypeTheme:
+    data:
+      documents: Document[]
+      settings: ThemeSettings
+  LinkPreviewTypeUnsupported: {data:{}}
+  LinkPreviewTypeUser:
+    data:
+      photo: -ChatPhoto
+      isBot: boolean
+  LinkPreviewTypeVideo:
+    data:
+      url: -String
+      mimeType: String
+      video: -Video
+      width: int
+      height: int
+      duration: int
+      author: -String
+  LinkPreviewTypeVideoChat:
+    data:
+      photo: -ChatPhoto
+      isLiveStream: boolean
+  LinkPreviewTypeVideoNote:
+    data:
+      videoNote: VideoNote
+  LinkPreviewTypeVoiceNote:
+    data:
+      voiceNote: VoiceNote
+  LinkPreviewTypeWebApp:
+    data:
+      photo: Photo
+
+  LinkPreviewAlbumMediaPhoto:
+    data:
+      photo: Photo
+  LinkPreviewAlbumMediaVideo:
+    data:
+      video: Video
+
+  InviteLinkChatTypeBasicGroup: {data:{}}
+  InviteLinkChatTypeSupergroup: {data:{}}
+  InviteLinkChatTypeChannel: {data:{}}
+
+  ThemeSettings:
+    data:
+      accentColor: int
+      background: Background
+      outgoingMessageFill: BackgroundFill
+      animateOutgoingMessageFill: boolean
+      outgoingMessageAccentColor: int
+
+  FixedStringUsername:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringFixedStringUsername"
+    data:
+      asciichar00: byte
+      asciichar01: byte
+      asciichar02: byte
+      asciichar03: byte
+      asciichar04: byte
+      asciichar05: byte
+      asciichar06: byte
+      asciichar07: byte
+      asciichar08: byte
+      asciichar09: byte
+      asciichar10: byte
+      asciichar11: byte
+      asciichar12: byte
+      asciichar13: byte
+      asciichar14: byte
+      asciichar15: byte
+      asciichar16: byte
+      asciichar17: byte
+      asciichar18: byte
+      asciichar19: byte
+      asciichar20: byte
+      asciichar21: byte
+      asciichar22: byte
+      asciichar23: byte
+      asciichar24: byte
+      asciichar25: byte
+      asciichar26: byte
+      asciichar27: byte
+      asciichar28: byte
+      asciichar29: byte
+      asciichar30: byte
+      asciichar31: byte
+  PhoneNumber:
+    stringRepresenter: "org.yotsuba.customrecords.SerialUtils.toStringPhoneNumber"
+    data:
+      value: long
+  LastChatResolutionResult:
+    data:
+      resolutionTime: Timestamp
+      id: -ChatEntityId
+
+# versions must have only numbers, lowercase letters, dots, dashes. Maximum: 99.999.9999
+versions:
+  0.0.0:
+    details:
+      changelog: "First version"
+  0.0.1:
+    previousVersion: 0.0.0
+    details:
+      changelog: "senderUserId is now chatId in messages, added isPinned (and upgraded to 1.6.10)"
+    transformations:
+      - moveData:
+          transformClass: Message
+          from: senderUserId
+          to: senderId
+      - upgradeData:
+          transformClass: Message
+          from: senderId
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.Message.SenderId"
+          type: ChatEntityId
+      - newData:
+          transformClass: Message
+          to: isPinned
+          initializer: "org.yotsuba.database.initializers.V169Initializers.Message.IsPinned"
+          type: boolean
+          index: 16
+  0.0.2:
+    previousVersion: 0.0.1
+    details:
+      changelog: "file id to global id"
+    transformations:
+      - upgradeData:
+          transformClass: Audio
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.FileUid"
+          type: MTFileUid
+      - upgradeData:
+          transformClass: Animation
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.FileUid"
+          type: MTFileUid
+      - upgradeData:
+          transformClass: PhotoSize
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.FileUid"
+          type: MTFileUid
+      - upgradeData:
+          transformClass: Document
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.FileUid"
+          type: MTFileUid
+      - upgradeData:
+          transformClass: Sticker
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.FileUid"
+          type: MTFileUid
+      - upgradeData:
+          transformClass: Video
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.FileUid"
+          type: MTFileUid
+      - upgradeData:
+          transformClass: VideoNote
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.FileUid"
+          type: MTFileUid
+      - upgradeData:
+          transformClass: VoiceNote
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.FileUid"
+          type: MTFileUid
+      - upgradeData:
+          transformClass: InlineKeyboardButtonTypeLoginUrl
+          from: url
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.LegacyURL"
+          type: String
+      - upgradeData:
+          transformClass: InlineKeyboardButtonTypeUrl
+          from: url
+          upgrader: "org.yotsuba.database.initializers.V169Initializers.LegacyURL"
+          type: String
+  0.0.3:
+    previousVersion: 0.0.2
+    details:
+      changelog: "52bit user ids"
+    transformations:
+      - upgradeData:
+          transformClass: User
+          from: haveAccessBots
+          upgrader: "org.yotsuba.database.initializers.V003.LegacyUserIdSetUpgrader"
+          type: OldUserIdSetV2
+      - upgradeData:
+          transformClass: SuperCollectionId
+          from: tableId
+          upgrader: "org.yotsuba.database.initializers.V003.SuperCollectionIdUpgrader"
+          type: Int52
+      - upgradeData:
+          transformClass: BasicGroupId
+          from: tableId
+          upgrader: "org.yotsuba.database.initializers.V003.BasicGroupIdUpgrader"
+          type: Int52
+      - upgradeData:
+          transformClass: UserId
+          from: tableId
+          upgrader: "org.yotsuba.database.initializers.V003.UserIdUpgrader"
+          type: Int52
+      - upgradeData:
+          transformClass: DeprecatedId
+          from: tableId
+          upgrader: "org.yotsuba.database.initializers.V003.DeprecatedIdUpgrader"
+          type: Int52
+      - upgradeData:
+          transformClass: MessageChatAddMembers
+          from: memberUserIds
+          upgrader: "org.yotsuba.database.initializers.V003.MessageChatAddMembersUpgrader"
+          type: OldUserIdSetV2
+      - upgradeData:
+          transformClass: MessageChatDeleteMember
+          from: userId
+          upgrader: "org.yotsuba.database.initializers.V003.MessageChatDeleteMemberUpgrader"
+          type: UserId
+      - upgradeData:
+          transformClass: ChatReceivers
+          from: receivers
+          upgrader: "org.yotsuba.database.initializers.V003.ChatReceiversUpgrader"
+          type: OldUserIdSetV2
+      - upgradeData:
+          transformClass: Contact
+          from: userId
+          upgrader: "org.yotsuba.database.initializers.V003.ContactUserIdUpgrader"
+          type: UserId
+  0.0.4:
+    previousVersion: 0.0.3
+    details:
+      changelog: "Full Webpage data"
+    transformations:
+      - upgradeData:
+          transformClass: User
+          from: haveAccessBots
+          upgrader: "org.yotsuba.database.initializers.V004.LegacyUserIdSetUpgrader"
+          type: UserIdSet
+      - upgradeData:
+          transformClass: MessageChatAddMembers
+          from: memberUserIds
+          upgrader: "org.yotsuba.database.initializers.V004.LegacyUserIdSetUpgrader"
+          type: UserIdSet
+      - upgradeData:
+          transformClass: ChatReceivers
+          from: receivers
+          upgrader: "org.yotsuba.database.initializers.V004.LegacyUserIdSetUpgrader"
+          type: UserIdSet
+      - newData:
+          transformClass: LinkPreview
+          to: photo
+          initializer: "org.yotsuba.database.initializers.V004.WebpagePhotoUpgrader"
+          type: -Photo
+      - newData:
+          transformClass: LinkPreview
+          to: embedWidth
+          initializer: "org.yotsuba.database.initializers.V004.WebpageEmbedWidthUpgrader"
+          type: int
+      - newData:
+          transformClass: LinkPreview
+          to: embedHeight
+          initializer: "org.yotsuba.database.initializers.V004.WebpageEmbedHeightUpgrader"
+          type: int
+      - newData:
+          transformClass: LinkPreview
+          to: duration
+          initializer: "org.yotsuba.database.initializers.V004.WebpageDurationUpgrader"
+          type: int
+      - newData:
+          transformClass: LinkPreview
+          to: author
+          initializer: "org.yotsuba.database.initializers.V004.WebpageAuthorUpgrader"
+          type: -String
+      - newData:
+          transformClass: LinkPreview
+          to: animation
+          initializer: "org.yotsuba.database.initializers.V004.WebpageAnimationUpgrader"
+          type: -Animation
+      - newData:
+          transformClass: LinkPreview
+          to: audio
+          initializer: "org.yotsuba.database.initializers.V004.WebpageAudioUpgrader"
+          type: -Audio
+      - newData:
+          transformClass: LinkPreview
+          to: document
+          initializer: "org.yotsuba.database.initializers.V004.WebpageDocumentUpgrader"
+          type: -Document
+      - newData:
+          transformClass: LinkPreview
+          to: sticker
+          initializer: "org.yotsuba.database.initializers.V004.WebpageStickerUpgrader"
+          type: -Sticker
+      - newData:
+          transformClass: LinkPreview
+          to: video
+          initializer: "org.yotsuba.database.initializers.V004.WebpageVideoUpgrader"
+          type: -Video
+      - newData:
+          transformClass: LinkPreview
+          to: videoNote
+          initializer: "org.yotsuba.database.initializers.V004.WebpageVideoNoteUpgrader"
+          type: -VideoNote
+      - newData:
+          transformClass: LinkPreview
+          to: voiceNote
+          initializer: "org.yotsuba.database.initializers.V004.WebpageVoiceNoteUpgrader"
+          type: -VoiceNote
+      - newData:
+          transformClass: LinkPreview
+          to: instantViewVersion
+          initializer: "org.yotsuba.database.initializers.V004.WebpageInstantViewVersionUpgrader"
+          type: int
+  0.0.5:
+    previousVersion: 0.0.4
+    details:
+      changelog: "Full Webpage data"
+    transformations:
+      - upgradeData:
+          transformClass: InlineKeyboardButtonTypeLoginUrl
+          from: id
+          upgrader: "org.yotsuba.database.initializers.V005.UserIdUpgrader"
+          type: UserId
+      - upgradeData:
+          transformClass: Poll
+          from: recentVoterUserIds
+          upgrader: "org.yotsuba.database.initializers.V005.UserIdSetUpgrader"
+          type: UserIdSet
+  0.0.6:
+    previousVersion: 0.0.5
+    details:
+      changelog: "Messages index time"
+    transformations:
+      - upgradeData:
+          transformClass: BMessage
+          from: value
+          upgrader: "org.yotsuba.database.initializers.V006.BMessageUpgrader"
+          type: ImportedMessage
+  0.0.7:
+    previousVersion: 0.0.6
+    details:
+      changelog: "Multiple File Uid"
+    transformations:
+      - upgradeData:
+          transformClass: Audio
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V007.FileIdUpgrader"
+          type: FileUid
+      - upgradeData:
+          transformClass: Animation
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V007.FileIdUpgrader"
+          type: FileUid
+      - upgradeData:
+          transformClass: PhotoSize
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V007.FileIdUpgrader"
+          type: FileUid
+      - upgradeData:
+          transformClass: Document
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V007.FileIdUpgrader"
+          type: FileUid
+      - upgradeData:
+          transformClass: Sticker
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V007.FileIdUpgrader"
+          type: FileUid
+      - upgradeData:
+          transformClass: Video
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V007.FileIdUpgrader"
+          type: FileUid
+      - upgradeData:
+          transformClass: VideoNote
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V007.FileIdUpgrader"
+          type: FileUid
+      - upgradeData:
+          transformClass: VoiceNote
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V007.FileIdUpgrader"
+          type: FileUid
+      - upgradeData:
+          transformClass: AnimatedChatPhoto
+          from: fileId
+          upgrader: "org.yotsuba.database.initializers.V007.FileIdUpgrader"
+          type: FileUid
+      - upgradeData:
+          transformClass: AnimatedEmoji
+          from: soundFileId
+          upgrader: "org.yotsuba.database.initializers.V007.NullableFileIdUpgrader"
+          type: -FileUid
+  # The following versions are all based on 0.0.7
+  0.0.8:
+    previousVersion: 0.0.7
+    details:
+      changelog: "Update to TDLib 1.8.1"
+    transformations:
+      - upgradeData:
+          transformClass: BChatEntity
+          from: value
+          upgrader: "org.yotsuba.database.initializers.V008.BChatEntityValueUpgrader"
+          type: ChatEntity
+      - upgradeData:
+          transformClass: MessageChatChangePhoto
+          from: photo
+          upgrader: "org.yotsuba.database.initializers.V008.MessageChatChangePhotoPhotoUpgrader"
+          type: ChatPhoto
+      - upgradeData:
+          transformClass: Sticker
+          from: thumbnail
+          upgrader: "org.yotsuba.database.initializers.V008.StickerThumbnailUpgrader"
+          type: -Thumbnail
+      - newData:
+          transformClass: Sticker
+          to: type
+          initializer: "org.yotsuba.database.initializers.V008.StickerTypeInitializer"
+          type: OldStickerType
+      - removeData:
+          transformClass: Sticker
+          from: maskPosition
+      - removeData:
+          transformClass: Sticker
+          from: isMask
+      - newData:
+          transformClass: ChatPhoto
+          to: minithumbnail
+          initializer: "org.yotsuba.database.initializers.V008.ChatPhotoMinithumbnailInitializer"
+          type: -Minithumbnail
+          index: 2
+      - newData:
+          transformClass: Photo
+          to: minithumbnail
+          initializer: "org.yotsuba.database.initializers.V008.ChatPhotoMinithumbnailInitializer"
+          type: -Minithumbnail
+          index: 1
+      - newData:
+          transformClass: Animation
+          to: minithumbnail
+          initializer: "org.yotsuba.database.initializers.V008.ChatPhotoMinithumbnailInitializer"
+          type: -Minithumbnail
+      - newData:
+          transformClass: Document
+          to: minithumbnail
+          initializer: "org.yotsuba.database.initializers.V008.ChatPhotoMinithumbnailInitializer"
+          type: -Minithumbnail
+      - newData:
+          transformClass: Video
+          to: minithumbnail
+          initializer: "org.yotsuba.database.initializers.V008.ChatPhotoMinithumbnailInitializer"
+          type: -Minithumbnail
+      - newData:
+          transformClass: VideoNote
+          to: minithumbnail
+          initializer: "org.yotsuba.database.initializers.V008.ChatPhotoMinithumbnailInitializer"
+          type: -Minithumbnail
+      - removeData:
+          transformClass: User
+          from: haveAccessBots
+      - newData:
+          transformClass: MessageChatUpgradeFrom
+          to: title
+          initializer: "org.yotsuba.database.initializers.V008.MessageChatUpgradeFromTitleInitializer"
+          type: String
+      - newData:
+          transformClass: MessageLocation
+          to: livePeriod
+          initializer: "org.yotsuba.database.initializers.V008.MessageLocationZeroInitializer"
+          type: int
+      - newData:
+          transformClass: MessageLocation
+          to: heading
+          initializer: "org.yotsuba.database.initializers.V008.MessageLocationZeroInitializer"
+          type: int
+      - newData:
+          transformClass: MessageLocation
+          to: proximityAlertRadius
+          initializer: "org.yotsuba.database.initializers.V008.MessageLocationZeroInitializer"
+          type: int
+      - newData:
+          transformClass: Message
+          to: canBeSaved
+          initializer: "org.yotsuba.database.initializers.V008.MessageTrueInitializer"
+          type: boolean
+      - newData:
+          transformClass: Message
+          to: hasTimestampedMedia
+          initializer: "org.yotsuba.database.initializers.V008.MessageFalseInitializer"
+          type: boolean
+      - newData:
+          transformClass: Message
+          to: messageThreadId
+          initializer: "org.yotsuba.database.initializers.V008.MessageZeroInitializer"
+          type: long
+      - newData:
+          transformClass: Message
+          to: restrictionReason
+          initializer: "org.yotsuba.database.initializers.V008.MessageRestrictionReasonInitializer"
+          type: -String
+      - newData:
+          transformClass: BasicGroup
+          to: permissions
+          initializer: "org.yotsuba.database.initializers.V008.ChatPermissionsInitializer"
+          type: ChatPermissions
+      - newData:
+          transformClass: BasicGroup
+          to: hasProtectedContent
+          initializer: "org.yotsuba.database.initializers.V008.ChatHasProtectedContentInitializer"
+          type: boolean
+      - newData:
+          transformClass: BasicGroup
+          to: availableReactions
+          initializer: "org.yotsuba.database.initializers.V008.ChatAvailableReactionsInitializer"
+          type: String[]
+      - newData:
+          transformClass: BasicGroup
+          to: messageTtl
+          initializer: "org.yotsuba.database.initializers.V008.ChatTtlInitializer"
+          type: int
+      - newData:
+          transformClass: BasicGroup
+          to: themeName
+          initializer: "org.yotsuba.database.initializers.V008.ChatThemeInitializer"
+          type: -String
+      - newData:
+          transformClass: BasicGroup
+          to: description
+          initializer: "org.yotsuba.database.initializers.V008.ChatThemeInitializer"
+          type: -String
+      - newData:
+          transformClass: User
+          to: hasProtectedContent
+          initializer: "org.yotsuba.database.initializers.V008.ChatHasProtectedContentInitializer"
+          type: boolean
+      - newData:
+          transformClass: User
+          to: availableReactions
+          initializer: "org.yotsuba.database.initializers.V008.ChatAvailableReactionsInitializer"
+          type: String[]
+      - newData:
+          transformClass: User
+          to: messageTtl
+          initializer: "org.yotsuba.database.initializers.V008.ChatTtlInitializer"
+          type: int
+      - newData:
+          transformClass: User
+          to: themeName
+          initializer: "org.yotsuba.database.initializers.V008.ChatThemeInitializer"
+          type: -String
+      - newData:
+          transformClass: User
+          to: verified
+          initializer: "org.yotsuba.database.initializers.V008.MessageFalseInitializer"
+          type: boolean
+      - newData:
+          transformClass: User
+          to: support
+          initializer: "org.yotsuba.database.initializers.V008.MessageFalseInitializer"
+          type: boolean
+      - newData:
+          transformClass: User
+          to: scam
+          initializer: "org.yotsuba.database.initializers.V008.MessageFalseInitializer"
+          type: boolean
+      - newData:
+          transformClass: User
+          to: fake
+          initializer: "org.yotsuba.database.initializers.V008.MessageFalseInitializer"
+          type: boolean
+      - newData:
+          transformClass: User
+          to: languageCode
+          initializer: "org.yotsuba.database.initializers.V008.UserLanguageCodeInitializer"
+          type: -String
+      - newData:
+          transformClass: Supergroup
+          to: broadcast
+          initializer: "org.yotsuba.database.initializers.V008.MessageFalseInitializer"
+          type: boolean
+      - newData:
+          transformClass: Supergroup
+          to: location
+          initializer: "org.yotsuba.database.initializers.V008.LocationInitializer"
+          type: -ChatLocation
+      - newData:
+          transformClass: Supergroup
+          to: linkedChatId
+          initializer: "org.yotsuba.database.initializers.V008.LinkedChatIdInitializer"
+          type: -ChatEntityId
+      - newData:
+          transformClass: Supergroup
+          to: verified
+          initializer: "org.yotsuba.database.initializers.V008.MessageFalseInitializer"
+          type: boolean
+      - newData:
+          transformClass: Supergroup
+          to: scam
+          initializer: "org.yotsuba.database.initializers.V008.MessageFalseInitializer"
+          type: boolean
+      - newData:
+          transformClass: Supergroup
+          to: fake
+          initializer: "org.yotsuba.database.initializers.V008.MessageFalseInitializer"
+          type: boolean
+      - upgradeData:
+          transformClass: VideoNote
+          from: thumbnail
+          upgrader: "org.yotsuba.database.initializers.V008.ThumbnailUpgrader"
+          type: -Thumbnail
+      - upgradeData:
+          transformClass: Video
+          from: thumbnail
+          upgrader: "org.yotsuba.database.initializers.V008.ThumbnailUpgrader"
+          type: -Thumbnail
+      - upgradeData:
+          transformClass: Audio
+          from: albumCoverThumbnail
+          upgrader: "org.yotsuba.database.initializers.V008.ThumbnailUpgrader"
+          type: -Thumbnail
+      - upgradeData:
+          transformClass: Animation
+          from: thumbnail
+          upgrader: "org.yotsuba.database.initializers.V008.ThumbnailUpgrader"
+          type: -Thumbnail
+      - upgradeData:
+          transformClass: Document
+          from: thumbnail
+          upgrader: "org.yotsuba.database.initializers.V008.ThumbnailUpgrader"
+          type: -Thumbnail
+      - moveData:
+          transformClass: Video
+          from: fileId
+          to: fileId
+          index: 7
+  0.0.9:
+    previousVersion: 0.0.8
+    details:
+      changelog: "Update to TDLib 1.8.3"
+    transformations:
+      - newData:
+          transformClass: BotInfo
+          to: shortDescription
+          initializer: "org.yotsuba.database.initializers.V009.BotInfoShortDescriptionInitializer"
+          type: String
+      - newData:
+          transformClass: BotInfo
+          to: menuButton
+          initializer: "org.yotsuba.database.initializers.V009.BotInfoMenuButtonInitializer"
+          type: -BotMenuButton
+      - newData:
+          transformClass: BotInfo
+          to: defaultGroupAdministratorRights
+          initializer: "org.yotsuba.database.initializers.V009.BotInfoDefaultAdminRightsInitializer"
+          type: -ChatAdministratorRights
+      - newData:
+          transformClass: BotInfo
+          to: defaultChannelAdministratorRights
+          initializer: "org.yotsuba.database.initializers.V009.BotInfoDefaultAdminRightsInitializer"
+          type: -ChatAdministratorRights
+      - newData:
+          transformClass: ChatMemberStatusAdministrator
+          to: customTitle
+          initializer: "org.yotsuba.database.initializers.V009.ChatMemberStatusAdministratorCustomTitleInitializer"
+          type: -String
+      - newData:
+          transformClass: ChatMemberStatusAdministrator
+          to: rights
+          initializer: "org.yotsuba.database.initializers.V009.ChatMemberStatusAdministratorRightsInitializer"
+          type: ChatAdministratorRights
+      - removeData:
+          transformClass: ChatMemberStatusAdministrator
+          from: canChangeInfo
+      - removeData:
+          transformClass: ChatMemberStatusAdministrator
+          from: canPostMessages
+      - removeData:
+          transformClass: ChatMemberStatusAdministrator
+          from: canEditMessages
+      - removeData:
+          transformClass: ChatMemberStatusAdministrator
+          from: canDeleteMessages
+      - removeData:
+          transformClass: ChatMemberStatusAdministrator
+          from: canInviteUsers
+      - removeData:
+          transformClass: ChatMemberStatusAdministrator
+          from: canRestrictMembers
+      - removeData:
+          transformClass: ChatMemberStatusAdministrator
+          from: canPinMessages
+      - removeData:
+          transformClass: ChatMemberStatusAdministrator
+          from: canPromoteMembers
+      - removeData:
+          transformClass: User
+          from: shortDescription
+  0.0.10:
+    previousVersion: 0.0.9
+    details:
+      changelog: "Update to TDLib 1.8.4"
+    transformations:
+      - newData:
+          transformClass: ChatPhoto
+          to: smallAnimation
+          initializer: "org.yotsuba.database.initializers.V010.SmallAnimatedChatPhotoInitializer"
+          type: -AnimatedChatPhoto
+      - newData:
+          transformClass: User
+          to: premium
+          initializer: "org.yotsuba.database.initializers.V010.PremiumInitializer"
+          type: boolean
+          index: 16
+      - upgradeData:
+          transformClass: User
+          from: bio
+          upgrader: "org.yotsuba.database.initializers.V010.BioUpgrader"
+          type: -FormattedText
+      - newData:
+          transformClass: BotInfo
+          to: photo
+          initializer: "org.yotsuba.database.initializers.V010.BotInfoPhotoInitializer"
+          type: -Photo
+      - newData:
+          transformClass: BotInfo
+          to: animation
+          initializer: "org.yotsuba.database.initializers.V010.BotInfoAnimationInitializer"
+          type: -Animation
+      - newData:
+          transformClass: Supergroup
+          to: joinToSendMessages
+          initializer: "org.yotsuba.database.initializers.V010.JoinToSendMessagesInitializer"
+          type: boolean
+          index: 7
+      - newData:
+          transformClass: Supergroup
+          to: joinByRequest
+          initializer: "org.yotsuba.database.initializers.V010.JoinByRequestInitializer"
+          type: boolean
+          index: 8
+      - upgradeData:
+          transformClass: Supergroup
+          from: availableReactions
+          upgrader: "org.yotsuba.database.initializers.V010.AvailableReactionsUpgrader"
+          type: AvailableReaction[]
+      - upgradeData:
+          transformClass: BasicGroup
+          from: availableReactions
+          upgrader: "org.yotsuba.database.initializers.V010.AvailableReactionsUpgrader"
+          type: AvailableReaction[]
+      - upgradeData:
+          transformClass: User
+          from: availableReactions
+          upgrader: "org.yotsuba.database.initializers.V010.AvailableReactionsUpgrader"
+          type: AvailableReaction[]
+      - newData:
+          transformClass: MessageSticker
+          to: premium
+          initializer: "org.yotsuba.database.initializers.V010.PremiumInitializer"
+          type: boolean
+      - upgradeData:
+          transformClass: MessageInvoice
+          from: description
+          upgrader: "org.yotsuba.database.initializers.V010.TextToFormattedTextUpgrader"
+          type: FormattedText
+      - newData:
+          transformClass: MessagePaymentSuccessful
+          to: recurring
+          initializer: "org.yotsuba.database.initializers.V010.RecurringInitializer"
+          type: boolean
+      - newData:
+          transformClass: MessagePaymentSuccessful
+          to: firstRecurring
+          initializer: "org.yotsuba.database.initializers.V010.RecurringInitializer"
+          type: boolean
+      - newData:
+          transformClass: MessagePaymentSuccessful
+          to: invoiceName
+          initializer: "org.yotsuba.database.initializers.V010.InvoiceNameInitializer"
+          type: -String
+      - newData:
+          transformClass: MessagePaymentSuccessfulBot
+          to: recurring
+          initializer: "org.yotsuba.database.initializers.V010.RecurringInitializer"
+          type: boolean
+      - newData:
+          transformClass: MessagePaymentSuccessfulBot
+          to: firstRecurring
+          initializer: "org.yotsuba.database.initializers.V010.RecurringInitializer"
+          type: boolean
+      - newData:
+          transformClass: Sticker
+          to: premiumAnimationFileId
+          initializer: "org.yotsuba.database.initializers.V010.PremiumAnimationFileIdInitializer"
+          type: -FileUid
+          index: 6
+  0.0.11:
+    previousVersion: 0.0.10
+    details:
+      changelog: "Update to TDLib 1.8.5"
+    transformations:
+      - moveData:
+          transformClass: Sticker
+          from: type
+          to: info
+      - moveData:
+          transformClass: StickerSet
+          from: stickerType
+          to: stickerSetInfo
+      - upgradeData:
+          transformClass: Sticker
+          from: info
+          upgrader: "org.yotsuba.database.initializers.V011.StickerTypeUpgrader"
+          type: StickerInfo
+      - removeData:
+          transformClass: StickerTypeMask
+          from: maskPosition
+      - newData:
+          transformClass: Audio
+          to: externalAlbumCoverThumbnails
+          initializer: "org.yotsuba.database.initializers.V011.ExternalAlbumCoverThumbnailsInitializer"
+          type: Thumbnail[]
+      - newData:
+          transformClass: Sticker
+          to: customEmojiId
+          initializer: "org.yotsuba.database.initializers.V011.CustomEmojiIdInitializer"
+          type: -long
+      - newData:
+          transformClass: Sticker
+          to: isPremium
+          initializer: "org.yotsuba.database.initializers.V011.IsPremiumInitializer"
+          type: boolean
+      - newData:
+          transformClass: User
+          to: hasRestrictedVoiceAndVideoNoteMessages
+          initializer: "org.yotsuba.database.initializers.V011.HasRestrictedVoiceAndVideoNoteMessagesInitializer"
+          type: boolean
+          index: 12
+      - upgradeData:
+          transformClass: StickerSet
+          from: stickerSetInfo
+          upgrader: "org.yotsuba.database.initializers.V011.StickerSetInfoUpgrader"
+          type: StickerSetInfo
+  0.0.12:
+    previousVersion: 0.0.11
+    details:
+      changelog: "Update to TDLib 1.8.8"
+    transformations:
+      - newData:
+          transformClass: VideoNote
+          to: waveform
+          initializer: "org.yotsuba.database.initializers.V012.VideoNoteWaveformInitializer"
+          type: byte[]
+      - newData:
+          transformClass: AnimatedEmoji
+          to: stickerWidth
+          initializer: "org.yotsuba.database.initializers.V012.AnimatedEmojiStickerWidthInitializer"
+          type: int
+      - newData:
+          transformClass: AnimatedEmoji
+          to: stickerHeight
+          initializer: "org.yotsuba.database.initializers.V012.AnimatedEmojiStickerHeightInitializer"
+          type: int
+      - upgradeData:
+          transformClass: AnimatedEmoji
+          from: sticker
+          upgrader: "org.yotsuba.database.initializers.V012.AnimatedEmojiStickerUpgrader"
+          type: -Sticker
+      - newData:
+          transformClass: ChatPermissions
+          to: canManageTopics
+          initializer: "org.yotsuba.database.initializers.V012.ChatPermissionsCanManageTopicsInitializer"
+          type: boolean
+      - newData:
+          transformClass: ChatAdministratorRights
+          to: canManageTopics
+          initializer: "org.yotsuba.database.initializers.V012.ChatAdministratorRightsCanManageTopicsInitializer"
+          type: boolean
+      - moveData:
+          transformClass: Supergroup
+          from: username
+          to: usernames
+      - upgradeData:
+          transformClass: Supergroup
+          from: usernames
+          upgrader: "org.yotsuba.database.initializers.V012.UsernamesUpgrader"
+          type: Usernames
+      - moveData:
+          transformClass: User
+          from: username
+          to: usernames
+      - upgradeData:
+          transformClass: User
+          from: usernames
+          upgrader: "org.yotsuba.database.initializers.V012.UsernamesUpgrader"
+          type: Usernames
+      - newData:
+          transformClass: Supergroup
+          to: isForum
+          initializer: "org.yotsuba.database.initializers.V012.SupergroupIsForumInitializer"
+          type: boolean
+      - newData:
+          transformClass: Message
+          to: isTopicMessage
+          initializer: "org.yotsuba.database.initializers.V012.MessageIsTopicMessageInitializer"
+          type: boolean
+      - newData:
+          transformClass: User
+          to: emojiStatusCustomEmojiId
+          initializer: "org.yotsuba.database.initializers.V012.UserEmojiInitializer"
+          type: -long
+      - newData:
+          transformClass: Supergroup
+          to: title
+          index: 1
+          initializer: "org.yotsuba.database.initializers.V012.SupergroupTitleInitializer"
+          type: String
+      - newData:
+          transformClass: BasicGroup
+          to: title
+          index: 1
+          initializer: "org.yotsuba.database.initializers.V012.BasicGroupTitleInitializer"
+          type: String
+      - newData:
+          transformClass: Supergroup
+          to: firstSeen
+          initializer: "org.yotsuba.database.initializers.V012.FirstSeenInitializer"
+          type: long
+      - newData:
+          transformClass: BasicGroup
+          to: firstSeen
+          initializer: "org.yotsuba.database.initializers.V012.FirstSeenInitializer"
+          type: long
+      - moveData:
+          transformClass: Video
+          from: thumbnail
+          to: thumbnail
+          index: 7
+  0.0.13:
+    previousVersion: 0.0.12
+    details:
+      changelog: "Update to TDLib 1.8.21"
+    transformations:
+      - moveData:
+          transformClass: AnimatedEmoji
+          from: colorReplacements
+          to: fitzpatrickType
+      - upgradeData:
+          transformClass: AnimatedEmoji
+          from: fitzpatrickType
+          upgraderInstance: "org.yotsuba.database.initializers.V013.ANIMATED_EMOJI_FITZPATRICK_TYPE_UPGRADER"
+          type: int
+      - newData:
+          transformClass: MessageAnimation
+          to: hasSpoiler
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_ANIMATION_HAS_SPOILER_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: Animation
+          to: hasStickers
+          initializerInstance: "org.yotsuba.database.initializers.V013.ANIMATION_HAS_STICKERS_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: TextEntityTypePreCode
+          to: language
+          initializerInstance: "org.yotsuba.database.initializers.V013.TEXT_ENTITY_TYPE_PRE_CODE_LANGUAGE_INITIALIZER"
+          type: -String
+      - newData:
+          transformClass: Audio
+          to: minithumbnail
+          initializerInstance: "org.yotsuba.database.initializers.V013.AUDIO_ALBUM_COVER_MINITHUMBNAIL_INITIALIZER"
+          type: -Minithumbnail
+      - newData:
+          transformClass: MessageChatCreate
+          to: memberUserIds
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_CHAT_CREATE_MEMBER_USER_IDS_INITIALIZER"
+          type: UserIdSet
+      - newData:
+          transformClass: MessageChatCreate
+          to: isSupergroup
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_CHAT_CREATE_IS_SUPERGROUP_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: ChatPhoto
+          to: sticker
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_PHOTO_STICKER_INITIALIZER"
+          type: -ChatPhotoSticker
+      - moveData:
+          transformClass: MessageChatSetMessageAutoDeleteTime
+          from: ttl
+          to: messageAutoDeleteTime
+      - newData:
+          transformClass: MessageChatSetMessageAutoDeleteTime
+          to: fromUserId
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_CHAT_SET_MESSAGE_AUTO_DELETE_TIME_FROM_USER_ID_INITIALIZER"
+          type: UserId
+      - newData:
+          transformClass: MessageGiftedPremium
+          to: gifterUserId
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_GIFTED_PREMIUM_GIFTER_USER_ID_INITIALIZER"
+          type: UserId
+      - newData:
+          transformClass: MessageGiftedPremium
+          to: cryptocurrency
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_GIFTED_PREMIUM_CRYPTOCURRENCY_INITIALIZER"
+          type: -String
+      - newData:
+          transformClass: MessageGiftedPremium
+          to: cryptocurrencyAmount
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_GIFTED_PREMIUM_CRYPTOCURRENCY_AMOUNT_INITIALIZER"
+          type: long
+      - upgradeData:
+          transformClass: MessageGiftedPremium
+          from: currency
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MESSAGE_GIFTED_PREMIUM_CURRENCY_UPGRADER"
+          type: -String
+      - newData:
+          transformClass: MessageInvoice
+          to: paidMedia
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_INVOICE_EXTENDED_MEDIA_INITIALIZER"
+          type: PaidMedia
+      - newData:
+          transformClass: Location
+          to: horizontalAccuracy
+          initializerInstance: "org.yotsuba.database.initializers.V013.LOCATION_HORIZONTAL_ACCURACY_INITIALIZER"
+          type: double
+      - newData:
+          transformClass: MessageLocation
+          to: expiresIn
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_LOCATION_EXPIRES_IN_INITIALIZER"
+          type: int
+      - newData:
+          transformClass: MessagePhoto
+          to: hasSpoiler
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_PHOTO_HAS_SPOILER_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: MessageText
+          to: linkPreviewOptions
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_TEXT_LINK_PREVIEW_OPTIONS"
+          type: LinkPreviewOptions
+      - newData:
+          transformClass: MessageVideo
+          to: hasSpoiler
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_VIDEO_HAS_SPOILER_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: VoiceNote
+          to: speechRecognitionResult
+          initializerInstance: "org.yotsuba.database.initializers.V013.SPEECH_RECOGNITION_RESULT_INITIALIZER"
+          type: SpeechRecognitionResult
+      - moveData:
+          transformClass: Message
+          from: id
+          to: id
+          index: 0
+      - moveData:
+          transformClass: Message
+          from: senderId
+          to: senderId
+          index: 1
+      - moveData:
+          transformClass: Message
+          from: chatEntityId
+          to: chatEntityId
+          index: 2
+      - upgradeData:
+          transformClass: Message
+          from: date
+          upgraderInstance: "org.yotsuba.database.initializers.V013.INT_TO_TIMESTAMP_UPGRADER"
+          type: Timestamp
+      - upgradeData:
+          transformClass: Message
+          from: editDate
+          upgraderInstance: "org.yotsuba.database.initializers.V013.TIMESTAMP_TO_NULLABLE_TIMESTAMP_UPGRADER"
+          type: -Timestamp
+      - newData:
+          transformClass: Message
+          to: canBeForwarded
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_CAN_BE_FORWARDED_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: Message
+          to: importInfo
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_IMPORT_INFO_INITIALIZER"
+          type: -MessageImportInfo
+      - moveData:
+          transformClass: Message
+          from: replyToMessageId
+          to: replyTo
+      - upgradeData:
+          transformClass: Message
+          from: replyTo
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MESSAGE_REPLY_TO_UPGRADER"
+          type: MessageReplyTo
+      - removeData:
+          transformClass: Message
+          from: ttlExpiresIn
+      - moveData:
+          transformClass: Message
+          from: ttl
+          to: selfDestructType
+      - upgradeData:
+          transformClass: Message
+          from: selfDestructType
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MESSAGE_SELF_DESTRUCT_TYPE_UPGRADER"
+          type: MessageSelfDestructType
+      - upgradeData:
+          transformClass: InlineKeyboardButtonTypeLoginUrl
+          from: id
+          upgraderInstance: "org.yotsuba.database.initializers.V013.INLINE_KEYBOARD_BUTTON_TYPE_LOGIN_URL_UPGRADER"
+          type: long
+      - newData:
+          transformClass: ReplyMarkupForceReply
+          to: inputFieldPlaceholder
+          initializerInstance: "org.yotsuba.database.initializers.V013.REPLY_MARKUP_FORCE_REPLY_INITIALIZER"
+          type: String
+      - newData:
+          transformClass: ReplyMarkupShowKeyboard
+          to: inputFieldPlaceholder
+          initializerInstance: "org.yotsuba.database.initializers.V013.REPLY_MARKUP_SHOW_KEYBOARD_INPUT_FIELD_PLACEHOLDER_INITIALIZER"
+          type: String
+      - newData:
+          transformClass: ReplyMarkupShowKeyboard
+          to: isPersistent
+          initializerInstance: "org.yotsuba.database.initializers.V013.REPLY_MARKUP_SHOW_KEYBOARD_IS_PERSISTENT_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: KeyboardButtonTypeWebApp
+          to: text
+          initializerInstance: "org.yotsuba.database.initializers.V013.KEYBOARD_BUTTON_TYPE_WEB_APP_TEXT_INITIALIZER"
+          type: String
+          index: 0
+      - moveData:
+          transformClass: InlineKeyboardButtonTypeSwitchInline
+          from: inCurrentChat
+          to: targetChat
+      - upgradeData:
+          transformClass: InlineKeyboardButtonTypeSwitchInline
+          from: targetChat
+          upgraderInstance: "org.yotsuba.database.initializers.V013.INLINE_KEYBOARD_BUTTON_TYPE_SWITCH_INLINE_TARGET_CHAT_UPGRADER"
+          type: TargetChat
+      - newData:
+          transformClass: InlineKeyboardButtonTypeUser
+          to: text
+          initializerInstance: "org.yotsuba.database.initializers.V013.INLINE_KEYBOARD_BUTTON_TYPE_USER_TEXT_INITIALIZER"
+          type: String
+          index: 0
+      - upgradeData:
+          transformClass: InlineKeyboardButtonTypeUser
+          from: userId
+          upgraderInstance: "org.yotsuba.database.initializers.V013.INLINE_KEYBOARD_BUTTON_TYPE_USER_USER_ID_UPGRADER"
+          type: UserId
+      - newData:
+          transformClass: InlineKeyboardButtonTypeWebApp
+          to: text
+          initializerInstance: "org.yotsuba.database.initializers.V013.INLINE_KEYBOARD_BUTTON_TYPE_WEB_APP_TEXT_INITIALIZER"
+          type: String
+          index: 0
+      - moveData:
+          transformClass: MessageInteractionInfo
+          from: publicReplyCount
+          to: replyInfo
+      - upgradeData:
+          transformClass: MessageInteractionInfo
+          from: replyInfo
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MESSAGE_INTERACTION_INFO_REPLY_INFO_UPGRADER"
+          type: MessageReplyInfo
+      - upgradeData:
+          transformClass: Message
+          from: interactionInfo
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MESSAGE_INTERACTION_INFO_UPGRADER"
+          type: -MessageInteractionInfo
+      - newData:
+          transformClass: MessageReaction
+          to: recentSenderIds
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_REACTION_RECENT_SENDER_IDS_INITIALIZER"
+          type: ChatEntityIdSet
+      - removeData:
+          transformClass: MessageReaction
+          from: isChosen
+      - newData:
+          transformClass: ChatAdministratorRights
+          to: canPostStories
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_ADMINISTRATOR_RIGHTS_CAN_POST_STORIES_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: ChatAdministratorRights
+          to: canEditStories
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_ADMINISTRATOR_RIGHTS_CAN_EDIT_STORIES_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: ChatAdministratorRights
+          to: canDeleteStories
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_ADMINISTRATOR_RIGHTS_CAN_DELETE_STORIES_INITIALIZER"
+          type: boolean
+      - upgradeData:
+          transformClass: MessageReplyToMessage
+          from: origin
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MESSAGE_ORIGIN_NULLABLE_UPGRADER"
+          type: MessageOrigin
+      - moveData:
+          transformClass: MessageForwardInfo
+          from: forwardOrigin
+          to: origin
+      - upgradeData:
+          transformClass: MessageForwardInfo
+          from: origin
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MESSAGE_FORWARD_ORIGIN_TO_MESSAGE_ORIGIN"
+          type: MessageOrigin
+      - upgradeData:
+          transformClass: MessageForwardInfo
+          from: forwardDate
+          upgraderInstance: "org.yotsuba.database.initializers.V013.INT_TO_TIMESTAMP_UPGRADER"
+          type: Timestamp
+      - newData:
+          transformClass: Poll
+          to: question
+          initializerInstance: "org.yotsuba.database.initializers.V013.POLL_QUESTION_INITIALIZER"
+          type: String
+      - upgradeData:
+          transformClass: ImportedMessage
+          from: firstImported
+          upgraderInstance: "org.yotsuba.database.initializers.V013.INT_TO_TIMESTAMP_UPGRADER"
+          type: Timestamp
+      - upgradeData:
+          transformClass: Supergroup
+          from: inviteLink
+          upgraderInstance: "org.yotsuba.database.initializers.V013.SUPERGROUP_INVITE_LINK_UPGRADER"
+          type: -ChatInviteLink
+      - upgradeData:
+          transformClass: BasicGroup
+          from: inviteLink
+          upgraderInstance: "org.yotsuba.database.initializers.V013.BASIC_GROUP_INVITE_LINK_UPGRADER"
+          type: -ChatInviteLink
+      - newData:
+          transformClass: Supergroup
+          to: slowModeDelaySeconds
+          initializerInstance: "org.yotsuba.database.initializers.V013.SUPERGROUP_SLOW_MODE_DELAY_SECS_INITIALIZER"
+          type: int
+      - newData:
+          transformClass: Supergroup
+          to: hasHiddenMembers
+          initializerInstance: "org.yotsuba.database.initializers.V013.SUPERGROUP_HAS_HIDDEN_MEMBERS_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: Supergroup
+          to: hasAggressiveAntispamEnabled
+          initializerInstance: "org.yotsuba.database.initializers.V013.SUPERGROUP_HAS_AGGRESSIVE_ANTI_SPAM_ENABLED_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: Supergroup
+          to: stickerSetId
+          initializerInstance: "org.yotsuba.database.initializers.V013.SUPERGROUP_STICKER_SET_ID_INITIALIZER"
+          type: -long
+      - moveData:
+          transformClass: Supergroup
+          from: inviteLink
+          to: primaryInviteLink
+      - moveData:
+          transformClass: BasicGroup
+          from: inviteLink
+          to: primaryInviteLink
+      - upgradeData:
+          transformClass: Supergroup
+          from: firstSeen
+          upgraderInstance: "org.yotsuba.database.initializers.V013.LONG_TO_TIMESTAMP_UPGRADER"
+          type: Timestamp
+      - upgradeData:
+          transformClass: Supergroup
+          from: date
+          upgraderInstance: "org.yotsuba.database.initializers.V013.LONG_TO_TIMESTAMP_UPGRADER"
+          type: Timestamp
+      - upgradeData:
+          transformClass: BasicGroup
+          from: firstSeen
+          upgraderInstance: "org.yotsuba.database.initializers.V013.LONG_TO_TIMESTAMP_UPGRADER"
+          type: Timestamp
+      - upgradeData:
+          transformClass: User
+          from: firstSeen
+          upgraderInstance: "org.yotsuba.database.initializers.V013.LONG_TO_TIMESTAMP_UPGRADER"
+          type: Timestamp
+      - newData:
+          transformClass: Supergroup
+          to: hasStories
+          initializerInstance: "org.yotsuba.database.initializers.V013.SUPERGROUP_HAS_STORIES_INITIALIZER"
+          type: boolean
+      - upgradeData:
+          transformClass: MessageDice
+          from: initialStateSticker
+          upgraderInstance: "org.yotsuba.database.initializers.V013.DICE_STICKER_NULLABLE_UPGRADER"
+          type: -Sticker
+      - upgradeData:
+          transformClass: MessageDice
+          from: finalStateSticker
+          upgraderInstance: "org.yotsuba.database.initializers.V013.DICE_STICKER_NULLABLE_UPGRADER"
+          type: -Sticker
+      - upgradeData:
+          transformClass: BasicGroup
+          from: memberCount
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MEMBER_COUNT_UPGRADER"
+          type: -int
+      - upgradeData:
+          transformClass: Supergroup
+          from: memberCount
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MEMBER_COUNT_UPGRADER"
+          type: -int
+      - upgradeData:
+          transformClass: ChatInviteLink
+          from: memberCount
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MEMBER_COUNT_UPGRADER"
+          type: -int
+      - newData:
+          transformClass: ChatMemberStatusCreator
+          to: customTitle
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_MEMBER_STATUS_CREATOR_CUSTOM_TITLE_INITIALIZER"
+          type: -String
+      - newData:
+          transformClass: ChatMemberStatusCreator
+          to: isAnonymous
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_MEMBER_STATUS_CREATOR_IS_ANONYMOUS_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: ChatMemberStatusRestricted
+          to: permissions
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_MEMBER_STATUS_RESTRICTED_PERMISSIONS_INITIALIZER"
+          contextParameters:
+            - canSendMessages
+            - canSendMediaMessages
+            - canSendOtherMessages
+            - canAddLinkPreviews
+          type: ChatPermissions
+      - removeData:
+          transformClass: ChatMemberStatusRestricted
+          from: canSendMessages
+      - removeData:
+          transformClass: ChatMemberStatusRestricted
+          from: canSendMediaMessages
+      - removeData:
+          transformClass: ChatMemberStatusRestricted
+          from: canSendOtherMessages
+      - removeData:
+          transformClass: ChatMemberStatusRestricted
+          from: canAddLinkPreviews
+      - moveData:
+          transformClass: ChatPermissions
+          from: canSendMediaMessages
+          to: canSendPhotos
+      - moveData:
+          transformClass: ChatPermissions
+          from: canSendMessages
+          to: canSendBasicMessages
+          index: 0
+      - newData:
+          transformClass: ChatPermissions
+          to: canSendAudios
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_PERMISSIONS_DEFAULT_FALSE_INITIALIZER"
+          type: boolean
+          index: 1
+      - newData:
+          transformClass: ChatPermissions
+          to: canSendDocuments
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_PERMISSIONS_DEFAULT_FALSE_INITIALIZER"
+          type: boolean
+          index: 2
+      - newData:
+          transformClass: ChatPermissions
+          to: canSendVideos
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_PERMISSIONS_DEFAULT_FALSE_INITIALIZER"
+          type: boolean
+          index: 4
+      - newData:
+          transformClass: ChatPermissions
+          to: canSendVideoNotes
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_PERMISSIONS_DEFAULT_FALSE_INITIALIZER"
+          type: boolean
+          index: 5
+      - newData:
+          transformClass: ChatPermissions
+          to: canSendVoiceNotes
+          initializerInstance: "org.yotsuba.database.initializers.V013.CHAT_PERMISSIONS_DEFAULT_FALSE_INITIALIZER"
+          type: boolean
+          index: 6
+      - newData:
+          transformClass: MessageForwardInfo
+          to: source
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_FORWARD_INFO_SOURCE_INITIALIZER"
+          type: -ForwardSource
+          contextParameters:
+            - fromChatId
+            - fromMessageId
+            - forwardDate
+      - newData:
+          transformClass: MessageForwardInfo
+          to: publicServiceAnnouncementType
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_FORWARD_INFO_PUBLIC_SERVICE_ANNOUNCEMENT_TYPE_INITIALIZER"
+          type: -String
+      - removeData:
+          transformClass: MessageForwardInfo
+          from: fromChatId
+      - removeData:
+          transformClass: MessageForwardInfo
+          from: fromMessageId
+      - newData:
+          transformClass: Message
+          to: factCheck
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_FACT_CHECK_INITIALIZER"
+          type: -FactCheck
+      - upgradeData:
+          transformClass: MessageReplyToMessage
+          from: quote
+          upgraderInstance: "org.yotsuba.database.initializers.V013.MESSAGE_REPLY_TO_MESSAGE_QUOTE_UPGRADER"
+          type: -TextQuote
+          contextParameters:
+            - isQuoteManual
+      - newData:
+          transformClass: Message
+          to: senderBusinessBotUserId
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_SENDER_BUSINESS_BOT_USER_ID_INITIALIZER"
+          type: UserId
+      - newData:
+          transformClass: Message
+          to: senderBoostCount
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_SENDER_BOOST_COUNT_INITIALIZER"
+          type: int
+      - newData:
+          transformClass: Message
+          to: effectId
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_EFFECT_ID_INITIALIZER"
+          type: long
+      - newData:
+          transformClass: Message
+          to: hasSensitiveContent
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_HAS_SENSITIVE_CONTENT_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: MessageAnimation
+          to: showCaptionAboveMedia
+          initializerInstance: "org.yotsuba.database.initializers.V013.SHOW_CAPTION_ABOVE_MEDIA_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: MessagePhoto
+          to: showCaptionAboveMedia
+          initializerInstance: "org.yotsuba.database.initializers.V013.SHOW_CAPTION_ABOVE_MEDIA_INITIALIZER"
+          type: boolean
+      - newData:
+          transformClass: MessageVideo
+          to: showCaptionAboveMedia
+          initializerInstance: "org.yotsuba.database.initializers.V013.SHOW_CAPTION_ABOVE_MEDIA_INITIALIZER"
+          type: boolean
+      - removeData:
+          transformClass: PaidMediaPreview
+          from: caption
+      - removeData:
+          transformClass: PaidMediaPhoto
+          from: caption
+      - removeData:
+          transformClass: PaidMediaVideo
+          from: caption
+      - removeData:
+          transformClass: PaidMediaUnsupported
+          from: caption
+      - removeData:
+          transformClass: Message
+          from: canBeForwarded
+      - newData:
+          transformClass: MessageInteractionInfo
+          to: reactions
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_INTERACTION_INFO_REACTIONS_INITIALIZER"
+          type: MessageReactions
+      - upgradeData:
+          transformClass: Poll
+          from: question
+          upgraderInstance: "org.yotsuba.database.initializers.V013.POLL_QUESTION_UPGRADER"
+          type: FormattedText
+      - upgradeData:
+          transformClass: PollOption
+          from: text
+          upgraderInstance: "org.yotsuba.database.initializers.V013.POLL_QUESTION_UPGRADER"
+          type: FormattedText
+      - newData:
+          transformClass: MessageInvoice
+          to: productInfo
+          initializerInstance: "org.yotsuba.database.initializers.V013.MESSAGE_INVOICE_PRODUCT_INFO_INITIALIZER"
+          type: ProductInfo
+          index: 0
+          contextParameters:
+            - title
+            - description
+            - photo
+      - removeData:
+          transformClass: MessageInvoice
+          from: title
+      - removeData:
+          transformClass: MessageInvoice
+          from: description
+      - removeData:
+          transformClass: MessageInvoice
+          from: photo
+      - upgradeData:
+          transformClass: LinkPreview
+          from: type
+          upgraderInstance: "org.yotsuba.database.initializers.V013.LINK_PREVIEW_TYPE_UPGRADER"
+          type: LinkPreviewType
+          contextParameters:
+            - embedUrl
+            - embedWidth
+            - embedHeight
+            - duration
+            - author
+            - animation
+            - audio
+            - embedType
+            - photo
+            - sticker
+            - video
+            - videoNote
+            - voiceNote
+            - document
+      - removeData:
+          transformClass: LinkPreview
+          from: embedUrl
+      - removeData:
+          transformClass: LinkPreview
+          from: embedType
+      - removeData:
+          transformClass: LinkPreview
+          from: embedWidth
+      - removeData:
+          transformClass: LinkPreview
+          from: embedHeight
+      - removeData:
+          transformClass: LinkPreview
+          from: duration
+      - removeData:
+          transformClass: LinkPreview
+          from: author
+      - removeData:
+          transformClass: LinkPreview
+          from: animation
+      - removeData:
+          transformClass: LinkPreview
+          from: audio
+      - removeData:
+          transformClass: LinkPreview
+          from: photo
+      - removeData:
+          transformClass: LinkPreview
+          from: sticker
+      - removeData:
+          transformClass: LinkPreview
+          from: video
+      - removeData:
+          transformClass: LinkPreview
+          from: videoNote
+      - removeData:
+          transformClass: LinkPreview
+          from: voiceNote
+      - removeData:
+          transformClass: LinkPreview
+          from: document
+      - removeData:
+          transformClass: MessageReplyToMessage
+          from: isQuoteManual
+
+# todo: in the next version, convert user phoneNumber to the new type PhoneNumber

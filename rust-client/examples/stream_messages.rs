@@ -1,9 +1,19 @@
 use rockserver_client::{RockserverClient, ColumnSchema};
+use rust_data_generator::stream::{SafeDataInputStream, SafeDataInput};
+use rust_data_generator::datagen::DataSerializer;
 use futures::StreamExt;
+use std::io::Cursor;
+use std::convert::TryInto;
+use std::io::Read;
+use std::io as std_io;
+
+pub mod records {
+    include!(concat!(env!("OUT_DIR"), "/generated_records/mod.rs"));
+}
+use records::v0_0_13::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Connect to the specified server
     let client = RockserverClient::connect("http://10.0.0.11:5333").await?;
 
     // Define the schema based on the Java snippet:
@@ -54,7 +64,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(result) = stream.next().await {
         match result {
             Ok(kv) => {
-                println!("Message: Key={:?}, Value={:?}", kv.keys, kv.value);
+                // Decode ChatEntityId (Key Part 1)
+                let chat_entity_id = if let Some(bytes) = kv.keys.get(0) {
+                    let mut cursor = Cursor::new(bytes);
+                    let mut input = SafeDataInputStream::new(&mut cursor);
+                    match ChatEntityIdSerializer.deserialize(&mut input) {
+                        Ok(id) => format!("{:?}", id),
+                        Err(e) => format!("DecodeError({:?})", e),
+                    }
+                } else {
+                    "Missing".to_string()
+                };
+
+                // Decode Message ID (Key Part 2)
+                let message_id = if let Some(bytes) = kv.keys.get(1) {
+                    if bytes.len() == 4 {
+                        let val = i32::from_be_bytes(bytes.as_slice().try_into().unwrap());
+                        format!("{}", val)
+                    } else {
+                        format!("InvalidLen({})", bytes.len())
+                    }
+                } else {
+                    "Missing".to_string()
+                };
+
+                // Decode Message (Value)
+                let message_display = if !kv.value.is_empty() {
+                    let mut cursor = Cursor::new(&kv.value);
+                    
+                    // Read Version Byte
+                    let mut version_buf = [0u8; 1];
+                    if let Ok(_) = cursor.read_exact(&mut version_buf) {
+                        let version = version_buf[0];
+                        
+                        let mut input = SafeDataInputStream::new(&mut cursor);
+                        
+                        // Dispatch based on version
+                        // Note: We use the serializers from generated versions, which all produce the latest ImportedMessage type.
+                        let decoded_result = match version {
+                            0 => records::v0_0_0::ImportedMessageSerializer.deserialize(&mut input),
+                            1 => records::v0_0_1::ImportedMessageSerializer.deserialize(&mut input),
+                            2 => records::v0_0_2::ImportedMessageSerializer.deserialize(&mut input),
+                            3 => records::v0_0_3::ImportedMessageSerializer.deserialize(&mut input),
+                            4 => records::v0_0_4::ImportedMessageSerializer.deserialize(&mut input),
+                            5 => records::v0_0_5::ImportedMessageSerializer.deserialize(&mut input),
+                            6 => records::v0_0_6::ImportedMessageSerializer.deserialize(&mut input),
+                            7 => records::v0_0_7::ImportedMessageSerializer.deserialize(&mut input),
+                            8 => records::v0_0_8::ImportedMessageSerializer.deserialize(&mut input),
+                            9 => records::v0_0_9::ImportedMessageSerializer.deserialize(&mut input),
+                            10 => records::v0_0_10::ImportedMessageSerializer.deserialize(&mut input),
+                            11 => records::v0_0_11::ImportedMessageSerializer.deserialize(&mut input),
+                            12 => records::v0_0_12::ImportedMessageSerializer.deserialize(&mut input),
+                            13 => records::v0_0_13::ImportedMessageSerializer.deserialize(&mut input),
+                            _ => Err(std_io::Error::new(std_io::ErrorKind::InvalidData, format!("Unknown version {}", version))),
+                        };
+
+                        match decoded_result {
+                            Ok(imported_msg) => {
+                                let msg = imported_msg.value;
+                                match &msg.content {
+                                    MessageContent::MessageText(text) => {
+                                        format!("Text: {:?} (Ver {})", text.text.text, version)
+                                    },
+                                    MessageContent::MessageEmpty(_) => format!("Empty (Ver {})", version),
+                                    _ => format!("{:?} (Ver {})", msg.content, version),
+                                }
+                            },
+                            Err(e) => format!("DecodeError: {} (Ver {})", e, version),
+                        }
+                    } else {
+                         "EmptyStream".to_string()
+                    }
+                } else {
+                    "EmptyValue".to_string()
+                };
+
+                println!("Chat: {}, MsgID: {} -> Content: {}", chat_entity_id, message_id, message_display);
             }
             Err(e) => {
                 eprintln!("Error reading stream: {}", e);

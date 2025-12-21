@@ -42,6 +42,7 @@ pub mod proto {
     tonic::include_proto!("it.cavallium.rockserver.core.common.api.proto");
 }
 
+pub mod datagen;
 mod types;
 mod client;
 
