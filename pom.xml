@@ -78,7 +78,7 @@
       <dependency>
         <groupId>io.micrometer</groupId>
         <artifactId>micrometer-bom</artifactId>
-        <version>1.14.2</version>
+        <version>1.15.2</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
@@ -94,7 +94,18 @@
     <dependency>
       <groupId>it.cavallium</groupId>
       <artifactId>datagen</artifactId>
-      <version>1.1.41</version>
+      <version>1.1.49</version>
+    </dependency>
+    <dependency>
+      <groupId>it.cavallium</groupId>
+      <artifactId>cavallium-patcher</artifactId>
+      <version>0.6.2</version>
+      <exclusions>
+        <exclusion>
+          <groupId>it.cavallium</groupId>
+          <artifactId>datagen</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <dependency>
       <groupId>net.sourceforge.argparse4j</groupId>
@@ -104,7 +115,7 @@
     <dependency>
       <groupId>it.unimi.dsi</groupId>
       <artifactId>fastutil</artifactId>
-      <version>8.5.16</version>
+      <version>8.5.18</version>
     </dependency>
     <dependency>
       <groupId>org.jetbrains</groupId>
@@ -220,7 +231,7 @@
     <dependency>
       <groupId>io.projectreactor</groupId>
       <artifactId>reactor-core</artifactId>
-      <version>3.7.8</version>
+      <version>3.7.12</version>
     </dependency>
     <dependency>
       <groupId>com.salesforce.servicelibs</groupId>
