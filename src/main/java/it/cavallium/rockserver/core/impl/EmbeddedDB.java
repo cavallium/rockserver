@@ -249,7 +249,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
 			int writeCap = Objects.requireNonNullElse(config.parallelism().write(), Runtime.getRuntime().availableProcessors());
-			this.scheduler = new RWScheduler(readCap, writeCap, "db");
+			this.scheduler = new RWScheduler(readCap, writeCap, "db[" + name + "]");
 			this.fastGet = config.global().enableFastGet();
 		} catch (GestaltException e) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get the scheduler parallelism");
@@ -1432,7 +1432,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					mode
 			);
 			var cf = new CompletableFuture<Void>();
-			batchPublisher.subscribe(new Subscriber<>() {
+			Flux.from(batchPublisher).subscribeOn(scheduler.write()).publishOn(scheduler.write()).subscribe(new Subscriber<>() {
 				private boolean stopped;
 				private Subscription subscription;
 				private ColumnInstance col;
@@ -1574,7 +1574,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					mode
 			);
 			var cf = new CompletableFuture<Void>();
-			batchPublisher.subscribe(new Subscriber<>() {
+			Flux.from(batchPublisher).subscribeOn(scheduler.write()).publishOn(scheduler.write()).subscribe(new Subscriber<>() {
 				private boolean stopped;
 				private Subscription subscription;
 				private ColumnInstance col;

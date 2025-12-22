@@ -30,7 +30,7 @@ public record RWScheduler(Scheduler read, Scheduler write, Executor readExecutor
 				.setDaemon(false)
 				.setNameFormat(name + "-%d")
 				.build();
-		return new ThreadPoolExecutor(cap,
+		var executor = new ThreadPoolExecutor(cap,
 				cap,
 				0L,
 				TimeUnit.MILLISECONDS,
@@ -38,6 +38,8 @@ public record RWScheduler(Scheduler read, Scheduler write, Executor readExecutor
 				threadFactory,
 				new ThreadPoolExecutor.AbortPolicy()
 		);
+		executor.allowCoreThreadTimeOut(false);
+		return executor;
 	}
 
 	public Mono<Void> disposeGracefully() {
