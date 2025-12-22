@@ -43,6 +43,22 @@ public class RocksDBLoader {
     @Nullable
     private static final String bugFallbackJniLibraryFileName = Environment.getFallbackJniLibraryFileName("rocksdbjni");
 
+	private static FFMAbstractMergeOperator instantiateMergeOperator(String mergeOperatorClass) throws it.cavallium.rockserver.core.common.RocksDBException {
+		try {
+			Class<?> clazz = Class.forName(mergeOperatorClass);
+			if (!FFMAbstractMergeOperator.class.isAssignableFrom(clazz)) {
+				throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+						"Merge operator class does not extend FFMAbstractMergeOperator: " + mergeOperatorClass);
+			}
+			@SuppressWarnings("unchecked")
+			Class<? extends FFMAbstractMergeOperator> typed = (Class<? extends FFMAbstractMergeOperator>) clazz;
+			return typed.getConstructor().newInstance();
+		} catch (ReflectiveOperationException e) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+					"Failed to instantiate merge operator: " + mergeOperatorClass, e);
+		}
+	}
+
     public static void loadLibrary() {
         for (final CompressionType compressionType : CompressionType.values()) {
             try {
@@ -134,25 +150,13 @@ public class RocksDBLoader {
                 columnOptions = globalDatabaseConfig.fallbackColumnOptions();
             }
 
-            FFMAbstractMergeOperator mergeOperator = null;
-            var mergeOperatorClass = columnOptions.mergeOperatorClass();
-            if (mergeOperatorClass != null && !mergeOperatorClass.isBlank()) {
-                try {
-                    Class<?> clazz = Class.forName(mergeOperatorClass);
-                    if (!FFMAbstractMergeOperator.class.isAssignableFrom(clazz)) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-                                "Merge operator class does not extend FFMAbstractMergeOperator: " + mergeOperatorClass);
-                    }
-                    @SuppressWarnings("unchecked")
-                    Class<? extends FFMAbstractMergeOperator> typed = (Class<? extends FFMAbstractMergeOperator>) clazz;
-                    mergeOperator = typed.getConstructor().newInstance();
-                    refs.add(mergeOperator);
-                    columnFamilyOptions.setMergeOperator(mergeOperator);
-                } catch (ReflectiveOperationException e) {
-                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-                            "Failed to instantiate merge operator: " + mergeOperatorClass, e);
-                }
-            }
+         			FFMAbstractMergeOperator mergeOperator = null;
+         			var mergeOperatorClass = columnOptions.mergeOperatorClass();
+         			if (mergeOperatorClass != null && !mergeOperatorClass.isBlank()) {
+         				mergeOperator = instantiateMergeOperator(mergeOperatorClass);
+         				refs.add(mergeOperator);
+         				columnFamilyOptions.setMergeOperator(mergeOperator);
+         			}
 
             //noinspection ConstantConditions
             if (columnOptions.memtableMemoryBudgetBytes() != null) {

@@ -7,7 +7,12 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 
 import org.jetbrains.annotations.Nullable;
 
-public record ColumnSchema(IntList keys, ObjectList<ColumnHashType> variableTailKeys, boolean hasValue, @Nullable String mergeOperatorName, @Nullable Long mergeOperatorVersion) {
+public record ColumnSchema(IntList keys,
+                           ObjectList<ColumnHashType> variableTailKeys,
+                           boolean hasValue,
+                           @Nullable String mergeOperatorName,
+                           @Nullable Long mergeOperatorVersion,
+                           @Nullable String mergeOperatorClass) {
 
 	public static ColumnSchema of(IntList fixedKeys, ObjectList<ColumnHashType> variableTailKeys, boolean hasValue, @Nullable String mergeOperatorName, @Nullable Long mergeOperatorVersion) {
 		IntList keys;
@@ -20,11 +25,30 @@ public record ColumnSchema(IntList keys, ObjectList<ColumnHashType> variableTail
 		} else {
 			keys = fixedKeys;
 		}
-		return new ColumnSchema(keys, variableTailKeys, hasValue, mergeOperatorName, mergeOperatorVersion);
+		return new ColumnSchema(keys, variableTailKeys, hasValue, mergeOperatorName, mergeOperatorVersion, null);
 	}
 
 	public static ColumnSchema of(IntList fixedKeys, ObjectList<ColumnHashType> variableTailKeys, boolean hasValue) {
 		return of(fixedKeys, variableTailKeys, hasValue, null, null);
+	}
+
+	public static ColumnSchema of(IntList fixedKeys,
+							  ObjectList<ColumnHashType> variableTailKeys,
+							  boolean hasValue,
+							  @Nullable String mergeOperatorName,
+							  @Nullable Long mergeOperatorVersion,
+							  @Nullable String mergeOperatorClass) {
+		IntList keys;
+		if (!variableTailKeys.isEmpty()) {
+			keys = new IntArrayList(fixedKeys.size() + variableTailKeys.size());
+			keys.addAll(fixedKeys);
+			for (ColumnHashType variableTailKey : variableTailKeys) {
+				keys.add(variableTailKey.bytesSize());
+			}
+		} else {
+			keys = fixedKeys;
+		}
+		return new ColumnSchema(keys, variableTailKeys, hasValue, mergeOperatorName, mergeOperatorVersion, mergeOperatorClass);
 	}
 
 	public ColumnSchema {

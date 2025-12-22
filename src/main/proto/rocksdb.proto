@@ -30,6 +30,7 @@ message ColumnSchema {
   bool hasValue = 3;
   optional string mergeOperatorName = 4;
   optional int64 mergeOperatorVersion = 5;
+  optional string mergeOperatorClass = 6;
 }
 
 message Column {

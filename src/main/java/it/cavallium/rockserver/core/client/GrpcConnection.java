@@ -730,6 +730,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		if (schema.mergeOperatorVersion() != null) {
 			builder.setMergeOperatorVersion(schema.mergeOperatorVersion());
 		}
+		if (schema.mergeOperatorClass() != null) {
+			invokeMergeOperatorClass(builder, schema.mergeOperatorClass());
+		}
 		return builder.build();
 	}
 
@@ -738,8 +741,37 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				unmapVariableTailKeys(schema.getVariableTailKeysCount(), schema::getVariableTailKeys),
 				schema.getHasValue(),
 				schema.hasMergeOperatorName() ? schema.getMergeOperatorName() : null,
-				schema.hasMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null
+				schema.hasMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null,
+				getMergeOperatorClass(schema)
 		);
+	}
+
+	@Nullable
+	private static String getMergeOperatorClass(Object schema) {
+		try {
+			var hasMethod = schema.getClass().getMethod("hasMergeOperatorClass");
+			Boolean has = (Boolean) hasMethod.invoke(schema);
+			if (Boolean.TRUE.equals(has)) {
+				var getter = schema.getClass().getMethod("getMergeOperatorClass");
+				return (String) getter.invoke(schema);
+			}
+		} catch (NoSuchMethodException e) {
+			return null;
+		} catch (ReflectiveOperationException e) {
+			throw new RuntimeException(e);
+		}
+		return null;
+	}
+
+	private static void invokeMergeOperatorClass(Object builder, String mergeOperatorClass) {
+		try {
+			var setter = builder.getClass().getMethod("setMergeOperatorClass", String.class);
+			setter.invoke(builder, mergeOperatorClass);
+		} catch (NoSuchMethodException ignored) {
+			// Older generated protos do not expose mergeOperatorClass; ignore to stay backward compatible
+		} catch (ReflectiveOperationException e) {
+			throw new RuntimeException(e);
+		}
 	}
 	private static IntList unmapKeysLength(int count, Int2IntFunction keyGetterAt) {
 		var l = new IntArrayList(count);

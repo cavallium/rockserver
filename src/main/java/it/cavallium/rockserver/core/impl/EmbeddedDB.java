@@ -529,7 +529,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					colHashTypes.add(ColumnHashType.values()[dis.readUnsignedByte()]);
 				}
 				var hasValue = dis.readBoolean();
-				return ColumnSchema.of(keys, colHashTypes, hasValue, null, null);
+				return ColumnSchema.of(keys, colHashTypes, hasValue, null, null, null);
 			} else if (check == 3) {
 				var size = dis.readInt();
 				var keys = new IntArrayList(size);
@@ -544,7 +544,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var hasValue = dis.readBoolean();
 				String mergeOperatorName = dis.readBoolean() ? dis.readUTF() : null;
 				Long mergeOperatorVersion = dis.readBoolean() ? dis.readLong() : null;
-				return ColumnSchema.of(keys, colHashTypes, hasValue, mergeOperatorName, mergeOperatorVersion);
+				String mergeOperatorClass = dis.readBoolean() ? dis.readUTF() : null;
+				return ColumnSchema.of(keys, colHashTypes, hasValue, mergeOperatorName, mergeOperatorVersion, mergeOperatorClass);
 			} else {
 				throw new IllegalStateException("Unknown schema version: " + check);
 			}
@@ -567,6 +568,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			daos.writeBoolean(schema.hasValue());
 			var mergeOperatorName = schema.mergeOperatorName();
 			var mergeOperatorVersion = schema.mergeOperatorVersion();
+			var mergeOperatorClass = schema.mergeOperatorClass();
 			daos.writeBoolean(mergeOperatorName != null);
 			if (mergeOperatorName != null) {
 				daos.writeUTF(mergeOperatorName);
@@ -574,6 +576,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			daos.writeBoolean(mergeOperatorVersion != null);
 			if (mergeOperatorVersion != null) {
 				daos.writeLong(mergeOperatorVersion);
+			}
+			daos.writeBoolean(mergeOperatorClass != null);
+			if (mergeOperatorClass != null) {
+				daos.writeUTF(mergeOperatorClass);
 			}
 			baos.close();
 			return baos.toByteArray();
@@ -587,12 +593,32 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable FFMAbstractMergeOperator configuredMergeOperator) throws RocksDBException {
 		String mergeOperatorName = schema.mergeOperatorName();
 		Long mergeOperatorVersion = schema.mergeOperatorVersion();
+		String mergeOperatorClass = schema.mergeOperatorClass();
+		if ((mergeOperatorName != null || mergeOperatorVersion != null) && mergeOperatorClass != null) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Merge operator name/version and merge operator class cannot be both specified");
+		}
 		if (mergeOperatorName != null || mergeOperatorVersion != null) {
 			if (mergeOperatorName == null || mergeOperatorVersion == null) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Merge operator name and version must both be specified when one of them is set");
 			}
 			return mergeOperatorRegistry.get(mergeOperatorName, mergeOperatorVersion);
+		}
+		if (mergeOperatorClass != null && !mergeOperatorClass.isBlank()) {
+			try {
+				Class<?> clazz = Class.forName(mergeOperatorClass);
+				if (!FFMAbstractMergeOperator.class.isAssignableFrom(clazz)) {
+					throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+							"Merge operator class does not extend FFMAbstractMergeOperator: " + mergeOperatorClass);
+				}
+				@SuppressWarnings("unchecked")
+				Class<? extends FFMAbstractMergeOperator> typed = (Class<? extends FFMAbstractMergeOperator>) clazz;
+				return typed.getConstructor().newInstance();
+			} catch (ReflectiveOperationException e) {
+				throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+						"Failed to instantiate merge operator: " + mergeOperatorClass, e);
+			}
 		}
 		return configuredMergeOperator;
 	}
