@@ -1679,10 +1679,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable GlobalDatabaseConfig globalDatabaseConfigOverride,
 			boolean forceNoOptions,
 			boolean ingestBehind) throws RocksDBException {
+		RocksDBLoader.ColumnOptionsWithMerge columnConifg = null;
+		RocksDBObjects refs = null;
 		try {
 			var col = getColumn(colId);
-			RocksDBLoader.ColumnOptionsWithMerge columnConifg;
-			RocksDBObjects refs;
 			if (!forceNoOptions) {
 				var name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
 				refs = new RocksDBObjects();
@@ -1712,9 +1712,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					refs = null;
 				}
-			} else {
-				columnConifg = null;
-				refs = null;
 			}
 			if (Files.notExists(tempSSTsPath)) {
 				Files.createDirectories(tempSSTsPath);
@@ -1728,9 +1725,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					refs
 			);
 		} catch (IOException ex) {
+			if (refs != null) refs.close();
+			if (columnConifg != null) columnConifg.options().close();
+			if (columnConifg != null && columnConifg.mergeOperator() != null) columnConifg.mergeOperator().close();
 			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_2, ex);
 		} catch (org.rocksdb.RocksDBException ex) {
+			if (refs != null) refs.close();
+			if (columnConifg != null) columnConifg.options().close();
+			if (columnConifg != null && columnConifg.mergeOperator() != null) columnConifg.mergeOperator().close();
 			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_3, ex);
+		} catch (Throwable ex) {
+			if (refs != null) refs.close();
+			if (columnConifg != null) columnConifg.options().close();
+			if (columnConifg != null && columnConifg.mergeOperator() != null) columnConifg.mergeOperator().close();
+			throw ex;
 		}
 	}
 
@@ -2167,7 +2175,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				it = db.get().newIterator(col.cfh(), ro);
 			}
 			var itEntry = new REntry<>(it, expirationTimestamp, new RocksDBObjects(ro));
-			return FastRandomUtils.allocateNewValue(its, itEntry, 1, Long.MAX_VALUE);
+			try {
+				return FastRandomUtils.allocateNewValue(its, itEntry, 1, Long.MAX_VALUE);
+			} catch (Throwable ex) {
+				itEntry.close();
+				throw ex;
+			}
 		} catch (Throwable ex) {
 			ops.endOp();
 			var end = System.nanoTime();
@@ -3179,25 +3192,29 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			try (TransactionLogIterator it = db.get().getUpdatesSince(iteratorStartWal)) {
 				while (result.size() < effectiveMax && it != null && it.isValid()) {
 					var br = it.getBatch();
-					long batchWalSeq = br.sequenceNumber();
-					if (batchWalSeq < walStart) {
+					try {
+						long batchWalSeq = br.sequenceNumber();
+						if (batchWalSeq < walStart) {
+							it.next();
+							continue;
+						}
+						int skipOps = (batchWalSeq == walStart) ? opStart : 0;
+						var handler = new EventCollector(result,
+								this.columnNamesIndex,
+								meta.columnFilter,
+								batchWalSeq,
+								skipOps,
+								effectiveMax - result.size()
+						);
+						//noinspection resource
+						br.writeBatch().iterate(handler);
+						if (result.size() >= effectiveMax) {
+							break;
+						}
 						it.next();
-						continue;
+					} finally {
+						br.writeBatch().close();
 					}
-					var wb = br.writeBatch();
-					int skipOps = (batchWalSeq == walStart) ? opStart : 0;
-					var handler = new EventCollector(result,
-							this.columnNamesIndex,
-							meta.columnFilter,
-							batchWalSeq,
-							skipOps,
-							effectiveMax - result.size()
-					);
-					wb.iterate(handler);
-					if (result.size() >= effectiveMax) {
-						break;
-					}
-					it.next();
 				}
 			}
 
