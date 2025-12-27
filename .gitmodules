@@ -1,0 +1,3 @@
+[submodule "rust-client/rust-data-generator"]
+	path = rust-client/rust-data-generator
+	url = ssh://git@ssh.git.mchv.eu:2222/andreacavalli/rust-data-generator.git
