@@ -87,7 +87,7 @@ public class Main {
 
 		if (config != null) {
 			if (!databaseUrl.getScheme().equals("file")) {
-				System.err.println("Do not set --config if the database is not local!");
+				LOG.error("Do not set --config if the database is not local!");
 				System.exit(1);
 				return;
 			} else {

@@ -272,10 +272,15 @@ database: {
 			Assertions.assertEquals(2, events.size());
 			CDCEvent ev1 = events.get(0);
 			CDCEvent ev2 = events.get(1);
-			Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
-			assertSegmentEquals(initial, ev1.value());
-			Assertions.assertEquals(CDCEvent.Op.MERGE, ev2.op());
+			
+			// With emitLatestValues=true, all events are resolved to the current value (Initial,-Patched)
+			// and emitted as PUT operations (replacing MERGE).
 			Buf expected = Buf.wrap("Initial,-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			
+			Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
+			assertSegmentEquals(expected, ev1.value());
+			
+			Assertions.assertEquals(CDCEvent.Op.PUT, ev2.op());
 			assertSegmentEquals(expected, ev2.value());
 		}
 	}

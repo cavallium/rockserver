@@ -181,7 +181,7 @@ public class CdcMergeExample {
                         lastReceivedSeq.set(ack.event().seq());
                         receivedCounter.incrementAndGet();
                         try {
-                            // With resolvedValues=true, both PUT and MERGE carry the full resolved value
+                            // With emitLatestValues=true, both PUT and MERGE carry the full resolved value
                             var m = decodeMessage(ack.event().value().toByteArray());
                             LOG.debug("CDC {} id={} pinned={} len(text)={}", ack.event().op(), m.id(), m.pinned(), m.text() != null ? m.text().length() : 0);
                         } catch (Throwable ignore) {}
@@ -208,7 +208,7 @@ public class CdcMergeExample {
                 LOG.info("Shutting down CDC/merge example...");
                 // Stop the remote input stream and let mergeBatch complete
                 stopSignal.tryEmitEmpty();
-                try { mergeLoop.get(5, TimeUnit.SECONDS); } catch (Exception ignored) {}
+                try { mergeLoop.get(5, TimeUnit.SECONDS); } catch (Exception e) { LOG.warn("Error waiting for merge loop to stop", e); }
                 cdcDisposable.dispose();
                 metricsSampler.dispose();
             }));
@@ -220,9 +220,9 @@ public class CdcMergeExample {
             stopSignal.tryEmitEmpty();
             cdcDisposable.dispose();
             metricsSampler.dispose();
-            try { mergeLoop.get(5, TimeUnit.SECONDS); } catch (Exception ignored) {}
+            try { mergeLoop.get(5, TimeUnit.SECONDS); } catch (Exception e) { LOG.warn("Error waiting for merge loop to stop", e); }
         } finally {
-            try { Files.deleteIfExists(tempConfig); } catch (IOException ignored) {}
+            try { Files.deleteIfExists(tempConfig); } catch (IOException e) { LOG.warn("Failed to delete temp config", e); }
         }
     }
 

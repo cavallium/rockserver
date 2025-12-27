@@ -120,6 +120,40 @@ database: {
         assertEquals(0, internal.getPendingOpsCount(), "Pending ops must be zero after randomized run");
         assertEquals(0, internal.getOpenTransactionsCount(), "Open transactions must be zero after randomized run");
         assertEquals(0, internal.getOpenIteratorsCount(), "Open iterators must be zero after randomized run");
+
+        // Explicitly close DB
+        try { db.close(); db = null; } catch (Exception e) { e.printStackTrace(); }
+
+        // Wait for background threads to die
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline) {
+            boolean clean = true;
+            for (Thread t : Thread.getAllStackTraces().keySet()) {
+                String name = t.getName();
+                if (name.contains("db-") || name.contains("rocksdb") || name.contains("influx")) {
+                    clean = false;
+                    break;
+                }
+            }
+            if (clean) break;
+            try { Thread.sleep(100); } catch (InterruptedException e) { break; }
+        }
+
+        // Final verification
+        StringBuilder err = new StringBuilder();
+        for (Thread t : Thread.getAllStackTraces().keySet()) {
+            String name = t.getName();
+            if (t.isAlive() && (name.contains("db-") || name.contains("rocksdb") || name.contains("influx"))) {
+                err.append("Leaked thread: ").append(name).append(" (Daemon=").append(t.isDaemon()).append(")\n");
+            }
+            if (!t.isDaemon() && !name.equals("main") && !name.startsWith("Test worker") && !name.startsWith("junit")) {
+                 // Note: In IDE/Maven, test runner threads might be non-daemon. Be careful failing on them.
+                 // But we should ensure *our* threads are gone.
+            }
+        }
+        if (err.length() > 0) {
+            throw new RuntimeException("Threads leaked:\n" + err);
+        }
     }
 
     private void doPut(Random rnd, int keySpace) {

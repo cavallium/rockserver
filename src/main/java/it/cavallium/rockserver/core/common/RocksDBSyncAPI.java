@@ -4,6 +4,7 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetAllColumnDefinitions;
@@ -12,6 +13,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Delete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange;
@@ -79,6 +81,14 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 			@NotNull Buf value,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		return requestSync(new Put<>(transactionOrUpdateId, columnId, keys, value, requestType));
+	}
+
+	/** See: {@link Delete}. */
+	default <T> T delete(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		return requestSync(new Delete<>(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
 	/** See: {@link Merge}. */
@@ -202,8 +212,8 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
     }
 
     /** Create or update a CDC subscription. Returns the start sequence. */
-    default long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
-        return requestSync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds, resolvedValues));
+    default long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean emitLatestValues) throws RocksDBException {
+        return requestSync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds, emitLatestValues));
     }
 
     /** Delete a CDC subscription */

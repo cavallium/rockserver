@@ -381,7 +381,7 @@ final class Target_io_netty_bootstrap_AbstractBootstrap {
 			init(channel);
 		} catch (Throwable t) {
 			// THE FIX IS HERE:
-			t.printStackTrace();
+			InternalLoggerFactory.getInstance("io.netty.bootstrap.AbstractBootstrap").warn("Failed to register channel", t);
 			if (channel != null) {
 				// channel can be null if newChannel crashed (eg SocketException("too many open files"))
 				channel.unsafe().closeForcibly();

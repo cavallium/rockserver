@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.common;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetAllColumnDefinitions;
@@ -11,6 +12,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Delete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange;
@@ -88,6 +90,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 			@NotNull Buf value,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		return requestAsync(new Put<>(transactionOrUpdateId, columnId, keys, value, requestType));
+	}
+
+	/** See: {@link Delete}. */
+	default <T> CompletableFuture<T> deleteAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		return requestAsync(new Delete<>(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
 	/** See: {@link Merge}. */

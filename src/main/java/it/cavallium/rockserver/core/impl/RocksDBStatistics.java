@@ -142,7 +142,7 @@ public class RocksDBStatistics {
 			}
 		});
 		executor.setName("rocksdb-statistics");
-		executor.setDaemon(true);
+		executor.setDaemon(false);
 		executor.start();
 	}
 

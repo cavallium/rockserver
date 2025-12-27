@@ -18,15 +18,19 @@ public record RWScheduler(Scheduler read, Scheduler write, Executor readExecutor
 	}
 
 	public RWScheduler(int readCap, int writeCap, String name) {
-		this(createScheduler(readCap, name + "-read"), createScheduler(writeCap, name + "-write"));
+		this(createExecutor(readCap, name + "-read"), createExecutor(writeCap, name + "-write"), name);
 	}
 
-	private static Scheduler createScheduler(int cap, String name) {
+	private RWScheduler(java.util.concurrent.ExecutorService readExecutor, java.util.concurrent.ExecutorService writeExecutor, String name) {
+		this(Schedulers.fromExecutorService(readExecutor, name + "-read"), Schedulers.fromExecutorService(writeExecutor, name + "-write"), readExecutor, writeExecutor);
+	}
+
+	private static java.util.concurrent.ExecutorService createExecutor(int cap, String name) {
 		var threadFactory = new ThreadFactoryBuilder()
 				.setDaemon(false)
 				.setNameFormat(name + "-%d")
 				.build();
-		var readPool = new ThreadPoolExecutor(cap,
+		return new ThreadPoolExecutor(cap,
 				cap,
 				0L,
 				TimeUnit.MILLISECONDS,
@@ -34,7 +38,6 @@ public record RWScheduler(Scheduler read, Scheduler write, Executor readExecutor
 				threadFactory,
 				new ThreadPoolExecutor.AbortPolicy()
 		);
-		return Schedulers.fromExecutorService(readPool, name);
 	}
 
 	public Mono<Void> disposeGracefully() {
@@ -44,5 +47,21 @@ public record RWScheduler(Scheduler read, Scheduler write, Executor readExecutor
 	public void dispose() {
 		read.dispose();
 		write.dispose();
+		shutdownExecutor(readExecutor);
+		shutdownExecutor(writeExecutor);
+	}
+
+	private void shutdownExecutor(Executor executor) {
+		if (executor instanceof java.util.concurrent.ExecutorService es) {
+			es.shutdown();
+			try {
+				if (!es.awaitTermination(10, TimeUnit.SECONDS)) {
+					es.shutdownNow();
+				}
+			} catch (InterruptedException e) {
+				es.shutdownNow();
+				Thread.currentThread().interrupt();
+			}
+		}
 	}
 }

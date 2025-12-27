@@ -191,14 +191,15 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
      * This is called for both full and partial merges. Default implementation prints the stack trace.
      */
     protected void onMergeError(Throwable t, boolean partial, Buf key) {
-        t.printStackTrace();
+        LOG.error("Merge error (partial={})", partial, t);
     }
 
     private void handleMergeError(Throwable t, boolean partial, Buf key) {
         try {
             onMergeError(t, partial, key);
-        } catch (Throwable ignored) {
+        } catch (Throwable hookEx) {
             // Swallow hook errors to keep RocksDB stable
+            LOG.error("Error in onMergeError hook", hookEx);
         }
     }
 
@@ -230,7 +231,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 }
             }
         } catch (Throwable e) {
-            // suppress
+            LOG.warn("Error disposing native handle", e);
         } finally {
             instanceArena.close();
         }
@@ -325,27 +326,24 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                     return allocateResult(result, successPtr, newValLenPtr);
                 }
             } catch (Throwable t) {
-                handleMergeError(t, false, key);
+                // System.err.println("DEBUG: Caught exception in fullMerge: " + t);
+                try {
+                    handleMergeError(t, false, key);
+                } catch (Throwable ignored) {
+                    LOG.error("Swallowed exception in fullMerge handleMergeError", ignored);
+                }
             }
 
             // Fallback: preserve existing value (or first operand) to avoid corruption
-            Buf fallback = existing;
-            if (fallback == null && !operands.isEmpty()) {
-                fallback = operands.getFirst();
-            }
-            if (fallback == null) {
-                fallback = Buf.wrap(new byte[0]);
-            }
-
-            try {
-                return allocateResult(fallback, successPtr, newValLenPtr);
-            } catch (Throwable t) {
-                handleMergeError(t, false, key);
-                // last resort: signal failure
-                return MemorySegment.NULL;
-            }
+            // However, this fallback is dangerous because it hides failures and discards operands.
+            // Returning NULL allows RocksDB to handle the failure (e.g. aborting compaction or preserving operands).
+            return MemorySegment.NULL;
         } catch (Throwable t) {
-            handleMergeError(t, false, key);
+            try {
+                handleMergeError(t, false, key);
+            } catch (Throwable ignored) {
+                LOG.error("Swallowed exception in fullMerge outer catch", ignored);
+            }
             return MemorySegment.NULL;
         }
     }
@@ -402,21 +400,20 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                     return allocateResult(merged, successPtr, newValLenPtr);
                 }
             } catch (Throwable t) { 
-                handleMergeError(t, true, key); 
+                try {
+                    handleMergeError(t, true, key); 
+                } catch (Throwable ignored) {
+                    LOG.error("Swallowed exception in partialMergeCb handleMergeError", ignored);
+                }
             }
 
-            // Fallback: return first operand to keep data intact
-            try {
-                MemorySegment ptr0 = opsPtrs.getAtIndex(ValueLayout.ADDRESS, 0);
-                long len0 = opsLens.getAtIndex(ValueLayout.JAVA_LONG, 0);
-                Buf first = new MemorySegmentBuf(ptr0.reinterpret(len0));
-                return allocateResult(first, successPtr, newValLenPtr);
-            } catch (Throwable t) {
-                handleMergeError(t, true, key);
-                return MemorySegment.NULL;
-            }
+            return MemorySegment.NULL;
         } catch (Throwable t) {
-            handleMergeError(t, true, key);
+            try {
+                handleMergeError(t, true, key);
+            } catch (Throwable ignored) {
+                LOG.error("Swallowed exception in partialMergeCb outer catch", ignored);
+            }
             return MemorySegment.NULL;
         }
     }
@@ -440,7 +437,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 FREE.invokeExact(valuePtr);
             }
         } catch (Throwable t) {
-            // suppress
+            LOG.warn("Error in deleteValueCb", t);
         }
     }
 

@@ -466,6 +466,9 @@
 
     <profile>
       <id>library</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
       <build>
         <plugins>
           <plugin>

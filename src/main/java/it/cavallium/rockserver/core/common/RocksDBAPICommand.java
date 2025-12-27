@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.common;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
+import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.util.List;
@@ -241,6 +242,46 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				sb.append(" column:").append(columnId);
 				sb.append(" keys:").append(keys);
 				sb.append(" value:").append(Utils.toPrettyString(value));
+				sb.append(" expected:").append(requestType.getRequestTypeId());
+				return sb.toString();
+			}
+		}
+		/**
+		 * Delete an element from the specified position
+		 *
+		 * @param transactionOrUpdateId transaction id, update id, or 0
+		 * @param columnId              column id
+		 * @param keys                  column keys
+		 * @param requestType           the request type determines which type of data will be returned.
+		 */
+		record Delete<T>(long transactionOrUpdateId,
+					  long columnId,
+					  Keys keys,
+					  RequestDelete<? super Buf, T> requestType) implements RocksDBAPICommandSingle<T> {
+
+			@Override
+			public T handleSync(RocksDBSyncAPI api) {
+				return api.delete(transactionOrUpdateId, columnId, keys, requestType);
+			}
+
+			@Override
+			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
+				return api.deleteAsync(transactionOrUpdateId, columnId, keys, requestType);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
+			@Override
+			public String toString() {
+				var sb = new StringBuilder("DELETE");
+				if (transactionOrUpdateId != 0) {
+					sb.append(" tx:").append(transactionOrUpdateId);
+				}
+				sb.append(" column:").append(columnId);
+				sb.append(" keys:").append(keys);
 				sb.append(" expected:").append(requestType.getRequestTypeId());
 				return sb.toString();
 			}
@@ -806,16 +847,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 	/**
 	 * Create or update a CDC subscription
 	 */
- record CdcCreate(String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) implements RocksDBAPICommandSingle<Long> {
+ record CdcCreate(String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean emitLatestValues) implements RocksDBAPICommandSingle<Long> {
 
         @Override
         public Long handleSync(RocksDBSyncAPI api) {
-            return api.cdcCreate(id, fromSeq, columnIds, resolvedValues);
+            return api.cdcCreate(id, fromSeq, columnIds, emitLatestValues);
         }
 
         @Override
         public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
-            return api.cdcCreateAsync(id, fromSeq, columnIds, resolvedValues);
+            return api.cdcCreateAsync(id, fromSeq, columnIds, emitLatestValues);
         }
 
         @Override

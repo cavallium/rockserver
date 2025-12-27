@@ -42,7 +42,15 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 				|| requestType instanceof RequestType.RequestChanged;
 	}
 
+	static boolean requiresGettingPreviousValue(RequestDelete<?, ?> requestType) {
+		return requestType instanceof RequestType.RequestPrevious<?>;
+	}
+
 	static boolean requiresGettingPreviousPresence(RequestPut<?, ?> requestType) {
+		return requestType instanceof RequestType.RequestPreviousPresence<?>;
+	}
+
+	static boolean requiresGettingPreviousPresence(RequestDelete<?, ?> requestType) {
 		return requestType instanceof RequestType.RequestPreviousPresence<?>;
 	}
 
@@ -123,6 +131,8 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 
 	sealed interface RequestPut<T, U> extends RequestType<T, U> {}
 
+	sealed interface RequestDelete<T, U> extends RequestType<T, U> {}
+
 	sealed interface RequestPatch<T, U> extends RequestType<T, U> {}
 
 	sealed interface RequestGet<T, U> extends RequestType<T, U> {}
@@ -135,8 +145,8 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 
 	sealed interface RequestMerge<T, U> extends RequestType<T, U> {}
 
- record RequestNothing<T>() implements RequestPut<T, Void>, RequestPatch<T, Void>, RequestIterate<T, Void>,
-            RequestGet<T, Void>, RequestMerge<T, Void> {
+	record RequestNothing<T>() implements RequestPut<T, Void>, RequestDelete<T, Void>, RequestPatch<T, Void>, RequestIterate<T, Void>,
+			RequestGet<T, Void>, RequestMerge<T, Void> {
 
 		private static final RequestNothing<Object> INSTANCE = new RequestNothing<>();
 
@@ -146,7 +156,7 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		}
 	}
 
-	record RequestPrevious<T>() implements RequestPut<T, @Nullable T> {
+	record RequestPrevious<T>() implements RequestPut<T, @Nullable T>, RequestDelete<T, @Nullable T> {
 
 		private static final RequestPrevious<Object> INSTANCE = new RequestPrevious<>();
 
@@ -216,7 +226,7 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		}
 	}
 
- record RequestPreviousPresence<T>() implements RequestPut<T, Boolean>, RequestPatch<T, Boolean> {
+	record RequestPreviousPresence<T>() implements RequestPut<T, Boolean>, RequestPatch<T, Boolean>, RequestDelete<T, Boolean> {
 
 		private static final RequestPreviousPresence<Object> INSTANCE = new RequestPreviousPresence<>();
 

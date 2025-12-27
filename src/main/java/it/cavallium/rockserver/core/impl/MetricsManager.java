@@ -86,7 +86,7 @@ public class MetricsManager implements AutoCloseable {
                     preloadClasses();
 
                     // Create a dedicated Vertx instance for metrics HTTP client
-                    this.vertx = Vertx.vertx(new VertxOptions().setUseDaemonThread(true));
+                    this.vertx = Vertx.vertx(new VertxOptions().setUseDaemonThread(false));
                     this.httpClient = vertx.createHttpClient(new HttpClientOptions()
                             .setTrustAll(config.metrics().influx().allowInsecureCertificates())
                             .setVerifyHost(!config.metrics().influx().allowInsecureCertificates())
@@ -176,7 +176,11 @@ public class MetricsManager implements AutoCloseable {
 											.blockingGet();
 								}
 							})
-							.threadFactory(new NamedThreadFactory("influx-metrics-publisher"))
+							.threadFactory(r -> {
+								Thread t = new Thread(r, "influx-metrics-publisher");
+								t.setDaemon(true);
+								return t;
+							})
 							.build();
 					compositeRegistry.add(influxMeterRegistry);
     } catch (Throwable ex) {
@@ -213,14 +217,20 @@ public class MetricsManager implements AutoCloseable {
 		}
 	}
 
- private void preloadClasses() {
+	private void preloadClasses() {
         try {
 					// Preload file deletion method, used during shutdown
-					var fs = Vertx.vertx().fileSystem();
-					var tmpDir = fs.createTempDirectoryBlocking("tmp");
-					fs.deleteRecursiveBlocking(tmpDir);
-        } catch (Throwable ignored) {
+					var vertx = Vertx.vertx(new VertxOptions().setUseDaemonThread(false));
+					try {
+						var fs = vertx.fileSystem();
+						var tmpDir = fs.createTempDirectoryBlocking("tmp");
+						fs.deleteRecursiveBlocking(tmpDir);
+					} finally {
+						vertx.close().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
+					}
+        } catch (Throwable t) {
             // best-effort; this is only to trigger classloading
+            LOG.debug("Failed to preload classes", t);
         }
     }
 
@@ -228,22 +238,26 @@ public class MetricsManager implements AutoCloseable {
 		return startTime;
 	}
 
- @Override
- public void close() {
-     if (httpClient != null) {
-         httpClient.rxClose().blockingAwait();
-     }
-     if (vertx != null) {
-         try {
-             vertx.rxClose().blockingAwait();
-         } catch (Throwable t) {
-             LOG.warn("Failed to close Vertx instance for metrics", t);
-         }
-     }
-     gcMetrics.close();
-     heapPressureMetrics.close();
-     compositeRegistry.close();
- }
+	@Override
+	public void close() {
+		if (httpClient != null) {
+			try {
+				httpClient.rxClose().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
+			} catch (Throwable t) {
+				LOG.warn("Failed to close http client for metrics", t);
+			}
+		}
+		if (vertx != null) {
+			try {
+				vertx.rxClose().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
+			} catch (Throwable t) {
+				LOG.warn("Failed to close Vertx instance for metrics", t);
+			}
+		}
+		gcMetrics.close();
+		heapPressureMetrics.close();
+		compositeRegistry.close();
+	}
 
 	public MeterRegistry getRegistry() {
 		return compositeRegistry;
