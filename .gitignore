@@ -10,3 +10,4 @@ hs_err_pid*.log
 /build_debug.log
 /output.log
 /thread_dump.txt
+/.output.txt
