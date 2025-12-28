@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::convert::TryInto;
 use std::io::Read;
 use std::io as std_io;
+use std::env;
 
 pub mod records {
     include!(concat!(env!("OUT_DIR"), "/generated_records/mod.rs"));
@@ -14,6 +15,9 @@ use records::v0_0_13::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    let errors_only = args.contains(&"--errors-only".to_string());
+
     let client = RockserverClient::connect("http://10.0.0.11:5333").await?;
 
     // Define the schema based on the Java snippet:
@@ -139,7 +143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "EmptyValue".to_string()
                 };
 
-                println!("Chat: {}, MsgID: {} -> Content: {}", chat_entity_id, message_id, message_display);
+                let has_error = chat_entity_id.contains("DecodeError") || message_display.contains("DecodeError");
+                if !errors_only || has_error {
+                    println!("Chat: {}, MsgID: {} -> Content: {}", chat_entity_id, message_id, message_display);
+                }
             }
             Err(e) => {
                 eprintln!("Error reading stream: {}", e);
