@@ -16,6 +16,8 @@ module rockserver.core.test {
 	requires reactor.core;
 	requires org.apache.thrift;
 	requires jdk.unsupported;
+	requires reactor.test;
+	requires org.mockito;
 	opens it.cavallium.rockserver.core.test;
 	opens it.cavallium.rockserver.core.impl.test;
 }

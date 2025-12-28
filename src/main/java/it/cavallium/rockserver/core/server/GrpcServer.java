@@ -747,6 +747,18 @@ public class GrpcServer extends Server {
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("uploadMergeOperator", request));
 		}
 
+		@Override
+		public Mono<CheckMergeOperatorResponse> checkMergeOperator(CheckMergeOperatorRequest request) {
+			return executeSync(() -> {
+				var version = api.checkMergeOperator(request.getOperatorName(), request.getHash().toByteArray());
+				var builder = CheckMergeOperatorResponse.newBuilder();
+				if (version != null) {
+					builder.setVersion(version);
+				}
+				return builder.build();
+			}, true).transform(this.onErrorMapMonoWithRequestInfo("checkMergeOperator", request));
+		}
+
             // ============ CDC RPCs ============
 
             @Override

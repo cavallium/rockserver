@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
+import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Path;
@@ -23,6 +24,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, InternalConnection {
 
@@ -82,6 +84,11 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public Long checkMergeOperator(String name, byte[] hash) throws RocksDBException {
+		return db.checkMergeOperator(name, hash);
+	}
+
+	@Override
 	public void deleteColumn(long columnId) throws RocksDBException {
 		db.deleteColumn(columnId);
 	}
@@ -116,6 +123,14 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull Buf value,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		return db.put(transactionOrUpdateId, columnId, keys, value, requestType);
+	}
+
+	@Override
+	public <T> T delete(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull RequestType.RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		return db.delete(transactionOrUpdateId, columnId, keys, requestType);
 	}
 
 	@Override
@@ -273,5 +288,14 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
     public @NotNull Publisher<CDCEvent> cdcPollAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
         // Default: defer to DB implementation; fallback to blocking stream if async is not supported
         return db.cdcPollAsyncInternal(id, fromSeq, maxEvents);
+    }
+
+    @Override
+    public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
+        try {
+            return db.cdcPollBatchAsyncInternal(id, fromSeq, maxEvents);
+        } catch (Throwable e) {
+            return Mono.error(e);
+        }
     }
 }

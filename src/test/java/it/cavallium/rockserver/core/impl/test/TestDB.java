@@ -94,6 +94,10 @@ public class TestDB implements AutoCloseable {
 			} catch (Exception e) {
 				// Ignore exceptions during close
 			}
+			try {
+				Thread.sleep(50);
+			} catch (InterruptedException ignored) {
+			}
 		}
 		if (!(server instanceof EmbeddedConnection)) {
 			try {

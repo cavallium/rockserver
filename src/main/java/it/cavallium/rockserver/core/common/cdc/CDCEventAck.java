@@ -16,5 +16,7 @@ public record CDCEventAck(@NotNull CDCEvent event, @NotNull Supplier<Mono<Void>>
      * Acknowledge successful processing of this event.
      * The returned Mono completes when the commit has been persisted on the server.
      */
-    public Mono<Void> ack() { return acknowledger.get(); }
+    public Mono<Void> ack() {
+        return acknowledger.get();
+    }
 }

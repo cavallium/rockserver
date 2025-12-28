@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
+import it.cavallium.rockserver.core.impl.DelegatingMergeOperator;
 import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
 import java.io.InputStream;
 import java.nio.file.StandardCopyOption;
@@ -153,7 +154,8 @@ public class RocksDBLoader {
          			FFMAbstractMergeOperator mergeOperator = null;
          			var mergeOperatorClass = columnOptions.mergeOperatorClass();
          			if (mergeOperatorClass != null && !mergeOperatorClass.isBlank()) {
-         				mergeOperator = instantiateMergeOperator(mergeOperatorClass);
+         				var impl = instantiateMergeOperator(mergeOperatorClass);
+         				mergeOperator = new DelegatingMergeOperator("Delegating-" + impl.getClass().getSimpleName(), impl);
          				refs.add(mergeOperator);
          				columnFamilyOptions.setMergeOperator(mergeOperator);
          			}

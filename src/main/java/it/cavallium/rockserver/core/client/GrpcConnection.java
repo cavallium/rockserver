@@ -220,6 +220,14 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public CompletableFuture<Long> checkMergeOperatorAsync(String name, byte[] hash) {
+		return toResponse(futureStub.checkMergeOperator(CheckMergeOperatorRequest.newBuilder()
+				.setOperatorName(name)
+				.setHash(UnsafeByteOperations.unsafeWrap(hash))
+				.build()), resp -> resp.hasVersion() ? resp.getVersion() : null);
+	}
+
+	@Override
 	public CompletableFuture<Void> deleteColumnAsync(long columnId) throws RocksDBException {
 		var request = DeleteColumnRequest.newBuilder()
 				.setColumnId(columnId)

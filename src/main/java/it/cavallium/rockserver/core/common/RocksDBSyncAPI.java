@@ -8,6 +8,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetAllColumnDefinitions;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CheckMergeOperator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
@@ -62,6 +63,25 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	/** See: {@link UploadMergeOperator}. */
 	default long uploadMergeOperator(String name, String className, byte[] jarData) throws RocksDBException {
 		return requestSync(new UploadMergeOperator(name, className, jarData));
+	}
+
+	default Long checkMergeOperator(String name, byte[] hash) throws RocksDBException {
+		return requestSync(new CheckMergeOperator(name, hash));
+	}
+
+	default long ensureMergeOperator(String name, String className, byte[] jarData) throws RocksDBException {
+		byte[] hash;
+		try {
+			java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+			hash = digest.digest(jarData);
+		} catch (java.security.NoSuchAlgorithmException e) {
+			throw new RuntimeException(e);
+		}
+		Long existing = checkMergeOperator(name, hash);
+		if (existing != null) {
+			return existing;
+		}
+		return uploadMergeOperator(name, className, jarData);
 	}
 
 	/** See: {@link DeleteColumn}. */

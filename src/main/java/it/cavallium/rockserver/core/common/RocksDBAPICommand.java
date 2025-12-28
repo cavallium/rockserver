@@ -156,6 +156,29 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			}
 		}
 		/**
+		 * Check if merge operator exists
+		 * @param name name
+		 * @param hash hash
+		 */
+		record CheckMergeOperator(String name, byte[] hash) implements RocksDBAPICommandSingle<Long> {
+
+			@Override
+			public Long handleSync(RocksDBSyncAPI api) {
+				return api.checkMergeOperator(name, hash);
+			}
+
+			@Override
+			public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
+				return api.checkMergeOperatorAsync(name, hash);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
+			}
+		}
+
+		/**
 		 * Delete a column
 		 * @param columnId column id
 		 */

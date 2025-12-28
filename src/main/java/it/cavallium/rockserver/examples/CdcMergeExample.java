@@ -59,15 +59,6 @@ public class CdcMergeExample {
             database: {
               global: {
                 ingest-behind: true
-                // Explicit per-column configuration so it also applies when running in-memory
-                column-options: [
-                  {
-                    name: "messages",
-                    // Use the domain-aware merge operator that applies MessagePatch to Message values
-                    merge-operator-class: "it.cavallium.rockserver.examples.MessagePatchMergeOperator"
-                  }
-                ]
-                // Fallback remains for any additional columns created later
                 fallback-column-options: {
                   merge-operator-class: "it.cavallium.rockserver.examples.MessagePatchMergeOperator"
                 }
@@ -80,7 +71,8 @@ public class CdcMergeExample {
         // The column is declared via config (column-options) so we only need to resolve its id.
         try (var db = new EmbeddedConnection(null, "cdc-merge-example", tempConfig)) {
             var api = db.getAsyncApi();
-            long columnId = db.getSyncApi().getColumnId("messages");
+            var schema = ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntList.of(4), new it.unimi.dsi.fastutil.objects.ObjectArrayList<>(), true, null, null, "it.cavallium.rockserver.examples.MessagePatchMergeOperator");
+            long columnId = db.getSyncApi().createColumn("messages", schema);
             LOG.info("Using column 'messages' with id={} (from config)", columnId);
 
             // 3) Create or resume a CDC subscription BEFORE seeding data so we also see initial PUTs
@@ -96,8 +88,8 @@ public class CdcMergeExample {
 
             // 5) Simulate an infinite remote input stream (replace with your real source)
             Flux<RemoteInput> remoteInputTypesFlux = Flux
-                    .interval(Duration.ofMillis(200))
-                    .onBackpressureBuffer(10_000)
+                    .interval(Duration.ofMillis(1).dividedBy(5))
+                    .onBackpressureBuffer(100_000)
                     .map(i -> new RemoteInput(1 + (int)(i % 3), // ids 1..3
                             " +delta-" + i,
                             (i % 5) == 0 // toggle pin sometimes
@@ -125,7 +117,7 @@ public class CdcMergeExample {
                             new Keys(new Buf[]{Buf.wrap(intToBytes(p.id()))}),
                             Buf.wrap(encodePatch(p))
                     ))
-                    .bufferTimeout(128, Duration.ofMillis(150)) // small, frequent batches for smoother CDC
+                    .bufferTimeout(128, Duration.ofMillis(150), true) // small, frequent batches for smoother CDC
                     .filter(batch -> !batch.isEmpty())
                     .map(batch -> {
                         List<Keys> keys = batch.stream().map(KV::keys).collect(Collectors.toList());

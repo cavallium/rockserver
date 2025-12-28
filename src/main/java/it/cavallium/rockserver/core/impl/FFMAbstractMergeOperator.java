@@ -39,12 +39,12 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
     private static final Logger LOG = LoggerFactory.getLogger(FFMAbstractMergeOperator.class);
     
     // Critical Downcalls for speed
-    private static final MethodHandle MALLOC;
-    private static final MethodHandle FREE;
+    private static MethodHandle MALLOC;
+    private static MethodHandle FREE;
     private static final String ALLOCATOR_TYPE;
     
-    private static final MethodHandle CREATE_OP;
-    private static final MethodHandle DESTROY_OP;
+    private static MethodHandle CREATE_OP;
+    private static MethodHandle DESTROY_OP;
 
     // Cache layout sizes for hot-path arithmetic
     private static final long ADDRESS_SIZE = ValueLayout.ADDRESS.byteSize();

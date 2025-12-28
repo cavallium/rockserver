@@ -7,6 +7,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Compact;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.Flush;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.GetAllColumnDefinitions;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CheckMergeOperator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
@@ -31,6 +32,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSt
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CDCEventAck;
+import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.cdc.CdcCommitMode;
 import it.cavallium.rockserver.core.common.cdc.CdcStreamOptions;
 import java.time.Duration;
@@ -71,6 +73,27 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	/** See: {@link UploadMergeOperator}. */
 	default CompletableFuture<Long> uploadMergeOperatorAsync(String name, String className, byte[] jarData) throws RocksDBException {
 		return requestAsync(new UploadMergeOperator(name, className, jarData));
+	}
+
+	default CompletableFuture<Long> checkMergeOperatorAsync(String name, byte[] hash) {
+		return requestAsync(new CheckMergeOperator(name, hash));
+	}
+
+	default CompletableFuture<Long> ensureMergeOperatorAsync(String name, String className, byte[] jarData) {
+		byte[] hash;
+		try {
+			java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+			hash = digest.digest(jarData);
+		} catch (java.security.NoSuchAlgorithmException e) {
+			return CompletableFuture.failedFuture(e);
+		}
+		return checkMergeOperatorAsync(name, hash).thenCompose(existing -> {
+			if (existing != null) {
+				return CompletableFuture.completedFuture(existing);
+			} else {
+				return uploadMergeOperatorAsync(name, className, jarData);
+			}
+		});
 	}
 
 	/** See: {@link DeleteColumn}. */
@@ -302,7 +325,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
                     AtomicReference<Long> c = (AtomicReference<Long>) state;
                     Long seq = c.get();
 
-                    Mono<java.util.List<CDCEvent>> fetch = Mono.defer(() -> Flux.from(cdcPollAsync(id, seq, batchSize)).collectList())
+                    Mono<CdcBatch> fetch = Mono.defer(() -> cdcPollBatchAsync(id, seq, batchSize))
                             .retryWhen(retrySpec);
 
                     Function<Long, Mono<Void>> commitFn = targetSeq -> Mono.defer(() -> {
@@ -316,15 +339,18 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
                             .retryWhen(retrySpec)
                             .doOnSuccess(__ -> c.updateAndGet(prev -> prev == null ? (targetSeq + 1) : Math.max(prev, targetSeq + 1)));
 
-                    return fetch.flatMapMany(events -> {
+                    return fetch.flatMapMany(batch -> {
+                        List<CDCEvent> events = batch.events();
+                        long nextSeq = batch.nextSeq();
+                        c.set(nextSeq);
+
                         if (events.isEmpty()) {
+                            if (seq == null || nextSeq > seq) return Mono.empty();
                             return Mono.delay(idle).then(Mono.empty());
                         }
 
                         if (processor == null || commitMode == CdcCommitMode.NONE) {
-                            CDCEvent last = events.get(events.size() - 1);
-                            return Flux.fromIterable(events)
-                                    .doOnComplete(() -> c.set(last.seq() + 1));
+                            return Flux.fromIterable(events);
                         }
 
                         long lastSeq = events.get(events.size() - 1).seq();
@@ -391,16 +417,18 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
                         AtomicReference<Long> c = (AtomicReference<Long>) state;
                         Long seq = c.get();
 
-                        Mono<java.util.List<CDCEvent>> fetch = Mono.defer(() -> Flux.from(cdcPollAsync(id, seq, batchSize)).collectList())
+                        Mono<CdcBatch> fetch = Mono.defer(() -> cdcPollBatchAsync(id, seq, batchSize))
                                 .retryWhen(retrySpec);
 
-                        return fetch.flatMapMany(events -> {
+                        return fetch.flatMapMany(batch -> {
+                            List<CDCEvent> events = batch.events();
+                            long nextSeq = batch.nextSeq();
+                            c.set(nextSeq);
+
                             if (events.isEmpty()) {
+                                if (seq == null || nextSeq > seq) return Mono.empty();
                                 return Mono.delay(idle).then(Mono.empty());
                             }
-                            // Advance local cursor to end of batch to avoid re-fetching within this session
-                            CDCEvent last = events.get(events.size() - 1);
-                            c.set(last.seq() + 1);
 
                             return Flux.fromIterable(events)
                                     .map(ev -> new CDCEventAck(ev, () -> commitFn.apply(ev.seq())));
@@ -409,11 +437,26 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
         });
     }
 
+    default Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
+        return Flux.from(cdcPollAsync(id, fromSeq, maxEvents))
+                .collectList()
+                .map(events -> {
+                    long nextSeq;
+                    if (events.isEmpty()) {
+                        nextSeq = fromSeq != null ? fromSeq : 0;
+                    } else {
+                        nextSeq = events.get(events.size() - 1).seq() + 1;
+                    }
+                    return new CdcBatch(events, nextSeq);
+                });
+    }
+
     /**
      * Default retry policy used by {@link #cdcStream} to make polling/commit resilient to transient failures.
      */
     private static Retry defaultCdcStreamRetry() {
         return Retry.backoff(Long.MAX_VALUE, Duration.ofMillis(50))
+                .doBeforeRetry(s -> System.err.println("CDC RETRY: " + s.failure()))
                 .maxBackoff(Duration.ofSeconds(5))
                 .transientErrors(true);
     }

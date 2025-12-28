@@ -37,7 +37,8 @@ public class RocksDBException extends RuntimeException {
 		GET_PROPERTY_ERROR,
 		INTERNAL_ERROR,
 		TRANSACTION_NOT_FOUND,
-		NULL_ARGUMENT
+		NULL_ARGUMENT,
+		CDC_GAP_DETECTED
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {

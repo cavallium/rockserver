@@ -4,12 +4,15 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.RocksDB;
+import org.rocksdb.RocksIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureClassLoader;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
@@ -51,13 +54,42 @@ public class MergeOperatorRegistry implements Closeable {
 
         // Validate JAR content before storage
         validateJar(jarData);
+        
+        byte[] hash;
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            hash = digest.digest(jarData);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new RuntimeException(e);
+        }
 
         synchronized (this) {
             try {
+                // Check deduplication
+                Long existing = check(name, hash);
+                if (existing != null) {
+                    // double check if the data exists
+                    byte[] key = encodeKey(name, existing);
+                    if (db.get(cfh, key) != null) {
+                        LOG.info("Merge operator '{}' with same content already exists as version {}. Reusing.", name, existing);
+                        return existing;
+                    }
+                }
+                
                 long version = getNextVersion(name);
                 byte[] key = encodeKey(name, version);
                 byte[] value = encodeValue(className, jarData);
+                
+                // Write data
                 db.put(cfh, key, value);
+
+                // Write hash index
+                byte[] hashKey = encodeHashKey(name, hash);
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                try (DataOutputStream dos = new DataOutputStream(baos)) {
+                    dos.writeLong(version);
+                }
+                db.put(cfh, hashKey, baos.toByteArray());
 
                 // Pre-load to verify instantiation and cache it
                 loadAndCache(name, version, className, jarData);
@@ -70,6 +102,33 @@ public class MergeOperatorRegistry implements Closeable {
                 throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, "Failed to upload merge operator: " + name, e);
             }
         }
+    }
+
+    /**
+     * Checks if a merge operator with the given hash already exists.
+     * @param name Operator name
+     * @param hash SHA-256 hash of the JAR content
+     * @return The version number if found, or null
+     */
+    public Long check(String name, byte[] hash) {
+        if (name == null || hash == null) return null;
+        try {
+            byte[] key = encodeHashKey(name, hash);
+            byte[] val = db.get(cfh, key);
+            if (val != null) {
+                try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(val))) {
+                    return dis.readLong();
+                }
+            }
+        } catch (Exception e) {
+            LOG.warn("Failed to check merge operator existence by hash", e);
+        }
+        return null;
+    }
+
+    private byte[] encodeHashKey(String name, byte[] hash) {
+        String hashHex = java.util.HexFormat.of().formatHex(hash);
+        return ("hash:" + name + ":" + hashHex).getBytes(StandardCharsets.UTF_8);
     }
 
     /**
@@ -212,6 +271,37 @@ public class MergeOperatorRegistry implements Closeable {
             }
         }
         cache.clear();
+    }
+
+    public record MergeOperatorInfo(String name, long version, String className) {}
+
+    public List<MergeOperatorInfo> listAll() {
+        List<MergeOperatorInfo> result = new ArrayList<>();
+        try (RocksIterator it = db.newIterator(cfh)) {
+            it.seekToFirst();
+            while (it.isValid()) {
+                String key = new String(it.key(), StandardCharsets.UTF_8);
+                if (key.startsWith("data:")) {
+                    try {
+                        int lastColon = key.lastIndexOf(':');
+                        if (lastColon > 4) {
+                            String name = key.substring(5, lastColon);
+                            long version = Long.parseLong(key.substring(lastColon + 1));
+
+                            String className;
+                            try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(it.value()))) {
+                                className = dis.readUTF();
+                            }
+                            result.add(new MergeOperatorInfo(name, version, className));
+                        }
+                    } catch (Exception e) {
+                        // Ignore malformed keys
+                    }
+                }
+                it.next();
+            }
+        }
+        return result;
     }
 
     private static class InMemoryClassLoader extends SecureClassLoader {

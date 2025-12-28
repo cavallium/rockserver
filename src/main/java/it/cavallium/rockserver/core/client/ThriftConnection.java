@@ -150,6 +150,11 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public Long checkMergeOperator(String name, byte[] hash) {
+		throw new UnsupportedOperationException("checkMergeOperator not implemented for Thrift");
+	}
+
+	@Override
 	public void deleteColumn(long columnId) {
 		try {
 			client.deleteColumn(columnId);
@@ -450,6 +455,11 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public CompletableFuture<Long> uploadMergeOperatorAsync(String name, String className, byte[] jarData) {
 		return CompletableFuture.supplyAsync(() -> uploadMergeOperator(name, className, jarData), executor);
+	}
+
+	@Override
+	public CompletableFuture<Long> checkMergeOperatorAsync(String name, byte[] hash) {
+		return CompletableFuture.failedFuture(new UnsupportedOperationException("checkMergeOperator not implemented for Thrift"));
 	}
 
 	@Override

@@ -15,8 +15,19 @@ public class Bucket {
 	private final ColumnInstance col;
 	private final ArrayList<Entry<Buf[], Buf>> elements;
 
+	public java.util.List<Entry<Buf[], Buf>> getElements() {
+		return java.util.Collections.unmodifiableList(elements);
+	}
+
 	public Bucket(ColumnInstance col) {
 		this(col, emptyBuf());
+	}
+
+	public static int readElementCount(Buf rawBucketSegment) {
+		if (rawBucketSegment.size() < Integer.BYTES) {
+			return 0;
+		}
+		return rawBucketSegment.getInt(0);
 	}
 
 	public Bucket(ColumnInstance col, Buf rawBucketSegment) {

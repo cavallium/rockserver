@@ -1,0 +1,177 @@
+= Rockserver Core: CDC and Merge Operations
+:toc: macro
+
+This document provides a technical overview of the Change Data Capture (CDC) and Merge Operator capabilities in `rockserver-core`. It explains how these features combine to replace legacy "read-update-write" patterns, offering a more efficient and consistent architecture for maintaining external indices or derived data stores.
+
+toc::[]
+
+== 1. The Legacy Pattern: Read-Modify-Write (RMW)
+
+In traditional key-value store usage, updating a value based on its current state (e.g., appending to a list, incrementing a counter, or updating a field in a JSON blob) often involves a client-side transaction:
+
+1.  **Read**: Client reads the current value from the DB.
+2.  **Modify**: Client computes the new value locally.
+3.  **Write**: Client writes the new value back to the DB (often needing conditional updates or CAS to ensure atomicity).
+4.  **Publish (Optional)**: Client notifies external systems (like a search index) of the change.
+
+=== Disadvantages
+*   **Race Conditions**: Requires complex locking or optimistic concurrency control (CAS loops) to handle concurrent updates.
+*   **Network Overhead**: Requires multiple round-trips (Read + Write).
+*   **Client Complexity**: The merge logic resides in the client. Every client (Java, Rust, Node, etc.) must implement the same logic exactly.
+*   **Indexing Lag/Complexity**: If the indexer is separate, it must independently fetch the new data, or rely on the client to dual-write (which is prone to inconsistency).
+
+== 2. The Solution: RocksDB Merge + Rockserver CDC
+
+Rockserver solves this by leveraging RocksDB's native **Merge Operators** combined with a powerful **CDC** implementation that can "resolve" these merges into final values automatically.
+
+=== 2.1. RocksDB Merge Operator
+Instead of RMW, the client sends a `Merge` operation:
+`db.merge(key, delta)`
+
+*   **Atomic**: RocksDB handles the merge internally. No user-side locks needed.
+*   **Fast**: Single fire-and-forget network call.
+*   **Logic on Server**: The rules for merging (e.g., "append string", "add integer") are defined in a `MergeOperator` class deployed on the server.
+
+=== 2.2. Rockserver CDC (Change Data Capture)
+Rockserver implements a durable, WAL-based (Write Ahead Log) CDC system. It allows consumers to subscribe to changes on specific columns.
+
+Key capabilities:
+*   **Durable**: Based on RocksDB WAL. If the consumer disconnects, they can resume from the last known sequence number (`seq`).
+*   **Filtering**: Subscriptions can be filtered by Column Family (Column ID).
+*   **Pagination**: Events are polled in batches.
+*   **Backpressure**: The consumer controls the consumption rate via polling.
+
+== 3. "Emit Latest Values" (Resolved CDC)
+
+The "Killer Feature" for indexing is the `emitLatestValues` (or `resolved=true`) flag in the CDC subscription.
+
+When a standard CDC consumer sees a `MERGE` operation in the WAL, it normally sees the *delta* (e.g., "+5" or ", World"). This is useless for a search index that needs the final document.
+
+With `resolved=true`:
+1.  **Detection**: The CDC processor detects `MERGE` (or `PUT`) operations in the WAL batch.
+2.  **Resolution**: It performs a read (Get/MultiGet) against the *current* state of the database for those keys.
+3.  **Emission**: It emits a `PUT` event containing the **fully merged, final value**.
+
+=== Benefits for Indexers
+*   **Stateless Consumer**: The indexer doesn't need to query the DB or know the merge logic. It receives "The value for Key X is now Y".
+*   **Efficiency**: Deduplicates rapid updates. If a key is updated 100 times in a millisecond, the CDC poll might resolve it once to the final value, saving 99 index operations (eventual consistency).
+*   **Simplified Architecture**:
+    *   **Write Path**: `client -> db.merge()` (Fast)
+    *   **Read Path**: `indexer -> db.cdcPoll(resolved=true) -> index.put()` (Simple)
+
+== 4. Handling Bucketed Columns
+
+Rockserver supports "Bucketed Columns" (where multiple logical rows are stored in a single physical RocksDB Key-Value pair, often used for 1:N relationships or wide rows).
+
+=== The Challenge
+Physically, RocksDB sees:
+*   **Key**: `FixedPrefix + Hash`
+*   **Value**: `Blob containing [VarKey1:Val1, VarKey2:Val2, ...]`
+
+A naive CDC would emit this raw blob, forcing the consumer to understand the internal hashing and bucket structure.
+
+=== The Solution: Real Key Reconstruction
+When `resolved=true` is used on a bucketed column, Rockserver performs **Automatic Bucket Expansion**:
+
+1.  **Expand**: The bucket blob is parsed into individual elements (`VarKey:Val`).
+2.  **Reconstruct**: For each element, Rockserver reconstructs the logical **Real Key**:
+    *   `RealKey = FixedPrefix + VarKey`
+    *   It discards the internal Hash used for physical storage.
+3.  **Emit**: The consumer receives a separate `PUT` event for each logical element in the bucket.
+
+=== Example
+*   **Schema**: Fixed Key (UserID, 4 bytes), Variable Key (DeviceID, String).
+*   **Operation**: User `123` adds Device `Mobile`.
+*   **Physical DB**:
+    *   Key: `123 + Hash("Mobile")`
+    *   Value: `BucketBlob { "Mobile": "Attributes..." }`
+*   **CDC Event (Resolved)**:
+    *   **Op**: `PUT`
+    *   **Key**: `123 + "Mobile"` (The exact bytes the user would send in a Put)
+    *   **Value**: `"Attributes..."` (Just the value for this device)
+
+== 5. Technical Workflow Summary
+
+. **Setup**:
+    *   Define Column Schema (e.g., with Merge Operator `MyAppendOperator`).
+    *   Create CDC Subscription: `db.cdcCreate("index-sub", startSeq=0, columns=[col1], emitLatestValues=true)`.
+
+. **Write**:
+    *   Client calls `db.merge(key, delta)`.
+    *   RocksDB appends to WAL and MemTable.
+
+. **Index**:
+    *   Indexer calls `db.cdcPoll("index-sub")`.
+    *   Rockserver scans WAL.
+    *   Finds `MERGE` on `key`.
+    *   Rockserver calls `db.get(key)` -> returns "OldValue + Delta".
+    *   Rockserver emits `CDCEvent(Op=PUT, Key=key, Value="OldValue+Delta")`.
+    *   Indexer updates Elasticsearch/Solr with "OldValue+Delta".
+
+== 6. API Reference
+
+=== Java API
+[source,java]
+----
+// Create Subscription
+boolean emitLatestValues = true;
+String subId = "my-indexer";
+long startSeq = db.cdcCreate(subId, null, List.of(columnId), emitLatestValues);
+
+// Poll Loop
+while (running) {
+    List<CDCEvent> events = db.cdcPoll(subId, null, 100).toList();
+    for (CDCEvent event : events) {
+        // event.key() is the Real Key
+        // event.value() is the Resolved Value
+        // event.op() is usually PUT (or DELETE)
+        indexService.update(event.key(), event.value());
+    }
+    // Commit progress
+   	if (!events.isEmpty()) {
+		db.cdcCommit(subId, events.get(events.size() - 1).seq());
+	}
+}
+----
+
+== 7. Handling Client/Schema Updates
+
+In a production environment, you may need to update the application logic or data schema.
+
+=== 7.1. Key Schema Updates (Immutable)
+The structure of the **Keys** (defined by `ColumnSchema`) is **immutable**. You cannot change the number or length of fixed keys, nor the hashing strategy of variable keys, for an existing column. `createColumn` enforces this and will throw an error if you attempt to change the physical key layout.
+
+To change the key structure, you must create a new Column Family (migration).
+
+=== 7.2. Value Schema Updates (Supported)
+The structure of the **Value** (payload) is flexible. Rockserver treats values as opaque bytes (or buckets of opaque bytes).
+
+You can safely update your client-side serialization logic (e.g., Protobuf, JSON) as long as it is backward-compatible (can read old data).
+
+=== 7.3. Merge Operator Updates (Supported & Safe)
+You can update the `MergeOperator` logic (Java code) to handle new data formats or new business rules.
+
+==== 7.3.1. Workflow (Server Restart)
+This is the standard approach for static deployments.
+
+1.  **Update Code**: Deploy the new `MergeOperator` class (e.g., in a new Jar).
+2.  **Update Configuration**: Update the database configuration to point to the new Merge Operator class (if the class name changed).
+3.  **Restart**: Restart Rockserver.
+    *   Rockserver will automatically detect the new configuration.
+    *   It will update the persisted schema metadata if the Key Schema matches but the Merge Operator info changed.
+
+==== 7.3.2. Workflow (Zero-Downtime / Hot Swap)
+You can also update the Merge Operator logic dynamically without restarting the server, using the Client API.
+
+1.  **Upload New Code**: Use the `uploadMergeOperator` API to upload the new `MergeOperator` jar (receiving a new version ID).
+2.  **Update Column Schema**: Call `createColumn` (or update) with the existing column name and the *same* Key Schema, but specifying the **new Merge Operator Name and Version**.
+3.  **Hot Swap**:
+    *   Rockserver detects the schema change.
+    *   It seamlessly swaps the internal Merge Operator logic to the new version.
+    *   All subsequent `MERGE` operations and CDC resolutions immediately use the new logic.
+    *   This is achieved via a `DelegatingMergeOperator` wrapper that proxies native calls to the active Java implementation.
+
+**CDC Safety (Both Workflows):**
+*   When CDC (Resolved) processes *old* WAL entries (generated before the update), it resolves them by reading the *current* state of the database.
+*   This read uses the **new** Merge Operator logic.
+*   This ensures that your indexer always receives values consistent with the latest business logic, even for historical events.

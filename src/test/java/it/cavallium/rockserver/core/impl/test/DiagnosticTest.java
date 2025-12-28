@@ -34,7 +34,6 @@ public class DiagnosticTest {
         checkSymbol("rocksdb_mergeoperator_create", loaderLookup, defaultLookup);
         
         System.out.println("==========================");
-        throw new RuntimeException("Force failure to see output");
     }
 
     private void checkSymbol(String name, SymbolLookup l1, SymbolLookup l2) {

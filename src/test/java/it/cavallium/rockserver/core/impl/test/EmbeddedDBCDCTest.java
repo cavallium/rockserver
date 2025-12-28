@@ -118,7 +118,7 @@ public class EmbeddedDBCDCTest {
     }
 
     @Test
-    public void testCDCEmitLatestValuesBucketedIgnored() throws Exception {
+    public void testCDCEmitLatestValuesBucketedSupported() throws Exception {
         long bucketColId = db.createColumn("bucketed", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(ColumnHashType.XXHASH32), true));
         
         String subId = "sub4";
@@ -137,17 +137,20 @@ public class EmbeddedDBCDCTest {
 
         Assertions.assertEquals(2, events.size());
         
-        // Should NOT be resolved to "b2" for the first event, because it's bucketed.
-        // It should be "b1" (bucketed) then "b2" (bucketed).
-        // Since bucketed columns store metadata, the value won't be equal to raw "b1",
-        // but ev1 and ev2 must be different (representing different states).
-        // If resolution happened, both would be the latest state (b2).
+        // Since we now support resolution for bucketed columns, both events should
+        // resolve to the LATEST state of the bucket.
+        // Also, we expect "Real Keys" (Fixed + Variable concatenated), not Raw/Hashed keys.
         
         CDCEvent ev1 = events.get(0);
         CDCEvent ev2 = events.get(1);
         
-        Assertions.assertNotEquals(ev1.value(), ev2.value());
-        Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
-        Assertions.assertEquals(CDCEvent.Op.PUT, ev2.op());
+        // Value should be "b2" (the latest value), not the bucket blob
+        Assertions.assertEquals("b2", new String(ev1.value().asArray(), StandardCharsets.UTF_8));
+        Assertions.assertEquals("b2", new String(ev2.value().asArray(), StandardCharsets.UTF_8));
+        
+        // Key should be "fixedkey" + "variable"
+        String expectedKey = "fixedkey" + "variable";
+        Assertions.assertEquals(expectedKey, new String(ev1.key().asArray(), StandardCharsets.UTF_8));
+        Assertions.assertEquals(expectedKey, new String(ev2.key().asArray(), StandardCharsets.UTF_8));
     }
 }

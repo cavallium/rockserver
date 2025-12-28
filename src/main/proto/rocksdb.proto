@@ -16,6 +16,15 @@ message UploadMergeOperatorResponse {
   int64 version = 1;
 }
 
+message CheckMergeOperatorRequest {
+  string operatorName = 1;
+  bytes hash = 2;
+}
+
+message CheckMergeOperatorResponse {
+  optional int64 version = 1;
+}
+
 message MergeOperatorReference {
   string operatorName = 1;
   int64 version = 2;
@@ -191,6 +200,7 @@ service RocksDBService {
   rpc compact(CompactRequest) returns (google.protobuf.Empty);
   rpc getAllColumnDefinitions(GetAllColumnDefinitionsRequest) returns (GetAllColumnDefinitionsResponse);
   rpc uploadMergeOperator(UploadMergeOperatorRequest) returns (UploadMergeOperatorResponse);
+  rpc checkMergeOperator(CheckMergeOperatorRequest) returns (CheckMergeOperatorResponse);
   // Change Data Capture (CDC) API
   // Create or update a CDC subscription. If fromSeq is not provided, it starts from the latest sequence.
   rpc cdcCreate(CdcCreateRequest) returns (CdcCreateResponse);

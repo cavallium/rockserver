@@ -95,11 +95,78 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 				}
 			}
 		} else {
-			// todo: implement
-			throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "Unsupported bucket columns, implement them");
+			if (bucketValue == null) {
+				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "bucketValue is required for decoding bucketed keys");
+			}
+			finalKeys = new Buf[schema.keysCount()];
+			int calculatedKeyOffset = 0;
+			int bucketValueOffset = 0;
+
+			int firstVariableKeyIndex = schema.keysCount() - schema.variableLengthKeysCount();
+
+			// 1. Decode Fixed Keys (from calculatedKey)
+			decodeFixedKeys(calculatedKey, finalKeys, firstVariableKeyIndex);
+
+			// 2. Decode Variable Keys (from bucketValue)
+			for (int i = firstVariableKeyIndex; i < schema.keysCount(); i++) {
+				// Read size (2 bytes - char)
+				if (bucketValueOffset + Character.BYTES > bucketValue.size()) {
+					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key length at index " + i);
+				}
+				char keyLengthChar = bucketValue.getChar(bucketValueOffset);
+				int keyLength = (int) keyLengthChar;
+				bucketValueOffset += Character.BYTES;
+
+				// Read bytes
+				if (bucketValueOffset + keyLength > bucketValue.size()) {
+					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
+				}
+				Buf finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
+				finalKey.setBytesFromBuf(0, bucketValue, bucketValueOffset, keyLength);
+				bucketValueOffset += keyLength;
+			}
 		}
 		validateKeyCount(finalKeys);
 		return finalKeys;
+	}
+
+	public void decodeFixedKeys(Buf calculatedKey, Buf[] finalKeys, int firstVariableKeyIndex) {
+		int calculatedKeyOffset = 0;
+		for (int i = 0; i < firstVariableKeyIndex; i++) {
+			int keyLength = schema.key(i);
+			Buf finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
+			finalKey.setBytesFromBuf(0, calculatedKey, calculatedKeyOffset, keyLength);
+			calculatedKeyOffset += keyLength;
+		}
+	}
+
+	public Buf decodeValue(Buf calculatedValue) {
+		if (!hasBuckets()) {
+			return calculatedValue;
+		}
+		int bucketValueOffset = 0;
+		int firstVariableKeyIndex = schema.keysCount() - schema.variableLengthKeysCount();
+
+		for (int i = firstVariableKeyIndex; i < schema.keysCount(); i++) {
+			// Read size (2 bytes - char)
+			if (bucketValueOffset + Character.BYTES > calculatedValue.size()) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key length at index " + i);
+			}
+			char keyLengthChar = calculatedValue.getChar(bucketValueOffset);
+			int keyLength = (int) keyLengthChar;
+			bucketValueOffset += Character.BYTES;
+
+			// Skip bytes
+			if (bucketValueOffset + keyLength > calculatedValue.size()) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
+			}
+			bucketValueOffset += keyLength;
+		}
+
+		int valueSize = calculatedValue.size() - bucketValueOffset;
+		Buf value = Buf.createZeroes(valueSize);
+		value.setBytesFromBuf(0, calculatedValue, bucketValueOffset, valueSize);
+		return value;
 	}
 
 	private Buf computeKeyAt(int i, Buf[] keys) {
