@@ -7,6 +7,7 @@ use std::convert::TryInto;
 use std::io::Read;
 use std::io as std_io;
 use std::env;
+use std::time::{Instant, Duration};
 
 pub mod records {
     include!(concat!(env!("OUT_DIR"), "/generated_records/mod.rs"));
@@ -65,7 +66,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ).await?;
 
     println!("Streaming messages...");
+    let mut total_count = 0;
+    let mut error_count = 0;
+    let start_time = Instant::now();
+    let mut last_log_time = Instant::now();
+    let log_interval = Duration::from_secs(2);
+
     while let Some(result) = stream.next().await {
+        total_count += 1;
         match result {
             Ok(kv) => {
                 // Decode ChatEntityId (Key Part 1)
@@ -144,8 +152,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let has_error = chat_entity_id.contains("DecodeError") || message_display.contains("DecodeError");
+                if has_error {
+                    error_count += 1;
+                }
+
                 if !errors_only || has_error {
                     println!("Chat: {}, MsgID: {} -> Content: {}", chat_entity_id, message_id, message_display);
+                }
+
+                if errors_only && last_log_time.elapsed() >= log_interval {
+                    let elapsed = start_time.elapsed();
+                    let throughput = total_count as f64 / elapsed.as_secs_f64();
+                    println!("Progress: {} messages. Time: {:.2}s. Speed: {:.2} msg/s. Errors: {}", 
+                        total_count, elapsed.as_secs_f64(), throughput, error_count);
+                    last_log_time = Instant::now();
                 }
             }
             Err(e) => {
