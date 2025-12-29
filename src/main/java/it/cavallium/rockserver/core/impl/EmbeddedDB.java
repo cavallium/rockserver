@@ -113,6 +113,7 @@ import org.rocksdb.WriteBatch;
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
 	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
+	private static final long ITERATOR_REFRESH_INTERVAL = 1_000_000;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
 	private static final byte[] MERGE_OPERATORS_COLUMN = "_merge_operators_".getBytes(StandardCharsets.UTF_8);
@@ -2818,28 +2819,79 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		final class IteratorResources {
 
 			private final ColumnInstance col;
-			private final ReadOptions ro;
+			private ReadOptions ro;
 			private final AbstractSlice<?> startKeySlice;
 			private final AbstractSlice<?> endKeySlice;
-			private final RocksIterator it;
+			private RocksIterator it;
 			private final StampedLock resourceLock = new StampedLock();
 			private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
+			private long itemsRead = 0;
+			private final boolean canRefresh;
+			private boolean closed = false;
 
 			IteratorResources(ColumnInstance col,
 					ReadOptions ro,
 					AbstractSlice<?> startKeySlice,
 					AbstractSlice<?> endKeySlice,
-					RocksIterator it) {
+					RocksIterator it,
+					boolean canRefresh) {
 				this.col = col;
 				this.ro = ro;
 				this.startKeySlice = startKeySlice;
 				this.endKeySlice = endKeySlice;
 				this.it = it;
+				this.canRefresh = canRefresh;
+			}
+
+			public void refresh(boolean reverse) throws RocksDBException {
+				if (!canRefresh) return;
+				long stamp = resourceLock.writeLock();
+				try {
+					if (closed) return;
+					if (!it.isValid()) return;
+
+					byte[] currentKey = it.key(); // Copy key
+
+					it.close();
+					ro.close();
+
+					var newRo = newReadOptions("get-range-async-read-options");
+					try {
+						if (startKeySlice != null) {
+							newRo.setIterateLowerBound(startKeySlice);
+						}
+						if (endKeySlice != null) {
+							newRo.setIterateUpperBound(endKeySlice);
+						}
+
+						RocksIterator newIt = db.get().newIterator(col.cfh(), newRo);
+						try {
+							if (reverse) {
+								newIt.seekForPrev(currentKey);
+							} else {
+								newIt.seek(currentKey);
+							}
+
+							this.ro = newRo;
+							this.it = newIt;
+						} catch (Throwable t) {
+							newIt.close();
+							throw t;
+						}
+					} catch (Throwable t) {
+						newRo.close();
+						throw t;
+					}
+				} finally {
+					resourceLock.unlockWrite(stamp);
+				}
 			}
 
 			public void close() {
 				var wl = resourceLock.writeLock();
 				try {
+					if (closed) return;
+					closed = true;
 					it.close();
 					ro.close();
 					if (endKeySlice != null) {
@@ -2888,7 +2940,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									} else {
 										it = db.get().newIterator(col.cfh(), ro);
 									}
-									res = new IteratorResources(col, ro, startKeySlice, endKeySlice, it);
+									res = new IteratorResources(col, ro, startKeySlice, endKeySlice, it, transactionId == 0);
 								} catch (Throwable ex) {
 									if (endKeySlice != null) {
 										endKeySlice.close();
@@ -2977,6 +3029,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 					if (nextResult != null) {
 						sink.next(nextResult);
+						res.itemsRead++;
+						if (res.canRefresh && res.itemsRead >= ITERATOR_REFRESH_INTERVAL && res.bucketIterator == null) {
+							try {
+								res.refresh(reverse);
+								res.itemsRead = 0;
+							} catch (RocksDBException e) {
+								sink.error(e);
+							}
+						}
 					} else {
 						sink.complete();
 					}
