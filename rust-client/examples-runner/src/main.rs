@@ -52,12 +52,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Open a transaction for consistent reading
     let tx_timeout_ms = 60_000;
-    let tx_id = client.open_transaction(tx_timeout_ms).await?;
 
     // Stream all messages
     // Passing empty vectors for keys implies scanning the full range.
     let mut stream = client.get_all_in_range(
-        tx_id,
+        0,
         column_id,
         vec![], // start_keys_inclusive
         vec![], // end_keys_exclusive
@@ -174,8 +173,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-
-    client.close_transaction(tx_id, false, 1000).await?;
 
     Ok(())
 }
