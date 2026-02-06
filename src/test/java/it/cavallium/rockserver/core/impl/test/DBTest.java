@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.foreign.Arena;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -33,6 +34,9 @@ import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+
+import it.cavallium.rockserver.core.impl.ColumnInstance;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
 
 @TestMethodOrder(MethodOrderer.MethodName.class)
 abstract class DBTest {
@@ -1227,6 +1231,142 @@ database: {
 			// Ev 3: PUT Start, Middle, End -> Resolved to Current
 			Assertions.assertEquals(CDCEvent.Op.PUT, events.get(2).op());
 			Assertions.assertEquals(expectedValue, new String(events.get(2).value().toByteArray()));
+		}
+	}
+
+	@TestAllImplementations
+	void testScanRaw(String name, ConnectionConfig connection) throws Exception {
+		if (connection.method() == ConnectionMethod.THRIFT) {
+			return;
+		}
+		try (var tdb = new TestDB(db, connection)) {
+			RocksDBAPI api = tdb.getAPI();
+			long colId = api.createColumn("scan-raw-col",
+					it.cavallium.rockserver.core.common.ColumnSchema.of(
+							it.unimi.dsi.fastutil.ints.IntList.of(8),
+							it.unimi.dsi.fastutil.objects.ObjectList.of(),
+							true));
+
+			int count = 10000;
+			List<KVBatch> batches = new ArrayList<>();
+
+			int batchSize = 1000;
+			for (int i = 0; i < count; i += batchSize) {
+				List<Keys> keys = new ArrayList<>();
+				List<Buf> values = new ArrayList<>();
+				for (int j = 0; j < batchSize; j++) {
+					long val = i + j;
+					java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(8);
+					bb.putLong(val);
+					Keys k = new Keys(Buf.wrap(bb.array()));
+
+					Buf v = Buf.wrap(("val-" + val).getBytes(StandardCharsets.UTF_8));
+					keys.add(k);
+					values.add(v);
+				}
+				batches.add(new KVBatch.KVBatchRef(keys, values));
+			}
+
+			// Insert data
+			api.putBatch(colId, Flux.fromIterable(batches), PutBatchMode.WRITE_BATCH);
+
+			// Flush to ensure data is in SST files (ScanRaw reads from SSTs)
+			api.flush();
+
+			// ScanRaw
+			List<it.cavallium.rockserver.core.common.SerializedKVBatch> resultBatches;
+			try (var stream = api.scanRaw(colId, 0, 1)) {
+				resultBatches = stream.collect(Collectors.toList());
+			}
+
+			// Verify
+			int totalEntries = 0;
+			Set<Long> foundKeys = new HashSet<>();
+
+			for (var batch : resultBatches) {
+				var kvStream = batch.decode();
+				var kvList = kvStream.toList();
+				totalEntries += kvList.size();
+
+				for (var kv : kvList) {
+					Keys k = kv.keys();
+					Buf v = kv.value();
+
+					long kLong = java.nio.ByteBuffer.wrap(k.keys()[0].toByteArray()).getLong();
+					String vStr = new String(v.toByteArray(), StandardCharsets.UTF_8);
+					Assertions.assertEquals("val-" + kLong, vStr);
+					foundKeys.add(kLong);
+				}
+			}
+
+			Assertions.assertEquals(count, totalEntries);
+			Assertions.assertEquals(count, foundKeys.size());
+
+			for(long i=0; i<count; i++) {
+				Assertions.assertTrue(foundKeys.contains(i), "Missing key-" + i);
+			}
+		}
+	}
+
+	@Test
+	void testTranscodeBatchKeysRegression() throws Exception {
+		var schema = ColumnSchema.of(
+				it.unimi.dsi.fastutil.ints.IntList.of(Integer.BYTES),
+				it.unimi.dsi.fastutil.objects.ObjectList.of(ColumnHashType.XXHASH32),
+				true
+		);
+		long testColId = db.createColumn("transcodeTest", schema);
+		try {
+			// Access ColumnInstance via InternalDB using Reflection
+			java.lang.reflect.Method getColumnMethod = EmbeddedDB.class.getDeclaredMethod("getColumn", long.class);
+			getColumnMethod.setAccessible(true);
+			ColumnInstance col = (ColumnInstance) getColumnMethod.invoke(db.getInternalDB(), testColId);
+
+			// 1. Prepare input
+			// Fixed Key: 0x01020304
+			// Full Key Size must correspond to Schema: 4 (Fixed) + 4 (Hash) = 8
+			Buf calculatedKey = Buf.createZeroes(8);
+			calculatedKey.setIntLE(0, 0x01020304);
+			calculatedKey.setIntLE(4, 0xDEADBEEF); // Hash part (ignored by transcode)
+
+			// Variable Key: "ABC" -> length 3
+			// Bucket Value: [Len(2 bytes)] + [Content]
+			Buf bucketValue = Buf.createZeroes(2 + 3);
+			bucketValue.setChar(0, (char) 3);
+			bucketValue.setBytesFromBuf(2, Buf.wrap("ABC".getBytes(StandardCharsets.UTF_8)), 0, 3);
+
+			// Output buffer
+			Buf output = Buf.createZeroes(0);
+
+			// 2. Call transcodeBatchKeys
+			int written = col.transcodeBatchKeys(calculatedKey, bucketValue, 0, output);
+
+			// 3. Verify Output
+			// keys count + key1 len + key1 + key2 len + key2
+			int expectedSize = 1 + 4 + 4 + 4 + 3;
+			Assertions.assertEquals(expectedSize, written);
+			Assertions.assertEquals(expectedSize, output.size());
+
+			int offset = 0;
+			Assertions.assertEquals((byte) 2, output.getByte(offset));
+			offset += 1;
+
+			// Key 1
+			Assertions.assertEquals(4, output.getIntLE(offset));
+			offset += 4;
+			Assertions.assertEquals(0x01020304, output.getIntLE(offset));
+			offset += 4;
+
+			// Key 2
+			Assertions.assertEquals(3, output.getIntLE(offset));
+			offset += 4;
+			byte[] expectedBytes = "ABC".getBytes(StandardCharsets.UTF_8);
+			for(int i=0; i<3; i++) {
+				Assertions.assertEquals(expectedBytes[i], output.getByte(offset + i));
+			}
+
+		} finally {
+			db.deleteColumn(testColId);
 		}
 	}
 }

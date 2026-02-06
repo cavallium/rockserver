@@ -779,6 +779,27 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		}
 
 		/**
+		 * Scan raw SST files
+		 */
+		record ScanRaw(long columnId, int shardIndex, int shardCount) implements RocksDBAPICommandStream<SerializedKVBatch> {
+
+			@Override
+			public Stream<SerializedKVBatch> handleSync(RocksDBSyncAPI api) {
+				return api.scanRaw(columnId, shardIndex, shardCount);
+			}
+
+			@Override
+			public Publisher<SerializedKVBatch> handleAsync(RocksDBAsyncAPI api) {
+				return api.scanRawAsync(columnId, shardIndex, shardCount);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
+			}
+		}
+
+		/**
 		 * CDC poll streaming command
 		 */
 		record CdcPoll(String id,

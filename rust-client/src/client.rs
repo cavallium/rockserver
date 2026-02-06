@@ -668,6 +668,18 @@ impl RockserverClient {
         Ok(resp.into_inner())
     }
 
+    /// Scans the column raw (ignoring transactions, usually).
+    pub async fn scan_raw(&self, column_id: i64, shard_index: i32, shard_count: i32) -> Result<impl Stream<Item = Result<KvBatch>>> {
+        let req = ScanRawRequest { column_id, shard_index, shard_count };
+        let resp = self.client.clone().scan_raw(req).await?;
+        Ok(resp.into_inner().map(|res| {
+            match res {
+                Ok(batch) => decode_kv_batch(&batch.serialized),
+                Err(e) => Err(e),
+            }
+        }))
+    }
+
     // ============================================================================================
     // Maintenance
     // ============================================================================================
@@ -803,4 +815,50 @@ impl RockserverClient {
             seq = Some(last_seq + 1);
         }
     }
+}
+
+fn decode_kv_batch(mut buf: &[u8]) -> Result<KvBatch> {
+    use std::convert::TryInto;
+
+    let get_u32 = |b: &mut &[u8]| -> Result<u32> {
+        if b.len() < 4 { return Err(Status::internal("Buffer too short for u32")); }
+        let (int_bytes, rest) = b.split_at(4);
+        *b = rest;
+        Ok(u32::from_le_bytes(int_bytes.try_into().unwrap()))
+    };
+
+    let get_u8 = |b: &mut &[u8]| -> Result<u8> {
+        if b.len() < 1 { return Err(Status::internal("Buffer too short for u8")); }
+        let (byte, rest) = b.split_at(1);
+        *b = rest;
+        Ok(byte[0])
+    };
+
+    let kv_count = get_u32(&mut buf)?;
+    let mut entries = Vec::with_capacity(kv_count as usize);
+
+    for _ in 0..kv_count {
+        let keys_count = get_u8(&mut buf)?;
+        let mut keys = Vec::with_capacity(keys_count as usize);
+
+        for _ in 0..keys_count {
+            let key_len = get_u32(&mut buf)?;
+            if buf.len() < key_len as usize { return Err(Status::internal("Buffer too short for key")); }
+            let (key_bytes, rest) = buf.split_at(key_len as usize);
+            buf = rest;
+            keys.push(key_bytes.to_vec());
+        }
+
+        let val_len = get_u32(&mut buf)?;
+        if buf.len() < val_len as usize { return Err(Status::internal("Buffer too short for value")); }
+        let (val_bytes, rest) = buf.split_at(val_len as usize);
+        buf = rest;
+
+        entries.push(Kv {
+            keys,
+            value: val_bytes.to_vec(),
+        });
+    }
+
+    Ok(KvBatch { entries })
 }

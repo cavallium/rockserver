@@ -16,3 +16,10 @@ rust-data-generator = { path = "../rust-data-generator" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 heck = "0.5"
+
+[profile.release]
+opt-level = 3        # Optimize for speed
+lto = "fat"          # Enable full Link Time Optimization
+codegen-units = 1    # Reduce parallel code generation to maximize optimization
+panic = "abort"      # Remove panic unwinding code (faster, but no stack traces)
+strip = true         # Automatically strip symbols (reduces binary size)

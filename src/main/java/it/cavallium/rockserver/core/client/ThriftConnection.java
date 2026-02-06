@@ -1,6 +1,5 @@
 package it.cavallium.rockserver.core.client;
 
-import static it.cavallium.rockserver.core.common.Utils.asByteBuffer;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
 import it.cavallium.buffer.Buf;
@@ -36,6 +35,7 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
 import it.cavallium.rockserver.core.common.api.RocksDB;
@@ -48,14 +48,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Spliterator;
-import java.util.Spliterators;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TSocket;
@@ -103,6 +100,16 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	// --- Sync API ---
+
+	@Override
+	public Stream<SerializedKVBatch> scanRaw(long columnId, int shardIndex, int shardCount) {
+		throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "scanRaw not implemented for Thrift");
+	}
+
+	@Override
+	public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
+		throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "scanRawAsync not implemented for Thrift");
+	}
 
 	@Override
 	public long openTransaction(long timeoutMs) {

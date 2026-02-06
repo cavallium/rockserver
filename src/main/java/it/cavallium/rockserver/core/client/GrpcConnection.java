@@ -26,16 +26,14 @@ import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
 import it.cavallium.rockserver.core.common.RequestType.RequestExists;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
-import it.cavallium.rockserver.core.common.RequestType.RequestGetRange;
 import it.cavallium.rockserver.core.common.RequestType.RequestMulti;
 import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
-import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
-import it.cavallium.rockserver.core.common.RequestType.RequestReduceRange;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.SerializedKVBatch.SerializedKVBatchRef;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.ColumnHashType;
@@ -397,6 +395,16 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 						.collectList()
 						.toFuture());
 		});
+	}
+
+	@Override
+	public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
+		return reactiveStub.scanRaw(ScanRawRequest.newBuilder()
+						.setColumnId(columnId)
+						.setShardIndex(shardIndex)
+						.setShardCount(shardCount)
+						.build())
+				.map(batch -> new SerializedKVBatchRef(Buf.wrap(batch.getSerialized().toByteArray())));
 	}
 
 	@Override

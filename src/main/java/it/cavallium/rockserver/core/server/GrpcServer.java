@@ -42,7 +42,6 @@ import it.cavallium.rockserver.core.common.RequestType.RequestMulti;
 import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
 import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
 import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
-import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
@@ -656,7 +655,9 @@ public class GrpcServer extends Server {
 					pageIndex++;
 				}
 				emitter.complete();
-			}, FluxSink.OverflowStrategy.BUFFER).transform(this.onErrorMapFluxWithRequestInfo("subsequentMultiGet", request));
+			}, FluxSink.OverflowStrategy.BUFFER)
+					.subscribeOn(GrpcServer.this.scheduler.read())
+					.transform(this.onErrorMapFluxWithRequestInfo("subsequentMultiGet", request));
 		}
 
 		@Override
@@ -709,6 +710,24 @@ public class GrpcServer extends Server {
 					))
 					.map(GrpcServerImpl::unmapKVHeap)
 					.transform(this.onErrorMapFluxWithRequestInfo("getAllInRange", request));
+		}
+
+		@Override
+		public Flux<it.cavallium.rockserver.core.common.api.proto.ScanRawResponse> scanRaw(ScanRawRequest request) {
+			return Flux
+					.from(asyncApi.scanRawAsync(request.getColumnId(), request.getShardIndex(), request.getShardCount()))
+					.map(batch -> {
+						var builder = it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder();
+						var serializedBatchValue = UnsafeByteOperations.unsafeWrap(
+								batch.serialized().getBackingByteArray(),
+								batch.serialized().getBackingByteArrayOffset(),
+								batch.serialized().getBackingByteArrayLength()
+						);
+						builder.setSerialized(serializedBatchValue);
+						return builder.build();
+					})
+					.limitRate(17, 1)
+					.transform(this.onErrorMapFluxWithRequestInfo("scanRaw", request));
 		}
 
 		@Override

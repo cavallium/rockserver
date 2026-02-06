@@ -29,6 +29,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.UploadMergeOperator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CDCEventAck;
@@ -240,6 +241,11 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 				requestType,
 				timeoutMs
 		));
+	}
+
+	/** See: {@link ScanRaw}. */
+	default Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
+		return requestAsync(new ScanRaw(columnId, shardIndex, shardCount));
 	}
 
 	/** See: {@link Flush}. */

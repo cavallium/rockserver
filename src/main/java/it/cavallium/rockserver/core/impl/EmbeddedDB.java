@@ -70,6 +70,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -98,8 +99,13 @@ import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.Slice;
+import org.rocksdb.SstFileReaderIterator;
+import org.rocksdb.SstFileReader;
+import org.rocksdb.LiveFileMetaData;
+import org.rocksdb.Options;
 import org.rocksdb.Status.Code;
 import org.rocksdb.TableProperties;
+import org.rocksdb.util.SizeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MarkerFactory;
@@ -109,6 +115,7 @@ import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import org.rocksdb.TransactionLogIterator;
 import org.rocksdb.WriteBatch;
+import reactor.core.publisher.SynchronousSink;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
@@ -3053,6 +3060,204 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				}
 		).subscribeOn(scheduler.read());
+	}
+
+	private static void ensureCapacity(Buf buf, int offset, int len) {
+		int required = offset + len;
+		if (buf.size() < required) {
+			int newSize = buf.size() + (buf.size() >> 1);
+			if (newSize < required) {
+				newSize = required;
+			}
+			buf.size(newSize);
+		}
+	}
+
+	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId, int shardIndex, int shardCount) {
+		return Flux.defer(() -> {
+			ColumnInstance col = getColumn(columnId);
+			String cfName;
+			try {
+				cfName = new String(col.cfh().getName(), StandardCharsets.UTF_8);
+			} catch (RocksDBException | org.rocksdb.RocksDBException e) {
+				return Flux.error(e);
+			}
+
+			List<LiveFileMetaData> files = getDb().get().getLiveFilesMetaData();
+
+			Function<LiveFileMetaData, Publisher<SerializedKVBatch>> mapper = f -> {
+				class ScanState implements AutoCloseable {
+					private final SstFileReader reader;
+					private final SstFileReaderIterator it;
+					private final ReadOptions readOptions;
+					private final Options options;
+					private boolean closed = false;
+					private final Buf outBuf = Buf.create(Math.toIntExact(SizeUnit.MB));
+
+					public ScanState() throws org.rocksdb.RocksDBException {
+						ColumnFamilyOptions cfOpts = columnsConifg.get(cfName);
+						this.options = cfOpts != null ? new Options(dbOptions, cfOpts) : new Options();
+						this.options.setAllowMmapReads(true);
+						this.options.setUseDirectReads(false);
+						this.options.setUseDirectIoForFlushAndCompaction(false);
+						this.options.setParanoidChecks(false);
+
+						this.reader = new SstFileReader(options);
+						String filePath = f.path();
+						if (!filePath.endsWith(".sst")) {
+							filePath = filePath + f.fileName();
+						}
+
+						ReadOptions tmpReadOptions = null;
+						SstFileReaderIterator tmpIt = null;
+						try {
+							this.reader.open(filePath);
+							tmpReadOptions = new ReadOptions()
+									.setFillCache(false)
+									.setIgnoreRangeDeletions(true)
+									.setVerifyChecksums(true)
+									.setReadaheadSize(8 * SizeUnit.MB);
+
+							tmpIt = reader.newIterator(tmpReadOptions);
+							tmpIt.seekToFirst();
+						} catch (org.rocksdb.RocksDBException e) {
+							if (e.getMessage() != null && e.getMessage().contains("No such file or directory")) {
+								logger.debug("SST file missing during scan (ignoring): " + f.fileName());
+							} else {
+								logger.warn("Failed to open SST file: " + f.fileName(), e);
+								this.options.close();
+								throw e;
+							}
+						}
+						this.readOptions = tmpReadOptions;
+						this.it = tmpIt;
+					}
+
+					public synchronized void generateNext(SynchronousSink<SerializedKVBatch> sink) {
+						if (closed) {
+							sink.complete();
+							return;
+						}
+						if (it == null) {
+							sink.complete();
+							return;
+						}
+						if (!it.isValid()) {
+							try {
+								it.status();
+							} catch (org.rocksdb.RocksDBException e) {
+								sink.error(e);
+								return;
+							}
+							sink.complete();
+							return;
+						}
+
+						int batchSize = 0;
+						int currentBatchBytes = 0;
+						int currentSerializedBatchBytes = Integer.BYTES;
+
+						try {
+							while (it.isValid()) {
+								if (closed) return;
+								batchSize++;
+								byte[] k = it.key();
+								byte[] v = it.value();
+								var kBuf = Buf.wrap(k);
+								var vBuf = Buf.wrap(v);
+								currentBatchBytes += k.length + v.length;
+
+								currentSerializedBatchBytes += col.transcodeBatchKeys(kBuf, vBuf, currentSerializedBatchBytes, outBuf);
+
+								if (col.schema().hasValue()) {
+									Buf userValue = col.decodeValue(vBuf);
+									var valLen = userValue.size();
+									ensureCapacity(outBuf, currentSerializedBatchBytes, Integer.BYTES);
+									outBuf.setIntLE(currentSerializedBatchBytes, valLen);
+									currentSerializedBatchBytes += Integer.BYTES;
+									if (valLen > 0) {
+										ensureCapacity(outBuf, currentSerializedBatchBytes, valLen);
+										outBuf.setBytesFromBuf(currentSerializedBatchBytes, userValue, 0, valLen);
+										currentSerializedBatchBytes += userValue.size();
+									}
+								} else {
+									ensureCapacity(outBuf, currentSerializedBatchBytes, Integer.BYTES);
+									outBuf.setIntLE(currentSerializedBatchBytes, 0);
+									currentSerializedBatchBytes += Integer.BYTES;
+								}
+
+								it.next();
+								if (batchSize >= 65536 || currentBatchBytes >= 2 * SizeUnit.MB) {
+									break;
+								}
+							}
+						} catch (Exception e) {
+							sink.error(e);
+							return;
+						}
+
+						if (batchSize > 0) {
+							outBuf.setIntLE(0, batchSize);
+							sink.next(new SerializedKVBatch.SerializedKVBatchRef(outBuf.copyOfRange(0, currentSerializedBatchBytes)));
+						} else {
+							try {
+								it.status();
+							} catch (org.rocksdb.RocksDBException e) {
+								sink.error(e);
+								return;
+							}
+							sink.complete();
+						}
+					}
+
+					@Override
+					public synchronized void close() {
+						if (!closed) {
+							closed = true;
+							if (it != null) it.close();
+							if (readOptions != null) readOptions.close();
+							if (reader != null) reader.close();
+							if (options != null) options.close();
+						}
+					}
+				}
+
+				return Flux.<SerializedKVBatch, ScanState>generate(
+						ScanState::new,
+						(state, sink) -> {
+							state.generateNext(sink);
+							return state;
+						},
+						ScanState::close
+				);
+			};
+
+			var ssts = Flux.fromIterable(files)
+					.filter(f -> new String(f.columnFamilyName(), StandardCharsets.UTF_8).equals(cfName))
+					.filter(f -> f.fileName().endsWith(".sst"));
+
+
+			Flux<SerializedKVBatch> exec;
+			if (shardCount == 1) {
+				exec = ssts
+						.parallel(4, 1)
+						.runOn(getScheduler().read(), 1)
+						.flatMap(mapper, false, 8, 1)
+						.sequential();
+			} else {
+				exec = ssts
+						.filter(m -> m.fileName().hashCode() % shardCount == shardIndex % shardCount)
+						.concatMap(mapper, 2);
+			}
+			return exec;
+		})
+				.doFirst(ops::beginOp)
+				.doFinally(s -> ops.endOp())
+				.subscribeOn(scheduler.read());
+	}
+
+	public Stream<SerializedKVBatch> scanRaw(long columnId, int shardIndex, int shardCount) {
+		return scanRawAsyncInternal(columnId, shardIndex, shardCount).toStream();
 	}
 
 	@Override

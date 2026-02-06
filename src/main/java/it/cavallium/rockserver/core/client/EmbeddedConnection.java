@@ -109,12 +109,23 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
         return (RA) switch (req) {
             case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
             case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
+            case RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw scanRaw -> this.scanRawAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount());
             case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
             case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> CompletableFuture.supplyAsync(() -> req.handleSync(this),
                     (req.isReadOnly() ? db.getScheduler().readExecutor() : db.getScheduler().writeExecutor()));
             case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
         };
     }
+
+	@Override
+	public Flux<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
+		return db.scanRawAsyncInternal(columnId, shardIndex, shardCount);
+	}
+
+	@Override
+	public Stream<SerializedKVBatch> scanRaw(long columnId, int shardIndex, int shardCount) {
+		return db.scanRaw(columnId, shardIndex, shardCount);
+	}
 
 	@Override
 	public <T> T put(long transactionOrUpdateId,

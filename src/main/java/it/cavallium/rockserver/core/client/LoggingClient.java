@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.client;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import java.io.IOException;
 import java.net.URI;
 import java.util.concurrent.CompletableFuture;
@@ -109,6 +110,11 @@ public class LoggingClient implements RocksDBConnection {
                             });
 				};
 			}
+		}
+
+		@Override
+		public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
+			return requestAsync(new RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw(columnId, shardIndex, shardCount));
 		}
 	}
 }

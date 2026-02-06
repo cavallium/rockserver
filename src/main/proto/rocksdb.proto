@@ -153,6 +153,41 @@ message GetRangeRequest {int64 transactionId = 1; int64 columnId = 2; repeated b
 message FirstAndLast {optional KV first = 1; optional KV last = 2;}
 message EntriesCount {int64 count = 1;}
 
+
+message ScanRawRequest {int64 columnId = 1; int32 shardIndex = 2; int32 shardCount = 3;}
+/*
+
++---------------------------------------------------------------+
+|                        Batch Structure                        |
++---------------------------------------------------------------+
+| KV Count (4 bytes, Little Endian)                             |
++---------------------------------------------------------------+
+|                                                               |
+|  +---------------------------------------------------------+  |
+|  |                   KV Entry (Repeated)                   |  |
+|  +---------------------------------------------------------+  |
+|  | Keys Count (1 byte)                                     |  |
+|  +---------------------------------------------------------+  |
+|  |                                                         |  |
+|  |  +---------------------------------------------------+  |  |
+|  |  |                  Key (Repeated)                   |  |  |
+|  |  +---------------------------------------------------+  |  |
+|  |  | Key Length (4 bytes, Little Endian)               |  |  |
+|  |  +---------------------------------------------------+  |  |
+|  |  | Key Bytes (Variable Length)                       |  |  |
+|  |  +---------------------------------------------------+  |  |
+|  |                                                         |  |
+|  +---------------------------------------------------------+  |
+|  | Value Size (4 bytes, Little Endian)                     |  |
+|  +---------------------------------------------------------+  |
+|  | Value Bytes (Variable Length)                           |  |
+|  +---------------------------------------------------------+  |
+|                                                               |
++---------------------------------------------------------------+
+
+*/
+message ScanRawResponse {bytes serialized = 1;}
+
 message CompactRequest {}
 
 message FlushRequest {}
@@ -196,6 +231,7 @@ service RocksDBService {
   rpc reduceRangeFirstAndLast(GetRangeRequest) returns (FirstAndLast);
   rpc reduceRangeEntriesCount(GetRangeRequest) returns (EntriesCount);
   rpc getAllInRange(GetRangeRequest) returns (stream KV);
+  rpc scanRaw(ScanRawRequest) returns (stream ScanRawResponse);
   rpc flush(FlushRequest) returns (google.protobuf.Empty);
   rpc compact(CompactRequest) returns (google.protobuf.Empty);
   rpc getAllColumnDefinitions(GetAllColumnDefinitionsRequest) returns (GetAllColumnDefinitionsResponse);

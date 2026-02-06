@@ -30,6 +30,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.UploadMergeOperator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.util.List;
 import java.util.Map;
@@ -208,6 +209,11 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 								   @NotNull RequestType.RequestGetRange<? super KV, T> requestType,
 								   long timeoutMs) throws RocksDBException {
 		return requestSync(new GetRange<>(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
+	}
+
+	/** See: {@link ScanRaw}. */
+	default Stream<SerializedKVBatch> scanRaw(long columnId, int shardIndex, int shardCount) {
+		return requestSync(new ScanRaw(columnId, shardIndex, shardCount));
 	}
 
 	/** See: {@link Flush}. */

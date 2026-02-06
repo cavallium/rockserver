@@ -130,6 +130,97 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 		return finalKeys;
 	}
 
+	private static void ensureCapacity(Buf buf, int offset, int len) {
+		int required = offset + len;
+		if (buf.size() < required) {
+			int newSize = buf.size() + (buf.size() >> 1);
+			if (newSize < required) {
+				newSize = required;
+			}
+			buf.size(newSize);
+		}
+	}
+
+	/**
+	 * @param bucketValue pass this parameter only if the columnInstance has variable-length keys
+	 * @return written bytes count
+	 */
+	public int transcodeBatchKeys(Buf calculatedKey, @Nullable Buf bucketValue, int outputOffset, Buf output) {
+		validateFinalKeySize(calculatedKey);
+		int initialOutputOffset = outputOffset;
+		if (calculatedKey.isEmpty()) {
+			ensureCapacity(output, outputOffset, Byte.BYTES);
+			output.setByte(outputOffset, (byte) 0);
+			outputOffset += Byte.BYTES;
+		} else if (!hasBuckets()) {
+			ensureCapacity(output, outputOffset, Byte.BYTES);
+			output.setByte(outputOffset, (byte) schema.keysCount());
+			outputOffset += Byte.BYTES;
+
+			if (schema.keysCount() == 1) {
+				var keySize = calculatedKey.size();
+				ensureCapacity(output, outputOffset, Integer.BYTES + keySize);
+				output.setIntLE(outputOffset, keySize);
+				output.setBytesFromBuf(outputOffset + Integer.BYTES, calculatedKey, 0, keySize);
+				outputOffset += Integer.BYTES + keySize;
+			} else {
+				int calculatedKeyOffset = 0;
+				for (int i = 0; i < schema.keysCount(); i++) {
+					var keySize = schema.key(i);
+					ensureCapacity(output, outputOffset, Integer.BYTES + keySize);
+					output.setIntLE(outputOffset, keySize);
+					output.setBytesFromBuf(outputOffset + Integer.BYTES, calculatedKey, calculatedKeyOffset, keySize);
+					outputOffset += Integer.BYTES + keySize;
+					calculatedKeyOffset += keySize;
+				}
+			}
+		} else {
+			if (bucketValue == null) {
+				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "bucketValue is required for transcoding bucketed keys");
+			}
+			ensureCapacity(output, outputOffset, Byte.BYTES);
+			output.setByte(outputOffset, (byte) schema.keysCount());
+			outputOffset += Byte.BYTES;
+
+			int calculatedKeyOffset = 0;
+			int bucketValueOffset = 0;
+
+			int firstVariableKeyIndex = schema.keysCount() - schema.variableLengthKeysCount();
+
+			// 1. Transcode Fixed Keys (from calculatedKey)
+			for (int i = 0; i < firstVariableKeyIndex; i++) {
+				int keySize = schema.key(i);
+				ensureCapacity(output, outputOffset, Integer.BYTES + keySize);
+				output.setIntLE(outputOffset, keySize);
+				output.setBytesFromBuf(outputOffset + Integer.BYTES, calculatedKey, calculatedKeyOffset, keySize);
+				outputOffset += Integer.BYTES + keySize;
+				calculatedKeyOffset += keySize;
+			}
+
+			// 2. Transcode Variable Keys (from bucketValue)
+			for (int i = firstVariableKeyIndex; i < schema.keysCount(); i++) {
+				// Read size (2 bytes - char)
+				if (bucketValueOffset + Character.BYTES > bucketValue.size()) {
+					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key length at index " + i);
+				}
+				char keyLengthChar = bucketValue.getChar(bucketValueOffset);
+				int keyLength = (int) keyLengthChar;
+				bucketValueOffset += Character.BYTES;
+
+				// Read bytes
+				if (bucketValueOffset + keyLength > bucketValue.size()) {
+					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
+				}
+				ensureCapacity(output, outputOffset, Integer.BYTES + keyLength);
+				output.setIntLE(outputOffset, keyLength);
+				output.setBytesFromBuf(outputOffset + Integer.BYTES, bucketValue, bucketValueOffset, keyLength);
+				outputOffset += Integer.BYTES + keyLength;
+				bucketValueOffset += keyLength;
+			}
+		}
+		return outputOffset - initialOutputOffset;
+	}
+
 	public void decodeFixedKeys(Buf calculatedKey, Buf[] finalKeys, int firstVariableKeyIndex) {
 		int calculatedKeyOffset = 0;
 		for (int i = 0; i < firstVariableKeyIndex; i++) {
