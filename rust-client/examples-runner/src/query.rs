@@ -7,12 +7,17 @@ pub enum Query {
     Text(String),
     ChatId(i64),
     SenderId(i64),
+    CheckKeyMatchesValue,
 }
 
 pub struct MessageContext<'a> {
     pub text: Vec<&'a str>,
     pub chat_id: Option<i64>,
     pub sender_id: Option<i64>,
+    pub key_chat_id: Option<i64>,
+    pub key_message_id: Option<i64>,
+    pub val_chat_id: Option<i64>,
+    pub val_message_id: Option<i64>,
 }
 
 impl Query {
@@ -42,6 +47,13 @@ impl Query {
             }
             Query::SenderId(id) => {
                 ctx.sender_id == Some(*id)
+            }
+            Query::CheckKeyMatchesValue => {
+                if let (Some(k_cid), Some(k_mid), Some(v_cid), Some(v_mid)) = (ctx.key_chat_id, ctx.key_message_id, ctx.val_chat_id, ctx.val_message_id) {
+                    k_cid != v_cid || k_mid != v_mid
+                } else {
+                    false
+                }
             }
         }
     }
@@ -252,6 +264,9 @@ impl Parser {
                     "sender" | "sender_id" | "user" | "userid" => {
                         let id = val.parse::<i64>().map_err(|_| format!("Invalid sender id: {}", val))?;
                         Ok(Query::SenderId(id))
+                    },
+                    "check_integrity" | "corrupt" => {
+                        Ok(Query::CheckKeyMatchesValue)
                     },
                     _ => Err(format!("Unknown key: {}", key)),
                 }

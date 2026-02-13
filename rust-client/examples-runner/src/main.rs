@@ -20,6 +20,7 @@ pub mod records {
 use records::v0_0_13::*;
 mod query;
 use query::{Query, MessageContext, parse_query};
+use serde_json::json;
 
 fn get_chat_entity_id_value(id: &ChatEntityId) -> i64 {
     match id {
@@ -78,11 +79,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Streaming messages...");
     let total_count = Arc::new(AtomicU64::new(0));
     let error_count = Arc::new(AtomicU64::new(0));
+    let match_count = Arc::new(AtomicU64::new(0));
     let start_time = Instant::now();
 
     // Logger task
     let total_count_log = total_count.clone();
     let error_count_log = error_count.clone();
+    let match_count_log = match_count.clone();
     let approx_total_count_log = approx_total_count;
     
     tokio::spawn(async move {
@@ -94,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(log_interval).await;
             let current_total = total_count_log.load(Ordering::Relaxed);
             let current_errors = error_count_log.load(Ordering::Relaxed);
+            let current_matches = match_count_log.load(Ordering::Relaxed);
             let elapsed = start_time.elapsed();
             let interval_elapsed = last_log_time.elapsed();
             let interval_count = current_total - last_log_count;
@@ -116,8 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log_msg.push_str(&format!(" ETA: {}.", format_duration(eta_seconds)));
             }
 
-            log_msg.push_str(&format!(" Current Speed: {:.2} msg/s. Total Speed: {:.2} msg/s. Errors: {}", 
-                current_speed, total_speed, current_errors));
+            let match_percent = if current_total > 0 { (current_matches as f64 / current_total as f64) * 100.0 } else { 0.0 };
+            log_msg.push_str(&format!(" Current Speed: {:.2} msg/s. Total Speed: {:.2} msg/s. Errors: {}. Matches: {} ({:.3}%)", 
+                current_speed, total_speed, current_errors, current_matches, match_percent));
 
             println!("{}", log_msg);
             last_log_time = Instant::now();
@@ -183,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let column_id = column_id;
         let total_count = total_count.clone();
         let error_count = error_count.clone();
+        let match_count = match_count.clone();
         let errors_only = errors_only;
         let search_query = search_query.clone();
         let match_tx = match_tx.clone();
@@ -193,6 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stream.for_each_concurrent(Some(shard_parallelism), |batch_res| {
                         let total_count = total_count.clone();
                         let error_count = error_count.clone();
+                        let match_count = match_count.clone();
                         let search_query = search_query.clone();
                         let match_tx = match_tx.clone();
                         async move {
@@ -201,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     tokio::task::spawn_blocking(move || {
                                         let mut batch_count = 0;
                                         let mut batch_errors = 0;
+                                        let mut batch_matches = 0;
                                         for kv in batch.entries {
                                             batch_count += 1;
                                             
@@ -263,6 +271,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             
                                             if has_error {
                                                 batch_errors += 1;
+                                                if let Err(e) = &chat_entity_id_res {
+                                                    if !is_missing_key0 {
+                                                        eprintln!("Error decoding Key0: {}", e);
+                                                    }
+                                                }
+                                                if let Err(e) = &message_res {
+                                                    if !is_empty_val {
+                                                        eprintln!("Error decoding Value: {}", e);
+                                                    }
+                                                }
                                             }
 
                                             if !errors_only || has_error {
@@ -270,12 +288,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let mut text_parts: Vec<&str> = Vec::new();
                                                 let mut sender_id_val: Option<i64> = None;
                                                 let mut chat_id_val: Option<i64> = None;
+                                                let mut key_chat_id: Option<i64> = None;
+                                                let mut key_message_id: Option<i64> = None;
+                                                let mut val_chat_id: Option<i64> = None;
+                                                let mut val_message_id: Option<i64> = None;
 
                                                 if let Ok(id) = &chat_entity_id_res {
-                                                    chat_id_val = Some(get_chat_entity_id_value(id));
+                                                    let cid = get_chat_entity_id_value(id);
+                                                    chat_id_val = Some(cid);
+                                                    key_chat_id = Some(cid);
+                                                }
+                                                
+                                                if let Ok(id) = &message_id_res {
+                                                    key_message_id = Some(*id as i64);
                                                 }
                                                 
                                                 if let Ok(msg) = &message_res {
+                                                    val_chat_id = Some(get_chat_entity_id_value(&msg.chat_entity_id));
+                                                    val_message_id = Some(msg.id);
                                                     sender_id_val = Some(get_chat_entity_id_value(&msg.sender_id));
                                                     
                                                     match &msg.content {
@@ -367,62 +397,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     text: text_parts,
                                                     chat_id: chat_id_val,
                                                     sender_id: sender_id_val,
+                                                    key_chat_id,
+                                                    key_message_id,
+                                                    val_chat_id,
+                                                    val_message_id,
                                                 };
                                                 
                                                 matched = search_query.matches(&ctx);
                                                 
                                                 if matched {
-                                                    let cid_str = match &chat_entity_id_res {
-                                                        Ok(id) => format!("{:?}", id),
-                                                        Err(e) => format!("DecodeError({:?})", e),
-                                                    };
-                                                    let mid_str = match &message_id_res {
-                                                        Ok(id) => format!("{}", id),
-                                                        Err(e) => {
-                                                             if e.to_string().starts_with("InvalidLen") {
-                                                                 e.to_string()
-                                                             } else if e.to_string() == "Missing" {
-                                                                 "Missing".to_string()
-                                                             } else {
-                                                                 format!("DecodeError({:?})", e)
-                                                             }
-                                                        }
-                                                    };
-                                                    
-                                                    let content_str = if let Ok(msg) = &message_res {
-                                                        match &msg.content {
-                                                            MessageContent::MessageText(t) => {
-                                                                 format!("Text: {:?} (Ver {})", t.text.text, version)
-                                                            },
-                                                            MessageContent::MessageEmpty(_) => format!("Empty (Ver {})", version),
-                                                            _ => format!("{:?} (Ver {})", msg.content, version),
-                                                        }
-                                                    } else {
-                                                         let e_str = message_res.as_ref().unwrap_err().to_string();
-                                                         if e_str == "EmptyStream" || e_str == "EmptyValue" {
-                                                             e_str
-                                                         } else {
-                                                             format!("DecodeError: {} (Ver {})", e_str, version)
-                                                         }
-                                                    };
-                                                    
-                                                    let sender_str = if let Some(sid) = sender_id_val {
-                                                        format!("{}", sid)
-                                                    } else {
-                                                        "Unknown".to_string()
-                                                    };
-                                                    
-                                                    let log_line = format!("Chat: {}, Sender: {}, MsgID: {} -> Content: {}", cid_str, sender_str, mid_str, content_str);
-                                                    println!("{}", log_line);
-                                                    
+                                                    batch_matches += 1;
+
                                                     if let Some(tx) = &match_tx {
+                                                        let value_obj = message_res.as_ref().ok();
+
+                                                        let json_output = json!({
+                                                            "key": {
+                                                                "chatId": key_chat_id,
+                                                                "messageId": key_message_id
+                                                            },
+                                                            "value": value_obj,
+                                                            "serializedVersion": version
+                                                        });
+                                                        
+                                                        let log_line = serde_json::to_string(&json_output).unwrap();
                                                         let _ = tx.send(log_line);
+                                                    } else {
+                                                        println!("Match found | ChatId: {} | MessageId: {} | Text: {:?}", 
+                                                            key_chat_id.unwrap_or(0), 
+                                                            key_message_id.unwrap_or(0), 
+                                                            ctx.text
+                                                        );
                                                     }
                                                 }
                                             }
                                         }
                                         total_count.fetch_add(batch_count, Ordering::Relaxed);
                                         error_count.fetch_add(batch_errors, Ordering::Relaxed);
+                                        match_count.fetch_add(batch_matches, Ordering::Relaxed);
                                     }).await.unwrap();
                                 }
                                 Err(e) => {
@@ -443,6 +455,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for h in handles {
         let _ = h.await;
     }
+
+    println!("Computation finished successfully.");
 
     Ok(())
 }
