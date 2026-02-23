@@ -61,7 +61,7 @@ database: {
 
     @AfterEach
     void tearDown() throws Exception {
-        if (db != null) db.close();
+        if (db != null) db.closeTesting();
         if (configFile != null) Files.deleteIfExists(configFile);
     }
 
@@ -122,7 +122,7 @@ database: {
         assertEquals(0, internal.getOpenIteratorsCount(), "Open iterators must be zero after randomized run");
 
         // Explicitly close DB
-        try { db.close(); db = null; } catch (Exception e) { e.printStackTrace(); }
+        try { db.closeTesting(); db = null; } catch (Exception e) { e.printStackTrace(); }
 
         // Wait for background threads to die
         long deadline = System.currentTimeMillis() + 5000;

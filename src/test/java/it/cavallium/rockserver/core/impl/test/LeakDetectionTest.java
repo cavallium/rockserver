@@ -54,7 +54,7 @@ database: {
 
     @AfterEach
     void tearDown() throws Exception {
-        if (db != null) db.close();
+        if (db != null) db.closeTesting();
         if (configFile != null) Files.deleteIfExists(configFile);
     }
 

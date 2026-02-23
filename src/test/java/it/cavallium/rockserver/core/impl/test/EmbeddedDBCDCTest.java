@@ -38,7 +38,7 @@ public class EmbeddedDBCDCTest {
     @AfterEach
     public void tearDown() throws IOException {
         if (db != null) {
-            db.close();
+            db.closeTesting();
         }
     }
 

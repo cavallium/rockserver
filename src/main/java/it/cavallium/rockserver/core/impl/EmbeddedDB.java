@@ -657,8 +657,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	@VisibleForTesting
+	public void closeTesting() throws IOException {
+		closeInternal(true);
+	}
+
 	@Override
 	public void close() throws IOException {
+		closeInternal(false);
+	}
+
+	private void closeInternal(boolean testing) throws IOException {
 		// Wait for 10 seconds
 		try {
 			logger.info("Closing... waiting for ops");
@@ -678,6 +687,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			forceCloseLeakedResources();
 			// After forcing close of leaked resources, proceed to close DB/native resources defensively
 			closeResources(true);
+
+			if (testing && ops.getPendingOpsCount() > 0) {
+				throw new IllegalStateException("Some operations lasted more than 10 seconds! pendingOps=" + ops.getPendingOpsCount() + ", openTxs=" + txs.size() + ", openIterators=" + its.size());
+			}
 		} finally {
 			// Ensure scheduler and leak-scheduler are always torn down
 			logger.info("Shutting down schedulers");
@@ -1132,7 +1145,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						throw ex;
 					}
 				}
-				if (!succeeded) {
+ 			if (!succeeded) {
 					// Do not call endOp here, since the transaction is still open
 					return false;
 				}
@@ -2440,7 +2453,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					} else {
 						committedOwnedTx = true;
 					}
-				} while (!committedOwnedTx);
+ 			} while (!committedOwnedTx);
 			} finally {
 				if (owningNewTx) {
 					this.closeTransactionInternal((Tx) newTx, false);
@@ -2701,11 +2714,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var col = getColumn(columnId);
 			RocksIterator it;
 			var ro = newReadOptions("open-iterator-read-options");
-			if (transactionId > 0L) {
-				//noinspection resource
-				it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
-			} else {
-				it = db.get().newIterator(col.cfh(), ro);
+			try {
+				if (transactionId > 0L) {
+					//noinspection resource
+					it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+				} else {
+					it = db.get().newIterator(col.cfh(), ro);
+				}
+			} catch (Throwable ex) {
+				ro.close();
+				throw ex;
 			}
 			var itEntry = new REntry<>(it, expirationTimestamp, new RocksDBObjects(ro));
 			try {

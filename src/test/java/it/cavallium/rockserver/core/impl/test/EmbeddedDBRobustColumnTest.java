@@ -45,7 +45,7 @@ public class EmbeddedDBRobustColumnTest {
     @AfterEach
     public void tearDown() throws IOException {
         if (db != null) {
-            db.close();
+            db.closeTesting();
         }
     }
 
@@ -152,7 +152,7 @@ public class EmbeddedDBRobustColumnTest {
         ColumnSchema schema = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
         
         long idOrig = db.createColumn(colName, schema);
-        db.close();
+        db.closeTesting();
         db = null;
 
         // Reopen
@@ -164,7 +164,7 @@ public class EmbeddedDBRobustColumnTest {
     
     @Test
     public void testManualColumnDetection() throws Exception {
-        db.close();
+        db.closeTesting();
         db = null;
         
         // Open raw and add a CF

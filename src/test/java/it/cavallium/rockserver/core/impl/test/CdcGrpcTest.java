@@ -70,7 +70,7 @@ public class CdcGrpcTest {
                 e.printStackTrace();
             }
         }
-        if (embeddedConnection != null) embeddedConnection.close();
+        if (embeddedConnection != null) embeddedConnection.closeTesting();
     }
 
     @AfterEach

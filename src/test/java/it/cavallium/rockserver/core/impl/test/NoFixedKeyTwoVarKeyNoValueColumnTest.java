@@ -43,7 +43,7 @@ class NoFixedKeyTwoVarKeyNoValueColumnTest {
 
 	@AfterEach
 	void tearDown() throws IOException {
-		if (db != null) db.close();
+		if (db != null) db.closeTesting();
 	}
 
 	@Test
@@ -64,7 +64,7 @@ class NoFixedKeyTwoVarKeyNoValueColumnTest {
 		assertTrue(colId > 0);
 
 		// Close and reopen
-		db.close();
+		db.closeTesting();
 		db = new EmbeddedDB(tempDir, "test-db", null);
 
 		// Column should be loadable and re-creatable with same schema
@@ -81,7 +81,7 @@ class NoFixedKeyTwoVarKeyNoValueColumnTest {
 		assertTrue(colId1 > 0);
 
 		// Close and reopen
-		db.close();
+		db.closeTesting();
 		db = new EmbeddedDB(tempDir, "test-db", null);
 
 		// Loaded column should still work
@@ -94,7 +94,7 @@ class NoFixedKeyTwoVarKeyNoValueColumnTest {
 		assertNotEquals(colId1, colId2);
 
 		// Close and reopen again
-		db.close();
+		db.closeTesting();
 		db = new EmbeddedDB(tempDir, "test-db", null);
 
 		// Both columns should be loadable
@@ -165,7 +165,7 @@ class NoFixedKeyTwoVarKeyNoValueColumnTest {
 		db.put(0, colId, new Keys(new Buf[]{varKey1, varKey2}), Buf.create(0), new RequestType.RequestNothing<>());
 
 		// Close and reopen
-		db.close();
+		db.closeTesting();
 		db = new EmbeddedDB(tempDir, "test-db", null);
 
 		long colId2 = db.createColumn("file_locations_3", schema);

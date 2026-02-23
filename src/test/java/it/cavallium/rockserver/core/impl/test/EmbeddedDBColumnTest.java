@@ -22,7 +22,7 @@ public class EmbeddedDBColumnTest {
     @AfterEach
     public void tearDown() throws IOException {
         if (db != null) {
-            db.close();
+            db.closeTesting();
         }
     }
 

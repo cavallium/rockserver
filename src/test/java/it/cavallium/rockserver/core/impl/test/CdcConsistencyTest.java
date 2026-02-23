@@ -46,7 +46,7 @@ class CdcConsistencyTest {
     @AfterEach
     void tearDown() throws IOException {
         if (db != null) {
-            db.close();
+            db.closeTesting();
         }
     }
 

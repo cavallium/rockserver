@@ -22,6 +22,7 @@ import java.util.stream.Stream;
 
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.VisibleForTesting;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -34,6 +35,12 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
 		super(name);
 		this.db = new EmbeddedDB(path, name, embeddedConfig);
+	}
+
+	@VisibleForTesting
+	public void closeTesting() throws IOException {
+		db.closeTesting();
+		super.close();
 	}
 
 	@Override

@@ -38,7 +38,7 @@ public class EmbeddedDBDeleteTest {
     @AfterEach
     public void tearDown() throws IOException {
         if (db != null) {
-            db.close();
+            db.closeTesting();
         }
         if (tempDir != null) {
             Utils.deleteDirectory(tempDir.toAbsolutePath().toString());

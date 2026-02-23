@@ -68,7 +68,7 @@ public class TestDB implements AutoCloseable {
 			};
 		} catch (IOException e) {
 			try {
-				this.db.close();
+				this.db.closeTesting();
 			} catch (IOException ex) {
 			}
 			throw new RuntimeException(e);

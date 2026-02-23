@@ -93,7 +93,7 @@ public class TestSSTWriter {
 
     @AfterEach
     public void tearDown() throws IOException {
-        db.close();
+        db.closeTesting();
         Files.walkFileTree(tempSstPath, new SimpleFileVisitor<Path>() {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {

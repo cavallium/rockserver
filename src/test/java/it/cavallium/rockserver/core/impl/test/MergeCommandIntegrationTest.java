@@ -57,7 +57,7 @@ database: {
 	@AfterEach
 	void tearDown() throws Exception {
 		if (embedded != null) {
-			embedded.close();
+			embedded.closeTesting();
 		}
 		if (configFile != null) {
 			Files.deleteIfExists(configFile);

@@ -36,7 +36,7 @@ public class HotSwapMergeOperatorTest {
 
     @AfterEach
     void tearDown() throws IOException {
-        if (db != null) db.close();
+        if (db != null) db.closeTesting();
     }
 
     public static class OperatorA extends FFMByteArrayMergeOperator {

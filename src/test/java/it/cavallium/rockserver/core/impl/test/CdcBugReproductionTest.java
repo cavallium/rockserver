@@ -58,7 +58,7 @@ class CdcBugReproductionTest {
     @AfterEach
     void tearDown() throws IOException {
         if (db != null) {
-            db.close();
+            db.closeTesting();
         }
     }
 
@@ -190,7 +190,7 @@ class CdcBugReproductionTest {
         // Close DB while poller is active
         // If the fix is working, this will wait for the active poll to finish (due to ops.closeAndWait)
         // or throw a managed exception in the poller, but NOT crash the JVM.
-        db.close();
+        db.closeTesting();
         db = null; // prevent tearDown from closing again
 
         running.set(false);
@@ -616,7 +616,7 @@ class CdcBugReproductionTest {
         db.cdcCommit(subId, lastSeq);
 
         // 3. Close and Reopen DB to simulate restart
-        db.close();
+        db.closeTesting();
         db = new EmbeddedDB(tempDir, "test-db", null);
 
         // Note: Column ID might change on restart if not strictly controlled,
