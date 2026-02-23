@@ -232,6 +232,65 @@ public class MetricsManager implements AutoCloseable {
             // best-effort; this is only to trigger classloading
             LOG.debug("Failed to preload classes", t);
         }
+        // Preload rainbowgum logging classes so that replacing the JAR at runtime
+        // does not cause ClassNotFoundException for lazily-loaded internal classes
+        // (e.g. io.jstach.rainbowgum.Internal$StringBuilderWriter)
+        preloadPackageClasses(
+            "io.jstach.rainbowgum",
+            "it.cavallium.rockserver",
+            "it.cavallium.buffer",
+            "io.vertx",
+            "io.micrometer",
+            "org.rocksdb",
+            "reactor",
+            "org.cliffc.high_scale_lib",
+            "it.unimi.dsi",
+            "org.reactivestreams",
+            "io.github.mweirauch",
+            "com.google.common",
+            "org.github.gestalt"
+        );
+    }
+
+    private void preloadPackageClasses(String... packagePrefixes) {
+        for (String prefix : packagePrefixes) {
+            String resourcePath = prefix.replace('.', '/');
+            try {
+                var cl = Thread.currentThread().getContextClassLoader();
+                if (cl == null) cl = MetricsManager.class.getClassLoader();
+                var resources = cl.getResources(resourcePath);
+                while (resources.hasMoreElements()) {
+                    var url = resources.nextElement();
+                    if ("jar".equals(url.getProtocol())) {
+                        var jarPath = url.getPath();
+                        int sep = jarPath.indexOf('!');
+                        if (sep != -1) {
+                            jarPath = jarPath.substring(0, sep);
+                        }
+                        if (jarPath.startsWith("file:")) {
+                            jarPath = jarPath.substring(5);
+                        }
+                        try (var jarFile = new java.util.jar.JarFile(jarPath)) {
+                            var entries = jarFile.entries();
+                            while (entries.hasMoreElements()) {
+                                var entry = entries.nextElement();
+                                var name = entry.getName();
+                                if (name.startsWith(resourcePath + "/") && name.endsWith(".class")) {
+                                    var className = name.replace('/', '.').substring(0, name.length() - 6);
+                                    try {
+                                        Class.forName(className, true, cl);
+                                    } catch (Throwable ignored) {
+                                        // some classes may fail to initialize; that's fine
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                LOG.debug("Failed to preload classes for package {}", prefix, t);
+            }
+        }
     }
 
 	private long getStartTime() {
