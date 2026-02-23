@@ -7,7 +7,16 @@ import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.UnsafeByteOperations;
+import io.grpc.CallOptions;
+import io.grpc.Channel;
+import io.grpc.ClientCall;
+import io.grpc.ClientInterceptor;
+import io.grpc.ForwardingClientCall;
+import io.grpc.ForwardingClientCallListener;
 import io.grpc.ManagedChannel;
+import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
+import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
@@ -125,6 +134,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 					.eventLoopGroup(new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2))
 					.channelType(NioSocketChannel.class);
 		}
+		channelBuilder.intercept(new RetryLoggingInterceptor());
 		this.channel = channelBuilder.build();
 		this.asyncStub = RocksDBServiceGrpc.newStub(channel);
 		this.futureStub = RocksDBServiceGrpc.newFutureStub(channel);
@@ -886,6 +896,33 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}, DIRECT_EXECUTOR);
 
 		return cf;
+	}
+
+	private static final java.util.Set<Code> RETRYABLE_STATUS_CODES = java.util.Set.of(
+			Code.UNAVAILABLE, Code.RESOURCE_EXHAUSTED, Code.ABORTED
+	);
+
+	private static class RetryLoggingInterceptor implements ClientInterceptor {
+		@Override
+		public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+				MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+			return new ForwardingClientCall.SimpleForwardingClientCall<>(next.newCall(method, callOptions)) {
+				@Override
+				public void start(ClientCall.Listener<RespT> responseListener, Metadata headers) {
+					var loggingListener = new ForwardingClientCallListener.SimpleForwardingClientCallListener<>(responseListener) {
+						@Override
+						public void onClose(Status status, Metadata trailers) {
+							if (!status.isOk() && RETRYABLE_STATUS_CODES.contains(status.getCode())) {
+								LOG.warn("gRPC call to {} failed with retryable status {}: {}. Retry will be attempted automatically.",
+										method.getFullMethodName(), status.getCode(), status.getDescription());
+							}
+							super.onClose(status, trailers);
+						}
+					};
+					super.start(loggingListener, headers);
+				}
+			};
+		}
 	}
 
 	private static final String grpcRocksDbErrorPrefixString = "RocksDBError: [uid:";
