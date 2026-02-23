@@ -98,7 +98,24 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 		channelBuilder
 				.directExecutor()
-				.usePlaintext();
+				.usePlaintext()
+				.keepAliveTime(30, TimeUnit.SECONDS)
+				.keepAliveTimeout(5, TimeUnit.SECONDS)
+				.keepAliveWithoutCalls(true)
+				.enableRetry()
+				.maxRetryAttempts(Integer.MAX_VALUE)
+				.defaultServiceConfig(Map.of(
+						"methodConfig", List.of(Map.of(
+								"name", List.of(Map.of()),
+								"retryPolicy", Map.of(
+										"maxAttempts", 1000000000.0,
+										"initialBackoff", "0.5s",
+										"maxBackoff", "30s",
+										"backoffMultiplier", 2.0,
+										"retryableStatusCodes", List.of("UNAVAILABLE", "RESOURCE_EXHAUSTED", "ABORTED")
+								)
+						))
+				));
 		if (socketAddress instanceof DomainSocketAddress _) {
 			channelBuilder
 					.eventLoopGroup(new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2))
