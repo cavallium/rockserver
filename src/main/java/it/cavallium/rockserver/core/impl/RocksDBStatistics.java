@@ -7,15 +7,16 @@ import io.micrometer.core.instrument.MultiGauge.Row;
 import io.micrometer.core.instrument.Tags;
 import java.math.BigInteger;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode;
 import java.util.function.BiFunction;
 import java.util.function.Function;
-import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -36,6 +37,7 @@ public class RocksDBStatistics {
 	private final EnumMap<TickerType, Counter> tickerMap;
 	private final EnumMap<HistogramType, MultiGauge> histogramMap;
 	private final EnumMap<RocksDBLongProperty, Gauge> longPropertyMap;
+	private final EnumMap<RocksDBLongProperty, MultiGauge> perCfLongPropertyMap;
 	private final Thread executor;
 	private final MultiGauge cacheStats;
 
@@ -45,7 +47,8 @@ public class RocksDBStatistics {
 			Statistics statistics,
 			MetricsManager metrics,
 			@Nullable Cache cache,
-			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter) {
+			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter,
+			Function<String, Map<String, Long>> perCfLongPropertyGetter) {
 		this.statistics = statistics;
 		this.metrics = metrics;
 		this.tickerMap = new EnumMap<>(Arrays
@@ -66,11 +69,24 @@ public class RocksDBStatistics {
 								.tag("histogram_name", histogramType.name())
 								.register(metrics.getRegistry())
 				)));
+		// Register non-PER_CF properties as single gauges (DB_WIDE, SINGLE_CF)
 		this.longPropertyMap = new EnumMap<>(Arrays
 				.stream(RocksDBLongProperty.values())
+				.filter(p -> p.getAggregationMode() != AggregationMode.PER_CF)
 				.collect(Collectors.toMap(Function.identity(),
 						longProperty -> Gauge
 								.builder("rocksdb.property.long", () -> longPropertyGetter.apply(longProperty.getName(), longProperty.getAggregationMode()))
+								.tag("database", name)
+								.tag("property_name", longProperty.getName())
+								.register(metrics.getRegistry())
+				)));
+		// Register PER_CF properties as MultiGauges with column_family tag
+		this.perCfLongPropertyMap = new EnumMap<>(Arrays
+				.stream(RocksDBLongProperty.values())
+				.filter(p -> p.getAggregationMode() == AggregationMode.PER_CF)
+				.collect(Collectors.toMap(Function.identity(),
+						longProperty -> MultiGauge
+								.builder("rocksdb.property.long")
 								.tag("database", name)
 								.tag("property_name", longProperty.getName())
 								.register(metrics.getRegistry())
@@ -83,6 +99,8 @@ public class RocksDBStatistics {
 
 		EnumMap<HistogramType, HistogramData> histogramDataRef = new EnumMap<>(HistogramType.class);
 		AtomicReference<CacheStats> cacheStatsRef = new AtomicReference<>(cache != null ? getCacheStats(cache) : new CacheStats(0L, 0L));
+		// Per-CF property snapshots: property -> (column_name -> value)
+		ConcurrentHashMap<RocksDBLongProperty, Map<String, Long>> perCfSnapshots = new ConcurrentHashMap<>();
 
 		histogramMap.forEach((histogramType, multiGauge) -> {
 			// Pre populate all
@@ -124,6 +142,20 @@ public class RocksDBStatistics {
 
 					if (cache != null) {
 						cacheStatsRef.set(getCacheStats(cache));
+					}
+
+					// Update per-CF property snapshots and re-register MultiGauge rows
+					for (var entry : perCfLongPropertyMap.entrySet()) {
+						RocksDBLongProperty prop = entry.getKey();
+						MultiGauge multiGauge = entry.getValue();
+						Map<String, Long> snapshot = perCfLongPropertyGetter.apply(prop.getName());
+						perCfSnapshots.put(prop, snapshot);
+						List<Row<?>> rows = new ArrayList<>();
+						for (var cfEntry : snapshot.entrySet()) {
+							String colName = cfEntry.getKey();
+							rows.add(Row.of(Tags.of("column_family", colName), cfEntry::getValue));
+						}
+						multiGauge.register(rows, true);
 					}
 				} catch (Throwable ex) {
 					LOG.error("Fatal error during stats collection", ex);

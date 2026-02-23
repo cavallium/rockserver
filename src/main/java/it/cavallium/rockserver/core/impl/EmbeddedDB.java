@@ -284,7 +284,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.refs = loadedDb.refs();
 		this.cache = loadedDb.cache();
 		this.definitiveDbPath = loadedDb.definitiveDbPath();
-		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache, this::getLongProperty);
+		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache, this::getLongProperty, this::getPerCfLongProperty);
 		try {
 			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
 			int writeCap = Objects.requireNonNullElse(config.parallelism().write(),
@@ -1411,6 +1411,32 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				}
 			};
+		} finally {
+			ops.endOp();
+		}
+	}
+
+	/**
+	 * Return per-column-family long property values as a map from column name to value.
+	 * Only meaningful for PER_CF properties.
+	 */
+	private Map<String, Long> getPerCfLongProperty(String name) {
+		ops.beginOp();
+		try {
+			var result = new LinkedHashMap<String, Long>();
+			for (Entry<Long, ColumnInstance> entry : columns.entrySet()) {
+				ColumnInstance ci = entry.getValue();
+				try {
+					String colName = new String(ci.cfh().getName());
+					long value = db.get().getLongProperty(ci.cfh(), name);
+					result.merge(colName, value, Long::sum);
+				} catch (org.rocksdb.RocksDBException e) {
+					if (e.getStatus().getCode() != Code.NotFound) {
+						throw new RuntimeException(e);
+					}
+				}
+			}
+			return result;
 		} finally {
 			ops.endOp();
 		}
