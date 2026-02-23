@@ -12,6 +12,8 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
@@ -43,7 +45,7 @@ public class RocksDBStatistics {
 			Statistics statistics,
 			MetricsManager metrics,
 			@Nullable Cache cache,
-			Function<String, BigInteger> longPropertyAllColumnsGetter) {
+			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter) {
 		this.statistics = statistics;
 		this.metrics = metrics;
 		this.tickerMap = new EnumMap<>(Arrays
@@ -68,7 +70,7 @@ public class RocksDBStatistics {
 				.stream(RocksDBLongProperty.values())
 				.collect(Collectors.toMap(Function.identity(),
 						longProperty -> Gauge
-								.builder("rocksdb.property.long", () -> longPropertyAllColumnsGetter.apply(longProperty.getName()))
+								.builder("rocksdb.property.long", () -> longPropertyGetter.apply(longProperty.getName(), longProperty.getAggregationMode()))
 								.tag("database", name)
 								.tag("property_name", longProperty.getName())
 								.register(metrics.getRegistry())

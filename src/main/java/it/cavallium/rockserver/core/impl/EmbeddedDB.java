@@ -1357,25 +1357,60 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	/**
-	 * Return long property, aggregated for all columns
+	 * Return long property based on the aggregation mode:
+	 * - PER_CF: sum values across all column families
+	 * - DB_WIDE: query once without a CF handle
+	 * - SINGLE_CF: query once with any single CF handle (for shared-resource properties like block cache)
 	 */
-	private BigInteger getLongProperty(String name) {
+	private BigInteger getLongProperty(String name, RocksDBLongProperty.AggregationMode aggregationMode) {
 		ops.beginOp();
 		try {
-			var val = BigInteger.ZERO;
-			for (Entry<Long, ColumnInstance> entry : columns.entrySet()) {
-				ColumnInstance ci = entry.getValue();
-				try {
-					val = val.add(new BigInteger(Long.toUnsignedString(db.get().getLongProperty(ci.cfh(), name))));
-				} catch (org.rocksdb.RocksDBException e) {
-					if (e.getStatus().getCode() == Code.NotFound) {
-						val = val.add(BigInteger.ZERO);
-					} else {
-						throw new RuntimeException(e);
+			return switch (aggregationMode) {
+				case PER_CF -> {
+					var val = BigInteger.ZERO;
+					for (Entry<Long, ColumnInstance> entry : columns.entrySet()) {
+						ColumnInstance ci = entry.getValue();
+						try {
+							val = val.add(new BigInteger(Long.toUnsignedString(db.get().getLongProperty(ci.cfh(), name))));
+						} catch (org.rocksdb.RocksDBException e) {
+							if (e.getStatus().getCode() == Code.NotFound) {
+								// skip
+							} else {
+								throw new RuntimeException(e);
+							}
+						}
+					}
+					yield val;
+				}
+				case DB_WIDE -> {
+					try {
+						yield new BigInteger(Long.toUnsignedString(db.get().getLongProperty(name)));
+					} catch (org.rocksdb.RocksDBException e) {
+						if (e.getStatus().getCode() == Code.NotFound) {
+							yield BigInteger.ZERO;
+						} else {
+							throw new RuntimeException(e);
+						}
 					}
 				}
-			}
-			return val;
+				case SINGLE_CF -> {
+					// Shared-resource properties (e.g. block cache) return the same value
+					// for every CF handle, so query with any single one.
+					var firstEntry = columns.entrySet().stream().findFirst().orElse(null);
+					if (firstEntry == null) {
+						yield BigInteger.ZERO;
+					}
+					try {
+						yield new BigInteger(Long.toUnsignedString(db.get().getLongProperty(firstEntry.getValue().cfh(), name)));
+					} catch (org.rocksdb.RocksDBException e) {
+						if (e.getStatus().getCode() == Code.NotFound) {
+							yield BigInteger.ZERO;
+						} else {
+							throw new RuntimeException(e);
+						}
+					}
+				}
+			};
 		} finally {
 			ops.endOp();
 		}
@@ -1834,7 +1869,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					doFinally();
 				}
 
-				@Override
+ 			@Override
 				public void onComplete() {
 					try {
 						switch (writer) {
@@ -1855,7 +1890,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				}
 
-				private void doFinally() {
+ 			private void doFinally() {
 					if (!stopped) {
 						stopped = true;
 						ops.endOp();
@@ -2431,10 +2466,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						result = null;
 					}
 				}
-			} finally {
+ 		} catch (Throwable ex) {
 				if (owningTx && writer instanceof Tx t) {
-					this.closeTransactionInternal(t, true);
+					this.closeTransactionInternal(t, false);
 				}
+				throw ex;
+			}
+			if (owningTx && writer instanceof Tx t) {
+				this.closeTransactionInternal(t, true);
 			}
 			return result;
 		} catch (Exception ex) {

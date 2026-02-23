@@ -24,10 +24,10 @@ public enum RocksDBLongProperty implements RocksDBProperty {
 	NUM_IMMUTABLE_MEM_TABLE("num-immutable-mem-table"),
 	NUM_IMMUTABLE_MEM_TABLE_FLUSHED("num-immutable-mem-table-flushed"),
 	MEM_TABLE_FLUSH_PENDING("mem-table-flush-pending"),
-	NUM_RUNNING_FLUSHES("num-running-flushes"),
+	NUM_RUNNING_FLUSHES("num-running-flushes", AggregationMode.DB_WIDE),
 	COMPACTION_PENDING("compaction-pending"),
-	NUM_RUNNING_COMPACTIONS("num-running-compactions"),
-	BACKGROUND_ERRORS("background-errors"),
+	NUM_RUNNING_COMPACTIONS("num-running-compactions", AggregationMode.DB_WIDE),
+	BACKGROUND_ERRORS("background-errors", AggregationMode.DB_WIDE),
 	CUR_SIZE_ACTIVE_MEM_TABLE("cur-size-active-mem-table"),
 	CUR_SIZE_ALL_MEM_TABLES("cur-size-all-mem-tables"),
 	SIZE_ALL_MEM_TABLES("size-all-mem-tables"),
@@ -37,43 +37,55 @@ public enum RocksDBLongProperty implements RocksDBProperty {
 	NUM_DELETES_IMMUTABLE_MEM_TABLES("num-deletes-imm-mem-tables"),
 	ESTIMATE_NUM_KEYS("estimate-num-keys"),
 	ESTIMATE_TABLE_READERS_MEM("estimate-table-readers-mem"),
-	IS_FILE_DELETIONS_ENABLED("is-file-deletions-enabled"),
-	NUM_SNAPSHOTS("num-snapshots"),
-	OLDEST_SNAPSHOT_TIME("oldest-snapshot-time"),
-	OLDEST_SNAPSHOT_SEQUENCE("oldest-snapshot-sequence"),
+	IS_FILE_DELETIONS_ENABLED("is-file-deletions-enabled", AggregationMode.DB_WIDE),
+	NUM_SNAPSHOTS("num-snapshots", AggregationMode.DB_WIDE),
+	OLDEST_SNAPSHOT_TIME("oldest-snapshot-time", AggregationMode.DB_WIDE),
+	OLDEST_SNAPSHOT_SEQUENCE("oldest-snapshot-sequence", AggregationMode.DB_WIDE),
 	NUM_LIVE_VERSIONS("num-live-versions"),
 	CURRENT_SUPER_VERSION_NUMBER("current-super-version-number"),
 	ESTIMATE_LIVE_DATA_SIZE("estimate-live-data-size"),
-	MIN_LOG_NUMBER_TO_KEEP("min-log-number-to-keep"),
-	MIN_OBSOLETE_SST_NUMBER_TO_KEEP("min-obsolete-sst-number-to-keep"),
+	MIN_LOG_NUMBER_TO_KEEP("min-log-number-to-keep", AggregationMode.DB_WIDE),
+	MIN_OBSOLETE_SST_NUMBER_TO_KEEP("min-obsolete-sst-number-to-keep", AggregationMode.DB_WIDE),
 	TOTAL_SST_FILES_SIZE("total-sst-files-size"),
 	LIVE_SST_FILES_SIZE("live-sst-files-size"),
 	LIVE_SST_FILES_SIZE_AT_TEMPERATURE("live-sst-files-size-at-temperature"),
 	BASE_LEVEL("base-level"),
 	ESTIMATE_PENDING_COMPACTION_BYTES("estimate-pending-compaction-bytes"),
-	ACTUAL_DELAYED_WRITE_RATE("actual-delayed-write-rate"),
-	IS_WRITE_STOPPED("is-write-stopped"),
+	ACTUAL_DELAYED_WRITE_RATE("actual-delayed-write-rate", AggregationMode.DB_WIDE),
+	IS_WRITE_STOPPED("is-write-stopped", AggregationMode.DB_WIDE),
 	ESTIMATE_OLDEST_KEY_TIME("estimate-oldest-key-time"),
-	BLOCK_CACHE_CAPACITY("block-cache-capacity", false),
-	BLOCK_CACHE_USAGE("block-cache-usage", false),
-	BLOCK_CACHE_PINNED_USAGE("block-cache-pinned-usage", false),
+	BLOCK_CACHE_CAPACITY("block-cache-capacity", AggregationMode.SINGLE_CF),
+	BLOCK_CACHE_USAGE("block-cache-usage", AggregationMode.SINGLE_CF),
+	BLOCK_CACHE_PINNED_USAGE("block-cache-pinned-usage", AggregationMode.SINGLE_CF),
 	NUM_BLOB_FILES("num-blob-files"),
 	TOTAL_BLOB_FILE_SIZE("total-blob-file-size"),
 	LIVE_BLOB_FILE_SIZE("live-blob-file-size"),
 	LIVE_BLOB_FILE_GARBAGE_SIZE("live-blob-file-garbage-size"),
-	FILE_READ_DB_OPEN_MICROS("file.read.db.open.micros")
+	FILE_READ_DB_OPEN_MICROS("file.read.db.open.micros", AggregationMode.DB_WIDE)
 	;
 
-	private final String name;
-	private final boolean dividedByColumnFamily;
-
-	RocksDBLongProperty(String name) {
-		this(name, true);
+	/**
+	 * How to aggregate this property across column families.
+	 */
+	public enum AggregationMode {
+		/** Per-column-family property: sum values across all CFs. */
+		PER_CF,
+		/** DB-wide property: query once without a CF handle. */
+		DB_WIDE,
+		/** Shared-resource property (e.g. block cache): query once with any single CF handle. */
+		SINGLE_CF
 	}
 
-	RocksDBLongProperty(String name, boolean dividedByColumnFamily) {
+	private final String name;
+	private final AggregationMode aggregationMode;
+
+	RocksDBLongProperty(String name) {
+		this(name, AggregationMode.PER_CF);
+	}
+
+	RocksDBLongProperty(String name, AggregationMode aggregationMode) {
 		this.name = name;
-		this.dividedByColumnFamily = dividedByColumnFamily;
+		this.aggregationMode = aggregationMode;
 	}
 
 	@Override
@@ -101,7 +113,15 @@ public enum RocksDBLongProperty implements RocksDBProperty {
 		return false;
 	}
 
+	public AggregationMode getAggregationMode() {
+		return aggregationMode;
+	}
+
+	/**
+	 * @deprecated Use {@link #getAggregationMode()} instead.
+	 */
+	@Deprecated
 	public boolean isDividedByColumnFamily() {
-		return dividedByColumnFamily;
+		return aggregationMode == AggregationMode.PER_CF;
 	}
 }
