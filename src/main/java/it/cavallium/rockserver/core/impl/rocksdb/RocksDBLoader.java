@@ -491,20 +491,6 @@ public class RocksDBLoader {
                     .map(DataSize::longValue)
                     .orElse(0L);
 
-            if (isDisableAutoCompactions()) {
-                options.setMaxBackgroundJobs(0);
-            } else {
-                var configuredMaxBackgroundJobs = databaseOptions.global().maxBackgroundJobs();
-                if (configuredMaxBackgroundJobs != null && configuredMaxBackgroundJobs >= 0) {
-                    options.setMaxBackgroundJobs(configuredMaxBackgroundJobs);
-                } else {
-                    var backgroundJobs = Integer.parseInt(System.getProperty("it.cavallium.dbengine.jobs.background.num", "-1"));
-                    if (backgroundJobs >= 0) {
-                        options.setMaxBackgroundJobs(backgroundJobs);
-                    }
-                }
-            }
-
             Cache blockCache;
             final boolean useDirectIO = path != null && databaseOptions.global().useDirectIo();
             final boolean allowMmapReads = (path == null) || (!useDirectIO && databaseOptions.global().allowRocksdbMemoryMapping());
@@ -551,6 +537,22 @@ public class RocksDBLoader {
                         .setWritableFileMaxBufferSize(8 * SizeUnit.MB);
             }
             options.setIncreaseParallelism(Runtime.getRuntime().availableProcessors());
+
+            // Apply max-background-jobs after setIncreaseParallelism, since that method
+            // internally overrides maxBackgroundJobs with the parallelism value.
+            if (isDisableAutoCompactions()) {
+                options.setMaxBackgroundJobs(0);
+            } else {
+                var configuredMaxBackgroundJobs = databaseOptions.global().maxBackgroundJobs();
+                if (configuredMaxBackgroundJobs != null && configuredMaxBackgroundJobs >= 0) {
+                    options.setMaxBackgroundJobs(configuredMaxBackgroundJobs);
+                } else {
+                    var backgroundJobs = Integer.parseInt(System.getProperty("it.cavallium.dbengine.jobs.background.num", "-1"));
+                    if (backgroundJobs >= 0) {
+                        options.setMaxBackgroundJobs(backgroundJobs);
+                    }
+                }
+            }
 
             if (path != null) {
                 // If writeBufferManagerSize is not explicitly configured, default to 50% of block cache size.
