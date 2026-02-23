@@ -145,6 +145,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final NonBlockingHashMapLong<ColumnInstance> columns;
 	private final Map<String, ColumnFamilyOptions> columnsConifg;
 	private final ConcurrentMap<String, Long> columnNamesIndex;
+	private final ConcurrentMap<String, ColumnFamilyHandle> unconfiguredColumns;
 	private final NonBlockingHashMapLong<Tx> txs;
 	private final NonBlockingHashMapLong<REntry<RocksIterator>> its;
 	private final SafeShutdown ops;
@@ -188,6 +189,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.txs = new NonBlockingHashMapLong<>();
 		this.its = new NonBlockingHashMapLong<>();
 		this.columnNamesIndex = new ConcurrentHashMap<>();
+		this.unconfiguredColumns = new ConcurrentHashMap<>();
 		this.ops = new SafeShutdown();
 		DatabaseConfig config = ConfigParser.parse(embeddedConfigPath);
 
@@ -588,18 +590,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 
-			// Register with default schema
-			logger.info("Registering startup column with default schema: {}", name);
-			FFMAbstractMergeOperator mergeOp = initialMergeOperators.get(name);
-			String mergeOperatorClass = mergeOp != null ? mergeOp.getClass().getName() : null;
-			ColumnSchema schema = ColumnSchema.of(new IntArrayList(),
-					new ObjectArrayList<>(),
-					true,
-					null,
-					null,
-					mergeOperatorClass
-			);
-			internalRegisterColumn(name, cfh, schema, mergeOp);
+			// Column exists in RocksDB but has no stored schema metadata.
+			// Mark as unconfigured — operations are forbidden until createColumn sets the schema.
+			logger.info("Found column without stored schema, marking as unconfigured: {}", name);
+			unconfiguredColumns.put(name, cfh);
 		}
 	}
 
@@ -1223,12 +1217,45 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
 						updateColumnSchema(colId, name, schema, mergeOp);
 						return colId;
-					} else {
+						} else {
 						throw RocksDBException.of(RocksDBErrorType.COLUMN_EXISTS,
 								"Column exists, with a different schema: " + name
 						);
 					}
 				} else {
+					// Check if this column exists in RocksDB but was loaded without a stored schema
+					var unconfiguredCfh = unconfiguredColumns.remove(name);
+					if (unconfiguredCfh != null) {
+						// Column exists in RocksDB but had no schema. Configure it now.
+						logger.info("Configuring schema for previously unconfigured column: {}", name);
+						try {
+							var options = RocksDBLoader.getColumnOptions(name,
+									path,
+									definitiveDbPath,
+									this.config.global(),
+									logger,
+									this.refs,
+									path == null,
+									cache
+							);
+							var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
+							if (mergeOp != null && !(mergeOp instanceof DelegatingMergeOperator)) {
+								mergeOp = new DelegatingMergeOperator("Delegating-" + name, mergeOp);
+							}
+							var prev = columnsConifg.put(name, options.options());
+							if (prev != null) {
+								prev.close();
+							}
+							byte[] key = name.getBytes(StandardCharsets.UTF_8);
+							byte[] value = encodeColumnSchema(schema);
+							db.get().put(columnSchemasColumnDescriptorHandle, key, value);
+							return internalRegisterColumn(name, unconfiguredCfh, schema, mergeOp);
+						} catch (org.rocksdb.RocksDBException | GestaltException e) {
+							// Put it back if we failed
+							unconfiguredColumns.put(name, unconfiguredCfh);
+							throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, e);
+						}
+					}
 					try {
 						var options = RocksDBLoader.getColumnOptions(name,
 								path,
@@ -4248,6 +4275,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			columnsTable.addRow(String.valueOf(id), name, schema, mergeOp);
 		}
+
+		// Show unconfigured columns (exist in RocksDB but have no stored schema)
+		for (var entry : unconfiguredColumns.entrySet()) {
+			long id = entry.getValue().getID();
+			columnsTable.addRow(String.valueOf(id), entry.getKey(), "<unconfigured>", "-");
+		}
+
 		sb.append(columnsTable.toString());
 
 		// Merge Operators

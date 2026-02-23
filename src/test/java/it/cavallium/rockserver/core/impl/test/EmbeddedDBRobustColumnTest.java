@@ -190,8 +190,17 @@ public class EmbeddedDBRobustColumnTest {
         // Reopen EmbeddedDB
         db = new EmbeddedDB(tempDir, "robust_test", null);
         
-        // Should find ManualCol
-        long id = db.getColumnId("ManualCol");
+        // ManualCol should NOT be accessible via getColumnId (unconfigured, no schema)
+        RocksDBException ex = assertThrows(RocksDBException.class, () -> db.getColumnId("ManualCol"));
+        assertEquals(RocksDBErrorType.COLUMN_NOT_FOUND, ex.getErrorUniqueId());
+        
+        // Calling createColumn should configure the unconfigured column
+        ColumnSchema schema = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
+        long id = db.createColumn("ManualCol", schema);
         assertTrue(id > 0);
+        
+        // Now it should be accessible
+        long fetchedId = db.getColumnId("ManualCol");
+        assertEquals(id, fetchedId);
     }
 }
