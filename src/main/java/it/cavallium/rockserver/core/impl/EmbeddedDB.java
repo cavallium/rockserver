@@ -284,7 +284,37 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.refs = loadedDb.refs();
 		this.cache = loadedDb.cache();
 		this.definitiveDbPath = loadedDb.definitiveDbPath();
-		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache, this::getLongProperty, this::getPerCfLongProperty);
+		// Compute upper-bound memory config from database options
+		RocksDBStatistics.MemoryUpperBoundConfig memoryUpperBoundConfig;
+		try {
+			var globalConfig = config.global();
+			boolean spinning = globalConfig.spinning();
+			boolean useDirectIo = path != null && globalConfig.useDirectIo();
+			long compactionReadaheadBytes = 0;
+			long writableFileMaxBufferBytes = 0;
+			if (useDirectIo) {
+				compactionReadaheadBytes = 4 * SizeUnit.MB;
+				writableFileMaxBufferBytes = 2 * SizeUnit.MB;
+			}
+			if (spinning) {
+				compactionReadaheadBytes = 16 * SizeUnit.MB;
+				writableFileMaxBufferBytes = 8 * SizeUnit.MB;
+			}
+			int maxBackgroundJobs;
+			var configuredMaxBgJobs = globalConfig.maxBackgroundJobs();
+			if (configuredMaxBgJobs != null && configuredMaxBgJobs >= 0) {
+				maxBackgroundJobs = configuredMaxBgJobs;
+			} else {
+				var bgJobs = Integer.parseInt(System.getProperty("it.cavallium.dbengine.jobs.background.num", "-1"));
+				maxBackgroundJobs = bgJobs >= 0 ? bgJobs : Runtime.getRuntime().availableProcessors();
+			}
+			memoryUpperBoundConfig = new RocksDBStatistics.MemoryUpperBoundConfig(
+					maxBackgroundJobs, compactionReadaheadBytes, writableFileMaxBufferBytes);
+		} catch (GestaltException e) {
+			memoryUpperBoundConfig = new RocksDBStatistics.MemoryUpperBoundConfig(
+					Runtime.getRuntime().availableProcessors(), 0, 0);
+		}
+		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache, this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig);
 		try {
 			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
 			int writeCap = Objects.requireNonNullElse(config.parallelism().write(),

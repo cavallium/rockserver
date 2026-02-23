@@ -43,12 +43,23 @@ public class RocksDBStatistics {
 
 	private volatile boolean stopRequested = false;
 
+	/**
+	 * Upper-bound memory configuration derived from RocksDB options.
+	 * Used to estimate maximum possible native memory usage.
+	 *
+	 * @param maxBackgroundJobs maximum concurrent compaction/flush jobs
+	 * @param compactionReadaheadBytes readahead buffer size per compaction input file
+	 * @param writableFileMaxBufferBytes writable file buffer size per compaction output file
+	 */
+	public record MemoryUpperBoundConfig(int maxBackgroundJobs, long compactionReadaheadBytes, long writableFileMaxBufferBytes) {}
+
 	public RocksDBStatistics(String name,
 			Statistics statistics,
 			MetricsManager metrics,
 			@Nullable Cache cache,
 			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter,
-			Function<String, Map<String, Long>> perCfLongPropertyGetter) {
+			Function<String, Map<String, Long>> perCfLongPropertyGetter,
+			MemoryUpperBoundConfig memoryUpperBoundConfig) {
 		this.statistics = statistics;
 		this.metrics = metrics;
 		this.tickerMap = new EnumMap<>(Arrays
@@ -96,6 +107,62 @@ public class RocksDBStatistics {
 				.tag("database", name)
 				.register(metrics.getRegistry());
 
+		// Realistic total memory gauge: block cache + table readers (index/filter outside cache) + memtables
+		// Note: block-cache-pinned-usage is a subset of block-cache-usage, so it's not added separately
+		Gauge.builder("rocksdb.memory.total", () -> {
+			try {
+				long blockCacheUsage = longPropertyGetter.apply(
+						RocksDBLongProperty.BLOCK_CACHE_USAGE.getName(),
+						RocksDBLongProperty.BLOCK_CACHE_USAGE.getAggregationMode()
+				).longValue();
+				long tableReadersMem = longPropertyGetter.apply(
+						RocksDBLongProperty.ESTIMATE_TABLE_READERS_MEM.getName(),
+						RocksDBLongProperty.ESTIMATE_TABLE_READERS_MEM.getAggregationMode()
+				).longValue();
+				long memtables = longPropertyGetter.apply(
+						RocksDBLongProperty.CUR_SIZE_ALL_MEM_TABLES.getName(),
+						RocksDBLongProperty.CUR_SIZE_ALL_MEM_TABLES.getAggregationMode()
+				).longValue();
+				return blockCacheUsage + tableReadersMem + memtables;
+			} catch (Throwable ex) {
+				LOG.error("Failed to compute total RocksDB memory", ex);
+				return 0;
+			}
+		}).tag("database", name).register(metrics.getRegistry());
+
+		// Upper-bound memory estimate: uses block cache capacity (not usage) + memtables including
+		// pending free + table readers + worst-case compaction I/O buffers.
+		// Each background job can read from ~10 input files (readahead buffer each) and write 1 output
+		// file (writable file buffer). This gives a realistic upper bound on native memory.
+		final int estimatedInputFilesPerCompaction = 10;
+		Gauge.builder("rocksdb.memory.max-estimate", () -> {
+			try {
+				// Block cache capacity (configured max, not current usage)
+				long blockCacheCapacity = longPropertyGetter.apply(
+						RocksDBLongProperty.BLOCK_CACHE_CAPACITY.getName(),
+						RocksDBLongProperty.BLOCK_CACHE_CAPACITY.getAggregationMode()
+				).longValue();
+				// All memtables including those pending flush (not yet freed)
+				long allMemtables = longPropertyGetter.apply(
+						RocksDBLongProperty.SIZE_ALL_MEM_TABLES.getName(),
+						RocksDBLongProperty.SIZE_ALL_MEM_TABLES.getAggregationMode()
+				).longValue();
+				// Index/filter blocks held outside the block cache
+				long tableReadersMem = longPropertyGetter.apply(
+						RocksDBLongProperty.ESTIMATE_TABLE_READERS_MEM.getName(),
+						RocksDBLongProperty.ESTIMATE_TABLE_READERS_MEM.getAggregationMode()
+				).longValue();
+				// Upper bound for compaction I/O buffers:
+				// readahead per input file + writable buffer per output file, per background job
+				long compactionBuffers = (long) memoryUpperBoundConfig.maxBackgroundJobs()
+						* (memoryUpperBoundConfig.compactionReadaheadBytes() * estimatedInputFilesPerCompaction
+						   + memoryUpperBoundConfig.writableFileMaxBufferBytes());
+				return blockCacheCapacity + allMemtables + tableReadersMem + compactionBuffers;
+			} catch (Throwable ex) {
+				LOG.error("Failed to compute max-estimate RocksDB memory", ex);
+				return 0;
+			}
+		}).tag("database", name).register(metrics.getRegistry());
 
 		EnumMap<HistogramType, HistogramData> histogramDataRef = new EnumMap<>(HistogramType.class);
 		AtomicReference<CacheStats> cacheStatsRef = new AtomicReference<>(cache != null ? getCacheStats(cache) : new CacheStats(0L, 0L));
