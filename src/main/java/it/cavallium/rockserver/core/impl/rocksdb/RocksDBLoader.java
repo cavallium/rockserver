@@ -217,11 +217,11 @@ public class RocksDBLoader {
                 if (maxLastLevelSstSize <= firstLevelSstSize) {
                     targetFileSizeMultiplier = 1;
                 } else {
-                    // multiplier = round((maxLastLevelSstSize / firstLevelSstSize) ^ (1/(numLevels-1)))
+                    // multiplier = ceil((maxLastLevelSstSize / firstLevelSstSize) ^ (1/(numLevels-1)))
                     double ratio = (double) maxLastLevelSstSize / (double) firstLevelSstSize;
-                    targetFileSizeMultiplier = Math.max(1, (int) Math.round(Math.pow(ratio, 1.0 / (numLevels - 1))));
+                    targetFileSizeMultiplier = Math.max(1, (int) Math.ceil(Math.pow(ratio, 1.0 / (numLevels - 1))));
                 }
-                logger.info("Column '{}': targetFileSizeMultiplier={} (firstLevelSstSize={}, maxLastLevelSstSize={}, numLevels={})",
+                logger.debug("Column '{}': targetFileSizeMultiplier={} (firstLevelSstSize={}, maxLastLevelSstSize={}, numLevels={})",
                         name, targetFileSizeMultiplier, firstLevelSstSize, maxLastLevelSstSize, numLevels);
             } else {
                 targetFileSizeMultiplier = 2;
