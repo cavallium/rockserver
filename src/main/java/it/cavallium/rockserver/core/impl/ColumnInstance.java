@@ -321,14 +321,12 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 	}
 
 	public void checkNullableValue(Buf value) {
-		if (schema.hasValue() == (value == null || value.isEmpty())) {
-			if (schema.hasValue()) {
-				throw RocksDBException.of(RocksDBErrorType.UNEXPECTED_NULL_VALUE,
-						"Schema expects a value, but a null value has been passed");
-			} else {
-				throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
-						"Schema expects no value, but a non-null value has been passed");
-			}
+		if (schema.hasValue() && value == null) {
+			throw RocksDBException.of(RocksDBErrorType.UNEXPECTED_NULL_VALUE,
+					"Schema expects a value, but a null value has been passed");
+		} else if (!schema.hasValue() && value != null && !value.isEmpty()) {
+			throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
+					"Schema expects no value, but a non-null value has been passed");
 		}
 	}
 
