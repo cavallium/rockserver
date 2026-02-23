@@ -248,7 +248,8 @@ public class MetricsManager implements AutoCloseable {
             "org.reactivestreams",
             "io.github.mweirauch",
             "com.google.common",
-            "org.github.gestalt"
+						"org.github.gestalt",
+						"com.google.protobuf"
         );
     }
 
