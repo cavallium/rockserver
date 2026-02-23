@@ -20,9 +20,12 @@ public class RocksDBObjects implements AutoCloseable {
 		}
 	}
 
-	public void add(AutoCloseable ref) {
-		this.refs.add(ref);
-	}
+ public void add(AutoCloseable ref) {
+                this.refs.add(ref);
+        }
+        public List<AutoCloseable> asList() {
+                return List.copyOf(refs);
+        }
 
 	@Override
 	public void close() {

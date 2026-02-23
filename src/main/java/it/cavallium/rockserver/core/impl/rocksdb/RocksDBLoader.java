@@ -206,10 +206,30 @@ public class RocksDBLoader {
 
             // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
             var firstLevelSstSize = Objects.requireNonNullElse(columnOptions.firstLevelSstSize(), new DataSize("64MiB")).longValue();
+            int numLevels = columnOptions.levels().length > 0 ? columnOptions.levels().length : 7;
+            // Compute targetFileSizeMultiplier: if maxLastLevelSstSize is set, derive the multiplier
+            // so that firstLevelSstSize * multiplier^(numLevels-1) <= maxLastLevelSstSize.
+            // Otherwise default to 2.
+            int targetFileSizeMultiplier;
+            var maxLastLevelSstSizeConfig = columnOptions.maxLastLevelSstSize();
+            if (maxLastLevelSstSizeConfig != null) {
+                long maxLastLevelSstSize = maxLastLevelSstSizeConfig.longValue();
+                if (maxLastLevelSstSize <= firstLevelSstSize) {
+                    targetFileSizeMultiplier = 1;
+                } else {
+                    // multiplier = round((maxLastLevelSstSize / firstLevelSstSize) ^ (1/(numLevels-1)))
+                    double ratio = (double) maxLastLevelSstSize / (double) firstLevelSstSize;
+                    targetFileSizeMultiplier = Math.max(1, (int) Math.round(Math.pow(ratio, 1.0 / (numLevels - 1))));
+                }
+                logger.info("Column '{}': targetFileSizeMultiplier={} (firstLevelSstSize={}, maxLastLevelSstSize={}, numLevels={})",
+                        name, targetFileSizeMultiplier, firstLevelSstSize, maxLastLevelSstSize, numLevels);
+            } else {
+                targetFileSizeMultiplier = 2;
+            }
             columnFamilyOptions
                     .setTargetFileSizeBase(firstLevelSstSize)
                     .setMaxBytesForLevelBase(firstLevelSstSize * 8)
-                    .setTargetFileSizeMultiplier(2);
+                    .setTargetFileSizeMultiplier(targetFileSizeMultiplier);
 
             if (isDisableAutoCompactions()) {
                 columnFamilyOptions.setLevel0FileNumCompactionTrigger(-1);
@@ -504,10 +524,13 @@ public class RocksDBLoader {
                     .setWalSizeLimitMB(0) // Auto
                     .setMaxTotalWalSize(0) // AUto
             ;
+            long blockCacheSize;
             if (path != null) {
-                blockCache = CACHE_FACTORY.newCache(writeBufferManagerSize + Optional.ofNullable(databaseOptions.global().blockCache()).map(DataSize::longValue).orElse( 512 * SizeUnit.MB));
+                blockCacheSize = writeBufferManagerSize + Optional.ofNullable(databaseOptions.global().blockCache()).map(DataSize::longValue).orElse( 512 * SizeUnit.MB);
+                blockCache = CACHE_FACTORY.newCache(blockCacheSize);
                 refs.add(blockCache);
             } else {
+                blockCacheSize = 0;
                 blockCache = null;
             }
 
@@ -529,14 +552,22 @@ public class RocksDBLoader {
             }
             options.setIncreaseParallelism(Runtime.getRuntime().availableProcessors());
 
-            if (path != null && writeBufferManagerSize > 0L) {
-                var writeBufferManager = new WriteBufferManager(writeBufferManagerSize, blockCache, false) {
-                  {
-                    RocksLeakDetector.register(this, "wb-manager", owningHandle_);
-                  }
-                };
-                refs.add(writeBufferManager);
-                options.setWriteBufferManager(writeBufferManager);
+            if (path != null) {
+                // If writeBufferManagerSize is not explicitly configured, default to 50% of block cache size.
+                // Without a WriteBufferManager, memtable memory is unbounded and not tracked by the block cache,
+                // which can cause real RAM usage to grow far beyond the configured block cache size.
+                long effectiveWbmSize = writeBufferManagerSize > 0L
+                        ? writeBufferManagerSize
+                        : blockCacheSize / 2;
+                if (effectiveWbmSize > 0) {
+                    var writeBufferManager = new WriteBufferManager(effectiveWbmSize, blockCache, false) {
+                      {
+                        RocksLeakDetector.register(this, "wb-manager", owningHandle_);
+                      }
+                    };
+                    refs.add(writeBufferManager);
+                    options.setWriteBufferManager(writeBufferManager);
+                }
             }
 
             if (useDirectIO) {
