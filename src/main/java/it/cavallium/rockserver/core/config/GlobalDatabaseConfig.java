@@ -40,6 +40,8 @@ public interface GlobalDatabaseConfig {
 
 	boolean unorderedWrite() throws GestaltException;
 
+	@Nullable Integer maxBackgroundJobs() throws GestaltException;
+
 	FallbackColumnConfig fallbackColumnOptions() throws GestaltException;
 
 	NamedColumnConfig[] columnOptions() throws GestaltException;

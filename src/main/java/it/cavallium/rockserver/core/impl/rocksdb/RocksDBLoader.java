@@ -474,9 +474,14 @@ public class RocksDBLoader {
             if (isDisableAutoCompactions()) {
                 options.setMaxBackgroundJobs(0);
             } else {
-                var backgroundJobs = Integer.parseInt(System.getProperty("it.cavallium.dbengine.jobs.background.num", "-1"));
-                if (backgroundJobs >= 0) {
-                    options.setMaxBackgroundJobs(backgroundJobs);
+                var configuredMaxBackgroundJobs = databaseOptions.global().maxBackgroundJobs();
+                if (configuredMaxBackgroundJobs != null && configuredMaxBackgroundJobs >= 0) {
+                    options.setMaxBackgroundJobs(configuredMaxBackgroundJobs);
+                } else {
+                    var backgroundJobs = Integer.parseInt(System.getProperty("it.cavallium.dbengine.jobs.background.num", "-1"));
+                    if (backgroundJobs >= 0) {
+                        options.setMaxBackgroundJobs(backgroundJobs);
+                    }
                 }
             }
 

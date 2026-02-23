@@ -414,7 +414,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					colHashTypes.add(ColumnHashType.values()[dis.readUnsignedByte()]);
 				}
 				var hasValue = dis.readBoolean();
-				return ColumnSchema.of(keys, colHashTypes, hasValue, null, null, null);
+				return new ColumnSchema(keys, colHashTypes, hasValue, null, null, null);
 			} else if (check == 3) {
 				var size = dis.readInt();
 				var keys = new IntArrayList(size);
@@ -430,7 +430,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				String mergeOperatorName = dis.readBoolean() ? dis.readUTF() : null;
 				Long mergeOperatorVersion = dis.readBoolean() ? dis.readLong() : null;
 				String mergeOperatorClass = dis.readBoolean() ? dis.readUTF() : null;
-				return ColumnSchema.of(keys,
+				return new ColumnSchema(keys,
 						colHashTypes,
 						hasValue,
 						mergeOperatorName,
