@@ -1557,8 +1557,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		ops.beginOp();
 		try {
 			var col = getColumn(columnId);
-			Tx tx = transactionOrUpdateId != 0 ? getTransaction(transactionOrUpdateId, true) : null;
-			return merge(tx, col, keys, value, requestType);
+			Tx tx;
+			if (transactionOrUpdateId != 0) {
+				tx = getTransaction(transactionOrUpdateId, true);
+			} else {
+				tx = null;
+			}
+			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
+			return merge(tx, col, updateId, keys, value, requestType);
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -1908,7 +1914,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								actionLogger.logAction("MergeBatch (next)", start, columnId, keys, value, null, null, null, mode);
 								switch (writer) {
 									case SSTWriter ignored -> pendingSstEntries.add(Map.entry(keys, value));
-									default -> merge(writer, col, keys, value, RequestType.none());
+									default -> merge(writer, col, 0L, keys, value, RequestType.none());
 								}
 							}
 						}
@@ -2187,6 +2193,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				do {
 					Buf previousValue;
 					Buf calculatedKey = col.calculateKey(keys.keys());
+					byte[] calculatedKeyArray = calculatedKey.toByteArray();
 					if (updateId != 0L) {
 						assert !owningNewTx;
 						((Tx) newTx).val().setSavePoint();
@@ -2195,16 +2202,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 						try (var readOptions = newReadOptions(null)) {
-							var previousRawBucketByteArray = ((Tx) newTx)
-									.val()
-									.getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
+							var previousRawBucketByteArray
+									= ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 							didGetForUpdateInternally = true;
 							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
 							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
 							previousValue = transformResultValue(col, bucket.addElement(bucketElementKeys, value));
-							var k = Utils.toByteArray(calculatedKey);
 							var v = Utils.toByteArray(bucket.toSegment());
-							((Tx) newTx).val().put(col.cfh(), k, v);
+							((Tx) newTx).val().put(col.cfh(), calculatedKeyArray, v);
 						} catch (org.rocksdb.RocksDBException e) {
 							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
 						}
@@ -2212,10 +2217,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						if (RequestType.requiresGettingPreviousValue(callback)) {
 							assert newTx instanceof Tx;
 							try (var readOptions = newReadOptions(null)) {
-								byte[] previousValueByteArray;
-								previousValueByteArray = ((Tx) newTx)
-										.val()
-										.getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
+								byte[] previousValueByteArray
+										= ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 								didGetForUpdateInternally = true;
 								previousValue = transformResultValue(col, toBuf(previousValueByteArray));
 							} catch (org.rocksdb.RocksDBException e) {
@@ -2225,10 +2228,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							// todo: in the future this should be replaced with just keyExists
 							assert newTx instanceof Tx;
 							try (var readOptions = newReadOptions(null)) {
-								byte[] previousValueByteArray;
-								previousValueByteArray = ((Tx) newTx)
+								byte[] previousValueByteArray = ((Tx) newTx)
 										.val()
-										.getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
+										.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 								didGetForUpdateInternally = true;
 								previousValue = previousValueByteArray != null ? emptyBuf() : null;
 							} catch (org.rocksdb.RocksDBException e) {
@@ -2238,18 +2240,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							previousValue = null;
 						}
 						switch (newTx) {
-							case WB wb -> wb.wb().put(col.cfh(), calculatedKey.toByteArray(), value.toByteArray());
+							case WB wb -> wb.wb().put(col.cfh(), calculatedKeyArray, value.toByteArray());
 							case SSTWriter sstWriter -> {
-								var keyBB = calculatedKey.toByteArray();
 								var valueBB = (col.schema().hasValue() ? value : dummyRocksDBEmptyValue()).toByteArray();
-								sstWriter.put(keyBB, valueBB);
+								sstWriter.put(calculatedKeyArray, valueBB);
 							}
-							case Tx t -> t.val().put(col.cfh(), calculatedKey.toByteArray(), value.toByteArray());
+							case Tx t -> t.val().put(col.cfh(), calculatedKeyArray, value.toByteArray());
 							case null -> {
 								try (var w = new LeakSafeWriteOptions(null)) {
-									var keyBB = calculatedKey.toByteArray();
 									var valueBB = (col.schema().hasValue() ? value : dummyRocksDBEmptyValue()).toByteArray();
-									db.get().put(col.cfh(), w, keyBB, valueBB);
+									db.get().put(col.cfh(), w, calculatedKeyArray, valueBB);
 								}
 							}
 						}
@@ -2274,7 +2274,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								undosCount++;
 							}
 							for (int i = 0; i < undosCount; i++) {
-								((Tx) newTx).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
+								((Tx) newTx).val().undoGetForUpdate(col.cfh(), calculatedKeyArray);
 							}
 							throw new RocksDBRetryException();
 						}
@@ -2283,9 +2283,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (owningNewTx) {
 						committedOwnedTx = this.closeTransactionInternal((Tx) newTx, true);
 						if (!committedOwnedTx) {
-							if (didGetForUpdateInternally) {
-								((Tx) newTx).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
-							}
+							// FIX: We MUST close the failed transaction and open a fresh one.
+							// If we reuse it, the C++ WriteBatch grows indefinitely on every retry!
+							this.closeTransactionInternal((Tx) newTx, false);
+							newTx = this.openTransactionInternal(120_000, false);
+							didGetForUpdateInternally = false;
 							Thread.yield();
 						}
 					} else {
@@ -2347,6 +2349,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				do {
 					Buf previousValue;
 					Buf calculatedKey = col.calculateKey(keys.keys());
+					byte[] calculatedKeyArray = calculatedKey.toByteArray();
 					if (updateId != 0L) {
 						assert !owningNewTx;
 						((Tx) newTx).val().setSavePoint();
@@ -2357,14 +2360,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						try (var readOptions = newReadOptions(null)) {
 							var previousRawBucketByteArray = ((Tx) newTx)
 									.val()
-									.getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
+									.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 							didGetForUpdateInternally = true;
 							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
 							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
 							previousValue = transformResultValue(col, bucket.removeElement(bucketElementKeys));
-							var k = Utils.toByteArray(calculatedKey);
 							var v = Utils.toByteArray(bucket.toSegment());
-							((Tx) newTx).val().put(col.cfh(), k, v);
+							((Tx) newTx).val().put(col.cfh(), calculatedKeyArray, v);
 						} catch (org.rocksdb.RocksDBException e) {
 							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
 						}
@@ -2375,7 +2377,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx)
 										.val()
-										.getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
+										.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 								didGetForUpdateInternally = true;
 								previousValue = transformResultValue(col, toBuf(previousValueByteArray));
 							} catch (org.rocksdb.RocksDBException e) {
@@ -2388,7 +2390,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx)
 										.val()
-										.getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
+										.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 								didGetForUpdateInternally = true;
 								previousValue = previousValueByteArray != null ? emptyBuf() : null;
 							} catch (org.rocksdb.RocksDBException e) {
@@ -2398,7 +2400,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							previousValue = null;
 						}
 						switch (newTx) {
-							case WB wb -> wb.wb().delete(col.cfh(), calculatedKey.toByteArray());
+							case WB wb -> wb.wb().delete(col.cfh(), calculatedKeyArray);
 							case SSTWriter sstWriter -> {
 								// SSTWriter doesn't support delete in standard way if using ingest, but here we can't delete from SST.
 								// Actually SST ingestion is usually for loading new data.
@@ -2408,11 +2410,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								// But we can check if we should support it.
 								throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Delete not supported in SST writer mode");
 							}
-							case Tx t -> t.val().delete(col.cfh(), calculatedKey.toByteArray());
+							case Tx t -> t.val().delete(col.cfh(), calculatedKeyArray);
 							case null -> {
 								try (var w = new LeakSafeWriteOptions(null)) {
-									var keyBB = calculatedKey.toByteArray();
-									db.get().delete(col.cfh(), w, keyBB);
+									db.get().delete(col.cfh(), w, calculatedKeyArray);
 								}
 							}
 						}
@@ -2436,7 +2437,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								undosCount++;
 							}
 							for (int i = 0; i < undosCount; i++) {
-								((Tx) newTx).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
+								((Tx) newTx).val().undoGetForUpdate(col.cfh(), calculatedKeyArray);
 							}
 							throw new RocksDBRetryException();
 						}
@@ -2445,9 +2446,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (owningNewTx) {
 						committedOwnedTx = this.closeTransactionInternal((Tx) newTx, true);
 						if (!committedOwnedTx) {
-							if (didGetForUpdateInternally) {
-								((Tx) newTx).val().undoGetForUpdate(col.cfh(), Utils.toByteArray(calculatedKey));
-							}
+							// FIX: We MUST close the failed transaction and open a fresh one.
+							// If we reuse it, the C++ WriteBatch grows indefinitely on every retry!
+							this.closeTransactionInternal((Tx) newTx, false);
+							newTx = this.openTransactionInternal(120_000, false);
+							didGetForUpdateInternally = false;
 							Thread.yield();
 						}
 					} else {
@@ -2474,78 +2477,131 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private <U> U merge(@Nullable DBWriter optionalDbWriter,
 			ColumnInstance col,
+			long updateId,
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestMerge<? super Buf, U> callback) throws RocksDBException {
 		try {
 			boolean needsTx = col.hasBuckets() || !(callback instanceof RequestType.RequestNothing<?>);
-			DBWriter writer =
-					needsTx && optionalDbWriter == null ? this.openTransactionInternal(120_000, false) : optionalDbWriter;
-			boolean owningTx = needsTx && optionalDbWriter == null;
+			if (optionalDbWriter instanceof Tx tx && tx.isFromGetForUpdate() && callback instanceof RequestType.RequestMerged<?>) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"You can't get the merged value, when you are already updating that value"
+				);
+			}
+			if (updateId != 0L && !(optionalDbWriter instanceof Tx)) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Update id must be accompanied with a valid transaction"
+				);
+			}
+
 			U result;
+			DBWriter newTx;
+			boolean owningNewTx = needsTx && optionalDbWriter == null;
+			// Retry using a transaction: transactions are required to handle this kind of data
+			newTx = owningNewTx ? this.openTransactionInternal(120_000, false) : optionalDbWriter;
 			try {
-				Buf calculatedKey = col.calculateKey(keys.keys());
-				if (col.hasBuckets()) {
-					assert writer instanceof Tx;
-					var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-					try (var readOptions = newReadOptions(null)) {
-						var previousRawBucketByteArray = ((Tx) writer)
-								.val()
-								.getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
-						Buf previousRawBucket = toBuf(previousRawBucketByteArray);
-						var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
-						var existing = bucket.getElement(bucketElementKeys);
-						Buf mergedValue;
-						if (existing != null) {
-							var mergedRes = col.mergeOperator().merge(calculatedKey, existing, List.of(value));
-							mergedValue = mergedRes != null ? mergedRes : existing;
-						} else {
-							mergedValue = value;
+				boolean didGetForUpdateInternally = false;
+				boolean committedOwnedTx;
+				do {
+					Buf calculatedKey = col.calculateKey(keys.keys());
+					byte[] calculatedKeyArray = calculatedKey.toByteArray();
+					if (updateId != 0L) {
+						assert !owningNewTx;
+						((Tx) newTx).val().setSavePoint();
+					}
+					if (col.hasBuckets()) {
+						assert newTx instanceof Tx;
+						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
+						try (var readOptions = newReadOptions(null)) {
+							var previousRawBucketByteArray = ((Tx) newTx)
+									.val()
+									.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
+							didGetForUpdateInternally = true;
+							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
+							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
+							var existing = bucket.getElement(bucketElementKeys);
+							Buf mergedValue;
+							if (existing != null) {
+								var mergedRes = col.mergeOperator().merge(calculatedKey, existing, List.of(value));
+								mergedValue = mergedRes != null ? mergedRes : existing;
+							} else {
+								mergedValue = value;
+							}
+							bucket.addElement(bucketElementKeys, mergedValue);
+							var v = Utils.toByteArray(bucket.toSegment());
+							((Tx) newTx).val().put(col.cfh(), calculatedKeyArray, v);
+							if (callback instanceof RequestType.RequestMerged<?>) {
+								var merged = bucket.getElement(col.getBucketElementKeys(keys.keys()));
+								result = RequestType.safeCast(transformResultValue(col, merged));
+							} else {
+								result = null;
+							}
+						} catch (org.rocksdb.RocksDBException e) {
+							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
 						}
-						bucket.addElement(bucketElementKeys, mergedValue);
-						var k = Utils.toByteArray(calculatedKey);
-						var v = Utils.toByteArray(bucket.toSegment());
-						((Tx) writer).val().put(col.cfh(), k, v);
+					} else {
+						switch (newTx) {
+							case WB wb -> wb.wb().merge(col.cfh(), calculatedKeyArray, value.toByteArray());
+							case SSTWriter ignored ->
+									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Merge not supported with SST writer");
+							case Tx t -> t.val().merge(col.cfh(), calculatedKeyArray, value.toByteArray());
+							case null -> {
+								try (var w = new LeakSafeWriteOptions(null)) {
+									db.get().merge(col.cfh(), w, calculatedKeyArray, value.toByteArray());
+								}
+							}
+						}
 						if (callback instanceof RequestType.RequestMerged<?>) {
-							var merged = bucket.getElement(col.getBucketElementKeys(keys.keys()));
-							result = RequestType.safeCast(transformResultValue(col, merged));
+							Buf merged;
+							try (var readOptions = newReadOptions(null)) {
+								merged = dbGet(newTx instanceof Tx ? (Tx) newTx : null, col, readOptions, calculatedKey);
+							}
+							result = RequestType.safeCast(merged);
 						} else {
 							result = null;
 						}
 					}
-				} else {
-					switch (writer) {
-						case WB wb -> wb.wb().merge(col.cfh(), calculatedKey.toByteArray(), value.toByteArray());
-						case SSTWriter ignored ->
-								throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Merge not supported with SST writer");
-						case Tx t -> t.val().merge(col.cfh(), calculatedKey.toByteArray(), value.toByteArray());
-						case null -> {
-							try (var w = new LeakSafeWriteOptions(null)) {
-								db.get().merge(col.cfh(), w, calculatedKey.toByteArray(), value.toByteArray());
+
+					if (updateId != 0L) {
+						boolean committed = closeTransaction(updateId, true);
+						if (!committed) {
+							((Tx) newTx).val().rollbackToSavePoint();
+							int undosCount = 0;
+							if (((Tx) newTx).isFromGetForUpdate()) {
+								undosCount++;
 							}
+							if (didGetForUpdateInternally) {
+								undosCount++;
+							}
+							for (int i = 0; i < undosCount; i++) {
+								((Tx) newTx).val().undoGetForUpdate(col.cfh(), calculatedKeyArray);
+							}
+							throw new RocksDBRetryException();
 						}
 					}
-					if (callback instanceof RequestType.RequestMerged<?>) {
-						Buf merged;
-						try (var readOptions = newReadOptions(null)) {
-							merged = dbGet(writer instanceof Tx ? (Tx) writer : null, col, readOptions, calculatedKey);
+
+					if (owningNewTx) {
+						committedOwnedTx = this.closeTransactionInternal((Tx) newTx, true);
+						if (!committedOwnedTx) {
+							this.closeTransactionInternal((Tx) newTx, false);
+							newTx = this.openTransactionInternal(120_000, false);
+							didGetForUpdateInternally = false;
+							Thread.yield();
 						}
-						result = RequestType.safeCast(merged);
 					} else {
-						result = null;
+						committedOwnedTx = true;
 					}
+				} while (!committedOwnedTx);
+			} finally {
+				if (owningNewTx) {
+					this.closeTransactionInternal((Tx) newTx, false);
 				}
- 		} catch (Throwable ex) {
-				if (owningTx && writer instanceof Tx t) {
-					this.closeTransactionInternal(t, false);
-				}
-				throw ex;
-			}
-			if (owningTx && writer instanceof Tx t) {
-				this.closeTransactionInternal(t, true);
 			}
 			return result;
 		} catch (Exception ex) {
+			if (updateId != 0L && !(ex instanceof RocksDBRetryException)) {
+				closeTransaction(updateId, false);
+			}
 			if (ex instanceof RocksDBException rocksDBException) {
 				throw rocksDBException;
 			} else {
@@ -3493,10 +3549,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			throws org.rocksdb.RocksDBException {
 		if (tx != null) {
 			byte[] previousRawBucketByteArray;
+			byte[] calculatedKeyArray = calculatedKey.toByteArray();
 			if (tx.isFromGetForUpdate()) {
-				previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKey.toByteArray(), true);
+				previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 			} else {
-				previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKey.toByteArray());
+				previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKeyArray);
 			}
 			return toBuf(previousRawBucketByteArray);
 		} else {
