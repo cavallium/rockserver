@@ -14,6 +14,7 @@ import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.util.NamedThreadFactory;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RequestType.RequestEntriesCount;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestGetRange;
@@ -1505,6 +1506,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
 			return put(tx, col, updateId, keys, value, requestType);
+		} catch (RocksDBRetryException ex) {
+			throw ex;
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -1535,6 +1538,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
 			return delete(tx, col, updateId, keys, requestType);
+		} catch (RocksDBRetryException ex) {
+			throw ex;
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -1565,6 +1570,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
 			return merge(tx, col, updateId, keys, value, requestType);
+		} catch (RocksDBRetryException ex) {
+			throw ex;
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -1573,6 +1580,137 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			ops.endOp();
 			var end = System.nanoTime();
 			putTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	@Override
+	public <T> List<T> deleteMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keysList,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		var start = System.nanoTime();
+		try {
+			actionLogger.logAction("deleteMulti (begin)",
+					start,
+					columnId,
+					keysList.size(),
+					0,
+					transactionOrUpdateId,
+					null,
+					null,
+					requestType
+			);
+
+			var col = getColumn(columnId);
+			Tx tx;
+			if (transactionOrUpdateId != 0) {
+				tx = getTransaction(transactionOrUpdateId, true);
+			} else {
+				tx = null;
+			}
+			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
+
+			if (updateId != 0) {
+				return deleteMultiWithUpdateId(tx, updateId, col, keysList, requestType);
+			}
+
+			List<T> responses =
+					requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+			for (int i = 0; i < keysList.size(); i++) {
+				var keys = keysList.get(i);
+				actionLogger.logAction("deleteMulti (next)",
+						start,
+						columnId,
+						keys,
+						null,
+						transactionOrUpdateId,
+						null,
+						null,
+						requestType
+				);
+				T result = delete(tx, col, 0L, keys, requestType);
+				if (responses != null) {
+					responses.add(result);
+				}
+			}
+			return responses != null ? responses : List.of();
+		} catch (RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+		} finally {
+			var end = System.nanoTime();
+			putMultiTimer.record(end - start, TimeUnit.NANOSECONDS); // Re-use putMultiTimer
+		}
+	}
+
+	private <T> List<T> deleteMultiWithUpdateId(Tx tx,
+			long updateId,
+			ColumnInstance col,
+			List<Keys> keysList,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		try {
+			boolean committedOwnedTx;
+			List<T> responses;
+			do {
+				boolean savePointSet = false;
+				try {
+					tx.val().setSavePoint();
+					savePointSet = true;
+				} catch (org.rocksdb.RocksDBException e) {
+					// Handle case where setSavePoint might not be supported or fails
+					logger.debug("Failed to set savepoint", e);
+				}
+				responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+				try {
+					for (int i = 0; i < keysList.size(); i++) {
+						var keys = keysList.get(i);
+						T result = delete(tx, col, 0L, keys, requestType);
+						if (responses != null) {
+							responses.add(result);
+						}
+					}
+
+					boolean committed = closeTransaction(updateId, true);
+					if (!committed) {
+						if (savePointSet) {
+							try {
+								tx.val().rollbackToSavePoint();
+							} catch (org.rocksdb.RocksDBException | AssertionError e) {
+								logger.debug("Failed to rollback to savepoint during commit failure in deleteMultiWithUpdateId", e);
+							}
+						}
+						closeTransaction(updateId, false);
+						throw new RocksDBRetryException();
+					}
+					committedOwnedTx = true;
+				} catch (RocksDBRetryException e) {
+					if (savePointSet) {
+						try {
+							tx.val().rollbackToSavePoint();
+						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
+							logger.debug("Failed to rollback to savepoint during retry in deleteMultiWithUpdateId", ex);
+						}
+					}
+					throw e;
+				} catch (Throwable t) {
+					if (savePointSet) {
+						try {
+							tx.val().rollbackToSavePoint();
+						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
+							logger.debug("Failed to rollback to savepoint during error in deleteMultiWithUpdateId", ex);
+						}
+					}
+					throw t;
+				}
+			} while (!committedOwnedTx);
+			return responses != null ? responses : List.of();
+		} catch (RocksDBRetryException e) {
+			throw e;
+		} catch (Throwable t) {
+			closeTransaction(updateId, false);
+			if (t instanceof RocksDBException r) throw r;
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, t);
 		}
 	}
 
@@ -1598,6 +1736,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				throw new IllegalArgumentException(
 						"keys length is different than values length: " + keysList.size() + " != " + valueList.size());
 			}
+
+			var col = getColumn(columnId);
+			Tx tx;
+			if (transactionOrUpdateId != 0) {
+				tx = getTransaction(transactionOrUpdateId, true);
+			} else {
+				tx = null;
+			}
+			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
+
+			if (updateId != 0) {
+				return putMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
+			}
+
 			List<T> responses =
 					requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
 			for (int i = 0; i < keysList.size(); i++) {
@@ -1613,15 +1765,94 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						null,
 						requestType
 				);
-				var result = put(transactionOrUpdateId, columnId, keys, value, requestType);
+				T result = put(tx, col, 0L, keys, value, requestType);
 				if (responses != null) {
 					responses.add(result);
 				}
 			}
 			return responses != null ? responses : List.of();
+		} catch (RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		} finally {
 			var end = System.nanoTime();
 			putMultiTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	private <T> List<T> putMultiWithUpdateId(Tx tx,
+			long updateId,
+			ColumnInstance col,
+			List<Keys> keysList,
+			List<Buf> valueList,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		try {
+			boolean committedOwnedTx;
+			List<T> responses;
+			do {
+				boolean savePointSet = false;
+				try {
+					tx.val().setSavePoint();
+					savePointSet = true;
+				} catch (org.rocksdb.RocksDBException e) {
+					logger.debug("Failed to set savepoint", e);
+				}
+				responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+				try {
+					for (int i = 0; i < keysList.size(); i++) {
+						var keys = keysList.get(i);
+						var value = valueList.get(i);
+						T result = put(tx, col, 0L, keys, value, requestType);
+						if (responses != null) {
+							responses.add(result);
+						}
+					}
+
+					boolean committed = closeTransaction(updateId, true);
+					if (!committed) {
+						if (savePointSet) {
+							try {
+								tx.val().rollbackToSavePoint();
+							} catch (org.rocksdb.RocksDBException | AssertionError e) {
+								logger.debug("Failed to rollback to savepoint during commit failure in putMultiWithUpdateId", e);
+							}
+						}
+						closeTransaction(updateId, false);
+						// We don't know which keys were locked internally by put() because we passed updateId=0 to it.
+						// However, if we are here, it means we are in an updateId transaction.
+						// Conflict happened during commit.
+						// We must throw retry exception so the caller can retry.
+						throw new RocksDBRetryException();
+					}
+					committedOwnedTx = true;
+				} catch (RocksDBRetryException e) {
+					if (savePointSet) {
+						try {
+							tx.val().rollbackToSavePoint();
+						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
+							logger.debug("Failed to rollback to savepoint during retry in putMultiWithUpdateId", ex);
+						}
+					}
+					throw e;
+				} catch (Throwable t) {
+					if (savePointSet) {
+						try {
+							tx.val().rollbackToSavePoint();
+						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
+							logger.debug("Failed to rollback to savepoint during error in putMultiWithUpdateId", ex);
+						}
+					}
+					throw t;
+				}
+			} while (!committedOwnedTx);
+			return responses != null ? responses : List.of();
+		} catch (RocksDBRetryException e) {
+			throw e;
+		} catch (Throwable t) {
+			closeTransaction(updateId, false);
+			if (t instanceof RocksDBException r) throw r;
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, t);
 		}
 	}
 
@@ -1647,6 +1878,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				throw new IllegalArgumentException(
 						"keys length is different than values length: " + keysList.size() + " != " + valueList.size());
 			}
+
+			var col = getColumn(columnId);
+			Tx tx;
+			if (transactionOrUpdateId != 0) {
+				tx = getTransaction(transactionOrUpdateId, true);
+			} else {
+				tx = null;
+			}
+			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
+
+			if (updateId != 0) {
+				return mergeMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
+			}
+
 			List<T> responses =
 					requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
 			for (int i = 0; i < keysList.size(); i++) {
@@ -1662,15 +1907,90 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						null,
 						requestType
 				);
-				var result = merge(transactionOrUpdateId, columnId, keys, value, requestType);
+				T result = merge(tx, col, 0L, keys, value, requestType);
 				if (responses != null) {
 					responses.add(result);
 				}
 			}
 			return responses != null ? responses : List.of();
+		} catch (RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 		} finally {
 			var end = System.nanoTime();
 			putMultiTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	private <T> List<T> mergeMultiWithUpdateId(Tx tx,
+			long updateId,
+			ColumnInstance col,
+			List<Keys> keysList,
+			List<Buf> valueList,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		try {
+			boolean committedOwnedTx;
+			List<T> responses;
+			do {
+				boolean savePointSet = false;
+				try {
+					tx.val().setSavePoint();
+					savePointSet = true;
+				} catch (org.rocksdb.RocksDBException e) {
+					logger.debug("Failed to set savepoint", e);
+				}
+				responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+				try {
+					for (int i = 0; i < keysList.size(); i++) {
+						var keys = keysList.get(i);
+						var value = valueList.get(i);
+						T result = merge(tx, col, 0L, keys, value, requestType);
+						if (responses != null) {
+							responses.add(result);
+						}
+					}
+
+					boolean committed = closeTransaction(updateId, true);
+					if (!committed) {
+						if (savePointSet) {
+							try {
+								tx.val().rollbackToSavePoint();
+							} catch (org.rocksdb.RocksDBException | AssertionError e) {
+								logger.debug("Failed to rollback to savepoint during commit failure in mergeMultiWithUpdateId", e);
+							}
+						}
+						closeTransaction(updateId, false);
+						throw new RocksDBRetryException();
+					}
+					committedOwnedTx = true;
+				} catch (RocksDBRetryException e) {
+					if (savePointSet) {
+						try {
+							tx.val().rollbackToSavePoint();
+						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
+							logger.debug("Failed to rollback to savepoint during retry in mergeMultiWithUpdateId", ex);
+						}
+					}
+					throw e;
+				} catch (Throwable t) {
+					if (savePointSet) {
+						try {
+							tx.val().rollbackToSavePoint();
+						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
+							logger.debug("Failed to rollback to savepoint during error in mergeMultiWithUpdateId", ex);
+						}
+					}
+					throw t;
+				}
+			} while (!committedOwnedTx);
+			return responses != null ? responses : List.of();
+		} catch (RocksDBRetryException e) {
+			throw e;
+		} catch (Throwable t) {
+			closeTransaction(updateId, false);
+			if (t instanceof RocksDBException r) throw r;
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, t);
 		}
 	}
 
@@ -1976,7 +2296,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							for (var ref : refs) {
 								try {
 									ref.close();
-								} catch (Exception ignored) {
+								} catch (Exception ex) {
+									logger.debug("Failed to close resource in MergeBatch", ex);
 								}
 							}
 						}
@@ -2265,7 +2586,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (updateId != 0L) {
 						boolean committed = closeTransaction(updateId, true);
 						if (!committed) {
-							((Tx) newTx).val().rollbackToSavePoint();
+							try {
+								((Tx) newTx).val().rollbackToSavePoint();
+							} catch (org.rocksdb.RocksDBException | AssertionError e) {
+								logger.debug("Failed to rollback to savepoint during commit failure in put", e);
+							}
 							int undosCount = 0;
 							if (((Tx) newTx).isFromGetForUpdate()) {
 								undosCount++;
@@ -2428,7 +2753,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (updateId != 0L) {
 						boolean committed = closeTransaction(updateId, true);
 						if (!committed) {
-							((Tx) newTx).val().rollbackToSavePoint();
+							try {
+								((Tx) newTx).val().rollbackToSavePoint();
+							} catch (org.rocksdb.RocksDBException | AssertionError e) {
+								logger.debug("Failed to rollback to savepoint during commit failure in delete", e);
+							}
 							int undosCount = 0;
 							if (((Tx) newTx).isFromGetForUpdate()) {
 								undosCount++;
@@ -2565,7 +2894,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (updateId != 0L) {
 						boolean committed = closeTransaction(updateId, true);
 						if (!committed) {
-							((Tx) newTx).val().rollbackToSavePoint();
+							try {
+								((Tx) newTx).val().rollbackToSavePoint();
+							} catch (org.rocksdb.RocksDBException | AssertionError e) {
+								logger.debug("Failed to rollback to savepoint during commit failure in merge", e);
+							}
 							int undosCount = 0;
 							if (((Tx) newTx).isFromGetForUpdate()) {
 								undosCount++;

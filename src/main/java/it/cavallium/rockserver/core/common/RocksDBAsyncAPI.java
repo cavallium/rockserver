@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.common;
 
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteMulti;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
@@ -122,6 +123,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 			@NotNull Keys keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
 		return requestAsync(new Delete<>(transactionOrUpdateId, columnId, keys, requestType));
+	}
+
+	/** See: {@link DeleteMulti}. */
+	default <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		return requestAsync(new DeleteMulti<>(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
 	/** See: {@link Merge}. */

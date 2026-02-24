@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Stream;
 
@@ -161,6 +162,14 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public <T> List<T> deleteMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		return db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType);
+	}
+
+	@Override
 	public <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
@@ -176,6 +185,20 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull List<@NotNull Buf> values,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
 		return db.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType);
+	}
+
+	@Override
+	public <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		return CompletableFuture.supplyAsync(() -> {
+			try {
+				return db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType);
+			} catch (RocksDBException e) {
+				throw new RuntimeException(e);
+			}
+		}, (java.util.concurrent.Executor) db.getScheduler().write()::schedule);
 	}
 
 	@Override

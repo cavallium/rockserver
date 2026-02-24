@@ -310,6 +310,50 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			}
 		}
 		/**
+		 * Delete multiple elements from the specified positions
+		 *
+		 * @param transactionOrUpdateId transaction id, update id, or 0
+		 * @param columnId              column id
+		 * @param keys                  multiple lists of column keys
+		 * @param requestType           the request type determines which type of data will be returned.
+		 */
+		record DeleteMulti<T>(long transactionOrUpdateId, long columnId,
+											 @NotNull List<Keys> keys,
+											 RequestDelete<? super Buf, T> requestType) implements RocksDBAPICommandSingle<List<T>> {
+
+			@Override
+			public List<T> handleSync(RocksDBSyncAPI api) {
+				return api.deleteMulti(transactionOrUpdateId, columnId, keys, requestType);
+			}
+
+			@Override
+			public CompletableFuture<List<T>> handleAsync(RocksDBAsyncAPI api) {
+				return api.deleteMultiAsync(transactionOrUpdateId, columnId, keys, requestType);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
+			@Override
+			public String toString() {
+				var sb = new StringBuilder("DELETE_MULTI");
+				if (transactionOrUpdateId != 0) {
+					sb.append(" tx:").append(transactionOrUpdateId);
+				}
+				sb.append(" column:").append(columnId);
+				sb.append(" expected:").append(requestType.getRequestTypeId());
+				sb.append(" multi:[");
+				for (int i = 0; i < keys.size(); i++) {
+					if (i > 0) sb.append(",");
+					sb.append(" keys:").append(keys.get(i));
+				}
+				sb.append("]");
+				return sb.toString();
+			}
+		}
+		/**
 		 * Put multiple elements into the specified positions
 		 *
 		 * @param transactionOrUpdateId transaction id, update id, or 0

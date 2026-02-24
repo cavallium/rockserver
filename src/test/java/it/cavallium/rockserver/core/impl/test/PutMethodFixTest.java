@@ -655,6 +655,133 @@ database: {
 		assertBufEquals(Buf.wrap("A,B,C".getBytes(StandardCharsets.UTF_8)), result);
 	}
 
+	// ==================== Multi-operation tests ====================
+
+	@Test
+	void putMulti_success() {
+		var keys = List.of(makeKey(10, 1, 1), makeKey(10, 1, 2));
+		var values = List.of(toBufSimple(101), toBufSimple(102));
+
+		db.putMulti(0, colIdNoBuckets, keys, values, RequestType.none());
+
+		assertBufEquals(values.get(0), db.get(0, colIdNoBuckets, keys.get(0), RequestType.current()));
+		assertBufEquals(values.get(1), db.get(0, colIdNoBuckets, keys.get(1), RequestType.current()));
+	}
+
+	@Test
+	void putMultiConcurrentUpdate_retrySucceeds() {
+		var key1 = makeKey(11, 1, 1);
+		var key2 = makeKey(11, 1, 2);
+		var v1_initial = toBufSimple(1);
+		var v2_initial = toBufSimple(2);
+
+		db.put(0, colIdNoBuckets, key1, v1_initial, RequestType.none());
+		db.put(0, colIdNoBuckets, key2, v2_initial, RequestType.none());
+
+		var fu1 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu2 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+
+		// Writer 1 updates key 1
+		db.put(fu1.updateId(), colIdNoBuckets, key1, toBufSimple(10), RequestType.none());
+
+		// Writer 2 tries putMulti on key 1 and key 2, should fail due to key 1 conflict
+		try {
+			db.putMulti(fu2.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(toBufSimple(11), toBufSimple(22)), RequestType.none());
+			Assertions.fail("Should have thrown RocksDBRetryException");
+		} catch (RocksDBRetryException e) {
+			// Expected
+		}
+
+		// Writer 2 retries - since the previous updateId was closed on failure, we need a fresh one.
+		var fu3 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		db.putMulti(fu3.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(toBufSimple(111), toBufSimple(222)), RequestType.none());
+
+		assertBufEquals(toBufSimple(111), db.get(0, colIdNoBuckets, key1, RequestType.current()));
+		assertBufEquals(toBufSimple(222), db.get(0, colIdNoBuckets, key2, RequestType.current()));
+	}
+
+	@Test
+	void deleteMulti_success() {
+		var keys = List.of(makeKey(12, 1, 1), makeKey(12, 1, 2));
+		db.put(0, colIdNoBuckets, keys.get(0), toBufSimple(1), RequestType.none());
+		db.put(0, colIdNoBuckets, keys.get(1), toBufSimple(2), RequestType.none());
+
+		db.deleteMulti(0, colIdNoBuckets, keys, RequestType.none());
+
+		Assertions.assertNull(db.get(0, colIdNoBuckets, keys.get(0), RequestType.current()));
+		Assertions.assertNull(db.get(0, colIdNoBuckets, keys.get(1), RequestType.current()));
+	}
+
+	@Test
+	void deleteMultiConcurrentUpdate_retrySucceeds() {
+		var key1 = makeKey(13, 1, 1);
+		var key2 = makeKey(13, 1, 2);
+		db.put(0, colIdNoBuckets, key1, toBufSimple(1), RequestType.none());
+		db.put(0, colIdNoBuckets, key2, toBufSimple(2), RequestType.none());
+
+		var fu1 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu2 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+
+		// Writer 1 updates key 1
+		db.put(fu1.updateId(), colIdNoBuckets, key1, toBufSimple(10), RequestType.none());
+
+		// Writer 2 tries deleteMulti, should fail
+		try {
+			db.deleteMulti(fu2.updateId(), colIdNoBuckets, List.of(key1, key2), RequestType.none());
+			Assertions.fail("Should have thrown RocksDBRetryException");
+		} catch (RocksDBRetryException e) {
+			// Expected
+		}
+
+		// Writer 2 retries - since the previous updateId was closed on failure, we need a fresh one.
+		var fu3 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		db.deleteMulti(fu3.updateId(), colIdNoBuckets, List.of(key1, key2), RequestType.none());
+
+		Assertions.assertNull(db.get(0, colIdNoBuckets, key1, RequestType.current()));
+		Assertions.assertNull(db.get(0, colIdNoBuckets, key2, RequestType.current()));
+	}
+
+	@Test
+	void mergeMulti_success() {
+		var keys = List.of(makeKey(14, 1, 1), makeKey(14, 1, 2));
+		db.put(0, colIdNoBuckets, keys.get(0), Buf.wrap("A1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.put(0, colIdNoBuckets, keys.get(1), Buf.wrap("B1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+
+		db.mergeMulti(0, colIdNoBuckets, keys, List.of(Buf.wrap("A2".getBytes(StandardCharsets.UTF_8)), Buf.wrap("B2".getBytes(StandardCharsets.UTF_8))), RequestType.none());
+
+		assertBufEquals(Buf.wrap("A1,A2".getBytes(StandardCharsets.UTF_8)), db.get(0, colIdNoBuckets, keys.get(0), RequestType.current()));
+		assertBufEquals(Buf.wrap("B1,B2".getBytes(StandardCharsets.UTF_8)), db.get(0, colIdNoBuckets, keys.get(1), RequestType.current()));
+	}
+
+	@Test
+	void mergeMultiConcurrentUpdate_retrySucceeds() {
+		var key1 = makeKey(15, 1, 1);
+		var key2 = makeKey(15, 1, 2);
+		db.put(0, colIdNoBuckets, key1, Buf.wrap("A".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.put(0, colIdNoBuckets, key2, Buf.wrap("B".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+
+		var fu1 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu2 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+
+		// Writer 1 updates key 1
+		db.put(fu1.updateId(), colIdNoBuckets, key1, Buf.wrap("A_new".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+
+		// Writer 2 tries mergeMulti, should fail
+		try {
+			db.mergeMulti(fu2.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(Buf.wrap("A2".getBytes(StandardCharsets.UTF_8)), Buf.wrap("B2".getBytes(StandardCharsets.UTF_8))), RequestType.none());
+			Assertions.fail("Should have thrown RocksDBRetryException");
+		} catch (RocksDBRetryException e) {
+			// Expected
+		}
+
+		// Writer 2 retries - since the previous updateId was closed on failure, we need a fresh one.
+		var fu3 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		db.mergeMulti(fu3.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(Buf.wrap("A3".getBytes(StandardCharsets.UTF_8)), Buf.wrap("B3".getBytes(StandardCharsets.UTF_8))), RequestType.none());
+
+		assertBufEquals(Buf.wrap("A_new,A3".getBytes(StandardCharsets.UTF_8)), db.get(0, colIdNoBuckets, key1, RequestType.current()));
+		assertBufEquals(Buf.wrap("B,B3".getBytes(StandardCharsets.UTF_8)), db.get(0, colIdNoBuckets, key2, RequestType.current()));
+	}
+
 	@Test
 	void concurrentDeleteWithPrevious_noBuckets_multiThreaded() throws Exception {
 		var key = makeKey(10, 10, 10);
