@@ -2010,11 +2010,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					mode
 			);
 			var cf = new CompletableFuture<Void>();
-			Flux
-					.from(batchPublisher)
-					.subscribeOn(scheduler.write())
-					.publishOn(scheduler.write())
-					.subscribe(new Subscriber<>() {
+			var subscriber = new Subscriber<KVBatch>() {
 						private boolean stopped;
 						private Subscription subscription;
 						private ColumnInstance col;
@@ -2065,17 +2061,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									put(writer, col, 0, keys, value, RequestType.none());
 									if (writer instanceof WB wb) {
 										if (wb.wb().count() >= 10000 || wb.wb().getDataSize() >= 4194304) {
-											wb.writePending();
-											wb.wb().clear();
+											wb.flushAndReset();
 										}
 									}
 								}
 							} catch (RocksDBException ex) {
-								doFinally();
 								cf.completeExceptionally(ex);
 								return;
 							} catch (Throwable ex) {
-								doFinally();
 								var ex2 = RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 								cf.completeExceptionally(ex2);
 								return;
@@ -2086,55 +2079,53 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						@Override
 						public void onError(Throwable throwable) {
 							cf.completeExceptionally(throwable);
-							doFinally();
 						}
 
 						@Override
 						public void onComplete() {
 							try {
-								try {
-									switch (writer) {
-										case WB wb -> {
-											if (wb.wb().count() > 0) {
-												wb.writePending();
-											}
-										}
-										case SSTWriter sst -> {
-											if (sst.fileSize() > 0) {
-												sst.writePending();
-											}
-										}
-										case null, default -> {
-											if (writer != null) {
-												writer.writePending();
-											}
+								switch (writer) {
+									case WB wb -> {
+										if (wb.wb().count() > 0) {
+											wb.writePending();
 										}
 									}
-								} catch (Throwable ex) {
-									cf.completeExceptionally(ex);
-									return;
+									case SSTWriter sst -> {
+										if (sst.fileSize() > 0) {
+											sst.writePending();
+										}
+									}
+									case null, default -> {
+										if (writer != null) {
+											writer.writePending();
+										}
+									}
 								}
-								cf.complete(null);
-							} finally {
-								doFinally();
+							} catch (Throwable ex) {
+								cf.completeExceptionally(ex);
+								return;
 							}
+							cf.complete(null);
 						}
 
-						private void doFinally() {
+						public void doFinally() {
 							try {
+								if (stopped) return;
 								stopped = true;
-								for (int i = refs.size() - 1; i >= 0; i--) {
-									try {
-										var c = refs.get(i);
-										if (c instanceof AbstractImmutableNativeReference fr) {
-											if (fr.isOwningHandle()) {
+								if (refs != null) {
+									for (int i = refs.size() - 1; i >= 0; i--) {
+										try {
+											var c = refs.get(i);
+											if (c instanceof AbstractImmutableNativeReference fr) {
+												if (fr.isOwningHandle()) {
+													c.close();
+												}
+											} else {
 												c.close();
 											}
-										} else {
-											c.close();
+										} catch (Exception ex) {
+											logger.error("Failed to close reference during batch write", ex);
 										}
-									} catch (Exception ex) {
-										logger.error("Failed to close reference during batch write", ex);
 									}
 								}
 							} finally {
@@ -2143,7 +2134,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
 							}
 						}
-					});
+					};
+			Flux
+					.from(batchPublisher)
+					.subscribeOn(scheduler.write())
+					.publishOn(scheduler.write())
+					.doFinally(signal -> subscriber.doFinally())
+					.subscribe(subscriber);
 			return cf;
 		} catch (RocksDBException ex) {
 			var end = System.nanoTime();
@@ -2179,7 +2176,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			);
 			var cf = new CompletableFuture<Void>();
 			Flux<KVBatch> source = Flux.from(batchPublisher).subscribeOn(scheduler.write()).publishOn(scheduler.write());
-			AdaptiveBatcher.buffer(source, 128, 4096, Duration.ofMillis(10)).subscribe(new Subscriber<>() {
+			var subscriber = new Subscriber<List<KVBatch>>() {
 				private boolean stopped;
 				private Subscription subscription;
 				private ColumnInstance col;
@@ -2260,18 +2257,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								}
 								if (writer instanceof WB wb) {
 									if (wb.wb().count() >= 10000 || wb.wb().getDataSize() >= 4194304) {
-										wb.writePending();
-										wb.wb().clear();
+										wb.flushAndReset();
 									}
 								}
 							}
 						}
 					} catch (RocksDBException ex) {
-						doFinally();
 						cf.completeExceptionally(ex);
 						return;
 					} catch (Throwable ex) {
-						doFinally();
 						var ex2 = RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 						cf.completeExceptionally(ex2);
 						return;
@@ -2282,7 +2276,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				@Override
 				public void onError(Throwable throwable) {
 					cf.completeExceptionally(throwable);
-					doFinally();
 				}
 
  			@Override
@@ -2307,12 +2300,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						cf.complete(null);
 					} catch (Throwable ex) {
 						cf.completeExceptionally(ex);
-					} finally {
-						doFinally();
 					}
 				}
 
- 			private void doFinally() {
+ 			public void doFinally() {
 					if (!stopped) {
 						stopped = true;
 						ops.endOp();
@@ -2330,7 +2321,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						}
 					}
 				}
-			});
+			};
+			AdaptiveBatcher.buffer(source, 128, 4096, Duration.ofMillis(10))
+					.doFinally(signal -> subscriber.doFinally())
+					.subscribe(subscriber);
 			return cf;
 		} catch (RocksDBException ex) {
 			throw ex;

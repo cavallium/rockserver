@@ -332,8 +332,17 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 					+ count + " != " + allValues.size());
 		}
 
-		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L) {
-			return putBatchAsync(columnId, Flux.just(new KVBatchRef(allKeys, allValues)), PutBatchMode.WRITE_BATCH)
+		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L && count > 1000) {
+			Flux<KVBatch> batchPublisher = Flux.create(sink -> {
+				int totalSize = allKeys.size();
+				int partitionSize = 5000;
+				for (int i = 0; i < totalSize; i += partitionSize) {
+					int end = Math.min(totalSize, i + partitionSize);
+					sink.next(new KVBatchRef(allKeys.subList(i, end), allValues.subList(i, end)));
+				}
+				sink.complete();
+			});
+			return putBatchAsync(columnId, batchPublisher, PutBatchMode.WRITE_BATCH)
 					.thenApply(_ -> List.of());
 		}
 
@@ -392,8 +401,17 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 					+ count + " != " + allValues.size());
 		}
 
-		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L) {
-			return mergeBatchAsync(columnId, Flux.just(new KVBatchRef(allKeys, allValues)), it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH)
+		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L && count > 1000) {
+			Flux<KVBatch> batchPublisher = Flux.create(sink -> {
+				int totalSize = allKeys.size();
+				int partitionSize = 5000;
+				for (int i = 0; i < totalSize; i += partitionSize) {
+					int end = Math.min(totalSize, i + partitionSize);
+					sink.next(new KVBatchRef(allKeys.subList(i, end), allValues.subList(i, end)));
+				}
+				sink.complete();
+			});
+			return mergeBatchAsync(columnId, batchPublisher, it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH)
 					.thenApply(_ -> List.of());
 		}
 
