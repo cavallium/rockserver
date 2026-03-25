@@ -2063,6 +2063,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									var value = valueIt.next();
 									actionLogger.logAction("PutBatch (next)", start, columnId, keys, value, null, null, null, mode);
 									put(writer, col, 0, keys, value, RequestType.none());
+									if (writer instanceof WB wb) {
+										if (wb.wb().count() >= 10000 || wb.wb().getDataSize() >= 4194304) {
+											wb.writePending();
+											wb.wb().clear();
+										}
+									}
 								}
 							} catch (RocksDBException ex) {
 								doFinally();
@@ -2087,7 +2093,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						public void onComplete() {
 							try {
 								try {
-									writer.writePending();
+									switch (writer) {
+										case WB wb -> {
+											if (wb.wb().count() > 0) {
+												wb.writePending();
+											}
+										}
+										case SSTWriter sst -> {
+											if (sst.fileSize() > 0) {
+												sst.writePending();
+											}
+										}
+										case null, default -> {
+											if (writer != null) {
+												writer.writePending();
+											}
+										}
+									}
 								} catch (Throwable ex) {
 									cf.completeExceptionally(ex);
 									return;
@@ -2236,13 +2258,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									case SSTWriter ignored -> pendingSstEntries.add(Map.entry(keys, value));
 									default -> merge(writer, col, 0L, keys, value, RequestType.none());
 								}
-							}
-						}
-						// Flush WB immediately after processing the group of batches
-						if (writer instanceof WB wb) {
-							if (wb.wb().count() > 0) {
-								wb.writePending();
-								wb.wb().clear();
+								if (writer instanceof WB wb) {
+									if (wb.wb().count() >= 10000 || wb.wb().getDataSize() >= 4194304) {
+										wb.writePending();
+										wb.wb().clear();
+									}
+								}
 							}
 						}
 					} catch (RocksDBException ex) {
@@ -2276,7 +2297,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							case Tx tx -> closeTransactionInternal(tx, true);
 							case SSTWriter sst -> {
 								writeSstEntries(col, sst, pendingSstEntries, mode == MergeBatchMode.MERGE_SST_INGEST_BEHIND);
-								sst.writePending();
+								if (sst.fileSize() > 0) {
+									sst.writePending();
+								}
 							}
 							case null -> {
 							}
