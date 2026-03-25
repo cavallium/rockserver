@@ -2268,7 +2268,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				public void onComplete() {
 					try {
 						switch (writer) {
-							case WB wb -> wb.writePending();
+							case WB wb -> {
+								if (wb.wb().count() > 0) {
+									wb.writePending();
+								}
+							}
 							case Tx tx -> closeTransactionInternal(tx, true);
 							case SSTWriter sst -> {
 								writeSstEntries(col, sst, pendingSstEntries, mode == MergeBatchMode.MERGE_SST_INGEST_BEHIND);
