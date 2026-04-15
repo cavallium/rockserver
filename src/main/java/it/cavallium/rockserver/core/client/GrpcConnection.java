@@ -333,16 +333,20 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}
 
 		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L && count > 1000) {
-			Flux<KVBatch> batchPublisher = Flux.create(sink -> {
-				int totalSize = allKeys.size();
-				int partitionSize = 5000;
-				for (int i = 0; i < totalSize; i += partitionSize) {
-					int end = Math.min(totalSize, i + partitionSize);
-					sink.next(new KVBatchRef(allKeys.subList(i, end), allValues.subList(i, end)));
-				}
-				sink.complete();
-			});
-			return putBatchAsync(columnId, batchPublisher, PutBatchMode.WRITE_BATCH)
+			return Flux.range(0, (count + 999) / 1000)
+					.concatMap(i -> {
+						int start = i * 1000;
+						int end = Math.min(count, start + 1000);
+						return Mono.fromFuture(() -> putMultiAsync(
+								transactionOrUpdateId,
+								columnId,
+								allKeys.subList(start, end),
+								allValues.subList(start, end),
+								requestType
+						));
+					})
+					.then()
+					.toFuture()
 					.thenApply(_ -> List.of());
 		}
 
@@ -402,16 +406,20 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}
 
 		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L && count > 1000) {
-			Flux<KVBatch> batchPublisher = Flux.create(sink -> {
-				int totalSize = allKeys.size();
-				int partitionSize = 5000;
-				for (int i = 0; i < totalSize; i += partitionSize) {
-					int end = Math.min(totalSize, i + partitionSize);
-					sink.next(new KVBatchRef(allKeys.subList(i, end), allValues.subList(i, end)));
-				}
-				sink.complete();
-			});
-			return mergeBatchAsync(columnId, batchPublisher, it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH)
+			return Flux.range(0, (count + 999) / 1000)
+					.concatMap(i -> {
+						int start = i * 1000;
+						int end = Math.min(count, start + 1000);
+						return Mono.fromFuture(() -> mergeMultiAsync(
+								transactionOrUpdateId,
+								columnId,
+								allKeys.subList(start, end),
+								allValues.subList(start, end),
+								requestType
+						));
+					})
+					.then()
+					.toFuture()
 					.thenApply(_ -> List.of());
 		}
 
