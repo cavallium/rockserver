@@ -40,7 +40,6 @@ module rockserver.core {
 	requires vertx.rx.java3;
 	requires io.reactivex.rxjava3;
 	requires micrometer.jvm.extras;
-	requires org.checkerframework.checker.qual;
 	requires java.desktop;
 	requires java.sql;
 	requires org.mongodb.bson;

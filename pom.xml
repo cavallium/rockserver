@@ -11,16 +11,16 @@
   <properties>
     <revision>1.0.0-SNAPSHOT</revision>
     <maven.compiler.release>25</maven.compiler.release>
-    <native.maven.plugin.version>0.10.3</native.maven.plugin.version>
-    <gestalt.version>0.36.0</gestalt.version>
-    <rocksdb.version>10.8.3</rocksdb.version>
-    <slf4j.version>2.0.16</slf4j.version>
+    <native.maven.plugin.version>0.10.6</native.maven.plugin.version>
+    <gestalt.version>0.37.2</gestalt.version>
+    <rocksdb.version>10.10.1.1</rocksdb.version>
+    <slf4j.version>2.0.17</slf4j.version>
     <imageName>rockserver-core</imageName>
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
     <protobuf-plugin.version>0.6.1</protobuf-plugin.version>
-    <protobuf.version>3.25.5</protobuf.version>
-    <grpc.version>1.69.1</grpc.version>
-    <netty.version>4.2.3.Final</netty.version>
+    <protobuf.version>3.25.8</protobuf.version>
+    <grpc.version>1.80.0</grpc.version>
+    <netty.version>4.2.12.Final</netty.version>
     <rainbowgum.version>0.8.2</rainbowgum.version>
   </properties>
 
@@ -78,14 +78,14 @@
       <dependency>
         <groupId>io.micrometer</groupId>
         <artifactId>micrometer-bom</artifactId>
-        <version>1.15.2</version>
+        <version>1.15.11</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
       <dependency>
         <groupId>org.mockito</groupId>
         <artifactId>mockito-bom</artifactId>
-        <version>5.19.0</version>
+        <version>5.23.0</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
@@ -127,7 +127,7 @@
     <dependency>
       <groupId>org.jetbrains</groupId>
       <artifactId>annotations</artifactId>
-      <version>26.0.2</version>
+      <version>26.1.0</version>
       <scope>compile</scope>
     </dependency>
     <dependency>
@@ -206,7 +206,7 @@
     <dependency>
       <groupId>io.netty</groupId>
       <artifactId>netty-tcnative-boringssl-static</artifactId>
-      <version>2.0.70.Final</version>
+      <version>2.0.75.Final</version>
     </dependency>
     <dependency>
       <groupId>io.grpc</groupId>
@@ -238,7 +238,7 @@
     <dependency>
       <groupId>io.projectreactor</groupId>
       <artifactId>reactor-core</artifactId>
-      <version>3.7.12</version>
+      <version>3.7.18</version>
     </dependency>
     <dependency>
       <groupId>com.salesforce.servicelibs</groupId>
@@ -276,12 +276,12 @@
     <dependency>
       <groupId>io.vertx</groupId>
       <artifactId>vertx-core</artifactId>
-      <version>5.0.1</version>
+      <version>5.0.10</version>
     </dependency>
     <dependency>
       <groupId>io.vertx</groupId>
       <artifactId>vertx-rx-java3</artifactId>
-      <version>5.0.1</version>
+      <version>5.0.10</version>
     </dependency>
 
     <dependency>
@@ -293,13 +293,13 @@
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
-      <version>5.10.3</version>
+      <version>5.14.3</version>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>io.projectreactor</groupId>
       <artifactId>reactor-test</artifactId>
-      <version>3.7.12</version>
+      <version>3.7.18</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -316,7 +316,7 @@
     <dependency>
       <groupId>org.mongodb</groupId>
       <artifactId>bson</artifactId>
-      <version>5.5.1</version>
+      <version>5.6.5</version>
     </dependency>
   </dependencies>
 
@@ -335,14 +335,14 @@
       <extension>
         <groupId>kr.motd.maven</groupId>
         <artifactId>os-maven-plugin</artifactId>
-        <version>1.6.1</version>
+        <version>1.7.1</version>
       </extension>
     </extensions>
     <plugins>
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
-        <version>3.0.0</version>
+        <version>3.5.0</version>
         <executions>
           <execution>
             <id>java</id>
@@ -358,7 +358,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.13.0</version>
+        <version>3.14.0</version>
         <configuration>
           <release>${maven.compiler.release}</release>
         </configuration>
@@ -368,13 +368,13 @@
       </plugin>
       <plugin>
         <artifactId>maven-failsafe-plugin</artifactId>
-        <version>3.3.1</version>
+        <version>3.5.3</version>
       </plugin>
 
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
-        <version>3.4.1</version>
+        <version>3.4.2</version>
         <configuration>
           <archive>
             <manifest>
@@ -448,7 +448,7 @@
           <plugin>
             <groupId>org.codehaus.mojo</groupId>
             <artifactId>build-helper-maven-plugin</artifactId>
-            <version>3.4.0</version>
+            <version>3.6.0</version>
             <executions>
               <execution>
                 <id>add-source</id>
@@ -468,7 +468,7 @@
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-shade-plugin</artifactId>
-            <version>3.4.1</version>
+            <version>3.6.0</version>
             <configuration>
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
@@ -497,7 +497,7 @@
           <plugin>
             <groupId>org.codehaus.mojo</groupId>
             <artifactId>build-helper-maven-plugin</artifactId>
-            <version>3.5.0</version>
+            <version>3.6.0</version>
             <executions>
               <execution>
                 <id>add-source</id>
@@ -566,7 +566,7 @@
           <plugin>
             <groupId>org.codehaus.mojo</groupId>
             <artifactId>build-helper-maven-plugin</artifactId>
-            <version>3.4.0</version>
+            <version>3.6.0</version>
             <executions>
               <execution>
                 <id>add-source</id>
