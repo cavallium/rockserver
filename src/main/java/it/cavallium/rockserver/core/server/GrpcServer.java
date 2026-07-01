@@ -1207,11 +1207,21 @@ public class GrpcServer extends Server {
 		LOG.info("GRPC server is shutting down...");
 		server.shutdown();
 		try {
-			server.awaitTermination();
+			if (!server.awaitTermination(1, TimeUnit.MINUTES)) {
+				server.shutdownNow();
+				server.awaitTermination(1, TimeUnit.MINUTES);
+			}
 		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
 			LOG.error("Server shutdown interrupted", e);
+			server.shutdownNow();
 		}
-		elg.close();
+		try {
+			elg.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync();
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			LOG.error("Grpc server event loop shutdown interrupted", e);
+		}
 		scheduler.disposeGracefully().timeout(Duration.ofMinutes(2)).onErrorResume(ex -> {
 			LOG.error("Grpc server executor shutdown timed out, terminating...", ex);
 			scheduler.dispose();

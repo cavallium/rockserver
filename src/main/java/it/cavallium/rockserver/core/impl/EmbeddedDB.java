@@ -2262,6 +2262,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								}
 							}
 						}
+						if (writer instanceof WB wb && wb.wb().count() > 0) {
+							wb.flushAndReset();
+						}
 					} catch (RocksDBException ex) {
 						cf.completeExceptionally(ex);
 						return;
@@ -3623,6 +3626,147 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private final class ScanState implements AutoCloseable {
+		private final ColumnInstance col;
+		private final LiveFileMetaData file;
+		private final SstFileReader reader;
+		private final SstFileReaderIterator it;
+		private final ReadOptions readOptions;
+		private final Options options;
+		private boolean closed = false;
+		private final Buf outBuf = Buf.create(Math.toIntExact(SizeUnit.MB));
+
+		private ScanState(ColumnInstance col, String cfName, LiveFileMetaData file) throws org.rocksdb.RocksDBException {
+			this.col = col;
+			this.file = file;
+			ColumnFamilyOptions cfOpts = columnsConifg.get(cfName);
+			this.options = cfOpts != null ? new Options(dbOptions, cfOpts) : new Options();
+			this.options.setAllowMmapReads(true);
+			this.options.setUseDirectReads(false);
+			this.options.setUseDirectIoForFlushAndCompaction(false);
+			this.options.setParanoidChecks(false);
+
+			this.reader = new SstFileReader(options);
+			String filePath = file.path();
+			if (!filePath.endsWith(".sst")) {
+				filePath = filePath + file.fileName();
+			}
+
+			ReadOptions tmpReadOptions = null;
+			SstFileReaderIterator tmpIt = null;
+			try {
+				this.reader.open(filePath);
+				tmpReadOptions = new ReadOptions()
+						.setFillCache(false)
+						.setIgnoreRangeDeletions(true)
+						.setVerifyChecksums(true)
+						.setReadaheadSize(8 * SizeUnit.MB);
+
+				tmpIt = reader.newIterator(tmpReadOptions);
+				tmpIt.seekToFirst();
+			} catch (org.rocksdb.RocksDBException e) {
+				if (e.getMessage() != null && e.getMessage().contains("No such file or directory")) {
+					logger.debug("SST file missing during scan (ignoring): " + file.fileName());
+				} else {
+					logger.warn("Failed to open SST file: " + file.fileName(), e);
+					this.reader.close();
+					this.options.close();
+					throw e;
+				}
+			}
+			this.readOptions = tmpReadOptions;
+			this.it = tmpIt;
+		}
+
+		private synchronized void generateNext(SynchronousSink<SerializedKVBatch> sink) {
+			if (closed) {
+				sink.complete();
+				return;
+			}
+			if (it == null) {
+				sink.complete();
+				return;
+			}
+			if (!it.isValid()) {
+				try {
+					it.status();
+				} catch (org.rocksdb.RocksDBException e) {
+					sink.error(e);
+					return;
+				}
+				sink.complete();
+				return;
+			}
+
+			int batchSize = 0;
+			int currentBatchBytes = 0;
+			int currentSerializedBatchBytes = Integer.BYTES;
+
+			try {
+				while (it.isValid()) {
+					if (closed) return;
+					batchSize++;
+					byte[] k = it.key();
+					byte[] v = it.value();
+					var kBuf = Buf.wrap(k);
+					var vBuf = Buf.wrap(v);
+					currentBatchBytes += k.length + v.length;
+
+					currentSerializedBatchBytes += col.transcodeBatchKeys(kBuf, vBuf, currentSerializedBatchBytes, outBuf);
+
+					if (col.schema().hasValue()) {
+						Buf userValue = col.decodeValue(vBuf);
+						var valLen = userValue.size();
+						ensureCapacity(outBuf, currentSerializedBatchBytes, Integer.BYTES);
+						outBuf.setIntLE(currentSerializedBatchBytes, valLen);
+						currentSerializedBatchBytes += Integer.BYTES;
+						if (valLen > 0) {
+							ensureCapacity(outBuf, currentSerializedBatchBytes, valLen);
+							outBuf.setBytesFromBuf(currentSerializedBatchBytes, userValue, 0, valLen);
+							currentSerializedBatchBytes += userValue.size();
+						}
+					} else {
+						ensureCapacity(outBuf, currentSerializedBatchBytes, Integer.BYTES);
+						outBuf.setIntLE(currentSerializedBatchBytes, 0);
+						currentSerializedBatchBytes += Integer.BYTES;
+					}
+
+					it.next();
+					if (batchSize >= 65536 || currentBatchBytes >= 2 * SizeUnit.MB) {
+						break;
+					}
+				}
+			} catch (Exception e) {
+				sink.error(e);
+				return;
+			}
+
+			if (batchSize > 0) {
+				outBuf.setIntLE(0, batchSize);
+				sink.next(new SerializedKVBatch.SerializedKVBatchRef(outBuf.copyOfRange(0, currentSerializedBatchBytes)));
+			} else {
+				try {
+					it.status();
+				} catch (org.rocksdb.RocksDBException e) {
+					sink.error(e);
+					return;
+				}
+				sink.complete();
+			}
+		}
+
+		@Override
+		public synchronized void close() {
+			if (!closed) {
+				closed = true;
+				if (it != null) it.close();
+				if (readOptions != null) readOptions.close();
+				reader.close();
+				options.close();
+			}
+		}
+	}
+
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId, int shardIndex, int shardCount) {
 		return Flux.defer(() -> {
 			ColumnInstance col = getColumn(columnId);
@@ -3636,144 +3780,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			List<LiveFileMetaData> files = getDb().get().getLiveFilesMetaData();
 
 			Function<LiveFileMetaData, Publisher<SerializedKVBatch>> mapper = f -> {
-				class ScanState implements AutoCloseable {
-					private final SstFileReader reader;
-					private final SstFileReaderIterator it;
-					private final ReadOptions readOptions;
-					private final Options options;
-					private boolean closed = false;
-					private final Buf outBuf = Buf.create(Math.toIntExact(SizeUnit.MB));
-
-					public ScanState() throws org.rocksdb.RocksDBException {
-						ColumnFamilyOptions cfOpts = columnsConifg.get(cfName);
-						this.options = cfOpts != null ? new Options(dbOptions, cfOpts) : new Options();
-						this.options.setAllowMmapReads(true);
-						this.options.setUseDirectReads(false);
-						this.options.setUseDirectIoForFlushAndCompaction(false);
-						this.options.setParanoidChecks(false);
-
-						this.reader = new SstFileReader(options);
-						String filePath = f.path();
-						if (!filePath.endsWith(".sst")) {
-							filePath = filePath + f.fileName();
-						}
-
-						ReadOptions tmpReadOptions = null;
-						SstFileReaderIterator tmpIt = null;
-						try {
-							this.reader.open(filePath);
-							tmpReadOptions = new ReadOptions()
-									.setFillCache(false)
-									.setIgnoreRangeDeletions(true)
-									.setVerifyChecksums(true)
-									.setReadaheadSize(8 * SizeUnit.MB);
-
-							tmpIt = reader.newIterator(tmpReadOptions);
-							tmpIt.seekToFirst();
-						} catch (org.rocksdb.RocksDBException e) {
-							if (e.getMessage() != null && e.getMessage().contains("No such file or directory")) {
-								logger.debug("SST file missing during scan (ignoring): " + f.fileName());
-							} else {
-								logger.warn("Failed to open SST file: " + f.fileName(), e);
-								this.options.close();
-								throw e;
-							}
-						}
-						this.readOptions = tmpReadOptions;
-						this.it = tmpIt;
-					}
-
-					public synchronized void generateNext(SynchronousSink<SerializedKVBatch> sink) {
-						if (closed) {
-							sink.complete();
-							return;
-						}
-						if (it == null) {
-							sink.complete();
-							return;
-						}
-						if (!it.isValid()) {
-							try {
-								it.status();
-							} catch (org.rocksdb.RocksDBException e) {
-								sink.error(e);
-								return;
-							}
-							sink.complete();
-							return;
-						}
-
-						int batchSize = 0;
-						int currentBatchBytes = 0;
-						int currentSerializedBatchBytes = Integer.BYTES;
-
-						try {
-							while (it.isValid()) {
-								if (closed) return;
-								batchSize++;
-								byte[] k = it.key();
-								byte[] v = it.value();
-								var kBuf = Buf.wrap(k);
-								var vBuf = Buf.wrap(v);
-								currentBatchBytes += k.length + v.length;
-
-								currentSerializedBatchBytes += col.transcodeBatchKeys(kBuf, vBuf, currentSerializedBatchBytes, outBuf);
-
-								if (col.schema().hasValue()) {
-									Buf userValue = col.decodeValue(vBuf);
-									var valLen = userValue.size();
-									ensureCapacity(outBuf, currentSerializedBatchBytes, Integer.BYTES);
-									outBuf.setIntLE(currentSerializedBatchBytes, valLen);
-									currentSerializedBatchBytes += Integer.BYTES;
-									if (valLen > 0) {
-										ensureCapacity(outBuf, currentSerializedBatchBytes, valLen);
-										outBuf.setBytesFromBuf(currentSerializedBatchBytes, userValue, 0, valLen);
-										currentSerializedBatchBytes += userValue.size();
-									}
-								} else {
-									ensureCapacity(outBuf, currentSerializedBatchBytes, Integer.BYTES);
-									outBuf.setIntLE(currentSerializedBatchBytes, 0);
-									currentSerializedBatchBytes += Integer.BYTES;
-								}
-
-								it.next();
-								if (batchSize >= 65536 || currentBatchBytes >= 2 * SizeUnit.MB) {
-									break;
-								}
-							}
-						} catch (Exception e) {
-							sink.error(e);
-							return;
-						}
-
-						if (batchSize > 0) {
-							outBuf.setIntLE(0, batchSize);
-							sink.next(new SerializedKVBatch.SerializedKVBatchRef(outBuf.copyOfRange(0, currentSerializedBatchBytes)));
-						} else {
-							try {
-								it.status();
-							} catch (org.rocksdb.RocksDBException e) {
-								sink.error(e);
-								return;
-							}
-							sink.complete();
-						}
-					}
-
-					@Override
-					public synchronized void close() {
-						if (!closed) {
-							closed = true;
-							if (it != null) it.close();
-							if (readOptions != null) readOptions.close();
-							if (reader != null) reader.close();
-							if (options != null) options.close();
-						}
-					}
-				}
-
 				return Flux.<SerializedKVBatch, ScanState>generate(
-						ScanState::new,
+						() -> new ScanState(col, cfName, f),
 						(state, sink) -> {
 							state.generateNext(sink);
 							return state;
@@ -3817,7 +3825,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			actionLogger.logAction("Flush", start, null, null, null, null, null, null, null);
 			db.get().flushWal(true);
-			try (var fo = new FlushOptions()) {
+			try (var fo = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
 				db
 						.get()
 						.flush(fo,
@@ -4299,6 +4307,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final boolean preserveKeys;
 		// Fix: Track the exact op index where we hit the limit
 		private int limitReachedAtOpIndex = -1;
+		private final boolean allowOversizedFirstEvent;
 
 		int getProducedCount() {
 			return produced;
@@ -4313,13 +4322,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return seenOps;
 		}
 
+		long getAccumulatedBytes() {
+			return accumulatedBytes;
+		}
+
 		EventCollector(List<CDCEvent> out,
 				@Nullable it.unimi.dsi.fastutil.longs.LongSet filter,
 				long walSeq,
 				int skipFirstOps,
 				long maxToProduce,
 				long maxBytes,
-				boolean preserveKeys) {
+				boolean preserveKeys,
+				boolean allowOversizedFirstEvent) {
 			this.out = out;
 			this.filter = filter;
 			this.walSeq = walSeq;
@@ -4327,6 +4341,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.maxToProduce = maxToProduce;
 			this.maxBytes = maxBytes;
 			this.preserveKeys = preserveKeys;
+			this.allowOversizedFirstEvent = allowOversizedFirstEvent;
 		}
 
 		private void trackAndMaybeEmitByCfId(int columnFamilyId, byte[] key, @Nullable byte[] value, CDCEvent.Op op) {
@@ -4367,7 +4382,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			long eventSize = (long)finalKey.length + (value != null ? value.length : 0);
 			// Check byte limit. Allow at least one event even if it exceeds limit to ensure progress.
-			if (produced > 0 && accumulatedBytes + eventSize > maxBytes) {
+			if ((!allowOversizedFirstEvent || produced > 0) && accumulatedBytes + eventSize > maxBytes) {
 				limitReachedAtOpIndex = seenOps - 1; // Stop BEFORE processing this op
 				return;
 			}
@@ -4500,6 +4515,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			List<CDCEvent> result = new ArrayList<>((int) Math.min(1024, effectiveMax));
 			long nextSeq = startSeq;
+			long accumulatedBytes = 0;
 
 			db.get().flushWal(true);
 
@@ -4551,8 +4567,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									batchWalSeq,
 									skipOps,
 									effectiveMax - result.size(),
-									CDC_MAX_BYTES_PER_POLL,
-									meta.emitLatestValues
+									CDC_MAX_BYTES_PER_POLL - accumulatedBytes,
+									meta.emitLatestValues,
+									result.isEmpty()
 							);
 							//noinspection resource
 							try {
@@ -4560,6 +4577,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							} catch (Exception e) {
 								throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Failed to parse WriteBatch at seq " + batchWalSeq, e);
 							}
+							accumulatedBytes += handler.getAccumulatedBytes();
 
 							int stopIndex = handler.getLimitReachedAtOpIndex();
 
@@ -4574,7 +4592,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									nextSeq = composeCdcSeq(batchWalSeq, handler.getSeenOps());
 								}
 
+							if (stopIndex != -1) {
+								break;
+							}
 							if (result.size() >= effectiveMax) {
+								break;
+							}
+							if (accumulatedBytes >= CDC_MAX_BYTES_PER_POLL && !result.isEmpty()) {
 								break;
 							}
 

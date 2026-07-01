@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import java.util.ArrayList;
 import java.util.List;
+import org.rocksdb.AbstractImmutableNativeReference;
 
 public class RocksDBObjects implements AutoCloseable {
 	private final List<AutoCloseable> refs;
@@ -32,7 +33,11 @@ public class RocksDBObjects implements AutoCloseable {
 		RuntimeException exception = null;
 		for (int i = refs.size() - 1; i >= 0; i--) {
 			try {
-				refs.get(i).close();
+				var ref = refs.get(i);
+				if (ref instanceof AbstractImmutableNativeReference nativeRef && !nativeRef.isOwningHandle()) {
+					continue;
+				}
+				ref.close();
 			} catch (Exception e) {
 				if (exception == null) {
 					exception = new RuntimeException(e);

@@ -472,8 +472,8 @@ public class RocksDBLoader {
                 options.setManualWalFlush(true);
             }
 
-            options.setAvoidFlushDuringShutdown(false); // Flush all WALs during shutdown
-            options.setAvoidFlushDuringRecovery(true); // Flush all WALs during startup
+            options.setAvoidFlushDuringShutdown(true); // Do not start memtable flush work from DB close; WAL is flushed explicitly.
+            options.setAvoidFlushDuringRecovery(false); // Flush replayed WAL data to SST during open/recovery.
             options.setWalRecoveryMode(databaseOptions.global().absoluteConsistency()
                     ? WALRecoveryMode.AbsoluteConsistency
                     : WALRecoveryMode.PointInTimeRecovery); // Crash if the WALs are corrupted.Default: TolerateCorruptedTailRecords
@@ -706,9 +706,18 @@ public class RocksDBLoader {
 
             var handles = new ArrayList<ColumnFamilyHandle>();
             RocksDB db;
+            boolean envRegistered = false;
             // a factory method that returns a RocksDB instance
             if (databaseOptions.global().optimistic()) {
-                db = OptimisticTransactionDB.open(rocksdbOptions, definitiveDbPath.toString(), descriptors, handles);
+                RocksDBEnvLifecycle.beforeOpen(rocksdbOptions.getEnv());
+                envRegistered = true;
+                try {
+                    db = OptimisticTransactionDB.open(rocksdbOptions, definitiveDbPath.toString(), descriptors, handles);
+                } catch (RocksDBException | RuntimeException ex) {
+                    RocksDBEnvLifecycle.openFailed();
+                    envRegistered = false;
+                    throw ex;
+                }
             } else {
                 var transactionOptions = new TransactionDBOptions() {
                   {
@@ -719,12 +728,20 @@ public class RocksDBLoader {
                     .setTransactionLockTimeout(5000)
                     .setDefaultLockTimeout(5000);
                 refs.add(transactionOptions);
-                db = TransactionDB.open(rocksdbOptions,
-                    transactionOptions,
-                    definitiveDbPath.toString(),
-                    descriptors,
-                    handles
-                );
+                RocksDBEnvLifecycle.beforeOpen(rocksdbOptions.getEnv());
+                envRegistered = true;
+                try {
+                    db = TransactionDB.open(rocksdbOptions,
+                        transactionOptions,
+                        definitiveDbPath.toString(),
+                        descriptors,
+                        handles
+                    );
+                } catch (RocksDBException | RuntimeException ex) {
+                    RocksDBEnvLifecycle.openFailed();
+                    envRegistered = false;
+                    throw ex;
+                }
             }
 
 					handles.forEach(refs::add);
@@ -741,7 +758,15 @@ public class RocksDBLoader {
 
             var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
             var dbTasks = new DatabaseTasks(db, inMemory, delayWalFlushConfig);
-            return new LoadedDb(TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks), path, definitiveDbPath, rocksdbOptions, definitiveColumnFamilyOptionsMap, mergeOperators, refs, optionsWithCache.standardCache());
+            try {
+                var transactionalDB = TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks);
+                envRegistered = false;
+                return new LoadedDb(transactionalDB, path, definitiveDbPath, rocksdbOptions, definitiveColumnFamilyOptionsMap, mergeOperators, refs, optionsWithCache.standardCache());
+            } finally {
+                if (envRegistered) {
+                    RocksDBEnvLifecycle.openFailed();
+                }
+            }
         } catch (IOException | RocksDBException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_LOAD_ERROR, "Failed to load rocksdb", ex);
         } catch (GestaltException e) {

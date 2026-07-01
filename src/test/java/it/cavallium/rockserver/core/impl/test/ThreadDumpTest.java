@@ -30,9 +30,10 @@ public class ThreadDumpTest {
             Thread t = entry.getKey();
             if (t.getName().equals("main")) continue; 
             if (t.isDaemon()) continue;
+            boolean ignored = isTestInfrastructureThread(t);
 
-            foundNonDaemon = true;
-            dump.append("Thread: ").append(t.getName()).append(" ID:").append(t.getId()).append("\n");
+            foundNonDaemon |= !ignored;
+            dump.append(ignored ? "Ignored thread: " : "Thread: ").append(t.getName()).append(" ID:").append(t.getId()).append("\n");
             dump.append("State: ").append(t.getState()).append("\n");
             for (StackTraceElement ste : entry.getValue()) {
                 dump.append("\t").append(ste.toString()).append("\n");
@@ -46,5 +47,12 @@ public class ThreadDumpTest {
         if (foundNonDaemon) {
              throw new RuntimeException("Found non-daemon threads! See thread_dump.txt");
         }
+    }
+
+    private static boolean isTestInfrastructureThread(Thread thread) {
+        String name = thread.getName();
+        return name.startsWith("junit")
+                || name.startsWith("surefire")
+                || name.startsWith("Test worker");
     }
 }

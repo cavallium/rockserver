@@ -6,10 +6,9 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import org.rocksdb.AbstractImmutableNativeReference;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
-import org.rocksdb.FlushOptions;
+import org.rocksdb.Env;
 import org.rocksdb.OptimisticTransactionDB;
 import org.rocksdb.OptimisticTransactionOptions;
 import org.rocksdb.RocksDB;
@@ -155,6 +154,8 @@ public sealed interface TransactionalDB extends Closeable {
 				}
 				this.closed = true;
 				List<Exception> exceptions = new ArrayList<>();
+				boolean lastOpenDatabase = RocksDBEnvLifecycle.afterCloseAndIsLast();
+				Env env = null;
 				try {
 					databaseTasks.close();
 				} catch (Exception ex) {
@@ -167,21 +168,17 @@ public sealed interface TransactionalDB extends Closeable {
 				} catch (RocksDBException e) {
 					exceptions.add(e);
 				}
-				try (var options = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
-					if (db.isOwningHandle()) {
-						var openHandles = handles.stream().filter(AbstractImmutableNativeReference::isOwningHandle).toList();
-						db.flush(options, openHandles);
-					}
-				} catch (RocksDBException e) {
-					exceptions.add(e);
-				}
-				db.cancelAllBackgroundWork(true);
 				try {
 					if (db.isOwningHandle()) {
-						db.closeE();
+						env = db.getEnv();
 					}
-				} catch (RocksDBException e) {
-					exceptions.add(e);
+				} catch (Exception ex) {
+					exceptions.add(ex);
+				}
+				try {
+					db.cancelAllBackgroundWork(true);
+				} catch (Exception ex) {
+					exceptions.add(ex);
 				}
 				for (ColumnFamilyHandle handle : handles) {
 					try {
@@ -191,6 +188,16 @@ public sealed interface TransactionalDB extends Closeable {
 					} catch (Exception ex) {
 						exceptions.add(ex);
 					}
+				}
+				try {
+					if (db.isOwningHandle()) {
+						db.closeE();
+					}
+				} catch (RocksDBException e) {
+					exceptions.add(e);
+				}
+				if (lastOpenDatabase && env != null) {
+					RocksDBEnvLifecycle.shutdownThreadPoolsOnLastClose(env, exceptions);
 				}
 				if (!exceptions.isEmpty()) {
 					IOException ex;

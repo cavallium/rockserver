@@ -20,6 +20,7 @@ import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
+import io.netty.channel.EventLoopGroup;
 import io.netty.channel.epoll.EpollDomainSocketChannel;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -90,6 +91,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcConnection.class);
 	private static final Executor DIRECT_EXECUTOR = MoreExecutors.directExecutor();
 	private final ManagedChannel channel;
+	private final EventLoopGroup eventLoopGroup;
 	private final RocksDBServiceStub asyncStub;
 	private final RocksDBServiceFutureStub futureStub;
 	private final ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStub;
@@ -126,17 +128,21 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 								)
 						))
 				));
+		EventLoopGroup eventLoopGroup;
 		if (socketAddress instanceof DomainSocketAddress _) {
+			eventLoopGroup = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
 			channelBuilder
-					.eventLoopGroup(new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2))
+					.eventLoopGroup(eventLoopGroup)
 					.channelType(EpollDomainSocketChannel.class);
 		} else {
+			eventLoopGroup = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
 			channelBuilder
-					.eventLoopGroup(new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2))
+					.eventLoopGroup(eventLoopGroup)
 					.channelType(NioSocketChannel.class);
 		}
 		channelBuilder.intercept(new RetryLoggingInterceptor());
 		this.channel = channelBuilder.build();
+		this.eventLoopGroup = eventLoopGroup;
 		this.asyncStub = RocksDBServiceGrpc.newStub(channel);
 		this.futureStub = RocksDBServiceGrpc.newFutureStub(channel);
 		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
@@ -1078,15 +1084,29 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}
 		try {
 			if (this.channel != null) {
-				this.channel.awaitTermination(1, TimeUnit.MINUTES);
+				if (!this.channel.awaitTermination(1, TimeUnit.MINUTES)) {
+					this.channel.shutdownNow();
+					this.channel.awaitTermination(1, TimeUnit.MINUTES);
+				}
 			}
 		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
 			LOG.error("Failed to wait channel termination", e);
 			try {
 				this.channel.shutdownNow();
 			} catch (Exception ex) {
 				LOG.error("Failed to close channel", ex);
 			}
+		}
+		try {
+			if (this.eventLoopGroup != null) {
+				this.eventLoopGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync();
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			LOG.error("Failed to wait channel event loop termination", e);
+		} catch (Exception ex) {
+			LOG.error("Failed to close channel event loop", ex);
 		}
 	}
 }

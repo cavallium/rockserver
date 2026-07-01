@@ -46,8 +46,22 @@ public class DatabaseTasks implements Closeable {
 
 	@Override
 	public synchronized void close() throws IOException {
-		if (walFlushThread != null) {
-			walFlushThread.interrupt();
+		var thread = walFlushThread;
+		if (thread != null) {
+			walFlushThread = null;
+			thread.interrupt();
+			boolean interrupted = false;
+			while (thread.isAlive()) {
+				try {
+					thread.join();
+				} catch (InterruptedException e) {
+					interrupted = true;
+				}
+			}
+			if (interrupted) {
+				Thread.currentThread().interrupt();
+				throw new IOException("Interrupted while waiting for WAL flush thread to stop");
+			}
 		}
 	}
 }
