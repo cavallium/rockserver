@@ -85,16 +85,19 @@ public class GrpcServer extends Server {
 	private final EventLoopGroup elg;
 	private final io.grpc.Server server;
 	private final RWScheduler scheduler;
+	private final boolean ownsScheduler;
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
 		if (client instanceof InternalConnection internalConnection) {
 			this.scheduler = internalConnection.getScheduler();
+			this.ownsScheduler = false;
 		} else {
 			this.scheduler = new RWScheduler(Runtime.getRuntime().availableProcessors(),
 					Runtime.getRuntime().availableProcessors(),
 					"grpc-db"
 			);
+			this.ownsScheduler = true;
 		}
 		this.grpc = new GrpcServerImpl(this.getClient());
 		EventLoopGroup elg;
@@ -1205,11 +1208,19 @@ public class GrpcServer extends Server {
 	@Override
 	public void close() throws IOException {
 		LOG.info("GRPC server is shutting down...");
+		var gracefulShutdownTimeout = durationProperty("it.cavallium.rockserver.grpc.server.shutdown-graceful-timeout-ms",
+				Duration.ofMinutes(1));
+		var forcedShutdownTimeout = durationProperty("it.cavallium.rockserver.grpc.server.shutdown-forced-timeout-ms",
+				Duration.ofMinutes(1));
+		var schedulerShutdownTimeout = durationProperty("it.cavallium.rockserver.grpc.server.scheduler-shutdown-timeout-ms",
+				Duration.ofMinutes(2));
 		server.shutdown();
 		try {
-			if (!server.awaitTermination(1, TimeUnit.MINUTES)) {
+			if (!server.awaitTermination(gracefulShutdownTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
 				server.shutdownNow();
-				server.awaitTermination(1, TimeUnit.MINUTES);
+				if (!server.awaitTermination(forcedShutdownTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
+					LOG.error("GRPC server did not terminate after forced shutdown");
+				}
 			}
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
@@ -1222,11 +1233,31 @@ public class GrpcServer extends Server {
 			Thread.currentThread().interrupt();
 			LOG.error("Grpc server event loop shutdown interrupted", e);
 		}
-		scheduler.disposeGracefully().timeout(Duration.ofMinutes(2)).onErrorResume(ex -> {
-			LOG.error("Grpc server executor shutdown timed out, terminating...", ex);
-			scheduler.dispose();
-			return Mono.empty();
-		}).block();
+		if (ownsScheduler) {
+			scheduler.disposeGracefully().timeout(schedulerShutdownTimeout).onErrorResume(ex -> {
+				LOG.error("Grpc server executor shutdown timed out, terminating...", ex);
+				scheduler.dispose();
+				return Mono.empty();
+			}).block();
+		}
 		super.close();
+	}
+
+	private static Duration durationProperty(String name, Duration defaultValue) {
+		var value = System.getProperty(name);
+		if (value == null || value.isBlank()) {
+			return defaultValue;
+		}
+		try {
+			long millis = Long.parseLong(value);
+			if (millis < 0) {
+				LOG.warn("Invalid negative duration for system property {}: {}", name, value);
+				return defaultValue;
+			}
+			return Duration.ofMillis(millis);
+		} catch (NumberFormatException ex) {
+			LOG.warn("Invalid duration in milliseconds for system property {}: {}", name, value);
+			return defaultValue;
+		}
 	}
 }

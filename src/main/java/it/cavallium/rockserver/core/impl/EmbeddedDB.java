@@ -123,6 +123,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
 	private static final long ITERATOR_REFRESH_INTERVAL = 1_000_000;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
+	private static final String SHUTDOWN_PENDING_OPS_TIMEOUT_MS_PROPERTY
+			= "it.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms";
 	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
 	private static final byte[] MERGE_OPERATORS_COLUMN = "_merge_operators_".getBytes(StandardCharsets.UTF_8);
 	private static final byte[] CDC_META_COLUMN = "_cdc_meta_".getBytes(StandardCharsets.UTF_8);
@@ -669,16 +671,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private void closeInternal(boolean testing) throws IOException {
-		// Wait for 10 seconds
+		long pendingOpsTimeoutMs = shutdownPendingOpsTimeoutMs();
 		try {
 			logger.info("Closing... waiting for ops");
-			ops.closeAndWait(MAX_TRANSACTION_DURATION_MS);
+			ops.closeAndWait(pendingOpsTimeoutMs);
 			// Normal shutdown path
 			logger.info("Ops finished, closing resources");
 			closeResources(false);
 		} catch (TimeoutException e) {
 			logger.error(
-					"Some operations lasted more than 10 seconds, forcing database shutdown... pendingOps={}, openTxs={}, openIterators={}",
+					"Some operations lasted more than {} ms, forcing database shutdown... pendingOps={}, openTxs={}, openIterators={}",
+					pendingOpsTimeoutMs,
 					ops.getPendingOpsCount(),
 					txs.size(),
 					its.size()
@@ -690,7 +693,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			closeResources(true);
 
 			if (testing && ops.getPendingOpsCount() > 0) {
-				throw new IllegalStateException("Some operations lasted more than 10 seconds! pendingOps=" + ops.getPendingOpsCount() + ", openTxs=" + txs.size() + ", openIterators=" + its.size());
+				throw new IllegalStateException("Some operations lasted more than " + pendingOpsTimeoutMs + " ms! pendingOps=" + ops.getPendingOpsCount() + ", openTxs=" + txs.size() + ", openIterators=" + its.size());
 			}
 		} finally {
 			// Ensure scheduler and leak-scheduler are always torn down
@@ -708,6 +711,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				logger.warn("Failed to shutdown leak scheduler", t);
 			}
 			logger.info("Closed.");
+		}
+	}
+
+	private static long shutdownPendingOpsTimeoutMs() {
+		var value = System.getProperty(SHUTDOWN_PENDING_OPS_TIMEOUT_MS_PROPERTY);
+		if (value == null || value.isBlank()) {
+			return MAX_TRANSACTION_DURATION_MS;
+		}
+		try {
+			return Math.max(0L, Long.parseLong(value));
+		} catch (NumberFormatException ex) {
+			return MAX_TRANSACTION_DURATION_MS;
 		}
 	}
 

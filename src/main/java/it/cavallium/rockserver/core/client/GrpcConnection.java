@@ -90,6 +90,14 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcConnection.class);
 	private static final Executor DIRECT_EXECUTOR = MoreExecutors.directExecutor();
+	private static final String MAX_RETRY_ATTEMPTS_PROPERTY
+			= "it.cavallium.rockserver.grpc.client.max-retry-attempts";
+	private static final String INITIAL_RETRY_BACKOFF_PROPERTY
+			= "it.cavallium.rockserver.grpc.client.initial-retry-backoff";
+	private static final String MAX_RETRY_BACKOFF_PROPERTY
+			= "it.cavallium.rockserver.grpc.client.max-retry-backoff";
+	private static final String RETRY_BACKOFF_MULTIPLIER_PROPERTY
+			= "it.cavallium.rockserver.grpc.client.retry-backoff-multiplier";
 	private final ManagedChannel channel;
 	private final EventLoopGroup eventLoopGroup;
 	private final RocksDBServiceStub asyncStub;
@@ -110,24 +118,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 		channelBuilder
 				.directExecutor()
-				.usePlaintext()
-				.keepAliveTime(30, TimeUnit.SECONDS)
-				.keepAliveTimeout(5, TimeUnit.SECONDS)
-				.keepAliveWithoutCalls(true)
-				.enableRetry()
-				.maxRetryAttempts(Integer.MAX_VALUE)
-				.defaultServiceConfig(Map.of(
-						"methodConfig", List.of(Map.of(
-								"name", List.of(Map.of()),
-								"retryPolicy", Map.of(
-										"maxAttempts", 1000000000.0,
-										"initialBackoff", "0.5s",
-										"maxBackoff", "30s",
-										"backoffMultiplier", 2.0,
-										"retryableStatusCodes", List.of("UNAVAILABLE", "RESOURCE_EXHAUSTED", "ABORTED")
-								)
-						))
-				));
+					.usePlaintext()
+					.keepAliveTime(30, TimeUnit.SECONDS)
+					.keepAliveTimeout(5, TimeUnit.SECONDS)
+					.keepAliveWithoutCalls(true);
+		configureRetry(channelBuilder);
 		EventLoopGroup eventLoopGroup;
 		if (socketAddress instanceof DomainSocketAddress _) {
 			eventLoopGroup = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
@@ -147,6 +142,56 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		this.futureStub = RocksDBServiceGrpc.newFutureStub(channel);
 		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 		this.address = address;
+	}
+
+	private static void configureRetry(NettyChannelBuilder channelBuilder) {
+		int maxAttempts = intProperty(MAX_RETRY_ATTEMPTS_PROPERTY, 5, 1);
+		if (maxAttempts <= 1) {
+			channelBuilder.disableRetry();
+			return;
+		}
+
+		channelBuilder
+				.enableRetry()
+				.maxRetryAttempts(maxAttempts)
+				.defaultServiceConfig(Map.of(
+						"methodConfig", List.of(Map.of(
+								"name", List.of(Map.of()),
+								"retryPolicy", Map.of(
+										"maxAttempts", (double) maxAttempts,
+										"initialBackoff", System.getProperty(INITIAL_RETRY_BACKOFF_PROPERTY, "0.5s"),
+										"maxBackoff", System.getProperty(MAX_RETRY_BACKOFF_PROPERTY, "30s"),
+										"backoffMultiplier", doubleProperty(RETRY_BACKOFF_MULTIPLIER_PROPERTY, 2.0d, 1.0d),
+										"retryableStatusCodes", List.of("UNAVAILABLE", "RESOURCE_EXHAUSTED", "ABORTED")
+								)
+						))
+				));
+	}
+
+	private static int intProperty(String name, int defaultValue, int minValue) {
+		var value = System.getProperty(name);
+		if (value == null || value.isBlank()) {
+			return defaultValue;
+		}
+		try {
+			return Math.max(minValue, Integer.parseInt(value));
+		} catch (NumberFormatException ex) {
+			LOG.warn("Invalid integer value for system property {}: {}", name, value);
+			return defaultValue;
+		}
+	}
+
+	private static double doubleProperty(String name, double defaultValue, double minValue) {
+		var value = System.getProperty(name);
+		if (value == null || value.isBlank()) {
+			return defaultValue;
+		}
+		try {
+			return Math.max(minValue, Double.parseDouble(value));
+		} catch (NumberFormatException ex) {
+			LOG.warn("Invalid double value for system property {}: {}", name, value);
+			return defaultValue;
+		}
 	}
 
 	public static GrpcConnection forHostAndPort(String name, HostAndPort address) {
