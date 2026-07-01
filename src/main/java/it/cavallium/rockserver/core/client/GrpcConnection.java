@@ -32,6 +32,7 @@ import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
+import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
 import it.cavallium.rockserver.core.common.RequestType.RequestExists;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
@@ -298,6 +299,29 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
+	public <T> CompletableFuture<T> deleteAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		if (requestType == null) {
+			throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "requestType");
+		}
+		var request = DeleteRequest.newBuilder()
+				.setTransactionOrUpdateId(transactionOrUpdateId)
+				.setColumnId(columnId)
+				.addAllKeys(mapKeys(keys))
+				.build();
+		return (CompletableFuture<T>) switch (requestType) {
+			case RequestNothing<?> _ -> toResponse(this.futureStub.delete(request), _ -> null);
+			case RequestPrevious<?> _ ->
+					toResponse(this.futureStub.deleteGetPrevious(request), GrpcConnection::mapPrevious);
+			case RequestPreviousPresence<?> _ ->
+					toResponse(this.futureStub.deleteGetPreviousPresence(request), PreviousPresence::getPresent);
+		};
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
 	public <T> CompletableFuture<T> mergeAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
@@ -389,6 +413,51 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 						.map(PreviousPresence::getPresent)
 						.collectList()
 						.toFuture());
+		});
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> allKeys,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		if (requestType == null) {
+			throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "requestType");
+		}
+
+		var initialRequest = DeleteMultiRequest.newBuilder()
+				.setInitialRequest(DeleteMultiInitialRequest.newBuilder()
+						.setTransactionOrUpdateId(transactionOrUpdateId)
+						.setColumnId(columnId)
+						.build())
+				.build();
+
+		Mono<DeleteMultiRequest> initialRequestMono = Mono.just(initialRequest);
+		Flux<DeleteMultiRequest> dataRequestsFlux = Flux.fromIterable(allKeys)
+				.map(keys -> DeleteMultiRequest.newBuilder()
+						.setData(DeleteRequest.newBuilder()
+								.addAllKeys(mapKeys(keys))
+								.build())
+						.build());
+		var inputRequests = initialRequestMono.concatWith(dataRequestsFlux);
+
+		return (CompletableFuture<List<T>>) (switch (requestType) {
+			case RequestNothing<?> _ ->
+					toResponse(this.reactiveStub.deleteMulti(inputRequests)
+							.ignoreElement()
+							.toFuture())
+							.thenApply(_ -> List.of());
+			case RequestPrevious<?> _ ->
+					toResponse(this.reactiveStub.deleteMultiGetPrevious(inputRequests)
+							.collect(() -> new ArrayList<@Nullable Buf>(),
+									(list, value) -> list.add(GrpcConnection.mapPrevious(value)))
+							.toFuture());
+			case RequestPreviousPresence<?> _ ->
+					toResponse(this.reactiveStub.deleteMultiGetPreviousPresence(inputRequests)
+							.map(PreviousPresence::getPresent)
+							.collectList()
+							.toFuture());
 		});
 	}
 

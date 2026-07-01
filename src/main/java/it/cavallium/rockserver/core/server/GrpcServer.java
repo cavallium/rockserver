@@ -35,6 +35,7 @@ import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
+import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
 import it.cavallium.rockserver.core.common.RequestType.RequestExists;
 import it.cavallium.rockserver.core.common.RequestType.RequestForUpdate;
@@ -218,6 +219,18 @@ public class GrpcServer extends Server {
 		}
 
 		@Override
+		public Mono<Empty> delete(DeleteRequest request) {
+			return executeSync(() -> {
+				api.delete(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getKeysCount(), request::getKeys),
+						new RequestNothing<>()
+				);
+				return Empty.getDefaultInstance();
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("delete", request));
+		}
+
+		@Override
 		public Mono<Empty> merge(MergeRequest request) {
 			return executeSync(() -> {
 				api.merge(request.getTransactionOrUpdateId(),
@@ -321,8 +334,105 @@ public class GrpcServer extends Server {
   			} else {
   				return requestFlux;
   			}
-  		}).then(Mono.just(Empty.getDefaultInstance()));
-  	}
+			}).then(Mono.just(Empty.getDefaultInstance()));
+		}
+
+		@Override
+		public Mono<Empty> deleteMulti(Flux<DeleteMultiRequest> request) {
+			return request.switchOnFirst((firstSignal, requestsFlux) -> {
+				if (firstSignal.isOnNext()) {
+					var firstValue = firstSignal.get();
+					assert firstValue != null;
+					if (!firstValue.hasInitialRequest()) {
+						return Mono.<Empty>error(RocksDBException.of(
+								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+					}
+					var initialRequest = firstValue.getInitialRequest();
+					var dataFlux = requestsFlux
+							.skip(1)
+							.map(deleteRequest -> {
+								if (!deleteRequest.hasData()) {
+									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Multiple initial requests");
+								}
+								return deleteRequest.getData();
+							});
+					return deleteMultiDataFlux(initialRequest, dataFlux, "deleteMulti");
+				} else if (firstSignal.isOnComplete()) {
+					return Mono.error(RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+				} else {
+					return requestsFlux;
+				}
+			}).then(Mono.just(Empty.getDefaultInstance()));
+		}
+
+		@Override
+		public Flux<Previous> deleteMultiGetPrevious(Flux<DeleteMultiRequest> request) {
+			return deleteMultiResponseFlux(request, "deleteMultiGetPrevious", new RequestPrevious<>(), previous -> {
+				var builder = Previous.newBuilder();
+				if (previous != null) {
+					builder.setPrevious(Utils.toByteString(previous));
+				}
+				return builder.build();
+			});
+		}
+
+		@Override
+		public Flux<PreviousPresence> deleteMultiGetPreviousPresence(Flux<DeleteMultiRequest> request) {
+			return deleteMultiResponseFlux(request,
+					"deleteMultiGetPreviousPresence",
+					new RequestPreviousPresence<>(),
+					present -> PreviousPresence.newBuilder().setPresent(present).build());
+		}
+
+		private Mono<Empty> deleteMultiDataFlux(DeleteMultiInitialRequest initialRequest,
+				Flux<DeleteRequest> dataFlux,
+				String requestName) {
+			return dataFlux
+					.publishOn(scheduler.write())
+					.doOnNext(data -> api.delete(initialRequest.getTransactionOrUpdateId(),
+							initialRequest.getColumnId(),
+							mapKeys(data.getKeysCount(), data::getKeys),
+							new RequestNothing<>()))
+					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
+					.then(Mono.just(Empty.getDefaultInstance()));
+		}
+
+		private <T, R> Flux<R> deleteMultiResponseFlux(Flux<DeleteMultiRequest> request,
+				String requestName,
+				RequestDelete<? super Buf, T> requestType,
+				Function<T, R> mapper) {
+			return request.switchOnFirst((firstSignal, requestsFlux) -> {
+				if (firstSignal.isOnNext()) {
+					var firstValue = firstSignal.get();
+					assert firstValue != null;
+					if (!firstValue.hasInitialRequest()) {
+						return Flux.error(RocksDBException.of(
+								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+					}
+					var initialRequest = firstValue.getInitialRequest();
+					var dataFlux = requestsFlux
+							.skip(1)
+							.map(deleteRequest -> {
+								if (!deleteRequest.hasData()) {
+									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Multiple initial requests");
+								}
+								return deleteRequest.getData();
+							});
+
+					return dataFlux
+							.publishOn(scheduler.write())
+							.map(data -> mapper.apply(api.delete(initialRequest.getTransactionOrUpdateId(),
+									initialRequest.getColumnId(),
+									mapKeys(data.getKeysCount(), data::getKeys),
+									requestType)))
+							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
+				} else {
+					return Flux.error(RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+				}
+			});
+		}
 
   		@Override
   		public Mono<Merged> mergeGetMerged(MergeRequest request) {
@@ -534,6 +644,34 @@ public class GrpcServer extends Server {
 				);
 				return PreviousPresence.newBuilder().setPresent(present).build();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetPreviousPresence", request));
+		}
+
+		@Override
+		public Mono<Previous> deleteGetPrevious(DeleteRequest request) {
+			return executeSync(() -> {
+				var prev = api.delete(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getKeysCount(), request::getKeys),
+						new RequestPrevious<>()
+				);
+				var prevBuilder = Previous.newBuilder();
+				if (prev != null) {
+					prevBuilder.setPrevious(Utils.toByteString(prev));
+				}
+				return prevBuilder.build();
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteGetPrevious", request));
+		}
+
+		@Override
+		public Mono<PreviousPresence> deleteGetPreviousPresence(DeleteRequest request) {
+			return executeSync(() -> {
+				var present = api.delete(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getKeysCount(), request::getKeys),
+						new RequestPreviousPresence<>()
+				);
+				return PreviousPresence.newBuilder().setPresent(present).build();
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteGetPreviousPresence", request));
 		}
 
 		@Override

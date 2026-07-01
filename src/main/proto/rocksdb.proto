@@ -122,6 +122,8 @@ message GetColumnIdResponse {int64 columnId = 1;}
 
 message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
 
+message DeleteRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3;}
+
 message MergeRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
 
 message PutBatchInitialRequest {int64 columnId = 1; PutBatchMode mode = 2;}
@@ -133,6 +135,9 @@ message MergeBatchRequest {oneof mergeBatchRequestType {MergeBatchInitialRequest
 message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
 message PutMultiRequest {oneof putMultiRequestType {PutMultiInitialRequest initialRequest = 1;KV data = 2;}}
 message PutMultiListRequest {PutMultiInitialRequest initialRequest = 1; repeated KV data = 2;}
+
+message DeleteMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
+message DeleteMultiRequest {oneof deleteMultiRequestType {DeleteMultiInitialRequest initialRequest = 1; DeleteRequest data = 2;}}
 
 message MergeMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
 message MergeMultiRequest {oneof mergeMultiRequestType {MergeMultiInitialRequest initialRequest = 1;KV data = 2;}}
@@ -214,6 +219,12 @@ service RocksDBService {
   rpc putMultiGetChanged(stream PutMultiRequest) returns (stream Changed);
   rpc putGetPreviousPresence(PutRequest) returns (PreviousPresence);
   rpc putMultiGetPreviousPresence(stream PutMultiRequest) returns (stream PreviousPresence);
+  rpc delete(DeleteRequest) returns (google.protobuf.Empty);
+  rpc deleteMulti(stream DeleteMultiRequest) returns (google.protobuf.Empty);
+  rpc deleteGetPrevious(DeleteRequest) returns (Previous);
+  rpc deleteMultiGetPrevious(stream DeleteMultiRequest) returns (stream Previous);
+  rpc deleteGetPreviousPresence(DeleteRequest) returns (PreviousPresence);
+  rpc deleteMultiGetPreviousPresence(stream DeleteMultiRequest) returns (stream PreviousPresence);
   rpc merge(MergeRequest) returns (google.protobuf.Empty);
   rpc mergeBatch(stream MergeBatchRequest) returns (google.protobuf.Empty);
   rpc mergeMulti(stream MergeMultiRequest) returns (google.protobuf.Empty);
