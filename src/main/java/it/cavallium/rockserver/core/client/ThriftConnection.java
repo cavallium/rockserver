@@ -171,6 +171,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public void deleteRange(long columnId, Keys startKeysInclusive, Keys endKeysExclusive) {
+		try {
+			client.deleteRange(columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive));
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@Override
 	public long getColumnId(String name) {
 		try {
 			return client.getColumnId(name);
@@ -472,6 +481,11 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public CompletableFuture<Void> deleteColumnAsync(long columnId) {
 		return CompletableFuture.runAsync(() -> deleteColumn(columnId), executor);
+	}
+
+	@Override
+	public CompletableFuture<Void> deleteRangeAsync(long columnId, Keys startKeysInclusive, Keys endKeysExclusive) {
+		return CompletableFuture.runAsync(() -> deleteRange(columnId, startKeysInclusive, endKeysExclusive), executor);
 	}
 
 	@Override

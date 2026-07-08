@@ -31,6 +31,9 @@ import static org.rocksdb.ColumnFamilyOptionsInterface.DEFAULT_COMPACTION_MEMTAB
 public class RocksDBLoader {
 
     private static final boolean FOLLOW_ROCKSDB_OPTIMIZATIONS = true;
+    private static final long AUTO_MEMTABLE_MAX_RANGE_DELETION_BYTES_PER_TOMBSTONE = 64L * SizeUnit.KB;
+    private static final int AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MIN = 64;
+    private static final int AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MAX = 65_536;
 
     private static final boolean PARANOID_CHECKS
             = Boolean.parseBoolean(System.getProperty("it.cavallium.dbengine.checks.paranoid", "true"));
@@ -167,6 +170,7 @@ public class RocksDBLoader {
                         .map(DataSize::longValue)
                         .orElse(DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET));
             }
+            columnFamilyOptions.setMemtableMaxRangeDeletions(resolveMemtableMaxRangeDeletions(columnOptions));
 
             if (isDisableAutoCompactions()) {
                 columnFamilyOptions.setDisableAutoCompactions(true);
@@ -391,6 +395,38 @@ public class RocksDBLoader {
         } catch (GestaltException ex) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, ex);
         }
+    }
+
+    private static int resolveMemtableMaxRangeDeletions(FallbackColumnConfig columnOptions) throws GestaltException {
+        Integer configured = columnOptions.memtableMaxRangeDeletions();
+        if (configured != null) {
+            if (configured < 0) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "memtable-max-range-deletions must be >= 0");
+            }
+            return configured;
+        }
+
+        long configuredWriteBufferSize = Optional.ofNullable(columnOptions.writeBufferSize())
+                .map(DataSize::longValue)
+                .orElse(0L);
+        long configuredMemtableBudget = Optional.ofNullable(columnOptions.memtableMemoryBudgetBytes())
+                .map(DataSize::longValue)
+                .orElse(DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET);
+        long budget = configuredWriteBufferSize > 0 ? configuredWriteBufferSize : configuredMemtableBudget;
+        if (budget <= 0) {
+            budget = DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET;
+        }
+
+        long autoValue = (budget + AUTO_MEMTABLE_MAX_RANGE_DELETION_BYTES_PER_TOMBSTONE - 1)
+                / AUTO_MEMTABLE_MAX_RANGE_DELETION_BYTES_PER_TOMBSTONE;
+        if (autoValue < AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MIN) {
+            return AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MIN;
+        }
+        if (autoValue > AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MAX) {
+            return AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MAX;
+        }
+        return (int) autoValue;
     }
 
     private static void setZstdCompressionOptions(CompressionOptions compressionOptions) {

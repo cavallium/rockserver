@@ -29,6 +29,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator;
@@ -69,6 +70,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Function;
@@ -104,6 +106,7 @@ import org.rocksdb.SstFileReaderIterator;
 import org.rocksdb.SstFileReader;
 import org.rocksdb.LiveFileMetaData;
 import org.rocksdb.Options;
+import org.rocksdb.OptimisticTransactionDB;
 import org.rocksdb.Status.Code;
 import org.rocksdb.TableProperties;
 import org.rocksdb.util.SizeUnit;
@@ -168,6 +171,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer putTimer;
 	private final Timer putMultiTimer;
 	private final Timer putBatchTimer;
+	private final Timer deleteRangeTimer;
 	private final Timer getTimer;
 	private final Timer openIteratorTimer;
 	private final Timer closeIteratorTimer;
@@ -178,6 +182,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer flushTimer;
 	private final Timer compactTimer;
 	private final Timer getAllColumnDefinitionsTimer;
+	private final AtomicBoolean nativeDeleteRangeFallbackLogged = new AtomicBoolean();
 	private final Counter cdcEventsEmitted;
 	private final Counter cdcBytesEmitted;
 	private final RocksDBStatistics rocksDBStatistics;
@@ -207,6 +212,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.putTimer = createActionTimer(Put.class);
 		this.putMultiTimer = createActionTimer(PutMulti.class);
 		this.putBatchTimer = createActionTimer(PutBatch.class);
+		this.deleteRangeTimer = createActionTimer(DeleteRange.class);
 		this.getTimer = createActionTimer(Get.class);
 		this.openIteratorTimer = createActionTimer(OpenIterator.class);
 		this.closeIteratorTimer = createActionTimer(CloseIterator.class);
@@ -1727,6 +1733,130 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (t instanceof RocksDBException r) throw r;
 			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, t);
 		}
+	}
+
+	@Override
+	public void deleteRange(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive) throws RocksDBException {
+		var start = System.nanoTime();
+		actionLogger.logAction("DeleteRange",
+				start,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				null,
+				null,
+				null,
+				null
+		);
+		ops.beginOp();
+		try {
+			var col = getColumn(columnId);
+			var beginKey = calculateDeleteRangeBeginKey(col, startKeysInclusive);
+			var endKey = calculateDeleteRangeEndKey(col, endKeysExclusive);
+			if (Arrays.compareUnsigned(beginKey, endKey) >= 0) {
+				return;
+			}
+			try {
+				deleteRangeNative(col, beginKey, endKey);
+			} catch (org.rocksdb.RocksDBException e) {
+				if (!isDeleteRangeUnsupported(e)) {
+					throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
+				}
+				if (nativeDeleteRangeFallbackLogged.compareAndSet(false, true)) {
+					logger.warn("Native RocksDB range delete is not supported by this database handle; falling back to batched point deletes. Further deleteRange fallback messages are suppressed");
+				}
+				deleteRangeByIterating(col, beginKey, endKey);
+			}
+		} catch (RocksDBException ex) {
+			throw ex;
+		} catch (Exception ex) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+		} finally {
+			ops.endOp();
+			var end = System.nanoTime();
+			deleteRangeTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	private static boolean isDeleteRangeUnsupported(org.rocksdb.RocksDBException e) {
+		if (e.getStatus() != null && e.getStatus().getCode() == Code.NotSupported) {
+			return true;
+		}
+		String message = e.getMessage();
+		return message != null
+				&& message.contains("DeleteRange")
+				&& (message.contains("not implemented") || message.contains("NotSupported"));
+	}
+
+	private void deleteRangeNative(ColumnInstance col, byte[] beginKey, byte[] endKey) throws org.rocksdb.RocksDBException {
+		var rocks = db.get();
+		if (rocks instanceof OptimisticTransactionDB optimisticTransactionDB) {
+			rocks = optimisticTransactionDB.getBaseDB();
+		}
+		try (var w = new LeakSafeWriteOptions(null); var wb = new LeakSafeWriteBatch()) {
+			wb.deleteRange(col.cfh(), beginKey, endKey);
+			rocks.write(w, wb);
+		}
+	}
+
+	private void deleteRangeByIterating(ColumnInstance col, byte[] beginKey, byte[] endKey) throws RocksDBException {
+		var snapshot = db.get().getSnapshot();
+		try (var ro = newReadOptions("delete-range-fallback-read-options");
+				var startKeySlice = new Slice(beginKey);
+				var endKeySlice = new Slice(endKey)) {
+			ro.setSnapshot(snapshot);
+			ro.setIterateLowerBound(startKeySlice);
+			ro.setIterateUpperBound(endKeySlice);
+			try (var it = db.get().newIterator(col.cfh(), ro); var wb = new LeakSafeWriteBatch()) {
+				int pendingDeletes = 0;
+				it.seekToFirst();
+				while (it.isValid()) {
+					wb.delete(col.cfh(), it.key());
+					pendingDeletes++;
+					if (pendingDeletes >= 10_000) {
+						writeDeleteRangeFallbackBatch(wb);
+						wb.clear();
+						pendingDeletes = 0;
+					}
+					it.next();
+				}
+				if (pendingDeletes > 0) {
+					writeDeleteRangeFallbackBatch(wb);
+				}
+			} catch (org.rocksdb.RocksDBException e) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
+			}
+		} finally {
+			db.get().releaseSnapshot(snapshot);
+		}
+	}
+
+	private void writeDeleteRangeFallbackBatch(LeakSafeWriteBatch wb) throws org.rocksdb.RocksDBException {
+		try (var w = new LeakSafeWriteOptions(null)) {
+			db.get().write(w, wb);
+		}
+	}
+
+	private byte[] calculateDeleteRangeBeginKey(ColumnInstance col, @Nullable Keys startKeysInclusive) {
+		if (startKeysInclusive != null && startKeysInclusive.keys().length > 0) {
+			return col.calculateKey(startKeysInclusive.keys()).toByteArray();
+		}
+		return new byte[0];
+	}
+
+	private byte[] calculateDeleteRangeEndKey(ColumnInstance col, @Nullable Keys endKeysExclusive) {
+		if (endKeysExclusive != null && endKeysExclusive.keys().length > 0) {
+			return col.calculateKey(endKeysExclusive.keys()).toByteArray();
+		}
+		return encodedKeyUpperBound(col.finalKeySizeBytes());
+	}
+
+	private static byte[] encodedKeyUpperBound(int keySizeBytes) {
+		var endKey = new byte[keySizeBytes + 1];
+		Arrays.fill(endKey, 0, keySizeBytes, (byte) 0xff);
+		return endKey;
 	}
 
 	@Override

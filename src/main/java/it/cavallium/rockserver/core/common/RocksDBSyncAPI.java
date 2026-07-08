@@ -16,6 +16,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Delete;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange;
@@ -119,6 +120,13 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 			@NotNull List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
 		return requestSync(new DeleteMulti<>(transactionOrUpdateId, columnId, keys, requestType));
+	}
+
+	/** See: {@link DeleteRange}. */
+	default void deleteRange(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive) throws RocksDBException {
+		requestSync(new DeleteRange(columnId, startKeysInclusive, endKeysExclusive));
 	}
 
 	/** See: {@link Merge}. */

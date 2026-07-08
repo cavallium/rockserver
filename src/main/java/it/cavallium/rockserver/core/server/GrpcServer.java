@@ -234,6 +234,17 @@ public class GrpcServer extends Server {
 		}
 
 		@Override
+		public Mono<Empty> deleteRange(DeleteRangeRequest request) {
+			return executeSync(() -> {
+				api.deleteRange(request.getColumnId(),
+						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive)
+				);
+				return Empty.getDefaultInstance();
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteRange", request));
+		}
+
+		@Override
 		public Mono<Empty> merge(MergeRequest request) {
 			return executeSync(() -> {
 				api.merge(request.getTransactionOrUpdateId(),

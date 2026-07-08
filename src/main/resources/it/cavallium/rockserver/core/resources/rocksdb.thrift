@@ -170,6 +170,8 @@ service RocksDB {
 
    void mergeBatch(1: required i64 columnId, 2: required list<KV> data, 3: required MergeBatchMode mode) throws (1: RocksDBThriftException e),
 
+   void deleteRange(1: required i64 columnId, 2: list<binary> startKeysInclusive, 3: list<binary> endKeysExclusive) throws (1: RocksDBThriftException e),
+
    OptionalBinary mergeGetMerged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
 
    list<OptionalBinary> mergeMultiGetMerged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti) throws (1: RocksDBThriftException e),

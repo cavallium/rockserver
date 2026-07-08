@@ -22,6 +22,9 @@ public interface FallbackColumnConfig {
 	DataSize memtableMemoryBudgetBytes() throws GestaltException;
 
 	@Nullable
+	Integer memtableMaxRangeDeletions() throws GestaltException;
+
+	@Nullable
 	Boolean cacheIndexAndFilterBlocks() throws GestaltException;
 
 	@Nullable

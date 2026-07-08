@@ -109,4 +109,41 @@ public class EmbeddedDBDeleteTest {
         // Verify still non-existent
         Assertions.assertFalse(db.get(0, colId, key, RequestType.exists()));
     }
+
+    @Test
+    public void testDeleteRangeRemovesOnlyKeysInsideBounds() {
+        Keys key1 = new Keys(longToBuf(1L));
+        Keys key2 = new Keys(longToBuf(2L));
+        Keys key3 = new Keys(longToBuf(3L));
+        Keys key4 = new Keys(longToBuf(4L));
+
+        db.put(0, colId, key1, Utils.toBufSimple(10), RequestType.none());
+        db.put(0, colId, key2, Utils.toBufSimple(20), RequestType.none());
+        db.put(0, colId, key3, Utils.toBufSimple(30), RequestType.none());
+        db.put(0, colId, key4, Utils.toBufSimple(40), RequestType.none());
+
+        db.deleteRange(colId, key2, key4);
+
+        Assertions.assertTrue(db.get(0, colId, key1, RequestType.exists()));
+        Assertions.assertFalse(db.get(0, colId, key2, RequestType.exists()));
+        Assertions.assertFalse(db.get(0, colId, key3, RequestType.exists()));
+        Assertions.assertTrue(db.get(0, colId, key4, RequestType.exists()));
+    }
+
+    @Test
+    public void testDeleteRangeSupportsOpenEndedUpperBound() {
+        Keys key1 = new Keys(longToBuf(1L));
+        Keys key2 = new Keys(longToBuf(2L));
+        Keys key3 = new Keys(longToBuf(3L));
+
+        db.put(0, colId, key1, Utils.toBufSimple(10), RequestType.none());
+        db.put(0, colId, key2, Utils.toBufSimple(20), RequestType.none());
+        db.put(0, colId, key3, Utils.toBufSimple(30), RequestType.none());
+
+        db.deleteRange(colId, key2, null);
+
+        Assertions.assertTrue(db.get(0, colId, key1, RequestType.exists()));
+        Assertions.assertFalse(db.get(0, colId, key2, RequestType.exists()));
+        Assertions.assertFalse(db.get(0, colId, key3, RequestType.exists()));
+    }
 }

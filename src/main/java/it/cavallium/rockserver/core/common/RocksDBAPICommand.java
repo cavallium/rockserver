@@ -354,6 +354,41 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			}
 		}
 		/**
+		 * Delete all elements in the encoded key range [startKeysInclusive, endKeysExclusive).
+		 * Null or empty bounds mean the beginning/end of the column.
+		 *
+		 * @param columnId              column id
+		 * @param startKeysInclusive    inclusive lower bound
+		 * @param endKeysExclusive      exclusive upper bound
+		 */
+		record DeleteRange(long columnId,
+						   @Nullable Keys startKeysInclusive,
+						   @Nullable Keys endKeysExclusive) implements RocksDBAPICommandSingle<Void> {
+
+			@Override
+			public Void handleSync(RocksDBSyncAPI api) {
+				api.deleteRange(columnId, startKeysInclusive, endKeysExclusive);
+				return null;
+			}
+
+			@Override
+			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
+				return api.deleteRangeAsync(columnId, startKeysInclusive, endKeysExclusive);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+
+			@Override
+			public String toString() {
+				return "DELETE_RANGE column:" + columnId
+						+ " start:" + startKeysInclusive
+						+ " end:" + endKeysExclusive;
+			}
+		}
+		/**
 		 * Put multiple elements into the specified positions
 		 *
 		 * @param transactionOrUpdateId transaction id, update id, or 0

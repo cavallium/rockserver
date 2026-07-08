@@ -124,6 +124,8 @@ message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data
 
 message DeleteRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3;}
 
+message DeleteRangeRequest {int64 columnId = 1; repeated bytes startKeysInclusive = 2; repeated bytes endKeysExclusive = 3;}
+
 message MergeRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
 
 message PutBatchInitialRequest {int64 columnId = 1; PutBatchMode mode = 2;}
@@ -221,6 +223,7 @@ service RocksDBService {
   rpc putMultiGetPreviousPresence(stream PutMultiRequest) returns (stream PreviousPresence);
   rpc delete(DeleteRequest) returns (google.protobuf.Empty);
   rpc deleteMulti(stream DeleteMultiRequest) returns (google.protobuf.Empty);
+  rpc deleteRange(DeleteRangeRequest) returns (google.protobuf.Empty);
   rpc deleteGetPrevious(DeleteRequest) returns (Previous);
   rpc deleteMultiGetPrevious(stream DeleteMultiRequest) returns (stream Previous);
   rpc deleteGetPreviousPresence(DeleteRequest) returns (PreviousPresence);

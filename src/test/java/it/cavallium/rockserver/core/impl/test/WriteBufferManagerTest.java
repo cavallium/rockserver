@@ -170,6 +170,80 @@ database: {
 	}
 
 	@Test
+	void memtableMaxRangeDeletionsAutoScalesFromWriteBufferSize(@TempDir Path tempDir) throws Exception {
+		var configFile = Files.createTempFile(tempDir, "range-delete-memtable-auto-test", ".conf");
+		Files.writeString(configFile, """
+database: {
+  global: {
+    fallback-column-options: {
+      levels: []
+      write-buffer-size: "8MiB"
+    }
+    column-options: [
+      {
+        name: "testcol"
+        levels: []
+        write-buffer-size: "8MiB"
+      }
+    ]
+  }
+}
+""");
+
+		var dbPath = tempDir.resolve("testdb-range-delete-auto");
+		var logger = LoggerFactory.getLogger(WriteBufferManagerTest.class);
+
+		var config = ConfigParser.parse(configFile);
+		var loadedDb = RocksDBLoader.load(dbPath, config, logger);
+		try {
+			var cfOptions = loadedDb.definitiveColumnFamilyOptionsMap().get("testcol");
+			assertNotNull(cfOptions, "testcol column options must exist");
+			assertEquals(128, cfOptions.memtableMaxRangeDeletions(),
+					"auto memtable range delete threshold should scale with write-buffer-size");
+		} finally {
+			loadedDb.db().close();
+			loadedDb.refs().close();
+		}
+	}
+
+	@Test
+	void memtableMaxRangeDeletionsCanBeDisabled(@TempDir Path tempDir) throws Exception {
+		var configFile = Files.createTempFile(tempDir, "range-delete-memtable-disabled-test", ".conf");
+		Files.writeString(configFile, """
+database: {
+  global: {
+    fallback-column-options: {
+      levels: []
+      memtable-max-range-deletions: 0
+    }
+    column-options: [
+      {
+        name: "testcol"
+        levels: []
+        memtable-max-range-deletions: 0
+      }
+    ]
+  }
+}
+""");
+
+		var dbPath = tempDir.resolve("testdb-range-delete-disabled");
+		var logger = LoggerFactory.getLogger(WriteBufferManagerTest.class);
+
+		var config = ConfigParser.parse(configFile);
+		var loadedDb = RocksDBLoader.load(dbPath, config, logger);
+		try {
+			var cfOptions = loadedDb.definitiveColumnFamilyOptionsMap().get("testcol");
+			assertNotNull(cfOptions, "testcol column options must exist");
+			assertEquals(0, cfOptions.memtableMaxRangeDeletions(),
+					"explicit zero should preserve RocksDB's disabled early-flush behavior");
+		} finally {
+			loadedDb.db().close();
+			loadedDb.refs().close();
+		}
+	}
+
+	@Test
 	void writeBufferManagerNotCreatedForInMemoryDb() throws Exception {
 		var configFile = Files.createTempFile("wbm-inmem-test", ".conf");
 		try {

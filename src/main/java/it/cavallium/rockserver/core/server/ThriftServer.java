@@ -225,6 +225,18 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
+		public void deleteRange(long columnId, List<ByteBuffer> startKeysInclusive, List<ByteBuffer> endKeysExclusive)
+				throws RocksDBThriftException {
+			try {
+				client.getSyncApi().deleteRange(columnId,
+						keysToRecord(startKeysInclusive),
+						keysToRecord(endKeysExclusive));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
 		public long getColumnId(String name) throws RocksDBThriftException {
 			try {
 				return client.getSyncApi().getColumnId(name);

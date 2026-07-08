@@ -170,6 +170,13 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public void deleteRange(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive) throws RocksDBException {
+		db.deleteRange(columnId, startKeysInclusive, endKeysExclusive);
+	}
+
+	@Override
 	public <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,

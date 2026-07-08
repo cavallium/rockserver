@@ -116,6 +116,26 @@ class GrpcDeleteTest {
 		assertFalse(client.getSyncApi().get(0, colId, key3, RequestType.exists()));
 	}
 
+	@Test
+	void deleteRangeOverGrpcRemovesOnlyKeysInsideBounds() {
+		var key1 = key(7);
+		var key2 = key(8);
+		var key3 = key(9);
+		var key4 = key(10);
+
+		client.getSyncApi().put(0, colId, key1, value(70), RequestType.none());
+		client.getSyncApi().put(0, colId, key2, value(80), RequestType.none());
+		client.getSyncApi().put(0, colId, key3, value(90), RequestType.none());
+		client.getSyncApi().put(0, colId, key4, value(100), RequestType.none());
+
+		client.getSyncApi().deleteRange(colId, key2, key4);
+
+		assertTrue(client.getSyncApi().get(0, colId, key1, RequestType.exists()));
+		assertFalse(client.getSyncApi().get(0, colId, key2, RequestType.exists()));
+		assertFalse(client.getSyncApi().get(0, colId, key3, RequestType.exists()));
+		assertTrue(client.getSyncApi().get(0, colId, key4, RequestType.exists()));
+	}
+
 	private static Keys key(long id) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(id).array()));
 	}

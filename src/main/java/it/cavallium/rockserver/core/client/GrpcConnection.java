@@ -512,6 +512,18 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		});
 	}
 
+	@Override
+	public CompletableFuture<Void> deleteRangeAsync(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive) throws RocksDBException {
+		var request = DeleteRangeRequest.newBuilder()
+				.setColumnId(columnId)
+				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
+				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
+				.build();
+		return toResponse(this.futureStub.deleteRange(request), _ -> null);
+	}
+
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> CompletableFuture<List<T>> mergeMultiAsync(long transactionOrUpdateId,
