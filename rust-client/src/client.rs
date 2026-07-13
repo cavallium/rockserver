@@ -750,6 +750,23 @@ impl RockserverClient {
         Ok(resp.into_inner())
     }
 
+    /// Polls a CDC batch and returns the server's exact next cursor. The cursor can advance
+    /// even when column filtering leaves the returned event list empty.
+    pub async fn cdc_poll_batch(
+        &self,
+        id: String,
+        from_seq: Option<i64>,
+        max_events: i64,
+    ) -> Result<CdcPollResponse> {
+        let req = CdcPollRequest {
+            id,
+            from_seq,
+            max_events,
+        };
+        let resp = self.client.clone().cdc_poll_batch(req).await?;
+        Ok(resp.into_inner())
+    }
+
     /// High-level method to stream CDC events continuously.
     ///
     /// This method manages polling, retries (TODO), and offset commits based on the provided options.

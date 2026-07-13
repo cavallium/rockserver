@@ -244,6 +244,9 @@ service RocksDBService {
   rpc cdcDelete(CdcDeleteRequest) returns (google.protobuf.Empty);
   // Stream CDC events starting from fromSeq (inclusive). If fromSeq is not provided, starts from last committed + 1
   rpc cdcPoll(CdcPollRequest) returns (stream CDCEvent);
+  // Poll a CDC batch together with the server cursor. Unlike cdcPoll, this preserves cursor
+  // advancement when column filtering produces an empty event list.
+  rpc cdcPollBatch(CdcPollRequest) returns (CdcPollResponse);
   // Commit the last processed sequence for a subscription
   rpc cdcCommit(CdcCommitRequest) returns (google.protobuf.Empty);
 }
@@ -273,6 +276,12 @@ message CdcPollRequest {
   optional int64 fromSeq = 2;
   // Max events to try to buffer per request cycle (server may emit fewer based on backpressure)
   int64 maxEvents = 3;
+}
+
+message CdcPollResponse {
+  repeated CDCEvent events = 1;
+  // Server cursor for the next poll. It may advance even when events is empty.
+  int64 nextSeq = 2;
 }
 
 message CdcCommitRequest { string id = 1; int64 seq = 2; }
