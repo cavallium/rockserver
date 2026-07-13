@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
+import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
 import java.net.URI;
 import java.util.concurrent.CompletableFuture;
@@ -13,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.event.Level;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 public class LoggingClient implements RocksDBConnection {
 
@@ -115,6 +117,17 @@ public class LoggingClient implements RocksDBConnection {
 		@Override
 		public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
 			return requestAsync(new RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw(columnId, shardIndex, shardCount));
+		}
+
+		@Override
+		public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+			Mono<CdcBatch> result = asyncApi.cdcPollBatchAsync(id, fromSeq, maxEvents);
+			if (!logger.isEnabledForLevel(Level.TRACE)) {
+				return result;
+			}
+			logger.trace("CDC batch request: id={}, fromSeq={}, maxEvents={}", id, fromSeq, maxEvents);
+			return result.doOnSuccess(batch -> logger.trace("CDC batch request executed: id={}, result={}", id, batch))
+					.doOnError(error -> logger.trace("CDC batch request failed: id={}, error={}", id, error.getMessage()));
 		}
 	}
 }

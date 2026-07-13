@@ -30,6 +30,9 @@ import static org.rocksdb.ColumnFamilyOptionsInterface.DEFAULT_COMPACTION_MEMTAB
 
 public class RocksDBLoader {
 
+    static final String WAL_TTL_SECONDS_PROPERTY = "it.cavallium.dbengine.wal.ttl.seconds";
+    static final long DEFAULT_WAL_TTL_SECONDS = 24L * 60L * 60L;
+
     private static final boolean FOLLOW_ROCKSDB_OPTIMIZATIONS = true;
     private static final long AUTO_MEMTABLE_MAX_RANGE_DELETION_BYTES_PER_TOMBSTONE = 64L * SizeUnit.KB;
     private static final int AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MIN = 64;
@@ -536,13 +539,14 @@ public class RocksDBLoader {
             // todo: replace with a real option called database-write-buffer-size
             // 0 = default = disabled
             long dbWriteBufferSize = Long.parseLong(System.getProperty("it.cavallium.dbengine.dbwritebuffer.size", "0"));
+            long walTtlSeconds = resolveWalTtlSeconds(databaseOptions.global());
 
             options
                     .setDbWriteBufferSize(dbWriteBufferSize)
                     .setBytesPerSync(64 * SizeUnit.MB)
                     .setWalBytesPerSync(64 * SizeUnit.MB)
 
-                    .setWalTtlSeconds(80) // Auto
+                    .setWalTtlSeconds(walTtlSeconds)
                     .setWalSizeLimitMB(0) // Auto
                     .setMaxTotalWalSize(0) // AUto
             ;
@@ -636,6 +640,32 @@ public class RocksDBLoader {
 
     private static Duration getWalFlushDelayConfig(DatabaseConfig databaseOptions) throws GestaltException {
         return Objects.requireNonNullElse(databaseOptions.global().delayWalFlushDuration(), Duration.ZERO);
+    }
+
+    public static long resolveWalTtlSeconds(GlobalDatabaseConfig globalConfig) throws GestaltException {
+        String propertyValue = System.getProperty(WAL_TTL_SECONDS_PROPERTY);
+        long walTtlSeconds;
+        if (propertyValue != null) {
+            try {
+                walTtlSeconds = Long.parseLong(propertyValue.trim());
+            } catch (NumberFormatException ex) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(
+                        RocksDBErrorType.CONFIG_ERROR,
+                        "System property %s must be a positive integer number of seconds"
+                                .formatted(WAL_TTL_SECONDS_PROPERTY),
+                        ex);
+            }
+        } else {
+            walTtlSeconds = Objects.requireNonNullElse(globalConfig.walTtlSeconds(), DEFAULT_WAL_TTL_SECONDS);
+        }
+        if (walTtlSeconds <= 0) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(
+                    RocksDBErrorType.CONFIG_ERROR,
+                    "%s must be greater than zero, but was %d".formatted(
+                            propertyValue != null ? WAL_TTL_SECONDS_PROPERTY : "database.global.wal-ttl-seconds",
+                            walTtlSeconds));
+        }
+        return walTtlSeconds;
     }
 
     private static Optional<Path> getWalDir(Path definitiveDbPath, DatabaseConfig databaseOptions)

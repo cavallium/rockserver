@@ -53,9 +53,21 @@ class CdcConsistencyTest {
     private byte[] intToBytes(int i) {
         return java.nio.ByteBuffer.allocate(4).putInt(i).array();
     }
-    
+
     private int bytesToInt(byte[] b) {
         return java.nio.ByteBuffer.wrap(b).getInt();
+    }
+
+    @Test
+    void pollPublishesManualWalBufferForImmediateVisibility() throws Exception {
+        var key = new Keys(new Buf[]{Buf.wrap(intToBytes(7))});
+        db.put(0, defaultColId, key, Buf.wrap("visible".getBytes()), RequestType.none());
+
+        CdcBatch batch = db.cdcPollBatchAsyncInternal(subId, null, 100).block();
+
+        assertNotNull(batch);
+        assertEquals(1, batch.events().size());
+        assertEquals("visible", new String(batch.events().getFirst().value().toByteArray()));
     }
 
     @Test

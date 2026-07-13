@@ -962,6 +962,18 @@ public class GrpcServer extends Server {
             }
 
             @Override
+            public Mono<CdcPollResponse> cdcPollBatch(CdcPollRequest request) {
+                long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
+                Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
+                return asyncApi.cdcPollBatchAsync(request.getId(), fromSeq, maxEvents)
+                        .map(batch -> CdcPollResponse.newBuilder()
+                                .addAllEvents(batch.events().stream().map(GrpcServerImpl::mapCDCEvent).toList())
+                                .setNextSeq(batch.nextSeq())
+                                .build())
+                        .transform(this.onErrorMapMonoWithRequestInfo("cdcPollBatch", request));
+            }
+
+            @Override
             public Mono<Empty> cdcCommit(CdcCommitRequest request) {
                 return executeSync(() -> {
                     api.cdcCommit(request.getId(), request.getSeq());

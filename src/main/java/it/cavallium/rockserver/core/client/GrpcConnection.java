@@ -72,6 +72,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -82,6 +83,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
@@ -103,6 +105,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	private final RocksDBServiceStub asyncStub;
 	private final RocksDBServiceFutureStub futureStub;
 	private final ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStub;
+	private final AtomicBoolean legacyCdcPollBatchWarningLogged = new AtomicBoolean();
 	private final URI address;
 
 	private GrpcConnection(String name, SocketAddress socketAddress, URI address) {
@@ -804,6 +807,34 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
         var builder = CdcPollRequest.newBuilder().setId(id).setMaxEvents(maxEvents);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
         return reactiveStub.cdcPoll(builder.build()).map(GrpcConnection::mapCDCEvent);
+    }
+
+    @Override
+    public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
+        var builder = CdcPollRequest.newBuilder().setId(id).setMaxEvents(maxEvents);
+        if (fromSeq != null) builder.setFromSeq(fromSeq);
+        return toResponse(reactiveStub.cdcPollBatch(builder.build()))
+                .map(response -> new CdcBatch(
+                        response.getEventsList().stream().map(GrpcConnection::mapCDCEvent).toList(),
+                        response.getNextSeq()))
+                .onErrorResume(
+                        error -> Status.fromThrowable(error).getCode() == Code.UNIMPLEMENTED,
+                        error -> {
+                            if (legacyCdcPollBatchWarningLogged.compareAndSet(false, true)) {
+                                LOG.warn("The connected Rockserver does not support exact CDC batch cursors; "
+                                        + "falling back to legacy event-stream cursor reconstruction. "
+                                        + "Upgrade the server to 1.2.1 or newer for filtered-empty progress.");
+                            }
+                            return legacyCdcPollBatchAsync(id, fromSeq, maxEvents);
+                        });
+    }
+
+    private Mono<CdcBatch> legacyCdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
+        return Mono.defer(() -> Flux.from(cdcPollAsync(id, fromSeq, maxEvents))
+                .collectList()
+                .map(events -> new CdcBatch(
+                        events,
+                        events.isEmpty() ? (fromSeq != null ? fromSeq : 0L) : events.getLast().seq() + 1)));
     }
 
     private static CDCEvent mapCDCEvent(it.cavallium.rockserver.core.common.api.proto.CDCEvent ev) {

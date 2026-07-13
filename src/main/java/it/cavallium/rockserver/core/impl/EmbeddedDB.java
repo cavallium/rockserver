@@ -4339,8 +4339,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private long findEarliestAvailableWalSeq() {
 		try {
-			// Fix: Flush WAL to ensure getUpdatesSince sees the latest operations
-			db.get().flushWal(true);
+			// getUpdatesSince reads WAL files, so publish the application WAL buffer without
+			// forcing an fsync. Explicit flush() remains the durability boundary.
+			db.get().flushWal(false);
 		} catch (org.rocksdb.RocksDBException e) {
 			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
 		}
@@ -4662,7 +4663,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long nextSeq = startSeq;
 			long accumulatedBytes = 0;
 
-			db.get().flushWal(true);
+			// Make manually buffered WAL records visible to getUpdatesSince without turning
+			// every CDC poll into a disk sync.
+			db.get().flushWal(false);
 
 			// Check latest sequence to avoid "Requested sequence not yet written" exception in common case
 			long latestSeq = db.get().getLatestSequenceNumber();

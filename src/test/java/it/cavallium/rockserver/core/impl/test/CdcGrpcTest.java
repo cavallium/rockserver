@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
+import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -105,6 +106,46 @@ public class CdcGrpcTest {
         
         // Commit
         client.getSyncApi().cdcCommit("sub1", events.get(1).seq());
+    }
+
+    @Test
+    void filteredEmptyBatchCarriesServerNextSequenceOverGrpc() throws Exception {
+        var selectedColumn = client.getSyncApi().createColumn(
+                "selected-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+        var ignoredColumn = client.getSyncApi().createColumn(
+                "ignored-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+        long startSeq = client.getSyncApi().cdcCreate("filtered-sub", null, List.of(selectedColumn));
+        var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
+
+        client.getSyncApi().put(0, ignoredColumn, key,
+                Buf.wrap("ignored".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+
+        CdcBatch embeddedBatch = embeddedConnection.getAsyncApi()
+                .cdcPollBatchAsync("filtered-sub", startSeq, 100)
+                .block();
+        assertNotNull(embeddedBatch);
+        assertTrue(embeddedBatch.events().isEmpty());
+        assertTrue(embeddedBatch.nextSeq() > startSeq,
+                "The embedded server cursor must advance first: start=" + startSeq
+                        + ", next=" + embeddedBatch.nextSeq());
+
+        CdcBatch emptyBatch = client.getAsyncApi()
+                .cdcPollBatchAsync("filtered-sub", startSeq, 100)
+                .block();
+        assertNotNull(emptyBatch);
+        assertTrue(emptyBatch.events().isEmpty());
+        assertTrue(emptyBatch.nextSeq() > startSeq,
+                "The server cursor must advance across WAL entries removed by the subscription filter: start="
+                        + startSeq + ", next=" + emptyBatch.nextSeq());
+
+        client.getSyncApi().put(0, selectedColumn, key,
+                Buf.wrap("selected".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+        CdcBatch selectedBatch = client.getAsyncApi()
+                .cdcPollBatchAsync("filtered-sub", emptyBatch.nextSeq(), 100)
+                .block();
+        assertNotNull(selectedBatch);
+        assertEquals(1, selectedBatch.events().size());
+        assertEquals(selectedColumn, selectedBatch.events().getFirst().columnId());
     }
 
     @Test

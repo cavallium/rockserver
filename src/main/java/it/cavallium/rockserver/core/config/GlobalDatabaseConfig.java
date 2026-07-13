@@ -28,6 +28,8 @@ public interface GlobalDatabaseConfig {
 
 	@Nullable Path walPath() throws GestaltException;
 
+	@Nullable Long walTtlSeconds() throws GestaltException;
+
 	@Nullable Path tempSstPath() throws GestaltException;
 
 	@Nullable Duration delayWalFlushDuration() throws GestaltException;
