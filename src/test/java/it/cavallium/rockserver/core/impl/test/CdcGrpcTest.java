@@ -5,8 +5,12 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.ColumnHashType;
+import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
@@ -16,6 +20,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import reactor.core.publisher.Flux;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -147,6 +152,38 @@ public class CdcGrpcTest {
         assertEquals(1, selectedBatch.events().size());
         assertEquals(selectedColumn, selectedBatch.events().getFirst().columnId());
     }
+
+	@Test
+	void cdcGapIsPropagatedOverGrpcInsteadOfReturningAnEmptyBatch() throws Exception {
+		var columnId = client.getSyncApi().createColumn(
+				"gap-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+		client.getSyncApi().cdcCreate("gap-sub", null, List.of(columnId));
+
+		long missingWalSeq = embeddedConnection.getInternalDB()
+				.getDb()
+				.get()
+				.getLatestSequenceNumber() + 1;
+		long pollFromMissingWalSeq = missingWalSeq << 20;
+
+		var missingKey = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
+		embeddedConnection.getSyncApi().putBatch(
+				columnId,
+				Flux.just(new KVBatch.KVBatchRef(
+						List.of(missingKey),
+						List.of(Buf.wrap("not-in-wal".getBytes(StandardCharsets.UTF_8))))),
+				PutBatchMode.WRITE_BATCH_NO_WAL);
+
+		var presentKey = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 2})});
+		client.getSyncApi().put(0, columnId, presentKey,
+				Buf.wrap("in-wal".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+
+		RocksDBException error = assertThrows(RocksDBException.class,
+				() -> client.getAsyncApi()
+						.cdcPollBatchAsync("gap-sub", pollFromMissingWalSeq, 100)
+						.block());
+		assertEquals(RocksDBErrorType.CDC_GAP_DETECTED, error.getErrorUniqueId());
+		assertTrue(error.getMessage().contains("Gap detected in WAL"));
+	}
 
     @Test
     void testResumeAfterRestart() throws Exception {

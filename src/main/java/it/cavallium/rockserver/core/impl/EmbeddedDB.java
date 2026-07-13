@@ -4249,6 +4249,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final int CDC_OP_INDEX_BITS = 20; // up to ~1M ops per batch
 	private static final long CDC_OP_INDEX_MASK = (1L << CDC_OP_INDEX_BITS) - 1L;
 	private static final long CDC_DEFAULT_MAX_EVENTS = 10_000L;
+	private static final int CDC_PREFIXLESS_PROBE_MAX_ATTEMPTS = 3;
 
 	private static long composeCdcSeq(long walSeq, int opIndex) {
 		return (walSeq << CDC_OP_INDEX_BITS) | (opIndex & CDC_OP_INDEX_MASK);
@@ -4338,21 +4339,72 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private long findEarliestAvailableWalSeq() {
-		try {
-			// getUpdatesSince reads WAL files, so publish the application WAL buffer without
-			// forcing an fsync. Explicit flush() remains the durability boundary.
-			db.get().flushWal(false);
-		} catch (org.rocksdb.RocksDBException e) {
-			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+		for (int attempt = 0; attempt < CDC_PREFIXLESS_PROBE_MAX_ATTEMPTS; attempt++) {
+			try {
+				var result = findEarliestAvailableWalSeqAttempt();
+				if (result.isPresent()) {
+					return result.getAsLong();
+				}
+			} catch (org.rocksdb.RocksDBException error) {
+				try {
+					if (handleCdcIteratorStatus(error)) {
+						continue;
+					}
+				} catch (org.rocksdb.RocksDBException operationalError) {
+					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, operationalError);
+				}
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, error);
+			}
+		}
+		throw new RocksDBRetryException();
+	}
+
+	private OptionalLong findEarliestAvailableWalSeqAttempt() throws org.rocksdb.RocksDBException {
+		long latestBeforeFlush = getLatestCdcWalSequence();
+		// getUpdatesSince reads WAL files, so publish the application WAL buffer without
+		// forcing an fsync. Explicit flush() remains the durability boundary.
+		flushCdcWalForPrefixlessProbe();
+
+		var earliest = probeEarliestAvailableWalSeq();
+		if (earliest.isPresent()) {
+			return earliest;
 		}
 
+		long latestAfterProbe = getLatestCdcWalSequence();
+		if (latestBeforeFlush == latestAfterProbe) {
+			return OptionalLong.of(latestAfterProbe + 1); // sequence-stable empty DB
+		}
+		return OptionalLong.empty();
+	}
+
+	@VisibleForTesting
+	protected long getLatestCdcWalSequence() {
+		return db.get().getLatestSequenceNumber();
+	}
+
+	@VisibleForTesting
+	protected void flushCdcWalForPrefixlessProbe() throws org.rocksdb.RocksDBException {
+		db.get().flushWal(false);
+	}
+
+	@VisibleForTesting
+	protected OptionalLong probeEarliestAvailableWalSeq() throws org.rocksdb.RocksDBException {
 		try (TransactionLogIterator it = db.get().getUpdatesSince(0)) {
 			if (it != null && it.isValid()) {
-				return it.getBatch().sequenceNumber();
+				return OptionalLong.of(readCdcBatchSequenceAndClose(it.getBatch()));
 			}
-			return db.get().getLatestSequenceNumber() + 1; // empty DB
-		} catch (org.rocksdb.RocksDBException e) {
-			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+			if (it != null) {
+				// Propagate the exact tail-refresh status to the bounded outer retry loop.
+				it.status();
+			}
+			return OptionalLong.empty();
+		}
+	}
+
+	@VisibleForTesting
+	protected long readCdcBatchSequenceAndClose(TransactionLogIterator.BatchResult batch) {
+		try (var ignored = batch.writeBatch()) {
+			return batch.sequenceNumber();
 		}
 	}
 
@@ -4438,6 +4490,53 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private static final long CDC_HARD_MAX_EVENTS = 10_000;
 	private static final long CDC_MAX_BYTES_PER_POLL = 16 * 1024 * 1024; // 16MB
+	private static final String CDC_TAIL_REFRESH_STATUS = "Create a new iterator to fetch the new tail.";
+	private static final String CDC_GAP_STATUS = "Gap in sequence numbers";
+	private static final String CDC_REQUIRED_SEQUENCE_GAP_STATUS =
+			"Gap in sequence number. Could not seek to required sequence number";
+	private static final String CDC_START_SEQUENCE_MISSING_STATUS =
+			"Start sequence was not found, skipping to the next available";
+
+	@VisibleForTesting
+	protected void iterateCdcWriteBatch(byte[] data, WriteBatch.Handler handler) throws org.rocksdb.RocksDBException {
+		WriteBatchIterator.iterate(data, handler);
+	}
+
+	private static boolean checkCdcIteratorStatus(TransactionLogIterator iterator) throws org.rocksdb.RocksDBException {
+		try {
+			iterator.status();
+			return false;
+		} catch (org.rocksdb.RocksDBException error) {
+			return handleCdcIteratorStatus(error);
+		}
+	}
+
+	@VisibleForTesting
+	protected static boolean handleCdcIteratorStatus(org.rocksdb.RocksDBException error)
+			throws org.rocksdb.RocksDBException {
+		var status = error.getStatus();
+		var code = status != null ? status.getCode() : null;
+		var state = status != null ? status.getState() : error.getMessage();
+
+		// A concurrent append can move the WAL tail after this iterator was created. RocksDB
+		// reports that snapshot boundary as TryAgain and requires the next poll to use a fresh
+		// iterator; the prefix already collected by this poll is complete and safe to return.
+		if (code == Code.TryAgain && CDC_TAIL_REFRESH_STATUS.equals(state)) {
+			return true;
+		}
+
+		// These are the exact continuity-loss states emitted by RocksDB 10.10.1's
+		// TransactionLogIteratorImpl. Do not classify unrelated Corruption/IOError statuses as
+		// CDC gaps: those must remain operational failures rather than trigger a projection rebuild.
+		boolean missingWalContinuity = (code == Code.NotFound && CDC_GAP_STATUS.equals(state))
+				|| (code == Code.Corruption && (CDC_REQUIRED_SEQUENCE_GAP_STATUS.equals(state)
+				|| CDC_START_SEQUENCE_MISSING_STATUS.equals(state)));
+		if (missingWalContinuity) {
+			throw new CdcGapDetectedException("Gap detected in WAL: " + state, error);
+		}
+
+		throw error;
+	}
 
 	private class EventCollector extends WriteBatch.Handler {
 
@@ -4689,75 +4788,69 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean firstBatch = true;
 			try (it) {
 				while (result.size() < effectiveMax && it != null && it.isValid()) {
+					var br = it.getBatch();
 					try {
-						var br = it.getBatch();
-						try {
-							long batchWalSeq = br.sequenceNumber();
+						long batchWalSeq = br.sequenceNumber();
 
-							if (firstBatch) {
-								if (batchWalSeq > iteratorStartWal) {
-									throw new CdcGapDetectedException("Gap detected in WAL. Requested WAL seq: " + iteratorStartWal + ", but earliest available is: " + batchWalSeq);
-								}
-								firstBatch = false;
+						if (firstBatch) {
+							if (batchWalSeq > iteratorStartWal) {
+								throw new CdcGapDetectedException("Gap detected in WAL. Requested WAL seq: " + iteratorStartWal + ", but earliest available is: " + batchWalSeq);
 							}
-
-							// Skip batch if completely before start point (safe check)
-							// If we somehow got a batch strictly before walStart (unlikely with getUpdatesSince), skipping it is correct.
-
-							long diff = walStart - batchWalSeq;
-							int skipOps = 0;
-							if (diff >= 0) {
-								skipOps = (int) diff + opStart;
-							}
-
-							var handler = new EventCollector(result,
-									filterSet,
-									batchWalSeq,
-									skipOps,
-									effectiveMax - result.size(),
-									CDC_MAX_BYTES_PER_POLL - accumulatedBytes,
-									meta.emitLatestValues,
-									result.isEmpty()
-							);
-							//noinspection resource
-							try {
-								WriteBatchIterator.iterate(br.writeBatch().data(), handler);
-							} catch (Exception e) {
-								throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Failed to parse WriteBatch at seq " + batchWalSeq, e);
-							}
-							accumulatedBytes += handler.getAccumulatedBytes();
-
-							int stopIndex = handler.getLimitReachedAtOpIndex();
-
-							if (stopIndex != -1) {
-								// We stopped in the middle of the batch
-								nextSeq = composeCdcSeq(batchWalSeq, stopIndex);
-							} else {
-								// We finished the batch.
-                                // Point to the end of this batch.
-                                // The next poll will re-scan this batch, skip all items, and move to the next.
-                                // This is safer than guessing the next sequence number.
-									nextSeq = composeCdcSeq(batchWalSeq, handler.getSeenOps());
-								}
-
-							if (stopIndex != -1) {
-								break;
-							}
-							if (result.size() >= effectiveMax) {
-								break;
-							}
-							if (accumulatedBytes >= CDC_MAX_BYTES_PER_POLL && !result.isEmpty()) {
-								break;
-							}
-
-							it.next();
-						} finally {
-							br.writeBatch().close();
+							firstBatch = false;
 						}
-					} catch (Exception e) {
-						// On error, return what we have
-						return new CdcBatch(result, nextSeq);
+
+						// Skip batch if completely before start point (safe check).
+						// If we somehow got a batch strictly before walStart (unlikely with getUpdatesSince), skipping it is correct.
+						long diff = walStart - batchWalSeq;
+						int skipOps = 0;
+						if (diff >= 0) {
+							skipOps = (int) diff + opStart;
+						}
+
+						var handler = new EventCollector(result,
+								filterSet,
+								batchWalSeq,
+								skipOps,
+								effectiveMax - result.size(),
+								CDC_MAX_BYTES_PER_POLL - accumulatedBytes,
+								meta.emitLatestValues,
+								result.isEmpty()
+						);
+						//noinspection resource
+						try {
+							iterateCdcWriteBatch(br.writeBatch().data(), handler);
+						} catch (Exception e) {
+							throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Failed to parse WriteBatch at seq " + batchWalSeq, e);
+						}
+						accumulatedBytes += handler.getAccumulatedBytes();
+
+						int stopIndex = handler.getLimitReachedAtOpIndex();
+						if (stopIndex != -1) {
+							// We stopped in the middle of the batch.
+							nextSeq = composeCdcSeq(batchWalSeq, stopIndex);
+						} else {
+							// Point to the end of this batch. The next poll will re-scan this batch,
+							// skip all items, and move to the next without guessing its sequence number.
+							nextSeq = composeCdcSeq(batchWalSeq, handler.getSeenOps());
+						}
+
+						if (stopIndex != -1) {
+							break;
+						}
+						if (result.size() >= effectiveMax) {
+							break;
+						}
+						if (accumulatedBytes >= CDC_MAX_BYTES_PER_POLL && !result.isEmpty()) {
+							break;
+						}
+
+						it.next();
+					} finally {
+						br.writeBatch().close();
 					}
+				}
+				if (it != null) {
+					checkCdcIteratorStatus(it);
 				}
 			}
 
