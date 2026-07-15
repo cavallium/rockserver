@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
@@ -14,12 +16,17 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
+import it.cavallium.rockserver.core.common.cdc.CdcCommitMode;
+import it.cavallium.rockserver.core.common.cdc.CdcStreamOptions;
+import it.cavallium.rockserver.core.server.CdcResponseBudget;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.api.parallel.Resources;
 import reactor.core.publisher.Flux;
 
 import java.io.IOException;
@@ -27,6 +34,8 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Assumptions;
@@ -151,6 +160,180 @@ public class CdcGrpcTest {
         assertNotNull(selectedBatch);
         assertEquals(1, selectedBatch.events().size());
         assertEquals(selectedColumn, selectedBatch.events().getFirst().columnId());
+    }
+
+    @Test
+    void cdcUnaryBatchLargerThanFourMiBSucceedsWithExactCursor() throws Exception {
+        long columnId = client.getSyncApi().createColumn(
+                "large-response-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+        long startSeq = client.getSyncApi().cdcCreate("large-response-sub", null, List.of(columnId));
+        var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 7})});
+        byte[] value = new byte[5 * 1024 * 1024];
+        Arrays.fill(value, (byte) 0x5a);
+        client.getSyncApi().put(0, columnId, key, Buf.wrap(value), RequestType.none());
+
+        CdcBatch embeddedBatch = embeddedConnection.getAsyncApi()
+                .cdcPollBatchAsync("large-response-sub", startSeq, 10)
+                .block();
+        assertNotNull(embeddedBatch);
+        assertEquals(1, embeddedBatch.events().size());
+        int serializedSize = CdcResponseBudget.build(embeddedBatch, Integer.MAX_VALUE).getSerializedSize();
+        assertTrue(serializedSize > 4 * 1024 * 1024,
+                "Regression fixture must exceed gRPC's legacy 4 MiB default, actual=" + serializedSize);
+
+        CdcBatch grpcBatch = client.getAsyncApi()
+                .cdcPollBatchAsync("large-response-sub", startSeq, 10)
+                .block();
+        assertNotNull(grpcBatch);
+        assertEquals(embeddedBatch.nextSeq(), grpcBatch.nextSeq());
+        assertEquals(1, grpcBatch.events().size());
+        CDCEvent event = grpcBatch.events().getFirst();
+        assertEquals(columnId, event.columnId());
+        assertEquals(CDCEvent.Op.PUT, event.op());
+        assertArrayEquals(new byte[]{0, 0, 0, 7}, event.key().toByteArray());
+        assertArrayEquals(value, event.value().toByteArray());
+
+        CdcBatch tail = client.getAsyncApi()
+                .cdcPollBatchAsync("large-response-sub", grpcBatch.nextSeq(), 10)
+                .block();
+        assertNotNull(tail);
+        assertTrue(tail.events().isEmpty());
+        assertEquals(grpcBatch.nextSeq(), tail.nextSeq());
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void negotiatedLimitIsExactAndOversizedGroupFailsWithoutRetryingOrAdvancing() throws Exception {
+        long columnId = client.getSyncApi().createColumn(
+                "limit-boundary-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+        long startSeq = client.getSyncApi().cdcCreate("limit-boundary-sub", null, List.of(columnId));
+        var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 8})});
+        byte[] value = new byte[5 * 1024 * 1024];
+        Arrays.fill(value, (byte) 0x33);
+        client.getSyncApi().put(0, columnId, key, Buf.wrap(value), RequestType.none());
+
+        CdcBatch expected = embeddedConnection.getAsyncApi()
+                .cdcPollBatchAsync("limit-boundary-sub", startSeq, 10)
+                .block();
+        assertNotNull(expected);
+        int exactResponseSize = CdcResponseBudget.build(expected, Integer.MAX_VALUE).getSerializedSize();
+
+        String previous = System.getProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY);
+        GrpcConnection undersizedClient = null;
+        GrpcConnection exactClient = null;
+        try {
+            int undersizedLimit = exactResponseSize - 1;
+            System.setProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY,
+                    Integer.toString(undersizedLimit));
+            undersizedClient = GrpcConnection.forHostAndPort(
+                    "undersized-grpc-client", new Utils.HostAndPort("127.0.0.1", grpcServer.getPort()));
+
+            GrpcConnection directClient = undersizedClient;
+            StatusRuntimeException directFailure = assertThrows(StatusRuntimeException.class,
+                    () -> directClient.getAsyncApi()
+                            .cdcPollBatchAsync("limit-boundary-sub", startSeq, 10)
+                            .block());
+            assertEquals(Status.Code.FAILED_PRECONDITION, directFailure.getStatus().getCode());
+            String description = directFailure.getStatus().getDescription();
+            assertNotNull(description);
+            assertTrue(description.contains(Long.toString(expected.events().getFirst().seq())));
+            assertTrue(description.contains(Integer.toString(exactResponseSize)));
+            assertTrue(description.contains(Integer.toString(undersizedLimit)));
+            assertTrue(description.contains(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY));
+
+            GrpcConnection streamClient = undersizedClient;
+            StatusRuntimeException streamFailure = assertThrows(StatusRuntimeException.class,
+                    () -> streamClient.getAsyncApi().cdcStream(
+                                    "limit-boundary-sub",
+                                    new CdcStreamOptions(startSeq, 10, Duration.ofMillis(10), CdcCommitMode.NONE),
+                                    null)
+                            .blockFirst(Duration.ofSeconds(2)));
+            assertEquals(Status.Code.FAILED_PRECONDITION, streamFailure.getStatus().getCode(),
+                    "A permanent oversized-group error must not enter the unbounded CDC retry loop");
+
+            System.setProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY,
+                    Integer.toString(exactResponseSize));
+            exactClient = GrpcConnection.forHostAndPort(
+                    "exact-limit-grpc-client", new Utils.HostAndPort("127.0.0.1", grpcServer.getPort()));
+            CdcBatch recovered = exactClient.getAsyncApi()
+                    .cdcPollBatchAsync("limit-boundary-sub", startSeq, 10)
+                    .block();
+            assertNotNull(recovered);
+            assertEquals(expected.nextSeq(), recovered.nextSeq());
+            assertEquals(1, recovered.events().size());
+            assertArrayEquals(value, recovered.events().getFirst().value().toByteArray());
+        } finally {
+            if (exactClient != null) exactClient.close();
+            if (undersizedClient != null) undersizedClient.close();
+            if (previous == null) {
+                System.clearProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY);
+            } else {
+                System.setProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY, previous);
+            }
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void negotiatedResponseBudgetPaginatesWithoutSkippingEvents() throws Exception {
+        long columnId = client.getSyncApi().createColumn(
+                "response-pages-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+        long startSeq = client.getSyncApi().cdcCreate("response-pages-sub", null, List.of(columnId));
+        int valueSize = 2 * 1024 * 1024;
+        for (int i = 0; i < 3; i++) {
+            byte[] value = new byte[valueSize];
+            Arrays.fill(value, (byte) (i + 1));
+            var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, (byte) (i + 1)})});
+            client.getSyncApi().put(0, columnId, key, Buf.wrap(value), RequestType.none());
+        }
+
+        CdcBatch expected = embeddedConnection.getAsyncApi()
+                .cdcPollBatchAsync("response-pages-sub", startSeq, 10)
+                .block();
+        assertNotNull(expected);
+        assertEquals(3, expected.events().size());
+
+        String previous = System.getProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY);
+        GrpcConnection pagedClient = null;
+        try {
+            System.setProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY,
+                    Integer.toString(GrpcConnection.MIN_MAX_INBOUND_MESSAGE_SIZE));
+            pagedClient = GrpcConnection.forHostAndPort(
+                    "paged-grpc-client", new Utils.HostAndPort("127.0.0.1", grpcServer.getPort()));
+
+            long cursor = startSeq;
+            for (int i = 0; i < expected.events().size(); i++) {
+                CdcBatch page = pagedClient.getAsyncApi()
+                        .cdcPollBatchAsync("response-pages-sub", cursor, 10)
+                        .block();
+                assertNotNull(page);
+                assertEquals(1, page.events().size(), "Two 2 MiB events plus protobuf framing exceed 4 MiB");
+                CDCEvent actual = page.events().getFirst();
+                CDCEvent expectedEvent = expected.events().get(i);
+                assertEquals(expectedEvent.seq(), actual.seq());
+                assertArrayEquals(expectedEvent.key().toByteArray(), actual.key().toByteArray());
+                assertArrayEquals(expectedEvent.value().toByteArray(), actual.value().toByteArray());
+                long expectedNextSeq = i + 1 < expected.events().size()
+                        ? expected.events().get(i + 1).seq()
+                        : expected.nextSeq();
+                assertEquals(expectedNextSeq, page.nextSeq());
+                cursor = page.nextSeq();
+            }
+
+            CdcBatch tail = pagedClient.getAsyncApi()
+                    .cdcPollBatchAsync("response-pages-sub", cursor, 10)
+                    .block();
+            assertNotNull(tail);
+            assertTrue(tail.events().isEmpty());
+            assertEquals(cursor, tail.nextSeq());
+        } finally {
+            if (pagedClient != null) pagedClient.close();
+            if (previous == null) {
+                System.clearProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY);
+            } else {
+                System.setProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY, previous);
+            }
+        }
     }
 
 	@Test
@@ -332,4 +515,5 @@ public class CdcGrpcTest {
         assertTrue(val2.contains("Initial"));
         assertTrue(val2.contains("Patched"));
     }
+
 }

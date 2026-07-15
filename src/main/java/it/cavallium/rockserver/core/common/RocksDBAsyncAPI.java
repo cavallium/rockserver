@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.common;
 
+import io.grpc.Status;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteMulti;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
@@ -481,6 +482,22 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
         return Retry.backoff(Long.MAX_VALUE, Duration.ofMillis(50))
                 .doBeforeRetry(s -> System.err.println("CDC RETRY: " + s.failure()))
                 .maxBackoff(Duration.ofSeconds(5))
-                .transientErrors(true);
+                .transientErrors(true)
+                .filter(RocksDBAsyncAPI::isRetryableCdcStreamFailure);
+    }
+
+    private static boolean isRetryableCdcStreamFailure(Throwable failure) {
+        Status status = Status.fromThrowable(failure);
+        if (status.getCode() == Status.Code.FAILED_PRECONDITION) {
+            return false;
+        }
+        if (status.getCode() == Status.Code.RESOURCE_EXHAUSTED) {
+            String description = status.getDescription();
+            if (description != null && description.toLowerCase(java.util.Locale.ROOT)
+                    .contains("message exceeds maximum size")) {
+                return false;
+            }
+        }
+        return true;
     }
 }

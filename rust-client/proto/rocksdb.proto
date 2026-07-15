@@ -276,6 +276,9 @@ message CdcPollRequest {
   optional int64 fromSeq = 2;
   // Max events to try to buffer per request cycle (server may emit fewer based on backpressure)
   int64 maxEvents = 3;
+  // Maximum serialized CdcPollResponse size accepted by the caller. Zero means the
+  // legacy gRPC default (4 MiB). Servers paginate without splitting one CDC sequence.
+  int32 maxResponseBytes = 4;
 }
 
 message CdcPollResponse {

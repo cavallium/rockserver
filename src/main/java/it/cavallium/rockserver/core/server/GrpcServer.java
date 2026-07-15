@@ -80,6 +80,7 @@ import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 public class GrpcServer extends Server {
 
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcServer.class.getName());
+	private static final int LEGACY_GRPC_MAX_INBOUND_MESSAGE_SIZE = 4 * 1024 * 1024;
 
 	private final GrpcServerImpl grpc;
 	private final EventLoopGroup elg;
@@ -1048,11 +1049,19 @@ public class GrpcServer extends Server {
             public Mono<CdcPollResponse> cdcPollBatch(CdcPollRequest request) {
                 long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
                 Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
+                int requestedMaxResponseBytes = request.getMaxResponseBytes();
+                if (requestedMaxResponseBytes < 0) {
+                    return Mono.<CdcPollResponse>error(Status.INVALID_ARGUMENT
+                                    .withDescription("maxResponseBytes must not be negative: "
+                                            + requestedMaxResponseBytes)
+                                    .asRuntimeException())
+                            .transform(this.onErrorMapMonoWithRequestInfo("cdcPollBatch", request));
+                }
+                int maxResponseBytes = requestedMaxResponseBytes > 0
+                        ? requestedMaxResponseBytes
+                        : LEGACY_GRPC_MAX_INBOUND_MESSAGE_SIZE;
                 return asyncApi.cdcPollBatchAsync(request.getId(), fromSeq, maxEvents)
-                        .map(batch -> CdcPollResponse.newBuilder()
-                                .addAllEvents(batch.events().stream().map(GrpcServerImpl::mapCDCEvent).toList())
-                                .setNextSeq(batch.nextSeq())
-                                .build())
+                        .map(batch -> CdcResponseBudget.build(batch, maxResponseBytes))
                         .transform(this.onErrorMapMonoWithRequestInfo("cdcPollBatch", request));
             }
 

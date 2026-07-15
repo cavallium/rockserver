@@ -100,6 +100,10 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			= "it.cavallium.rockserver.grpc.client.max-retry-backoff";
 	private static final String RETRY_BACKOFF_MULTIPLIER_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.retry-backoff-multiplier";
+	public static final String MAX_INBOUND_MESSAGE_SIZE_PROPERTY
+			= "it.cavallium.rockserver.grpc.client.max-inbound-message-size-bytes";
+	public static final int DEFAULT_MAX_INBOUND_MESSAGE_SIZE = 64 * 1024 * 1024;
+	public static final int MIN_MAX_INBOUND_MESSAGE_SIZE = 4 * 1024 * 1024;
 	private final ManagedChannel channel;
 	private final EventLoopGroup eventLoopGroup;
 	private final RocksDBServiceStub asyncStub;
@@ -107,9 +111,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	private final ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStub;
 	private final AtomicBoolean legacyCdcPollBatchWarningLogged = new AtomicBoolean();
 	private final URI address;
+	private final int maxInboundMessageSize;
 
 	private GrpcConnection(String name, SocketAddress socketAddress, URI address) {
 		super(name);
+		int maxInboundMessageSize = configuredMaxInboundMessageSize();
 		NettyChannelBuilder channelBuilder;
 		if (socketAddress instanceof InetSocketAddress inetSocketAddress) {
 			channelBuilder = NettyChannelBuilder
@@ -122,6 +128,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		channelBuilder
 				.directExecutor()
 					.usePlaintext()
+					.maxInboundMessageSize(maxInboundMessageSize)
 					.keepAliveTime(30, TimeUnit.SECONDS)
 					.keepAliveTimeout(5, TimeUnit.SECONDS)
 					.keepAliveWithoutCalls(true);
@@ -145,6 +152,28 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		this.futureStub = RocksDBServiceGrpc.newFutureStub(channel);
 		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 		this.address = address;
+		this.maxInboundMessageSize = maxInboundMessageSize;
+	}
+
+	public static int configuredMaxInboundMessageSize() {
+		var value = System.getProperty(MAX_INBOUND_MESSAGE_SIZE_PROPERTY);
+		if (value == null || value.isBlank()) {
+			return DEFAULT_MAX_INBOUND_MESSAGE_SIZE;
+		}
+
+		final long parsed;
+		try {
+			parsed = Long.parseLong(value);
+		} catch (NumberFormatException ex) {
+			throw new IllegalArgumentException("System property " + MAX_INBOUND_MESSAGE_SIZE_PROPERTY
+					+ " must be an integer byte count, but was: " + value, ex);
+		}
+		if (parsed < MIN_MAX_INBOUND_MESSAGE_SIZE || parsed > Integer.MAX_VALUE) {
+			throw new IllegalArgumentException("System property " + MAX_INBOUND_MESSAGE_SIZE_PROPERTY
+					+ " must be between " + MIN_MAX_INBOUND_MESSAGE_SIZE + " and " + Integer.MAX_VALUE
+					+ " bytes, but was: " + value);
+		}
+		return (int) parsed;
 	}
 
 	private static void configureRetry(NettyChannelBuilder channelBuilder) {
@@ -811,7 +840,10 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
     @Override
     public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
-        var builder = CdcPollRequest.newBuilder().setId(id).setMaxEvents(maxEvents);
+        var builder = CdcPollRequest.newBuilder()
+				.setId(id)
+				.setMaxEvents(maxEvents)
+				.setMaxResponseBytes(maxInboundMessageSize);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
         return toResponse(reactiveStub.cdcPollBatch(builder.build()))
                 .map(response -> new CdcBatch(

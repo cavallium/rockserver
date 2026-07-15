@@ -745,6 +745,7 @@ impl RockserverClient {
             id,
             from_seq,
             max_events,
+            max_response_bytes: 0,
         };
         let resp = self.client.clone().cdc_poll(req).await?;
         Ok(resp.into_inner())
@@ -762,6 +763,7 @@ impl RockserverClient {
             id,
             from_seq,
             max_events,
+            max_response_bytes: 0,
         };
         let resp = self.client.clone().cdc_poll_batch(req).await?;
         Ok(resp.into_inner())
