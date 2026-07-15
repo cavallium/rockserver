@@ -1037,32 +1037,39 @@ public class GrpcServer extends Server {
 
             @Override
             public Flux<it.cavallium.rockserver.core.common.api.proto.CDCEvent> cdcPoll(CdcPollRequest request) {
-                long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
-                Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
-                return Flux
-                        .from(asyncApi.cdcPollAsync(request.getId(), fromSeq, maxEvents))
-                        .map(GrpcServerImpl::mapCDCEvent)
+                return Flux.defer(() -> {
+                            long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
+                            Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
+                            int maxResponseBytes = requestedMaxResponseBytes(request);
+                            return Flux.from(asyncApi.cdcPollAsync(request.getId(), fromSeq, maxEvents))
+                                    .map(event -> CdcResponseBudget.buildEvent(event, maxResponseBytes));
+                        })
                         .transform(this.onErrorMapFluxWithRequestInfo("cdcPoll", request));
             }
 
             @Override
             public Mono<CdcPollResponse> cdcPollBatch(CdcPollRequest request) {
-                long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
-                Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
+                return Mono.defer(() -> {
+                            long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
+                            Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
+                            int maxResponseBytes = requestedMaxResponseBytes(request);
+                            return asyncApi.cdcPollBatchAsync(request.getId(), fromSeq, maxEvents)
+                                    .map(batch -> CdcResponseBudget.build(batch, maxResponseBytes));
+                        })
+                        .transform(this.onErrorMapMonoWithRequestInfo("cdcPollBatch", request));
+            }
+
+            private static int requestedMaxResponseBytes(CdcPollRequest request) {
                 int requestedMaxResponseBytes = request.getMaxResponseBytes();
                 if (requestedMaxResponseBytes < 0) {
-                    return Mono.<CdcPollResponse>error(Status.INVALID_ARGUMENT
-                                    .withDescription("maxResponseBytes must not be negative: "
-                                            + requestedMaxResponseBytes)
-                                    .asRuntimeException())
-                            .transform(this.onErrorMapMonoWithRequestInfo("cdcPollBatch", request));
+                    throw Status.INVALID_ARGUMENT
+                            .withDescription("maxResponseBytes must not be negative: "
+                                    + requestedMaxResponseBytes)
+                            .asRuntimeException();
                 }
-                int maxResponseBytes = requestedMaxResponseBytes > 0
+                return requestedMaxResponseBytes > 0
                         ? requestedMaxResponseBytes
                         : LEGACY_GRPC_MAX_INBOUND_MESSAGE_SIZE;
-                return asyncApi.cdcPollBatchAsync(request.getId(), fromSeq, maxEvents)
-                        .map(batch -> CdcResponseBudget.build(batch, maxResponseBytes))
-                        .transform(this.onErrorMapMonoWithRequestInfo("cdcPollBatch", request));
             }
 
             @Override
@@ -1071,23 +1078,6 @@ public class GrpcServer extends Server {
                     api.cdcCommit(request.getId(), request.getSeq());
                     return Empty.getDefaultInstance();
                 }, false).transform(this.onErrorMapMonoWithRequestInfo("cdcCommit", request));
-            }
-
-            private static it.cavallium.rockserver.core.common.api.proto.CDCEvent mapCDCEvent(CDCEvent ev) {
-                var builder = it.cavallium.rockserver.core.common.api.proto.CDCEvent.newBuilder()
-                        .setSeq(ev.seq())
-                        .setColumnId(ev.columnId())
-                        .setKey(Utils.toByteString(ev.key()));
-                if (ev.value() != null && !ev.value().isEmpty()) {
-                    builder.setValue(Utils.toByteString(ev.value()));
-                }
-                var op = switch (ev.op()) {
-                    case PUT -> it.cavallium.rockserver.core.common.api.proto.CDCEvent.Op.PUT;
-                    case DELETE -> it.cavallium.rockserver.core.common.api.proto.CDCEvent.Op.DELETE;
-                    case MERGE -> it.cavallium.rockserver.core.common.api.proto.CDCEvent.Op.MERGE;
-                };
-                builder.setOp(op);
-                return builder.build();
             }
 
 		// utils

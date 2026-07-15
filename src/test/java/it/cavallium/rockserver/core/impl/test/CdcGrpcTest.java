@@ -193,6 +193,14 @@ public class CdcGrpcTest {
         assertArrayEquals(new byte[]{0, 0, 0, 7}, event.key().toByteArray());
         assertArrayEquals(value, event.value().toByteArray());
 
+        List<CDCEvent> streamedEvents = Flux.from(client.getAsyncApi()
+                        .cdcPollAsync("large-response-sub", startSeq, 10))
+                .collectList()
+                .block();
+        assertNotNull(streamedEvents);
+        assertEquals(1, streamedEvents.size());
+        assertArrayEquals(value, streamedEvents.getFirst().value().toByteArray());
+
         CdcBatch tail = client.getAsyncApi()
                 .cdcPollBatchAsync("large-response-sub", grpcBatch.nextSeq(), 10)
                 .block();
@@ -217,12 +225,14 @@ public class CdcGrpcTest {
                 .block();
         assertNotNull(expected);
         int exactResponseSize = CdcResponseBudget.build(expected, Integer.MAX_VALUE).getSerializedSize();
+        int exactEventSize = CdcResponseBudget.buildEvent(
+                expected.events().getFirst(), Integer.MAX_VALUE).getSerializedSize();
 
         String previous = System.getProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY);
         GrpcConnection undersizedClient = null;
         GrpcConnection exactClient = null;
         try {
-            int undersizedLimit = exactResponseSize - 1;
+            int undersizedLimit = exactEventSize - 1;
             System.setProperty(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY,
                     Integer.toString(undersizedLimit));
             undersizedClient = GrpcConnection.forHostAndPort(
@@ -240,6 +250,16 @@ public class CdcGrpcTest {
             assertTrue(description.contains(Integer.toString(exactResponseSize)));
             assertTrue(description.contains(Integer.toString(undersizedLimit)));
             assertTrue(description.contains(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY));
+
+            StatusRuntimeException legacyStreamFailure = assertThrows(StatusRuntimeException.class,
+                    () -> Flux.from(directClient.getAsyncApi()
+                                    .cdcPollAsync("limit-boundary-sub", startSeq, 10))
+                            .collectList()
+                            .block());
+            assertEquals(Status.Code.FAILED_PRECONDITION, legacyStreamFailure.getStatus().getCode());
+            assertNotNull(legacyStreamFailure.getStatus().getDescription());
+            assertTrue(legacyStreamFailure.getStatus().getDescription()
+                    .contains("requires " + exactEventSize + " serialized bytes"));
 
             GrpcConnection streamClient = undersizedClient;
             StatusRuntimeException streamFailure = assertThrows(StatusRuntimeException.class,

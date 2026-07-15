@@ -132,6 +132,22 @@ class CdcResponseBudgetTest {
 				() -> CdcResponseBudget.build(new CdcBatch(List.of(), 0), -1));
 	}
 
+	@Test
+	void streamedEventUsesExactSerializedBoundary() {
+		var event = event(81, 6, "stream-key", "stream-value", CDCEvent.Op.PUT);
+		var unbounded = CdcResponseBudget.buildEvent(event, Integer.MAX_VALUE);
+		int exactSize = unbounded.getSerializedSize();
+
+		assertEquals(unbounded, CdcResponseBudget.buildEvent(event, exactSize));
+		var error = assertThrows(StatusRuntimeException.class,
+				() -> CdcResponseBudget.buildEvent(event, exactSize - 1));
+		assertEquals(Status.Code.FAILED_PRECONDITION, error.getStatus().getCode());
+		assertNotNull(error.getStatus().getDescription());
+		assertTrue(error.getStatus().getDescription().contains("seq " + event.seq()));
+		assertTrue(error.getStatus().getDescription().contains("requires " + exactSize + " serialized bytes"));
+		assertTrue(error.getStatus().getDescription().contains(CdcResponseBudget.CLIENT_MAX_INBOUND_MESSAGE_SIZE_PROPERTY));
+	}
+
 	private static CDCEvent event(long seq, long columnId, String key, String value, CDCEvent.Op op) {
 		return new CDCEvent(
 				seq,

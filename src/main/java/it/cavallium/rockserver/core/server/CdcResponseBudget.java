@@ -19,6 +19,21 @@ public final class CdcResponseBudget {
 
 	private CdcResponseBudget() {}
 
+	/** Maps and validates one message emitted by the legacy server-streaming CDC endpoint. */
+	public static it.cavallium.rockserver.core.common.api.proto.CDCEvent buildEvent(
+			CDCEvent event,
+			int maxSerializedBytes) {
+		if (maxSerializedBytes <= 0) {
+			throw new IllegalArgumentException("maxSerializedBytes must be positive: " + maxSerializedBytes);
+		}
+		var mappedEvent = mapEvent(event);
+		int serializedSize = mappedEvent.getSerializedSize();
+		if (serializedSize > maxSerializedBytes) {
+			throw eventTooLarge(event.seq(), serializedSize, maxSerializedBytes);
+		}
+		return mappedEvent;
+	}
+
 	public static CdcPollResponse build(CdcBatch batch, int maxSerializedBytes) {
 		if (maxSerializedBytes <= 0) {
 			throw new IllegalArgumentException("maxSerializedBytes must be positive: " + maxSerializedBytes);
@@ -94,6 +109,14 @@ public final class CdcResponseBudget {
 	private static StatusRuntimeException responseTooLarge(long seq, long requiredBytes, int limitBytes) {
 		return Status.FAILED_PRECONDITION
 				.withDescription("CDC response sequence group at seq " + seq
+						+ " requires " + requiredBytes + " serialized bytes, exceeding limit " + limitBytes
+						+ "; increase system property " + CLIENT_MAX_INBOUND_MESSAGE_SIZE_PROPERTY)
+				.asRuntimeException();
+	}
+
+	private static StatusRuntimeException eventTooLarge(long seq, long requiredBytes, int limitBytes) {
+		return Status.FAILED_PRECONDITION
+				.withDescription("CDC event at seq " + seq
 						+ " requires " + requiredBytes + " serialized bytes, exceeding limit " + limitBytes
 						+ "; increase system property " + CLIENT_MAX_INBOUND_MESSAGE_SIZE_PROPERTY)
 				.asRuntimeException();

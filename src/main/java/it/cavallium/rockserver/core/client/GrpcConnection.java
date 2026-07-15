@@ -833,9 +833,13 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
     @Override
     public Publisher<CDCEvent> cdcPollAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
-        var builder = CdcPollRequest.newBuilder().setId(id).setMaxEvents(maxEvents);
+        var builder = CdcPollRequest.newBuilder()
+                .setId(id)
+                .setMaxEvents(maxEvents)
+                .setMaxResponseBytes(maxInboundMessageSize);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
-        return reactiveStub.cdcPoll(builder.build()).map(GrpcConnection::mapCDCEvent);
+        return toResponse(reactiveStub.cdcPoll(builder.build()))
+                .map(GrpcConnection::mapCDCEvent);
     }
 
     @Override
