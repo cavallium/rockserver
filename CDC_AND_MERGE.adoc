@@ -134,6 +134,26 @@ while (running) {
 }
 ----
 
+=== gRPC response-size contract
+
+Java gRPC clients accept CDC responses up to 64 MiB by default. Override the limit, in bytes, with
+`-Dit.cavallium.rockserver.grpc.client.max-inbound-message-size-bytes=<bytes>`; values must be between
+4 MiB and `Integer.MAX_VALUE`. The setting applies to both TCP and Unix-domain socket connections and
+is read when the connection is created.
+
+The 64 MiB default leaves ample headroom over the normal 16 MiB raw CDC key/value budget and its
+protobuf framing. Resolved values and bucket expansion happen after the raw budget, however, so the
+client advertises its actual limit on every CDC poll. A compatible server measures the complete
+serialized protobuf response and paginates batch responses only between complete CDC sequence groups.
+This preserves `nextSeq` and never splits bucket-expanded events that share a sequence.
+
+If one indivisible sequence group alone exceeds the configured limit, the poll fails once with
+`FAILED_PRECONDITION` and reports the sequence, required size, and configured size. The cursor is not
+advanced. Increase the property and create a new connection to retrieve the same event; continuous CDC
+streams do not retry this permanent configuration error indefinitely. Clients that do not advertise a
+limit are budgeted to gRPC's legacy 4 MiB default. The legacy server-streaming poll validates every
+individual event against the same advertised limit and fails before sending an event that cannot fit.
+
 == 7. Handling Client/Schema Updates
 
 In a production environment, you may need to update the application logic or data schema.
