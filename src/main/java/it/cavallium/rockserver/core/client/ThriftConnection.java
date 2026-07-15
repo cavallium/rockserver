@@ -19,6 +19,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestExists;
 import it.cavallium.rockserver.core.common.RequestType.RequestForUpdate;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestGetAllInRange;
+import it.cavallium.rockserver.core.common.RequestType.RequestGetAllInRangeNoCache;
 import it.cavallium.rockserver.core.common.RequestType.RequestGetFirstAndLast;
 import it.cavallium.rockserver.core.common.RequestType.RequestGetRange;
 import it.cavallium.rockserver.core.common.RequestType.RequestIterate;
@@ -54,6 +55,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.thrift.TApplicationException;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TSocket;
@@ -459,6 +461,9 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			if (requestType instanceof RequestGetAllInRange) {
 				List<it.cavallium.rockserver.core.common.api.KV> list = client.getAllInRange(transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs);
 				return list.stream().map(this::mapKV).map(k -> (T) k);
+			} else if (requestType instanceof RequestGetAllInRangeNoCache) {
+				List<it.cavallium.rockserver.core.common.api.KV> list = client.getAllInRangeNoCache(transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs);
+				return list.stream().map(this::mapKV).map(k -> (T) k);
 			}
 			throw new UnsupportedOperationException("Get range type " + requestType + " not implemented");
 		} catch (TException e) {
@@ -677,6 +682,12 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 					type,
 					re.getMessage()
 			);
+		}
+		if (e instanceof TApplicationException applicationException
+				&& applicationException.getType() == TApplicationException.UNKNOWN_METHOD) {
+			return RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
+					"The Thrift peer does not support the requested method: " + applicationException.getMessage(),
+					e);
 		}
 		return RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
 	}

@@ -245,6 +245,7 @@ service RocksDBService {
   rpc reduceRangeFirstAndLast(GetRangeRequest) returns (FirstAndLast);
   rpc reduceRangeEntriesCount(GetRangeRequest) returns (EntriesCount);
   rpc getAllInRange(GetRangeRequest) returns (stream KV);
+  rpc getAllInRangeNoCache(GetRangeRequest) returns (stream KV);
   rpc scanRaw(ScanRawRequest) returns (stream ScanRawResponse);
   rpc flush(FlushRequest) returns (google.protobuf.Empty);
   rpc compact(CompactRequest) returns (google.protobuf.Empty);

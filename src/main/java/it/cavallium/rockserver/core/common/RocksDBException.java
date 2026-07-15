@@ -38,7 +38,8 @@ public class RocksDBException extends RuntimeException {
 		INTERNAL_ERROR,
 		TRANSACTION_NOT_FOUND,
 		NULL_ARGUMENT,
-		CDC_GAP_DETECTED
+		CDC_GAP_DETECTED,
+		READ_DEADLINE_EXCEEDED
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {

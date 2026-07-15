@@ -599,6 +599,17 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
+		public List<KV> getAllInRangeNoCache(long transactionId, long columnId, List<ByteBuffer> startKeysInclusive, List<ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().getRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.allInRangeNoCache(), timeoutMs)
+						.map(ThriftServer::mapKV)
+						.collect(Collectors.toList());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
 		public List<OptionalBinary> putMultiGetPrevious(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
 			try {
 				return mapResult(client.getSyncApi().putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.previous()));

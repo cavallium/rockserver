@@ -74,6 +74,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -185,6 +186,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Counter cdcBytesEmitted;
 	private final RocksDBStatistics rocksDBStatistics;
 	private final boolean fastGet;
+	private volatile long getRangeIteratorRefreshInterval = ITERATOR_REFRESH_INTERVAL;
+	private volatile @Nullable Consumer<Boolean> rangeReadOptionsObserver;
 	private Path tempSSTsPath;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
@@ -1035,6 +1038,44 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var ro = new LeakSafeReadOptions(label);
 		ro.setAsyncIo(true);
 		return ro;
+	}
+
+	private ReadOptions newRangeReadOptions(long deadlineMicros,
+			boolean fillCache,
+			@Nullable AbstractSlice<?> startKeySlice,
+			@Nullable AbstractSlice<?> endKeySlice) {
+		var ro = newReadOptions("get-range-async-read-options");
+		try {
+			ro.setDeadline(deadlineMicros);
+			ro.setFillCache(fillCache);
+			if (startKeySlice != null) {
+				ro.setIterateLowerBound(startKeySlice);
+			}
+			if (endKeySlice != null) {
+				ro.setIterateUpperBound(endKeySlice);
+			}
+			var observer = rangeReadOptionsObserver;
+			if (observer != null) {
+				observer.accept(ro.fillCache());
+			}
+			return ro;
+		} catch (Throwable throwable) {
+			ro.close();
+			throw throwable;
+		}
+	}
+
+	@VisibleForTesting
+	public void setGetRangeIteratorRefreshIntervalForTesting(long refreshInterval) {
+		if (refreshInterval <= 0) {
+			throw new IllegalArgumentException("refreshInterval must be positive");
+		}
+		this.getRangeIteratorRefreshInterval = refreshInterval;
+	}
+
+	@VisibleForTesting
+	public void setRangeReadOptionsObserverForTesting(@Nullable Consumer<Boolean> observer) {
+		this.rangeReadOptionsObserver = observer;
 	}
 
 	@Override
@@ -3652,8 +3693,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			iterator.status();
 		} catch (org.rocksdb.RocksDBException exception) {
-			throw RocksDBException.of(RocksDBErrorType.GET_1, exception);
+			throw mapIteratorStatusException(exception);
 		}
+	}
+
+	@VisibleForTesting
+	public static RocksDBException mapIteratorStatusException(org.rocksdb.RocksDBException exception) {
+		var status = exception.getStatus();
+		var errorType = status != null && status.getCode() == Code.TimedOut
+				? RocksDBErrorType.READ_DEADLINE_EXCEEDED
+				: RocksDBErrorType.GET_1;
+		return RocksDBException.of(errorType, exception);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -3801,6 +3851,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
 		long deadlineMicros = readDeadlineMicros(timeoutMs);
+		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
+		long iteratorRefreshInterval = getRangeIteratorRefreshInterval;
 		actionLogger.logAction("GetRange (begin)",
 				start,
 				columnId,
@@ -3851,16 +3903,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					it.close();
 					ro.close();
 
-					var newRo = newReadOptions("get-range-async-read-options");
+					var newRo = newRangeReadOptions(deadlineMicros, fillCache, startKeySlice, endKeySlice);
 					try {
-						newRo.setDeadline(deadlineMicros);
-						if (startKeySlice != null) {
-							newRo.setIterateLowerBound(startKeySlice);
-						}
-						if (endKeySlice != null) {
-							newRo.setIterateUpperBound(endKeySlice);
-						}
-
 						RocksIterator newIt = db.get().newIterator(col.cfh(), newRo);
 						try {
 							if (reverse) {
@@ -3911,10 +3955,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						var col = getColumn(columnId);
 
 						IteratorResources res;
-
-						var ro = newReadOptions("get-range-async-read-options");
 						try {
-							ro.setDeadline(deadlineMicros);
 							Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(
 									startKeysInclusive.keys()) : null;
 							Buf calculatedEndKey =
@@ -3924,21 +3965,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							try {
 								var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null;
 								try {
-									if (startKeySlice != null) {
-										ro.setIterateLowerBound(startKeySlice);
+									var ro = newRangeReadOptions(deadlineMicros, fillCache, startKeySlice, endKeySlice);
+									try {
+										RocksIterator it;
+										if (transactionId != 0L) {
+											//noinspection resource
+											it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+										} else {
+											it = db.get().newIterator(col.cfh(), ro);
+										}
+										try {
+											res = new IteratorResources(col, ro, startKeySlice, endKeySlice, it, transactionId == 0);
+										} catch (Throwable ex) {
+											it.close();
+											throw ex;
+										}
+									} catch (Throwable ex) {
+										ro.close();
+										throw ex;
 									}
-									if (endKeySlice != null) {
-										ro.setIterateUpperBound(endKeySlice);
-									}
-
-									RocksIterator it;
-									if (transactionId != 0L) {
-										//noinspection resource
-										it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
-									} else {
-										it = db.get().newIterator(col.cfh(), ro);
-									}
-									res = new IteratorResources(col, ro, startKeySlice, endKeySlice, it, transactionId == 0);
 								} catch (Throwable ex) {
 									if (endKeySlice != null) {
 										endKeySlice.close();
@@ -3951,9 +3996,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								}
 								throw ex;
 							}
-						} catch (Throwable ex) {
-							ro.close();
-							throw ex;
 						} finally {
 							totalTime.add(System.nanoTime() - initializationStartTime);
 						}
@@ -4029,7 +4071,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (nextResult != null) {
 						sink.next(nextResult);
 						res.itemsRead++;
-						if (res.canRefresh && res.itemsRead >= ITERATOR_REFRESH_INTERVAL && res.bucketIterator == null) {
+						if (res.canRefresh && res.itemsRead >= iteratorRefreshInterval && res.bucketIterator == null) {
 							try {
 								res.refresh(reverse);
 								res.itemsRead = 0;

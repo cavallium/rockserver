@@ -109,7 +109,8 @@ enum RocksDBErrorType {
   GET_PROPERTY_ERROR = 34,
   INTERNAL_ERROR = 35,
   TRANSACTION_NOT_FOUND = 36,
-  NULL_ARGUMENT = 37
+  NULL_ARGUMENT = 37,
+  READ_DEADLINE_EXCEEDED = 38
 }
 
 exception RocksDBThriftException {
@@ -194,6 +195,8 @@ service RocksDB {
    i64 reduceRangeEntriesCount(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
 
    list<KV> getAllInRange(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+
+   list<KV> getAllInRangeNoCache(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
 
    i64 uploadMergeOperator(1: required string operatorName, 2: required string className, 3: required binary jarPayload) throws (1: RocksDBThriftException e),
 

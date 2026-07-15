@@ -935,17 +935,29 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Flux<KV> getAllInRange(GetRangeRequest request) {
+			return getAllInRange(request, RequestType.allInRange(), "getAllInRange");
+		}
+
+		@Override
+		public Flux<KV> getAllInRangeNoCache(GetRangeRequest request) {
+			return getAllInRange(request, RequestType.allInRangeNoCache(), "getAllInRangeNoCache");
+		}
+
+		private Flux<KV> getAllInRange(GetRangeRequest request,
+				RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV,
+						it.cavallium.rockserver.core.common.KV> requestType,
+				String requestName) {
 			return Flux
 					.from(asyncApi.getRangeAsync(request.getTransactionId(),
 							request.getColumnId(),
 							mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
 							mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 							request.getReverse(),
-							RequestType.allInRange(),
+							requestType,
 							request.getTimeoutMs()
 					))
 					.map(GrpcServerImpl::unmapKVHeap)
-					.transform(this.onErrorMapFluxWithRequestInfo("getAllInRange", request));
+					.transform(this.onErrorMapFluxWithRequestInfo(requestName, request));
 		}
 
 		@Override

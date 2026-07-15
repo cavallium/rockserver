@@ -45,7 +45,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
   GET_PROPERTY_ERROR(34),
   INTERNAL_ERROR(35),
   TRANSACTION_NOT_FOUND(36),
-  NULL_ARGUMENT(37);
+  NULL_ARGUMENT(37),
+  READ_DEADLINE_EXCEEDED(38);
 
   private final int value;
 
@@ -66,7 +67,7 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
    * @return null if the value is not found.
    */
   @org.apache.thrift.annotation.Nullable
-  public static RocksDBErrorType findByValue(int value) { 
+  public static RocksDBErrorType findByValue(int value) {
     switch (value) {
       case 0:
         return PUT_UNKNOWN_ERROR;
@@ -144,6 +145,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
         return TRANSACTION_NOT_FOUND;
       case 37:
         return NULL_ARGUMENT;
+      case 38:
+        return READ_DEADLINE_EXCEEDED;
       default:
         return null;
     }

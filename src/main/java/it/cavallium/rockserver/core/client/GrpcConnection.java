@@ -799,7 +799,19 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return (Publisher<T>) switch (requestType) {
 			case RequestType.RequestGetAllInRange<?> _ -> toResponse(reactiveStub.getAllInRange(request)
 					.map(kv -> mapKV(kv)));
+			case RequestType.RequestGetAllInRangeNoCache<?> _ -> toResponse(reactiveStub.getAllInRangeNoCache(request)
+					.map(GrpcConnection::mapKV))
+					.onErrorMap(GrpcConnection::mapNoCacheRangeCompatibilityError);
 		};
+	}
+
+	private static Throwable mapNoCacheRangeCompatibilityError(Throwable error) {
+		if (Status.fromThrowable(error).getCode() == Code.UNIMPLEMENTED) {
+			return RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
+					"The connected Rockserver does not support RequestType.allInRangeNoCache(); "
+							+ "upgrade the peer to version 1.2.8 or newer");
+		}
+		return error;
 	}
 
     // ============ CDC Async API ============

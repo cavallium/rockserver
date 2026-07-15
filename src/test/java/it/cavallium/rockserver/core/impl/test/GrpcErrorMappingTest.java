@@ -8,6 +8,7 @@ import io.grpc.ServerBuilder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import it.cavallium.rockserver.core.client.GrpcConnection;
+import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
@@ -62,6 +63,24 @@ class GrpcErrorMappingTest {
 	}
 
 	@Test
+	void readDeadlineExceededRetainsItsTypedContract() {
+		var error = assertThrows(RocksDBException.class,
+				() -> client.getSyncApi().getColumnId("read-deadline"));
+
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
+		assertEquals("Deadline exceeded", error.getMessage());
+	}
+
+	@Test
+	void getErrorWithDeadlineTextIsNotReclassifiedAsReadDeadlineExceeded() {
+		var error = assertThrows(RocksDBException.class,
+				() -> client.getSyncApi().getColumnId("get-deadline-text"));
+
+		assertEquals(RocksDBErrorType.GET_1, error.getErrorUniqueId());
+		assertEquals("Deadline exceeded", error.getMessage());
+	}
+
+	@Test
 	void updateRetryRetainsItsSpecializedExceptionType() {
 		assertThrows(RocksDBRetryException.class,
 				() -> client.getSyncApi().getColumnId("retry"));
@@ -95,6 +114,25 @@ class GrpcErrorMappingTest {
 		assertEquals("plain grpc error", error.getStatus().getDescription());
 	}
 
+	@Test
+	void noCacheRangeFailsClearlyAgainstAnIncompatiblePeer() {
+		var error = assertThrows(RocksDBException.class, () -> {
+			try (var range = client.getSyncApi().getRange(0,
+					0,
+					null,
+					null,
+					false,
+					RequestType.allInRangeNoCache(),
+					1_000)) {
+				range.toList();
+			}
+		});
+
+		assertEquals(RocksDBErrorType.NOT_IMPLEMENTED, error.getErrorUniqueId());
+		assertEquals("The connected Rockserver does not support RequestType.allInRangeNoCache(); "
+				+ "upgrade the peer to version 1.2.8 or newer", error.getMessage());
+	}
+
 	private static final class ErrorService extends ReactorRocksDBServiceGrpc.RocksDBServiceImplBase {
 
 		@Override
@@ -102,6 +140,12 @@ class GrpcErrorMappingTest {
 			return Mono.error(switch (request.getName()) {
 				case "valid" -> Status.INTERNAL
 						.withDescription(ERROR_PREFIX + "COLUMN_NOT_FOUND] missing column")
+						.asRuntimeException();
+				case "read-deadline" -> Status.INTERNAL
+						.withDescription(ERROR_PREFIX + "READ_DEADLINE_EXCEEDED] Deadline exceeded")
+						.asRuntimeException();
+				case "get-deadline-text" -> Status.INTERNAL
+						.withDescription(ERROR_PREFIX + "GET_1] Deadline exceeded")
 						.asRuntimeException();
 				case "retry" -> Status.INTERNAL
 						.withDescription(ERROR_PREFIX + "UPDATE_RETRY] retry")

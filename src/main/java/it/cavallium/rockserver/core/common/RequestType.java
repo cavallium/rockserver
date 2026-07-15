@@ -21,7 +21,8 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		MERGED(new RequestMerged()),
 		FIRST_AND_LAST(new RequestGetFirstAndLast()),
 		ALL_IN_RANGE(new RequestGetAllInRange()),
-		ENTRIES_COUNT(new RequestEntriesCount());
+		ENTRIES_COUNT(new RequestEntriesCount()),
+		ALL_IN_RANGE_NO_CACHE(new RequestGetAllInRangeNoCache());
 
 		private final RequestType requestType;
 
@@ -122,6 +123,11 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 	@SuppressWarnings("unchecked")
 	static <T> RequestGetAllInRange<T> allInRange() {
 		return (RequestGetAllInRange<T>) RequestGetAllInRange.INSTANCE;
+	}
+
+	@SuppressWarnings("unchecked")
+	static <T> RequestGetAllInRangeNoCache<T> allInRangeNoCache() {
+		return (RequestGetAllInRangeNoCache<T>) RequestGetAllInRangeNoCache.INSTANCE;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -263,6 +269,16 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		@Override
 		public RequestTypeId getRequestTypeId() {
 			return RequestTypeId.ALL_IN_RANGE;
+		}
+	}
+
+	record RequestGetAllInRangeNoCache<T>() implements RequestGetRange<T, T> {
+
+		private static final RequestGetAllInRangeNoCache<Object> INSTANCE = new RequestGetAllInRangeNoCache<>();
+
+		@Override
+		public RequestTypeId getRequestTypeId() {
+			return RequestTypeId.ALL_IN_RANGE_NO_CACHE;
 		}
 	}
 
