@@ -97,13 +97,18 @@ public class ThriftServer extends Server {
 				hashTypesToRecord(schema.getVariableTailKeys()),
 				schema.isHasValue(),
 				schema.isSetMergeOperatorName() ? schema.getMergeOperatorName() : null,
-				schema.isSetMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null
+				schema.isSetMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null,
+				schema.isSetMergeOperatorClass() ? schema.getMergeOperatorClass() : null
 		);
 	}
 
 	private static ColumnSchema mapSchemaToThrift(it.cavallium.rockserver.core.common.ColumnSchema schema) {
 		ColumnSchema s = new ColumnSchema();
-		s.setFixedKeys(new ArrayList<>(schema.keys()));
+		var fixedKeys = new ArrayList<Integer>(schema.fixedLengthKeysCount());
+		for (int i = 0; i < schema.fixedLengthKeysCount(); i++) {
+			fixedKeys.add(schema.key(i));
+		}
+		s.setFixedKeys(fixedKeys);
 		s.setVariableTailKeys(schema.variableTailKeys().stream()
 				.map(t -> ColumnHashType.valueOf(t.name()))
 				.collect(Collectors.toList()));
@@ -113,6 +118,9 @@ public class ThriftServer extends Server {
 		}
 		if (schema.mergeOperatorVersion() != null) {
 			s.setMergeOperatorVersion(schema.mergeOperatorVersion());
+		}
+		if (schema.mergeOperatorClass() != null) {
+			s.setMergeOperatorClass(schema.mergeOperatorClass());
 		}
 		return s;
 	}
@@ -325,6 +333,78 @@ public class ThriftServer extends Server {
 				ByteBuffer value) throws RocksDBThriftException {
 			try {
 				return client.getSyncApi().put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.previousPresence());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void delete(long transactionOrUpdateId,
+				long columnId,
+				List<ByteBuffer> keys) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().delete(
+						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.none());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public OptionalBinary deleteGetPrevious(long transactionOrUpdateId,
+				long columnId,
+				List<ByteBuffer> keys) throws RocksDBThriftException {
+			try {
+				return ThriftServer.mapResult(client.getSyncApi().delete(
+						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.previous()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public boolean deleteGetPreviousPresence(long transactionOrUpdateId,
+				long columnId,
+				List<ByteBuffer> keys) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().delete(
+						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.previousPresence());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void deleteMulti(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti) throws RocksDBThriftException {
+			try {
+				client.getSyncApi().deleteMulti(
+						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.none());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<OptionalBinary> deleteMultiGetPrevious(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti) throws RocksDBThriftException {
+			try {
+				return ThriftServer.mapResult(client.getSyncApi().deleteMulti(
+						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.previous()));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<Boolean> deleteMultiGetPreviousPresence(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().deleteMulti(
+						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.previousPresence());
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}

@@ -23,6 +23,8 @@ import org.rocksdb.Status;
 import org.rocksdb.WriteBatch;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
@@ -58,6 +60,83 @@ class CdcPollErrorPropagationTest {
 
 			assertEquals(RocksDBErrorType.INTERNAL_ERROR, error.getErrorUniqueId());
 			assertTrue(error.getMessage().contains("Failed to parse WriteBatch at seq"));
+			assertNotNull(db.failedHandler);
+			assertFalse(db.failedHandler.isOwningHandle(),
+					"The native WriteBatch.Handler must be closed when parsing fails");
+		}
+	}
+
+	@Test
+	void nativeCallbackIsReusedAcrossWalBatchesAndClosedAfterPoll() throws Exception {
+		try (var db = new HandlerTrackingEmbeddedDB(tempDir, "cdc-handler-lifecycle")) {
+			long columnId = db.createColumn("data", ColumnSchema.of(
+					IntArrayList.of(Integer.BYTES),
+					new ObjectArrayList<>(),
+					true,
+					null,
+					null,
+					null));
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			db.put(0, columnId,
+					new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})}),
+					Buf.wrap("first".getBytes(StandardCharsets.UTF_8)),
+					RequestType.none());
+			db.put(0, columnId,
+					new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 2})}),
+					Buf.wrap("second".getBytes(StandardCharsets.UTF_8)),
+					RequestType.none());
+
+			var batch = db.cdcPollBatchAsyncInternal("sub", startSeq, 100).block();
+
+			assertNotNull(batch);
+			assertEquals(2, batch.events().size());
+			assertTrue(db.iteratedBatches >= 2);
+			assertTrue(db.reusedOneHandler,
+					"A poll should allocate one native callback, not one callback per WAL batch");
+			assertNotNull(db.firstHandler);
+			assertFalse(db.firstHandler.isOwningHandle(),
+					"The poll-owned native callback must be closed after iteration");
+		}
+	}
+
+	@Test
+	void fullyConsumedBatchAdvancesToTheNextWalSequence() throws Exception {
+		try (var db = new HandlerTrackingEmbeddedDB(tempDir, "cdc-canonical-next-sequence")) {
+			long columnId = db.createColumn("data", ColumnSchema.of(
+					IntArrayList.of(Integer.BYTES),
+					new ObjectArrayList<>(),
+					true,
+					null,
+					null,
+					null));
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			long txId = db.openTransaction(10_000);
+			for (int i = 0; i < 4; i++) {
+				db.put(txId, columnId,
+						new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, (byte) i})}),
+						Buf.wrap(("value-" + i).getBytes(StandardCharsets.UTF_8)),
+						RequestType.none());
+			}
+			db.closeTransaction(txId, true);
+
+			var batch = db.cdcPollBatchAsyncInternal("sub", startSeq, 4).block();
+
+			assertNotNull(batch);
+			assertEquals(4, batch.events().size());
+			long batchWalSequence = batch.events().getFirst().seq() >>> 20;
+			for (var event : batch.events()) {
+				assertEquals(batchWalSequence, event.seq() >>> 20,
+						"The transaction must be represented by one WAL batch");
+			}
+			assertEquals((batchWalSequence + 4) << 20, batch.nextSeq(),
+					"A fully consumed batch should not be retained as the next poll's dependency");
+
+			int iteratedBatches = db.iteratedBatches;
+			var emptyTail = db.cdcPollBatchAsyncInternal("sub", batch.nextSeq(), 100).block();
+			assertNotNull(emptyTail);
+			assertTrue(emptyTail.events().isEmpty());
+			assertEquals(iteratedBatches, db.iteratedBatches,
+					"An idle tail poll must not reopen and parse the fully-consumed batch");
 		}
 	}
 
@@ -155,17 +234,42 @@ class CdcPollErrorPropagationTest {
 
 	private static final class ParserFailingEmbeddedDB extends EmbeddedDB {
 		private int parsedBatches;
+		private WriteBatch.Handler failedHandler;
 
 		private ParserFailingEmbeddedDB(Path path, String name) throws IOException {
 			super(path, name, null);
 		}
 
 		@Override
-		protected void iterateCdcWriteBatch(byte[] data, WriteBatch.Handler handler) throws org.rocksdb.RocksDBException {
+		protected void iterateCdcWriteBatch(WriteBatch writeBatch, WriteBatch.Handler handler)
+				throws org.rocksdb.RocksDBException {
 			if (++parsedBatches == 3) {
+				failedHandler = handler;
 				throw new org.rocksdb.RocksDBException("synthetic malformed WriteBatch");
 			}
-			super.iterateCdcWriteBatch(data, handler);
+			super.iterateCdcWriteBatch(writeBatch, handler);
+		}
+	}
+
+	private static final class HandlerTrackingEmbeddedDB extends EmbeddedDB {
+		private WriteBatch.Handler firstHandler;
+		private int iteratedBatches;
+		private boolean reusedOneHandler = true;
+
+		private HandlerTrackingEmbeddedDB(Path path, String name) throws IOException {
+			super(path, name, null);
+		}
+
+		@Override
+		protected void iterateCdcWriteBatch(WriteBatch writeBatch, WriteBatch.Handler handler)
+				throws org.rocksdb.RocksDBException {
+			iteratedBatches++;
+			if (firstHandler == null) {
+				firstHandler = handler;
+			} else {
+				reusedOneHandler &= firstHandler == handler;
+			}
+			super.iterateCdcWriteBatch(writeBatch, handler);
 		}
 	}
 

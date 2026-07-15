@@ -17,6 +17,7 @@ module rockserver.core.test {
 	requires jdk.unsupported;
 	requires reactor.test;
 	requires org.mockito;
+	requires micrometer.core;
 	opens it.cavallium.rockserver.core.test;
 	opens it.cavallium.rockserver.core.impl.test;
 }

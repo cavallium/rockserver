@@ -299,7 +299,11 @@ database: {
 			if (!getHasValues()) {
 				Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, toBufSimple(123), RequestType.delta()));
 			} else {
-				Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, emptyBuf(), RequestType.delta()));
+				var emptyValue = emptyBuf();
+				var emptyDelta = db.put(0, colId, key, emptyValue, RequestType.delta());
+				Assertions.assertNull(emptyDelta.previous());
+				assertSegmentEquals(emptyValue, emptyDelta.current());
+				assertSegmentEquals(emptyValue, db.get(0, colId, key, RequestType.current()));
 				Assertions.assertThrows(RocksDBException.class, () -> {
 					try {
 						db.put(0, colId, key, null, RequestType.delta());

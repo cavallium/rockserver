@@ -87,13 +87,10 @@ database: {
 			// Expected
 		}
 
-		// Check if key1 was persisted.
-		Buf val1 = db.get(0, colIdNoBuckets, key1, RequestType.current());
-		if (val1 != null) {
-			System.out.println("Value 1 after failed putMulti: " + Arrays.toString(Utils.toByteArray(val1)));
-		} else {
-			System.out.println("Value 1 after failed putMulti: null");
-		}
+		// The failed multi-operation must not leak its successful prefix, and it must not
+		// roll back the competing transaction that caused the conflict.
+		Assertions.assertNull(db.get(0, colIdNoBuckets, key1, RequestType.current()));
+		assertBufEquals(toBufSimple(100), db.get(0, colIdNoBuckets, key2, RequestType.current()));
 	}
 
 	private static void assertBufEquals(Buf expected, Buf actual) {

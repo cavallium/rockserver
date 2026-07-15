@@ -1,64 +1,165 @@
 package it.cavallium.rockserver.core.impl;
 
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class SafeShutdown implements AutoCloseable {
 
-	private volatile boolean closing;
+	private static final long CLOSING_MASK = Long.MIN_VALUE;
+	private static final long PENDING_MASK = Long.MAX_VALUE;
 
-	private final LongAdder pendingOps = new LongAdder();
+	/**
+	 * The sign bit marks closing and the remaining bits hold the exact pending-operation count.
+	 * Keeping both values in one CAS word makes beginOp linearizable with closeAndWait.
+	 */
+	private final AtomicLong state = new AtomicLong();
+
+	private final ReentrantLock waitLock = new ReentrantLock();
+	private final Condition operationsFinished = waitLock.newCondition();
+	private volatile int waiters;
 
 	public void beginOp() {
-		if (closing) {
-			throw new IllegalStateException("Closed");
+		for (;;) {
+			long current = state.get();
+			if (current < 0) {
+				throw new IllegalStateException("Closed");
+			}
+			if (current == PENDING_MASK) {
+				throw new IllegalStateException("Too many pending operations");
+			}
+			if (state.compareAndSet(current, current + 1)) {
+				return;
+			}
 		}
-		pendingOps.increment();
 	}
 
- public void endOp() {
-        pendingOps.decrement();
-    }
+	public void endOp() {
+		long updated;
+		for (;;) {
+			long current = state.get();
+			if ((current & PENDING_MASK) == 0) {
+				throw new IllegalStateException("No pending operation to end");
+			}
+			updated = current - 1;
+			if (state.compareAndSet(current, updated)) {
+				break;
+			}
+		}
+
+		if ((updated & PENDING_MASK) == 0 && waiters != 0) {
+			signalWaiters();
+		}
+	}
 
 	public void closeAndWait(long timeoutMs) throws TimeoutException {
-		this.closing = true;
+		validateTimeout(timeoutMs);
+		startClosing();
 		waitForExit(timeoutMs);
 	}
 
- public void waitForExit(long timeoutMs) throws TimeoutException {
-        try {
-            long startMs = System.nanoTime();
-            while (pendingOps.sum() > 0 && System.nanoTime() - startMs < (timeoutMs * 1000000L)) {
-                //noinspection BusyWait
-                Thread.sleep(10);
-    }
-            if (pendingOps.sum() > 0) {
-                throw new TimeoutException();
-            }
-        } catch (InterruptedException e) {
-            // Preserve interrupt status and propagate as timeout to let callers perform forced cleanup path
-            Thread.currentThread().interrupt();
-            throw new TimeoutException("Interrupted while waiting for pending operations to finish");
-        }
-    }
+	public void waitForExit(long timeoutMs) throws TimeoutException {
+		validateTimeout(timeoutMs);
+		if (getPendingOpsCount() == 0) {
+			return;
+		}
 
-	@Override
- public void close() {
+		long waitStartedNanos = System.nanoTime();
 		try {
-			closeAndWait(Long.MAX_VALUE);
-		} catch (TimeoutException e) {
-			throw new RuntimeException(e);
-  }
+			waitLock.lockInterruptibly();
+		} catch (InterruptedException exception) {
+			throw interruptedTimeout(exception);
+		}
+		waiters++;
+		try {
+			if (timeoutMs == Long.MAX_VALUE) {
+				awaitIndefinitely();
+			} else {
+				long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+				long lockWaitNanos = System.nanoTime() - waitStartedNanos;
+				long remainingNanos = lockWaitNanos >= timeoutNanos ? 0 : timeoutNanos - lockWaitNanos;
+				awaitFor(remainingNanos);
+			}
+		} finally {
+			waiters--;
+			waitLock.unlock();
+		}
 	}
 
-    public boolean isOpen() {
-        return !closing;
-    }
+	private static void validateTimeout(long timeoutMs) {
+		if (timeoutMs < 0) {
+			throw new IllegalArgumentException("timeoutMs must not be negative");
+		}
+	}
 
-    /**
-     * Expose current number of pending operations for diagnostics/metrics.
-     */
-    public long getPendingOpsCount() {
-        return pendingOps.sum();
-    }
+	private void startClosing() {
+		for (;;) {
+			long current = state.get();
+			if (current < 0 || state.compareAndSet(current, current | CLOSING_MASK)) {
+				return;
+			}
+		}
+	}
+
+	private void awaitIndefinitely() throws TimeoutException {
+		while (getPendingOpsCount() != 0) {
+			try {
+				operationsFinished.await();
+			} catch (InterruptedException exception) {
+				throw interruptedTimeout(exception);
+			}
+		}
+	}
+
+	private void awaitFor(long timeoutNanos) throws TimeoutException {
+		long remainingNanos = timeoutNanos;
+		while (getPendingOpsCount() != 0) {
+			if (remainingNanos <= 0) {
+				throw new TimeoutException("Timed out with " + getPendingOpsCount() + " pending operations");
+			}
+			try {
+				remainingNanos = operationsFinished.awaitNanos(remainingNanos);
+			} catch (InterruptedException exception) {
+				throw interruptedTimeout(exception);
+			}
+		}
+	}
+
+	private void signalWaiters() {
+		waitLock.lock();
+		try {
+			operationsFinished.signalAll();
+		} finally {
+			waitLock.unlock();
+		}
+	}
+
+	private static TimeoutException interruptedTimeout(InterruptedException cause) {
+		Thread.currentThread().interrupt();
+		var exception = new TimeoutException("Interrupted while waiting for pending operations to finish");
+		exception.initCause(cause);
+		return exception;
+	}
+
+	@Override
+	public void close() {
+		try {
+			closeAndWait(Long.MAX_VALUE);
+		} catch (TimeoutException exception) {
+			throw new RuntimeException(exception);
+		}
+	}
+
+	public boolean isOpen() {
+		return state.get() >= 0;
+	}
+
+	/**
+	 * Expose current number of pending operations for diagnostics/metrics.
+	 */
+	public long getPendingOpsCount() {
+		return state.get() & PENDING_MASK;
+	}
 }

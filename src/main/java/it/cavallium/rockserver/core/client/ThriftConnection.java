@@ -12,6 +12,7 @@ import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
+import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
 import it.cavallium.rockserver.core.common.RequestType.RequestEntriesCount;
 import it.cavallium.rockserver.core.common.RequestType.RequestExists;
@@ -213,6 +214,30 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@SuppressWarnings("unchecked")
 	@Override
+	public <T> T delete(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			RequestDelete<? super Buf, T> requestType) {
+		try {
+			if (requestType == null) {
+				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
+			}
+			if (requestType instanceof RequestNothing) {
+				client.delete(transactionOrUpdateId, columnId, mapKeys(keys));
+				return null;
+			} else if (requestType instanceof RequestPrevious) {
+				return (T) mapOptionalBinary(client.deleteGetPrevious(transactionOrUpdateId, columnId, mapKeys(keys)));
+			} else if (requestType instanceof RequestPreviousPresence) {
+				return (T) (Boolean) client.deleteGetPreviousPresence(transactionOrUpdateId, columnId, mapKeys(keys));
+			}
+			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
 	public <T> T merge(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestMerge<? super Buf, T> requestType) {
 		try {
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
@@ -245,6 +270,32 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 				return (List<T>) client.putMultiGetChanged(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
 			} else if (requestType instanceof RequestPreviousPresence) {
 				return (List<T>) client.putMultiGetPreviousPresence(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
+			}
+			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> List<T> deleteMulti(long transactionOrUpdateId,
+			long columnId,
+			List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType) {
+		try {
+			if (requestType == null) {
+				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
+			}
+			if (requestType instanceof RequestNothing) {
+				client.deleteMulti(transactionOrUpdateId, columnId, mapKeysList(keys));
+				return Collections.nCopies(keys.size(), null);
+			} else if (requestType instanceof RequestPrevious) {
+				return (List<T>) mapOptionalBinaryList(
+						client.deleteMultiGetPrevious(transactionOrUpdateId, columnId, mapKeysList(keys)));
+			} else if (requestType instanceof RequestPreviousPresence) {
+				return (List<T>) client.deleteMultiGetPreviousPresence(
+						transactionOrUpdateId, columnId, mapKeysList(keys));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -499,6 +550,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public <T> CompletableFuture<T> deleteAsync(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			RequestDelete<? super Buf, T> requestType) {
+		return CompletableFuture.supplyAsync(
+				() -> delete(transactionOrUpdateId, columnId, keys, requestType), executor);
+	}
+
+	@Override
 	public <T> CompletableFuture<T> mergeAsync(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestMerge<? super Buf, T> requestType) {
 		return CompletableFuture.supplyAsync(() -> merge(transactionOrUpdateId, columnId, keys, value, requestType), executor);
 	}
@@ -506,6 +566,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId, long columnId, List<Keys> keys, List<Buf> values, RequestPut<? super Buf, T> requestType) {
 		return CompletableFuture.supplyAsync(() -> putMulti(transactionOrUpdateId, columnId, keys, values, requestType), executor);
+	}
+
+	@Override
+	public <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType) {
+		return CompletableFuture.supplyAsync(
+				() -> deleteMulti(transactionOrUpdateId, columnId, keys, requestType), executor);
 	}
 
 	@Override
@@ -674,7 +743,11 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	private it.cavallium.rockserver.core.common.api.ColumnSchema mapSchema(ColumnSchema schema) {
 		it.cavallium.rockserver.core.common.api.ColumnSchema s = new it.cavallium.rockserver.core.common.api.ColumnSchema();
-		s.setFixedKeys(new ArrayList<>(schema.keys()));
+		var fixedKeys = new ArrayList<Integer>(schema.fixedLengthKeysCount());
+		for (int i = 0; i < schema.fixedLengthKeysCount(); i++) {
+			fixedKeys.add(schema.key(i));
+		}
+		s.setFixedKeys(fixedKeys);
 		s.setVariableTailKeys(schema.variableTailKeys().stream()
 				.map(t -> it.cavallium.rockserver.core.common.api.ColumnHashType.valueOf(t.name()))
 				.collect(Collectors.toList()));
@@ -684,6 +757,9 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 		}
 		if (schema.mergeOperatorVersion() != null) {
 			s.setMergeOperatorVersion(schema.mergeOperatorVersion());
+		}
+		if (schema.mergeOperatorClass() != null) {
+			s.setMergeOperatorClass(schema.mergeOperatorClass());
 		}
 		return s;
 	}
@@ -696,7 +772,8 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 						.toArray(it.cavallium.rockserver.core.common.ColumnHashType[]::new)),
 				schema.isHasValue(),
 				schema.isSetMergeOperatorName() ? schema.getMergeOperatorName() : null,
-				schema.isSetMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null
+				schema.isSetMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null,
+				schema.isSetMergeOperatorClass() ? schema.getMergeOperatorClass() : null
 		);
 	}
 }

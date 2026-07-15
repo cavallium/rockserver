@@ -246,7 +246,11 @@ database: {
 
 		// Second writer should fail with RocksDBRetryException
 		Assertions.assertThrowsExactly(RocksDBRetryException.class,
-				() -> db.put(forUpdate2.updateId(), colIdNoBuckets, key, value2, RequestType.none()));
+					() -> db.put(forUpdate2.updateId(), colIdNoBuckets, key, value2, RequestType.none()));
+		Assertions.assertEquals(1, db.getInternalDB().getOpenTransactionsCount(),
+				"a retryable commit must remain mapped");
+		Assertions.assertEquals(1, db.getInternalDB().getPendingOpsCount(),
+				"a retryable commit must remain counted until its retry closes");
 
 		// Second writer retries with a new forUpdate on the same transaction
 		var forUpdate3 = db.get(forUpdate2.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
@@ -254,6 +258,8 @@ database: {
 
 		// Now the retry should succeed
 		db.put(forUpdate3.updateId(), colIdNoBuckets, key, value3, RequestType.none());
+		Assertions.assertEquals(0, db.getInternalDB().getOpenTransactionsCount());
+		Assertions.assertEquals(0, db.getInternalDB().getPendingOpsCount());
 
 		// Verify final value
 		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());

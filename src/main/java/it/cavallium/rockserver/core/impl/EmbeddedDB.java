@@ -71,6 +71,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Function;
@@ -84,8 +85,6 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.VisibleForTesting;
 import org.reactivestreams.Publisher;
-import org.reactivestreams.Subscriber;
-import org.reactivestreams.Subscription;
 import org.rocksdb.AbstractImmutableNativeReference;
 import org.rocksdb.AbstractSlice;
 import org.rocksdb.Cache;
@@ -108,7 +107,6 @@ import org.rocksdb.LiveFileMetaData;
 import org.rocksdb.Options;
 import org.rocksdb.OptimisticTransactionDB;
 import org.rocksdb.Status.Code;
-import org.rocksdb.TableProperties;
 import org.rocksdb.util.SizeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -767,30 +765,24 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		// Close any remaining transactions to avoid hanging on DB close
 		if (!txs.isEmpty()) {
 			logger.warn("Closing {} remaining transactions", txs.size());
-			for (var tx : txs.values()) {
+			for (long transactionId : new ArrayList<>(txs.keySet())) {
 				try {
-					tx.close();
+					closeTransactionInternal(transactionId, false);
 				} catch (Throwable t) {
 					logger.error("Error closing remaining transaction", t);
-				} finally {
-					ops.endOp(); // Balance
 				}
 			}
-			txs.clear();
 		}
 		// Close any remaining iterators
 		if (!its.isEmpty()) {
 			logger.warn("Closing {} remaining iterators", its.size());
-			for (var it : its.values()) {
+			for (long iteratorId : new ArrayList<>(its.keySet())) {
 				try {
-					it.close();
+					closeIteratorInternal(iteratorId);
 				} catch (Throwable t) {
 					logger.error("Error closing remaining iterator", t);
-				} finally {
-					ops.endOp(); // Balance
 				}
 			}
-			its.clear();
 		}
 
 		// User column handles
@@ -886,32 +878,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		int closedIts = 0;
 		try {
 			// Transactions
-			for (var tx : txs.values()) {
+			for (long transactionId : new ArrayList<>(txs.keySet())) {
 				try {
-					tx.close();
+					closeTransactionInternal(transactionId, false);
+					closedTx++;
 				} catch (Throwable t) {
 					logger.warn("Failed to close transaction during forced shutdown", t);
-				} finally {
-					// Balance the beginOp done at transaction open
-					ops.endOp();
-					closedTx++;
 				}
 			}
-			txs.clear();
 
 			// Iterators
-			for (var it : its.values()) {
+			for (long iteratorId : new ArrayList<>(its.keySet())) {
 				try {
-					it.close();
+					if (closeIteratorInternal(iteratorId)) {
+						closedIts++;
+					}
 				} catch (Throwable t) {
 					logger.warn("Failed to close iterator during forced shutdown", t);
-				} finally {
-					// Balance the beginOp done at iterator open
-					ops.endOp();
-					closedIts++;
 				}
 			}
-			its.clear();
 
 			try {
 				ops.waitForExit(2_000);
@@ -969,22 +954,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}));
 			idsToRemove.forEach(id -> {
-				var tx = EmbeddedDB.this.txs.remove(id);
-				if (tx != null) {
-					try {
-						if (tx.val().isOwningHandle()) {
-							tx.val().rollback();
-						}
-					} catch (Throwable ex) {
-						logger.error("Failed to rollback a transaction", ex);
-					}
-					try {
-						tx.close();
-					} catch (Throwable ex) {
-						logger.error("Failed to close a transaction", ex);
-					}
-					// Balance the pending op started in openTransaction
-					ops.endOp();
+				try {
+					closeTransactionInternal(id, false);
+				} catch (Throwable ex) {
+					logger.error("Failed to close an expired transaction", ex);
 				}
 			});
 		} finally {
@@ -1034,15 +1007,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}));
 			idsToRemove.forEach(id -> {
-				var it = EmbeddedDB.this.its.remove(id);
-				if (it != null) {
-					try {
-						it.close();
-					} catch (Throwable ex) {
-						logger.error("Failed to close an iteration", ex);
-					}
-					// Balance the pending op started in openIterator
-					ops.endOp();
+				try {
+					closeIteratorInternal(id);
+				} catch (Throwable ex) {
+					logger.error("Failed to close an iteration", ex);
 				}
 			});
 		} finally {
@@ -1124,10 +1092,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Contract("_, false -> true; _, true -> _")
 	private boolean closeTransactionInternal(long transactionId, boolean commit) {
 		var tx = txs.get(transactionId);
-		if (tx != null) {
+		if (tx == null) {
+			return handleMissingTransaction(transactionId, commit);
+		}
+		synchronized (tx) {
+			// A queued closer may have read the transaction before the previous closer
+			// removed it. Recheck ownership while holding the per-transaction monitor.
+			if (txs.get(transactionId) != tx) {
+				return handleMissingTransaction(transactionId, commit);
+			}
 			try {
-				var succeeded = closeTransactionInternal(tx, commit);
+				var succeeded = closeTransactionExclusively(tx, commit);
 				if (!succeeded) {
+					// Busy/TryAgain keeps the native transaction open, mapped and counted.
 					return false;
 				}
 				txs.remove(transactionId, tx);
@@ -1136,14 +1113,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				txs.remove(transactionId, tx);
 				throw ex;
 			}
-		} else {
-			// Transaction not found
-			if (commit) {
-				throw RocksDBException.of(RocksDBErrorType.TX_NOT_FOUND, "Transaction not found: " + transactionId);
-			} else {
-				return true;
-			}
 		}
+	}
+
+	private static boolean handleMissingTransaction(long transactionId, boolean commit) {
+		if (commit) {
+			throw RocksDBException.of(RocksDBErrorType.TX_NOT_FOUND,
+					"Transaction not found: " + transactionId);
+		}
+		return true;
 	}
 
 	/**
@@ -1151,8 +1129,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 */
 	@Contract("_, false -> true; _, true -> _")
 	private boolean closeTransactionInternal(@NotNull Tx tx, boolean commit) {
-		ops.beginOp();
-		// Transaction found
+		synchronized (tx) {
+			return closeTransactionExclusively(tx, commit);
+		}
+	}
+
+	@Contract("_, false -> true; _, true -> _")
+	private boolean closeTransactionExclusively(@NotNull Tx tx, boolean commit) {
+		// Owned transactions are deliberately closed again from several finally blocks.
+		// Once the native handle is gone, its lifetime operation has already been balanced.
+		if (!tx.val().isOwningHandle()) {
+			return true;
+		}
+		// The transaction's lifetime is already counted by openTransactionInternal().
+		// Starting a second operation here is both redundant and incorrect during shutdown:
+		// closing forbids new operations, but an already-open transaction must still be able
+		// to commit or roll back so its original operation can drain.
 		try {
 			if (commit) {
 				boolean succeeded;
@@ -1198,8 +1190,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// Balance the open op
 			ops.endOp();
 			throw ex;
-		} finally {
-			ops.endOp();
 		}
 	}
 
@@ -2143,159 +2133,31 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode) throws RocksDBException {
 		var start = System.nanoTime();
-		try {
-			actionLogger.logAction("PutBatch (begin)",
-					start,
-					columnId,
-					"multiple (async)",
-					"multiple (async)",
-					null,
-					null,
-					null,
-					mode
+		actionLogger.logAction("PutBatch (begin)",
+				start,
+				columnId,
+				"multiple (async)",
+				"multiple (async)",
+				null,
+				null,
+				null,
+				mode
+		);
+
+		Mono<Void> operation = Mono.using(
+				() -> new PutBatchState(columnId, mode, start),
+				state -> Flux.from(batchPublisher)
+						.publishOn(scheduler.write())
+						.doOnNext(state::write)
+						.then(Mono.fromRunnable(state::writePending)),
+				BatchWriteState::close,
+				true
 			);
-			var cf = new CompletableFuture<Void>();
-			var subscriber = new Subscriber<KVBatch>() {
-						private boolean stopped;
-						private Subscription subscription;
-						private ColumnInstance col;
-						private ArrayList<AutoCloseable> refs;
-						private DBWriter writer;
-
-						@Override
-						public void onSubscribe(Subscription subscription) {
-							ops.beginOp();
-
-							try {
-								// Column id
-								col = getColumn(columnId);
-								refs = new ArrayList<>();
-
-								writer = switch (mode) {
-									case WRITE_BATCH, WRITE_BATCH_NO_WAL -> {
-										var wb = new WB(db.get(), new LeakSafeWriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL);
-										refs.add(wb);
-										yield wb;
-									}
-									case SST_INGESTION, SST_INGEST_BEHIND -> {
-										var sstWriter = getSSTWriter(columnId, null, false, mode == PutBatchMode.SST_INGEST_BEHIND);
-										refs.add(sstWriter);
-										yield sstWriter;
-									}
-								};
-							} catch (Throwable ex) {
-								doFinally();
-								throw ex;
-							}
-							this.subscription = subscription;
-							subscription.request(1);
-						}
-
-						@Override
-						public void onNext(KVBatch kvBatch) {
-							if (stopped) {
-								return;
-							}
-							var keyIt = kvBatch.keys().iterator();
-							var valueIt = kvBatch.values().iterator();
-							try {
-								while (keyIt.hasNext()) {
-									var keys = keyIt.next();
-									var value = valueIt.next();
-									actionLogger.logAction("PutBatch (next)", start, columnId, keys, value, null, null, null, mode);
-									put(writer, col, 0, keys, value, RequestType.none());
-									if (writer instanceof WB wb) {
-										if (wb.wb().count() >= 10000 || wb.wb().getDataSize() >= 4194304) {
-											wb.flushAndReset();
-										}
-									}
-								}
-							} catch (RocksDBException ex) {
-								cf.completeExceptionally(ex);
-								return;
-							} catch (Throwable ex) {
-								var ex2 = RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-								cf.completeExceptionally(ex2);
-								return;
-							}
-							subscription.request(1);
-						}
-
-						@Override
-						public void onError(Throwable throwable) {
-							cf.completeExceptionally(throwable);
-						}
-
-						@Override
-						public void onComplete() {
-							try {
-								switch (writer) {
-									case WB wb -> {
-										if (wb.wb().count() > 0) {
-											wb.writePending();
-										}
-									}
-									case SSTWriter sst -> {
-										if (sst.fileSize() > 0) {
-											sst.writePending();
-										}
-									}
-									case null, default -> {
-										if (writer != null) {
-											writer.writePending();
-										}
-									}
-								}
-							} catch (Throwable ex) {
-								cf.completeExceptionally(ex);
-								return;
-							}
-							cf.complete(null);
-						}
-
-						public void doFinally() {
-							try {
-								if (stopped) return;
-								stopped = true;
-								if (refs != null) {
-									for (int i = refs.size() - 1; i >= 0; i--) {
-										try {
-											var c = refs.get(i);
-											if (c instanceof AbstractImmutableNativeReference fr) {
-												if (fr.isOwningHandle()) {
-													c.close();
-												}
-											} else {
-												c.close();
-											}
-										} catch (Exception ex) {
-											logger.error("Failed to close reference during batch write", ex);
-										}
-									}
-								}
-							} finally {
-								ops.endOp();
-								var end = System.nanoTime();
-								putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
-							}
-						}
-					};
-			Flux
-					.from(batchPublisher)
-					.subscribeOn(scheduler.write())
-					.publishOn(scheduler.write())
-					.doFinally(signal -> subscriber.doFinally())
-					.subscribe(subscriber);
-			return cf;
-		} catch (RocksDBException ex) {
-			var end = System.nanoTime();
-			putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
-			throw ex;
-		} catch (Exception ex) {
-			var end = System.nanoTime();
-			putBatchTimer.record(end - start, TimeUnit.NANOSECONDS);
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		}
+		return operation.subscribeOn(scheduler.write())
+				.onErrorMap(error -> !(error instanceof RocksDBException),
+						error -> RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, error))
+				.doFinally(ignored -> putBatchTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS))
+				.toFuture();
 	}
 
 	public CompletableFuture<Void> mergeBatchInternal(long columnId,
@@ -2308,186 +2170,333 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
 		}
 		var start = System.nanoTime();
-		try {
-			actionLogger.logAction("MergeBatch (begin)",
-					start,
-					columnId,
-					"multiple (async)",
-					"multiple (async)",
-					null,
-					null,
-					null,
-					mode
+		actionLogger.logAction("MergeBatch (begin)",
+				start,
+				columnId,
+				"multiple (async)",
+				"multiple (async)",
+				null,
+				null,
+				null,
+				mode
+		);
+
+		Mono<Void> operation = Mono.using(
+				() -> new MergeBatchState(columnId, mode, ingestBehindEnabled, start),
+				state -> AdaptiveBatcher.buffer(
+							Flux.from(batchPublisher).publishOn(scheduler.write()),
+							128,
+							4096,
+							Duration.ofMillis(10)
+						)
+						.doOnNext(state::write)
+						.then(Mono.fromRunnable(state::writePending)),
+				BatchWriteState::close,
+				true
 			);
-			var cf = new CompletableFuture<Void>();
-			Flux<KVBatch> source = Flux.from(batchPublisher).subscribeOn(scheduler.write()).publishOn(scheduler.write());
-			var subscriber = new Subscriber<List<KVBatch>>() {
-				private boolean stopped;
-				private Subscription subscription;
-				private ColumnInstance col;
-				private ArrayList<AutoCloseable> refs;
-				private DBWriter writer;
-				private ArrayList<Map.Entry<Keys, Buf>> pendingSstEntries;
+		return operation.subscribeOn(scheduler.write())
+				.onErrorMap(error -> !(error instanceof RocksDBException),
+						error -> RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, error))
+				.toFuture();
+	}
 
-				@Override
-				public void onSubscribe(Subscription subscription) {
-					ops.beginOp();
+	private abstract class BatchWriteState implements AutoCloseable {
 
-					try {
-						col = getColumn(columnId);
-						refs = new ArrayList<>();
-						writer = switch (mode) {
-							case MERGE_WRITE_BATCH -> {
-								if (col.hasBuckets()) {
-									var tx = openTransactionInternal(120_000, false);
-									refs.add(tx);
-									yield tx;
-								}
-								var wb = new WB(db.get(), new LeakSafeWriteBatch(), false);
-								refs.add(wb);
-								yield wb;
-							}
-							case MERGE_WRITE_BATCH_NO_WAL -> {
-								if (col.hasBuckets()) {
-									var tx = openTransactionInternal(120_000, false);
-									refs.add(tx);
-									yield tx;
-								}
-								var wb = new WB(db.get(), new LeakSafeWriteBatch(), true);
-								refs.add(wb);
-								yield wb;
-							}
-							case MERGE_SST_INGESTION -> {
-								var sst = getSSTWriter(columnId, null, false, false);
-								refs.add(sst);
-								pendingSstEntries = new ArrayList<>();
-								yield sst;
-							}
-							case MERGE_SST_INGEST_BEHIND -> {
-								if (!ingestBehindEnabled) {
-									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-											"MERGE_SST_INGEST_BEHIND requires database.global.ingest-behind=true"
-									);
-								}
-								var sst = getSSTWriter(columnId, null, false, true);
-								refs.add(sst);
-								pendingSstEntries = new ArrayList<>();
-								yield sst;
-							}
-						};
-					} catch (Throwable ex) {
-						doFinally();
-						throw ex;
-					}
-					this.subscription = subscription;
-					subscription.request(1);
+		private static final int ACTIVE = 1;
+		private static final int CLOSE_REQUESTED = 1 << 1;
+		private static final int CLOSED = 1 << 2;
+
+		private final AtomicInteger lifecycle = new AtomicInteger();
+
+		private BatchWriteState() {
+			ops.beginOp();
+		}
+
+		protected final void runWhileOpen(Runnable operation) {
+			if (!tryEnter()) {
+				return;
+			}
+			try {
+				operation.run();
+			} finally {
+				exit();
+			}
+		}
+
+		private boolean tryEnter() {
+			for (;;) {
+				int state = lifecycle.get();
+				if ((state & (CLOSE_REQUESTED | CLOSED)) != 0) {
+					return false;
 				}
-
-				@Override
-				public void onNext(List<KVBatch> batches) {
-					if (stopped) {
-						return;
-					}
-					try {
-						for (var kvBatch : batches) {
-							var keyIt = kvBatch.keys().iterator();
-							var valueIt = kvBatch.values().iterator();
-							while (keyIt.hasNext()) {
-								var keys = keyIt.next();
-								var value = valueIt.next();
-								actionLogger.logAction("MergeBatch (next)", start, columnId, keys, value, null, null, null, mode);
-								switch (writer) {
-									case SSTWriter ignored -> pendingSstEntries.add(Map.entry(keys, value));
-									default -> merge(writer, col, 0L, keys, value, RequestType.none());
-								}
-								if (writer instanceof WB wb) {
-									if (wb.wb().count() >= 10000 || wb.wb().getDataSize() >= 4194304) {
-										wb.flushAndReset();
-									}
-								}
-							}
-						}
-						if (writer instanceof WB wb && wb.wb().count() > 0) {
-							wb.flushAndReset();
-						}
-					} catch (RocksDBException ex) {
-						cf.completeExceptionally(ex);
-						return;
-					} catch (Throwable ex) {
-						var ex2 = RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-						cf.completeExceptionally(ex2);
-						return;
-					}
-					subscription.request(1);
+				if (lifecycle.compareAndSet(state, state | ACTIVE)) {
+					return true;
 				}
+			}
+		}
 
-				@Override
-				public void onError(Throwable throwable) {
-					cf.completeExceptionally(throwable);
-				}
-
- 			@Override
-				public void onComplete() {
-					try {
-						switch (writer) {
-							case WB wb -> {
-								if (wb.wb().count() > 0) {
-									wb.writePending();
-								}
-							}
-							case Tx tx -> closeTransactionInternal(tx, true);
-							case SSTWriter sst -> {
-								writeSstEntries(col, sst, pendingSstEntries, mode == MergeBatchMode.MERGE_SST_INGEST_BEHIND);
-								if (sst.fileSize() > 0) {
-									sst.writePending();
-								}
-							}
-							case null -> {
-							}
-						}
-						cf.complete(null);
-					} catch (Throwable ex) {
-						cf.completeExceptionally(ex);
+		private void exit() {
+			for (;;) {
+				int state = lifecycle.get();
+				int next = state & ~ACTIVE;
+				if (lifecycle.compareAndSet(state, next)) {
+					if ((next & CLOSE_REQUESTED) != 0) {
+						closeNow();
 					}
+					return;
 				}
+			}
+		}
 
- 			public void doFinally() {
-					if (!stopped) {
-						stopped = true;
-						ops.endOp();
-						if (subscription != null) {
-							subscription.cancel();
-						}
-						if (refs != null) {
-							for (var ref : refs) {
-								try {
-									ref.close();
-								} catch (Exception ex) {
-									logger.debug("Failed to close resource in MergeBatch", ex);
-								}
-							}
+		@Override
+		public final void close() {
+			for (;;) {
+				int state = lifecycle.get();
+				if ((state & CLOSED) != 0) {
+					return;
+				}
+				int next = state | CLOSE_REQUESTED;
+				if (lifecycle.compareAndSet(state, next)) {
+					if ((state & ACTIVE) == 0) {
+						closeNow();
+					}
+					return;
+				}
+			}
+		}
+
+		private void closeNow() {
+			for (;;) {
+				int state = lifecycle.get();
+				if ((state & CLOSED) != 0) {
+					return;
+				}
+				if ((state & ACTIVE) != 0) {
+					return;
+				}
+				if (lifecycle.compareAndSet(state, state | CLOSED)) {
+					break;
+				}
+			}
+
+			try {
+				closeResources();
+			} catch (Throwable error) {
+				logger.error("Failed to close asynchronous batch-write resources", error);
+			} finally {
+				ops.endOp();
+			}
+		}
+
+		protected abstract void closeResources();
+	}
+
+	private final class PutBatchState extends BatchWriteState {
+
+		private final long columnId;
+		private final PutBatchMode mode;
+		private final long start;
+		private ColumnInstance col;
+		private DBWriter writer;
+		private boolean sstEntriesWritten;
+
+		private PutBatchState(long columnId, PutBatchMode mode, long start) {
+			this.columnId = columnId;
+			this.mode = mode;
+			this.start = start;
+			try {
+				this.col = getColumn(columnId);
+				this.writer = switch (mode) {
+					case WRITE_BATCH, WRITE_BATCH_NO_WAL ->
+							new WB(db.get(), new LeakSafeWriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL);
+					case SST_INGESTION, SST_INGEST_BEHIND ->
+							getSSTWriter(columnId, null, false, mode == PutBatchMode.SST_INGEST_BEHIND);
+				};
+			} catch (Throwable error) {
+				close();
+				throw error;
+			}
+		}
+
+		private void write(KVBatch batch) {
+			runWhileOpen(() -> {
+				validateBatch(batch);
+				var keyIt = batch.keys().iterator();
+				var valueIt = batch.values().iterator();
+				while (keyIt.hasNext()) {
+					var keys = keyIt.next();
+					var value = valueIt.next();
+					actionLogger.logAction("PutBatch (next)", start, columnId, keys, value, null, null, null, mode);
+					put(writer, col, 0, keys, value, RequestType.none());
+					if (writer instanceof SSTWriter) {
+						sstEntriesWritten = true;
+					}
+					flushFullWriteBatch(writer);
+				}
+			});
+		}
+
+		private void writePending() {
+			runWhileOpen(() -> {
+				switch (writer) {
+					case WB wb -> {
+						if (wb.wb().count() > 0) {
+							wb.writePending();
 						}
 					}
+					case SSTWriter sst -> {
+						if (sstEntriesWritten) {
+							sst.writePending();
+						}
+					}
+					case null -> { }
+					default -> writer.writePending();
 				}
-			};
-			AdaptiveBatcher.buffer(source, 128, 4096, Duration.ofMillis(10))
-					.doFinally(signal -> subscriber.doFinally())
-					.subscribe(subscriber);
-			return cf;
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			});
+		}
+
+		@Override
+		protected void closeResources() {
+			if (writer != null) {
+				try {
+					writer.close();
+				} catch (Exception error) {
+					throw new RuntimeException(error);
+				}
+			}
 		}
 	}
 
-	private void writeSstEntries(ColumnInstance col,
+	private final class MergeBatchState extends BatchWriteState {
+
+		private final long columnId;
+		private final MergeBatchMode mode;
+		private final long start;
+		private ColumnInstance col;
+		private DBWriter writer;
+		private ArrayList<Map.Entry<Keys, Buf>> pendingSstEntries;
+
+		private MergeBatchState(long columnId, MergeBatchMode mode, boolean ingestBehindEnabled, long start) {
+			this.columnId = columnId;
+			this.mode = mode;
+			this.start = start;
+			try {
+				this.col = getColumn(columnId);
+				this.writer = switch (mode) {
+					case MERGE_WRITE_BATCH, MERGE_WRITE_BATCH_NO_WAL -> {
+						if (col.hasBuckets()) {
+							yield openTransactionInternal(120_000, false);
+						}
+						yield new WB(db.get(), new LeakSafeWriteBatch(),
+								mode == MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL);
+					}
+					case MERGE_SST_INGESTION -> {
+						pendingSstEntries = new ArrayList<>();
+						yield getSSTWriter(columnId, null, false, false);
+					}
+					case MERGE_SST_INGEST_BEHIND -> {
+						if (!ingestBehindEnabled) {
+							throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+									"MERGE_SST_INGEST_BEHIND requires database.global.ingest-behind=true");
+						}
+						pendingSstEntries = new ArrayList<>();
+						yield getSSTWriter(columnId, null, false, true);
+					}
+				};
+			} catch (Throwable error) {
+				close();
+				throw error;
+			}
+		}
+
+		private void write(List<KVBatch> batches) {
+			runWhileOpen(() -> {
+				for (var batch : batches) {
+					validateBatch(batch);
+					var keyIt = batch.keys().iterator();
+					var valueIt = batch.values().iterator();
+					while (keyIt.hasNext()) {
+						var keys = keyIt.next();
+						var value = valueIt.next();
+						actionLogger.logAction("MergeBatch (next)", start, columnId, keys, value, null, null, null, mode);
+						if (writer instanceof SSTWriter) {
+							pendingSstEntries.add(Map.entry(keys, value));
+						} else {
+							merge(writer, col, 0L, keys, value, RequestType.none());
+						}
+						flushFullWriteBatch(writer);
+					}
+				}
+				if (writer instanceof WB wb && wb.wb().count() > 0) {
+					wb.flushAndReset();
+				}
+			});
+		}
+
+		private void writePending() {
+			runWhileOpen(() -> {
+				switch (writer) {
+					case WB wb -> {
+						if (wb.wb().count() > 0) {
+							wb.writePending();
+						}
+					}
+					case Tx tx -> {
+						if (!closeTransactionInternal(tx, true)) {
+							throw new RocksDBRetryException();
+						}
+					}
+					case SSTWriter sst -> {
+						if (writeSstEntries(col, sst, pendingSstEntries,
+								mode == MergeBatchMode.MERGE_SST_INGEST_BEHIND)) {
+							sst.writePending();
+						}
+					}
+					case null -> { }
+				}
+			});
+		}
+
+		@Override
+		protected void closeResources() {
+			if (writer instanceof Tx tx) {
+				if (tx.val().isOwningHandle()) {
+					closeTransactionInternal(tx, false);
+				}
+			} else if (writer != null) {
+				try {
+					writer.close();
+				} catch (Exception error) {
+					throw new RuntimeException(error);
+				}
+			}
+		}
+	}
+
+	private static void validateBatch(KVBatch batch) {
+		int keyCount = batch.keys().size();
+		int valueCount = batch.values().size();
+		if (keyCount != valueCount) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Batch key/value count mismatch: " + keyCount + " keys, " + valueCount + " values");
+		}
+	}
+
+	private static void flushFullWriteBatch(DBWriter writer) {
+		if (writer instanceof WB wb
+				&& (wb.wb().count() >= 10_000 || wb.wb().getDataSize() >= 4 * 1024 * 1024)) {
+			wb.flushAndReset();
+		}
+	}
+
+	private boolean writeSstEntries(ColumnInstance col,
 			SSTWriter sst,
 			@Nullable List<Map.Entry<Keys, Buf>> entries,
 			boolean ingestBehind) throws RocksDBException {
 		if (entries == null || entries.isEmpty()) {
-			return;
+			return false;
 		}
+		boolean wroteEntry = false;
 		entries.sort((a, b) -> {
 			var ka = col.calculateKey(a.getKey().keys()).toByteArray();
 			var kb = col.calculateKey(b.getKey().keys()).toByteArray();
@@ -2514,6 +2523,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					bucket.addElement(bucketElementKeys, mergedValue);
 					byte[] valBytes = Utils.toByteArray(bucket.toSegment());
 					sst.put(keyBytes, valBytes);
+					wroteEntry = true;
 				} else {
 					Buf existing = dbGet(null, col, ro, calculatedKey);
 					var mergeOp = col.mergeOperator();
@@ -2524,12 +2534,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (merged != null) {
 						byte[] valBytes = Utils.toByteArray(merged);
 						sst.put(keyBytes, valBytes);
+						wroteEntry = true;
 					}
 				}
 			}
 		} catch (org.rocksdb.RocksDBException e) {
 			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_3, e);
 		}
+		return wroteEntry;
 	}
 
 	@VisibleForTesting
@@ -3250,52 +3262,129 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public long openIterator(long transactionId,
 			long columnId,
-			Keys startKeysInclusive,
+			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
 		var start = System.nanoTime();
 		// Open an operation that ends when the iterator is closed
 		ops.beginOp();
+		boolean installed = false;
 		try {
 			actionLogger.logAction("OpenIterator",
 					start,
 					columnId,
-					null,
-					null,
-					null,
-					null,
+					startKeysInclusive,
+					endKeysExclusive,
+					transactionId,
+					reverse,
 					timeoutMs,
 					null
-			); // todo: improve logging
-			var expirationTimestamp = timeoutMs + System.currentTimeMillis();
+			);
+			var expirationTimestamp = iteratorExpirationTimestamp(timeoutMs);
 			var col = getColumn(columnId);
-			RocksIterator it;
-			var ro = newReadOptions("open-iterator-read-options");
+			var state = new IteratorState(col, reverse);
+			RocksIterator it = null;
+			REntry<RocksIterator> itEntry = null;
 			try {
-				if (transactionId > 0L) {
+				var calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0
+						? col.calculateKey(startKeysInclusive.keys())
+						: null;
+				var calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0
+						? col.calculateKey(endKeysExclusive.keys())
+						: null;
+				var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
+				if (startKeySlice != null) {
+					state.add(startKeySlice);
+				}
+				var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null;
+				if (endKeySlice != null) {
+					state.add(endKeySlice);
+				}
+
+				var ro = newReadOptions("open-iterator-read-options");
+				state.add(ro);
+				ro.setDeadline(readDeadlineMicros(timeoutMs));
+				if (startKeySlice != null) {
+					ro.setIterateLowerBound(startKeySlice);
+				}
+				if (endKeySlice != null) {
+					ro.setIterateUpperBound(endKeySlice);
+				}
+				if (transactionId != 0L) {
 					//noinspection resource
 					it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
 				} else {
 					it = db.get().newIterator(col.cfh(), ro);
 				}
+				state.iterator = it;
+				if (reverse) {
+					it.seekToLast();
+				} else {
+					it.seekToFirst();
+				}
+				checkIteratorStatusIfInvalid(it);
+
+				itEntry = new REntry<>(it, expirationTimestamp, state);
+				long iteratorId = FastRandomUtils.allocateNewValue(its, itEntry, 1, Long.MAX_VALUE);
+				installed = true;
+				return iteratorId;
 			} catch (Throwable ex) {
-				ro.close();
+				if (itEntry != null) {
+					itEntry.close();
+				} else {
+					if (it != null) {
+						it.close();
+					}
+					state.close();
+				}
 				throw ex;
 			}
-			var itEntry = new REntry<>(it, expirationTimestamp, new RocksDBObjects(ro));
-			try {
-				return FastRandomUtils.allocateNewValue(its, itEntry, 1, Long.MAX_VALUE);
-			} catch (Throwable ex) {
-				itEntry.close();
-				throw ex;
+		} finally {
+			if (!installed) {
+				ops.endOp();
 			}
-		} catch (Throwable ex) {
-			ops.endOp();
 			var end = System.nanoTime();
 			openIteratorTimer.record(end - start, TimeUnit.NANOSECONDS);
-			throw ex;
 		}
+	}
+
+	private static long iteratorExpirationTimestamp(long timeoutMs) {
+		if (timeoutMs < 0) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Iterator timeout must be non-negative");
+		}
+		long now = System.currentTimeMillis();
+		return timeoutMs >= Long.MAX_VALUE - now ? Long.MAX_VALUE : now + timeoutMs;
+	}
+
+	private static long readDeadlineMicros(long timeoutMs) {
+		if (timeoutMs < 0) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Read timeout must be non-negative");
+		}
+		long nowMicros = TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
+		long timeoutMicros = TimeUnit.MILLISECONDS.toMicros(timeoutMs);
+		return timeoutMicros >= Long.MAX_VALUE - nowMicros ? Long.MAX_VALUE : nowMicros + timeoutMicros;
+	}
+
+	private final class IteratorState extends RocksDBObjects {
+
+		private final ColumnInstance column;
+		private final boolean reverse;
+		private RocksIterator iterator;
+		private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
+		private boolean closed;
+
+		private IteratorState(ColumnInstance column, boolean reverse) {
+			this.column = column;
+			this.reverse = reverse;
+		}
+	}
+
+	private record LogicalIteratorStep(boolean present, @Nullable Buf value) {
+
+		private static final LogicalIteratorStep END = new LogicalIteratorStep(false, null);
 	}
 
 	@Override
@@ -3303,21 +3392,39 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		try {
 			actionLogger.logAction("CloseIterator", start, null, null, null, null, null, null, null); // todo: improve logging
-			var entry = its.remove(iteratorId);
-			if (entry != null) {
-				try {
-					entry.close();
-				} finally {
-					// Balance the pending op started in openIterator
-					ops.endOp();
-				}
-			} else {
-				// If iterator not found, ignore
-			}
+			closeIteratorInternal(iteratorId);
 		} finally {
 			var end = System.nanoTime();
 			closeIteratorTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
+	}
+
+	/**
+	 * Atomically claims an iterator before closing it. Removing the map entry is the ownership
+	 * transfer that guarantees both the native handle and its lifetime operation are completed
+	 * exactly once when explicit close, leak cleanup, and forced shutdown race.
+	 */
+	private boolean closeIteratorInternal(long iteratorId) {
+		var entry = its.remove(iteratorId);
+		if (entry == null) {
+			return false;
+		}
+		try {
+			if (entry.objs() instanceof IteratorState state) {
+				synchronized (state) {
+					state.closed = true;
+					state.bucketIterator = null;
+					entry.close();
+				}
+			} else {
+				// Compatibility with synthetic entries used by close-race tests.
+				entry.close();
+			}
+		} finally {
+			// Balance the pending operation started in openIterator.
+			ops.endOp();
+		}
+		return true;
 	}
 
 	@Override
@@ -3325,8 +3432,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
-			actionLogger.logAction("SeekTo", start, null, null, null, null, null, null, null); // todo: improve logging
-			throw new UnsupportedOperationException();
+			actionLogger.logAction("SeekTo", start, null, keys, null, iterationId, null, null, null);
+			if (keys == null) {
+				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Iterator seek keys cannot be null");
+			}
+			withIterator(iterationId, state -> {
+				state.bucketIterator = null;
+				if (keys.keys().length == 0) {
+					if (state.reverse) {
+						state.iterator.seekToLast();
+					} else {
+						state.iterator.seekToFirst();
+					}
+					checkIteratorStatusIfInvalid(state.iterator);
+					positionBucketCursor(state, null, null);
+					return null;
+				}
+
+				var calculatedKey = state.column.calculateKey(keys.keys());
+				var target = calculatedKey.toByteArray();
+				if (state.reverse) {
+					state.iterator.seekForPrev(target);
+				} else {
+					state.iterator.seek(target);
+				}
+				checkIteratorStatusIfInvalid(state.iterator);
+				positionBucketCursor(state, keys, target);
+				return null;
+			});
 		} finally {
 			ops.endOp();
 			var end = System.nanoTime();
@@ -3342,12 +3475,184 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
-			actionLogger.logAction("Subsequent", start, null, null, null, null, null, null, null); // todo: improve logging
-			throw new UnsupportedOperationException();
+			actionLogger.logAction("Subsequent", start, null, skipCount, takeCount, iterationId, null, null, requestType);
+			if (requestType == null) {
+				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Iterator request type cannot be null");
+			}
+			if (skipCount < 0 || takeCount < 0) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Iterator skip and take counts must be non-negative");
+			}
+
+			return withIterator(iterationId, state -> {
+				for (long i = 0; i < skipCount; i++) {
+					if (!advanceIterator(state, false).present()) {
+						break;
+					}
+				}
+
+				Object result = switch (requestType) {
+					case RequestType.RequestNothing<?> _ -> {
+						for (long i = 0; i < takeCount; i++) {
+							if (!advanceIterator(state, false).present()) {
+								break;
+							}
+						}
+						yield null;
+					}
+					case RequestType.RequestExists<?> _ -> {
+						boolean found = false;
+						for (long i = 0; i < takeCount; i++) {
+							if (!advanceIterator(state, false).present()) {
+								break;
+							}
+							found = true;
+						}
+						yield found;
+					}
+					case RequestType.RequestMulti<?> _ -> {
+						var values = new ArrayList<Buf>((int) Math.min(takeCount, 1_024));
+						for (long i = 0; i < takeCount; i++) {
+							var step = advanceIterator(state, true);
+							if (!step.present()) {
+								break;
+							}
+							values.add(Objects.requireNonNull(step.value()));
+						}
+						yield values;
+					}
+				};
+				return RequestType.safeCast(result);
+			});
 		} finally {
 			ops.endOp();
 			var end = System.nanoTime();
 			subsequentTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	private <T> T withIterator(long iteratorId, Function<IteratorState, T> action) {
+		var entry = its.get(iteratorId);
+		if (entry == null || !(entry.objs() instanceof IteratorState state)) {
+			throw iteratorNotFound(iteratorId);
+		}
+		synchronized (state) {
+			if (state.closed || its.get(iteratorId) != entry) {
+				throw iteratorNotFound(iteratorId);
+			}
+			Long expirationTimestamp = entry.expirationTimestamp();
+			if (expirationTimestamp != null && System.currentTimeMillis() >= expirationTimestamp) {
+				var removed = its.remove(iteratorId);
+				if (removed == entry) {
+					state.closed = true;
+					state.bucketIterator = null;
+					try {
+						entry.close();
+					} finally {
+						ops.endOp();
+					}
+				}
+				throw iteratorNotFound(iteratorId);
+			}
+			return action.apply(state);
+		}
+	}
+
+	private static RocksDBException iteratorNotFound(long iteratorId) {
+		return RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "No iterator with id " + iteratorId);
+	}
+
+	private LogicalIteratorStep advanceIterator(IteratorState state, boolean materializeValue) {
+		while (true) {
+			if (state.bucketIterator != null) {
+				boolean hasNext = state.reverse ? state.bucketIterator.hasPrevious() : state.bucketIterator.hasNext();
+				if (hasNext) {
+					var entry = state.reverse ? state.bucketIterator.previous() : state.bucketIterator.next();
+					boolean hasMoreInBucket = state.reverse
+							? state.bucketIterator.hasPrevious()
+							: state.bucketIterator.hasNext();
+					if (!hasMoreInBucket) {
+						state.bucketIterator = null;
+						advanceNativeIterator(state);
+						checkIteratorStatusIfInvalid(state.iterator);
+					}
+					return new LogicalIteratorStep(true, materializeValue ? entry.getValue() : null);
+				}
+				state.bucketIterator = null;
+				advanceNativeIterator(state);
+				continue;
+			}
+
+			if (!state.iterator.isValid()) {
+				checkIteratorStatusIfInvalid(state.iterator);
+				return LogicalIteratorStep.END;
+			}
+
+			if (state.column.hasBuckets()) {
+				var bucket = new Bucket(state.column, toBuf(state.iterator.value()));
+				var elements = bucket.getElements();
+				state.bucketIterator = elements.listIterator(state.reverse ? elements.size() : 0);
+				continue;
+			}
+
+			Buf value = null;
+			if (materializeValue) {
+				value = state.column.schema().hasValue() ? toBuf(state.iterator.value()) : emptyBuf();
+			}
+			advanceNativeIterator(state);
+			checkIteratorStatusIfInvalid(state.iterator);
+			return new LogicalIteratorStep(true, value);
+		}
+	}
+
+	private static void advanceNativeIterator(IteratorState state) {
+		if (state.reverse) {
+			state.iterator.prev();
+		} else {
+			state.iterator.next();
+		}
+	}
+
+	private void positionBucketCursor(IteratorState state, @Nullable Keys exactKeys, @Nullable byte[] target) {
+		if (!state.iterator.isValid() || !state.column.hasBuckets()) {
+			return;
+		}
+		var bucket = new Bucket(state.column, toBuf(state.iterator.value()));
+		var elements = bucket.getElements();
+		int cursor = state.reverse ? elements.size() : 0;
+		if (exactKeys != null && target != null && Arrays.equals(state.iterator.key(), target)) {
+			var variableKeys = state.column.getBucketElementKeys(exactKeys.keys());
+			for (int i = 0; i < elements.size(); i++) {
+				var candidate = elements.get(i).getKey();
+				if (bucketKeysEqual(candidate, variableKeys)) {
+					cursor = state.reverse ? i + 1 : i;
+					break;
+				}
+			}
+		}
+		state.bucketIterator = elements.listIterator(cursor);
+	}
+
+	private static boolean bucketKeysEqual(Buf[] left, Buf[] right) {
+		if (left.length != right.length) {
+			return false;
+		}
+		for (int i = 0; i < left.length; i++) {
+			if (!Utils.valueEquals(left[i], right[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private static void checkIteratorStatusIfInvalid(RocksIterator iterator) {
+		if (iterator.isValid()) {
+			return;
+		}
+		try {
+			iterator.status();
+		} catch (org.rocksdb.RocksDBException exception) {
+			throw RocksDBException.of(RocksDBErrorType.GET_1, exception);
 		}
 	}
 
@@ -3377,6 +3682,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 
 			try (var ro = newReadOptions(null)) {
+				ro.setDeadline(readDeadlineMicros(timeoutMs));
 				Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(
 						startKeysInclusive.keys()) : null;
 				Buf calculatedEndKey =
@@ -3392,7 +3698,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 
 					RocksIterator it;
-					if (transactionId > 0L) {
+					if (transactionId != 0L) {
 						//noinspection resource
 						it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
 					} else {
@@ -3401,70 +3707,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					try (it) {
 						return (T) switch (requestType) {
 							case RequestEntriesCount<?> _ -> {
-								if (col.hasBuckets() || calculatedStartKey != null || calculatedEndKey != null || path == null) {
-									long count = 0;
-									it.seekToFirst();
-									while (it.isValid()) {
-										if (col.hasBuckets()) {
-											count += Bucket.readElementCount(toBuf(it.value()));
-										} else {
-											count++;
-										}
-										it.next();
+								long count = 0;
+								it.seekToFirst();
+								while (it.isValid()) {
+									if (col.hasBuckets()) {
+										count += Bucket.readElementCount(toBuf(it.value()));
+									} else {
+										count++;
 									}
-									yield count;
-								} else {
-									Map<String, TableProperties> props;
-									try {
-										props = db.get().getPropertiesOfAllTables(col.cfh());
-									} catch (org.rocksdb.RocksDBException e) {
-										throw RocksDBException.of(RocksDBErrorType.GET_PROPERTY_ERROR, e);
-									}
-									long entries = 0;
-									for (TableProperties tableProperties : props.values()) {
-										entries += tableProperties.getNumEntries();
-									}
-									yield entries;
+									it.next();
 								}
+								checkIteratorStatusIfInvalid(it);
+								yield count;
 							}
 							case RequestType.RequestGetFirstAndLast<?> _ -> {
-								if (!reverse) {
-									it.seekToFirst();
-								} else {
-									it.seekToLast();
-								}
-								if (!it.isValid()) {
+								var first = seekLogicalEndpoint(it, col, reverse);
+								if (first == null) {
 									yield new FirstAndLast<>(null, null);
 								}
-								var calculatedKey = toBuf(it.key());
-								var calculatedValue = (col.schema().hasValue() || col.hasBuckets()) ? toBuf(it.value()) : emptyBuf();
-								KV first;
-								if (col.hasBuckets()) {
-									var bucket = new Bucket(col, calculatedValue);
-									var elements = bucket.getElements();
-									var entry = !reverse ? elements.get(0) : elements.get(elements.size() - 1);
-									first = decodeBucketEntry(col, calculatedKey, entry);
-								} else {
-									first = decodeKV(col, calculatedKey, calculatedValue);
-								}
-
-								if (!reverse) {
-									it.seekToLast();
-								} else {
-									it.seekToFirst();
-								}
-
-								calculatedKey = toBuf(it.key());
-								calculatedValue = (col.schema().hasValue() || col.hasBuckets()) ? toBuf(it.value()) : emptyBuf();
-								KV last;
-								if (col.hasBuckets()) {
-									var bucket = new Bucket(col, calculatedValue);
-									var elements = bucket.getElements();
-									var entry = !reverse ? elements.get(elements.size() - 1) : elements.get(0);
-									last = decodeBucketEntry(col, calculatedKey, entry);
-								} else {
-									last = decodeKV(col, calculatedKey, calculatedValue);
-								}
+								var last = Objects.requireNonNull(seekLogicalEndpoint(it, col, !reverse));
 								yield new FirstAndLast<>(first, last);
 							}
 						};
@@ -3476,6 +3737,35 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var end = System.nanoTime();
 			reduceRangeTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
+	}
+
+	private @Nullable KV seekLogicalEndpoint(RocksIterator iterator, ColumnInstance column, boolean fromEnd) {
+		if (fromEnd) {
+			iterator.seekToLast();
+		} else {
+			iterator.seekToFirst();
+		}
+		while (iterator.isValid()) {
+			var calculatedKey = toBuf(iterator.key());
+			var calculatedValue = (column.schema().hasValue() || column.hasBuckets())
+					? toBuf(iterator.value())
+					: emptyBuf();
+			if (!column.hasBuckets()) {
+				return decodeKV(column, calculatedKey, calculatedValue);
+			}
+			var elements = new Bucket(column, calculatedValue).getElements();
+			if (!elements.isEmpty()) {
+				var entry = fromEnd ? elements.getLast() : elements.getFirst();
+				return decodeBucketEntry(column, calculatedKey, entry);
+			}
+			if (fromEnd) {
+				iterator.prev();
+			} else {
+				iterator.next();
+			}
+		}
+		checkIteratorStatusIfInvalid(iterator);
+		return null;
 	}
 
 	@Override
@@ -3510,6 +3800,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long timeoutMs) throws RocksDBException {
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
+		long deadlineMicros = readDeadlineMicros(timeoutMs);
 		actionLogger.logAction("GetRange (begin)",
 				start,
 				columnId,
@@ -3562,6 +3853,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 					var newRo = newReadOptions("get-range-async-read-options");
 					try {
+						newRo.setDeadline(deadlineMicros);
 						if (startKeySlice != null) {
 							newRo.setIterateLowerBound(startKeySlice);
 						}
@@ -3622,6 +3914,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 						var ro = newReadOptions("get-range-async-read-options");
 						try {
+							ro.setDeadline(deadlineMicros);
 							Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(
 									startKeysInclusive.keys()) : null;
 							Buf calculatedEndKey =
@@ -3639,7 +3932,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									}
 
 									RocksIterator it;
-									if (transactionId > 0L) {
+									if (transactionId != 0L) {
 										//noinspection resource
 										it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
 									} else {
@@ -3706,6 +3999,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								}
 							} else {
 								if (!res.it.isValid()) {
+									checkIteratorStatusIfInvalid(res.it);
 									nextResult = null;
 									break;
 								}
@@ -3949,7 +4243,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						.sequential();
 			} else {
 				exec = ssts
-						.filter(m -> m.fileName().hashCode() % shardCount == shardIndex % shardCount)
+						.filter(m -> Math.floorMod(m.fileName().hashCode(), shardCount)
+								== Math.floorMod(shardIndex, shardCount))
 						.concatMap(mapper, 2);
 			}
 			return exec;
@@ -4498,8 +4793,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			"Start sequence was not found, skipping to the next available";
 
 	@VisibleForTesting
-	protected void iterateCdcWriteBatch(byte[] data, WriteBatch.Handler handler) throws org.rocksdb.RocksDBException {
-		WriteBatchIterator.iterate(data, handler);
+	protected void iterateCdcWriteBatch(WriteBatch writeBatch, WriteBatch.Handler handler)
+			throws org.rocksdb.RocksDBException {
+		writeBatch.iterate(handler);
 	}
 
 	private static boolean checkCdcIteratorStatus(TransactionLogIterator iterator) throws org.rocksdb.RocksDBException {
@@ -4542,29 +4838,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private final List<CDCEvent> out;
 		private final @Nullable it.unimi.dsi.fastutil.longs.LongSet filter;
-		private final long walSeq;
-		private final int skipFirstOps;
+		private final boolean preserveKeys;
+		private long walSeq;
+		private int skipFirstOps;
 		private int seenOps = 0;
 		private int produced = 0;
 		private long accumulatedBytes = 0;
-		private final long maxToProduce;
-		private final long maxBytes;
-		private final boolean preserveKeys;
-		// Fix: Track the exact op index where we hit the limit
+		private long maxToProduce;
+		private long maxBytes;
 		private int limitReachedAtOpIndex = -1;
-		private final boolean allowOversizedFirstEvent;
-
-		int getProducedCount() {
-			return produced;
-		}
+		private boolean allowOversizedFirstEvent;
 
 		int getLimitReachedAtOpIndex() {
 			return limitReachedAtOpIndex;
-		}
-
-		// FIX: Expose total iterated operations count
-		int getSeenOps() {
-			return seenOps;
 		}
 
 		long getAccumulatedBytes() {
@@ -4573,20 +4859,31 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		EventCollector(List<CDCEvent> out,
 				@Nullable it.unimi.dsi.fastutil.longs.LongSet filter,
-				long walSeq,
+				boolean preserveKeys) {
+			this.out = out;
+			this.filter = filter;
+			this.preserveKeys = preserveKeys;
+		}
+
+		void reset(long walSeq,
 				int skipFirstOps,
 				long maxToProduce,
 				long maxBytes,
-				boolean preserveKeys,
 				boolean allowOversizedFirstEvent) {
-			this.out = out;
-			this.filter = filter;
 			this.walSeq = walSeq;
 			this.skipFirstOps = skipFirstOps;
 			this.maxToProduce = maxToProduce;
 			this.maxBytes = maxBytes;
-			this.preserveKeys = preserveKeys;
 			this.allowOversizedFirstEvent = allowOversizedFirstEvent;
+			this.seenOps = 0;
+			this.produced = 0;
+			this.accumulatedBytes = 0;
+			this.limitReachedAtOpIndex = -1;
+		}
+
+		@Override
+		public boolean shouldContinue() {
+			return limitReachedAtOpIndex == -1;
 		}
 
 		private void trackAndMaybeEmitByCfId(int columnFamilyId, byte[] key, @Nullable byte[] value, CDCEvent.Op op) {
@@ -4605,7 +4902,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 
 			long colId = (long) columnFamilyId;
-			if (!EmbeddedDB.this.columns.containsKey(colId)) {
+			var colInstance = EmbeddedDB.this.columns.get(colId);
+			if (colInstance == null) {
 				return;
 			}
 			if (filter != null && !filter.contains(colId)) {
@@ -4613,8 +4911,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 
 			byte[] finalKey = key;
-			var colInstance = EmbeddedDB.this.columns.get(colId);
-			if (!preserveKeys && colInstance != null && colInstance.hasBuckets()) {
+			if (!preserveKeys && colInstance.hasBuckets()) {
 				int fixedCount = colInstance.schema().fixedLengthKeysCount();
 				int fixedBytes = 0;
 				for (int i = 0; i < fixedCount; i++) {
@@ -4704,41 +5001,28 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			seenOps++;
 		}
 
-		// FIX: Count LogData and other markers to keep index in sync
+		// WAL metadata and transaction markers are not included in WriteBatch.count(), so
+		// they do not consume RocksDB sequence numbers and must not advance the CDC op index.
 		@Override
-		public void logData(byte[] blob) {
-			seenOps++;
-		}
+		public void logData(byte[] blob) {}
 
 		@Override
-		public void markBeginPrepare() {
-			seenOps++;
-		}
+		public void markBeginPrepare() {}
 
 		@Override
-		public void markEndPrepare(byte[] xid) {
-			seenOps++;
-		}
+		public void markEndPrepare(byte[] xid) {}
 
 		@Override
-		public void markCommit(byte[] xid) {
-			seenOps++;
-		}
+		public void markCommit(byte[] xid) {}
 
 		@Override
-		public void markRollback(byte[] xid) {
-			seenOps++;
-		}
+		public void markRollback(byte[] xid) {}
 
 		@Override
-		public void markNoop(boolean emptyBatch) {
-			seenOps++;
-		}
+		public void markNoop(boolean emptyBatch) {}
 
 		@Override
-		public void markCommitWithTimestamp(byte[] xid, byte[] ts) {
-			seenOps++;
-		}
+		public void markCommitWithTimestamp(byte[] xid, byte[] ts) {}
 	}
 
 	private CdcBatch cdcPollOnce(String id, long fromSeq, long maxEvents) {
@@ -4786,10 +5070,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 
 			boolean firstBatch = true;
-			try (it) {
+			try (it; var handler = new EventCollector(result, filterSet, meta.emitLatestValues)) {
 				while (result.size() < effectiveMax && it != null && it.isValid()) {
 					var br = it.getBatch();
-					try {
+					try (var writeBatch = br.writeBatch()) {
 						long batchWalSeq = br.sequenceNumber();
 
 						if (firstBatch) {
@@ -4807,34 +5091,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							skipOps = (int) diff + opStart;
 						}
 
-						var handler = new EventCollector(result,
-								filterSet,
+						handler.reset(
 								batchWalSeq,
 								skipOps,
 								effectiveMax - result.size(),
 								CDC_MAX_BYTES_PER_POLL - accumulatedBytes,
-								meta.emitLatestValues,
 								result.isEmpty()
 						);
-						//noinspection resource
 						try {
-							iterateCdcWriteBatch(br.writeBatch().data(), handler);
+							iterateCdcWriteBatch(writeBatch, handler);
 						} catch (Exception e) {
 							throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Failed to parse WriteBatch at seq " + batchWalSeq, e);
 						}
 						accumulatedBytes += handler.getAccumulatedBytes();
 
 						int stopIndex = handler.getLimitReachedAtOpIndex();
-						if (stopIndex != -1) {
+						int batchMutationCount = writeBatch.count();
+						boolean fullyConsumed = stopIndex == -1 || stopIndex >= batchMutationCount;
+						if (!fullyConsumed) {
 							// We stopped in the middle of the batch.
 							nextSeq = composeCdcSeq(batchWalSeq, stopIndex);
 						} else {
-							// Point to the end of this batch. The next poll will re-scan this batch,
-							// skip all items, and move to the next without guessing its sequence number.
-							nextSeq = composeCdcSeq(batchWalSeq, handler.getSeenOps());
+							// The native count is the authoritative number of sequence-consuming
+							// mutations. Advance to the next WAL sequence so tail polls do not reopen,
+							// materialize and parse this fully-consumed batch again.
+							nextSeq = composeCdcSeq(batchWalSeq + batchMutationCount, 0);
 						}
 
-						if (stopIndex != -1) {
+						if (!fullyConsumed) {
 							break;
 						}
 						if (result.size() >= effectiveMax) {
@@ -4845,8 +5129,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						}
 
 						it.next();
-					} finally {
-						br.writeBatch().close();
 					}
 				}
 				if (it != null) {

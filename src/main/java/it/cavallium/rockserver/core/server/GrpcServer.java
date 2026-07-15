@@ -296,7 +296,7 @@ public class GrpcServer extends Server {
 							.fromFuture(() -> asyncApi.putBatchAsync(initialRequest.getColumnId(), batches, mode))
 							.transform(this.onErrorMapMonoWithRequestInfo("putBatch", initialRequest));
 				} else if (firstSignal.isOnComplete()) {
-					return Mono.just(RocksDBException.of(
+					return Mono.error(RocksDBException.of(
 							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
 				} else {
 					return requestFlux;
@@ -342,9 +342,9 @@ public class GrpcServer extends Server {
   			return Mono
   					.fromFuture(() -> asyncApi.mergeBatchAsync(initialRequest.getColumnId(), batches, mode))
   					.transform(this.onErrorMapMonoWithRequestInfo("mergeBatch", initialRequest));
-  			} else if (firstSignal.isOnComplete()) {
-  				return Mono.just(RocksDBException.of(
-  						RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+			} else if (firstSignal.isOnComplete()) {
+				return Mono.error(RocksDBException.of(
+						RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
   			} else {
   				return requestFlux;
   			}
@@ -490,7 +490,7 @@ public class GrpcServer extends Server {
 							});
 					return mergeMultiDataFlux(initialRequest, dataFlux, "mergeMulti");
 				} else if (firstSignal.isOnComplete()) {
-					return Mono.just(RocksDBException.of(
+					return Mono.error(RocksDBException.of(
 							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
 				} else {
 					return requestsFlux;
@@ -574,12 +574,90 @@ public class GrpcServer extends Server {
 							});
 					return putMultiDataFlux(initialRequest, dataFlux, "putMulti");
 				} else if (firstSignal.isOnComplete()) {
-					return Mono.just(RocksDBException.of(
+					return Mono.error(RocksDBException.of(
 							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
 				} else {
 					return requestsFlux;
 				}
 			}).then(Mono.just(Empty.getDefaultInstance()));
+		}
+
+		@Override
+		public Flux<Previous> putMultiGetPrevious(Flux<PutMultiRequest> request) {
+			return putMultiResponseFlux(request, "putMultiGetPrevious", new RequestPrevious<>(), previous -> {
+				var builder = Previous.newBuilder();
+				if (previous != null) {
+					builder.setPrevious(Utils.toByteString(previous));
+				}
+				return builder.build();
+			});
+		}
+
+		@Override
+		public Flux<Delta> putMultiGetDelta(Flux<PutMultiRequest> request) {
+			return putMultiResponseFlux(request, "putMultiGetDelta", new RequestDelta<>(), delta -> {
+				var builder = Delta.newBuilder();
+				if (delta.previous() != null) {
+					builder.setPrevious(Utils.toByteString(delta.previous()));
+				}
+				if (delta.current() != null) {
+					builder.setCurrent(Utils.toByteString(delta.current()));
+				}
+				return builder.build();
+			});
+		}
+
+		@Override
+		public Flux<Changed> putMultiGetChanged(Flux<PutMultiRequest> request) {
+			return putMultiResponseFlux(request,
+					"putMultiGetChanged",
+					new RequestChanged<>(),
+					changed -> Changed.newBuilder().setChanged(changed).build());
+		}
+
+		@Override
+		public Flux<PreviousPresence> putMultiGetPreviousPresence(Flux<PutMultiRequest> request) {
+			return putMultiResponseFlux(request,
+					"putMultiGetPreviousPresence",
+					new RequestPreviousPresence<>(),
+					present -> PreviousPresence.newBuilder().setPresent(present).build());
+		}
+
+		private <T, R> Flux<R> putMultiResponseFlux(Flux<PutMultiRequest> request,
+				String requestName,
+				RequestType.RequestPut<? super Buf, T> requestType,
+				Function<T, R> mapper) {
+			return request.switchOnFirst((firstSignal, requestsFlux) -> {
+				if (firstSignal.isOnNext()) {
+					var firstValue = firstSignal.get();
+					assert firstValue != null;
+					if (!firstValue.hasInitialRequest()) {
+						return Flux.error(RocksDBException.of(
+								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+					}
+					var initialRequest = firstValue.getInitialRequest();
+					var dataFlux = requestsFlux
+							.skip(1)
+							.map(putRequest -> {
+								if (!putRequest.hasData()) {
+									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Multiple initial requests");
+								}
+								return putRequest.getData();
+							});
+
+					return dataFlux
+							.publishOn(scheduler.write())
+							.map(data -> mapper.apply(api.put(initialRequest.getTransactionOrUpdateId(),
+									initialRequest.getColumnId(),
+									mapKeys(data.getKeysCount(), data::getKeys),
+									toBuf(data.getValue()),
+									requestType)))
+							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
+				} else {
+					return Flux.error(RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+				}
+			});
 		}
 
 		private Mono<Empty> putMultiDataFlux(PutMultiInitialRequest initialRequest,
@@ -788,7 +866,12 @@ public class GrpcServer extends Server {
 		@Override
 		public Flux<KV> subsequentMultiGet(SubsequentRequest request) {
 			return Flux.<KV>create(emitter -> {
-				int pageIndex = 0;
+				if (request.getSkipCount() < 0 || request.getTakeCount() < 0) {
+					emitter.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+							"Iterator skip and take counts must be non-negative"));
+					return;
+				}
+				long pageIndex = 0;
 				final long pageSize = 16L;
 				while (request.getTakeCount() > pageIndex * pageSize) {
 					var response = api.subsequent(request.getIterationId(),
@@ -797,12 +880,12 @@ public class GrpcServer extends Server {
 							new RequestMulti<>()
 					);
 					for (Buf entry : response) {
-						Keys keys = null; // todo: implement
-						Buf value = entry;
 						emitter.next(KV.newBuilder()
-								.addAllKeys(null) // todo: implement
-								.setValue(Utils.toByteString(value))
+								.setValue(Utils.toByteString(entry))
 								.build());
+					}
+					if (response.size() < Math.min(request.getTakeCount() - pageIndex * pageSize, pageSize)) {
+						break;
 					}
 					pageIndex++;
 				}

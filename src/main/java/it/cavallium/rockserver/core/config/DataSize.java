@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.config;
 
 import java.io.Serial;
+import java.math.BigInteger;
 import java.text.CharacterIterator;
 import java.text.StringCharacterIterator;
 import org.jetbrains.annotations.NotNull;
@@ -20,11 +21,11 @@ public final class DataSize extends Number implements Comparable<DataSize> {
 	public static DataSize GIB = new DataSize(1024L * 1024 * 1024);
 	public static DataSize GB = new DataSize(1000L * 1000 * 1000);
 	public static DataSize TIB = new DataSize(1024L * 1024 * 1024 * 1024);
-	public static DataSize TB = new DataSize(1000L * 1000 * 1000 * 1024);
+	public static DataSize TB = new DataSize(1000L * 1000 * 1000 * 1000);
 	public static DataSize PIB = new DataSize(1024L * 1024 * 1024 * 1024 * 1024);
-	public static DataSize PB = new DataSize(1000L * 1000 * 1000 * 1024 * 1024);
+	public static DataSize PB = new DataSize(1000L * 1000 * 1000 * 1000 * 1000);
 	public static DataSize EIB = new DataSize(1024L * 1024 * 1024 * 1024 * 1024 * 1024);
-	public static DataSize EB = new DataSize(1000L * 1000 * 1000 * 1024 * 1024 * 1024);
+	public static DataSize EB = new DataSize(1000L * 1000 * 1000 * 1000 * 1000 * 1000);
 	public static DataSize MAX_VALUE = new DataSize(Long.MAX_VALUE);
 
 	private final long size;
@@ -45,82 +46,63 @@ public final class DataSize extends Number implements Comparable<DataSize> {
 				return;
 			}
 		}
-		int numberStartOffset = 0;
-		int numberEndOffset = 0;
-		boolean negative = false;
-		{
-			boolean firstChar = true;
-			boolean numberMode = true;
-			for (char c : size.toCharArray()) {
-				if (c == '-') {
-					if (firstChar) {
-						negative = true;
-						numberStartOffset++;
-						numberEndOffset++;
-					} else {
-						throw new IllegalArgumentException("Found a minus character after index 0");
-					}
-				} else if (Character.isDigit(c)) {
-					if (numberMode) {
-						numberEndOffset++;
-					} else {
-						throw new IllegalArgumentException("Found a number after the unit");
-					}
-				} else if (Character.isLetter(c)) {
-					if (numberEndOffset - numberStartOffset <= 0) {
-						throw new IllegalArgumentException("No number found");
-					}
-					if (numberMode) {
-						numberMode = false;
-					}
-				} else {
-					throw new IllegalArgumentException("Unsupported character");
-				}
-				if (firstChar) {
-					firstChar = false;
-				}
+		int numberStartOffset = size.charAt(0) == '-' ? 1 : 0;
+		int numberEndOffset = numberStartOffset;
+		while (numberEndOffset < size.length() && Character.isDigit(size.charAt(numberEndOffset))) {
+			numberEndOffset++;
+		}
+		if (numberEndOffset == numberStartOffset) {
+			throw new IllegalArgumentException("No number found");
+		}
+		for (int i = numberEndOffset; i < size.length(); i++) {
+			if (!Character.isLetter(size.charAt(i))) {
+				throw new IllegalArgumentException("Unsupported character");
 			}
 		}
-		var number = Long.parseUnsignedLong(size, numberStartOffset, numberEndOffset, 10);
-		if (numberEndOffset == size.length()) {
-			// No measurement
-			this.size = (negative ? -1 : 1) * number;
-			return;
+
+		try {
+			BigInteger number = new BigInteger(size.substring(0, numberEndOffset));
+			BigInteger scale = getScale(size.substring(numberEndOffset));
+			this.size = number.multiply(scale).longValueExact();
+		} catch (ArithmeticException | NumberFormatException ex) {
+			throw new IllegalArgumentException("Data size is outside the supported 64-bit range", ex);
 		}
-		// Measurements are like B, MB, or MiB, not longer
-		final var scale = getScale(size, numberEndOffset);
-		this.size = (negative ? -1 : 1) * number * scale;
 	}
 
-	private static long getScale(String size, int numberEndOffset) {
-		if (size.length() - numberEndOffset > 3) {
+	private static BigInteger getScale(String unit) {
+		if (unit.isEmpty()) {
+			return BigInteger.ONE;
+		}
+		if (unit.equals("B")) {
+			return BigInteger.ONE;
+		}
+		if (unit.endsWith("b")) {
+			throw new IllegalArgumentException("Bits are not allowed");
+		}
+		boolean powerOf2;
+		if (unit.length() == 2 && unit.charAt(1) == 'B') {
+			powerOf2 = false;
+		} else if (unit.length() == 3 && unit.charAt(1) == 'i' && unit.charAt(2) == 'B') {
+			powerOf2 = true;
+		} else {
 			throw new IllegalArgumentException("Wrong measurement unit");
 		}
-		var scaleChar = size.charAt(numberEndOffset);
-		boolean powerOf2 = numberEndOffset + 1 < size.length() && size.charAt(numberEndOffset + 1) == 'i';
-		final var scale = getScale(powerOf2, scaleChar);
-		// if scale is 1, the unit should be "B", nothing more
-		if (scale == 1 && numberEndOffset + 1 != size.length()) {
-			throw new IllegalArgumentException("Invalid unit");
-		}
-		return scale;
+		return getScale(powerOf2, unit.charAt(0));
 	}
 
-	private static long getScale(boolean powerOf2, char scaleChar) {
-		long k = powerOf2 ? 1024L : 1000L;
-		return switch (scaleChar) {
-			case 'B' -> 1;
-			case 'b' -> throw new IllegalArgumentException("Bits are not allowed");
-			case 'K', 'k' -> k;
-			case 'M', 'm' -> k * k;
-			case 'G', 'g' -> k * k * k;
-			case 'T', 't' -> k * k * k * k;
-			case 'P', 'p' -> k * k * k * k * k;
-			case 'E', 'e' -> k * k * k * k * k * k;
-			case 'Z', 'z' -> k * k * k * k * k * k * k;
-			case 'Y', 'y' -> k * k * k * k * k * k * k * k;
-			default -> throw new IllegalStateException("Unexpected value: " + scaleChar);
+	private static BigInteger getScale(boolean powerOf2, char scaleChar) {
+		int exponent = switch (scaleChar) {
+			case 'K', 'k' -> 1;
+			case 'M', 'm' -> 2;
+			case 'G', 'g' -> 3;
+			case 'T', 't' -> 4;
+			case 'P', 'p' -> 5;
+			case 'E', 'e' -> 6;
+			case 'Z', 'z' -> 7;
+			case 'Y', 'y' -> 8;
+			default -> throw new IllegalArgumentException("Unexpected measurement unit: " + scaleChar);
 		};
+		return BigInteger.valueOf(powerOf2 ? 1024L : 1000L).pow(exponent);
 	}
 
 	public static Long get(DataSize value) {
@@ -144,6 +126,9 @@ public final class DataSize extends Number implements Comparable<DataSize> {
 	public int intValue() {
 		if (size >= Integer.MAX_VALUE) {
 			return Integer.MAX_VALUE;
+		}
+		if (size <= Integer.MIN_VALUE) {
+			return Integer.MIN_VALUE;
 		}
 		return (int) size;
 	}

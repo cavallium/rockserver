@@ -5,7 +5,8 @@ struct ColumnSchema {
   2: list<ColumnHashType> variableTailKeys,
   3: bool hasValue,
   4: optional string mergeOperatorName,
-  5: optional i64 mergeOperatorVersion
+  5: optional i64 mergeOperatorVersion,
+  6: optional string mergeOperatorClass
 }
 
 struct Column {
@@ -144,13 +145,25 @@ service RocksDB {
 
    bool putGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
 
+   void delete(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
+
+   OptionalBinary deleteGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
+
+   bool deleteGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
+
+   void deleteMulti(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti) throws (1: RocksDBThriftException e),
+
+   list<OptionalBinary> deleteMultiGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti) throws (1: RocksDBThriftException e),
+
+   list<bool> deleteMultiGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti) throws (1: RocksDBThriftException e),
+
    OptionalBinary get(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
 
    UpdateBegin getForUpdate(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
 
    bool exists(1: required i64 transactionOrUpdateId, 3: required i64 columnId, 4: required list<binary> keys) throws (1: RocksDBThriftException e),
 
-   i64 openIterator(1: required i64 transactionId, 2: required i64 columnId, 3: required list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   i64 openIterator(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
 
    void closeIterator(1: required i64 iteratorId) throws (1: RocksDBThriftException e),
 
@@ -176,11 +189,11 @@ service RocksDB {
 
    list<OptionalBinary> mergeMultiGetMerged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti) throws (1: RocksDBThriftException e),
 
-   FirstAndLast reduceRangeFirstAndLast(1: required i64 transactionId, 2: required i64 columnId, 3: required list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   FirstAndLast reduceRangeFirstAndLast(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
 
-   i64 reduceRangeEntriesCount(1: required i64 transactionId, 2: required i64 columnId, 3: required list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   i64 reduceRangeEntriesCount(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
 
-   list<KV> getAllInRange(1: required i64 transactionId, 2: required i64 columnId, 3: required list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   list<KV> getAllInRange(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
 
    i64 uploadMergeOperator(1: required string operatorName, 2: required string className, 3: required binary jarPayload) throws (1: RocksDBThriftException e),
 

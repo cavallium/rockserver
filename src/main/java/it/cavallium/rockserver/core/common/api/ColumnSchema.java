@@ -15,6 +15,7 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
   private static final org.apache.thrift.protocol.TField HAS_VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("hasValue", org.apache.thrift.protocol.TType.BOOL, (short)3);
   private static final org.apache.thrift.protocol.TField MERGE_OPERATOR_NAME_FIELD_DESC = new org.apache.thrift.protocol.TField("mergeOperatorName", org.apache.thrift.protocol.TType.STRING, (short)4);
   private static final org.apache.thrift.protocol.TField MERGE_OPERATOR_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("mergeOperatorVersion", org.apache.thrift.protocol.TType.I64, (short)5);
+  private static final org.apache.thrift.protocol.TField MERGE_OPERATOR_CLASS_FIELD_DESC = new org.apache.thrift.protocol.TField("mergeOperatorClass", org.apache.thrift.protocol.TType.STRING, (short)6);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new ColumnSchemaStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new ColumnSchemaTupleSchemeFactory();
@@ -24,6 +25,7 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
   public boolean hasValue; // required
   public @org.apache.thrift.annotation.Nullable java.lang.String mergeOperatorName; // optional
   public long mergeOperatorVersion; // optional
+  public @org.apache.thrift.annotation.Nullable java.lang.String mergeOperatorClass; // optional
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -31,7 +33,8 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
     VARIABLE_TAIL_KEYS((short)2, "variableTailKeys"),
     HAS_VALUE((short)3, "hasValue"),
     MERGE_OPERATOR_NAME((short)4, "mergeOperatorName"),
-    MERGE_OPERATOR_VERSION((short)5, "mergeOperatorVersion");
+    MERGE_OPERATOR_VERSION((short)5, "mergeOperatorVersion"),
+    MERGE_OPERATOR_CLASS((short)6, "mergeOperatorClass");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -57,6 +60,8 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
           return MERGE_OPERATOR_NAME;
         case 5: // MERGE_OPERATOR_VERSION
           return MERGE_OPERATOR_VERSION;
+        case 6: // MERGE_OPERATOR_CLASS
+          return MERGE_OPERATOR_CLASS;
         default:
           return null;
       }
@@ -103,22 +108,24 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
   private static final int __HASVALUE_ISSET_ID = 0;
   private static final int __MERGEOPERATORVERSION_ISSET_ID = 1;
   private byte __isset_bitfield = 0;
-  private static final _Fields[] optionals = {_Fields.MERGE_OPERATOR_NAME,_Fields.MERGE_OPERATOR_VERSION};
+  private static final _Fields[] optionals = {_Fields.MERGE_OPERATOR_NAME,_Fields.MERGE_OPERATOR_VERSION,_Fields.MERGE_OPERATOR_CLASS};
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
-    tmpMap.put(_Fields.FIXED_KEYS, new org.apache.thrift.meta_data.FieldMetaData("fixedKeys", org.apache.thrift.TFieldRequirementType.DEFAULT, 
-        new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST, 
+    tmpMap.put(_Fields.FIXED_KEYS, new org.apache.thrift.meta_data.FieldMetaData("fixedKeys", org.apache.thrift.TFieldRequirementType.DEFAULT,
+        new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
             new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32))));
-    tmpMap.put(_Fields.VARIABLE_TAIL_KEYS, new org.apache.thrift.meta_data.FieldMetaData("variableTailKeys", org.apache.thrift.TFieldRequirementType.DEFAULT, 
-        new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST, 
+    tmpMap.put(_Fields.VARIABLE_TAIL_KEYS, new org.apache.thrift.meta_data.FieldMetaData("variableTailKeys", org.apache.thrift.TFieldRequirementType.DEFAULT,
+        new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
             new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, ColumnHashType.class))));
-    tmpMap.put(_Fields.HAS_VALUE, new org.apache.thrift.meta_data.FieldMetaData("hasValue", org.apache.thrift.TFieldRequirementType.DEFAULT, 
+    tmpMap.put(_Fields.HAS_VALUE, new org.apache.thrift.meta_data.FieldMetaData("hasValue", org.apache.thrift.TFieldRequirementType.DEFAULT,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
-    tmpMap.put(_Fields.MERGE_OPERATOR_NAME, new org.apache.thrift.meta_data.FieldMetaData("mergeOperatorName", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+    tmpMap.put(_Fields.MERGE_OPERATOR_NAME, new org.apache.thrift.meta_data.FieldMetaData("mergeOperatorName", org.apache.thrift.TFieldRequirementType.OPTIONAL,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
-    tmpMap.put(_Fields.MERGE_OPERATOR_VERSION, new org.apache.thrift.meta_data.FieldMetaData("mergeOperatorVersion", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+    tmpMap.put(_Fields.MERGE_OPERATOR_VERSION, new org.apache.thrift.meta_data.FieldMetaData("mergeOperatorVersion", org.apache.thrift.TFieldRequirementType.OPTIONAL,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+    tmpMap.put(_Fields.MERGE_OPERATOR_CLASS, new org.apache.thrift.meta_data.FieldMetaData("mergeOperatorClass", org.apache.thrift.TFieldRequirementType.OPTIONAL,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(ColumnSchema.class, metaDataMap);
   }
@@ -159,6 +166,9 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
       this.mergeOperatorName = other.mergeOperatorName;
     }
     this.mergeOperatorVersion = other.mergeOperatorVersion;
+    if (other.isSetMergeOperatorClass()) {
+      this.mergeOperatorClass = other.mergeOperatorClass;
+    }
   }
 
   @Override
@@ -175,6 +185,7 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
     this.mergeOperatorName = null;
     setMergeOperatorVersionIsSet(false);
     this.mergeOperatorVersion = 0;
+    this.mergeOperatorClass = null;
   }
 
   public int getFixedKeysSize() {
@@ -330,6 +341,31 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
     __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __MERGEOPERATORVERSION_ISSET_ID, value);
   }
 
+  @org.apache.thrift.annotation.Nullable
+  public java.lang.String getMergeOperatorClass() {
+    return this.mergeOperatorClass;
+  }
+
+  public ColumnSchema setMergeOperatorClass(@org.apache.thrift.annotation.Nullable java.lang.String mergeOperatorClass) {
+    this.mergeOperatorClass = mergeOperatorClass;
+    return this;
+  }
+
+  public void unsetMergeOperatorClass() {
+    this.mergeOperatorClass = null;
+  }
+
+  /** Returns true if field mergeOperatorClass is set (has been assigned a value) and false otherwise */
+  public boolean isSetMergeOperatorClass() {
+    return this.mergeOperatorClass != null;
+  }
+
+  public void setMergeOperatorClassIsSet(boolean value) {
+    if (!value) {
+      this.mergeOperatorClass = null;
+    }
+  }
+
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
@@ -373,6 +409,14 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
       }
       break;
 
+    case MERGE_OPERATOR_CLASS:
+      if (value == null) {
+        unsetMergeOperatorClass();
+      } else {
+        setMergeOperatorClass((java.lang.String)value);
+      }
+      break;
+
     }
   }
 
@@ -394,6 +438,9 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
 
     case MERGE_OPERATOR_VERSION:
       return getMergeOperatorVersion();
+
+    case MERGE_OPERATOR_CLASS:
+      return getMergeOperatorClass();
 
     }
     throw new java.lang.IllegalStateException();
@@ -417,6 +464,8 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
       return isSetMergeOperatorName();
     case MERGE_OPERATOR_VERSION:
       return isSetMergeOperatorVersion();
+    case MERGE_OPERATOR_CLASS:
+      return isSetMergeOperatorClass();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -479,6 +528,15 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
         return false;
     }
 
+    boolean this_present_mergeOperatorClass = true && this.isSetMergeOperatorClass();
+    boolean that_present_mergeOperatorClass = true && that.isSetMergeOperatorClass();
+    if (this_present_mergeOperatorClass || that_present_mergeOperatorClass) {
+      if (!(this_present_mergeOperatorClass && that_present_mergeOperatorClass))
+        return false;
+      if (!this.mergeOperatorClass.equals(that.mergeOperatorClass))
+        return false;
+    }
+
     return true;
   }
 
@@ -503,6 +561,10 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
     hashCode = hashCode * 8191 + ((isSetMergeOperatorVersion()) ? 131071 : 524287);
     if (isSetMergeOperatorVersion())
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(mergeOperatorVersion);
+
+    hashCode = hashCode * 8191 + ((isSetMergeOperatorClass()) ? 131071 : 524287);
+    if (isSetMergeOperatorClass())
+      hashCode = hashCode * 8191 + mergeOperatorClass.hashCode();
 
     return hashCode;
   }
@@ -561,6 +623,16 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
     }
     if (isSetMergeOperatorVersion()) {
       lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.mergeOperatorVersion, other.mergeOperatorVersion);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetMergeOperatorClass(), other.isSetMergeOperatorClass());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetMergeOperatorClass()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.mergeOperatorClass, other.mergeOperatorClass);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -624,6 +696,16 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
       sb.append(this.mergeOperatorVersion);
       first = false;
     }
+    if (isSetMergeOperatorClass()) {
+      if (!first) sb.append(", ");
+      sb.append("mergeOperatorClass:");
+      if (this.mergeOperatorClass == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.mergeOperatorClass);
+      }
+      first = false;
+    }
     sb.append(")");
     return sb.toString();
   }
@@ -667,7 +749,7 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
       while (true)
       {
         schemeField = iprot.readFieldBegin();
-        if (schemeField.type == org.apache.thrift.protocol.TType.STOP) { 
+        if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
           break;
         }
         switch (schemeField.id) {
@@ -685,7 +767,7 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
                 iprot.readListEnd();
               }
               struct.setFixedKeysIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
@@ -706,7 +788,7 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
                 iprot.readListEnd();
               }
               struct.setVariableTailKeysIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
@@ -714,7 +796,7 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
             if (schemeField.type == org.apache.thrift.protocol.TType.BOOL) {
               struct.hasValue = iprot.readBool();
               struct.setHasValueIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
@@ -722,7 +804,7 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
             if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
               struct.mergeOperatorName = iprot.readString();
               struct.setMergeOperatorNameIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
@@ -730,7 +812,15 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
             if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
               struct.mergeOperatorVersion = iprot.readI64();
               struct.setMergeOperatorVersionIsSet(true);
-            } else { 
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 6: // MERGE_OPERATOR_CLASS
+            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+              struct.mergeOperatorClass = iprot.readString();
+              struct.setMergeOperatorClassIsSet(true);
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
@@ -789,6 +879,13 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
         oprot.writeI64(struct.mergeOperatorVersion);
         oprot.writeFieldEnd();
       }
+      if (struct.mergeOperatorClass != null) {
+        if (struct.isSetMergeOperatorClass()) {
+          oprot.writeFieldBegin(MERGE_OPERATOR_CLASS_FIELD_DESC);
+          oprot.writeString(struct.mergeOperatorClass);
+          oprot.writeFieldEnd();
+        }
+      }
       oprot.writeFieldStop();
       oprot.writeStructEnd();
     }
@@ -823,7 +920,10 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
       if (struct.isSetMergeOperatorVersion()) {
         optionals.set(4);
       }
-      oprot.writeBitSet(optionals, 5);
+      if (struct.isSetMergeOperatorClass()) {
+        optionals.set(5);
+      }
+      oprot.writeBitSet(optionals, 6);
       if (struct.isSetFixedKeys()) {
         {
           oprot.writeI32(struct.fixedKeys.size());
@@ -851,12 +951,15 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
       if (struct.isSetMergeOperatorVersion()) {
         oprot.writeI64(struct.mergeOperatorVersion);
       }
+      if (struct.isSetMergeOperatorClass()) {
+        oprot.writeString(struct.mergeOperatorClass);
+      }
     }
 
     @Override
     public void read(org.apache.thrift.protocol.TProtocol prot, ColumnSchema struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
-      java.util.BitSet incoming = iprot.readBitSet(5);
+      java.util.BitSet incoming = iprot.readBitSet(6);
       if (incoming.get(0)) {
         {
           org.apache.thrift.protocol.TList _list10 = iprot.readListBegin(org.apache.thrift.protocol.TType.I32);
@@ -897,6 +1000,10 @@ public class ColumnSchema implements org.apache.thrift.TBase<ColumnSchema, Colum
       if (incoming.get(4)) {
         struct.mergeOperatorVersion = iprot.readI64();
         struct.setMergeOperatorVersionIsSet(true);
+      }
+      if (incoming.get(5)) {
+        struct.mergeOperatorClass = iprot.readString();
+        struct.setMergeOperatorClassIsSet(true);
       }
     }
   }

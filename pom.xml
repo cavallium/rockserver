@@ -10,6 +10,8 @@
 
   <properties>
     <revision>1.0.0-SNAPSHOT</revision>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <maven.compiler.release>25</maven.compiler.release>
     <native.maven.plugin.version>0.10.6</native.maven.plugin.version>
     <gestalt.version>0.37.2</gestalt.version>
@@ -364,7 +366,17 @@
         </configuration>
       </plugin>
       <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-resources-plugin</artifactId>
+        <version>3.3.1</version>
+        <configuration>
+          <encoding>UTF-8</encoding>
+          <propertiesEncoding>UTF-8</propertiesEncoding>
+        </configuration>
+      </plugin>
+      <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
       </plugin>
       <plugin>
         <artifactId>maven-failsafe-plugin</artifactId>
@@ -421,6 +433,108 @@
   </build>
 
   <profiles>
+    <profile>
+      <id>coverage</id>
+      <properties>
+        <coverage.instruction.minimum>0.70</coverage.instruction.minimum>
+        <coverage.branch.minimum>0.64</coverage.branch.minimum>
+        <coverage.line.minimum>0.70</coverage.line.minimum>
+        <coverage.method.minimum>0.77</coverage.method.minimum>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.6.0</version>
+            <executions>
+              <execution>
+                <id>add-library-source-for-coverage</id>
+                <phase>generate-sources</phase>
+                <goals>
+                  <goal>add-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>src/library/java/</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.jacoco</groupId>
+            <artifactId>jacoco-maven-plugin</artifactId>
+            <version>0.8.15</version>
+            <configuration>
+              <excludes>
+                <!-- Generated from rocksdb.thrift. -->
+                <exclude>it/cavallium/rockserver/core/common/api/*.class</exclude>
+                <!-- Generated from rocksdb.proto. -->
+                <exclude>it/cavallium/rockserver/core/common/api/proto/*.class</exclude>
+              </excludes>
+            </configuration>
+            <executions>
+              <execution>
+                <id>prepare-coverage-agent</id>
+                <phase>initialize</phase>
+                <goals>
+                  <goal>prepare-agent</goal>
+                </goals>
+                <configuration>
+                  <destFile>${project.build.directory}/jacoco.exec</destFile>
+                  <append>false</append>
+                </configuration>
+              </execution>
+              <execution>
+                <id>coverage-report</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>report</goal>
+                </goals>
+              </execution>
+              <execution>
+                <id>coverage-check</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>check</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <rule>
+                      <element>BUNDLE</element>
+                      <limits>
+                        <limit>
+                          <counter>INSTRUCTION</counter>
+                          <value>COVEREDRATIO</value>
+                          <minimum>${coverage.instruction.minimum}</minimum>
+                        </limit>
+                        <limit>
+                          <counter>BRANCH</counter>
+                          <value>COVEREDRATIO</value>
+                          <minimum>${coverage.branch.minimum}</minimum>
+                        </limit>
+                        <limit>
+                          <counter>LINE</counter>
+                          <value>COVEREDRATIO</value>
+                          <minimum>${coverage.line.minimum}</minimum>
+                        </limit>
+                        <limit>
+                          <counter>METHOD</counter>
+                          <value>COVEREDRATIO</value>
+                          <minimum>${coverage.method.minimum}</minimum>
+                        </limit>
+                      </limits>
+                    </rule>
+                  </rules>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
     <profile>
       <id>fatjar</id>
       <dependencies>

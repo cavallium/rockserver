@@ -252,8 +252,7 @@ public class RocksDBLoader {
                 columnFamilyOptions.setLevel0StopWritesTrigger(Integer.MAX_VALUE);
                 columnFamilyOptions.setHardPendingCompactionBytesLimit(Long.MAX_VALUE);
                 columnFamilyOptions.setSoftPendingCompactionBytesLimit(Long.MAX_VALUE);
-            }
-            {
+            } else {
                 // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
                 columnFamilyOptions.setLevel0SlowdownWritesTrigger(20);
                 // https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
@@ -440,19 +439,28 @@ public class RocksDBLoader {
 
     public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger) {
         var refs = new RocksDBObjects();
-        // Get databases directory path
-        Path definitiveDbPath;
-        if (path != null) {
-            definitiveDbPath = path.toAbsolutePath();
-        } else {
-            try {
-                definitiveDbPath = Files.createTempDirectory("temp-rocksdb");
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+        try {
+            // Get databases directory path
+            Path definitiveDbPath;
+            if (path != null) {
+                definitiveDbPath = path.toAbsolutePath();
+            } else {
+                try {
+                    definitiveDbPath = Files.createTempDirectory("temp-rocksdb");
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
             }
+            var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
+            return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger);
+        } catch (RuntimeException | Error failure) {
+            try {
+                refs.close();
+            } catch (RuntimeException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
         }
-        var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
-        return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger);
     }
 
     record OptionsWithCache(DBOptions options, @Nullable Cache standardCache) {}

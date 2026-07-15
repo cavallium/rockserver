@@ -2,20 +2,542 @@ package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.impl.AdaptiveBatcher;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.reactivestreams.Subscription;
 import reactor.core.Disposable;
+import reactor.core.Disposables;
+import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 import reactor.test.StepVerifier;
 import reactor.test.publisher.TestPublisher;
+import reactor.util.context.Context;
 
 public class AdaptiveBatcherTest {
+
+    @Test
+    @DisplayName("The batching boundary should preserve downstream Reactor context")
+    public void testDownstreamContextIsVisibleToSource() {
+        Flux<String> contextualSource = Flux.deferContextual(context ->
+            Flux.just(context.<String>get("tenant")));
+
+        StepVerifier.create(
+                AdaptiveBatcher.buffer(contextualSource, 1, 4, Duration.ofSeconds(1))
+                    .contextWrite(Context.of("tenant", "rockserver"))
+            )
+            .expectNext(List.of("rockserver"))
+            .verifyComplete();
+    }
+
+    @Test
+    @Timeout(10)
+    @DisplayName("Cancellation while scheduling a timeout should dispose the late task")
+    public void testCancelWhileTimeoutSchedulingIsInFlight() throws Exception {
+        CountDownLatch schedulingStarted = new CountDownLatch(1);
+        CountDownLatch releaseScheduling = new CountDownLatch(1);
+        AtomicReference<Disposable> returnedTask = new AtomicReference<>();
+        Scheduler blockingScheduler = new Scheduler() {
+            @Override
+            public Disposable schedule(Runnable task, long delay, TimeUnit unit) {
+                schedulingStarted.countDown();
+                try {
+                    if (!releaseScheduling.await(1, TimeUnit.SECONDS)) {
+                        throw new AssertionError("timeout scheduling was not released");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(exception);
+                }
+                Disposable disposable = Disposables.single();
+                returnedTask.set(disposable);
+                return disposable;
+            }
+
+            @Override
+            public Disposable schedule(Runnable task) {
+                task.run();
+                return Disposables.disposed();
+            }
+
+            @Override
+            public Worker createWorker() {
+                return Schedulers.immediate().createWorker();
+            }
+        };
+        TestPublisher<Integer> publisher = TestPublisher.create();
+        AtomicInteger receivedBatches = new AtomicInteger();
+        BaseSubscriber<List<Integer>> subscriber = new BaseSubscriber<>() {
+            @Override
+            protected void hookOnSubscribe(Subscription subscription) {
+                request(1);
+            }
+
+            @Override
+            protected void hookOnNext(List<Integer> value) {
+                receivedBatches.incrementAndGet();
+            }
+        };
+
+        AdaptiveBatcher.buffer(publisher.flux(), 2, 8, Duration.ofSeconds(1), blockingScheduler)
+            .subscribe(subscriber);
+        Thread producer = Thread.startVirtualThread(() -> publisher.next(1));
+        Assertions.assertTrue(schedulingStarted.await(1, TimeUnit.SECONDS));
+
+        subscriber.cancel();
+        releaseScheduling.countDown();
+        producer.join(1_000);
+
+        Assertions.assertFalse(producer.isAlive());
+        publisher.assertCancelled();
+        Assertions.assertEquals(0, receivedBatches.get());
+        Assertions.assertNotNull(returnedTask.get());
+        Assertions.assertTrue(returnedTask.get().isDisposed(),
+            "a timer returned after cancellation must be disposed");
+    }
+
+    @Test
+    @Timeout(10)
+    @DisplayName("Scheduler rejection should cancel upstream and fail even without downstream demand")
+    public void testSchedulerRejectionIsTerminalWithoutDemand() {
+        RejectedExecutionException rejection = new RejectedExecutionException("synthetic rejection");
+        Scheduler rejectingScheduler = new Scheduler() {
+            @Override
+            public Disposable schedule(Runnable task, long delay, TimeUnit unit) {
+                throw rejection;
+            }
+
+            @Override
+            public Disposable schedule(Runnable task) {
+                task.run();
+                return Disposables.disposed();
+            }
+
+            @Override
+            public Worker createWorker() {
+                return Schedulers.immediate().createWorker();
+            }
+        };
+        TestPublisher<Integer> publisher = TestPublisher.create();
+
+        StepVerifier.create(
+                AdaptiveBatcher.buffer(
+                    publisher.flux(), 2, 8, Duration.ofSeconds(1), rejectingScheduler),
+                0
+            )
+            .then(() -> publisher.next(1))
+            .expectErrorSatisfies(error -> Assertions.assertSame(rejection, error))
+            .verify();
+
+        publisher.assertCancelled();
+    }
+
+    @Test
+    @Timeout(10)
+    @DisplayName("A full batch paused by backpressure should cancel its obsolete timer")
+    public void testFullBatchWaitingForDemandCancelsTimer() {
+        AtomicReference<Disposable> timer = new AtomicReference<>();
+        Scheduler recordingScheduler = new Scheduler() {
+            @Override
+            public Disposable schedule(Runnable task, long delay, TimeUnit unit) {
+                Disposable disposable = Disposables.single();
+                timer.set(disposable);
+                return disposable;
+            }
+
+            @Override
+            public Disposable schedule(Runnable task) {
+                task.run();
+                return Disposables.disposed();
+            }
+
+            @Override
+            public Worker createWorker() {
+                return Schedulers.immediate().createWorker();
+            }
+        };
+        TestPublisher<Integer> publisher = TestPublisher.create();
+
+        StepVerifier.create(
+                AdaptiveBatcher.buffer(
+                    publisher.flux(), 2, 8, Duration.ofMinutes(1), recordingScheduler),
+                0
+            )
+            .then(() -> publisher.next(1))
+            .then(() -> Assertions.assertNotNull(timer.get()))
+            .then(() -> publisher.next(2))
+            .then(() -> Assertions.assertTrue(timer.get().isDisposed(),
+                "a full batch no longer needs its partial-batch timeout"))
+            .thenRequest(1)
+            .expectNext(List.of(1, 2))
+            .thenCancel()
+            .verify();
+    }
+
+    @Test
+    @DisplayName("Invalid batching bounds and timeouts should fail at assembly")
+    public void testConfigurationValidation() {
+        Flux<Integer> source = Flux.never();
+
+        Assertions.assertThrows(IllegalArgumentException.class,
+            () -> AdaptiveBatcher.buffer(source, 0, 8, Duration.ofSeconds(1)));
+        Assertions.assertThrows(IllegalArgumentException.class,
+            () -> AdaptiveBatcher.buffer(source, 8, 4, Duration.ofSeconds(1)));
+        Assertions.assertThrows(IllegalArgumentException.class,
+            () -> AdaptiveBatcher.buffer(source, 4, 8, Duration.ZERO));
+    }
+
+    @Timeout(10)
+    @Test
+    @DisplayName("A paused downstream should not turn the first minimum batch into one maximum-sized batch")
+    public void testInitialUpstreamRequestIsLimitedToFirstBatch() {
+        AtomicLong requested = new AtomicLong();
+        Flux<Integer> source = Flux.from(subscriber -> subscriber.onSubscribe(new Subscription() {
+            @Override
+            public void request(long n) {
+                requested.addAndGet(n);
+            }
+
+            @Override
+            public void cancel() {
+            }
+        }));
+
+        StepVerifier.create(AdaptiveBatcher.buffer(source, 4, 32, Duration.ofMinutes(1)), 0)
+            .expectSubscription()
+            .then(() -> Assertions.assertEquals(4, requested.get()))
+            .thenCancel()
+            .verify();
+    }
+
+    @Timeout(10)
+    @Test
+    @DisplayName("A partial timeout should reuse outstanding upstream demand")
+    public void testTimeoutDoesNotOverRequestNextBatch() {
+        AtomicInteger requestCalls = new AtomicInteger();
+        AtomicInteger nextValue = new AtomicInteger(1);
+        AtomicLong outstanding = new AtomicLong();
+        Flux<Integer> source = Flux.create(sink -> sink.onRequest(n -> {
+            outstanding.addAndGet(n);
+            if (requestCalls.incrementAndGet() == 1) {
+                sink.next(nextValue.getAndIncrement());
+                outstanding.decrementAndGet();
+            } else {
+                long toEmit = outstanding.getAndSet(0);
+                for (long i = 0; i < toEmit; i++) {
+                    sink.next(nextValue.getAndIncrement());
+                }
+            }
+        }));
+
+        StepVerifier.withVirtualTime(() ->
+                AdaptiveBatcher.buffer(source, 4, 8, Duration.ofSeconds(1))
+            )
+            .expectSubscription()
+            .thenRequest(1)
+            .thenAwait(Duration.ofSeconds(1))
+            .expectNext(List.of(1))
+            .thenRequest(1)
+            .expectNext(List.of(2, 3, 4, 5))
+            .thenCancel()
+            .verify();
+    }
+
+    @Timeout(10)
+    @Test
+    @DisplayName("Delayed demand from a larger batch should be split at the shrunken limit")
+    public void testOutstandingDemandIsSplitAfterShrink() {
+        AtomicInteger nextValue = new AtomicInteger(1);
+        AtomicLong outstanding = new AtomicLong();
+        AtomicReference<FluxSink<Integer>> sourceSink = new AtomicReference<>();
+        Flux<Integer> source = Flux.create(sink -> {
+            sourceSink.set(sink);
+            sink.onRequest(outstanding::addAndGet);
+        });
+
+        StepVerifier.withVirtualTime(() ->
+                AdaptiveBatcher.buffer(source, 4, 8, Duration.ofSeconds(1)),
+                2
+            )
+            .expectSubscription()
+            .then(() -> emitRequested(sourceSink.get(), outstanding, nextValue, 4))
+            .expectNext(List.of(1, 2, 3, 4))
+            .then(() -> emitRequested(sourceSink.get(), outstanding, nextValue, 1))
+            .thenAwait(Duration.ofSeconds(1))
+            .expectNext(List.of(5))
+            .then(() -> emitRequested(sourceSink.get(), outstanding, nextValue, 7))
+            .thenRequest(1)
+            .expectNext(List.of(6, 7, 8, 9))
+            .thenCancel()
+            .verify();
+    }
+
+    @Timeout(10)
+    @Test
+    @DisplayName("A canceled timeout should not flush a newer batch")
+    public void testStaleTimeoutCannotFlushNextBatch() {
+        List<Runnable> scheduledTasks = new ArrayList<>();
+        Scheduler manualScheduler = new Scheduler() {
+            @Override
+            public Disposable schedule(Runnable task, long delay, java.util.concurrent.TimeUnit unit) {
+                scheduledTasks.add(task);
+                return Disposables.single();
+            }
+
+            @Override
+            public Disposable schedule(Runnable task) {
+                task.run();
+                return Disposables.disposed();
+            }
+
+            @Override
+            public Worker createWorker() {
+                return Schedulers.immediate().createWorker();
+            }
+        };
+        TestPublisher<Integer> publisher = TestPublisher.create();
+
+        StepVerifier.create(AdaptiveBatcher.buffer(
+                publisher.flux(), 4, 8, Duration.ofSeconds(1), manualScheduler), 2)
+            .then(() -> publisher.next(1, 2, 3, 4))
+            .expectNext(List.of(1, 2, 3, 4))
+            .then(() -> publisher.next(5))
+            .then(() -> {
+                Assertions.assertEquals(2, scheduledTasks.size());
+                scheduledTasks.getFirst().run();
+            })
+            .then(() -> publisher.next(6, 7, 8, 9, 10, 11, 12))
+            .expectNext(List.of(5, 6, 7, 8, 9, 10, 11, 12))
+            .thenCancel()
+            .verify();
+    }
+
+    @Timeout(10)
+    @Test
+    @DisplayName("Delayed demand should flush a fired timeout before synchronous upstream prefetch")
+    public void testFiredTimeoutWinsOverLateSynchronousItems() {
+        List<Runnable> scheduledTasks = new ArrayList<>();
+        Scheduler manualScheduler = new Scheduler() {
+            @Override
+            public Disposable schedule(Runnable task, long delay, TimeUnit unit) {
+                scheduledTasks.add(task);
+                return Disposables.single();
+            }
+
+            @Override
+            public Disposable schedule(Runnable task) {
+                task.run();
+                return Disposables.disposed();
+            }
+
+            @Override
+            public Worker createWorker() {
+                return Schedulers.immediate().createWorker();
+            }
+        };
+        AtomicInteger nextValue = new AtomicInteger(1);
+        AtomicLong outstanding = new AtomicLong();
+        AtomicBoolean emitOneOnRequest = new AtomicBoolean();
+        AtomicReference<FluxSink<Integer>> sourceSink = new AtomicReference<>();
+        Flux<Integer> source = Flux.create(sink -> {
+            sourceSink.set(sink);
+            sink.onRequest(n -> {
+                outstanding.addAndGet(n);
+                if (emitOneOnRequest.getAndSet(false)) {
+                    Assertions.assertTrue(outstanding.getAndDecrement() > 0);
+                    sink.next(nextValue.getAndIncrement());
+                }
+            });
+        });
+
+        StepVerifier.create(AdaptiveBatcher.buffer(
+                source, 2, 8, Duration.ofSeconds(1), manualScheduler), 1)
+            .then(() -> emitRequested(sourceSink.get(), outstanding, nextValue, 2))
+            .expectNext(List.of(1, 2))
+            .then(() -> emitRequested(sourceSink.get(), outstanding, nextValue, 3))
+            .then(() -> {
+                Assertions.assertEquals(2, scheduledTasks.size());
+                scheduledTasks.get(1).run();
+                emitOneOnRequest.set(true);
+            })
+            .thenRequest(1)
+            .expectNext(List.of(3, 4, 5))
+            .thenCancel()
+            .verify();
+    }
+
+    @Timeout(10)
+    @Test
+    @DisplayName("Upstream demand should be replenished before delivering a full batch")
+    public void testDemandIsReplenishedBeforeDownstreamDelivery() {
+        AtomicLong requested = new AtomicLong();
+        AtomicLong outstanding = new AtomicLong();
+        AtomicReference<FluxSink<Integer>> sourceSink = new AtomicReference<>();
+        Flux<Integer> source = Flux.create(sink -> {
+            sourceSink.set(sink);
+            sink.onRequest(n -> {
+                requested.addAndGet(n);
+                outstanding.addAndGet(n);
+            });
+        });
+
+        StepVerifier.create(AdaptiveBatcher.buffer(source, 4, 8, Duration.ofMinutes(1)), 1)
+            .then(() -> emitRequested(sourceSink.get(), outstanding, new AtomicInteger(1), 4))
+            .assertNext(batch -> {
+                Assertions.assertEquals(List.of(1, 2, 3, 4), batch);
+                Assertions.assertEquals(12, requested.get(),
+                    "the next bounded request must be visible before downstream processing starts");
+            })
+            .thenCancel()
+            .verify();
+    }
+
+    @Test
+    @Timeout(10)
+    @DisplayName("An upstream error racing a timeout flush must not turn into completion")
+    public void testConcurrentErrorWinsOverTimeoutCompletionPath() throws Exception {
+        List<Runnable> scheduledTasks = new ArrayList<>();
+        Scheduler manualScheduler = new Scheduler() {
+            @Override
+            public Disposable schedule(Runnable task, long delay, TimeUnit unit) {
+                scheduledTasks.add(task);
+                return Disposables.single();
+            }
+
+            @Override
+            public Disposable schedule(Runnable task) {
+                task.run();
+                return Disposables.disposed();
+            }
+
+            @Override
+            public Worker createWorker() {
+                return Schedulers.immediate().createWorker();
+            }
+        };
+        TestPublisher<Integer> publisher = TestPublisher.create();
+        RuntimeException failure = new RuntimeException("boom");
+        CountDownLatch deliveryStarted = new CountDownLatch(1);
+        CountDownLatch releaseDelivery = new CountDownLatch(1);
+        CountDownLatch terminated = new CountDownLatch(1);
+        AtomicReference<Throwable> terminalError = new AtomicReference<>();
+        AtomicBoolean completed = new AtomicBoolean();
+
+        AdaptiveBatcher.buffer(publisher.flux(), 4, 8, Duration.ofSeconds(1), manualScheduler)
+            .subscribe(new BaseSubscriber<>() {
+                @Override
+                protected void hookOnSubscribe(Subscription subscription) {
+                    request(1);
+                }
+
+                @Override
+                protected void hookOnNext(List<Integer> value) {
+                    deliveryStarted.countDown();
+                    try {
+                        releaseDelivery.await();
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(exception);
+                    }
+                }
+
+                @Override
+                protected void hookOnError(Throwable throwable) {
+                    terminalError.set(throwable);
+                    terminated.countDown();
+                }
+
+                @Override
+                protected void hookOnComplete() {
+                    completed.set(true);
+                    terminated.countDown();
+                }
+            });
+
+        publisher.next(1);
+        Assertions.assertEquals(1, scheduledTasks.size());
+        Thread timeoutThread = Thread.startVirtualThread(scheduledTasks.getFirst());
+        Assertions.assertTrue(deliveryStarted.await(1, TimeUnit.SECONDS));
+
+        publisher.error(failure);
+        releaseDelivery.countDown();
+
+        Assertions.assertTrue(terminated.await(1, TimeUnit.SECONDS));
+        timeoutThread.join(1_000);
+        Assertions.assertFalse(timeoutThread.isAlive());
+        Assertions.assertSame(failure, terminalError.get());
+        Assertions.assertFalse(completed.get());
+    }
+
+    @Test
+    @Timeout(10)
+    @DisplayName("Completion should preserve a shrunken limit for delayed in-flight items")
+    public void testCompletionSplitsOutstandingDemandAfterShrink() {
+        AtomicInteger nextValue = new AtomicInteger(1);
+        AtomicLong outstanding = new AtomicLong();
+        AtomicReference<FluxSink<Integer>> sourceSink = new AtomicReference<>();
+        Flux<Integer> source = Flux.create(sink -> {
+            sourceSink.set(sink);
+            sink.onRequest(outstanding::addAndGet);
+        });
+
+        StepVerifier.withVirtualTime(() ->
+                AdaptiveBatcher.buffer(source, 4, 8, Duration.ofSeconds(1)),
+                2
+            )
+            .then(() -> emitRequested(sourceSink.get(), outstanding, nextValue, 4))
+            .expectNext(List.of(1, 2, 3, 4))
+            .then(() -> emitRequested(sourceSink.get(), outstanding, nextValue, 1))
+            .thenAwait(Duration.ofSeconds(1))
+            .expectNext(List.of(5))
+            .then(() -> emitRequested(sourceSink.get(), outstanding, nextValue, 7))
+            .then(() -> sourceSink.get().complete())
+            .thenRequest(1)
+            .expectNext(List.of(6, 7, 8, 9))
+            .thenRequest(1)
+            .expectNext(List.of(10, 11, 12))
+            .verifyComplete();
+    }
+
+    @Timeout(10)
+    @Test
+    @DisplayName("An empty source should complete without downstream demand")
+    public void testEmptyCompletionIsNotBackpressured() {
+        StepVerifier.create(
+                AdaptiveBatcher.buffer(Flux.empty(), 4, 8, Duration.ofSeconds(1)),
+                0
+            )
+            .expectSubscription()
+            .verifyComplete();
+    }
+
+    @Timeout(10)
+    @Test
+    @DisplayName("An upstream error should terminate without downstream demand")
+    public void testErrorIsNotBackpressured() {
+        RuntimeException failure = new RuntimeException("boom");
+
+        StepVerifier.create(
+                AdaptiveBatcher.buffer(Flux.<Integer>error(failure), 4, 8, Duration.ofSeconds(1)),
+                0
+            )
+            .expectSubscription()
+            .expectErrorMatches(throwable -> throwable == failure)
+            .verify();
+    }
 
     @Timeout(10)
     @Test
@@ -148,5 +670,16 @@ public class AdaptiveBatcherTest {
             .expectNextCount(7) // 10+20+40+80+100+100+...
             .thenConsumeWhile(batch -> !batch.isEmpty())
             .verifyComplete();
+    }
+
+    private static void emitRequested(FluxSink<Integer> sink,
+            AtomicLong outstanding,
+            AtomicInteger nextValue,
+            int count) {
+        for (int i = 0; i < count; i++) {
+            Assertions.assertTrue(outstanding.get() > 0, "Source emitted without demand");
+            sink.next(nextValue.getAndIncrement());
+            outstanding.decrementAndGet();
+        }
     }
 }

@@ -12,7 +12,7 @@ public class ConfigPrinter {
 		return """
 				{
 				        "bits-per-key": %d,
-				        "optimize-for-hits": %b
+				        "optimize-for-hits": %s
 				      }\
 				""".formatted(o.bitsPerKey(), o.optimizeForHits());
 	}
@@ -42,7 +42,7 @@ public class ConfigPrinter {
 				        "compression": "%s",
 				        "max-dict-bytes": "%s"
 				      }\
-				""".formatted(o.compression(), o.maxDictBytes());
+				""".formatted(stringifyCompression(o.compression()), o.maxDictBytes());
 	}
 
 	public static List<VolumeConfig> getVolumeConfigs(FallbackColumnConfig g) throws GestaltException {
@@ -64,13 +64,17 @@ public class ConfigPrinter {
 				    "allow-rocksdb-memory-mapping": %b,
 				    "maximum-open-files": %d,
 				    "optimistic": %b,
-				    "block-cache": "%s",
-				    "write-buffer-manager": "%s",
-				    "log-path": "%s",
-				    "wal-path": "%s",
+				    "block-cache": %s,
+				    "write-buffer-manager": %s,
+				    "log-path": %s,
+				    "wal-path": %s,
 				    "wal-ttl-seconds": %s,
+				    "temp-sst-path": %s,
+				    "delay-wal-flush-duration": %s,
 				    "absolute-consistency": %b,
 				    "ingest-behind": %b,
+				    "unordered-write": %b,
+				    "max-background-jobs": %s,
 				    "fallback-column-options": %s,
 				    "column-options": %s
 				  }\
@@ -81,13 +85,17 @@ public class ConfigPrinter {
 				o.allowRocksdbMemoryMapping(),
 				o.maximumOpenFiles(),
 				o.optimistic(),
-				o.blockCache(),
-				o.writeBufferManager(),
-				o.logPath(),
-				o.walPath(),
+				quote(o.blockCache()),
+				quote(o.writeBufferManager()),
+				quote(o.logPath()),
+				quote(o.walPath()),
 				o.walTtlSeconds(),
+				quote(o.tempSstPath()),
+				quote(o.delayWalFlushDuration()),
 				o.absoluteConsistency(),
 				o.ingestBehind(),
+				o.unorderedWrite(),
+				o.maxBackgroundJobs(),
 				stringifyFallbackColumn(o.fallbackColumnOptions()),
 				joiner.toString()
 		);
@@ -112,7 +120,7 @@ public class ConfigPrinter {
 				    "jmx": %s
 				  }\
 				""".formatted(
-				o.databaseName(),
+				quote(o.databaseName()),
 				stringifyInflux(o.influx()),
 				stringifyJmx(o.jmx())
 		);
@@ -122,19 +130,19 @@ public class ConfigPrinter {
 		return """
 				{
 				      "enabled": %b,
-				      "url": "%s",
-				      "bucket": "%s",
-				      "user": "%s",
-				      "token": "%s",
-				      "org": "%s",
-				      "allow-insecure-certificates": %b
+				      "url": %s,
+				      "bucket": %s,
+				      "user": %s,
+				      "token": %s,
+				      "org": %s,
+				      "allow-insecure-certificates": %s
 				    }\
 				""".formatted(o.enabled(),
-				o.url(),
-				o.bucket(),
-				o.user(),
-				o.token(),
-				o.org(),
+				quote(o.url()),
+				quote(o.bucket()),
+				quote(o.user()),
+				quote(o.token()),
+				quote(o.org()),
 				o.allowInsecureCertificates()
 		);
 	}
@@ -150,11 +158,11 @@ public class ConfigPrinter {
 	private static String stringifyVolume(VolumeConfig o) throws GestaltException {
 		return """
 				{
-				        "volume-path": "%s",
-				        "target-size-bytes": "%s"
+				        "volume-path": %s,
+				        "target-size": %s
 				      }\
-				""".formatted(o.volumePath(),
-				o.targetSize()
+				""".formatted(quote(o.volumePath()),
+				quote(o.targetSize())
 		);
 	}
 
@@ -182,27 +190,27 @@ public class ConfigPrinter {
 				      "max-last-level-sst-size": %s,
 				      "volumes": %s,
 				      "levels": %s,
-				      "memtable-memory-budget-bytes": "%s",
+				      "memtable-memory-budget-bytes": %s,
 				      "memtable-max-range-deletions": %s,
-				      "cache-index-and-filter-blocks": %b,
+				      "cache-index-and-filter-blocks": %s,
 				      "partition-filters": %s,
 				      "bloom-filter": %s,
-				      "block-size": "%s",
-				      "write-buffer-size": "%s"
+				      "block-size": %s,
+				      "write-buffer-size": %s
 			    }\
 			""".formatted(
-				o.mergeOperatorClass(),
-				o.firstLevelSstSize(),
-				o.maxLastLevelSstSize(),
+				quote(o.mergeOperatorClass()),
+				quote(o.firstLevelSstSize()),
+				quote(o.maxLastLevelSstSize()),
 				volumesStr.toString(),
 				joiner.toString(),
-				o.memtableMemoryBudgetBytes(),
+				quote(o.memtableMemoryBudgetBytes()),
 				o.memtableMaxRangeDeletions(),
 				o.cacheIndexAndFilterBlocks(),
 				o.partitionFilters(),
 				bloom,
-				o.blockSize(),
-				o.writeBufferSize()
+				quote(o.blockSize()),
+				quote(o.writeBufferSize())
 		);
 	}
 
@@ -226,32 +234,56 @@ public class ConfigPrinter {
 		return """
 				{
 				      "merge-operator-class": %s,
-				      "name": "%s",
+				      "name": %s,
 				      "first-level-sst-size": %s,
 				      "max-last-level-sst-size": %s,
 				      "volumes": %s,
 				      "levels": %s,
-				      "memtable-memory-budget-bytes": "%s",
+				      "memtable-memory-budget-bytes": %s,
 				      "memtable-max-range-deletions": %s,
-				      "cache-index-and-filter-blocks": %b,
+				      "cache-index-and-filter-blocks": %s,
 				      "partition-filters": %s,
 				      "bloom-filter": %s,
-				      "block-size": "%s",
-				      "write-buffer-size": "%s"
+				      "block-size": %s,
+				      "write-buffer-size": %s
 			    }\
-			""".formatted(o.name(),
-				o.mergeOperatorClass(),
-				o.firstLevelSstSize(),
-				o.maxLastLevelSstSize(),
+			""".formatted(quote(o.mergeOperatorClass()),
+				quote(o.name()),
+				quote(o.firstLevelSstSize()),
+				quote(o.maxLastLevelSstSize()),
 				volumesStr.toString(),
 				joiner.toString(),
-				o.memtableMemoryBudgetBytes(),
+				quote(o.memtableMemoryBudgetBytes()),
 				o.memtableMaxRangeDeletions(),
 				o.cacheIndexAndFilterBlocks(),
 				o.partitionFilters(),
 				bloom,
-				o.blockSize(),
-				o.writeBufferSize()
+				quote(o.blockSize()),
+				quote(o.writeBufferSize())
 		);
+	}
+
+	private static String stringifyCompression(org.rocksdb.CompressionType compressionType) {
+		return switch (compressionType.name()) {
+			case "NO_COMPRESSION" -> "PLAIN";
+			case "SNAPPY_COMPRESSION" -> "SNAPPY";
+			case "LZ4_COMPRESSION" -> "LZ4";
+			case "LZ4HC_COMPRESSION" -> "LZ4_HC";
+			case "ZSTD_COMPRESSION" -> "ZSTD";
+			case "ZLIB_COMPRESSION" -> "ZLIB";
+			case "BZLIB2_COMPRESSION" -> "BZLIB2";
+			default -> throw new IllegalArgumentException("Unsupported RocksDB compression type: " + compressionType);
+		};
+	}
+
+	private static String quote(Object value) {
+		if (value == null) {
+			return "null";
+		}
+		return '"' + value.toString()
+				.replace("\\", "\\\\")
+				.replace("\"", "\\\"")
+				.replace("\n", "\\n")
+				.replace("\r", "\\r") + '"';
 	}
 }

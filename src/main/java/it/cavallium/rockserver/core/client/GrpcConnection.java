@@ -946,6 +946,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	private static ByteString mapValue(@NotNull Buf value) {
+		if (value == null) {
+			throw RocksDBException.of(RocksDBErrorType.UNEXPECTED_NULL_VALUE, "value");
+		}
 		return UnsafeByteOperations.unsafeWrap(value.getBackingByteArray(),
 				value.getBackingByteArrayOffset(),
 				value.getBackingByteArrayLength());
@@ -1122,10 +1125,22 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				&& statusRuntimeException.getStatus().getDescription() != null
 				&& statusRuntimeException.getStatus().getDescription().startsWith(grpcRocksDbErrorPrefixString)) {
 			var desc = statusRuntimeException.getStatus().getDescription();
-			var closeIndex = desc.indexOf(']');
+			var closeIndex = desc.indexOf(']', grpcRocksDbErrorPrefixString.length());
+			if (closeIndex < 0) {
+				return t;
+			}
 			var errorCode = desc.substring(grpcRocksDbErrorPrefixString.length(), closeIndex);
-			var errorDescription = desc.substring(closeIndex + 2);
-			var errorType = RocksDBErrorType.valueOf(errorCode);
+			var errorDescriptionStart = closeIndex + 1;
+			if (errorDescriptionStart < desc.length() && desc.charAt(errorDescriptionStart) == ' ') {
+				errorDescriptionStart++;
+			}
+			var errorDescription = desc.substring(errorDescriptionStart);
+			final RocksDBErrorType errorType;
+			try {
+				errorType = RocksDBErrorType.valueOf(errorCode);
+			} catch (IllegalArgumentException malformedOrFutureErrorCode) {
+				return t;
+			}
 			if (errorType == RocksDBErrorType.UPDATE_RETRY) {
 				return new RocksDBRetryException();
 			} else {
