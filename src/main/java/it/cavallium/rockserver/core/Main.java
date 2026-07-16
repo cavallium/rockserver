@@ -11,13 +11,13 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnixDomainSocketAddress;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import net.sourceforge.argparse4j.ArgumentParsers;
 import net.sourceforge.argparse4j.inf.ArgumentParser;
 import net.sourceforge.argparse4j.inf.ArgumentParserException;
 import net.sourceforge.argparse4j.inf.Namespace;
+import org.jetbrains.annotations.VisibleForTesting;
 import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,6 +27,12 @@ public class Main {
 	private static final Logger LOG = LoggerFactory.getLogger("rockserver-core");
 
 	public static void main(String[] args) throws IOException, URISyntaxException {
+		run(args, () -> {});
+	}
+
+	@VisibleForTesting
+	static void run(String[] args, Runnable shutdownCompleteCallback) throws IOException, URISyntaxException {
+		requireNonNull(shutdownCompleteCallback, "shutdownCompleteCallback");
 		ArgumentParser parser = ArgumentParsers.newFor("rockserver-core").build()
 				.defaultHelp(true)
 				.description("RocksDB server core");
@@ -115,29 +121,68 @@ public class Main {
 
 		clientBuilder.setName(name);
 
-		LOG.info("Connecting...");
-		try (var connection = clientBuilder.build()) {
-			try {
-				LOG.info("Connected to {}", connection);
+		CountDownLatch shutdownRequested = new CountDownLatch(1);
+		CountDownLatch shutdownComplete = new CountDownLatch(1);
+		Thread shutdownHook = Thread.ofPlatform()
+				.name("DB shutdown hook")
+				.unstarted(() -> {
+					shutdownRequested.countDown();
+					awaitUninterruptibly(shutdownComplete);
+				});
+		Runtime.getRuntime().addShutdownHook(shutdownHook);
 
-				thriftServerBuilder.setClient(connection);
-				grpcServerBuilder.setClient(connection);
+		try {
+			LOG.info("Connecting...");
+			try (var connection = clientBuilder.build()) {
+				try {
+					LOG.info("Connected to {}", connection);
 
-				CountDownLatch shutdownLatch = new CountDownLatch(1);
-				Runtime.getRuntime().addShutdownHook(Thread.ofPlatform()
-						.name("DB shutdown hook").unstarted(shutdownLatch::countDown));
+					thriftServerBuilder.setClient(connection);
+					grpcServerBuilder.setClient(connection);
 
-				try (var thrift = thriftServerBuilder.build(); var grpc = grpcServerBuilder.build()) {
-					thrift.start();
-					grpc.start();
-					shutdownLatch.await();
-					LOG.info("Shutting down...");
+					try (var thrift = thriftServerBuilder.build(); var grpc = grpcServerBuilder.build()) {
+						if (shutdownRequested.getCount() != 0) {
+							thrift.start();
+							grpc.start();
+							LOG.info("Rockserver is ready");
+							shutdownRequested.await();
+						}
+						LOG.info("Shutting down...");
+					}
+				} catch (Exception ex) {
+					LOG.error("Unexpected error", ex);
 				}
-			} catch (Exception ex) {
-				LOG.error("Unexpected error", ex);
+			}
+			LOG.info("Shut down successfully");
+		} finally {
+			// A JVM shutdown waits for hook threads, not for this ordinary main thread. Keep the hook alive until all
+			// try-with-resources scopes above have closed gRPC, Thrift, and the database connection.
+			try {
+				shutdownCompleteCallback.run();
+			} finally {
+				shutdownComplete.countDown();
+				try {
+					Runtime.getRuntime().removeShutdownHook(shutdownHook);
+				} catch (IllegalStateException ignored) {
+					// Shutdown is already in progress, so this hook is the thread waiting on shutdownComplete above.
+				}
 			}
 		}
-		LOG.info("Shut down successfully");
+	}
+
+	private static void awaitUninterruptibly(CountDownLatch latch) {
+		boolean interrupted = false;
+		while (true) {
+			try {
+				latch.await();
+				break;
+			} catch (InterruptedException ex) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
 	}
 
 	private static void buildServerAddress(ServerBuilder serverBuilder, URI listenUrl, boolean useThrift) {

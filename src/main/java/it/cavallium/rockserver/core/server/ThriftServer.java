@@ -734,6 +734,23 @@ public class ThriftServer extends Server {
 	public void close() throws IOException {
 		LOG.info("Thrift server is shutting down...");
 		this.server.stop();
-		super.close();
+		boolean interrupted = false;
+		if (Thread.currentThread() != thriftThread) {
+			while (thriftThread.isAlive()) {
+				try {
+					thriftThread.join();
+				} catch (InterruptedException ex) {
+					interrupted = true;
+				}
+			}
+		}
+		try {
+			super.close();
+			LOG.info("Thrift server shut down.");
+		} finally {
+			if (interrupted) {
+				Thread.currentThread().interrupt();
+			}
+		}
 	}
 }

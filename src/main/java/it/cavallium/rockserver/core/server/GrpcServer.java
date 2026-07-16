@@ -1379,6 +1379,7 @@ public class GrpcServer extends Server {
 			}).block();
 		}
 		super.close();
+		LOG.info("GRPC server shut down.");
 	}
 
 	private static Duration durationProperty(String name, Duration defaultValue) {
