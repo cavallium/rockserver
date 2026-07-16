@@ -254,6 +254,15 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
+		public long estimateNumKeys(long columnId) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().estimateNumKeys(columnId);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
 		public void putFast(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
@@ -438,6 +447,21 @@ public class ThriftServer extends Server {
 				List<ByteBuffer> keys) throws RocksDBThriftException {
 			try {
 				return client.getSyncApi().get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.exists());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public List<Boolean> existsMulti(long transactionId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti,
+				long timeoutMs) throws RocksDBThriftException {
+			try {
+				return client.getSyncApi().existsMulti(transactionId,
+						columnId,
+						keysToRecords(keysMulti),
+						timeoutMs);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}

@@ -352,6 +352,14 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return toResponse(this.futureStub.getColumnId(request), GetColumnIdResponse::getColumnId);
 	}
 
+	@Override
+	public CompletableFuture<Long> estimateNumKeysAsync(long columnId) throws RocksDBException {
+		var request = EstimateNumKeysRequest.newBuilder()
+				.setColumnId(columnId)
+				.build();
+		return toResponse(this.futureStub.estimateNumKeys(request), EntriesCount::getCount);
+	}
+
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> CompletableFuture<T> putAsync(long transactionOrUpdateId,
@@ -700,6 +708,22 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				case RequestType.RequestForUpdate<?> _ -> throw new IllegalStateException();
 			});
 		}
+	}
+
+	@Override
+	public CompletableFuture<List<Boolean>> existsMultiAsync(long transactionId,
+			long columnId,
+			@NotNull List<@NotNull Keys> keys,
+			long timeoutMs) throws RocksDBException {
+		var request = ExistsMultiRequest.newBuilder()
+				.setTransactionId(transactionId)
+				.setColumnId(columnId)
+				.setTimeoutMs(timeoutMs);
+		for (var logicalKeys : keys) {
+			request.addKeysMulti(KeyTuple.newBuilder().addAllKeys(mapKeys(logicalKeys)));
+		}
+		return toResponse(this.futureStub.existsMulti(request.build()),
+				response -> List.copyOf(response.getPresentList()));
 	}
 
 	@Override

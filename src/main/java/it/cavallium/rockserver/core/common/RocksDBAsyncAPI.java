@@ -17,6 +17,8 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Delete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.EstimateNumKeys;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange;
@@ -110,6 +112,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new GetColumnId(name));
 	}
 
+	/**
+	 * Asynchronously return RocksDB's unbounded estimate of physical keys in a column.
+	 * See {@link RocksDBSyncAPI#estimateNumKeys(long)} for its deliberately approximate semantics.
+	 */
+	default CompletableFuture<Long> estimateNumKeysAsync(long columnId) throws RocksDBException {
+		return requestAsync(new EstimateNumKeys(columnId));
+	}
+
 	/** See: {@link Put}. */
 	default <T> CompletableFuture<T> putAsync(long transactionOrUpdateId,
 			long columnId,
@@ -189,6 +199,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 			@NotNull Keys keys,
 			RequestGet<? super Buf, T> requestType) throws RocksDBException {
 		return requestAsync(new Get<>(transactionOrUpdateId, columnId, keys, requestType));
+	}
+
+	/** See: {@link ExistsMulti}. */
+	default CompletableFuture<List<Boolean>> existsMultiAsync(long transactionId,
+			long columnId,
+			@NotNull List<@NotNull Keys> keys,
+			long timeoutMs) throws RocksDBException {
+		return requestAsync(new ExistsMulti(transactionId, columnId, keys, timeoutMs));
 	}
 
 	/** See: {@link OpenIterator}. */

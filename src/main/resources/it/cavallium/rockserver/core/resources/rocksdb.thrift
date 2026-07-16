@@ -132,6 +132,8 @@ service RocksDB {
 
    i64 getColumnId(1: required string name) throws (1: RocksDBThriftException e),
 
+   i64 estimateNumKeys(1: required i64 columnId) throws (1: RocksDBThriftException e),
+
    oneway void putFast(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value),
 
    void put(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
@@ -163,6 +165,8 @@ service RocksDB {
    UpdateBegin getForUpdate(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
 
    bool exists(1: required i64 transactionOrUpdateId, 3: required i64 columnId, 4: required list<binary> keys) throws (1: RocksDBThriftException e),
+
+   list<bool> existsMulti(1: required i64 transactionId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required i64 timeoutMs) throws (1: RocksDBThriftException e),
 
    i64 openIterator(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
 

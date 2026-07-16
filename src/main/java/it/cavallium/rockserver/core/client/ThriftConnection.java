@@ -191,6 +191,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 		}
 	}
 
+	@Override
+	public long estimateNumKeys(long columnId) {
+		try {
+			return client.estimateNumKeys(columnId);
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> T put(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestPut<? super Buf, T> requestType) {
@@ -390,6 +399,18 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public List<Boolean> existsMulti(long transactionId,
+			long columnId,
+			List<Keys> keys,
+			long timeoutMs) {
+		try {
+			return client.existsMulti(transactionId, columnId, mapKeysList(keys), timeoutMs);
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@Override
 	public long openIterator(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, long timeoutMs) {
 		try {
 			return client.openIterator(transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs);
@@ -550,6 +571,11 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public CompletableFuture<Long> estimateNumKeysAsync(long columnId) {
+		return CompletableFuture.supplyAsync(() -> estimateNumKeys(columnId), executor);
+	}
+
+	@Override
 	public <T> CompletableFuture<T> putAsync(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestPut<? super Buf, T> requestType) {
 		return CompletableFuture.supplyAsync(() -> put(transactionOrUpdateId, columnId, keys, value, requestType), executor);
 	}
@@ -600,6 +626,14 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public <T> CompletableFuture<T> getAsync(long transactionOrUpdateId, long columnId, Keys keys, RequestGet<? super Buf, T> requestType) {
 		return CompletableFuture.supplyAsync(() -> get(transactionOrUpdateId, columnId, keys, requestType), executor);
+	}
+
+	@Override
+	public CompletableFuture<List<Boolean>> existsMultiAsync(long transactionId,
+			long columnId,
+			List<Keys> keys,
+			long timeoutMs) {
+		return CompletableFuture.supplyAsync(() -> existsMulti(transactionId, columnId, keys, timeoutMs), executor);
 	}
 
 	@Override

@@ -112,6 +112,13 @@ impl RockserverClient {
         Ok(resp.into_inner().column_id)
     }
 
+    /// Returns RocksDB's unbounded estimate of physical keys in a column.
+    pub async fn estimate_num_keys(&self, column_id: i64) -> Result<i64> {
+        let req = EstimateNumKeysRequest { column_id };
+        let resp = self.client.clone().estimate_num_keys(req).await?;
+        Ok(resp.into_inner().count)
+    }
+
     /// Retrieves definitions for all existing columns.
     pub async fn get_all_column_definitions(&self) -> Result<Vec<Column>> {
         let req = GetAllColumnDefinitionsRequest {};
@@ -517,6 +524,27 @@ impl RockserverClient {
             keys,
         };
         let resp = self.client.clone().exists(req).await?;
+        Ok(resp.into_inner().present)
+    }
+
+    /// Checks several logical keys for presence in one bounded request.
+    pub async fn exists_multi(
+        &self,
+        transaction_id: i64,
+        column_id: i64,
+        keys_multi: Vec<Vec<Vec<u8>>>,
+        timeout_ms: i64,
+    ) -> Result<Vec<bool>> {
+        let req = ExistsMultiRequest {
+            transaction_id,
+            column_id,
+            keys_multi: keys_multi
+                .into_iter()
+                .map(|keys| KeyTuple { keys })
+                .collect(),
+            timeout_ms,
+        };
+        let resp = self.client.clone().exists_multi(req).await?;
         Ok(resp.into_inner().present)
     }
 

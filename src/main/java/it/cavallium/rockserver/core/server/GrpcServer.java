@@ -210,6 +210,14 @@ public class GrpcServer extends Server {
 		}
 
 		@Override
+		public Mono<EntriesCount> estimateNumKeys(EstimateNumKeysRequest request) {
+			return executeSync(() -> EntriesCount.newBuilder()
+					.setCount(api.estimateNumKeys(request.getColumnId()))
+					.build(), true)
+					.transform(this.onErrorMapMonoWithRequestInfo("estimateNumKeys", request));
+		}
+
+		@Override
 		public Mono<Empty> put(PutRequest request) {
 			return executeSync(() -> {
 				api.put(request.getTransactionOrUpdateId(),
@@ -243,6 +251,19 @@ public class GrpcServer extends Server {
 				);
 				return Empty.getDefaultInstance();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteRange", request));
+		}
+
+		@Override
+		public Mono<ExistsMultiResponse> existsMulti(ExistsMultiRequest request) {
+			return executeSync(() -> ExistsMultiResponse.newBuilder()
+					.addAllPresent(api.existsMulti(request.getTransactionId(),
+							request.getColumnId(),
+							request.getKeysMultiList().stream()
+									.map(keyTuple -> mapKeys(keyTuple.getKeysCount(), keyTuple::getKeys))
+									.toList(),
+							request.getTimeoutMs()))
+					.build(), true)
+					.transform(this.onErrorMapMonoWithRequestInfo("existsMulti", request));
 		}
 
 		@Override

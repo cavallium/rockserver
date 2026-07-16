@@ -3,8 +3,6 @@ package it.cavallium.rockserver.core.impl;
 import static it.cavallium.rockserver.core.common.Utils.dummyRocksDBEmptyValue;
 import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
-import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithValue;
-import static org.rocksdb.KeyMayExist.KeyMayExistEnum.kExistsWithoutValue;
 
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Counter;
@@ -30,6 +28,8 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.EstimateNumKeys;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator;
@@ -97,7 +97,6 @@ import org.rocksdb.CompactRangeOptions.BottommostLevelCompaction;
 import org.rocksdb.DBOptions;
 import org.rocksdb.DirectSlice;
 import org.rocksdb.FlushOptions;
-import org.rocksdb.Holder;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
@@ -122,7 +121,6 @@ import reactor.core.publisher.SynchronousSink;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
-	private static final int INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES = 4096;
 	private static final long ITERATOR_REFRESH_INTERVAL = 1_000_000;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final String SHUTDOWN_PENDING_OPS_TIMEOUT_MS_PROPERTY
@@ -167,11 +165,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer createColumnTimer;
 	private final Timer deleteColumnTimer;
 	private final Timer getColumnIdTimer;
+	private final Timer estimateNumKeysTimer;
 	private final Timer putTimer;
 	private final Timer putMultiTimer;
 	private final Timer putBatchTimer;
 	private final Timer deleteRangeTimer;
 	private final Timer getTimer;
+	private final Timer existsMultiTimer;
 	private final Timer openIteratorTimer;
 	private final Timer closeIteratorTimer;
 	private final Timer seekToTimer;
@@ -186,6 +186,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Counter cdcBytesEmitted;
 	private final RocksDBStatistics rocksDBStatistics;
 	private final boolean fastGet;
+	private final @Nullable FFMRocksDBGet fastGetReader;
+	private final LongAdder fastGetNativeErrorFallbacks = new LongAdder();
 	private volatile long getRangeIteratorRefreshInterval = ITERATOR_REFRESH_INTERVAL;
 	private volatile @Nullable Consumer<Boolean> rangeReadOptionsObserver;
 	private Path tempSSTsPath;
@@ -210,11 +212,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.createColumnTimer = createActionTimer(CreateColumn.class);
 		this.deleteColumnTimer = createActionTimer(DeleteColumn.class);
 		this.getColumnIdTimer = createActionTimer(GetColumnId.class);
+		this.estimateNumKeysTimer = createActionTimer(EstimateNumKeys.class);
 		this.putTimer = createActionTimer(Put.class);
 		this.putMultiTimer = createActionTimer(PutMulti.class);
 		this.putBatchTimer = createActionTimer(PutBatch.class);
 		this.deleteRangeTimer = createActionTimer(DeleteRange.class);
 		this.getTimer = createActionTimer(Get.class);
+		this.existsMultiTimer = createActionTimer(ExistsMulti.class);
 		this.openIteratorTimer = createActionTimer(OpenIterator.class);
 		this.closeIteratorTimer = createActionTimer(CloseIterator.class);
 		this.seekToTimer = createActionTimer(SeekTo.class);
@@ -332,6 +336,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			);
 			this.scheduler = new RWScheduler(readCap, writeCap, "db[" + name + "]");
 			this.fastGet = config.global().enableFastGet();
+			this.fastGetReader = fastGet ? new FFMRocksDBGet(db.get(), (long) readCap + writeCap) : null;
 		} catch (GestaltException e) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get the scheduler parallelism");
 		}
@@ -785,6 +790,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				} catch (Throwable t) {
 					logger.error("Error closing remaining iterator", t);
 				}
+			}
+		}
+		if (forced && ops.getPendingOpsCount() > 0) {
+			logger.error("Leaving RocksDB native resources allocated because {} operations are still active; "
+					+ "freeing DB, column, or FFM memory here could crash the process",
+					ops.getPendingOpsCount());
+			return;
+		}
+
+		// No operations remain, so native key scratch and C-API wrapper segments can be released before their handles.
+		if (fastGetReader != null) {
+			try {
+				fastGetReader.close();
+			} catch (Throwable t) {
+				logger.error("Error closing FFM fast-get{}", forced ? " (forced)" : "", t);
 			}
 		}
 
@@ -1439,6 +1459,29 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} finally {
 			var end = System.nanoTime();
 			getColumnIdTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	/**
+	 * Return RocksDB's estimate of physical keys in this column family.
+	 * Exact, bounded, and transaction-aware counts remain implemented by {@link #reduceRange}.
+	 */
+	@Override
+	public long estimateNumKeys(long columnId) {
+		var start = System.nanoTime();
+		ops.beginOp();
+		actionLogger.logAction("EstimateNumKeys", start, columnId, null, null, null, null, null, null);
+		try {
+			var col = getColumn(columnId);
+			try {
+				return db.get().getLongProperty(col.cfh(), RocksDBLongProperty.ESTIMATE_NUM_KEYS.getName());
+			} catch (org.rocksdb.RocksDBException e) {
+				throw RocksDBException.of(RocksDBErrorType.GET_PROPERTY_ERROR, e);
+			}
+		} finally {
+			ops.endOp();
+			var end = System.nanoTime();
+			estimateNumKeysTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
 	}
 
@@ -3228,6 +3271,120 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	@Override
+	public List<Boolean> existsMulti(long transactionId,
+			long columnId,
+			@NotNull List<@NotNull Keys> keys,
+			long timeoutMs) throws RocksDBException {
+		var start = System.nanoTime();
+		ops.beginOp();
+		try {
+			if (keys == null) {
+				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "keys");
+			}
+			actionLogger.logAction("ExistsMulti",
+					start,
+					columnId,
+					keys.size(),
+					null,
+					transactionId,
+					null,
+					timeoutMs,
+					null
+			);
+
+			var deadlineMicros = readDeadlineMicros(timeoutMs);
+			var col = getColumn(columnId);
+			Tx tx = transactionId != 0 ? getTransaction(transactionId, false) : null;
+			if (keys.isEmpty()) {
+				return List.of();
+			}
+
+			var calculatedKeys = new ArrayList<Buf>(keys.size());
+			for (var logicalKeys : keys) {
+				if (logicalKeys == null) {
+					throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "keys contains null");
+				}
+				calculatedKeys.add(col.calculateKey(logicalKeys.keys()));
+			}
+
+			try (var readOptions = newReadOptions("exists-multi-read-options")) {
+				readOptions.setDeadline(deadlineMicros);
+				readOptions.setFillCache(false);
+				if (tx == null && !col.hasBuckets()) {
+					return existsMultiStatusOnly(col, readOptions, calculatedKeys);
+				}
+				return existsMultiWithValues(tx, col, readOptions, keys, calculatedKeys);
+			} catch (org.rocksdb.RocksDBException exception) {
+				throw mapIteratorStatusException(exception);
+			}
+		} catch (RocksDBException exception) {
+			throw exception;
+		} catch (Exception exception) {
+			throw RocksDBException.of(RocksDBErrorType.GET_1, exception);
+		} finally {
+			ops.endOp();
+			existsMultiTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	private List<Boolean> existsMultiStatusOnly(ColumnInstance col,
+			ReadOptions readOptions,
+			List<Buf> calculatedKeys) throws org.rocksdb.RocksDBException {
+		var nativeKeys = new ArrayList<ByteBuffer>(calculatedKeys.size());
+		var emptyValues = new ArrayList<ByteBuffer>(calculatedKeys.size());
+		for (var calculatedKey : calculatedKeys) {
+			var nativeKey = ByteBuffer.allocateDirect(calculatedKey.size());
+			nativeKey.put(calculatedKey.getBackingByteArray(),
+					calculatedKey.getBackingByteArrayOffset(),
+					calculatedKey.getBackingByteArrayLength());
+			nativeKey.flip();
+			nativeKeys.add(nativeKey);
+			emptyValues.add(ByteBuffer.allocateDirect(0));
+		}
+
+		var statuses = db.get().multiGetByteBuffers(readOptions, List.of(col.cfh()), nativeKeys, emptyValues);
+		var result = new ArrayList<Boolean>(statuses.size());
+		for (var status : statuses) {
+			result.add(switch (status.status.getCode()) {
+				case Ok -> true;
+				case NotFound -> false;
+				default -> throw mapIteratorStatusException(new org.rocksdb.RocksDBException(status.status));
+			});
+		}
+		return result;
+	}
+
+	private List<Boolean> existsMultiWithValues(@Nullable Tx tx,
+			ColumnInstance col,
+			ReadOptions readOptions,
+			List<Keys> logicalKeys,
+			List<Buf> calculatedKeys) throws org.rocksdb.RocksDBException {
+		var nativeKeys = calculatedKeys.stream().map(Buf::toByteArray).toList();
+		List<byte[]> values;
+		if (tx == null) {
+			values = db.get().multiGetAsList(readOptions,
+					Collections.nCopies(nativeKeys.size(), col.cfh()),
+					nativeKeys);
+		} else {
+			values = tx.val().multiGetAsList(readOptions, col.cfh(), nativeKeys);
+		}
+
+		var result = new ArrayList<Boolean>(values.size());
+		for (int i = 0; i < values.size(); i++) {
+			var value = values.get(i);
+			if (value == null) {
+				result.add(false);
+			} else if (col.hasBuckets()) {
+				var bucket = new Bucket(col, Buf.wrap(value));
+				result.add(bucket.getElement(col.getBucketElementKeys(logicalKeys.get(i).keys())) != null);
+			} else {
+				result.add(true);
+			}
+		}
+		return result;
+	}
+
 	private <T> T get(Tx tx, long updateId, ColumnInstance col, Keys keys, RequestGet<? super Buf, T> callback)
 			throws RocksDBException {
 		ops.beginOp();
@@ -3243,8 +3400,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Buf calculatedKey = col.calculateKey(keys.keys());
 			if (col.hasBuckets()) {
 				var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-				try (var readOptions = newReadOptions(null)) {
-					Buf previousRawBucket = dbGet(tx, col, readOptions, calculatedKey);
+				try {
+					Buf previousRawBucket = dbGetWithDefaultOptions(tx, col, calculatedKey);
 					if (previousRawBucket != null) {
 						var bucket = new Bucket(col, previousRawBucket);
 						foundValue = bucket.getElement(bucketElementKeys);
@@ -3259,8 +3416,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				boolean shouldGetCurrent = RequestType.requiresGettingCurrentValue(callback) || (tx != null
 						&& callback instanceof RequestType.RequestExists<?>);
 				if (shouldGetCurrent) {
-					try (var readOptions = newReadOptions(null)) {
-						foundValue = dbGet(tx, col, readOptions, calculatedKey);
+					try {
+						foundValue = dbGetWithDefaultOptions(tx, col, calculatedKey);
 						existsValue = foundValue != null;
 					} catch (org.rocksdb.RocksDBException e) {
 						throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
@@ -4403,7 +4560,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} else {
 			var db = this.db.get();
 			if (fastGet) {
-				return dbGetIndirect(col.cfh(), readOptions, calculatedKey);
+				return dbGetFast(col.cfh(), readOptions, calculatedKey);
 			} else {
 				var previousRawBucketByteArray = db.get(col.cfh(),
 						readOptions,
@@ -4417,68 +4574,73 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Nullable
-	private Buf dbGetDirect(ColumnFamilyHandle cfh, ReadOptions readOptions, Buf calculatedKey)
+	private Buf dbGetWithDefaultOptions(@Nullable Tx tx, ColumnInstance col, Buf calculatedKey)
 			throws org.rocksdb.RocksDBException {
-		// Get the key nio buffer to pass to RocksDB
-		ByteBuffer keyNioBuffer = calculatedKey.asHeapByteBuffer();
-
-		// Create a direct result buffer because RocksDB works only with direct buffers
-		var resultBuffer = ByteBuffer.allocate(INITIAL_DIRECT_READ_BYTE_BUF_SIZE_BYTES);
-		var keyMayExist = this.db.get().keyMayExist(cfh, readOptions, keyNioBuffer.rewind(), resultBuffer.clear());
-		return switch (keyMayExist.exists) {
-			case kNotExist -> null;
-			case kExistsWithValue, kExistsWithoutValue -> {
-				// At the beginning, size reflects the expected size, then it becomes the real data size
-				int size = keyMayExist.exists == kExistsWithValue ? keyMayExist.valueLength : -1;
-				if (keyMayExist.exists == kExistsWithoutValue || size > resultBuffer.limit()) {
-					if (size > resultBuffer.capacity()) {
-						resultBuffer = ByteBuffer.allocate(size);
-					}
-					size = this.db.get().get(cfh, readOptions, keyNioBuffer.rewind(), resultBuffer.clear());
-				}
-
-				if (size == RocksDB.NOT_FOUND) {
-					yield null;
-				} else if (size == resultBuffer.limit()) {
-					yield Utils.fromHeapByteBuffer(resultBuffer);
-				} else {
-					throw new IllegalStateException("size (" + size + ") != read size (" + resultBuffer.limit() + ")");
-				}
-			}
-		};
+		if (tx == null && fastGet) {
+			return dbGetFast(col.cfh(), calculatedKey);
+		}
+		try (var readOptions = newReadOptions(null)) {
+			return dbGet(tx, col, readOptions, calculatedKey);
+		}
 	}
 
 	@Nullable
-	private Buf dbGetIndirect(ColumnFamilyHandle cfh, ReadOptions readOptions, Buf calculatedKey)
+	private Buf dbGetFast(ColumnFamilyHandle cfh, ReadOptions readOptions, Buf calculatedKey)
 			throws org.rocksdb.RocksDBException {
-		var valueHolder = new Holder<byte[]>();
-		var keyMayExist = this.db
-				.get()
-				.keyMayExist(cfh,
+		return dbGetFast(cfh, readOptions, calculatedKey, false);
+	}
+
+	@Nullable
+	private Buf dbGetFast(ColumnFamilyHandle cfh, Buf calculatedKey)
+			throws org.rocksdb.RocksDBException {
+		return dbGetFast(cfh, null, calculatedKey, true);
+	}
+
+	@Nullable
+	private Buf dbGetFast(ColumnFamilyHandle cfh,
+			@Nullable ReadOptions readOptions,
+			Buf calculatedKey,
+			boolean useDefaultReadOptions)
+			throws org.rocksdb.RocksDBException {
+		var db = this.db.get();
+		try {
+			var reader = Objects.requireNonNull(fastGetReader);
+			byte[] value = useDefaultReadOptions
+					? reader.get(cfh,
+							calculatedKey.getBackingByteArray(),
+							calculatedKey.getBackingByteArrayOffset(),
+							calculatedKey.getBackingByteArrayLength())
+					: reader.get(cfh,
+							Objects.requireNonNull(readOptions),
+							calculatedKey.getBackingByteArray(),
+							calculatedKey.getBackingByteArrayOffset(),
+							calculatedKey.getBackingByteArrayLength());
+			return toBuf(value);
+		} catch (FFMRocksDBGet.NativeError nativeError) {
+			if (!nativeError.isRocksDBStatus()) {
+				var exception = new org.rocksdb.RocksDBException("FFM fast-get failed: " + nativeError.getMessage());
+				exception.initCause(nativeError);
+				throw exception;
+			}
+			// The C API exposes errors as strings. Retry only an actual RocksDB status through JNI so callers retain the
+			// exact typed Status (timeout, corruption, I/O error, etc.); infrastructure failures above never downgrade.
+			fastGetNativeErrorFallbacks.increment();
+			if (readOptions != null) {
+				return toBuf(db.get(cfh,
 						readOptions,
 						calculatedKey.getBackingByteArray(),
 						calculatedKey.getBackingByteArrayOffset(),
-						calculatedKey.getBackingByteArrayLength(),
-						valueHolder
-				);
-		if (keyMayExist) {
-			var value = valueHolder.getValue();
-			if (value != null && value.length
-					!= 0 // todo: this is put in place to bypass a bug in rocksdb keyMayExist. It may return a 0-length array even if a value has some data...
-			) {
-				return Buf.wrap(value);
-			} else {
-				return toBuf(this.db
-						.get()
-						.get(cfh,
-								readOptions,
-								calculatedKey.getBackingByteArray(),
-								calculatedKey.getBackingByteArrayOffset(),
-								calculatedKey.getBackingByteArrayLength()
-						));
+						calculatedKey.getBackingByteArrayLength()
+				));
 			}
-		} else {
-			return null;
+			try (var fallbackReadOptions = newReadOptions("ffm-fast-get-error-fallback")) {
+				return toBuf(db.get(cfh,
+						fallbackReadOptions,
+						calculatedKey.getBackingByteArray(),
+						calculatedKey.getBackingByteArrayOffset(),
+						calculatedKey.getBackingByteArrayLength()
+				));
+			}
 		}
 	}
 
@@ -4527,6 +4689,31 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public int getOpenIteratorsCount() {
 		return its.size();
+	}
+
+	@VisibleForTesting
+	public long getFastGetNativeCallsCount() {
+		return fastGetReader != null ? fastGetReader.getCallsCount() : 0;
+	}
+
+	@VisibleForTesting
+	public long getFastGetNativeErrorFallbacksCount() {
+		return fastGetNativeErrorFallbacks.sum();
+	}
+
+	@VisibleForTesting
+	public int getFastGetRetainedStateCount() {
+		return fastGetReader != null ? fastGetReader.getRetainedStateCount() : 0;
+	}
+
+	@VisibleForTesting
+	public int getFastGetRetainedStateCapacity() {
+		return fastGetReader != null ? fastGetReader.getRetainedStateCapacity() : 0;
+	}
+
+	@VisibleForTesting
+	public boolean isFastGetReaderClosed() {
+		return fastGetReader == null || fastGetReader.isClosed();
 	}
 
 	@VisibleForTesting

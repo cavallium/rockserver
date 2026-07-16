@@ -120,6 +120,8 @@ message DeleteColumnRequest {int64 columnId = 1;}
 message GetColumnIdRequest {string name = 1;}
 message GetColumnIdResponse {int64 columnId = 1;}
 
+message EstimateNumKeysRequest {int64 columnId = 1;}
+
 message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
 
 message DeleteRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3;}
@@ -146,6 +148,10 @@ message MergeMultiRequest {oneof mergeMultiRequestType {MergeMultiInitialRequest
 
 message GetRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3;}
 message GetResponse {optional bytes value = 1;}
+
+message KeyTuple {repeated bytes keys = 1;}
+message ExistsMultiRequest {int64 transactionId = 1; int64 columnId = 2; repeated KeyTuple keysMulti = 3; int64 timeoutMs = 4;}
+message ExistsMultiResponse {repeated bool present = 1;}
 
 message OpenIteratorRequest {int64 transactionId = 1; int64 columnId = 2; repeated bytes startKeysInclusive = 3; repeated bytes endKeysExclusive = 4; bool reverse = 5; int64 timeoutMs = 6;}
 message OpenIteratorResponse {int64 iteratorId = 1;}
@@ -209,6 +215,7 @@ service RocksDBService {
   rpc createColumn(CreateColumnRequest) returns (CreateColumnResponse);
   rpc deleteColumn(DeleteColumnRequest) returns (google.protobuf.Empty);
   rpc getColumnId(GetColumnIdRequest) returns (GetColumnIdResponse);
+  rpc estimateNumKeys(EstimateNumKeysRequest) returns (EntriesCount);
   rpc put(PutRequest) returns (google.protobuf.Empty);
   rpc putBatch(stream PutBatchRequest) returns (google.protobuf.Empty);
   rpc putMulti(stream PutMultiRequest) returns (google.protobuf.Empty);
@@ -236,6 +243,7 @@ service RocksDBService {
   rpc get(GetRequest) returns (GetResponse);
   rpc getForUpdate(GetRequest) returns (UpdateBegin);
   rpc exists(GetRequest) returns (PreviousPresence);
+  rpc existsMulti(ExistsMultiRequest) returns (ExistsMultiResponse);
   rpc openIterator(OpenIteratorRequest) returns (OpenIteratorResponse);
   rpc closeIterator(CloseIteratorRequest) returns (google.protobuf.Empty);
   rpc seekTo(SeekToRequest) returns (google.protobuf.Empty);

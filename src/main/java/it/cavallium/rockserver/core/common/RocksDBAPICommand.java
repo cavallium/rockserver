@@ -227,6 +227,33 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 		}
 		/**
+		 * Estimate the number of physical RocksDB keys in a column.
+		 *
+		 * <p>This is an unbounded, non-transactional estimate. For bucketed columns, multiple logical
+		 * entries may share one physical key, so the result is a bucket count rather than an exact
+		 * logical-entry count.</p>
+		 *
+		 * @param columnId column id
+		 */
+		record EstimateNumKeys(long columnId) implements RocksDBAPICommandSingle<Long> {
+
+			@Override
+			public Long handleSync(RocksDBSyncAPI api) {
+				return api.estimateNumKeys(columnId);
+			}
+
+			@Override
+			public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
+				return api.estimateNumKeysAsync(columnId);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
+			}
+
+		}
+		/**
 		 * Put an element into the specified position
 		 *
 		 * @param transactionOrUpdateId transaction id, update id, or 0
@@ -632,6 +659,34 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				sb.append(" keys:").append(keys);
 				sb.append(" expected:").append(requestType.getRequestTypeId());
 				return sb.toString();
+			}
+		}
+		/**
+		 * Test several logical keys for presence in one bounded read.
+		 *
+		 * @param transactionId transaction id, or 0
+		 * @param columnId column id
+		 * @param keys logical keys to test, in result order
+		 * @param timeoutMs read timeout in milliseconds
+		 */
+		record ExistsMulti(long transactionId,
+					   long columnId,
+					   @NotNull List<@NotNull Keys> keys,
+					   long timeoutMs) implements RocksDBAPICommandSingle<List<Boolean>> {
+
+			@Override
+			public List<Boolean> handleSync(RocksDBSyncAPI api) {
+				return api.existsMulti(transactionId, columnId, keys, timeoutMs);
+			}
+
+			@Override
+			public CompletableFuture<List<Boolean>> handleAsync(RocksDBAsyncAPI api) {
+				return api.existsMultiAsync(transactionId, columnId, keys, timeoutMs);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
 			}
 		}
 		/**

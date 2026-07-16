@@ -17,6 +17,8 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Delete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.EstimateNumKeys;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange;
@@ -95,6 +97,18 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	/** See: {@link GetColumnId}. */
 	default long getColumnId(@NotNull String name) throws RocksDBException {
 		return requestSync(new GetColumnId(name));
+	}
+
+	/**
+	 * Return RocksDB's unbounded estimate of physical keys in a column.
+	 *
+	 * <p>Unlike {@link #reduceRange(long, long, Keys, Keys, boolean,
+	 * RequestType.RequestReduceRange, long)} with {@link RequestType#entriesCount()}, this method
+	 * is approximate, ignores transaction-local state, and cannot be bounded. For bucketed columns,
+	 * it estimates physical buckets rather than logical entries.</p>
+	 */
+	default long estimateNumKeys(long columnId) throws RocksDBException {
+		return requestSync(new EstimateNumKeys(columnId));
 	}
 
 	/** See: {@link Put}. */
@@ -176,6 +190,14 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 			Keys keys,
 			RequestGet<? super Buf, T> requestType) throws RocksDBException {
 		return requestSync(new Get<>(transactionOrUpdateId, columnId, keys, requestType));
+	}
+
+	/** See: {@link ExistsMulti}. */
+	default List<Boolean> existsMulti(long transactionId,
+			long columnId,
+			@NotNull List<@NotNull Keys> keys,
+			long timeoutMs) throws RocksDBException {
+		return requestSync(new ExistsMulti(transactionId, columnId, keys, timeoutMs));
 	}
 
 	/** See: {@link OpenIterator}. */

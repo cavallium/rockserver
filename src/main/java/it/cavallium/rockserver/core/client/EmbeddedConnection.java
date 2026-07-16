@@ -107,6 +107,11 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public long estimateNumKeys(long columnId) {
+		return db.estimateNumKeys(columnId);
+	}
+
+	@Override
 	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> req) {
 		return req.handleSync(this);
 	}
@@ -242,6 +247,14 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			Keys keys,
 			RequestGet<? super Buf, T> requestType) throws RocksDBException {
 		return db.get(transactionOrUpdateId, columnId, keys, requestType);
+	}
+
+	@Override
+	public List<Boolean> existsMulti(long transactionId,
+			long columnId,
+			@NotNull List<@NotNull Keys> keys,
+			long timeoutMs) throws RocksDBException {
+		return db.existsMulti(transactionId, columnId, keys, timeoutMs);
 	}
 
 	@Override
