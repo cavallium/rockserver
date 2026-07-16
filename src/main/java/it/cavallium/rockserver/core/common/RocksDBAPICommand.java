@@ -17,10 +17,20 @@ import org.reactivestreams.Publisher;
 
 public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> {
 
+	enum ReadWorkClass {
+		INTERACTIVE,
+		COMPOSITE
+	}
+
 	SYNC_RESULT handleSync(RocksDBSyncAPI api);
 	ASYNC_RESULT handleAsync(RocksDBAsyncAPI api);
 
 	boolean isReadOnly();
+
+	/** Scheduling class for asynchronous read commands. Ignored for write commands. */
+	default ReadWorkClass readWorkClass() {
+		return ReadWorkClass.INTERACTIVE;
+	}
 
 	sealed interface RocksDBAPICommandSingle<R> extends RocksDBAPICommand<R, R, CompletableFuture<R>> {
 
@@ -96,7 +106,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 			@Override
 			public boolean isReadOnly() {
-				return true;
+				return false;
 			}
 
 		}
@@ -688,6 +698,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			public boolean isReadOnly() {
 				return true;
 			}
+
+			@Override
+			public ReadWorkClass readWorkClass() {
+				return ReadWorkClass.COMPOSITE;
+			}
 		}
 		/**
 		 * Open an iterator
@@ -729,6 +744,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return true;
 			}
 
+			@Override
+			public ReadWorkClass readWorkClass() {
+				return ReadWorkClass.COMPOSITE;
+			}
+
 		}
 		/**
 		 * Close an iterator
@@ -749,7 +769,9 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 			@Override
 			public boolean isReadOnly() {
-				return true;
+				// Closing can wait for an in-flight native iterator call. Treat it as
+				// control work so that wait can never occupy a scarce read worker.
+				return false;
 			}
 
 		}
@@ -774,6 +796,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
+			}
+
+			@Override
+			public ReadWorkClass readWorkClass() {
+				return ReadWorkClass.COMPOSITE;
 			}
 
 		}
@@ -803,6 +830,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
+			}
+
+			@Override
+			public ReadWorkClass readWorkClass() {
+				return ReadWorkClass.COMPOSITE;
 			}
 
 		}
@@ -854,6 +886,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
+			}
+
+			@Override
+			public ReadWorkClass readWorkClass() {
+				return ReadWorkClass.COMPOSITE;
 			}
 
 		}
@@ -910,6 +947,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return true;
 			}
 
+			@Override
+			public ReadWorkClass readWorkClass() {
+				return ReadWorkClass.COMPOSITE;
+			}
+
 		}
 
 		/**
@@ -930,6 +972,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
+			}
+
+			@Override
+			public ReadWorkClass readWorkClass() {
+				return ReadWorkClass.COMPOSITE;
 			}
 		}
 
@@ -954,6 +1001,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			public boolean isReadOnly() {
 				return true;
 			}
+
+			@Override
+			public ReadWorkClass readWorkClass() {
+				return ReadWorkClass.COMPOSITE;
+			}
 		}
 	}
 	/**
@@ -974,7 +1026,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 		@Override
 		public boolean isReadOnly() {
-			return true;
+			return false;
 		}
 
 	}
@@ -996,7 +1048,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 		@Override
 		public boolean isReadOnly() {
-			return true;
+			return false;
 		}
 
 	}

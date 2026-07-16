@@ -64,16 +64,17 @@ import java.time.Instant;
 import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.StampedLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -100,6 +101,7 @@ import org.rocksdb.FlushOptions;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
+import org.rocksdb.Snapshot;
 import org.rocksdb.Slice;
 import org.rocksdb.SstFileReaderIterator;
 import org.rocksdb.SstFileReader;
@@ -111,6 +113,7 @@ import org.rocksdb.util.SizeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MarkerFactory;
+import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
@@ -122,6 +125,13 @@ import reactor.core.publisher.SynchronousSink;
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
 	private static final long ITERATOR_REFRESH_INTERVAL = 1_000_000;
+	private static final int RANGE_READ_CHUNK_SIZE = 1_024;
+	private static final int RANGE_READ_MAX_PHYSICAL_KEYS_PER_CHUNK = 4_096;
+	private static final long RANGE_READ_MAX_DECODED_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
+	private static final int EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL = 4_096;
+	private static final long EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
+	private static final int RAW_SCAN_MAX_ENTRIES_PER_CHUNK = 65_536;
+	private static final long RAW_SCAN_MAX_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final String SHUTDOWN_PENDING_OPS_TIMEOUT_MS_PROPERTY
 			= "it.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms";
@@ -141,6 +151,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final DBOptions dbOptions;
 	private final RWScheduler scheduler;
 	private final ScheduledExecutorService leakScheduler;
+	private final ScheduledFuture<?> expiredRangeCleanupTask;
 	private final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
 	private final ColumnFamilyHandle mergeOperatorsColumnDescriptorHandle;
 	private final ColumnFamilyHandle cdcMetaColumnDescriptorHandle;
@@ -151,6 +162,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final ConcurrentMap<String, ColumnFamilyHandle> unconfiguredColumns;
 	private final NonBlockingHashMapLong<Tx> txs;
 	private final NonBlockingHashMapLong<REntry<RocksIterator>> its;
+	private final Set<ActiveRangeResource> activeRangeResources = ConcurrentHashMap.newKeySet();
+	private final Set<CdcPollCursor> activeCdcPollCursors = ConcurrentHashMap.newKeySet();
 	private final SafeShutdown ops;
 	private final Object columnEditLock = new Object();
 	private final DatabaseConfig config;
@@ -190,6 +203,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final LongAdder fastGetNativeErrorFallbacks = new LongAdder();
 	private volatile long getRangeIteratorRefreshInterval = ITERATOR_REFRESH_INTERVAL;
 	private volatile @Nullable Consumer<Boolean> rangeReadOptionsObserver;
+	private volatile @Nullable Runnable rangeIteratorOpenObserver;
+	private volatile @Nullable Consumer<Integer> rangeReadChunkSizeObserver;
+	private volatile @Nullable Runnable rangeCountChunkObserver;
+	private volatile @Nullable Runnable existsMultiChunkObserver;
+	private volatile @Nullable Runnable existsMultiSnapshotObserver;
+	private volatile @Nullable Runnable cdcPollTailCapturedObserver;
+	private volatile @Nullable Runnable cdcWalIteratorOpenObserver;
 	private Path tempSSTsPath;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
@@ -345,6 +365,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		leakScheduler.scheduleWithFixedDelay(this::cleanupExpiredTransactionsNow, 1, 1, TimeUnit.MINUTES);
 
 		leakScheduler.scheduleWithFixedDelay(this::cleanupExpiredIteratorsNow, 1, 1, TimeUnit.MINUTES);
+		this.expiredRangeCleanupTask = leakScheduler.scheduleWithFixedDelay(
+				this::cleanupExpiredRangesNow, 1, 1, TimeUnit.MINUTES);
 
 		this.columnsConifg = loadedDb.definitiveColumnFamilyOptionsMap();
 		try {
@@ -770,6 +792,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			logger.error("Error closing metrics manager{}", forced ? " (forced)" : "", t);
 		}
 
+		// Logical range and CDC polls keep their native iterators between bounded
+		// scheduler slices. SafeShutdown has already excluded new/in-flight slices, so
+		// close those idle cursors before column handles or the database itself.
+		closeActiveCdcPollCursors();
+		closeActiveRangeResources();
+
 		// Close any remaining transactions to avoid hanging on DB close
 		if (!txs.isEmpty()) {
 			logger.warn("Closing {} remaining transactions", txs.size());
@@ -889,6 +917,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 		} catch (Throwable t) {
 			logger.error("Error deleting in-memory DB directory{}", forced ? " (forced)" : "", t);
+		}
+	}
+
+	private void closeActiveRangeResources() {
+		var ranges = new ArrayList<>(activeRangeResources);
+		if (!ranges.isEmpty()) {
+			logger.info("Closing {} active range cursors", ranges.size());
+		}
+		for (var range : ranges) {
+			try {
+				range.close();
+			} catch (Throwable error) {
+				logger.error("Error closing active range cursor", error);
+			}
+		}
+	}
+
+	private void closeActiveCdcPollCursors() {
+		var cursors = new ArrayList<>(activeCdcPollCursors);
+		if (!cursors.isEmpty()) {
+			logger.info("Closing {} active CDC poll cursors", cursors.size());
+		}
+		for (var cursor : cursors) {
+			try {
+				cursor.close();
+			} catch (Throwable error) {
+				logger.error("Error closing active CDC poll cursor", error);
+			}
 		}
 	}
 
@@ -1054,6 +1110,33 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	/** Release native iterator views held by stalled range subscribers after their logical deadline. */
+	@VisibleForTesting
+	public void cleanupExpiredRangesNow() {
+		if (!ops.isOpen()) {
+			return;
+		}
+		try {
+			ops.beginOp();
+		} catch (IllegalStateException closed) {
+			return;
+		}
+		try {
+			long nowMicros = TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
+			for (var range : activeRangeResources) {
+				try {
+					range.expireIfDeadlinePassed(nowMicros);
+				} catch (Throwable error) {
+					// ScheduledExecutorService suppresses every later execution when one
+					// invocation escapes. Keep cleaning the other cursors and future runs.
+					logger.warn("Failed to clean an expired range cursor", error);
+				}
+			}
+		} finally {
+			ops.endOp();
+		}
+	}
+
 	private ReadOptions newReadOptions(String label) {
 		var ro = new LeakSafeReadOptions(label);
 		ro.setAsyncIo(true);
@@ -1096,6 +1179,48 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setRangeReadOptionsObserverForTesting(@Nullable Consumer<Boolean> observer) {
 		this.rangeReadOptionsObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setRangeIteratorOpenObserverForTesting(@Nullable Runnable observer) {
+		this.rangeIteratorOpenObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setRangeReadChunkSizeObserverForTesting(@Nullable Consumer<Integer> observer) {
+		this.rangeReadChunkSizeObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setRangeCountChunkObserverForTesting(@Nullable Runnable observer) {
+		this.rangeCountChunkObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setExistsMultiChunkObserverForTesting(@Nullable Runnable observer) {
+		this.existsMultiChunkObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setExistsMultiSnapshotObserverForTesting(@Nullable Runnable observer) {
+		this.existsMultiSnapshotObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setCdcPollTailCapturedObserverForTesting(@Nullable Runnable observer) {
+		this.cdcPollTailCapturedObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setCdcWalIteratorOpenObserverForTesting(@Nullable Runnable observer) {
+		this.cdcWalIteratorOpenObserver = observer;
+	}
+
+	private void notifyRangeIteratorOpened() {
+		var observer = rangeIteratorOpenObserver;
+		if (observer != null) {
+			observer.run();
+		}
 	}
 
 	@Override
@@ -3300,23 +3425,59 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return List.of();
 			}
 
-			var calculatedKeys = new ArrayList<Buf>(keys.size());
 			for (var logicalKeys : keys) {
 				if (logicalKeys == null) {
 					throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "keys contains null");
 				}
-				calculatedKeys.add(col.calculateKey(logicalKeys.keys()));
 			}
 
-			try (var readOptions = newReadOptions("exists-multi-read-options")) {
-				readOptions.setDeadline(deadlineMicros);
-				readOptions.setFillCache(false);
-				if (tx == null && !col.hasBuckets()) {
-					return existsMultiStatusOnly(col, readOptions, calculatedKeys);
+			// Calculate the first bounded native page before deciding whether an explicit
+			// snapshot is necessary. A single native MultiGet already has one consistent
+			// view, so the common small-request path must not pay the snapshot lifecycle
+			// cost. Only genuinely split logical requests need a view pinned across calls.
+			var chunk = calculateExistsMultiChunk(col, keys, 0);
+			Snapshot snapshot = chunk.nextOffset() < keys.size() ? db.get().getSnapshot() : null;
+			try {
+				if (snapshot != null) {
+					var snapshotObserver = existsMultiSnapshotObserver;
+					if (snapshotObserver != null) {
+						snapshotObserver.run();
+					}
 				}
-				return existsMultiWithValues(tx, col, readOptions, keys, calculatedKeys);
-			} catch (org.rocksdb.RocksDBException exception) {
-				throw mapIteratorStatusException(exception);
+				try (var readOptions = newReadOptions("exists-multi-read-options")) {
+					readOptions.setDeadline(deadlineMicros);
+					readOptions.setFillCache(false);
+					if (snapshot != null) {
+						readOptions.setSnapshot(snapshot);
+					}
+					var result = new ArrayList<Boolean>(keys.size());
+					while (true) {
+						if (tx == null && !col.hasBuckets()) {
+							result.addAll(existsMultiStatusOnly(col, readOptions, chunk.calculatedKeys()));
+						} else {
+							result.addAll(existsMultiWithValues(tx,
+									col,
+									readOptions,
+									chunk.logicalKeys(),
+									chunk.calculatedKeys()));
+						}
+						var chunkObserver = existsMultiChunkObserver;
+						if (chunkObserver != null) {
+							chunkObserver.run();
+						}
+						if (chunk.nextOffset() >= keys.size()) {
+							break;
+						}
+						chunk = calculateExistsMultiChunk(col, keys, chunk.nextOffset());
+					}
+					return result;
+				} catch (org.rocksdb.RocksDBException exception) {
+					throw mapIteratorStatusException(exception);
+				}
+			} finally {
+				if (snapshot != null) {
+					db.get().releaseSnapshot(snapshot);
+				}
 			}
 		} catch (RocksDBException exception) {
 			throw exception;
@@ -3326,6 +3487,27 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			ops.endOp();
 			existsMultiTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
 		}
+	}
+
+	private record ExistsMultiChunk(List<Keys> logicalKeys, List<Buf> calculatedKeys, int nextOffset) {
+	}
+
+	private ExistsMultiChunk calculateExistsMultiChunk(ColumnInstance col, List<Keys> keys, int offset) {
+		int chunkCapacity = Math.min(EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL, keys.size() - offset);
+		var logicalChunk = new ArrayList<Keys>(chunkCapacity);
+		var calculatedChunk = new ArrayList<Buf>(chunkCapacity);
+		long calculatedKeyBytes = 0L;
+		while (offset < keys.size() && calculatedChunk.size() < EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL) {
+			var logicalKey = keys.get(offset++);
+			var calculatedKey = col.calculateKey(logicalKey.keys());
+			logicalChunk.add(logicalKey);
+			calculatedChunk.add(calculatedKey);
+			calculatedKeyBytes = saturatingAdd(calculatedKeyBytes, calculatedKey.size());
+			if (calculatedKeyBytes >= EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL) {
+				break;
+			}
+		}
+		return new ExistsMultiChunk(logicalChunk, calculatedChunk, offset);
 	}
 
 	private List<Boolean> existsMultiStatusOnly(ColumnInstance col,
@@ -3729,11 +3911,40 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	/**
+	 * Advance an explicit iterator without materializing values and report the exact
+	 * number of logical entries consumed. Async adapters use the count to stop
+	 * scheduling slices immediately when the iterator is exhausted.
+	 */
+	public long advanceIteratorInternal(long iterationId, long maxCount) {
+		var start = System.nanoTime();
+		ops.beginOp();
+		try {
+			if (maxCount < 0) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Iterator advance count must be non-negative");
+			}
+			return withIterator(iterationId, state -> {
+				long advanced = 0L;
+				while (advanced < maxCount && advanceIterator(state, false).present()) {
+					advanced++;
+				}
+				return advanced;
+			});
+		} finally {
+			ops.endOp();
+			subsequentTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
 	private <T> T withIterator(long iteratorId, Function<IteratorState, T> action) {
 		var entry = its.get(iteratorId);
 		if (entry == null || !(entry.objs() instanceof IteratorState state)) {
 			throw iteratorNotFound(iteratorId);
 		}
+		// The embedded API historically serializes operations on the same iterator.
+		// Remote adapters may reject overlapping requests before queueing them, but the
+		// native ownership boundary itself must remain race-safe and blocking.
 		synchronized (state) {
 			if (state.closed || its.get(iteratorId) != entry) {
 				throw iteratorNotFound(iteratorId);
@@ -3912,6 +4123,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						it = db.get().newIterator(col.cfh(), ro);
 					}
 					try (it) {
+						notifyRangeIteratorOpened();
 						return (T) switch (requestType) {
 							case RequestEntriesCount<?> _ -> {
 								long count = 0;
@@ -4009,7 +4221,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		long start = System.nanoTime();
 		long deadlineMicros = readDeadlineMicros(timeoutMs);
 		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
-		long iteratorRefreshInterval = getRangeIteratorRefreshInterval;
 		actionLogger.logAction("GetRange (begin)",
 				start,
 				columnId,
@@ -4021,236 +4232,473 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				requestType
 		); // todo: log if reversed or not
 
-		final class IteratorResources {
-
-			private final ColumnInstance col;
-			private ReadOptions ro;
-			private final AbstractSlice<?> startKeySlice;
-			private final AbstractSlice<?> endKeySlice;
-			private RocksIterator it;
-			private final StampedLock resourceLock = new StampedLock();
-			private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
-			private long itemsRead = 0;
-			private final boolean canRefresh;
-			private boolean closed = false;
-
-			IteratorResources(ColumnInstance col,
-					ReadOptions ro,
-					AbstractSlice<?> startKeySlice,
-					AbstractSlice<?> endKeySlice,
-					RocksIterator it,
-					boolean canRefresh) {
-				this.col = col;
-				this.ro = ro;
-				this.startKeySlice = startKeySlice;
-				this.endKeySlice = endKeySlice;
-				this.it = it;
-				this.canRefresh = canRefresh;
-			}
-
-			public void refresh(boolean reverse) throws RocksDBException {
-				if (!canRefresh) return;
-				long stamp = resourceLock.writeLock();
-				try {
-					if (closed) return;
-					if (!it.isValid()) return;
-
-					byte[] currentKey = it.key(); // Copy key
-
-					it.close();
-					ro.close();
-
-					var newRo = newRangeReadOptions(deadlineMicros, fillCache, startKeySlice, endKeySlice);
+		return Flux.<List<T>, RangeCursor>generate(
+				() -> openRangeCursor(transactionId,
+						columnId,
+						startKeysInclusive,
+						endKeysExclusive,
+						reverse,
+						deadlineMicros,
+						fillCache,
+						true,
+						totalTime),
+				(cursor, sink) -> {
+					@SuppressWarnings("unchecked")
+					var chunk = (List<T>) (List<?>) cursor.readChunk(totalTime);
+					var chunkObserver = rangeReadChunkSizeObserver;
+					if (chunkObserver != null) {
+						chunkObserver.accept(chunk.size());
+					}
+					if (chunk.isEmpty() && cursor.isExhausted()) {
+						sink.complete();
+					} else {
+						sink.next(chunk);
+					}
+					return cursor;
+				},
+				cursor -> {
+					var closeStart = System.nanoTime();
 					try {
-						RocksIterator newIt = db.get().newIterator(col.cfh(), newRo);
-						try {
-							if (reverse) {
-								newIt.seekForPrev(currentKey);
-							} else {
-								newIt.seek(currentKey);
-							}
-
-							this.ro = newRo;
-							this.it = newIt;
-						} catch (Throwable t) {
-							newIt.close();
-							throw t;
-						}
-					} catch (Throwable t) {
-						newRo.close();
-						throw t;
-					}
-				} finally {
-					resourceLock.unlockWrite(stamp);
-				}
-			}
-
-			public void close() {
-				var wl = resourceLock.writeLock();
-				try {
-					if (closed) return;
-					closed = true;
-					it.close();
-					ro.close();
-					if (endKeySlice != null) {
-						endKeySlice.close();
-					}
-					if (startKeySlice != null) {
-						startKeySlice.close();
-					}
-				} finally {
-					resourceLock.unlockWrite(wl);
-				}
-			}
-
-		}
-
-		return Flux.<T, IteratorResources>generate(() -> {
-					ops.beginOp();
-					try {
-						var initializationStartTime = System.nanoTime();
-						var col = getColumn(columnId);
-
-						IteratorResources res;
-						try {
-							Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(
-									startKeysInclusive.keys()) : null;
-							Buf calculatedEndKey =
-									endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(endKeysExclusive.keys())
-											: null;
-							var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
-							try {
-								var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null;
-								try {
-									var ro = newRangeReadOptions(deadlineMicros, fillCache, startKeySlice, endKeySlice);
-									try {
-										RocksIterator it;
-										if (transactionId != 0L) {
-											//noinspection resource
-											it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
-										} else {
-											it = db.get().newIterator(col.cfh(), ro);
-										}
-										try {
-											res = new IteratorResources(col, ro, startKeySlice, endKeySlice, it, transactionId == 0);
-										} catch (Throwable ex) {
-											it.close();
-											throw ex;
-										}
-									} catch (Throwable ex) {
-										ro.close();
-										throw ex;
-									}
-								} catch (Throwable ex) {
-									if (endKeySlice != null) {
-										endKeySlice.close();
-									}
-									throw ex;
-								}
-							} catch (Throwable ex) {
-								if (startKeySlice != null) {
-									startKeySlice.close();
-								}
-								throw ex;
-							}
-						} finally {
-							totalTime.add(System.nanoTime() - initializationStartTime);
-						}
-
-						var seekStartTime = System.nanoTime();
-						try {
-							if (!reverse) {
-								res.it.seekToFirst();
-							} else {
-								res.it.seekToLast();
-							}
-							return res;
-						} catch (Throwable ex) {
-							res.close();
-							throw ex;
-						} finally {
-							totalTime.add(System.nanoTime() - seekStartTime);
-						}
-					} catch (Throwable t) {
-						ops.endOp();
-						throw t;
-					}
-				}, (res, sink) -> {
-					T nextResult = null;
-					var nextTime = System.nanoTime();
-					var readLock = res.resourceLock.readLock();
-					try {
-						while (nextResult == null) {
-							if (res.bucketIterator != null) {
-								if (!reverse ? res.bucketIterator.hasNext() : res.bucketIterator.hasPrevious()) {
-									var entry = !reverse ? res.bucketIterator.next() : res.bucketIterator.previous();
-									var calculatedKey = toBuf(res.it.key());
-									var kv = decodeBucketEntry(res.col, calculatedKey, entry);
-									//noinspection unchecked
-									nextResult = (T) Objects.requireNonNull(kv);
-								} else {
-									res.bucketIterator = null;
-									if (!reverse) {
-										res.it.next();
-									} else {
-										res.it.prev();
-									}
-								}
-							} else {
-								if (!res.it.isValid()) {
-									checkIteratorStatusIfInvalid(res.it);
-									nextResult = null;
-									break;
-								}
-								var calculatedValue = (res.col.schema().hasValue() || res.col.hasBuckets()) ? toBuf(res.it.value()) : emptyBuf();
-								if (res.col.hasBuckets()) {
-									var bucket = new Bucket(res.col, calculatedValue);
-									var elements = bucket.getElements();
-									res.bucketIterator = elements.listIterator(!reverse ? 0 : elements.size());
-								} else {
-									var calculatedKey = toBuf(res.it.key());
-									var kv = decodeKV(res.col, calculatedKey, calculatedValue);
-									if (!reverse) {
-										res.it.next();
-									} else {
-										res.it.prev();
-									}
-									//noinspection unchecked
-									nextResult = (T) Objects.requireNonNull(kv);
-								}
-							}
-						}
+						cursor.close();
 					} finally {
-						res.resourceLock.unlockRead(readLock);
-						totalTime.add(System.nanoTime() - nextTime);
+						totalTime.add(System.nanoTime() - closeStart);
+						getRangeTimer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
 					}
+				})
+				.subscribeOn(scheduler.read())
+				// Flatten before crossing the delivery boundary. With prefetch one, the
+				// current decoded page must be exhausted before generate is asked for the
+				// next native slice; publishOn then buffers at most one individual row rather
+				// than a second decoded page. Slow consumers still never park a RocksDB worker.
+				.concatMapIterable(Function.identity(), 1)
+				.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
+	}
 
-					if (nextResult != null) {
-						sink.next(nextResult);
-						res.itemsRead++;
-						if (res.canRefresh && res.itemsRead >= iteratorRefreshInterval && res.bucketIterator == null) {
-							try {
-								res.refresh(reverse);
-								res.itemsRead = 0;
-							} catch (RocksDBException e) {
-								sink.error(e);
-							}
-						}
+	/** Count logical entries in bounded physical slices without materializing one signal per entry. */
+	public Mono<Long> countRangeAsyncInternal(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			long timeoutMs) {
+		LongAdder totalTime = new LongAdder();
+		long start = System.nanoTime();
+		long deadlineMicros = readDeadlineMicros(timeoutMs);
+		actionLogger.logAction("ReduceRange (begin)",
+				start,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				transactionId,
+				null,
+				timeoutMs,
+				RequestType.entriesCount()
+		); // todo: log if reversed or not
+
+		return Flux.<Long, RangeCursor>generate(
+				() -> openRangeCursor(transactionId,
+						columnId,
+						startKeysInclusive,
+						endKeysExclusive,
+						reverse,
+						deadlineMicros,
+						false,
+						false,
+						totalTime),
+				(cursor, sink) -> {
+					var chunk = cursor.countChunk(totalTime);
+					var chunkObserver = rangeCountChunkObserver;
+					if (chunkObserver != null) {
+						chunkObserver.run();
+					}
+					if (chunk.count() != 0L || !chunk.exhausted()) {
+						sink.next(chunk.count());
 					} else {
 						sink.complete();
 					}
-					return res;
-				}, res -> {
-					var closeTime = System.nanoTime();
+					return cursor;
+				},
+				cursor -> {
+					var closeStart = System.nanoTime();
 					try {
-						res.close();
+						cursor.close();
 					} finally {
-						totalTime.add(System.nanoTime() - closeTime);
-						ops.endOp();
-						getRangeTimer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
+						totalTime.add(System.nanoTime() - closeStart);
+						reduceRangeTimer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
+					}
+				})
+				.subscribeOn(scheduler.read())
+				.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
+				.reduce(0L, Long::sum);
+	}
+
+	private RangeCursor openRangeCursor(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			long deadlineMicros,
+			boolean fillCache,
+			boolean allowIteratorRefresh,
+			LongAdder totalTime) {
+		ops.beginOp();
+		var initializationStart = System.nanoTime();
+		try {
+			var col = getColumn(columnId);
+			Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0
+					? col.calculateKey(startKeysInclusive.keys())
+					: null;
+			Buf calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0
+					? col.calculateKey(endKeysExclusive.keys())
+					: null;
+			var cursor = new RangeCursor(transactionId,
+					col,
+					calculatedStartKey,
+					calculatedEndKey,
+					reverse,
+					deadlineMicros,
+					fillCache,
+					allowIteratorRefresh,
+					getRangeIteratorRefreshInterval);
+			try {
+				activeRangeResources.add(cursor);
+				return cursor;
+			} catch (Throwable error) {
+				cursor.close();
+				throw error;
+			}
+		} finally {
+			totalTime.add(System.nanoTime() - initializationStart);
+			ops.endOp();
+		}
+	}
+
+	private interface ActiveRangeResource {
+
+		void close();
+
+		void expireIfDeadlinePassed(long nowMicros);
+	}
+
+	private record RangeCountChunk(long count, boolean exhausted) {
+	}
+
+	private final class RangeCursor implements ActiveRangeResource {
+
+		private final long transactionId;
+		private final ColumnInstance col;
+		private final boolean reverse;
+		private final long deadlineMicros;
+		private final boolean fillCache;
+		private final boolean allowIteratorRefresh;
+		private final long refreshInterval;
+		private final AbstractSlice<?> startKeySlice;
+		private final AbstractSlice<?> endKeySlice;
+		private ReadOptions readOptions;
+		private RocksIterator iterator;
+		private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
+		private long logicalItemsSinceRefresh;
+		private boolean exhausted;
+		private boolean expired;
+		private boolean closed;
+
+		private RangeCursor(long transactionId,
+				ColumnInstance col,
+				@Nullable Buf startKey,
+				@Nullable Buf endKey,
+				boolean reverse,
+				long deadlineMicros,
+				boolean fillCache,
+				boolean allowIteratorRefresh,
+				long refreshInterval) {
+			this.transactionId = transactionId;
+			this.col = col;
+			this.reverse = reverse;
+			this.deadlineMicros = deadlineMicros;
+			this.fillCache = fillCache;
+			this.allowIteratorRefresh = allowIteratorRefresh;
+			this.refreshInterval = refreshInterval;
+
+			AbstractSlice<?> createdStartKeySlice = null;
+			AbstractSlice<?> createdEndKeySlice = null;
+			ReadOptions createdReadOptions = null;
+			RocksIterator createdIterator = null;
+			try {
+				createdStartKeySlice = startKey != null ? toSlice(startKey) : null;
+				createdEndKeySlice = endKey != null ? toSlice(endKey) : null;
+				createdReadOptions = createReadOptions(createdStartKeySlice,
+						createdEndKeySlice);
+				createdIterator = createIterator(createdReadOptions);
+				if (reverse) {
+					createdIterator.seekToLast();
+				} else {
+					createdIterator.seekToFirst();
+				}
+			} catch (Throwable error) {
+				if (createdIterator != null) {
+					createdIterator.close();
+				}
+				if (createdReadOptions != null) {
+					createdReadOptions.close();
+				}
+				if (createdEndKeySlice != null) {
+					createdEndKeySlice.close();
+				}
+				if (createdStartKeySlice != null) {
+					createdStartKeySlice.close();
+				}
+				throw error;
+			}
+			this.startKeySlice = createdStartKeySlice;
+			this.endKeySlice = createdEndKeySlice;
+			this.readOptions = createdReadOptions;
+			this.iterator = createdIterator;
+		}
+
+		private ReadOptions createReadOptions(@Nullable AbstractSlice<?> lowerBound,
+				@Nullable AbstractSlice<?> upperBound) {
+			return newRangeReadOptions(deadlineMicros, fillCache, lowerBound, upperBound);
+		}
+
+		private RocksIterator createIterator(ReadOptions options) {
+			var created = transactionId != 0L
+					? getTransaction(transactionId, false).val().getIterator(options, col.cfh())
+					: db.get().newIterator(col.cfh(), options);
+			try {
+				notifyRangeIteratorOpened();
+				return created;
+			} catch (Throwable error) {
+				created.close();
+				throw error;
+			}
+		}
+
+		private List<KV> readChunk(LongAdder totalTime) {
+			ops.beginOp();
+			var sliceStart = System.nanoTime();
+			try {
+				synchronized (this) {
+					if (expired) {
+						throw rangeDeadlineExceeded();
+					}
+					if (closed || exhausted) {
+						return List.of();
+					}
+					var results = new ArrayList<KV>(RANGE_READ_CHUNK_SIZE);
+					int physicalKeysExamined = 0;
+					long decodedBytes = 0L;
+					while (results.size() < RANGE_READ_CHUNK_SIZE
+							&& (results.isEmpty() || decodedBytes < RANGE_READ_MAX_DECODED_BYTES_PER_CHUNK)
+							&& !exhausted) {
+						if (bucketIterator != null) {
+							if (reverse ? bucketIterator.hasPrevious() : bucketIterator.hasNext()) {
+								var entry = reverse ? bucketIterator.previous() : bucketIterator.next();
+								var kv = decodeBucketEntry(col, toBuf(iterator.key()), entry);
+								var decoded = Objects.requireNonNull(kv);
+								results.add(decoded);
+								decodedBytes = saturatingAdd(decodedBytes, decodedKVBytes(decoded));
+								boolean bucketHasMore = reverse
+										? bucketIterator.hasPrevious()
+										: bucketIterator.hasNext();
+								if (!bucketHasMore) {
+									bucketIterator = null;
+									advanceIterator();
+								}
+								recordLogicalItemsAndMaybeRefresh(1L);
+								continue;
+							}
+							bucketIterator = null;
+							advanceIterator();
+							recordLogicalItemsAndMaybeRefresh(0L);
+							continue;
+						}
+
+						if (!iterator.isValid()) {
+							checkIteratorStatusIfInvalid(iterator);
+							exhausted = true;
+							break;
+						}
+						if (physicalKeysExamined >= RANGE_READ_MAX_PHYSICAL_KEYS_PER_CHUNK) {
+							break;
+						}
+						physicalKeysExamined++;
+
+						if (col.hasBuckets()) {
+							var elements = new Bucket(col, toBuf(iterator.value())).getElements();
+							bucketIterator = elements.listIterator(reverse ? elements.size() : 0);
+							if (elements.isEmpty()) {
+								bucketIterator = null;
+								advanceIterator();
+								recordLogicalItemsAndMaybeRefresh(0L);
+							}
+						} else {
+							var calculatedKey = toBuf(iterator.key());
+							var calculatedValue = col.schema().hasValue() ? toBuf(iterator.value()) : emptyBuf();
+							var decoded = Objects.requireNonNull(decodeKV(col, calculatedKey, calculatedValue));
+							results.add(decoded);
+							decodedBytes = saturatingAdd(decodedBytes, decodedKVBytes(decoded));
+							advanceIterator();
+							recordLogicalItemsAndMaybeRefresh(1L);
+						}
+					}
+					return results;
+				}
+			} finally {
+				totalTime.add(System.nanoTime() - sliceStart);
+				ops.endOp();
+			}
+		}
+
+		private RangeCountChunk countChunk(LongAdder totalTime) {
+			ops.beginOp();
+			var sliceStart = System.nanoTime();
+			try {
+				synchronized (this) {
+					if (expired) {
+						throw rangeDeadlineExceeded();
+					}
+					if (closed || exhausted) {
+						return new RangeCountChunk(0L, true);
+					}
+					long count = 0L;
+					int physicalKeysExamined = 0;
+					while (physicalKeysExamined < RANGE_READ_MAX_PHYSICAL_KEYS_PER_CHUNK) {
+						if (!iterator.isValid()) {
+							checkIteratorStatusIfInvalid(iterator);
+							exhausted = true;
+							break;
+						}
+						long logicalItems = col.hasBuckets()
+								? Bucket.readElementCount(toBuf(iterator.value()))
+								: 1L;
+						count += logicalItems;
+						physicalKeysExamined++;
+						advanceIterator();
+						recordLogicalItemsAndMaybeRefresh(logicalItems);
+					}
+					return new RangeCountChunk(count, exhausted);
+				}
+			} finally {
+				totalTime.add(System.nanoTime() - sliceStart);
+				ops.endOp();
+			}
+		}
+
+		private void advanceIterator() {
+			if (reverse) {
+				iterator.prev();
+			} else {
+				iterator.next();
+			}
+		}
+
+		private void recordLogicalItemsAndMaybeRefresh(long items) {
+			if (items > Long.MAX_VALUE - logicalItemsSinceRefresh) {
+				logicalItemsSinceRefresh = Long.MAX_VALUE;
+			} else {
+				logicalItemsSinceRefresh += items;
+			}
+			if (allowIteratorRefresh
+					&& transactionId == 0L
+					&& bucketIterator == null
+					&& logicalItemsSinceRefresh >= refreshInterval
+					&& iterator.isValid()) {
+				refreshIterator();
+				logicalItemsSinceRefresh = 0L;
+			}
+		}
+
+		private void refreshIterator() {
+			var iteratorKey = iterator.key();
+			var currentKey = Arrays.copyOf(iteratorKey, iteratorKey.length);
+			iterator.close();
+			readOptions.close();
+			iterator = null;
+			readOptions = null;
+
+			ReadOptions replacementOptions = null;
+			RocksIterator replacementIterator = null;
+			try {
+				replacementOptions = createReadOptions(startKeySlice, endKeySlice);
+				replacementIterator = createIterator(replacementOptions);
+				if (reverse) {
+					replacementIterator.seekForPrev(currentKey);
+				} else {
+					replacementIterator.seek(currentKey);
+				}
+				readOptions = replacementOptions;
+				iterator = replacementIterator;
+			} catch (Throwable error) {
+				if (replacementIterator != null) {
+					replacementIterator.close();
+				}
+				if (replacementOptions != null) {
+					replacementOptions.close();
+				}
+				throw error;
+			}
+		}
+
+		private synchronized boolean isExhausted() {
+			if (expired) {
+				throw rangeDeadlineExceeded();
+			}
+			return exhausted || closed;
+		}
+
+		@Override
+		public void expireIfDeadlinePassed(long nowMicros) {
+			synchronized (this) {
+				if (closed || deadlineMicros == Long.MAX_VALUE || nowMicros < deadlineMicros) {
+					return;
+				}
+				expired = true;
+			}
+			close();
+		}
+
+		private RocksDBException rangeDeadlineExceeded() {
+			return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded");
+		}
+
+		@Override
+		public void close() {
+			try {
+				synchronized (this) {
+					if (closed) {
+						return;
+					}
+					closed = true;
+					exhausted = true;
+					bucketIterator = null;
+					try {
+						if (iterator != null) {
+							iterator.close();
+							iterator = null;
+						}
+					} finally {
+						try {
+							if (readOptions != null) {
+								readOptions.close();
+								readOptions = null;
+							}
+						} finally {
+							try {
+								if (endKeySlice != null) {
+									endKeySlice.close();
+								}
+							} finally {
+								if (startKeySlice != null) {
+									startKeySlice.close();
+								}
+							}
+						}
 					}
 				}
-		).subscribeOn(scheduler.read());
+			} finally {
+				activeRangeResources.remove(this);
+			}
+		}
 	}
 
 	private static void ensureCapacity(Buf buf, int offset, int len) {
@@ -4370,7 +4818,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 
 					it.next();
-					if (batchSize >= 65536 || currentBatchBytes >= 2 * SizeUnit.MB) {
+					if (batchSize >= RAW_SCAN_MAX_ENTRIES_PER_CHUNK
+							|| currentBatchBytes >= RAW_SCAN_MAX_BYTES_PER_CHUNK) {
 						break;
 					}
 				}
@@ -4417,16 +4866,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			List<LiveFileMetaData> files = getDb().get().getLiveFilesMetaData();
 
-			Function<LiveFileMetaData, Publisher<SerializedKVBatch>> mapper = f -> {
-				return Flux.<SerializedKVBatch, ScanState>generate(
+			Function<LiveFileMetaData, Publisher<SerializedKVBatch>> mapper = f ->
+				Flux.<SerializedKVBatch, ScanState>generate(
 						() -> new ScanState(col, cfName, f),
 						(state, sink) -> {
 							state.generateNext(sink);
 							return state;
 						},
-						ScanState::close
-				);
-			};
+						ScanState::close)
+						.subscribeOn(scheduler.read())
+						.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
 
 			var ssts = Flux.fromIterable(files)
 					.filter(f -> new String(f.columnFamilyName(), StandardCharsets.UTF_8).equals(cfName))
@@ -4435,11 +4884,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			Flux<SerializedKVBatch> exec;
 			if (shardCount == 1) {
-				exec = ssts
-						.parallel(4, 1)
-						.runOn(getScheduler().read(), 1)
-						.flatMap(mapper, false, 8, 1)
-						.sequential();
+				exec = ssts.flatMap(mapper, 4, 1);
 			} else {
 				exec = ssts
 						.filter(m -> Math.floorMod(m.fileName().hashCode(), shardCount)
@@ -4692,6 +5137,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@VisibleForTesting
+	public int getActiveRangeCursorCount() {
+		return activeRangeResources.size();
+	}
+
+	@VisibleForTesting
+	public boolean isExpiredRangeCleanupScheduledForTesting() {
+		return !expiredRangeCleanupTask.isCancelled() && !expiredRangeCleanupTask.isDone();
+	}
+
+	@VisibleForTesting
 	public long getFastGetNativeCallsCount() {
 		return fastGetReader != null ? fastGetReader.getCallsCount() : 0;
 	}
@@ -4750,6 +5205,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return new KV(new Keys(keys), bucketEntry.getValue());
 	}
 
+	private static long decodedKVBytes(KV kv) {
+		long bytes = kv.value() != null ? kv.value().size() : 0L;
+		for (var key : kv.keys().keys()) {
+			bytes = saturatingAdd(bytes, key.size());
+		}
+		return bytes;
+	}
+
+	private static long saturatingAdd(long left, long right) {
+		return right >= Long.MAX_VALUE - left ? Long.MAX_VALUE : left + right;
+	}
+
 	@Override
 	public RWScheduler getScheduler() {
 		return scheduler;
@@ -4788,6 +5255,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private record CdcSubscriptionMeta(long lastCommittedSeq, @Nullable long[] columnFilter, boolean emitLatestValues) {}
+	private record CdcPollWindow(long startSeq,
+			long maxWalSequenceInclusive,
+			CdcSubscriptionMeta subscription) {}
+	private record CdcPollPage(CdcBatch batch, long emittedEvents, long emittedBytes) {}
+	private record CdcPollCursorStart(CdcPollCursor cursor, CdcPollPage firstPage) {}
+	private record CdcStreamPage(long startSeq,
+			long remainingEvents,
+			long remainingBytes,
+			boolean allowOversizedFirstEvent,
+			CdcPollPage page) {}
 
 	private byte[] cdcKeyOf(String id) {
 		return ("sub:" + id).getBytes(StandardCharsets.UTF_8);
@@ -5013,6 +5490,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private static final long CDC_HARD_MAX_EVENTS = 10_000;
+	private static final long CDC_MAX_SCANNED_MUTATIONS_PER_POLL = 4_096;
 	private static final long CDC_MAX_BYTES_PER_POLL = 16 * 1024 * 1024; // 16MB
 	private static final String CDC_TAIL_REFRESH_STATUS = "Create a new iterator to fetch the new tail.";
 	private static final String CDC_GAP_STATUS = "Gap in sequence numbers";
@@ -5020,6 +5498,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			"Gap in sequence number. Could not seek to required sequence number";
 	private static final String CDC_START_SEQUENCE_MISSING_STATUS =
 			"Start sequence was not found, skipping to the next available";
+
+	private long captureCdcPollTail() {
+		long tail = db.get().getLatestSequenceNumber();
+		var observer = cdcPollTailCapturedObserver;
+		if (observer != null) {
+			observer.run();
+		}
+		return tail;
+	}
 
 	@VisibleForTesting
 	protected void iterateCdcWriteBatch(WriteBatch writeBatch, WriteBatch.Handler handler)
@@ -5084,6 +5571,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		long getAccumulatedBytes() {
 			return accumulatedBytes;
+		}
+
+		int getSeenOps() {
+			return seenOps;
 		}
 
 		EventCollector(List<CDCEvent> out,
@@ -5172,6 +5663,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 		}
 
+		private void trackUnemittedMutation() {
+			seenOps++;
+			if (limitReachedAtOpIndex == -1 && produced >= maxToProduce) {
+				limitReachedAtOpIndex = seenOps - 1;
+			}
+		}
+
 
 		@Override
 		public void put(int cfId, byte[] key, byte[] value) {
@@ -5201,33 +5699,33 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		// DeleteRange must be counted as it consumes a sequence number
 		@Override
 		public void deleteRange(int cfId, byte[] beginKey, byte[] endKey) {
-			seenOps++;
+			trackUnemittedMutation();
 		}
 
 		// Default CF methods - skip data but MUST count ops
 		@Override
 		public void put(byte[] key, byte[] value) {
-			seenOps++;
+			trackUnemittedMutation();
 		}
 
 		@Override
 		public void merge(byte[] key, byte[] value) {
-			seenOps++;
+			trackUnemittedMutation();
 		}
 
 		@Override
 		public void delete(byte[] key) {
-			seenOps++;
+			trackUnemittedMutation();
 		}
 
 		@Override
 		public void singleDelete(byte[] key) {
-			seenOps++;
+			trackUnemittedMutation();
 		}
 
 		@Override
 		public void deleteRange(byte[] beginKey, byte[] endKey) {
-			seenOps++;
+			trackUnemittedMutation();
 		}
 
 		// WAL metadata and transaction markers are not included in WriteBatch.count(), so
@@ -5254,221 +5752,340 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		public void markCommitWithTimestamp(byte[] xid, byte[] ts) {}
 	}
 
-	private CdcBatch cdcPollOnce(String id, long fromSeq, long maxEvents) {
+	private CdcPollPage cdcPollPage(String id,
+			long fromSeq,
+			long maxEvents,
+			long maxBytes,
+			boolean allowOversizedFirstEvent,
+			long maxScannedMutations,
+			long maxWalSequenceInclusive) {
 		try {
 			var meta = loadCdcMeta(id);
 			if (meta == null) {
 				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "CDC subscription not found: " + id);
 			}
-			long effectiveMax = maxEvents > 0 ? maxEvents : CDC_DEFAULT_MAX_EVENTS;
-			if (effectiveMax > CDC_HARD_MAX_EVENTS) {
-				effectiveMax = CDC_HARD_MAX_EVENTS;
+			return cdcPollPage(meta,
+					fromSeq,
+					maxEvents,
+					maxBytes,
+					allowOversizedFirstEvent,
+					maxScannedMutations,
+					maxWalSequenceInclusive);
+		} catch (org.rocksdb.RocksDBException e) {
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+		}
+	}
+
+	private CdcPollPage cdcPollPage(CdcSubscriptionMeta subscription,
+			long fromSeq,
+			long maxEvents,
+			long maxBytes,
+			boolean allowOversizedFirstEvent,
+			long maxScannedMutations,
+			long maxWalSequenceInclusive) {
+		try (var cursor = openCdcPollCursor(subscription, fromSeq, maxWalSequenceInclusive)) {
+			return cursor.readPage(maxEvents,
+					maxBytes,
+					allowOversizedFirstEvent,
+					maxScannedMutations);
+		} catch (org.rocksdb.RocksDBException e) {
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+		}
+	}
+
+	private List<CDCEvent> resolveLatestCdcValues(CdcSubscriptionMeta meta, List<CDCEvent> result) {
+		if (!meta.emitLatestValues || result.isEmpty()) {
+			return result;
+		}
+
+		var transformed = new ArrayList<CDCEvent>(result.size());
+		var keysToResolve = new ArrayList<byte[]>();
+		var cfHandles = new ArrayList<ColumnFamilyHandle>();
+		var indicesToResolve = new IntArrayList();
+
+		for (int i = 0; i < result.size(); i++) {
+			var event = result.get(i);
+			var column = columns.get(event.columnId());
+			if (column != null) {
+				// Resolve every operation to the latest value to ensure monotonicity and
+				// avoid "time travel" corruption.
+				keysToResolve.add(event.key().asArray());
+				cfHandles.add(column.cfh());
+				indicesToResolve.add(i);
 			}
-			long startSeq = fromSeq != 0 ? fromSeq : composeCdcSeq(findEarliestAvailableWalSeq(), 0);
-			long walStart = extractWalSeq(startSeq);
-			int opStart = extractOpIndex(startSeq);
+		}
 
-			// Start iterator from the batch containing walStart
-			long iteratorStartWal = walStart;
+		if (keysToResolve.isEmpty()) {
+			transformed.addAll(result);
+			return transformed;
+		}
 
-			List<CDCEvent> result = new ArrayList<>((int) Math.min(1024, effectiveMax));
-			long nextSeq = startSeq;
-			long accumulatedBytes = 0;
+		final List<byte[]> resolvedValues;
+		try {
+			resolvedValues = db.get().multiGetAsList(cfHandles, keysToResolve);
+		} catch (org.rocksdb.RocksDBException error) {
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, error);
+		}
 
-			// Make manually buffered WAL records visible to getUpdatesSince without turning
-			// every CDC poll into a disk sync.
-			db.get().flushWal(false);
-
-			// Check latest sequence to avoid "Requested sequence not yet written" exception in common case
-			long latestSeq = db.get().getLatestSequenceNumber();
-			if (walStart > latestSeq) {
-				return new CdcBatch(java.util.Collections.emptyList(), fromSeq);
-			}
-
-			// Optimize: create filter set once
-			it.unimi.dsi.fastutil.longs.LongSet filterSet = meta.columnFilter == null ? null : new it.unimi.dsi.fastutil.longs.LongOpenHashSet(meta.columnFilter);
-
-			TransactionLogIterator it;
-			try {
-				it = db.get().getUpdatesSince(iteratorStartWal);
-			} catch (org.rocksdb.RocksDBException e) {
-				if (e.getMessage() != null && e.getMessage().contains("Requested sequence not yet written")) {
-					return new CdcBatch(java.util.Collections.emptyList(), fromSeq);
+		int resolutionIndex = 0;
+		for (int i = 0; i < result.size(); i++) {
+			var event = result.get(i);
+			var column = columns.get(event.columnId());
+			Buf finalKey = event.key();
+			if (resolutionIndex < indicesToResolve.size() && indicesToResolve.getInt(resolutionIndex) == i) {
+				byte[] valueBytes = resolvedValues.get(resolutionIndex++);
+				if (valueBytes != null) {
+					if (column != null && column.hasBuckets()) {
+						var elements = new Bucket(column, Buf.wrap(valueBytes)).getElements();
+						int fixedCount = column.schema().fixedLengthKeysCount();
+						int fixedBytes = 0;
+						for (int k = 0; k < fixedCount; k++) {
+							fixedBytes += column.schema().key(k);
+						}
+						Buf fixedPart = finalKey.subList(0, fixedBytes);
+						for (var element : elements) {
+							Buf[] variableKeys = element.getKey();
+							long totalSize = fixedBytes;
+							for (Buf variableKey : variableKeys) {
+								totalSize += variableKey.size();
+							}
+							Buf realKey = Buf.createZeroes((int) totalSize);
+							realKey.setBytesFromBuf(0, fixedPart, 0, fixedBytes);
+							int offset = fixedBytes;
+							for (Buf variableKey : variableKeys) {
+								int length = variableKey.size();
+								realKey.setBytesFromBuf(offset, variableKey, 0, length);
+								offset += length;
+							}
+							transformed.add(new CDCEvent(event.seq(),
+									event.columnId(),
+									realKey,
+									element.getValue(),
+									CDCEvent.Op.PUT));
+						}
+					} else {
+						transformed.add(new CDCEvent(event.seq(),
+								event.columnId(),
+								finalKey,
+								Buf.wrap(valueBytes),
+								CDCEvent.Op.PUT));
+					}
+				} else {
+					Buf deleteKey = finalKey;
+					if (column != null && column.hasBuckets()) {
+						int fixedCount = column.schema().fixedLengthKeysCount();
+						int fixedBytes = 0;
+						for (int k = 0; k < fixedCount; k++) {
+							fixedBytes += column.schema().key(k);
+						}
+						if (fixedBytes < finalKey.size()) {
+							deleteKey = Buf.wrap(Arrays.copyOf(finalKey.toByteArray(), fixedBytes));
+						}
+					}
+					transformed.add(new CDCEvent(event.seq(),
+							event.columnId(),
+							deleteKey,
+							emptyBuf(),
+							CDCEvent.Op.DELETE));
 				}
-				throw e;
+			} else {
+				transformed.add(new CDCEvent(event.seq(),
+						event.columnId(),
+						finalKey,
+						event.value(),
+						event.op()));
+			}
+		}
+		return transformed;
+	}
+
+	private CdcPollCursor openCdcPollCursor(CdcSubscriptionMeta subscription,
+			long startSeq,
+			long maxWalSequenceInclusive) throws org.rocksdb.RocksDBException {
+		var cursor = new CdcPollCursor(subscription, startSeq, maxWalSequenceInclusive);
+		try {
+			activeCdcPollCursors.add(cursor);
+			return cursor;
+		} catch (RuntimeException | Error error) {
+			cursor.close();
+			throw error;
+		}
+	}
+
+	/**
+	 * One fixed-tail CDC view. Event-only async polls retain this cursor across
+	 * bounded scheduler slices so fairness does not require repeatedly seeking the
+	 * WAL or rebuilding the subscription filter.
+	 */
+	private final class CdcPollCursor implements AutoCloseable {
+
+		private final CdcSubscriptionMeta subscription;
+		private final it.unimi.dsi.fastutil.longs.LongSet filter;
+		private final long initialWalSequence;
+		private final int initialOperationIndex;
+		private final long maxWalSequenceInclusive;
+		private TransactionLogIterator iterator;
+		private long nextSeq;
+		private boolean firstBatch = true;
+		private boolean exhausted;
+		private boolean closed;
+
+		private CdcPollCursor(CdcSubscriptionMeta subscription,
+				long startSeq,
+				long maxWalSequenceInclusive) throws org.rocksdb.RocksDBException {
+			this.subscription = subscription;
+			this.filter = subscription.columnFilter == null
+					? null
+					: new it.unimi.dsi.fastutil.longs.LongOpenHashSet(subscription.columnFilter);
+			this.initialWalSequence = extractWalSeq(startSeq);
+			this.initialOperationIndex = extractOpIndex(startSeq);
+			this.maxWalSequenceInclusive = maxWalSequenceInclusive;
+			this.nextSeq = startSeq;
+
+			if (initialWalSequence > maxWalSequenceInclusive) {
+				exhausted = true;
+				return;
 			}
 
-			boolean firstBatch = true;
-			try (it; var handler = new EventCollector(result, filterSet, meta.emitLatestValues)) {
-				while (result.size() < effectiveMax && it != null && it.isValid()) {
-					var br = it.getBatch();
-					try (var writeBatch = br.writeBatch()) {
-						long batchWalSeq = br.sequenceNumber();
+			var iteratorObserver = cdcWalIteratorOpenObserver;
+			if (iteratorObserver != null) {
+				iteratorObserver.run();
+			}
+			try {
+				iterator = db.get().getUpdatesSince(initialWalSequence);
+			} catch (org.rocksdb.RocksDBException error) {
+				if (error.getMessage() != null
+						&& error.getMessage().contains("Requested sequence not yet written")) {
+					exhausted = true;
+					return;
+				}
+				throw error;
+			}
+		}
 
+		private synchronized CdcPollPage readPage(long maxEvents,
+				long maxBytes,
+				boolean allowOversizedFirstEvent,
+				long maxScannedMutations) {
+			if (closed) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "CDC poll cursor is closed");
+			}
+			if (exhausted || iterator == null) {
+				return emptyPage();
+			}
+
+			long effectiveMax = Math.min(maxEvents > 0 ? maxEvents : CDC_DEFAULT_MAX_EVENTS,
+					CDC_HARD_MAX_EVENTS);
+			List<CDCEvent> result = new ArrayList<>((int) Math.min(1_024L, effectiveMax));
+			long accumulatedBytes = 0L;
+			long scannedMutations = 0L;
+
+			try (var handler = new EventCollector(result, filter, subscription.emitLatestValues)) {
+				while (result.size() < effectiveMax
+						&& scannedMutations < maxScannedMutations
+						&& iterator.isValid()) {
+					var batchResult = iterator.getBatch();
+					try (var writeBatch = batchResult.writeBatch()) {
+						long batchWalSequence = batchResult.sequenceNumber();
 						if (firstBatch) {
-							if (batchWalSeq > iteratorStartWal) {
-								throw new CdcGapDetectedException("Gap detected in WAL. Requested WAL seq: " + iteratorStartWal + ", but earliest available is: " + batchWalSeq);
+							if (batchWalSequence > initialWalSequence) {
+								throw new CdcGapDetectedException("Gap detected in WAL. Requested WAL seq: "
+										+ initialWalSequence + ", but earliest available is: " + batchWalSequence);
 							}
 							firstBatch = false;
 						}
-
-						// Skip batch if completely before start point (safe check).
-						// If we somehow got a batch strictly before walStart (unlikely with getUpdatesSince), skipping it is correct.
-						long diff = walStart - batchWalSeq;
-						int skipOps = 0;
-						if (diff >= 0) {
-							skipOps = (int) diff + opStart;
+						if (batchWalSequence > maxWalSequenceInclusive) {
+							exhausted = true;
+							break;
 						}
 
-						handler.reset(
-								batchWalSeq,
+						long sequenceDifference = initialWalSequence - batchWalSequence;
+						int skipOps = sequenceDifference >= 0
+								? (int) sequenceDifference + initialOperationIndex
+								: 0;
+						handler.reset(batchWalSequence,
 								skipOps,
 								effectiveMax - result.size(),
-								CDC_MAX_BYTES_PER_POLL - accumulatedBytes,
-								result.isEmpty()
-						);
+								maxBytes - accumulatedBytes,
+								allowOversizedFirstEvent && result.isEmpty());
 						try {
 							iterateCdcWriteBatch(writeBatch, handler);
-						} catch (Exception e) {
-							throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Failed to parse WriteBatch at seq " + batchWalSeq, e);
+						} catch (Exception error) {
+							throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+									"Failed to parse WriteBatch at seq " + batchWalSequence,
+									error);
 						}
-						accumulatedBytes += handler.getAccumulatedBytes();
 
+						accumulatedBytes += handler.getAccumulatedBytes();
+						scannedMutations += Math.max(0, handler.getSeenOps() - skipOps);
 						int stopIndex = handler.getLimitReachedAtOpIndex();
 						int batchMutationCount = writeBatch.count();
 						boolean fullyConsumed = stopIndex == -1 || stopIndex >= batchMutationCount;
 						if (!fullyConsumed) {
-							// We stopped in the middle of the batch.
-							nextSeq = composeCdcSeq(batchWalSeq, stopIndex);
-						} else {
-							// The native count is the authoritative number of sequence-consuming
-							// mutations. Advance to the next WAL sequence so tail polls do not reopen,
-							// materialize and parse this fully-consumed batch again.
-							nextSeq = composeCdcSeq(batchWalSeq + batchMutationCount, 0);
-						}
-
-						if (!fullyConsumed) {
-							break;
-						}
-						if (result.size() >= effectiveMax) {
-							break;
-						}
-						if (accumulatedBytes >= CDC_MAX_BYTES_PER_POLL && !result.isEmpty()) {
+							nextSeq = composeCdcSeq(batchWalSequence, stopIndex);
+							// A TransactionLogIterator cannot resume in the middle of its current
+							// WriteBatch. This only happens at the logical event/byte boundary, so
+							// the caller will terminate the poll and return this continuation.
+							exhausted = true;
 							break;
 						}
 
-						it.next();
-					}
-				}
-				if (it != null) {
-					checkCdcIteratorStatus(it);
-				}
-			}
-
-			// If subscription requires resolved values, transform events accordingly for non-bucketed columns
-			if (meta.emitLatestValues && !result.isEmpty()) {
-				var transformed = new ArrayList<CDCEvent>(result.size());
-				var keysToResolve = new ArrayList<byte[]>();
-				var cfHandles = new ArrayList<ColumnFamilyHandle>();
-				var indicesToResolve = new IntArrayList();
-
-				// First pass: identify events that need resolution
-				for (int i = 0; i < result.size(); i++) {
-					CDCEvent ev = result.get(i);
-					var col = this.columns.get(ev.columnId());
-					if (col != null) {
-						// We resolve ALL operations (PUT, MERGE, DELETE)
-						// to the latest value to ensure monotonicity and avoid "time travel" corruption.
-						keysToResolve.add(ev.key().asArray());
-						cfHandles.add(col.cfh());
-						indicesToResolve.add(i);
+						nextSeq = composeCdcSeq(batchWalSequence + batchMutationCount, 0);
+						// Move past the consumed batch before yielding a fairness slice. The
+						// next scheduled task can then continue on this same native iterator.
+						iterator.next();
+						if (result.size() >= effectiveMax
+								|| (accumulatedBytes >= maxBytes && !result.isEmpty())
+								|| scannedMutations >= maxScannedMutations) {
+							break;
+						}
 					}
 				}
 
-				if (!keysToResolve.isEmpty()) {
-					List<byte[]> resolvedValues;
+				if (!iterator.isValid()) {
 					try {
-						// Batch read for performance
-						resolvedValues = db.get().multiGetAsList(cfHandles, keysToResolve);
-					} catch (org.rocksdb.RocksDBException e) {
-						throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+						checkCdcIteratorStatus(iterator);
+					} catch (org.rocksdb.RocksDBException error) {
+						throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, error);
 					}
-
-					int resolutionIndex = 0;
-					for (int i = 0; i < result.size(); i++) {
-						CDCEvent ev = result.get(i);
-						var col = this.columns.get(ev.columnId());
-						Buf finalKey = ev.key();
- 					if (resolutionIndex < indicesToResolve.size() && indicesToResolve.getInt(resolutionIndex) == i) {
- 						// This event was marked for resolution
- 						byte[] valBytes = resolvedValues.get(resolutionIndex);
- 						resolutionIndex++;
-
- 						if (valBytes != null) {
- 							// Key exists in current state -> Emit PUT with latest value
- 							if (col != null && col.hasBuckets()) {
- 								// Expand bucket into individual events with real keys
- 								var bucket = new Bucket(col, Buf.wrap(valBytes));
- 								var elements = bucket.getElements();
-
- 								int fixedCount = col.schema().fixedLengthKeysCount();
- 								int fixedBytes = 0;
- 								for (int k = 0; k < fixedCount; k++) {
- 									fixedBytes += col.schema().key(k);
- 								}
- 								// Extract fixed part from the original key (which is Fixed | Hash)
- 								Buf fixedPart = finalKey.subList(0, fixedBytes);
-
- 								for (var elem : elements) {
- 									Buf[] varKeys = elem.getKey();
- 									long totalSize = fixedBytes;
- 									for (Buf vk : varKeys) totalSize += vk.size();
-
- 									Buf realKey = Buf.createZeroes((int) totalSize);
- 									realKey.setBytesFromBuf(0, fixedPart, 0, fixedBytes);
- 									int offset = fixedBytes;
- 									for (Buf vk : varKeys) {
- 										int len = vk.size();
- 										realKey.setBytesFromBuf(offset, vk, 0, len);
- 										offset += len;
- 									}
-
- 									transformed.add(new CDCEvent(ev.seq(), ev.columnId(), realKey, elem.getValue(), CDCEvent.Op.PUT));
- 								}
- 							} else {
- 								transformed.add(new CDCEvent(ev.seq(), ev.columnId(), finalKey, Buf.wrap(valBytes), CDCEvent.Op.PUT));
- 							}
- 						} else {
- 							// Key does not exist in current state -> Emit DELETE
- 							Buf delKey = finalKey;
- 							if (col != null && col.hasBuckets()) {
- 								// For DELETE on bucketed column, we can't know the variable keys.
- 								// Truncate to Fixed Key to avoid exposing Hash.
- 								int fixedCount = col.schema().fixedLengthKeysCount();
- 								int fixedBytes = 0;
- 								for (int k = 0; k < fixedCount; k++) {
- 									fixedBytes += col.schema().key(k);
- 								}
- 								if (fixedBytes < finalKey.size()) {
- 									delKey = Buf.wrap(java.util.Arrays.copyOf(finalKey.toByteArray(), fixedBytes));
- 								}
- 							}
- 							transformed.add(new CDCEvent(ev.seq(), ev.columnId(), delKey, emptyBuf(), CDCEvent.Op.DELETE));
- 						}
- 					} else {
- 						// Keep original event (bucketed column or unknown column)
- 						transformed.add(new CDCEvent(ev.seq(), ev.columnId(), finalKey, ev.value(), ev.op()));
- 					}
-					}
-				} else {
-					// No events to resolve
-					transformed.addAll(result);
+					exhausted = true;
 				}
-				result = transformed;
+			} catch (RocksDBException error) {
+				throw error;
+			} catch (Exception error) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, error);
 			}
-			return new CdcBatch(result, nextSeq);
-		} catch (org.rocksdb.RocksDBException e) {
-			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+
+			long emittedEvents = result.size();
+			result = resolveLatestCdcValues(subscription, result);
+			return new CdcPollPage(new CdcBatch(result, nextSeq), emittedEvents, accumulatedBytes);
+		}
+
+		private CdcPollPage emptyPage() {
+			return new CdcPollPage(new CdcBatch(Collections.emptyList(), nextSeq), 0L, 0L);
+		}
+
+		private synchronized boolean isExhausted() {
+			return exhausted || closed;
+		}
+
+		@Override
+		public void close() {
+			try {
+				synchronized (this) {
+					if (closed) {
+						return;
+					}
+					closed = true;
+					exhausted = true;
+					if (iterator != null) {
+						iterator.close();
+						iterator = null;
+					}
+				}
+			} finally {
+				activeCdcPollCursors.remove(this);
+			}
 		}
 	}
 
@@ -5477,22 +6094,53 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			throws RocksDBException {
 		ops.beginOp();
 		try {
+			long requestedEvents = normalizeCdcMaxEvents(maxEvents);
 			long startSeq;
-			if (fromSeq != null) {
-				startSeq = fromSeq;
-			} else {
-				try {
-					var meta = loadCdcMeta(id);
-					if (meta == null) {
-						throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "CDC subscription not found: " + id);
-					}
-					startSeq = meta.lastCommittedSeq + 1;
-				} catch (org.rocksdb.RocksDBException e) {
-					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+			long maxWalSequenceInclusive;
+			try {
+				var meta = loadCdcMeta(id);
+				if (meta == null) {
+					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+							"CDC subscription not found: " + id);
 				}
+				if (fromSeq != null && fromSeq == 0L) {
+					startSeq = composeCdcSeq(findEarliestAvailableWalSeq(), 0);
+				} else {
+					// Publish the application WAL buffer once before fixing this logical
+					// poll's tail. Continuation pages must neither flush nor chase appends.
+					db.get().flushWal(false);
+					startSeq = fromSeq != null ? fromSeq : meta.lastCommittedSeq + 1;
+				}
+				maxWalSequenceInclusive = captureCdcPollTail();
+			} catch (org.rocksdb.RocksDBException e) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
 			}
-			var batch = cdcPollOnce(id, startSeq, maxEvents);
-			return batch.events().stream();
+			var events = new ArrayList<CDCEvent>((int) Math.min(1_024L, requestedEvents));
+			long pageStart = startSeq;
+			long remainingEvents = requestedEvents;
+			long remainingBytes = CDC_MAX_BYTES_PER_POLL;
+			boolean allowOversizedFirstEvent = true;
+			while (remainingEvents > 0L && (allowOversizedFirstEvent || remainingBytes > 0L)) {
+				var page = cdcPollPage(id,
+						pageStart,
+						remainingEvents,
+						remainingBytes,
+						allowOversizedFirstEvent,
+						Long.MAX_VALUE,
+						maxWalSequenceInclusive);
+				var batch = page.batch();
+				long pageBytes = page.emittedBytes();
+				events.addAll(batch.events());
+				remainingEvents = Math.max(0L, remainingEvents - page.emittedEvents());
+				remainingBytes = pageBytes >= remainingBytes ? 0L : remainingBytes - pageBytes;
+				allowOversizedFirstEvent &= page.emittedEvents() == 0L;
+				long nextSeq = batch.nextSeq();
+				if (extractWalSeq(nextSeq) > maxWalSequenceInclusive || nextSeq == pageStart) {
+					break;
+				}
+				pageStart = nextSeq;
+			}
+			return events.stream();
 		} finally {
 			ops.endOp();
 		}
@@ -5501,51 +6149,247 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public @NotNull org.reactivestreams.Publisher<CDCEvent> cdcPollAsyncInternal(@NotNull String id,
 			@Nullable Long fromSeq,
 			long maxEvents) throws RocksDBException {
-		long maxEv = maxEvents > 0 ? maxEvents : CDC_DEFAULT_MAX_EVENTS;
-		// Note: This returns a Publisher for a single poll batch. Caller is responsible for looping/state.
-		return Flux.defer(() -> {
-			ops.beginOp();
-			try {
-				long startSeqInternal;
-				if (fromSeq != null) {
-					startSeqInternal = fromSeq;
-				} else {
-					var meta = loadCdcMeta(id);
-					if (meta == null) {
-						throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "CDC subscription not found: " + id);
-					}
-					startSeqInternal = meta.lastCommittedSeq + 1;
-				}
-				return Flux.fromIterable(cdcPollOnce(id, startSeqInternal, maxEv).events());
-			} catch (Throwable t) {
-				return Flux.error(t);
-			} finally {
-				ops.endOp();
-			}
-		}).subscribeOn(this.scheduler.read());
+		long requestedEvents = normalizeCdcMaxEvents(maxEvents);
+		return prepareCdcPollStartAsync(id, fromSeq)
+				.flatMapMany(window -> Flux.usingWhen(
+						openAndReadCdcPollCursorAsync(window,
+								requestedEvents,
+								CDC_MAX_BYTES_PER_POLL,
+								true),
+						cursorStart -> {
+							var cursor = cursorStart.cursor();
+							return Mono.just(new CdcStreamPage(window.startSeq(),
+										requestedEvents,
+										CDC_MAX_BYTES_PER_POLL,
+										true,
+										cursorStart.firstPage()))
+									.expand(page -> {
+										long emitted = page.page().emittedEvents();
+										long remainingEvents = Math.max(0L, page.remainingEvents() - emitted);
+										long emittedBytes = page.page().emittedBytes();
+										long remainingBytes = emittedBytes >= page.remainingBytes()
+												? 0L
+												: page.remainingBytes() - emittedBytes;
+										long nextSeq = page.page().batch().nextSeq();
+										if (remainingEvents == 0L
+												|| (remainingBytes == 0L && emitted > 0L)
+												|| cursor.isExhausted()
+												|| extractWalSeq(nextSeq) > window.maxWalSequenceInclusive()
+												|| nextSeq == page.startSeq()) {
+											return Mono.empty();
+										}
+										boolean allowOversizedFirstEvent = page.allowOversizedFirstEvent()
+												&& emitted == 0L;
+										return readCdcPollCursorPageAsync(cursor,
+												remainingEvents,
+												remainingBytes,
+												allowOversizedFirstEvent)
+												.map(nextPage -> new CdcStreamPage(nextSeq,
+														remainingEvents,
+														remainingBytes,
+														allowOversizedFirstEvent,
+														nextPage));
+									}, 1)
+									.concatMapIterable(page -> page.page().batch().events(), 1);
+						},
+						cursorStart -> closeCdcPollCursorAsync(cursorStart.cursor()),
+						(cursorStart, _) -> closeCdcPollCursorAsync(cursorStart.cursor()),
+						cursorStart -> closeCdcPollCursorAsync(cursorStart.cursor())));
 	}
 
 	public @NotNull Mono<CdcBatch> cdcPollBatchAsyncInternal(@NotNull String id, @Nullable Long fromSeq, long maxEvents)
 			throws RocksDBException {
-		long maxEv = maxEvents > 0 ? maxEvents : CDC_DEFAULT_MAX_EVENTS;
-		return Mono.fromCallable(() -> {
-			ops.beginOp();
-			try {
-				long startSeq;
-				if (fromSeq != null) {
-					startSeq = fromSeq;
-				} else {
-					var meta = loadCdcMeta(id);
-					if (meta == null) {
-						throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "CDC subscription not found: " + id);
-					}
-					startSeq = meta.lastCommittedSeq + 1;
-				}
-				return cdcPollOnce(id, startSeq, maxEv);
-			} finally {
-				ops.endOp();
+		long requestedEvents = normalizeCdcMaxEvents(maxEvents);
+		return prepareCdcPollStartAsync(id, fromSeq)
+				.flatMap(window -> cdcPollPreparedAsync(window.subscription(),
+						window.startSeq(),
+						requestedEvents,
+						window.maxWalSequenceInclusive()))
+				// Mapping and emitting a materialized CDC page must not retain a scarce
+				// RocksDB read worker after the bounded poll step has completed.
+				.publishOn(reactor.core.scheduler.Schedulers.parallel());
+	}
+
+	private static long normalizeCdcMaxEvents(long maxEvents) {
+		long requested = maxEvents > 0 ? maxEvents : CDC_DEFAULT_MAX_EVENTS;
+		return Math.min(requested, CDC_HARD_MAX_EVENTS);
+	}
+
+	private Mono<CdcPollWindow> prepareCdcPollStartAsync(@NotNull String id, @Nullable Long fromSeq) {
+		return scheduleTracked(this.scheduler.cdc(), () -> {
+			var meta = loadCdcMeta(id);
+			if (meta == null) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+						"CDC subscription not found: " + id);
 			}
-		}).subscribeOn(this.scheduler.read());
+			long startSeq;
+			if (fromSeq != null && fromSeq == 0L) {
+				// Prefix-less WAL discovery includes its own bounded flush/probe loop and
+				// therefore belongs to the CDC lane, never a read/write worker or the
+				// independently serialized flush/compact lane.
+				startSeq = composeCdcSeq(findEarliestAvailableWalSeq(), 0);
+			} else {
+				// Publish the application WAL buffer without forcing an fsync. Explicit
+				// flush() remains the durability boundary.
+				db.get().flushWal(false);
+				startSeq = fromSeq != null ? fromSeq : meta.lastCommittedSeq + 1;
+			}
+			return new CdcPollWindow(startSeq, captureCdcPollTail(), meta);
+		});
+	}
+
+	private Mono<CdcBatch> cdcPollPreparedAsync(CdcSubscriptionMeta subscription,
+			long startSeq,
+			long maxEvents,
+			long maxWalSequenceInclusive) {
+		return scheduleTracked(this.scheduler.read(),
+				() -> cdcPollPage(subscription,
+						startSeq,
+						maxEvents,
+						CDC_MAX_BYTES_PER_POLL,
+						true,
+						CDC_MAX_SCANNED_MUTATIONS_PER_POLL,
+						maxWalSequenceInclusive).batch());
+	}
+
+	private Mono<CdcPollCursorStart> openAndReadCdcPollCursorAsync(CdcPollWindow window,
+			long maxEvents,
+			long maxBytes,
+			boolean allowOversizedFirstEvent) {
+		return scheduleTracked(this.scheduler.read(), () -> {
+			var cursor = openCdcPollCursor(window.subscription(),
+					window.startSeq(),
+					window.maxWalSequenceInclusive());
+			try {
+				return new CdcPollCursorStart(cursor,
+						cursor.readPage(maxEvents,
+								maxBytes,
+								allowOversizedFirstEvent,
+								CDC_MAX_SCANNED_MUTATIONS_PER_POLL));
+			} catch (RuntimeException | Error error) {
+				cursor.close();
+				throw error;
+			}
+		}, cursorStart -> cursorStart.cursor().close());
+	}
+
+	private Mono<CdcPollPage> readCdcPollCursorPageAsync(CdcPollCursor cursor,
+			long maxEvents,
+			long maxBytes,
+			boolean allowOversizedFirstEvent) {
+		return scheduleTracked(this.scheduler.read(),
+				() -> cursor.readPage(maxEvents,
+						maxBytes,
+						allowOversizedFirstEvent,
+						CDC_MAX_SCANNED_MUTATIONS_PER_POLL));
+	}
+
+	private Mono<Void> closeCdcPollCursorAsync(CdcPollCursor cursor) {
+		return scheduleTracked(this.scheduler.control(), () -> {
+			cursor.close();
+			return (Void) null;
+		}).onErrorResume(_ -> {
+			// SafeShutdown may already be closed, or the control scheduler may reject
+			// during teardown. The cursor must still release its native handle.
+			cursor.close();
+			return Mono.empty();
+		});
+	}
+
+	/**
+	 * Schedule a native database step while keeping SafeShutdown accounting tied to
+	 * actual task completion. Cancellation stops delivery to the subscriber but does
+	 * not pretend that an already queued or running JNI call has finished.
+	 */
+	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target, Callable<T> callable) {
+		return scheduleTracked(target, callable, null);
+	}
+
+	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target,
+			Callable<T> callable,
+			@Nullable Consumer<? super T> lateSuccessCleanup) {
+		return Mono.create(sink -> {
+			final int queued = 0;
+			final int running = 1;
+			final int finished = 2;
+			final int cancelledBeforeStart = 3;
+			var emissionLock = new Object();
+			var cancelled = new AtomicBoolean();
+			var state = new AtomicInteger(queued);
+			var task = Disposables.swap();
+			try {
+				ops.beginOp();
+			} catch (Throwable error) {
+				sink.error(error);
+				return;
+			}
+			sink.onCancel(() -> {
+				synchronized (emissionLock) {
+					cancelled.set(true);
+				}
+				if (state.compareAndSet(queued, cancelledBeforeStart)) {
+					// The queued callable will never own the SafeShutdown lease.
+					task.dispose();
+					ops.endOp();
+				} else {
+					// A running native call owns the lease until its finally block.
+					task.dispose();
+				}
+			});
+			try {
+				task.replace(target.schedule(() -> {
+					if (!state.compareAndSet(queued, running)) {
+						return;
+					}
+					try {
+						var result = callable.call();
+						boolean late;
+						synchronized (emissionLock) {
+							late = cancelled.get();
+							if (!late) {
+								sink.success(result);
+							}
+						}
+						if (late && lateSuccessCleanup != null) {
+							try {
+								lateSuccessCleanup.accept(result);
+							} catch (Throwable cleanupError) {
+								logger.warn("Failed to clean a CDC native result after subscriber cancellation",
+										cleanupError);
+							}
+						}
+					} catch (Throwable error) {
+						boolean late;
+						synchronized (emissionLock) {
+							late = cancelled.get();
+							if (!late) {
+								sink.error(error);
+							}
+						}
+						if (late) {
+							logger.debug("CDC native task failed after subscriber cancellation", error);
+						}
+					} finally {
+						state.set(finished);
+						ops.endOp();
+					}
+				}));
+			} catch (Throwable error) {
+				if (state.compareAndSet(queued, finished)) {
+					ops.endOp();
+					boolean late;
+					synchronized (emissionLock) {
+						late = cancelled.get();
+						if (!late) {
+							sink.error(error);
+						}
+					}
+					if (late) {
+						logger.debug("CDC task scheduling failed after subscriber cancellation", error);
+					}
+				}
+			}
+		});
 	}
 	private void printStartupInfo() {
 		if (!Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {

@@ -70,6 +70,8 @@ class IteratorContractTest {
 					() -> assertMaximumTimeoutDoesNotOverflow(api, columnId),
 					() -> assertRepeatedCloseIsIdempotent(api, internal, columnId),
 					() -> assertIteratorResourcesReleased(internal));
+
+			assertLargeIteratorRequest(api, internal);
 		}
 	}
 
@@ -148,6 +150,27 @@ class IteratorContractTest {
 		} finally {
 			api.closeIterator(iteratorId);
 		}
+	}
+
+	private static void assertLargeIteratorRequest(RocksDBAPI api, EmbeddedDB internal) {
+		long columnId = api.createColumn("large-entries",
+				ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
+		for (int i = 0; i < 130; i++) {
+			api.put(0, columnId, key(i), value(i), RequestType.none());
+		}
+
+		long iteratorId = api.openIterator(0, columnId, new Keys(), null, false, ITERATOR_TIMEOUT_MS);
+		try {
+			var expected = java.util.stream.IntStream.range(1, 129)
+					.mapToObj(IteratorContractTest::value)
+					.toList();
+			assertIterableEquals(expected, api.subsequent(iteratorId, 1, 128, RequestType.multi()));
+			assertTrue(api.subsequent(iteratorId, 0, 1, RequestType.exists()));
+			assertFalse(api.subsequent(iteratorId, 0, 1, RequestType.exists()));
+		} finally {
+			api.closeIterator(iteratorId);
+		}
+		assertIteratorResourcesReleased(internal);
 	}
 
 	private static void assertNoneSkipsAndTakesWithoutReturningValues(RocksDBAPI api, long columnId) {

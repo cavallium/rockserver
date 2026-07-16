@@ -19,12 +19,22 @@ import reactor.core.publisher.Flux;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class CdcGhostAndSkipTest {
+
+    private static final int FILTERED_WAL_BATCH_SIZE = 512;
+    private static final int FILTERED_WAL_BATCHES_PER_PHYSICAL_PAGE = 8;
+    private static final int FILTERED_MUTATIONS_PER_PHYSICAL_PAGE =
+            FILTERED_WAL_BATCH_SIZE * FILTERED_WAL_BATCHES_PER_PHYSICAL_PAGE;
+    private static final Duration CDC_POLL_TIMEOUT = Duration.ofSeconds(30);
 
     @TempDir
     Path tempDir;
@@ -54,6 +64,251 @@ class CdcGhostAndSkipTest {
     
     private int bytesToInt(byte[] b) {
         return java.nio.ByteBuffer.wrap(b).getInt();
+    }
+
+    private int writeFilteredWalPage() throws RocksDBException {
+        int written = 0;
+        for (int batch = 0; batch < FILTERED_WAL_BATCHES_PER_PHYSICAL_PAGE; batch++) {
+            long txId = db.openTransaction(10_000);
+            for (int i = 0; i < FILTERED_WAL_BATCH_SIZE; i++) {
+                int key = batch * FILTERED_WAL_BATCH_SIZE + i;
+                db.put(txId,
+                        colB,
+                        new Keys(new Buf[]{Buf.wrap(intToBytes(key))}),
+                        Buf.wrap(intToBytes(key)),
+                        RequestType.none());
+                written++;
+            }
+            db.closeTransaction(txId, true);
+        }
+        return written;
+    }
+
+    private int writeFilteredWalPagesThenMatchingEvent() throws RocksDBException {
+        int written = writeFilteredWalPage();
+        long matchingTx = db.openTransaction(10_000);
+        db.put(matchingTx,
+                colA,
+                new Keys(new Buf[]{Buf.wrap(intToBytes(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE))}),
+                Buf.wrap("match".getBytes(StandardCharsets.UTF_8)),
+                RequestType.none());
+        db.closeTransaction(matchingTx, true);
+        return written + 1;
+    }
+
+    @Test
+    void eventOnlyAsyncPollTraversesFullyFilteredPhysicalPage() throws Exception {
+        String subscriptionId = "sub-event-only-filtered-pages";
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        int written = writeFilteredWalPagesThenMatchingEvent();
+
+        assertEquals(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE + 1, written,
+                "the fixture must contain a full physical page in multiple WAL batches plus one matching batch");
+
+        List<CDCEvent> events = Flux.from(db.cdcPollAsyncInternal(subscriptionId, startSeq, 1))
+                .collectList()
+                .block(CDC_POLL_TIMEOUT);
+
+        assertNotNull(events);
+        assertEquals(1, events.size(), "Event-only polling must continue past an empty physical CDC page");
+        assertEquals(colA, events.getFirst().columnId());
+        assertEquals("match", new String(events.getFirst().value().toByteArray(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void eventOnlyAsyncPollRetainsOneWalIteratorAcrossFilteredPhysicalSlices() throws Exception {
+        String subscriptionId = "sub-event-only-retained-wal-iterator";
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        final int filteredPages = 3;
+        int filteredMutations = 0;
+        for (int page = 0; page < filteredPages; page++) {
+            filteredMutations += writeFilteredWalPage();
+        }
+        long matchingTx = db.openTransaction(10_000);
+        db.put(matchingTx,
+                colA,
+                new Keys(new Buf[]{Buf.wrap(intToBytes(filteredMutations))}),
+                Buf.wrap("match".getBytes(StandardCharsets.UTF_8)),
+                RequestType.none());
+        db.closeTransaction(matchingTx, true);
+
+        assertEquals((long) filteredPages * FILTERED_MUTATIONS_PER_PHYSICAL_PAGE,
+                filteredMutations,
+                "the fixture must force several 4096-mutation scheduler slices");
+        var iteratorOpens = new AtomicInteger();
+        db.setCdcWalIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
+        List<CDCEvent> events;
+        try {
+            events = Flux.from(db.cdcPollAsyncInternal(subscriptionId, startSeq, 1))
+                    .collectList()
+                    .block(CDC_POLL_TIMEOUT);
+        } finally {
+            db.setCdcWalIteratorOpenObserverForTesting(null);
+        }
+
+        assertNotNull(events);
+        assertEquals(1, events.size());
+        assertEquals("match", new String(events.getFirst().value().toByteArray(), StandardCharsets.UTF_8));
+        assertEquals(1, iteratorOpens.get(),
+                "fair scheduler slices must retain one WAL iterator for the logical poll");
+    }
+
+    @Test
+    void batchPollReturnsBoundedFilteredProgressAndNextSeq() throws Exception {
+        String subscriptionId = "sub-batch-filtered-page";
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        // The physical scan budget is a soft boundary between WAL batches. Splitting
+        // one WriteBatch would force every continuation to replay its prefix.
+        int written = writeFilteredWalPagesThenMatchingEvent();
+
+        assertEquals(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE + 1, written);
+
+        CdcBatch firstPage = db.cdcPollBatchAsyncInternal(subscriptionId, startSeq, 1)
+                .block(CDC_POLL_TIMEOUT);
+
+        assertNotNull(firstPage);
+        assertTrue(firstPage.events().isEmpty(), "A physical page containing only filtered mutations stays empty");
+        assertTrue(firstPage.nextSeq() > startSeq, "An empty physical page must still return bounded cursor progress");
+
+        CdcBatch secondPage = db.cdcPollBatchAsyncInternal(subscriptionId, firstPage.nextSeq(), 1)
+                .block(CDC_POLL_TIMEOUT);
+
+        assertNotNull(secondPage);
+        assertEquals(1, secondPage.events().size());
+        assertEquals("match", new String(secondPage.events().getFirst().value().toByteArray(), StandardCharsets.UTF_8));
+        assertTrue(secondPage.nextSeq() > firstPage.nextSeq());
+    }
+
+    @Test
+    void eventOnlyAsyncPollDoesNotChaseWritesPastItsCapturedTail() throws Exception {
+        String subscriptionId = "sub-event-only-stable-tail";
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        assertEquals(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE, writeFilteredWalPage());
+
+        var appended = new AtomicBoolean();
+        db.setCdcPollTailCapturedObserverForTesting(() -> {
+            if (appended.compareAndSet(false, true)) {
+                long txId = db.openTransaction(10_000);
+                db.put(txId,
+                        colA,
+                        new Keys(new Buf[]{Buf.wrap(intToBytes(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE))}),
+                        Buf.wrap("after-tail".getBytes(StandardCharsets.UTF_8)),
+                        RequestType.none());
+                db.closeTransaction(txId, true);
+            }
+        });
+
+        List<CDCEvent> firstPoll;
+        try {
+            firstPoll = Flux.from(db.cdcPollAsyncInternal(subscriptionId, startSeq, 1))
+                    .collectList()
+                    .block(CDC_POLL_TIMEOUT);
+        } finally {
+            db.setCdcPollTailCapturedObserverForTesting(null);
+        }
+
+        assertTrue(appended.get(), "the fixture must append after the logical poll captured its tail");
+        assertNotNull(firstPoll);
+        assertTrue(firstPoll.isEmpty(), "a logical poll must not chase a concurrently growing WAL");
+
+        List<CDCEvent> secondPoll = Flux.from(db.cdcPollAsyncInternal(subscriptionId, startSeq, 1))
+                .collectList()
+                .block(CDC_POLL_TIMEOUT);
+        assertNotNull(secondPoll);
+        assertEquals(1, secondPoll.size(), "the next logical poll must see the post-tail append");
+        assertEquals("after-tail",
+                new String(secondPoll.getFirst().value().toByteArray(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void synchronousPollHonorsRequestsAboveTheFormerPhysicalPageSize() throws Exception {
+        String subscriptionId = "sub-sync-large";
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        final int events = 5_000;
+        final int transactionSize = 512;
+        int written = 0;
+        for (int first = 0; first < events; first += transactionSize) {
+            long txId = db.openTransaction(10_000);
+            int end = Math.min(events, first + transactionSize);
+            for (int i = first; i < end; i++) {
+                db.put(txId,
+                        colA,
+                        new Keys(new Buf[]{Buf.wrap(intToBytes(i))}),
+                        Buf.wrap(intToBytes(i)),
+                        RequestType.none());
+                written++;
+            }
+            db.closeTransaction(txId, true);
+        }
+
+        assertEquals(events, written, "the fixture must not overfill its final WAL batch");
+        var iteratorOpens = new AtomicInteger();
+        db.setCdcWalIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
+        List<CDCEvent> polled;
+        try {
+            try (var poll = db.cdcPoll(subscriptionId, startSeq, events)) {
+                polled = poll.toList();
+            }
+        } finally {
+            db.setCdcWalIteratorOpenObserverForTesting(null);
+        }
+
+        assertEquals(events, polled.size(),
+                "the public synchronous API must not be silently capped to an internal page size");
+        assertEquals(1, iteratorOpens.get(),
+                "a synchronous poll must scan its fixed WAL tail with one iterator");
+        var uniqueSequences = new HashSet<Long>(events);
+        long previousSequence = -1L;
+        for (int i = 0; i < polled.size(); i++) {
+            var event = polled.get(i);
+            assertTrue(event.seq() > previousSequence, "CDC events must remain strictly ordered across pages");
+            assertTrue(uniqueSequences.add(event.seq()), "CDC pages must not replay an event");
+            assertEquals(i, bytesToInt(event.key().toByteArray()), "unexpected key order at index " + i);
+            assertEquals(i, bytesToInt(event.value().toByteArray()), "unexpected value order at index " + i);
+            previousSequence = event.seq();
+        }
+        assertEquals(events, uniqueSequences.size());
+    }
+
+    @Test
+    void eventOnlyAsyncPollKeepsOneAggregateByteBudgetAcrossPhysicalPages() throws Exception {
+        String subscriptionId = "sub-async-byte-budget";
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        final int events = 10_000;
+        final int eventsPerTransaction = 1_000;
+        final int valueBytes = 1_800;
+        var value = Buf.wrap(new byte[valueBytes]);
+        int written = 0;
+        for (int first = 0; first < events; first += eventsPerTransaction) {
+            long txId = db.openTransaction(10_000);
+            int end = Math.min(events, first + eventsPerTransaction);
+            for (int i = first; i < end; i++) {
+                db.put(txId,
+                        colA,
+                        new Keys(new Buf[]{Buf.wrap(intToBytes(i))}),
+                        value,
+                        RequestType.none());
+                written++;
+            }
+            db.closeTransaction(txId, true);
+        }
+
+        assertEquals(events, written);
+        List<CDCEvent> emitted = Flux.from(db.cdcPollAsyncInternal(subscriptionId, startSeq, events))
+                .collectList()
+                .block(CDC_POLL_TIMEOUT);
+        assertNotNull(emitted);
+        long eventBytes = Integer.BYTES + valueBytes;
+        long byteBudget = 16L * 1024L * 1024L;
+        long expectedEvents = byteBudget / eventBytes;
+        assertEquals(expectedEvents, emitted.size(),
+                "all continuation pages must share one exact logical 16 MiB byte budget");
+        assertTrue(emitted.size() > 4_096, "the logical poll should continue beyond one physical page");
+        assertTrue((long) emitted.size() * eventBytes <= byteBudget);
+        for (int i = 0; i < emitted.size(); i++) {
+            assertEquals(i, bytesToInt(emitted.get(i).key().toByteArray()),
+                    "byte-limited continuation must remain gap-free and ordered");
+        }
     }
 
     @Test

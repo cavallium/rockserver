@@ -13,24 +13,45 @@ import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.VisibleForTesting;
 import org.reactivestreams.Publisher;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, InternalConnection {
 
+	private static final Logger LOG = LoggerFactory.getLogger(EmbeddedConnection.class);
+	private static final String REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY = "reactor.onErrorDropped.local";
+	private static final int ITERATOR_READ_STEP_SIZE = 4_096;
+	private static final int ASYNC_TASK_QUEUED = 0;
+	private static final int ASYNC_TASK_RUNNING = 1;
+	private static final int ASYNC_TASK_FINISHED = 2;
+	private static final int ASYNC_TASK_CANCELLED = 3;
 	private final EmbeddedDB db;
+	private final Map<Long, AsyncIteratorOperation> asyncIteratorOperations = new ConcurrentHashMap<>();
+	private final Map<Long, CompletableFuture<Void>> closingAsyncIterators = new ConcurrentHashMap<>();
 	public static final URI PRIVATE_MEMORY_URL = URI.create("memory://private");
 
 	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
@@ -121,14 +142,48 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
     public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> req) {
         return (RA) switch (req) {
             case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch mergeBatch -> this.mergeBatchAsync(
+					mergeBatch.columnId(), mergeBatch.batchPublisher(), mergeBatch.mode());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti existsMulti -> this.existsMultiAsync(
+					existsMulti.transactionId(), existsMulti.columnId(), existsMulti.keys(), existsMulti.timeoutMs());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator closeIterator -> this.closeIteratorAsync(
+					closeIterator.iteratorId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo seekTo -> this.seekToAsync(
+					seekTo.iterationId(), seekTo.keys());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<?> subsequent -> this.subsequentAsync(
+					subsequent.iterationId(), subsequent.skipCount(), subsequent.takeCount(), subsequent.requestType());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?> reduceRange -> this.reduceRangeAsync(
+					reduceRange.transactionId(),
+					reduceRange.columnId(),
+					reduceRange.startKeysInclusive(),
+					reduceRange.endKeysExclusive(),
+					reduceRange.reverse(),
+					reduceRange.requestType(),
+					reduceRange.timeoutMs());
             case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
             case RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw scanRaw -> this.scanRawAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount());
             case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
             case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> CompletableFuture.supplyAsync(() -> req.handleSync(this),
-                    (req.isReadOnly() ? db.getScheduler().readExecutor() : db.getScheduler().writeExecutor()));
+                    commandExecutor(req));
             case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
         };
     }
+
+	private java.util.concurrent.Executor commandExecutor(RocksDBAPICommand<?, ?, ?> command) {
+		if (command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator) {
+			return db.getScheduler().controlExecutor();
+		}
+		if (command instanceof RocksDBAPICommand.Flush
+				|| command instanceof RocksDBAPICommand.Compact) {
+			return db.getScheduler().maintenanceExecutor();
+		}
+		if (!command.isReadOnly()) {
+			return db.getScheduler().writeExecutor();
+		}
+		return command.readWorkClass() == RocksDBAPICommand.ReadWorkClass.INTERACTIVE
+				? db.getScheduler().interactiveReadExecutor()
+				: db.getScheduler().readExecutor();
+	}
 
 	@Override
 	public Flux<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
@@ -258,6 +313,19 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public CompletableFuture<List<Boolean>> existsMultiAsync(long transactionId,
+			long columnId,
+			@NotNull List<@NotNull Keys> keys,
+			long timeoutMs) throws RocksDBException {
+		// Keep the complete logical request in one scheduled task. EmbeddedDB bounds
+		// each native MultiGet's direct memory while sharing one deadline and snapshot
+		// across those native chunks.
+		return supplyAsyncPreservingRunningCompletion(
+				() -> db.existsMulti(transactionId, columnId, keys, timeoutMs),
+				db.getScheduler().readExecutor());
+	}
+
+	@Override
 	public long openIterator(long transactionId,
 			long columnId,
 			@NotNull Keys startKeysInclusive,
@@ -286,8 +354,396 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	@SuppressWarnings("unchecked")
+	public <T> CompletableFuture<T> subsequentAsync(long iterationId,
+			long skipCount,
+			long takeCount,
+			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws RocksDBException {
+		if (requestType == null) {
+			return CompletableFuture.failedFuture(RocksDBException.of(
+					RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
+					"Iterator request type cannot be null"));
+		}
+		if (skipCount < 0 || takeCount < 0) {
+			return CompletableFuture.failedFuture(RocksDBException.of(
+					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Iterator skip and take counts must be non-negative"));
+		}
+		var iteratorOperation = acquireAsyncIteratorOperation(iterationId);
+		if (iteratorOperation == null) {
+			return CompletableFuture.failedFuture(RocksDBException.of(
+					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Concurrent operation on iterator " + iterationId + " is not supported"));
+		}
+
+		var cancelled = new AtomicBoolean();
+		CompletableFuture<T> result = new CompletableFuture<>() {
+			@Override
+			public boolean cancel(boolean mayInterruptIfRunning) {
+				cancelled.set(true);
+				return super.cancel(false);
+			}
+		};
+
+		CompletableFuture<T> operation;
+		try {
+			if (skipCount == 0 && takeCount == 0) {
+				operation = scheduleIteratorStep(iterationId, 0, requestType, cancelled);
+			} else {
+				var skipped = advanceIteratorAsync(iterationId, skipCount, cancelled);
+				operation = switch (requestType) {
+					case RequestType.RequestNothing<?> _ -> (CompletableFuture<T>) (CompletableFuture<?>) skipped
+							.thenCompose(exhausted -> exhausted
+									? CompletableFuture.completedFuture(null)
+									: advanceIteratorAsync(iterationId, takeCount, cancelled).thenApply(_ -> null));
+					case RequestType.RequestExists<?> _ -> (CompletableFuture<T>) (CompletableFuture<?>) skipped
+							.thenCompose(exhausted -> exhausted
+									? CompletableFuture.completedFuture(false)
+									: subsequentExistsAsync(iterationId, takeCount, false, cancelled));
+					case RequestType.RequestMulti<?> _ -> (CompletableFuture<T>) (CompletableFuture<?>) skipped
+							.thenCompose(exhausted -> exhausted
+									? CompletableFuture.completedFuture(List.of())
+									: subsequentMultiAsync(
+											iterationId, takeCount, new ArrayList<>(), cancelled));
+				};
+			}
+		} catch (Throwable error) {
+			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
+			return CompletableFuture.failedFuture(error);
+		}
+
+		operation.whenComplete((value, error) -> {
+			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
+			if (error != null) {
+				result.completeExceptionally(error instanceof CompletionException completionError
+						&& completionError.getCause() != null
+						? completionError.getCause()
+						: error);
+			} else {
+				result.complete(value);
+			}
+		});
+		return result;
+	}
+
+	@Override
+	public CompletableFuture<Void> seekToAsync(long iterationId, @NotNull Keys keys) throws RocksDBException {
+		var iteratorOperation = acquireAsyncIteratorOperation(iterationId);
+		if (iteratorOperation == null) {
+			return CompletableFuture.failedFuture(concurrentIteratorOperation(iterationId));
+		}
+		CompletableFuture<Void> result;
+		try {
+			result = supplyAsyncPreservingRunningCompletion(() -> {
+				db.seekTo(iterationId, keys);
+				return null;
+			}, db.getScheduler().readExecutor());
+		} catch (Throwable error) {
+			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
+			return CompletableFuture.failedFuture(error);
+		}
+		result.whenComplete((_, _) -> releaseAsyncIteratorOperation(iterationId, iteratorOperation));
+		return result;
+	}
+
+	@Override
+	public CompletableFuture<Void> closeIteratorAsync(long iteratorId) throws RocksDBException {
+		var closeToken = new CompletableFuture<Void>();
+		var existingClose = closingAsyncIterators.putIfAbsent(iteratorId, closeToken);
+		if (existingClose != null) {
+			return existingClose.thenApply(_ -> null);
+		}
+		var closeOperation = closeAsyncIteratorWhenIdle(iteratorId);
+		closeOperation.whenComplete((_, failure) -> {
+			try {
+				if (failure != null) {
+					closeToken.completeExceptionally(failure);
+				} else {
+					closeToken.complete(null);
+				}
+			} finally {
+				closingAsyncIterators.remove(iteratorId, closeToken);
+			}
+		});
+		// Do not expose the coordination token itself: cancellation by one caller
+		// must not reopen the iterator-operation admission gate for another caller.
+		return closeToken.thenApply(_ -> null);
+	}
+
+	private CompletableFuture<Void> closeAsyncIteratorWhenIdle(long iteratorId) {
+		var active = asyncIteratorOperations.get(iteratorId);
+		if (active != null) {
+			return active.finished.handle((_, _) -> null)
+					.thenCompose(_ -> closeAsyncIteratorWhenIdle(iteratorId));
+		}
+		return supplyAsyncPreservingRunningCompletion(() -> {
+			db.closeIterator(iteratorId);
+			return null;
+		}, db.getScheduler().controlExecutor());
+	}
+
+	private @Nullable AsyncIteratorOperation acquireAsyncIteratorOperation(long iteratorId) {
+		if (closingAsyncIterators.containsKey(iteratorId)) {
+			return null;
+		}
+		var operation = new AsyncIteratorOperation();
+		if (asyncIteratorOperations.putIfAbsent(iteratorId, operation) != null) {
+			return null;
+		}
+		if (closingAsyncIterators.containsKey(iteratorId)) {
+			releaseAsyncIteratorOperation(iteratorId, operation);
+			return null;
+		}
+		return operation;
+	}
+
+	private void releaseAsyncIteratorOperation(long iteratorId, AsyncIteratorOperation operation) {
+		if (asyncIteratorOperations.remove(iteratorId, operation)) {
+			operation.finished.complete(null);
+		}
+	}
+
+	private RocksDBException concurrentIteratorOperation(long iteratorId) {
+		return RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+				"Concurrent operation on iterator " + iteratorId + " is not supported");
+	}
+
+	private static final class AsyncIteratorOperation {
+
+		private final CompletableFuture<Void> finished = new CompletableFuture<>();
+	}
+
+	/** @return true when the iterator was exhausted before consuming the requested count. */
+	private CompletableFuture<Boolean> advanceIteratorAsync(long iterationId,
+			long remaining,
+			AtomicBoolean cancelled) {
+		if (remaining <= 0) {
+			return CompletableFuture.completedFuture(false);
+		}
+		long step = Math.min(remaining, ITERATOR_READ_STEP_SIZE);
+		return scheduleIteratorAdvanceStep(iterationId, step, cancelled)
+				.thenCompose(advanced -> advanced < step
+						? CompletableFuture.completedFuture(true)
+						: advanceIteratorAsync(iterationId, remaining - step, cancelled));
+	}
+
+	private CompletableFuture<Boolean> subsequentExistsAsync(long iterationId,
+			long remaining,
+			boolean found,
+			AtomicBoolean cancelled) {
+		if (remaining <= 0 || cancelled.get()) {
+			return cancelled.get()
+					? CompletableFuture.failedFuture(new CancellationException())
+					: CompletableFuture.completedFuture(found);
+		}
+		long step = Math.min(remaining, ITERATOR_READ_STEP_SIZE);
+		return scheduleIteratorAdvanceStep(iterationId, step, cancelled)
+				.thenCompose(advanced -> {
+					boolean pageFound = found || advanced > 0L;
+					return advanced < step
+							? CompletableFuture.completedFuture(pageFound)
+							: subsequentExistsAsync(iterationId, remaining - step, pageFound, cancelled);
+				});
+	}
+
+	private CompletableFuture<List<Buf>> subsequentMultiAsync(long iterationId,
+			long remaining,
+			ArrayList<Buf> values,
+			AtomicBoolean cancelled) {
+		if (remaining <= 0 || cancelled.get()) {
+			return cancelled.get()
+					? CompletableFuture.failedFuture(new CancellationException())
+					: CompletableFuture.completedFuture(values);
+		}
+		long step = Math.min(remaining, ITERATOR_READ_STEP_SIZE);
+		return scheduleIteratorStep(iterationId, step, RequestType.multi(), cancelled)
+				.thenCompose(page -> {
+					values.addAll(page);
+					return page.size() < step
+							? CompletableFuture.completedFuture(values)
+							: subsequentMultiAsync(iterationId, remaining - step, values, cancelled);
+				});
+	}
+
+	private <T> CompletableFuture<T> scheduleIteratorStep(long iterationId,
+			long takeCount,
+			RequestType.RequestIterate<? super Buf, T> requestType,
+			AtomicBoolean cancelled) {
+		if (cancelled.get()) {
+			return CompletableFuture.failedFuture(new CancellationException());
+		}
+		return CompletableFuture.supplyAsync(() -> {
+			if (cancelled.get()) {
+				throw new CancellationException();
+			}
+			return db.subsequent(iterationId, 0, takeCount, requestType);
+		}, db.getScheduler().readExecutor());
+	}
+
+	private CompletableFuture<Long> scheduleIteratorAdvanceStep(long iterationId,
+			long takeCount,
+			AtomicBoolean cancelled) {
+		if (cancelled.get()) {
+			return CompletableFuture.failedFuture(new CancellationException());
+		}
+		return CompletableFuture.supplyAsync(() -> {
+			if (cancelled.get()) {
+				throw new CancellationException();
+			}
+			return db.advanceIteratorInternal(iterationId, takeCount);
+		}, db.getScheduler().readExecutor());
+	}
+
+	@Override
 	public <T> T reduceRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestReduceRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
 		return db.reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+	}
+
+	@Override
+	@SuppressWarnings("unchecked")
+	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			@NotNull RequestType.RequestReduceRange<? super KV, T> requestType,
+		long timeoutMs) throws RocksDBException {
+		if (requestType instanceof RequestType.RequestEntriesCount<?>) {
+			Consumer<Throwable> lateFailureHandler = error -> logLateRangeCountFailure(
+					transactionId, columnId, reverse, timeoutMs, error);
+			return (CompletableFuture<T>) (CompletableFuture<?>) db.countRangeAsyncInternal(
+					transactionId,
+					columnId,
+					startKeysInclusive,
+					endKeysExclusive,
+					reverse,
+					timeoutMs)
+					.contextWrite(context -> context.put(
+							REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY, lateFailureHandler))
+					.toFuture();
+		}
+		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
+				transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs);
+		return supplyAsyncPreservingRunningCompletion(() -> command.handleSync(this), commandExecutor(command));
+	}
+
+	/**
+	 * Cancellation removes work that has not started, but a running native call keeps
+	 * its future observable so request-scoped transport logging can retain its real
+	 * terminal failure instead of replacing it with CancellationException.
+	 */
+	private static <T> CompletableFuture<T> supplyAsyncPreservingRunningCompletion(Supplier<T> supplier,
+			Executor executor) {
+		var future = new RunningCompletionFuture<>(supplier, executor);
+		try {
+			executor.execute(future);
+		} catch (Throwable error) {
+			future.reject(error);
+		}
+		return future;
+	}
+
+	private static void logLateRangeCountFailure(long transactionId,
+			long columnId,
+			boolean reverse,
+			long timeoutMs,
+			Throwable error) {
+		var rocksError = findRocksDBException(error);
+		if (rocksError != null) {
+			LOG.warn("Late embedded read failure after cancellation: operation=reduceRangeEntriesCount, "
+					+ "transactionId={}, columnId={}, reverse={}, timeoutMs={}, errorType={}, message={}",
+					transactionId,
+					columnId,
+					reverse,
+					timeoutMs,
+					rocksError.getErrorUniqueId(),
+					sanitizeForLog(rocksError.getMessage()));
+			LOG.debug("Late embedded read failure stack: operation=reduceRangeEntriesCount, columnId={}",
+					columnId,
+					error);
+		} else if (error instanceof CancellationException) {
+			LOG.debug("Late embedded read cancellation: operation=reduceRangeEntriesCount, columnId={}", columnId);
+		} else {
+			LOG.error("Unexpected late embedded read failure after cancellation: "
+					+ "operation=reduceRangeEntriesCount, transactionId={}, columnId={}, reverse={}, timeoutMs={}",
+					transactionId,
+					columnId,
+					reverse,
+					timeoutMs,
+					error);
+		}
+	}
+
+	private static @Nullable RocksDBException findRocksDBException(Throwable error) {
+		var current = error;
+		for (int depth = 0; current != null && depth < 32; depth++) {
+			if (current instanceof RocksDBException rocksError) {
+				return rocksError;
+			}
+			if (current.getCause() == current) {
+				break;
+			}
+			current = current.getCause();
+		}
+		return null;
+	}
+
+	private static String sanitizeForLog(@Nullable String value) {
+		if (value == null) {
+			return "<none>";
+		}
+		var sanitized = value.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n");
+		return sanitized.length() <= 256 ? sanitized : sanitized.substring(0, 253) + "...";
+	}
+
+	private static final class RunningCompletionFuture<T> extends CompletableFuture<T> implements Runnable {
+
+		private final Supplier<T> supplier;
+		private final Executor executor;
+		private final AtomicInteger state = new AtomicInteger(ASYNC_TASK_QUEUED);
+
+		private RunningCompletionFuture(Supplier<T> supplier, Executor executor) {
+			this.supplier = supplier;
+			this.executor = executor;
+		}
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			if (!state.compareAndSet(ASYNC_TASK_QUEUED, ASYNC_TASK_CANCELLED)) {
+				return false;
+			}
+			var cancelled = super.cancel(mayInterruptIfRunning);
+			if (executor instanceof ThreadPoolExecutor threadPool) {
+				threadPool.remove(this);
+			}
+			return cancelled;
+		}
+
+		@Override
+		public void run() {
+			if (!state.compareAndSet(ASYNC_TASK_QUEUED, ASYNC_TASK_RUNNING)) {
+				return;
+			}
+			try {
+				complete(supplier.get());
+			} catch (Throwable error) {
+				completeExceptionally(error);
+			} finally {
+				state.set(ASYNC_TASK_FINISHED);
+			}
+		}
+
+		private void reject(Throwable error) {
+			if (state.compareAndSet(ASYNC_TASK_QUEUED, ASYNC_TASK_FINISHED)) {
+				completeExceptionally(error);
+			}
+		}
 	}
 
 	@Override

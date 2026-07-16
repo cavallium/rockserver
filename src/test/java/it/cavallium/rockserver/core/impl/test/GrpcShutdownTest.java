@@ -1,8 +1,10 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
@@ -22,7 +24,10 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -172,6 +177,103 @@ class GrpcShutdownTest {
 		});
 	}
 
+	@Test
+	void blockedMaintenanceDoesNotDelayRemoteIteratorClose() throws Exception {
+		var client = newClient();
+		var api = client.getAsyncApi();
+		var syncApi = client.getSyncApi();
+		var colId = syncApi.createColumn("maintenance-close-col",
+				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+		syncApi.put(0,
+				colId,
+				key(1),
+				Buf.wrap(new byte[] {1}),
+				RequestType.none());
+		long iteratorId = api.openIteratorAsync(0,
+				colId,
+				new Keys(),
+				null,
+				false,
+				TimeUnit.MINUTES.toMillis(1)).get(5, TimeUnit.SECONDS);
+
+		var maintenanceStarted = new CountDownLatch(1);
+		var releaseMaintenance = new CountDownLatch(1);
+		embeddedConnection.getScheduler().maintenance().schedule(() -> {
+			maintenanceStarted.countDown();
+			try {
+				releaseMaintenance.await();
+			} catch (InterruptedException ex) {
+				Thread.currentThread().interrupt();
+			}
+		});
+		try {
+			assertTrue(maintenanceStarted.await(5, TimeUnit.SECONDS));
+			api.closeIteratorAsync(iteratorId).get(5, TimeUnit.SECONDS);
+			assertEquals(0, embeddedConnection.getInternalDB().getOpenIteratorsCount());
+			assertEquals(0L, embeddedConnection.getInternalDB().getPendingOpsCount());
+		} finally {
+			releaseMaintenance.countDown();
+		}
+	}
+
+	@Test
+	void cancelledQueuedRemoteIteratorCloseCanBeRetried() throws Exception {
+		var client = newClient();
+		var api = client.getAsyncApi();
+		var colId = client.getSyncApi().createColumn("cancelled-close-col",
+				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+		client.getSyncApi().put(0,
+				colId,
+				key(1),
+				Buf.wrap(new byte[] {1}),
+				RequestType.none());
+
+		var controlStarted = new CountDownLatch(2);
+		var releaseControl = new CountDownLatch(1);
+		var controlExecutor = assertInstanceOf(ThreadPoolExecutor.class,
+				embeddedConnection.getScheduler().controlExecutor());
+		for (int i = 0; i < 2; i++) {
+			embeddedConnection.getScheduler().control().schedule(() -> {
+				controlStarted.countDown();
+				try {
+					releaseControl.await();
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+				}
+			});
+		}
+
+		long iteratorId = 0;
+		try {
+			assertTrue(controlStarted.await(5, TimeUnit.SECONDS));
+			iteratorId = api.openIteratorAsync(0,
+					colId,
+					new Keys(),
+					null,
+					false,
+					TimeUnit.MINUTES.toMillis(1)).get(5, TimeUnit.SECONDS);
+			assertEquals(1, embeddedConnection.getInternalDB().getOpenIteratorsCount());
+			assertEquals(1, embeddedConnection.getInternalDB().getPendingOpsCount());
+
+			var close = api.closeIteratorAsync(iteratorId);
+			var queuedClose = awaitQueuedTask(controlExecutor);
+			assertTrue(close.cancel(true));
+			awaitCancelled(queuedClose);
+
+			assertTrue(api.subsequentAsync(iteratorId, 0, 1, RequestType.exists())
+					.get(5, TimeUnit.SECONDS),
+					"cancelling a queued close must leave the server registration and native iterator usable");
+			assertEquals(1, embeddedConnection.getInternalDB().getOpenIteratorsCount());
+			assertEquals(1, embeddedConnection.getInternalDB().getPendingOpsCount());
+		} finally {
+			releaseControl.countDown();
+		}
+
+		api.closeIteratorAsync(iteratorId).get(5, TimeUnit.SECONDS);
+		assertEquals(0, embeddedConnection.getInternalDB().getOpenIteratorsCount());
+		assertEquals(0, embeddedConnection.getInternalDB().getPendingOpsCount());
+	}
+
 	private GrpcConnection newClient() {
 		var client = GrpcConnection.forHostAndPort("grpc-shutdown-client",
 				new Utils.HostAndPort("127.0.0.1", grpcServer.getPort()));
@@ -184,6 +286,29 @@ class GrpcShutdownTest {
 			grpcServer.close();
 			grpcServer = null;
 		}
+	}
+
+	private static Future<?> awaitQueuedTask(ThreadPoolExecutor executor) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		do {
+			var queued = executor.getQueue().peek();
+			if (queued != null) {
+				return assertInstanceOf(Future.class, queued);
+			}
+			Thread.sleep(10);
+		} while (System.nanoTime() < deadline);
+		throw new AssertionError("remote iterator close was not queued on the blocked maintenance lane");
+	}
+
+	private static void awaitCancelled(Future<?> task) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		do {
+			if (task.isCancelled()) {
+				return;
+			}
+			Thread.sleep(10);
+		} while (System.nanoTime() < deadline);
+		throw new AssertionError("queued remote iterator close did not observe RPC cancellation");
 	}
 
 	private static Keys key(long id) {

@@ -90,14 +90,20 @@ public class LoggingClient implements RocksDBConnection {
 				logger.trace("Request input (async): {}", req);
 				var r = asyncApi.requestAsync(req);
 				return switch (req) {
-					case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ ->
-                            (ASYNC_RESULT) ((CompletableFuture<?>) r).whenComplete((result, e) -> {
+					case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> {
+						var future = (CompletableFuture<?>) r;
+						future.whenComplete((result, e) -> {
                                 if (e != null) {
                                     logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
                                 } else {
                                     logger.trace("Request executed: {}    Result: {}", req, result);
                                 }
                             });
+						// Preserve the original future's cancellation contract. In particular,
+						// running native reads may deliberately reject cancellation so their real
+						// terminal error remains observable by the transport diagnostic bridge.
+						yield r;
+					}
 					case RocksDBAPICommand.RocksDBAPICommandStream<?> _ ->
                             (ASYNC_RESULT) Flux.from((Publisher<?>) r).doOnEach(signal -> {
                                 if (signal.isOnNext()) {

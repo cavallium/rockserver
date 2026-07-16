@@ -3,7 +3,9 @@ package it.cavallium.rockserver.core.server;
 import static it.cavallium.rockserver.core.common.Utils.toByteArray;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Descriptors.FieldDescriptor;
 import com.google.protobuf.Empty;
 import com.google.protobuf.Message;
 import com.google.protobuf.UnsafeByteOperations;
@@ -63,30 +65,77 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map.Entry;
+import java.util.StringJoiner;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
-import it.cavallium.rockserver.core.common.cdc.CDCEvent;
+import reactor.util.context.ContextView;
 
 public class GrpcServer extends Server {
 
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcServer.class.getName());
 	private static final int LEGACY_GRPC_MAX_INBOUND_MESSAGE_SIZE = 4 * 1024 * 1024;
+	private static final String GRPC_LATE_ERROR_HANDLER_CONTEXT_KEY
+			= GrpcServer.class.getName() + ".lateErrorHandler";
+	private static final Object ITERATOR_OPERATION_LEASE_CONTEXT_KEY = new Object();
+	// Reactor exposes sequence-local dropped-error handling through this documented context key, while
+	// keeping Hooks.KEY_ON_ERROR_DROPPED package-private.
+	private static final String REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY = "reactor.onErrorDropped.local";
+	private static final Consumer<Throwable> UNCONTEXTUALIZED_LATE_ERROR_HANDLER
+			= GrpcServer::logUncontextualizedLateError;
 
 	private final GrpcServerImpl grpc;
 	private final EventLoopGroup elg;
 	private final io.grpc.Server server;
 	private final RWScheduler scheduler;
 	private final boolean ownsScheduler;
+
+	private static void logUncontextualizedLateError(Throwable error) {
+		var rocksError = GrpcServerImpl.findRocksDBException(error);
+		var status = Status.fromThrowable(error);
+		if (rocksError != null) {
+			var statusCode = status.getCode() == Code.UNKNOWN ? Code.INTERNAL : status.getCode();
+			LOG.warn("Late gRPC request failure after call termination without request context: "
+					+ "errorType={}, grpcStatus={}, message={}",
+					rocksError.getErrorUniqueId(),
+					statusCode,
+					GrpcServerImpl.sanitizeForLog(rocksError.getMessage()));
+			LOG.debug("Late gRPC request failure stack without request context", error);
+			return;
+		}
+		if (status.getCode() == Code.CANCELLED
+				|| error instanceof java.util.concurrent.CancellationException) {
+			LOG.debug("Late gRPC cancellation after call termination without request context: description={}",
+					GrpcServerImpl.sanitizeForLog(status.getDescription()));
+			return;
+		}
+		if (status.getCode() != Code.UNKNOWN && status.getCode() != Code.INTERNAL) {
+			LOG.warn("Late gRPC transport failure after call termination without request context: "
+					+ "grpcStatus={}, description={}",
+					status.getCode(),
+					GrpcServerImpl.sanitizeForLog(status.getDescription()));
+			LOG.debug("Late gRPC transport failure stack without request context", error);
+			return;
+		}
+		LOG.error("Unexpected late gRPC request failure after call termination; request context is unavailable",
+				error);
+	}
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
@@ -136,6 +185,11 @@ public class GrpcServer extends Server {
 		return server.getPort();
 	}
 
+	@VisibleForTesting
+	public int getActiveIteratorOperationLeaseCountForTesting() {
+		return grpc.iteratorOperations.size();
+	}
+
 	private static class GzipCompressorInterceptor implements ServerInterceptor {
 
 		@Override
@@ -150,8 +204,12 @@ public class GrpcServer extends Server {
 
 	private final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplBase {
 
+		private static final long ITERATOR_VALUE_PAGE_SIZE = 64L;
+		private static final long ITERATOR_ADVANCE_STEP_SIZE = 4_096L;
+
 		private final RocksDBAsyncAPI asyncApi;
         private final RocksDBSyncAPI api;
+		private final ConcurrentMap<Long, Object> iteratorOperations = new ConcurrentHashMap<>();
 
 		public GrpcServerImpl(RocksDBConnection client) {
 			this.asyncApi = client.getAsyncApi();
@@ -182,7 +240,7 @@ public class GrpcServer extends Server {
 			return executeSync(() -> {
 				api.closeFailedUpdate(request.getUpdateId());
 				return Empty.getDefaultInstance();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
+			}, false).transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
 		}
 
 		@Override
@@ -255,14 +313,17 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<ExistsMultiResponse> existsMulti(ExistsMultiRequest request) {
-			return executeSync(() -> ExistsMultiResponse.newBuilder()
-					.addAllPresent(api.existsMulti(request.getTransactionId(),
+			return Mono.defer(() -> {
+					var keys = request.getKeysMultiList().stream()
+							.map(keyTuple -> mapKeys(keyTuple.getKeysCount(), keyTuple::getKeys))
+							.toList();
+					return fromCancellableFuture(asyncApi.existsMultiAsync(
+							request.getTransactionId(),
 							request.getColumnId(),
-							request.getKeysMultiList().stream()
-									.map(keyTuple -> mapKeys(keyTuple.getKeysCount(), keyTuple::getKeys))
-									.toList(),
-							request.getTimeoutMs()))
-					.build(), true)
+							keys,
+							request.getTimeoutMs()));
+				})
+					.map(present -> ExistsMultiResponse.newBuilder().addAllPresent(present).build())
 					.transform(this.onErrorMapMonoWithRequestInfo("existsMulti", request));
 		}
 
@@ -835,7 +896,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<OpenIteratorResponse> openIterator(OpenIteratorRequest request) {
-			return executeSync(() -> {
+			return executeScheduled(() -> {
 				var iteratorId = api.openIterator(request.getTransactionId(),
 						request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
@@ -844,114 +905,102 @@ public class GrpcServer extends Server {
 						request.getTimeoutMs()
 				);
 				return OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
+			}, scheduler.read(), response -> {
+				long iteratorId = response.getIteratorId();
+				api.closeIterator(iteratorId);
+			}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
 		}
 
 		@Override
 		public Mono<Empty> closeIterator(CloseIteratorRequest request) {
-			return executeSync(() -> {
-				api.closeIterator(request.getIteratorId());
-				return Empty.getDefaultInstance();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("closeIterator", request));
+			return executeScheduled(() -> {
+					api.closeIterator(request.getIteratorId());
+					return Empty.getDefaultInstance();
+				}, scheduler.control())
+					.transform(this.onErrorMapMonoWithRequestInfo("closeIterator", request));
 		}
 
 		@Override
 		public Mono<Empty> seekTo(SeekToRequest request) {
-			return executeSync(() -> {
+			return withIteratorLease(request.getIterationId(), () -> executeCompositeRead(() -> {
 				api.seekTo(request.getIterationId(), mapKeys(request.getKeysCount(), request::getKeys));
 				return Empty.getDefaultInstance();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("seekTo", request));
+			})).transform(this.onErrorMapMonoWithRequestInfo("seekTo", request));
 		}
 
 		@Override
 		public Mono<Empty> subsequent(SubsequentRequest request) {
-			return executeSync(() -> {
-				api.subsequent(request.getIterationId(),
-						request.getSkipCount(),
-						request.getTakeCount(),
-						new RequestNothing<>());
-				return Empty.getDefaultInstance();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("subsequent", request));
+			return validateIteratorCounts(request)
+					.then(withIteratorLease(request.getIterationId(), () ->
+							advanceIterator(request.getIterationId(), request.getSkipCount(), request.getTakeCount())
+									.thenReturn(Empty.getDefaultInstance())))
+					.transform(this.onErrorMapMonoWithRequestInfo("subsequent", request));
 		}
 
 		@Override
 		public Mono<PreviousPresence> subsequentExists(SubsequentRequest request) {
-			return executeSync(() -> {
-				var exists = api.subsequent(request.getIterationId(),
-						request.getSkipCount(),
-						request.getTakeCount(),
-						new RequestExists<>());
-				return PreviousPresence.newBuilder().setPresent(exists).build();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("subsequentExists", request));
+			return validateIteratorCounts(request)
+					.then(withIteratorLease(request.getIterationId(), () ->
+							advanceIterator(request.getIterationId(), request.getSkipCount(), 0)
+									.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_ADVANCE_STEP_SIZE))
+									.concatMap(take -> executeCompositeRead(() -> api.subsequent(
+											request.getIterationId(), 0, take, new RequestExists<>())), 1)
+									.takeUntil(found -> !found)
+									.reduce(false, (found, pageFound) -> found || pageFound)
+									.map(found -> PreviousPresence.newBuilder().setPresent(found).build())))
+					.transform(this.onErrorMapMonoWithRequestInfo("subsequentExists", request));
 		}
 
 		@Override
 		public Flux<KV> subsequentMultiGet(SubsequentRequest request) {
-			return Flux.<KV>create(emitter -> {
-				if (request.getSkipCount() < 0 || request.getTakeCount() < 0) {
-					emitter.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-							"Iterator skip and take counts must be non-negative"));
-					return;
-				}
-				long pageIndex = 0;
-				final long pageSize = 16L;
-				while (request.getTakeCount() > pageIndex * pageSize) {
-					var response = api.subsequent(request.getIterationId(),
-							pageIndex == 0 ? request.getSkipCount() : 0,
-							Math.min(request.getTakeCount() - pageIndex * pageSize, pageSize),
-							new RequestMulti<>()
-					);
-					for (Buf entry : response) {
-						emitter.next(KV.newBuilder()
-								.setValue(Utils.toByteString(entry))
-								.build());
-					}
-					if (response.size() < Math.min(request.getTakeCount() - pageIndex * pageSize, pageSize)) {
-						break;
-					}
-					pageIndex++;
-				}
-				emitter.complete();
-			}, FluxSink.OverflowStrategy.BUFFER)
-					.subscribeOn(GrpcServer.this.scheduler.read())
+			return validateIteratorCounts(request)
+					.thenMany(withIteratorFluxLease(request.getIterationId(), () ->
+							advanceIterator(request.getIterationId(), request.getSkipCount(), 0)
+									.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_VALUE_PAGE_SIZE)
+											.concatMap(take -> executeCompositeRead(() -> api.subsequent(
+													request.getIterationId(), 0, take, new RequestMulti<>())), 1)
+											.takeUntil(values -> values.size() < ITERATOR_VALUE_PAGE_SIZE)
+											.concatMapIterable(Function.identity(), 1)
+											.map(entry -> KV.newBuilder()
+													.setValue(Utils.toByteString(entry))
+													.build()))))
 					.transform(this.onErrorMapFluxWithRequestInfo("subsequentMultiGet", request));
 		}
 
 		@Override
 		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
-			return executeSync(() -> {
-				var firstAndLast = api.reduceRange(request.getTransactionId(), request.getColumnId(),
+			return Mono.defer(() -> fromCancellableFuture(asyncApi.reduceRangeAsync(
+						request.getTransactionId(),
+						request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
 						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 						request.getReverse(),
 						RequestType.firstAndLast(),
-						request.getTimeoutMs()
-				);
-				var resultBuilder = FirstAndLast.newBuilder();
-				if (firstAndLast.first() != null) {
-					resultBuilder.setFirst(unmapKVHeap(firstAndLast.first()));
-				}
-				if (firstAndLast.last() != null) {
-					resultBuilder.setLast(unmapKVHeap(firstAndLast.last()));
-				}
-				return resultBuilder.build();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeFirstAndLast", request));
+						request.getTimeoutMs())))
+					.map(range -> {
+						if (range.first() == null || range.last() == null) {
+							return FirstAndLast.getDefaultInstance();
+						}
+						return FirstAndLast.newBuilder()
+								.setFirst(unmapKVHeap(range.first()))
+								.setLast(unmapKVHeap(range.last()))
+								.build();
+					})
+					.transform(this.onErrorMapMonoWithRequestInfo("reduceRangeFirstAndLast", request));
 		}
 
 		@Override
 		public Mono<EntriesCount> reduceRangeEntriesCount(GetRangeRequest request) {
-			return executeSync(() -> {
-				long entriesCount
-						= api.reduceRange(request.getTransactionId(),
+			return Mono.defer(() -> fromCancellableFuture(asyncApi.reduceRangeAsync(
+						request.getTransactionId(),
 						request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
 						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 						request.getReverse(),
 						RequestType.entriesCount(),
-						request.getTimeoutMs()
-				);
-				return EntriesCount.newBuilder().setCount(entriesCount).build();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("reduceRangeEntriesCount", request));
+						request.getTimeoutMs())))
+					.map(count -> EntriesCount.newBuilder().setCount(count).build())
+					.transform(this.onErrorMapMonoWithRequestInfo("reduceRangeEntriesCount", request));
 		}
 
 		@Override
@@ -968,23 +1017,22 @@ public class GrpcServer extends Server {
 				RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV,
 						it.cavallium.rockserver.core.common.KV> requestType,
 				String requestName) {
-			return Flux
+			return Flux.defer(() -> Flux
 					.from(asyncApi.getRangeAsync(request.getTransactionId(),
 							request.getColumnId(),
 							mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
 							mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 							request.getReverse(),
 							requestType,
-							request.getTimeoutMs()
-					))
+							request.getTimeoutMs())))
 					.map(GrpcServerImpl::unmapKVHeap)
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, request));
 		}
 
 		@Override
 		public Flux<it.cavallium.rockserver.core.common.api.proto.ScanRawResponse> scanRaw(ScanRawRequest request) {
-			return Flux
-					.from(asyncApi.scanRawAsync(request.getColumnId(), request.getShardIndex(), request.getShardCount()))
+			return Flux.defer(() -> Flux
+					.from(asyncApi.scanRawAsync(request.getColumnId(), request.getShardIndex(), request.getShardCount())))
 					.map(batch -> {
 						var builder = it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder();
 						var serializedBatchValue = UnsafeByteOperations.unsafeWrap(
@@ -1001,18 +1049,18 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> flush(FlushRequest request) {
-			return executeSync(() -> {
+			return executeScheduled(() -> {
 				api.flush();
 				return Empty.getDefaultInstance();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("flush", request));
+			}, scheduler.maintenance()).transform(this.onErrorMapMonoWithRequestInfo("flush", request));
 		}
 
 		@Override
 		public Mono<Empty> compact(CompactRequest request) {
-			return executeSync(() -> {
+			return executeScheduled(() -> {
 				api.compact();
 				return Empty.getDefaultInstance();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("compact", request));
+			}, scheduler.maintenance()).transform(this.onErrorMapMonoWithRequestInfo("compact", request));
 		}
 
 		@Override
@@ -1116,37 +1164,510 @@ public class GrpcServer extends Server {
 		// utils
 
 		private <T> Mono<T> executeSync(Callable<T> callable, boolean isReadOnly) {
-			return Mono.fromCallable(callable).subscribeOn(isReadOnly ? scheduler.read() : scheduler.write());
+			return executeScheduled(callable, isReadOnly ? scheduler.interactiveRead() : scheduler.write());
+		}
+
+		private <T> Mono<T> executeCompositeRead(Callable<T> callable) {
+			return executeScheduled(callable, scheduler.read());
+		}
+
+		private Mono<Void> validateIteratorCounts(SubsequentRequest request) {
+			if (request.getSkipCount() < 0 || request.getTakeCount() < 0) {
+				return Mono.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Iterator skip and take counts must be non-negative"));
+			}
+			return Mono.empty();
+		}
+
+		private Flux<Long> iteratorChunks(long count, long stepSize) {
+			return Flux.generate(() -> count, (remaining, sink) -> {
+				if (remaining <= 0) {
+					sink.complete();
+					return 0L;
+				}
+				long chunk = Math.min(remaining, stepSize);
+				sink.next(chunk);
+				return remaining - chunk;
+			});
+		}
+
+		private Mono<Void> advanceIterator(long iteratorId, long skipCount, long takeCount) {
+			return advanceIteratorPart(iteratorId, skipCount)
+					.then(advanceIteratorPart(iteratorId, takeCount));
+		}
+
+		private Mono<Void> advanceIteratorPart(long iteratorId, long count) {
+			return iteratorChunks(count, ITERATOR_ADVANCE_STEP_SIZE)
+					.concatMap(step -> executeCompositeRead(() -> api.subsequent(
+							iteratorId, 0, step, new RequestExists<>())), 1)
+					.takeUntil(found -> !found)
+					.then();
+		}
+
+		private <T> Mono<T> withIteratorLease(long iteratorId, Supplier<Mono<T>> operation) {
+			return Mono.defer(() -> {
+				var lease = new IteratorOperationLease(iteratorId);
+				if (iteratorOperations.putIfAbsent(iteratorId, lease) != null) {
+					return Mono.error(concurrentIteratorOperation(iteratorId));
+				}
+				try {
+					return operation.get()
+							.doFinally(_ -> lease.operationTerminated())
+							.contextWrite(context -> context.put(ITERATOR_OPERATION_LEASE_CONTEXT_KEY, lease));
+				} catch (Throwable error) {
+					lease.operationTerminated();
+					return Mono.error(error);
+				}
+			});
+		}
+
+		private <T> Flux<T> withIteratorFluxLease(long iteratorId, Supplier<Flux<T>> operation) {
+			return Flux.defer(() -> {
+				var lease = new IteratorOperationLease(iteratorId);
+				if (iteratorOperations.putIfAbsent(iteratorId, lease) != null) {
+					return Flux.error(concurrentIteratorOperation(iteratorId));
+				}
+				try {
+					return operation.get()
+							.doFinally(_ -> lease.operationTerminated())
+							.contextWrite(context -> context.put(ITERATOR_OPERATION_LEASE_CONTEXT_KEY, lease));
+				} catch (Throwable error) {
+					lease.operationTerminated();
+					return Flux.error(error);
+				}
+			});
+		}
+
+		/**
+		 * A subscriber owns the iterator lease until it terminates and every native task that
+		 * it started has actually returned. Cancelling an RPC can interrupt a RocksDB call,
+		 * but JNI is allowed to keep running until its own deadline; releasing the lease from
+		 * {@code doFinally(CANCEL)} alone would then admit a concurrent operation on the same
+		 * native iterator.
+		 */
+		private final class IteratorOperationLease {
+
+			private static final int OPERATION_TERMINATED = 1 << 31;
+			private static final int ACTIVE_TASKS_MASK = Integer.MAX_VALUE;
+
+			private final long iteratorId;
+			private final AtomicInteger state = new AtomicInteger();
+
+			private IteratorOperationLease(long iteratorId) {
+				this.iteratorId = iteratorId;
+			}
+
+			private boolean registerTask() {
+				while (true) {
+					int current = state.get();
+					if ((current & OPERATION_TERMINATED) != 0) {
+						return false;
+					}
+					if ((current & ACTIVE_TASKS_MASK) == ACTIVE_TASKS_MASK) {
+						throw new IllegalStateException("Too many active iterator tasks");
+					}
+					if (state.compareAndSet(current, current + 1)) {
+						return true;
+					}
+				}
+			}
+
+			private void taskTerminated() {
+				while (true) {
+					int current = state.get();
+					int activeTasks = current & ACTIVE_TASKS_MASK;
+					if (activeTasks == 0) {
+						throw new IllegalStateException("Iterator task accounting underflow");
+					}
+					int updated = (current & OPERATION_TERMINATED) | (activeTasks - 1);
+					if (state.compareAndSet(current, updated)) {
+						if (updated == OPERATION_TERMINATED) {
+							iteratorOperations.remove(iteratorId, this);
+						}
+						return;
+					}
+				}
+			}
+
+			private void operationTerminated() {
+				while (true) {
+					int current = state.get();
+					if ((current & OPERATION_TERMINATED) != 0) {
+						return;
+					}
+					int updated = current | OPERATION_TERMINATED;
+					if (state.compareAndSet(current, updated)) {
+						if (updated == OPERATION_TERMINATED) {
+							iteratorOperations.remove(iteratorId, this);
+						}
+						return;
+					}
+				}
+			}
+		}
+
+		/** Tracks whether cancellation won before a scheduled callable began running. */
+		private final class ScheduledTaskLifecycle {
+
+			private static final int QUEUED = 0;
+			private static final int RUNNING = 1;
+			private static final int TERMINATED = 2;
+
+			private final IteratorOperationLease iteratorLease;
+			private final AtomicInteger state = new AtomicInteger(QUEUED);
+
+			private ScheduledTaskLifecycle(IteratorOperationLease iteratorLease) {
+				this.iteratorLease = iteratorLease;
+			}
+
+			private boolean start() {
+				return state.compareAndSet(QUEUED, RUNNING);
+			}
+
+			private void cancelBeforeStart() {
+				if (state.compareAndSet(QUEUED, TERMINATED)) {
+					taskTerminated();
+				}
+			}
+
+			private void runningTaskTerminated() {
+				if (!state.compareAndSet(RUNNING, TERMINATED)) {
+					throw new IllegalStateException("Scheduled task did not terminate from running state");
+				}
+				taskTerminated();
+			}
+
+			private void taskTerminated() {
+				iteratorLease.taskTerminated();
+			}
+		}
+
+		private RocksDBException concurrentIteratorOperation(long iteratorId) {
+			return RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Concurrent operation on iterator " + iteratorId + " is not supported");
+		}
+
+		/**
+		 * Bridge an externally-owned future without delivering its terminal signal after
+		 * the RPC has been cancelled. Native calls may finish after cancellation; their
+		 * late failures still go through the request-scoped diagnostic handler instead of
+		 * Reactor's global onErrorDropped hook.
+		 */
+		private <T> Mono<T> fromCancellableFuture(CompletableFuture<T> future) {
+			return Mono.create(sink -> {
+				var emissionLock = new Object();
+				var cancelled = new AtomicBoolean();
+				sink.onCancel(() -> {
+					synchronized (emissionLock) {
+						cancelled.set(true);
+					}
+					future.cancel(true);
+				});
+				future.whenComplete((value, failure) -> {
+					Throwable error = failure instanceof CompletionException completionError
+							&& completionError.getCause() != null
+							? completionError.getCause()
+							: failure;
+					boolean late;
+					synchronized (emissionLock) {
+						late = cancelled.get();
+						if (!late) {
+							if (error != null) {
+								sink.error(error);
+							} else {
+								sink.success(value);
+							}
+						}
+					}
+					if (late && error != null && !(error instanceof java.util.concurrent.CancellationException)) {
+						lateErrorHandler(sink.contextView()).accept(error);
+					}
+				});
+			});
+		}
+
+		private <T> Mono<T> executeScheduled(Callable<T> callable, reactor.core.scheduler.Scheduler executionScheduler) {
+			return executeScheduled(callable, executionScheduler, null, null);
+		}
+
+		private <T> Mono<T> executeScheduled(Callable<T> callable,
+				reactor.core.scheduler.Scheduler executionScheduler,
+				@Nullable Consumer<T> lateSuccessCleanup,
+				@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler) {
+			return Mono.deferContextual(contextView -> {
+				var iteratorLease = contextView.<IteratorOperationLease>getOrDefault(
+						ITERATOR_OPERATION_LEASE_CONTEXT_KEY, null);
+				ScheduledTaskLifecycle taskLifecycle;
+				if (iteratorLease != null) {
+					if (!iteratorLease.registerTask()) {
+						return Mono.error(new java.util.concurrent.CancellationException(
+								"Iterator operation terminated before its task could be scheduled"));
+					}
+					taskLifecycle = new ScheduledTaskLifecycle(iteratorLease);
+				} else {
+					taskLifecycle = null;
+				}
+				return Mono.<T>create(sink -> {
+					var emissionLock = new Object();
+					var cancelled = new AtomicBoolean();
+					var task = Disposables.swap();
+
+					// RocksDB JNI calls may keep running after interruption until their native deadline. Serialize
+					// cancellation with terminal delivery so a late native error is not emitted to an already-cancelled
+					// gRPC subscriber (which Reactor would otherwise report through onErrorDropped).
+					sink.onCancel(() -> {
+						synchronized (emissionLock) {
+							cancelled.set(true);
+						}
+						if (taskLifecycle != null) {
+							taskLifecycle.cancelBeforeStart();
+						}
+						task.dispose();
+					});
+
+					try {
+						task.replace(executionScheduler.schedule(() -> {
+							if (taskLifecycle != null && !taskLifecycle.start()) {
+								return;
+							}
+							try {
+								var result = callable.call();
+								boolean lateSuccess;
+								synchronized (emissionLock) {
+									lateSuccess = cancelled.get();
+									if (!lateSuccess) {
+										sink.success(result);
+									}
+								}
+								if (lateSuccess && lateSuccessCleanup != null) {
+									Runnable cleanup = () -> {
+										try {
+											lateSuccessCleanup.accept(result);
+										} catch (Throwable cleanupError) {
+											lateErrorHandler(sink.contextView()).accept(cleanupError);
+										}
+									};
+									try {
+										if (lateSuccessCleanupScheduler != null) {
+											lateSuccessCleanupScheduler.schedule(cleanup);
+										} else {
+											cleanup.run();
+										}
+									} catch (Throwable schedulingError) {
+										LOG.debug("Late-success cleanup scheduler rejected the task; "
+												+ "running iterator cleanup inline", schedulingError);
+										cleanup.run();
+									}
+								}
+							} catch (Throwable error) {
+								boolean lateError;
+								synchronized (emissionLock) {
+									lateError = cancelled.get();
+									if (!lateError) {
+										sink.error(error);
+									}
+								}
+								if (lateError) {
+									lateErrorHandler(sink.contextView()).accept(error);
+								}
+							} finally {
+								if (taskLifecycle != null) {
+									taskLifecycle.runningTaskTerminated();
+								}
+							}
+						}));
+					} catch (Throwable schedulingError) {
+						if (taskLifecycle != null) {
+							taskLifecycle.cancelBeforeStart();
+						}
+						boolean lateError;
+						synchronized (emissionLock) {
+							lateError = cancelled.get();
+							if (!lateError) {
+								sink.error(schedulingError);
+							}
+						}
+						if (lateError) {
+							lateErrorHandler(sink.contextView()).accept(schedulingError);
+						}
+					}
+				});
+			});
 		}
 
 		// mappers
 
 		private <T> Function<Flux<T>, Flux<T>> onErrorMapFluxWithRequestInfo(String requestName, Message request) {
-			return flux -> flux.onErrorResume(throwable -> {
-				var ex = handleError(throwable).asException();
-				if (ex.getStatus().getCode() == Code.INTERNAL && !(throwable instanceof RocksDBException)) {
-					LOG.error("Unexpected internal error during request \"{}\": {}", requestName, request.toString(), ex);
-					return Mono.error(RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex.getCause()));
-				}
-				return Mono.error(ex);
-			});
+			return flux -> {
+				var lateErrorHandler = lateRequestErrorHandler(requestName, request);
+				return flux
+						.onErrorResume(throwable -> Mono.error(mapRequestError(requestName, request, throwable)))
+						.contextWrite(context -> context
+								.put(GRPC_LATE_ERROR_HANDLER_CONTEXT_KEY, lateErrorHandler)
+								.put(REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY, lateErrorHandler));
+			};
 		}
 
 		private <T> Function<Mono<T>, Mono<T>> onErrorMapMonoWithRequestInfo(String requestName, Message request) {
-			return flux -> flux.onErrorResume(throwable -> {
-				var ex = handleError(throwable).asException();
-				if (ex.getStatus().getCode() == Code.INTERNAL && !(throwable instanceof RocksDBException)) {
-					LOG.error("Unexpected internal error during request \"{}\": {}", requestName, request.toString(), ex);
-					return Mono.error(RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex.getCause()));
+			return mono -> {
+				var lateErrorHandler = lateRequestErrorHandler(requestName, request);
+				return mono
+						.onErrorResume(throwable -> Mono.error(mapRequestError(requestName, request, throwable)))
+						.contextWrite(context -> context
+								.put(GRPC_LATE_ERROR_HANDLER_CONTEXT_KEY, lateErrorHandler)
+								.put(REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY, lateErrorHandler));
+			};
+		}
+
+		private Throwable mapRequestError(String requestName, Message request, Throwable throwable) {
+			var ex = handleError(throwable).asException();
+			if (ex.getStatus().getCode() == Code.INTERNAL && findRocksDBException(throwable) == null) {
+				LOG.error("Unexpected internal gRPC request failure: operation={}, requestType={}, request={}",
+						requestName,
+						request.getDescriptorForType().getFullName(),
+						summarizeRequest(request),
+						throwable);
+				return RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+						ex.getCause() != null ? ex.getCause() : throwable);
+			}
+			return ex;
+		}
+
+		private static Consumer<Throwable> lateErrorHandler(ContextView context) {
+			return context.getOrDefault(GRPC_LATE_ERROR_HANDLER_CONTEXT_KEY,
+					UNCONTEXTUALIZED_LATE_ERROR_HANDLER);
+		}
+
+		private static Consumer<Throwable> lateRequestErrorHandler(String requestName, Message request) {
+			return error -> logLateRequestError(requestName, request, error);
+		}
+
+		private static void logLateRequestError(String requestName, Message request, Throwable error) {
+			var requestType = request.getDescriptorForType().getFullName();
+			var requestSummary = summarizeRequest(request);
+			var rocksDBException = findRocksDBException(error);
+			var status = Status.fromThrowable(error);
+
+			if (rocksDBException != null) {
+				var statusCode = status.getCode() == Code.UNKNOWN ? Code.INTERNAL : status.getCode();
+				LOG.warn("Late gRPC request failure after call termination: operation={}, requestType={}, "
+						+ "request={}, errorType={}, grpcStatus={}, message={}",
+						requestName,
+						requestType,
+						requestSummary,
+						rocksDBException.getErrorUniqueId(),
+						statusCode,
+						sanitizeForLog(rocksDBException.getMessage()));
+				LOG.debug("Late gRPC request failure stack: operation={}, requestType={}",
+						requestName,
+						requestType,
+						error);
+				return;
+			}
+
+			if (status.getCode() == Code.CANCELLED
+					|| error instanceof java.util.concurrent.CancellationException) {
+				LOG.debug("Late gRPC cancellation after call termination: operation={}, requestType={}, request={}, "
+						+ "description={}",
+						requestName,
+						requestType,
+						requestSummary,
+						sanitizeForLog(status.getDescription()));
+				return;
+			}
+
+			if (status.getCode() != Code.UNKNOWN && status.getCode() != Code.INTERNAL) {
+				LOG.warn("Late gRPC transport failure after call termination: operation={}, requestType={}, request={}, "
+						+ "grpcStatus={}, description={}",
+						requestName,
+						requestType,
+						requestSummary,
+						status.getCode(),
+						sanitizeForLog(status.getDescription()));
+				LOG.debug("Late gRPC transport failure stack: operation={}, requestType={}",
+						requestName,
+						requestType,
+						error);
+				return;
+			}
+
+			LOG.error("Unexpected late gRPC request failure after call termination: operation={}, requestType={}, "
+					+ "request={}, grpcStatus={}, description={}",
+					requestName,
+					requestType,
+					requestSummary,
+					status.getCode(),
+					sanitizeForLog(status.getDescription()),
+					error);
+		}
+
+		@Nullable
+		private static RocksDBException findRocksDBException(Throwable error) {
+			var current = error;
+			for (int depth = 0; current != null && depth < 32; depth++) {
+				if (current instanceof RocksDBException rocksDBException) {
+					return rocksDBException;
 				}
-				return Mono.error(ex);
-			});
+				var cause = current.getCause();
+				if (cause == current) {
+					break;
+				}
+				current = cause;
+			}
+			return null;
+		}
+
+		private static String summarizeRequest(Message request) {
+			try {
+				return summarizeMessage(request, 0);
+			} catch (Throwable summaryError) {
+				return "{summaryUnavailable=" + summaryError.getClass().getSimpleName() + "}";
+			}
+		}
+
+		private static String summarizeMessage(Message message, int depth) {
+			var fields = new StringJoiner(", ", "{", "}");
+			for (FieldDescriptor field : message.getDescriptorForType().getFields()) {
+				var fieldName = field.getJsonName();
+				var value = message.getField(field);
+				if (field.isRepeated()) {
+					fields.add(fieldName + ".count=" + ((List<?>) value).size());
+					continue;
+				}
+				if (field.hasPresence() && !message.hasField(field)) {
+					continue;
+				}
+				fields.add(fieldName + "=" + summarizeFieldValue(field, value, depth));
+			}
+			return fields.toString();
+		}
+
+		private static String summarizeFieldValue(FieldDescriptor field, Object value, int depth) {
+			return switch (field.getJavaType()) {
+				case BYTE_STRING -> "bytes(" + ((ByteString) value).size() + ")";
+				case MESSAGE -> depth < 1
+						? summarizeMessage((Message) value, depth + 1)
+						: "message(" + ((Message) value).getDescriptorForType().getFullName() + ")";
+				case STRING -> "\"" + sanitizeForLog(String.valueOf(value)) + "\"";
+				default -> String.valueOf(value);
+			};
+		}
+
+		private static String sanitizeForLog(@Nullable String value) {
+			if (value == null) {
+				return "<none>";
+			}
+			var sanitized = value
+					.replace("\\", "\\\\")
+					.replace("\r", "\\r")
+					.replace("\n", "\\n");
+			return sanitized.length() <= 256 ? sanitized : sanitized.substring(0, 253) + "...";
 		}
 
 		@Override
 		protected Throwable onErrorMap(Throwable throwable) {
 			var ex = handleError(throwable).asException();
-			if (ex.getStatus().getCode() == Code.INTERNAL && !(throwable.getCause() instanceof RocksDBException)) {
+			if (ex.getStatus().getCode() == Code.INTERNAL && findRocksDBException(throwable) == null) {
 				LOG.error("Unexpected internal error during request", ex);
 			}
 			return ex;
@@ -1326,7 +1847,6 @@ public class GrpcServer extends Server {
 
 		private static Status handleError(Throwable ex) {
 			if (ex instanceof StatusRuntimeException e && e.getStatus().getCode().equals(Status.CANCELLED.getCode())) {
-				LOG.warn("Connection cancelled: {}", e.getStatus().getDescription());
 				return e.getStatus();
 			}
 
