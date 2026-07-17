@@ -1196,7 +1196,6 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	private static Throwable mapGrpcStatusError(@NotNull Throwable t) {
 		if (t instanceof StatusRuntimeException statusRuntimeException
-				&& statusRuntimeException.getStatus().getCode() == Code.INTERNAL
 				&& statusRuntimeException.getStatus().getDescription() != null
 				&& statusRuntimeException.getStatus().getDescription().startsWith(grpcRocksDbErrorPrefixString)) {
 			var desc = statusRuntimeException.getStatus().getDescription();

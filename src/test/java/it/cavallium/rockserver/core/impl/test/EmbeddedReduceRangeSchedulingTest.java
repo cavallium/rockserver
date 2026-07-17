@@ -24,6 +24,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -43,6 +44,31 @@ class EmbeddedReduceRangeSchedulingTest {
 
 		assertEquals(RocksDBAPICommand.ReadWorkClass.INTERACTIVE, firstAndLast.readWorkClass());
 		assertEquals(RocksDBAPICommand.ReadWorkClass.COMPOSITE, entriesCount.readWorkClass());
+	}
+
+	@Test
+	void firstAndLastUsesAsyncIoForManySstSeekFanout() throws Exception {
+		var configFile = tempDir.resolve("range-async-io.conf");
+		Files.writeString(configFile, """
+				database: {
+				  parallelism: { read: 1, write: 1 }
+				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
+				}
+				""");
+		try (var connection = new EmbeddedConnection(tempDir.resolve("async-io-db"), "range-async-io", configFile)) {
+			var api = connection.getSyncApi();
+			long columnId = api.createColumn("entries",
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			var observedAsyncIo = new AtomicReference<Boolean>();
+			connection.getInternalDB().setReduceRangeAsyncIoObserverForTesting(observedAsyncIo::set);
+			try {
+				api.reduceRange(0, columnId, null, null, false, RequestType.firstAndLast(), 1_000);
+				assertEquals(Boolean.TRUE, observedAsyncIo.get(),
+						"endpoint seeks must submit SST child reads concurrently");
+			} finally {
+				connection.getInternalDB().setReduceRangeAsyncIoObserverForTesting(null);
+			}
+		}
 	}
 
 	@Test

@@ -64,6 +64,7 @@ class GrpcServerDeadlineErrorTest {
 
 	@Test
 	void cancelledUnaryCallDoesNotDropLateNativeDeadlineError() throws Exception {
+		GrpcServer.clearLateReadDeadlineLogStatesForTesting();
 		var backend = new BlockingDeadlineBackendConnection();
 		var droppedError = new AtomicReference<Throwable>();
 		var lateWarning = new AtomicReference<LogCall>();
@@ -100,7 +101,7 @@ class GrpcServerDeadlineErrorTest {
 				assertTrue(warning.arguments().get(1).toString().endsWith(".GetRangeRequest"));
 				assertTrue(warning.arguments().get(2).toString().contains("timeoutMs=1000"));
 				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, warning.arguments().get(3));
-				assertEquals(io.grpc.Status.Code.INTERNAL, warning.arguments().get(4));
+				assertEquals(io.grpc.Status.Code.DEADLINE_EXCEEDED, warning.arguments().get(4));
 				assertEquals("Deadline exceeded", warning.arguments().get(5));
 			}
 		} finally {

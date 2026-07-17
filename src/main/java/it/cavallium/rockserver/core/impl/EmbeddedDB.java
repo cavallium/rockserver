@@ -204,6 +204,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final @Nullable FFMRocksDBGet fastGetReader;
 	private final LongAdder fastGetNativeErrorFallbacks = new LongAdder();
 	private volatile @Nullable Consumer<Boolean> rangeReadOptionsObserver;
+	private volatile @Nullable Consumer<Boolean> reduceRangeAsyncIoObserver;
 	private volatile @Nullable Runnable rangeIteratorOpenObserver;
 	private volatile @Nullable Consumer<Integer> rangeReadChunkSizeObserver;
 	private volatile @Nullable Runnable rangeCountChunkObserver;
@@ -1166,12 +1167,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private ReadOptions newReadOptions(String label) {
-		return newReadOptions(label, true);
-	}
-
-	private ReadOptions newReadOptions(String label, boolean asyncIo) {
 		var ro = new LeakSafeReadOptions(label);
-		ro.setAsyncIo(asyncIo);
+		ro.setAsyncIo(true);
 		return ro;
 	}
 
@@ -1203,6 +1200,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setRangeReadOptionsObserverForTesting(@Nullable Consumer<Boolean> observer) {
 		this.rangeReadOptionsObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setReduceRangeAsyncIoObserverForTesting(@Nullable Consumer<Boolean> observer) {
+		this.reduceRangeAsyncIoObserver = observer;
 	}
 
 	@VisibleForTesting
@@ -4508,12 +4510,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var col = getColumn(columnId);
 
 
-			// async_io pipelines sequential iterator reads, which helps full scans but adds
-			// an extra asynchronous read hand-off to the two independent endpoint seeks.
-			// Keep it for entries-count scans and use the low-latency synchronous seek path
-			// for first/last lookups such as ChatExtremes.
-			boolean asyncIo = requestType instanceof RequestEntriesCount<?>;
-			try (var ro = newReadOptions(null, asyncIo)) {
+			// A bounded endpoint seek still fans out to every relevant RocksDB merge child.
+			// With many SSTs, async_io lets RocksDB submit those child reads together before
+			// polling them; disabling it serializes cold index/data-block misses.
+			try (var ro = newReadOptions(null)) {
+				var asyncIoObserver = reduceRangeAsyncIoObserver;
+				if (asyncIoObserver != null) {
+					asyncIoObserver.accept(ro.asyncIo());
+				}
 				ro.setDeadline(readDeadlineMicros(timeoutMs));
 				Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(
 						startKeysInclusive.keys()) : null;

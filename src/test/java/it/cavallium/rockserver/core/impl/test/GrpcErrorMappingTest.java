@@ -141,7 +141,7 @@ class GrpcErrorMappingTest {
 				case "valid" -> Status.INTERNAL
 						.withDescription(ERROR_PREFIX + "COLUMN_NOT_FOUND] missing column")
 						.asRuntimeException();
-				case "read-deadline" -> Status.INTERNAL
+				case "read-deadline" -> Status.DEADLINE_EXCEEDED
 						.withDescription(ERROR_PREFIX + "READ_DEADLINE_EXCEEDED] Deadline exceeded")
 						.asRuntimeException();
 				case "get-deadline-text" -> Status.INTERNAL

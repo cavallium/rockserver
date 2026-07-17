@@ -75,6 +75,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -101,6 +102,9 @@ public class GrpcServer extends Server {
 	private static final String REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY = "reactor.onErrorDropped.local";
 	private static final Consumer<Throwable> UNCONTEXTUALIZED_LATE_ERROR_HANDLER
 			= GrpcServer::logUncontextualizedLateError;
+	private static final long LATE_READ_DEADLINE_LOG_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
+	private static final ConcurrentMap<String, LateReadDeadlineLogState> LATE_READ_DEADLINE_LOG_STATES
+			= new ConcurrentHashMap<>();
 
 	private final GrpcServerImpl grpc;
 	private final EventLoopGroup elg;
@@ -112,12 +116,27 @@ public class GrpcServer extends Server {
 		var rocksError = GrpcServerImpl.findRocksDBException(error);
 		var status = Status.fromThrowable(error);
 		if (rocksError != null) {
-			var statusCode = status.getCode() == Code.UNKNOWN ? Code.INTERNAL : status.getCode();
-			LOG.warn("Late gRPC request failure after call termination without request context: "
-					+ "errorType={}, grpcStatus={}, message={}",
-					rocksError.getErrorUniqueId(),
-					statusCode,
-					GrpcServerImpl.sanitizeForLog(rocksError.getMessage()));
+			var statusCode = lateErrorStatusCode(status, rocksError);
+			Long suppressed = rocksError.getErrorUniqueId() == RocksDBErrorType.READ_DEADLINE_EXCEEDED
+					? claimLateReadDeadlineLog("<uncontextualized>")
+					: 0L;
+			if (suppressed == null) {
+				return;
+			}
+			if (suppressed == 0L) {
+				LOG.warn("Late gRPC request failure after call termination without request context: "
+						+ "errorType={}, grpcStatus={}, message={}",
+						rocksError.getErrorUniqueId(),
+						statusCode,
+						GrpcServerImpl.sanitizeForLog(rocksError.getMessage()));
+			} else {
+				LOG.warn("Late gRPC request failure after call termination without request context: "
+						+ "errorType={}, grpcStatus={}, message={}, suppressedSimilarFailures={}",
+						rocksError.getErrorUniqueId(),
+						statusCode,
+						GrpcServerImpl.sanitizeForLog(rocksError.getMessage()),
+						suppressed);
+			}
 			LOG.debug("Late gRPC request failure stack without request context", error);
 			return;
 		}
@@ -137,6 +156,32 @@ public class GrpcServer extends Server {
 		}
 		LOG.error("Unexpected late gRPC request failure after call termination; request context is unavailable",
 				error);
+	}
+
+	private static @Nullable Long claimLateReadDeadlineLog(String operation) {
+		var state = LATE_READ_DEADLINE_LOG_STATES.computeIfAbsent(operation,
+				_ -> new LateReadDeadlineLogState());
+		long now = System.nanoTime();
+		long previous = state.lastLogNanos.get();
+		if ((previous == 0L || now - previous >= LATE_READ_DEADLINE_LOG_INTERVAL_NANOS)
+				&& state.lastLogNanos.compareAndSet(previous, now)) {
+			return state.suppressed.getAndSet(0L);
+		}
+		state.suppressed.incrementAndGet();
+		return null;
+	}
+
+	private static Code lateErrorStatusCode(Status status, RocksDBException rocksError) {
+		if (rocksError.getErrorUniqueId() == RocksDBErrorType.READ_DEADLINE_EXCEEDED) {
+			return Code.DEADLINE_EXCEEDED;
+		}
+		return status.getCode() == Code.UNKNOWN ? Code.INTERNAL : status.getCode();
+	}
+
+	private static final class LateReadDeadlineLogState {
+
+		private final AtomicLong lastLogNanos = new AtomicLong();
+		private final AtomicLong suppressed = new AtomicLong();
 	}
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
@@ -190,6 +235,11 @@ public class GrpcServer extends Server {
 	@VisibleForTesting
 	public int getActiveIteratorOperationLeaseCountForTesting() {
 		return grpc.iteratorOperations.size();
+	}
+
+	@VisibleForTesting
+	public static void clearLateReadDeadlineLogStatesForTesting() {
+		LATE_READ_DEADLINE_LOG_STATES.clear();
 	}
 
 	private static class GzipCompressorInterceptor implements ServerInterceptor {
@@ -1564,15 +1614,33 @@ public class GrpcServer extends Server {
 			var status = Status.fromThrowable(error);
 
 			if (rocksDBException != null) {
-				var statusCode = status.getCode() == Code.UNKNOWN ? Code.INTERNAL : status.getCode();
-				LOG.warn("Late gRPC request failure after call termination: operation={}, requestType={}, "
-						+ "request={}, errorType={}, grpcStatus={}, message={}",
-						requestName,
-						requestType,
-						requestSummary,
-						rocksDBException.getErrorUniqueId(),
-						statusCode,
-						sanitizeForLog(rocksDBException.getMessage()));
+				var statusCode = lateErrorStatusCode(status, rocksDBException);
+				Long suppressed = rocksDBException.getErrorUniqueId() == RocksDBErrorType.READ_DEADLINE_EXCEEDED
+						? claimLateReadDeadlineLog(requestName)
+						: 0L;
+				if (suppressed == null) {
+					return;
+				}
+				if (suppressed == 0L) {
+					LOG.warn("Late gRPC request failure after call termination: operation={}, requestType={}, "
+							+ "request={}, errorType={}, grpcStatus={}, message={}",
+							requestName,
+							requestType,
+							requestSummary,
+							rocksDBException.getErrorUniqueId(),
+							statusCode,
+							sanitizeForLog(rocksDBException.getMessage()));
+				} else {
+					LOG.warn("Late gRPC request failure after call termination: operation={}, requestType={}, "
+							+ "request={}, errorType={}, grpcStatus={}, message={}, suppressedSimilarFailures={}",
+							requestName,
+							requestType,
+							requestSummary,
+							rocksDBException.getErrorUniqueId(),
+							statusCode,
+							sanitizeForLog(rocksDBException.getMessage()),
+							suppressed);
+				}
 				LOG.debug("Late gRPC request failure stack: operation={}, requestType={}",
 						requestName,
 						requestType,
@@ -1869,9 +1937,13 @@ public class GrpcServer extends Server {
 				return handleError(exx.getCause());
 			} else {
 				return switch (ex) {
-					case RocksDBException e -> e.getErrorUniqueId() == RocksDBErrorType.CDC_RESPONSE_TOO_LARGE
-							? Status.FAILED_PRECONDITION.withDescription(e.getLocalizedMessage()).withCause(e)
-							: Status.INTERNAL.withDescription(e.getLocalizedMessage()).withCause(e);
+					case RocksDBException e -> switch (e.getErrorUniqueId()) {
+						case CDC_RESPONSE_TOO_LARGE -> Status.FAILED_PRECONDITION
+								.withDescription(e.getLocalizedMessage()).withCause(e);
+						case READ_DEADLINE_EXCEEDED -> Status.DEADLINE_EXCEEDED
+								.withDescription(e.getLocalizedMessage()).withCause(e);
+						default -> Status.INTERNAL.withDescription(e.getLocalizedMessage()).withCause(e);
+					};
 					case StatusException ex2 -> ex2.getStatus();
 					case StatusRuntimeException ex3 -> ex3.getStatus();
 					case null, default -> Status.INTERNAL.withCause(ex);
