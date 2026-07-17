@@ -24,7 +24,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
@@ -317,12 +317,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
 			long timeoutMs) throws RocksDBException {
-		// Keep the complete logical request in one scheduled task. EmbeddedDB bounds
-		// each native MultiGet's direct memory while sharing one deadline and snapshot
-		// across those native chunks.
-		return supplyAsyncPreservingRunningCompletion(
-				() -> db.existsMulti(transactionId, columnId, keys, timeoutMs),
-				db.getScheduler().readExecutor());
+		return db.existsMultiAsyncInternal(transactionId, columnId, keys, timeoutMs);
 	}
 
 	@Override
@@ -622,6 +617,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 							REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY, lateFailureHandler))
 					.toFuture();
 		}
+		long queuedAtNanos = System.nanoTime();
 		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
 				transactionId,
 				columnId,
@@ -630,7 +626,32 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 				reverse,
 				requestType,
 				timeoutMs);
-		return supplyAsyncPreservingRunningCompletion(() -> command.handleSync(this), commandExecutor(command));
+		return supplyAsyncPreservingRunningCompletion(() -> db.reduceRange(
+				transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				remainingReadTimeoutMillis(timeoutMs, queuedAtNanos)), commandExecutor(command));
+	}
+
+	/**
+	 * Convert a request-scoped timeout into the native budget remaining after scheduler
+	 * admission. Millisecond rounding preserves a positive final fraction without allowing
+	 * queueing time to grant the native read a fresh full timeout.
+	 */
+	private static long remainingReadTimeoutMillis(long timeoutMs, long queuedAtNanos) {
+		if (timeoutMs <= 0 || timeoutMs == Long.MAX_VALUE) {
+			return timeoutMs;
+		}
+		long elapsedNanos = Math.max(0L, System.nanoTime() - queuedAtNanos);
+		long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
+		if (elapsedMillis >= timeoutMs) {
+			throw RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					"Deadline exceeded");
+		}
+		return timeoutMs - elapsedMillis;
 	}
 
 	/**
@@ -638,9 +659,12 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	 * its future observable so request-scoped transport logging can retain its real
 	 * terminal failure instead of replacing it with CancellationException.
 	 */
-	private static <T> CompletableFuture<T> supplyAsyncPreservingRunningCompletion(Supplier<T> supplier,
+	private <T> CompletableFuture<T> supplyAsyncPreservingRunningCompletion(Supplier<T> supplier,
 			Executor executor) {
-		var future = new RunningCompletionFuture<>(supplier, executor);
+		var future = new RunningCompletionFuture<>(
+				supplier,
+				executor,
+				db.getScheduler()::removeQueuedTask);
 		try {
 			executor.execute(future);
 		} catch (Throwable error) {
@@ -706,11 +730,15 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 		private final Supplier<T> supplier;
 		private final Executor executor;
+		private final java.util.function.BiPredicate<Executor, Runnable> queuedTaskRemover;
 		private final AtomicInteger state = new AtomicInteger(ASYNC_TASK_QUEUED);
 
-		private RunningCompletionFuture(Supplier<T> supplier, Executor executor) {
+		private RunningCompletionFuture(Supplier<T> supplier,
+				Executor executor,
+				java.util.function.BiPredicate<Executor, Runnable> queuedTaskRemover) {
 			this.supplier = supplier;
 			this.executor = executor;
+			this.queuedTaskRemover = queuedTaskRemover;
 		}
 
 		@Override
@@ -719,9 +747,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 				return false;
 			}
 			var cancelled = super.cancel(mayInterruptIfRunning);
-			if (executor instanceof ThreadPoolExecutor threadPool) {
-				threadPool.remove(this);
-			}
+			queuedTaskRemover.test(executor, this);
 			return cancelled;
 		}
 

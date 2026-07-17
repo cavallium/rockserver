@@ -226,7 +226,8 @@ public class MainShutdownTest {
 				}
 			};
 			var run = Class.forName("it.cavallium.rockserver.core.Main")
-					.getMethod("run", String[].class, Runnable.class);
+					.getDeclaredMethod("run", String[].class, Runnable.class);
+			run.setAccessible(true);
 			try {
 				run.invoke(null, mainArgs, onShutdownComplete);
 			} catch (java.lang.reflect.InvocationTargetException ex) {

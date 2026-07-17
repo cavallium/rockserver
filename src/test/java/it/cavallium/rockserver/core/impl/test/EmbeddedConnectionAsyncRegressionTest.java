@@ -33,6 +33,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -146,6 +148,228 @@ class EmbeddedConnectionAsyncRegressionTest {
 				assertTrue(awaitCompletedTasks(readExecutor, 1));
 				assertEquals(0, nativeChunks.get(), "cancelled queued work reached RocksDB");
 				assertTrue(queued.isCancelled());
+			} finally {
+				releaseWorker.countDown();
+				connection.getInternalDB().setExistsMultiChunkObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void cancellingBetweenMultiGetChunksStopsContinuationAndReleasesLogicalState() throws Exception {
+		try (var connection = singleThreadedConnection("between-chunks-cancel")) {
+			var syncApi = connection.getSyncApi();
+			long columnId = syncApi.createColumn("entries",
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			var keys = new ArrayList<Keys>(ITERATOR_CHUNK_SIZE + 1);
+			for (int i = 0; i <= ITERATOR_CHUNK_SIZE; i++) {
+				keys.add(key(i));
+			}
+			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var nativeChunks = new AtomicInteger();
+			var snapshotAcquisitions = new AtomicInteger();
+			var betweenChunksEntered = new CountDownLatch(1);
+			var releaseBetweenChunks = new CountDownLatch(1);
+			connection.getInternalDB()
+					.setExistsMultiSnapshotObserverForTesting(snapshotAcquisitions::incrementAndGet);
+			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
+				if (nativeChunks.incrementAndGet() == 1) {
+					readExecutor.execute(() -> {
+						betweenChunksEntered.countDown();
+						awaitUninterruptibly(releaseBetweenChunks);
+					});
+				}
+			});
+			try {
+				var request = connection.getAsyncApi().existsMultiAsync(
+						0, columnId, keys, 10_000);
+				assertTrue(betweenChunksEntered.await(5, SECONDS));
+				assertTrue(awaitQueueSize(readExecutor, 1),
+						"the second native chunk never entered the composite queue");
+
+				assertFalse(request.cancel(true),
+						"a started logical read must retain its terminal completion");
+				assertThrows(CancellationException.class, () -> request.get(5, SECONDS));
+				assertTrue(request.isCancelled());
+				assertTrue(awaitQueueSize(readExecutor, 0),
+						"cancellation did not remove the queued continuation");
+				assertEquals(0, connection.getInternalDB().getPendingOpsCount(),
+						"cancellation did not release the retained logical operation");
+				assertEquals(1, nativeChunks.get(), "a native chunk ran after cancellation");
+				assertEquals(1, snapshotAcquisitions.get());
+			} finally {
+				releaseBetweenChunks.countDown();
+				connection.getInternalDB().setExistsMultiChunkObserverForTesting(null);
+				connection.getInternalDB().setExistsMultiSnapshotObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void forcedShutdownCancelsQueuedMultiGetContinuationAndReleasesLogicalState() throws Exception {
+		String timeoutProperty = "it.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms";
+		String previousTimeout = System.getProperty(timeoutProperty);
+		System.setProperty(timeoutProperty, "1");
+		var releaseBetweenChunks = new CountDownLatch(1);
+		EmbeddedConnection connection = null;
+		CompletableFuture<Void> close = null;
+		try {
+			connection = singleThreadedConnection("between-chunks-shutdown");
+			var syncApi = connection.getSyncApi();
+			long columnId = syncApi.createColumn("entries",
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			var keys = new ArrayList<Keys>(ITERATOR_CHUNK_SIZE + 1);
+			for (int i = 0; i <= ITERATOR_CHUNK_SIZE; i++) {
+				keys.add(key(i));
+			}
+			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var nativeChunks = new AtomicInteger();
+			var betweenChunksEntered = new CountDownLatch(1);
+			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
+				if (nativeChunks.incrementAndGet() == 1) {
+					readExecutor.execute(() -> {
+						betweenChunksEntered.countDown();
+						awaitUninterruptibly(releaseBetweenChunks);
+					});
+				}
+			});
+
+			var request = connection.getAsyncApi().existsMultiAsync(
+					0, columnId, keys, 10_000);
+			assertTrue(betweenChunksEntered.await(5, SECONDS));
+			assertTrue(awaitQueueSize(readExecutor, 1),
+					"the second native chunk never entered the composite queue");
+
+			var connectionToClose = connection;
+			close = CompletableFuture.runAsync(() -> {
+				try {
+					connectionToClose.closeTesting();
+				} catch (Exception error) {
+					throw new CompletionException(error);
+				}
+			});
+
+			assertThrows(CancellationException.class, () -> request.get(5, SECONDS));
+			assertTrue(request.isCancelled());
+			assertEquals(0, connection.getInternalDB().getPendingOpsCount(),
+					"forced shutdown did not release the retained logical operation");
+			assertEquals(1, nativeChunks.get(), "a native chunk ran after shutdown cancellation");
+			assertTrue(awaitQueueSize(readExecutor, 0),
+					"shutdown cancellation did not remove the queued continuation");
+
+			releaseBetweenChunks.countDown();
+			close.get(5, SECONDS);
+		} finally {
+			releaseBetweenChunks.countDown();
+			if (connection != null) {
+				connection.getInternalDB().setExistsMultiChunkObserverForTesting(null);
+				if (close == null) {
+					connection.closeTesting();
+				} else if (!close.isDone()) {
+					close.get(5, SECONDS);
+				}
+			}
+			if (previousTimeout == null) {
+				System.clearProperty(timeoutProperty);
+			} else {
+				System.setProperty(timeoutProperty, previousTimeout);
+			}
+		}
+	}
+
+	@Test
+	void forcedShutdownCancelsInitiallyQueuedMultiGetAndReleasesAdmission() throws Exception {
+		String timeoutProperty = "it.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms";
+		String previousTimeout = System.getProperty(timeoutProperty);
+		System.setProperty(timeoutProperty, "1");
+		var releaseWorker = new CountDownLatch(1);
+		EmbeddedConnection connection = null;
+		CompletableFuture<Void> close = null;
+		try {
+			connection = singleThreadedConnection("initial-queue-shutdown");
+			long columnId = connection.getSyncApi().createColumn("entries",
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var workerEntered = new CountDownLatch(1);
+			var nativeChunks = new AtomicInteger();
+			connection.getInternalDB().setExistsMultiChunkObserverForTesting(nativeChunks::incrementAndGet);
+			readExecutor.execute(() -> {
+				workerEntered.countDown();
+				awaitUninterruptibly(releaseWorker);
+			});
+			assertTrue(workerEntered.await(5, SECONDS));
+
+			var request = connection.getAsyncApi().existsMultiAsync(
+					0, columnId, List.of(key(1)), 10_000);
+			assertTrue(awaitQueueSize(readExecutor, 1), "the initial read never entered the executor queue");
+			assertEquals(1, connection.getInternalDB().getPendingOpsCount(),
+					"initial queue residence must retain one admitted logical operation");
+
+			var connectionToClose = connection;
+			close = CompletableFuture.runAsync(() -> {
+				try {
+					connectionToClose.closeTesting();
+				} catch (Exception error) {
+					throw new CompletionException(error);
+				}
+			});
+
+			assertThrows(CancellationException.class, () -> request.get(5, SECONDS));
+			assertTrue(request.isCancelled());
+			assertEquals(0, connection.getInternalDB().getPendingOpsCount(),
+					"forced shutdown did not release the initially queued admission");
+			assertEquals(0, nativeChunks.get(), "an initially queued request reached RocksDB during shutdown");
+			assertTrue(awaitQueueSize(readExecutor, 0),
+					"shutdown cancellation did not remove the initially queued request");
+
+			releaseWorker.countDown();
+			close.get(5, SECONDS);
+		} finally {
+			releaseWorker.countDown();
+			if (connection != null) {
+				connection.getInternalDB().setExistsMultiChunkObserverForTesting(null);
+				if (close == null) {
+					connection.closeTesting();
+				} else if (!close.isDone()) {
+					close.get(5, SECONDS);
+				}
+			}
+			if (previousTimeout == null) {
+				System.clearProperty(timeoutProperty);
+			} else {
+				System.setProperty(timeoutProperty, previousTimeout);
+			}
+		}
+	}
+
+	@Test
+	void multiGetDeadlineIncludesInitialSchedulerQueueWait() throws Exception {
+		try (var connection = singleThreadedConnection("queued-deadline")) {
+			var syncApi = connection.getSyncApi();
+			long columnId = syncApi.createColumn("entries",
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var workerEntered = new CountDownLatch(1);
+			var releaseWorker = new CountDownLatch(1);
+			var nativeChunks = new AtomicInteger();
+			connection.getInternalDB().setExistsMultiChunkObserverForTesting(nativeChunks::incrementAndGet);
+			try {
+				readExecutor.execute(() -> {
+					workerEntered.countDown();
+					awaitUninterruptibly(releaseWorker);
+				});
+				assertTrue(workerEntered.await(5, SECONDS));
+
+				var request = connection.getAsyncApi().existsMultiAsync(
+						0, columnId, List.of(key(1)), 25);
+				assertTrue(awaitQueueSize(readExecutor, 1));
+				Thread.sleep(75);
+				releaseWorker.countDown();
+
+				var completion = assertThrows(ExecutionException.class, () -> request.get(5, SECONDS));
+				var rocksFailure = assertInstanceOf(RocksDBException.class, completion.getCause());
+				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocksFailure.getErrorUniqueId());
+				assertEquals(0, nativeChunks.get(), "an expired queued request reached RocksDB");
 			} finally {
 				releaseWorker.countDown();
 				connection.getInternalDB().setExistsMultiChunkObserverForTesting(null);

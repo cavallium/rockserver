@@ -29,6 +29,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -136,6 +137,43 @@ class ThriftAsyncDispatchRegressionTest {
 		}
 	}
 
+	@Test
+	void concurrentAsyncCallsUseIndependentFramedTransports() throws Exception {
+		var config = tempDir.resolve("concurrent-thrift.conf");
+		Files.writeString(config, """
+				database: {
+				  parallelism: { read: 4, write: 2 }
+				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
+				}
+				""");
+		int port = freePort();
+		try (var backend = new EmbeddedConnection(tempDir.resolve("concurrent-db"), "concurrent-thrift", config);
+				var server = new ThriftServer(backend, "127.0.0.1", port)) {
+			server.start();
+			try (var client = new ThriftConnection("concurrent-thrift", "127.0.0.1", port)) {
+				var sync = client.getSyncApi();
+				long columnId = sync.createColumn("entries",
+						ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+				for (int i = 0; i < 32; i++) {
+					sync.put(0, columnId, key(i), intValue(i), RequestType.none());
+				}
+
+				var reads = new ArrayList<CompletableFuture<Buf>>();
+				for (int i = 0; i < 256; i++) {
+					int value = i % 32;
+					reads.add(client.getAsyncApi().getAsync(0,
+							columnId,
+							key(value),
+							RequestType.current()));
+				}
+				CompletableFuture.allOf(reads.toArray(CompletableFuture[]::new)).get(10, SECONDS);
+				for (int i = 0; i < reads.size(); i++) {
+					assertEquals(intValue(i % 32), reads.get(i).join());
+				}
+			}
+		}
+	}
+
 	private void assertInterruptedOpenIteratorCleanup(boolean running) throws Exception {
 		var connection = new TrackingConnection();
 		var api = ThriftServer.createDispatchingSyncApiForTesting(connection);
@@ -202,6 +240,10 @@ class ThriftAsyncDispatchRegressionTest {
 
 	private static Keys key(int value) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Integer.BYTES).putInt(value).array()));
+	}
+
+	private static Buf intValue(int value) {
+		return Buf.wrap(ByteBuffer.allocate(Integer.BYTES).putInt(value).array());
 	}
 
 	private record InterruptedInvocation(Throwable failure, boolean interruptRestored) {

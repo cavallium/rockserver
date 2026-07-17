@@ -176,7 +176,7 @@ class EmbeddedRangeSchedulingTest {
 	}
 
 	@Test
-	void multiPointReadUsesOneNativeViewAndOneDeadline() throws Exception {
+	void multiPointReadUsesOneNativeViewAndYieldsBetweenChunks() throws Exception {
 		var configFile = tempDir.resolve("single-reader-multi.conf");
 		Files.writeString(configFile, """
 				database: {
@@ -200,18 +200,28 @@ class EmbeddedRangeSchedulingTest {
 			}
 			var nativeChunks = new java.util.concurrent.atomic.AtomicInteger();
 			var snapshotAcquisitions = new AtomicInteger();
-			connection.getInternalDB()
-					.setExistsMultiSnapshotObserverForTesting(snapshotAcquisitions::incrementAndGet);
-			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
-				if (nativeChunks.incrementAndGet() == 1) {
-					api.put(0, columnId, intKey(existingKeys), intValue(existingKeys), RequestType.none());
-				}
-			});
-
+			var competingCompositeRan = new CountDownLatch(1);
+			var secondChunkSawCompetingComposite = new AtomicBoolean();
+			var pendingOpsBetweenChunks = new java.util.concurrent.atomic.AtomicLong(-1L);
 			var readExecutor = (ThreadPoolExecutor) connection.getInternalDB()
 					.getScheduler()
 					.readExecutor();
 			long tasksBefore = readExecutor.getTaskCount();
+			connection.getInternalDB()
+					.setExistsMultiSnapshotObserverForTesting(snapshotAcquisitions::incrementAndGet);
+			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
+				int chunk = nativeChunks.incrementAndGet();
+				if (chunk == 1) {
+					api.put(0, columnId, intKey(existingKeys), intValue(existingKeys), RequestType.none());
+					readExecutor.execute(() -> {
+						pendingOpsBetweenChunks.set(connection.getInternalDB().getPendingOpsCount());
+						competingCompositeRan.countDown();
+					});
+				} else if (chunk == 2) {
+					secondChunkSawCompetingComposite.set(competingCompositeRan.getCount() == 0L);
+				}
+			});
+
 			var existence = connection.getAsyncApi()
 					.existsMultiAsync(0, columnId, keys, 10_000)
 					.get(5, TimeUnit.SECONDS);
@@ -223,9 +233,14 @@ class EmbeddedRangeSchedulingTest {
 			assertEquals(2, nativeChunks.get());
 			assertEquals(1, snapshotAcquisitions.get(),
 					"a split logical MultiGet must acquire exactly one shared snapshot");
+			assertTrue(competingCompositeRan.await(5, TimeUnit.SECONDS));
+			assertTrue(secondChunkSawCompetingComposite.get(),
+					"a queued composite task must run before the next native MultiGet chunk");
+			assertEquals(1L, pendingOpsBetweenChunks.get(),
+					"the yielded request must retain one active logical operation between chunks");
 			long tasks = readExecutor.getTaskCount() - tasksBefore;
-			assertEquals(1, tasks,
-					"one MultiGet should require one queued read task, got " + tasks);
+			assertEquals(3, tasks,
+					"two MultiGet chunks plus the competing composite should require three tasks, got " + tasks);
 		}
 	}
 

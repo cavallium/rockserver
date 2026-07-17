@@ -47,7 +47,6 @@ class RangePerformanceRegressionTest {
 			for (int i = 0; i < entries; i++) {
 				api.put(0, columnId, key(i), value(i), RequestType.none());
 			}
-			internal.setGetRangeIteratorRefreshIntervalForTesting(Long.MAX_VALUE);
 			var iteratorOpens = new AtomicInteger();
 			internal.setRangeIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
 
@@ -65,9 +64,6 @@ class RangePerformanceRegressionTest {
 			assertEquals(1, iteratorOpens.get(),
 					"scheduler slices must not recreate the native range iterator");
 
-			// Count slicing is solely a scheduler fairness boundary. Even a deliberately
-			// tiny value-stream refresh interval must not recreate its native iterator.
-			internal.setGetRangeIteratorRefreshIntervalForTesting(2L);
 			iteratorOpens.set(0);
 			long count = connection.getAsyncApi().reduceRangeAsync(0,
 					columnId,
@@ -184,7 +180,6 @@ class RangePerformanceRegressionTest {
 				api.put(0, columnId, key(i * 2), value(i), RequestType.none());
 			}
 			var internal = connection.getInternalDB();
-			internal.setGetRangeIteratorRefreshIntervalForTesting(Long.MAX_VALUE);
 			var decodedPages = new AtomicInteger();
 			internal.setRangeReadChunkSizeObserverForTesting(_ -> decodedPages.incrementAndGet());
 
@@ -208,7 +203,7 @@ class RangePerformanceRegressionTest {
 	}
 
 	@Test
-	void deliberateIteratorRefreshReleasesTheOldViewAtTheConfiguredBoundary() throws Exception {
+	void longRangeKeepsOneOriginalPointInTimeViewAcrossSchedulingSlices() throws Exception {
 		final int entries = 3_000;
 		try (var connection = new EmbeddedConnection(tempDir.resolve("refresh-snapshot-db"),
 				"range-refresh-snapshot", null)) {
@@ -219,8 +214,6 @@ class RangePerformanceRegressionTest {
 			for (int i = 0; i < entries; i++) {
 				api.put(0, columnId, key(i * 2), value(i), RequestType.none());
 			}
-			// Refresh beyond the first decoded slice, after the concurrent insert below.
-			internal.setGetRangeIteratorRefreshIntervalForTesting(2_049L);
 			var iteratorOpens = new AtomicInteger();
 			internal.setRangeIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
 
@@ -235,10 +228,10 @@ class RangePerformanceRegressionTest {
 					.assertNext(first -> assertEquals(key(0), first.keys()))
 					.then(() -> api.put(0, columnId, key(5_001), value(-1), RequestType.none()))
 					.thenRequest(Long.MAX_VALUE)
-					.expectNextCount(entries)
+					.expectNextCount(entries - 1L)
 					.verifyComplete();
-			assertEquals(2, iteratorOpens.get(),
-					"the deliberate million-entry policy should reopen exactly once at this test boundary");
+			assertEquals(1, iteratorOpens.get(),
+					"one logical range must retain one native iterator and point-in-time view");
 		}
 	}
 

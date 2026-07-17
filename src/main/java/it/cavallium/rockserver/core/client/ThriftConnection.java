@@ -1,7 +1,5 @@
 package it.cavallium.rockserver.core.client;
 
-import static it.cavallium.rockserver.core.common.Utils.toBuf;
-
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
@@ -44,15 +42,20 @@ import it.cavallium.rockserver.core.common.api.RocksDB;
 import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.thrift.TApplicationException;
@@ -60,24 +63,48 @@ import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TSocket;
 import org.apache.thrift.transport.TTransport;
+import org.apache.thrift.transport.TTransportException;
 import org.apache.thrift.transport.layered.TFramedTransport;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	private final URI uri;
-	private final TTransport transport;
-	private final RocksDB.Client client;
+	private final String host;
+	private final int port;
+	private final List<ClientSlot> allClientSlots;
+	private final ArrayBlockingQueue<ClientSlot> availableClientSlots;
+	private final RocksDB.Iface client;
 	private final ExecutorService executor;
+	private final Scheduler executorScheduler;
+	private final AtomicBoolean closed = new AtomicBoolean();
 
 	public ThriftConnection(String name, String host, int port) throws TException {
 		super(name);
 		this.uri = URI.create("thrift://" + host + ":" + port);
-		this.transport = new TFramedTransport(new TSocket(host, port));
-		this.transport.open();
-		this.client = new RocksDB.Client(new TBinaryProtocol(this.transport));
-		this.executor = Executors.newCachedThreadPool();
+		this.host = host;
+		this.port = port;
+		int poolSize = thriftClientPoolSize();
+		this.allClientSlots = new ArrayList<>(poolSize);
+		this.availableClientSlots = new ArrayBlockingQueue<>(poolSize);
+		for (int i = 0; i < poolSize; i++) {
+			var slot = new ClientSlot();
+			allClientSlots.add(slot);
+			availableClientSlots.add(slot);
+		}
+		// Retain the constructor's fail-fast connectivity check. The remaining
+		// transports are opened lazily as actual concurrency requires them.
+		allClientSlots.getFirst().client();
+		this.client = (RocksDB.Iface) Proxy.newProxyInstance(
+				RocksDB.Iface.class.getClassLoader(),
+				new Class<?>[] {RocksDB.Iface.class},
+				this::invokeClient);
+		this.executor = Executors.newFixedThreadPool(poolSize,
+				Thread.ofPlatform().name("rockserver-thrift-client-", 0).factory());
+		this.executorScheduler = Schedulers.fromExecutorService(executor);
 	}
 
 	@Override
@@ -97,8 +124,14 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public void close() throws IOException {
-		transport.close();
-		executor.shutdown();
+		if (!closed.compareAndSet(false, true)) {
+			return;
+		}
+		for (var slot : allClientSlots) {
+			slot.close();
+		}
+		executorScheduler.dispose();
+		executor.shutdownNow();
 		super.close();
 	}
 
@@ -663,17 +696,17 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestGetRange<? super KV, T> requestType, long timeoutMs) {
-		return Flux.create(sink -> {
-			executor.submit(() -> {
-				try {
-					Stream<T> stream = getRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
-					stream.forEach(sink::next);
-					sink.complete();
-				} catch (Throwable e) {
-					sink.error(e);
-				}
-			});
-		});
+		// The legacy Thrift method materializes its response before returning, but
+		// downstream delivery can still obey demand and cancellation. Flux.fromStream
+		// also closes the stream on cancellation; the previous sink::next loop eagerly
+		// pushed every item and kept running after the subscriber went away.
+		return Flux.fromStream(() -> getRange(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs)).subscribeOn(executorScheduler);
 	}
 
 	@Override
@@ -705,6 +738,95 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	// --- Helpers ---
+
+	private static int thriftClientPoolSize() {
+		int defaultSize = Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors()));
+		int configuredSize = Integer.getInteger("rockserver.thrift.client.connections", defaultSize);
+		if (configuredSize <= 0 || configuredSize > 256) {
+			throw new IllegalArgumentException(
+					"rockserver.thrift.client.connections must be between 1 and 256, got " + configuredSize);
+		}
+		return configuredSize;
+	}
+
+	private Object invokeClient(Object proxy, Method method, Object[] args) throws Throwable {
+		if (method.getDeclaringClass() == Object.class) {
+			return switch (method.getName()) {
+				case "toString" -> "PooledThriftClient[" + uri + "]";
+				case "hashCode" -> System.identityHashCode(proxy);
+				case "equals" -> proxy == args[0];
+				default -> throw new UnsupportedOperationException(method.toString());
+			};
+		}
+		if (closed.get()) {
+			throw new TException("Thrift connection is closed");
+		}
+
+		ClientSlot slot;
+		try {
+			slot = availableClientSlots.take();
+		} catch (InterruptedException interrupted) {
+			Thread.currentThread().interrupt();
+			throw new TException("Interrupted while waiting for a Thrift client transport", interrupted);
+		}
+		try {
+			if (closed.get()) {
+				throw new TException("Thrift connection is closed");
+			}
+			try {
+				return method.invoke(slot.client(), args);
+			} catch (InvocationTargetException invocationFailure) {
+				Throwable failure = invocationFailure.getCause();
+				if (failure instanceof TTransportException) {
+					slot.invalidate();
+				}
+				throw failure;
+			} catch (IllegalAccessException impossible) {
+				throw new IllegalStateException("Unable to invoke generated Thrift client", impossible);
+			}
+		} finally {
+			// Keep the pool cardinality stable even after close. That lets threads which
+			// were already waiting acquire a slot, observe closed, and terminate.
+			availableClientSlots.offer(slot);
+		}
+	}
+
+	private final class ClientSlot {
+
+		private TTransport transport;
+		private RocksDB.Client physicalClient;
+
+		private synchronized RocksDB.Client client() throws TException {
+			if (closed.get()) {
+				throw new TException("Thrift connection is closed");
+			}
+			if (physicalClient != null && transport != null && transport.isOpen()) {
+				return physicalClient;
+			}
+			var newTransport = new TFramedTransport(new TSocket(host, port));
+			try {
+				newTransport.open();
+				transport = newTransport;
+				physicalClient = new RocksDB.Client(new TBinaryProtocol(newTransport));
+				return physicalClient;
+			} catch (TException failure) {
+				newTransport.close();
+				throw failure;
+			}
+		}
+
+		private synchronized void invalidate() {
+			close();
+		}
+
+		private synchronized void close() {
+			physicalClient = null;
+			if (transport != null) {
+				transport.close();
+				transport = null;
+			}
+		}
+	}
 
 	private RocksDBException wrap(TException e) {
 		if (e instanceof RocksDBThriftException re) {

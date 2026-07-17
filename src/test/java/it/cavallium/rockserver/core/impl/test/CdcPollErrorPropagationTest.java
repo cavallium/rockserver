@@ -4,26 +4,30 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.CdcGapDetectedException;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.KVBatch;
+import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.WriteBatchIterator;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.Status;
 import org.rocksdb.WriteBatch;
+import reactor.core.publisher.Flux;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -60,14 +64,11 @@ class CdcPollErrorPropagationTest {
 
 			assertEquals(RocksDBErrorType.INTERNAL_ERROR, error.getErrorUniqueId());
 			assertTrue(error.getMessage().contains("Failed to parse WriteBatch at seq"));
-			assertNotNull(db.failedHandler);
-			assertFalse(db.failedHandler.isOwningHandle(),
-					"The native WriteBatch.Handler must be closed when parsing fails");
 		}
 	}
 
 	@Test
-	void nativeCallbackIsReusedAcrossWalBatchesAndClosedAfterPoll() throws Exception {
+	void createsOneResumableDecoderPerWalBatch() throws Exception {
 		try (var db = new HandlerTrackingEmbeddedDB(tempDir, "cdc-handler-lifecycle")) {
 			long columnId = db.createColumn("data", ColumnSchema.of(
 					IntArrayList.of(Integer.BYTES),
@@ -90,12 +91,39 @@ class CdcPollErrorPropagationTest {
 
 			assertNotNull(batch);
 			assertEquals(2, batch.events().size());
-			assertTrue(db.iteratedBatches >= 2);
-			assertTrue(db.reusedOneHandler,
-					"A poll should allocate one native callback, not one callback per WAL batch");
-			assertNotNull(db.firstHandler);
-			assertFalse(db.firstHandler.isOwningHandle(),
-					"The poll-owned native callback must be closed after iteration");
+			assertTrue(db.createdBatchCursors >= 2);
+		}
+	}
+
+	@Test
+	void largeWalBatchRetainsOneDecoderAcrossSchedulerSlices() throws Exception {
+		try (var db = new HandlerTrackingEmbeddedDB(tempDir, "cdc-large-batch-cursor")) {
+			long columnId = db.createColumn("data", ColumnSchema.of(
+					IntArrayList.of(Integer.BYTES),
+					new ObjectArrayList<>(),
+					true,
+					null,
+					null,
+					null));
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			int mutations = 4_097;
+			var keys = new ArrayList<Keys>(mutations);
+			var values = new ArrayList<Buf>(mutations);
+			for (int i = 0; i < mutations; i++) {
+				keys.add(new Keys(new Buf[]{Buf.wrap(new byte[]{
+						(byte) (i >>> 24), (byte) (i >>> 16), (byte) (i >>> 8), (byte) i})}));
+				values.add(Buf.wrap(new byte[]{1}));
+			}
+			db.putBatch(columnId,
+					Flux.just(new KVBatch.KVBatchRef(keys, values)),
+					PutBatchMode.WRITE_BATCH);
+
+			var batch = db.cdcPollBatchAsyncInternal("sub", startSeq, 10_000).block();
+
+			assertNotNull(batch);
+			assertEquals(mutations, batch.events().size());
+			assertEquals(1, db.largeBatchCursors,
+					"A scheduling slice must resume the retained decoder, not replay the WAL batch");
 		}
 	}
 
@@ -124,18 +152,18 @@ class CdcPollErrorPropagationTest {
 			assertNotNull(batch);
 			assertEquals(4, batch.events().size());
 			long batchWalSequence = batch.events().getFirst().seq() >>> 20;
-			for (var event : batch.events()) {
-				assertEquals(batchWalSequence, event.seq() >>> 20,
-						"The transaction must be represented by one WAL batch");
+			for (int i = 0; i < batch.events().size(); i++) {
+				assertEquals((batchWalSequence << 20) | i, batch.events().get(i).seq(),
+						"A transaction's mutations must retain the packed external cursor format");
 			}
 			assertEquals((batchWalSequence + 4) << 20, batch.nextSeq(),
 					"A fully consumed batch should not be retained as the next poll's dependency");
 
-			int iteratedBatches = db.iteratedBatches;
+			int iteratedBatches = db.createdBatchCursors;
 			var emptyTail = db.cdcPollBatchAsyncInternal("sub", batch.nextSeq(), 100).block();
 			assertNotNull(emptyTail);
 			assertTrue(emptyTail.events().isEmpty());
-			assertEquals(iteratedBatches, db.iteratedBatches,
+			assertEquals(iteratedBatches, db.createdBatchCursors,
 					"An idle tail poll must not reopen and parse the fully-consumed batch");
 		}
 	}
@@ -178,6 +206,23 @@ class CdcPollErrorPropagationTest {
 			assertEquals(RocksDBErrorType.CDC_GAP_DETECTED, mapped.getErrorUniqueId());
 			assertSame(nativeError, mapped.getCause());
 		}
+	}
+
+	@Test
+	void packedCursorFormatRemainsStableAndRejectsAliasingOffsets() throws Exception {
+		var compose = EmbeddedDB.class.getDeclaredMethod("composeCdcSeq", long.class, long.class);
+		compose.setAccessible(true);
+		long walSequence = 1_234_567L;
+		long operationIndex = (1L << 20) - 1L;
+
+		long sequence = (long) compose.invoke(null, walSequence, operationIndex);
+
+		assertEquals((walSequence << 20) | operationIndex, sequence,
+				"Existing CDC consumers persist this packed ordering and must remain compatible");
+		var error = assertThrows(java.lang.reflect.InvocationTargetException.class,
+				() -> compose.invoke(null, walSequence, 1L << 20));
+		assertEquals(IllegalArgumentException.class, error.getCause().getClass(),
+				"An oversized batch offset must fail instead of aliasing another WAL sequence");
 	}
 
 	@Test
@@ -234,42 +279,37 @@ class CdcPollErrorPropagationTest {
 
 	private static final class ParserFailingEmbeddedDB extends EmbeddedDB {
 		private int parsedBatches;
-		private WriteBatch.Handler failedHandler;
 
 		private ParserFailingEmbeddedDB(Path path, String name) throws IOException {
 			super(path, name, null);
 		}
 
 		@Override
-		protected void iterateCdcWriteBatch(WriteBatch writeBatch, WriteBatch.Handler handler)
+		protected WriteBatchIterator.Cursor createCdcWriteBatchCursor(WriteBatch writeBatch)
 				throws org.rocksdb.RocksDBException {
 			if (++parsedBatches == 3) {
-				failedHandler = handler;
 				throw new org.rocksdb.RocksDBException("synthetic malformed WriteBatch");
 			}
-			super.iterateCdcWriteBatch(writeBatch, handler);
+			return super.createCdcWriteBatchCursor(writeBatch);
 		}
 	}
 
 	private static final class HandlerTrackingEmbeddedDB extends EmbeddedDB {
-		private WriteBatch.Handler firstHandler;
-		private int iteratedBatches;
-		private boolean reusedOneHandler = true;
+		private int createdBatchCursors;
+		private int largeBatchCursors;
 
 		private HandlerTrackingEmbeddedDB(Path path, String name) throws IOException {
 			super(path, name, null);
 		}
 
 		@Override
-		protected void iterateCdcWriteBatch(WriteBatch writeBatch, WriteBatch.Handler handler)
+		protected WriteBatchIterator.Cursor createCdcWriteBatchCursor(WriteBatch writeBatch)
 				throws org.rocksdb.RocksDBException {
-			iteratedBatches++;
-			if (firstHandler == null) {
-				firstHandler = handler;
-			} else {
-				reusedOneHandler &= firstHandler == handler;
+			createdBatchCursors++;
+			if (writeBatch.count() > 4_096) {
+				largeBatchCursors++;
 			}
-			super.iterateCdcWriteBatch(writeBatch, handler);
+			return super.createCdcWriteBatchCursor(writeBatch);
 		}
 	}
 

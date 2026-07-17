@@ -321,13 +321,9 @@ class CdcBugReproductionTest {
         CdcBatch peek = db.cdcPollBatchAsyncInternal(subId, null, 1).block();
         long firstSeq = peek.events().get(0).seq();
 
-        // The seq is (WalSeq << 20) | OpIndex.
-        // Let's artificially construct a seq that points to index 15 (key=15).
-        // Since we wrote 1 batch, the base WAL seq is extractWalSeq(firstSeq).
-        long baseWalSeq = firstSeq >>> 20;
-
-        // Construct start seq for index 15
-        long startAt15 = (baseWalSeq << 20) | (15 & 0xFFFFF);
+		// Public CDC cursors retain the stable packed (WAL batch, operation index)
+		// representation even though RocksDB is sought by its absolute sequence.
+		long startAt15 = ((firstSeq >>> 20) << 20) | 15L;
 
         // Poll requesting index 15
         CdcBatch result = db.cdcPollBatchAsyncInternal(subId, startAt15, 100).block();
@@ -590,8 +586,8 @@ class CdcBugReproductionTest {
 
         // Construct a sequence far in the future (nextValid + 1,000,000)
         // Keep the lower bits 0 to represent start of a hypothetical batch
-        long futureWalSeq = (nextValid >>> 20) + 50;
-        long futureSeq = (futureWalSeq << 20);
+		long futureWalSeq = (nextValid >>> 20) + 50;
+		long futureSeq = futureWalSeq << 20;
 
         CdcBatch res = db.cdcPollBatchAsyncInternal(subId, futureSeq, 10).block();
 

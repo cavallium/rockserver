@@ -22,6 +22,7 @@ import org.rocksdb.WriteBatch;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -145,6 +146,54 @@ class WriteBatchIteratorTest {
 		try (RecordingHandler handler = new RecordingHandler(1)) {
 			WriteBatchIterator.iterate(data, handler);
 			assertEquals(List.of(event("PUT", 0, bytes("key-1"), bytes("value-1"))), handler.events);
+		}
+	}
+
+	@Test
+	void resumableCursorDecodesEachRecordExactlyOnceAcrossBoundedSlices() throws Exception {
+		byte[] data = batch(3,
+				record(0x01, varString("key-1"), varString("value-1")),
+				record(0x01, varString("key-2"), varString("value-2")),
+				record(0x01, varString("key-3"), varString("value-3"))
+		);
+		var cursor = WriteBatchIterator.cursor(data);
+
+		try (RecordingHandler handler = new RecordingHandler()) {
+			assertEquals(1, cursor.iterate(handler, 1));
+			assertEquals(1L, cursor.recordsRead());
+			assertFalse(cursor.isFinished());
+
+			assertEquals(1, cursor.iterate(handler, 1));
+			assertEquals(2L, cursor.recordsRead());
+			assertFalse(cursor.isFinished());
+
+			assertEquals(1, cursor.iterate(handler, 1));
+			assertEquals(3L, cursor.recordsRead());
+			assertTrue(cursor.isFinished());
+			assertEquals(nativeEvents(data), handler.events);
+		}
+	}
+
+	@Test
+	void cursorCanRewindAByteBudgetRejectionWithoutSkippingTheRecord() throws Exception {
+		byte[] data = batch(2,
+				record(0x01, varString("key-1"), varString("value-1")),
+				record(0x01, varString("key-2"), varString("value-2"))
+		);
+		var cursor = WriteBatchIterator.cursor(data);
+
+		try (RecordingHandler firstAttempt = new RecordingHandler()) {
+			assertEquals(1, cursor.iterate(firstAttempt, 1));
+			assertEquals(1L, cursor.recordsRead());
+			cursor.rewindLastRecord();
+			assertEquals(0L, cursor.recordsRead());
+			assertFalse(cursor.isFinished());
+		}
+
+		try (RecordingHandler resumed = new RecordingHandler()) {
+			assertEquals(2, cursor.iterate(resumed, 2));
+			assertTrue(cursor.isFinished());
+			assertEquals(nativeEvents(data), resumed.events);
 		}
 	}
 

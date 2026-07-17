@@ -8,6 +8,12 @@ import java.nio.file.Path;
 
 public interface GlobalDatabaseConfig {
 
+	boolean followRocksdbOptimizations() throws GestaltException;
+
+	boolean paranoidChecks() throws GestaltException;
+
+	boolean useClockCache() throws GestaltException;
+
 	boolean spinning() throws GestaltException;
 
 	boolean checksum() throws GestaltException;
@@ -16,13 +22,19 @@ public interface GlobalDatabaseConfig {
 
 	boolean allowRocksdbMemoryMapping() throws GestaltException;
 
+	boolean allowRocksdbMmapWrites() throws GestaltException;
+
 	@Nullable Integer maximumOpenFiles() throws GestaltException;
 
 	boolean optimistic() throws GestaltException;
 
 	@Nullable DataSize blockCache() throws GestaltException;
 
+	@Nullable Double blockCacheHighPriorityRatio() throws GestaltException;
+
 	@Nullable DataSize writeBufferManager() throws GestaltException;
+
+	@Nullable DataSize databaseWriteBufferSize() throws GestaltException;
 
 	@Nullable Path logPath() throws GestaltException;
 
@@ -41,6 +53,12 @@ public interface GlobalDatabaseConfig {
 	boolean ingestBehind() throws GestaltException;
 
 	boolean unorderedWrite() throws GestaltException;
+
+	boolean disableAutoCompactions() throws GestaltException;
+
+	boolean disableWriteSlowdown() throws GestaltException;
+
+	@Nullable Integer maxSubcompactions() throws GestaltException;
 
 	@Nullable Integer maxBackgroundJobs() throws GestaltException;
 

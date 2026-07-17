@@ -60,7 +60,6 @@ class RangeNoCacheTest {
 		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
 		embeddedConnection = new EmbeddedConnection(tempDir.resolve("db"), "range-no-cache", configFile);
 		embeddedDB = embeddedConnection.getInternalDB();
-		embeddedDB.setGetRangeIteratorRefreshIntervalForTesting(2);
 
 		columnId = embeddedConnection.getSyncApi().createColumn("range-column",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
@@ -95,12 +94,12 @@ class RangeNoCacheTest {
 	}
 
 	@Test
-	void embeddedBoundedRangesKeepRowsAndReadOptionsModeAcrossRefresh() {
+	void embeddedBoundedRangesKeepRowsAndReadOptionsMode() {
 		assertBoundedRangeModes(embeddedConnection.getSyncApi());
 	}
 
 	@Test
-	void grpcBoundedRangesKeepRowsAndReadOptionsModeAcrossRefresh() {
+	void grpcBoundedRangesKeepRowsAndReadOptionsMode() {
 		assertBoundedRangeModes(grpcClient.getSyncApi());
 	}
 
@@ -150,12 +149,8 @@ class RangeNoCacheTest {
 			result = range.toList();
 		}
 
-		assertTrue(observedFillCache.size() >= 2,
-				() -> "expected ReadOptions observations for initial creation and refresh, got " + observedFillCache);
-		assertEquals(List.of(expectedFillCache, expectedFillCache), observedFillCache.subList(0, 2),
-				"initial and refreshed ReadOptions must use the requested fill-cache mode");
-		assertTrue(observedFillCache.stream().allMatch(value -> value == expectedFillCache),
-				() -> "every refreshed ReadOptions must preserve fillCache=" + expectedFillCache + ": " + observedFillCache);
+		assertEquals(List.of(expectedFillCache), observedFillCache,
+				"a range must create exactly one ReadOptions with the requested fill-cache mode");
 		return result;
 	}
 

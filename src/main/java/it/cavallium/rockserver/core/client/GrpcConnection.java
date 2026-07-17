@@ -447,24 +447,6 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 					+ count + " != " + allValues.size());
 		}
 
-		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L && count > 1000) {
-			return Flux.range(0, (count + 999) / 1000)
-					.concatMap(i -> {
-						int start = i * 1000;
-						int end = Math.min(count, start + 1000);
-						return Mono.fromFuture(() -> putMultiAsync(
-								transactionOrUpdateId,
-								columnId,
-								allKeys.subList(start, end),
-								allValues.subList(start, end),
-								requestType
-						));
-					})
-					.then()
-					.toFuture()
-					.thenApply(_ -> List.of());
-		}
-
 		var initialRequest = PutMultiRequest.newBuilder()
 				.setInitialRequest(PutMultiInitialRequest.newBuilder()
 						.setTransactionOrUpdateId(transactionOrUpdateId)
@@ -483,7 +465,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			case RequestNothing<?> _ ->
 					toResponse(this.reactiveStub.putMulti(inputRequests)
 						.ignoreElement()
-						.toFuture());
+						.toFuture())
+						.thenApply(_ -> List.of());
 			case RequestPrevious<?> _ ->
 					toResponse(this.reactiveStub.putMultiGetPrevious(inputRequests)
 						.collect(() -> new ArrayList<@Nullable Buf>(),
@@ -577,24 +560,6 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 					+ count + " != " + allValues.size());
 		}
 
-		if (requestType instanceof RequestType.RequestNothing<?> && transactionOrUpdateId == 0L && count > 1000) {
-			return Flux.range(0, (count + 999) / 1000)
-					.concatMap(i -> {
-						int start = i * 1000;
-						int end = Math.min(count, start + 1000);
-						return Mono.fromFuture(() -> mergeMultiAsync(
-								transactionOrUpdateId,
-								columnId,
-								allKeys.subList(start, end),
-								allValues.subList(start, end),
-								requestType
-						));
-					})
-					.then()
-					.toFuture()
-					.thenApply(_ -> List.of());
-		}
-
 		var initialRequest = MergeMultiRequest.newBuilder()
 				.setInitialRequest(MergeMultiInitialRequest.newBuilder()
 						.setTransactionOrUpdateId(transactionOrUpdateId)
@@ -613,7 +578,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			case RequestNothing<?> _ ->
 					toResponse(this.reactiveStub.mergeMulti(inputRequests)
 						.ignoreElement()
-						.toFuture());
+						.toFuture())
+						.thenApply(_ -> List.of());
 			case RequestType.RequestMerged<?> _ ->
 					toResponse(this.reactiveStub.mergeMultiGetMerged(inputRequests)
 						.map(v -> v.hasMerged() ? mapByteString(v.getMerged()) : null)
@@ -715,6 +681,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
 			long timeoutMs) throws RocksDBException {
+		var deadlineStub = futureStubWithReadDeadline(timeoutMs);
 		var request = ExistsMultiRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -722,8 +689,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		for (var logicalKeys : keys) {
 			request.addKeysMulti(KeyTuple.newBuilder().addAllKeys(mapKeys(logicalKeys)));
 		}
-		return toResponse(this.futureStub.existsMulti(request.build()),
-				response -> List.copyOf(response.getPresentList()));
+		return toResponse(deadlineStub.existsMulti(request.build()),
+				response -> List.copyOf(response.getPresentList()),
+				GrpcConnection::mapReadDeadlineError);
 	}
 
 	@Override
@@ -788,6 +756,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.
 		RequestReduceRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+		var deadlineStub = futureStubWithReadDeadline(timeoutMs);
 		var request = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -798,20 +767,44 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.build();
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestType.RequestGetFirstAndLast<?> _ ->
-					toResponse(this.futureStub.reduceRangeFirstAndLast(request), result -> new FirstAndLast<>(
+					toResponse(deadlineStub.reduceRangeFirstAndLast(request), result -> new FirstAndLast<>(
 							result.hasFirst() ? mapKV(result.getFirst()) : null,
 							result.hasLast() ? mapKV(result.getLast()) : null
-					));
+					), GrpcConnection::mapReadDeadlineError);
 			case RequestType.RequestEntriesCount<?> _ ->
-					toResponse(this.futureStub.reduceRangeEntriesCount(request), EntriesCount::getCount);
+					toResponse(deadlineStub.reduceRangeEntriesCount(request),
+							EntriesCount::getCount,
+							GrpcConnection::mapReadDeadlineError);
 			default -> throw new UnsupportedOperationException();
 		};
+	}
+
+	private RocksDBServiceFutureStub futureStubWithReadDeadline(long timeoutMs) {
+		validateReadTimeout(timeoutMs);
+		return timeoutMs == Long.MAX_VALUE
+				? futureStub
+				: futureStub.withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS);
+	}
+
+	private ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStubWithReadDeadline(long timeoutMs) {
+		validateReadTimeout(timeoutMs);
+		return timeoutMs == Long.MAX_VALUE
+				? reactiveStub
+				: reactiveStub.withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS);
+	}
+
+	private static void validateReadTimeout(long timeoutMs) {
+		if (timeoutMs < 0) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Read timeout must be non-negative");
+		}
 	}
 
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.
 		RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
+		var deadlineStub = reactiveStubWithReadDeadline(timeoutMs);
 		var request = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -821,9 +814,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setTimeoutMs(timeoutMs)
 				.build();
 		return (Publisher<T>) switch (requestType) {
-			case RequestType.RequestGetAllInRange<?> _ -> toResponse(reactiveStub.getAllInRange(request)
+			case RequestType.RequestGetAllInRange<?> _ -> toReadResponse(deadlineStub.getAllInRange(request)
 					.map(kv -> mapKV(kv)));
-			case RequestType.RequestGetAllInRangeNoCache<?> _ -> toResponse(reactiveStub.getAllInRangeNoCache(request)
+			case RequestType.RequestGetAllInRangeNoCache<?> _ -> toReadResponse(deadlineStub.getAllInRangeNoCache(request)
 					.map(GrpcConnection::mapKV))
 					.onErrorMap(GrpcConnection::mapNoCacheRangeCompatibilityError);
 		};
@@ -1137,7 +1130,17 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return flux.onErrorMap(GrpcConnection::mapGrpcStatusError);
 	}
 
+	private static <T> Flux<T> toReadResponse(Flux<T> flux) {
+		return flux.onErrorMap(GrpcConnection::mapReadDeadlineError);
+	}
+
 	private static <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture, Function<T, U> mapper) {
+		return toResponse(listenableFuture, mapper, GrpcConnection::mapGrpcStatusError);
+	}
+
+	private static <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture,
+			Function<T, U> mapper,
+			Function<Throwable, Throwable> errorMapper) {
 		var cf = new CompletableFuture<U>() {
 			@Override
 			public boolean cancel(boolean mayInterruptIfRunning) {
@@ -1155,7 +1158,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 			@Override
 			public void onFailure(@NotNull Throwable t) {
-				cf.completeExceptionally(mapGrpcStatusError(t));
+				cf.completeExceptionally(errorMapper.apply(t));
 			}
 		}, DIRECT_EXECUTOR);
 
@@ -1221,6 +1224,16 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		} else {
 			return t;
 		}
+	}
+
+	private static Throwable mapReadDeadlineError(@NotNull Throwable error) {
+		var mapped = mapGrpcStatusError(error);
+		if (mapped != error) {
+			return mapped;
+		}
+		return Status.fromThrowable(error).getCode() == Code.DEADLINE_EXCEEDED
+				? RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded")
+				: error;
 	}
 
 	private static <T> CompletableFuture<T> toResponse(ListenableFuture<T> listenableFuture) {

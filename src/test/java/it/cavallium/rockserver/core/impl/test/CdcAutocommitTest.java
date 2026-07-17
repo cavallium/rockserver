@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.cdc.CdcCommitMode;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
@@ -108,4 +109,97 @@ public class CdcAutocommitTest {
             // cleanup
         }
     }
+
+	@Test
+	void resolvedBucketSequenceGroupIsCommittedOnlyAfterEverySiblingSucceeds() throws Exception {
+		Path dbDir = Files.createTempDirectory("cdc-group-autocommit");
+		Path configFile = Files.createTempFile("rockserver", ".conf");
+		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
+
+		try (var db = new EmbeddedConnection(dbDir, "cdc-group-autocommit", configFile)) {
+			long columnId = db.getSyncApi().createColumn("bucket", ColumnSchema.of(
+					IntList.of(Integer.BYTES),
+					ObjectList.of(ColumnHashType.ALLSAME8),
+					true));
+			String subscriptionId = "resolved-group";
+			long startSeq = db.getSyncApi().cdcCreate(subscriptionId, null, List.of(columnId), true);
+			putBucketSiblings(db, columnId);
+
+			var firstSequence = new java.util.concurrent.atomic.AtomicReference<Long>();
+			var processed = new AtomicInteger();
+			Assertions.assertThrows(RuntimeException.class, () -> db.getAsyncApi().cdcStream(
+						subscriptionId,
+						new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+								startSeq, 1, Duration.ofMillis(10), CdcCommitMode.PER_EVENT),
+						event -> {
+							firstSequence.compareAndSet(null, event.seq());
+							return processed.incrementAndGet() == 2
+									? Mono.error(new RuntimeException("synthetic crash inside sequence group"))
+									: Mono.empty();
+						})
+						.collectList()
+						.block(Duration.ofSeconds(5)));
+
+			var replay = db.getAsyncApi().cdcPollBatchAsync(subscriptionId, null, 1)
+					.block(Duration.ofSeconds(5));
+			Assertions.assertNotNull(replay);
+			Assertions.assertFalse(replay.events().isEmpty());
+			Assertions.assertEquals(firstSequence.get(), replay.events().getFirst().seq(),
+					"A failed sibling must replay the complete resolved sequence group");
+		}
+	}
+
+	@Test
+	void resolvedBucketAcknowledgmentsAdvanceOnlyAtTheFinalSibling() throws Exception {
+		Path dbDir = Files.createTempDirectory("cdc-group-ack");
+		Path configFile = Files.createTempFile("rockserver", ".conf");
+		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
+
+		try (var db = new EmbeddedConnection(dbDir, "cdc-group-ack", configFile)) {
+			long columnId = db.getSyncApi().createColumn("bucket", ColumnSchema.of(
+					IntList.of(Integer.BYTES),
+					ObjectList.of(ColumnHashType.ALLSAME8),
+					true));
+			String subscriptionId = "resolved-group-ack";
+			long startSeq = db.getSyncApi().cdcCreate(subscriptionId, null, List.of(columnId), true);
+			putBucketSiblings(db, columnId);
+
+			var acknowledgments = db.getAsyncApi().cdcStreamAck(
+						subscriptionId,
+						new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+								startSeq, 1, Duration.ofMillis(10), CdcCommitMode.NONE))
+					.take(2)
+					.collectList()
+					.block(Duration.ofSeconds(5));
+			Assertions.assertNotNull(acknowledgments);
+			Assertions.assertEquals(2, acknowledgments.size());
+			long groupSequence = acknowledgments.getFirst().event().seq();
+			Assertions.assertEquals(groupSequence, acknowledgments.getLast().event().seq());
+
+			acknowledgments.getFirst().ack().block(Duration.ofSeconds(5));
+			var replay = db.getAsyncApi().cdcPollBatchAsync(subscriptionId, null, 1)
+					.block(Duration.ofSeconds(5));
+			Assertions.assertNotNull(replay);
+			Assertions.assertEquals(groupSequence, replay.events().getFirst().seq());
+
+			acknowledgments.getLast().ack().block(Duration.ofSeconds(5));
+			var afterGroup = db.getAsyncApi().cdcPollBatchAsync(subscriptionId, null, 1)
+					.block(Duration.ofSeconds(5));
+			Assertions.assertNotNull(afterGroup);
+			Assertions.assertFalse(afterGroup.events().isEmpty());
+			Assertions.assertTrue(afterGroup.events().getFirst().seq() > groupSequence);
+		}
+	}
+
+	private static void putBucketSiblings(EmbeddedConnection db, long columnId) {
+		for (String suffix : List.of("A", "B")) {
+			db.getSyncApi().put(0,
+					columnId,
+					new Keys(new Buf[]{
+							Buf.wrap(new byte[]{0, 0, 0, 1}),
+							Buf.wrap(suffix.getBytes(StandardCharsets.UTF_8))}),
+					Buf.wrap(("value-" + suffix).getBytes(StandardCharsets.UTF_8)),
+					RequestType.none());
+		}
+	}
 }

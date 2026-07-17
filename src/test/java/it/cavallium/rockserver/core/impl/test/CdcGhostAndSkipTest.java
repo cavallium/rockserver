@@ -154,29 +154,23 @@ class CdcGhostAndSkipTest {
     }
 
     @Test
-    void batchPollReturnsBoundedFilteredProgressAndNextSeq() throws Exception {
+    void batchPollContinuesAcrossFilteredSchedulerSlices() throws Exception {
         String subscriptionId = "sub-batch-filtered-page";
         long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
-        // The physical scan budget is a soft boundary between WAL batches. Splitting
-        // one WriteBatch would force every continuation to replay its prefix.
+        // Scheduler slices are an internal fairness boundary. A logical batch poll
+        // retains its WAL/parser cursor and must not expose an artificial empty batch
+        // merely because one slice contained only filtered mutations.
         int written = writeFilteredWalPagesThenMatchingEvent();
 
         assertEquals(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE + 1, written);
 
-        CdcBatch firstPage = db.cdcPollBatchAsyncInternal(subscriptionId, startSeq, 1)
+        CdcBatch batch = db.cdcPollBatchAsyncInternal(subscriptionId, startSeq, 1)
                 .block(CDC_POLL_TIMEOUT);
 
-        assertNotNull(firstPage);
-        assertTrue(firstPage.events().isEmpty(), "A physical page containing only filtered mutations stays empty");
-        assertTrue(firstPage.nextSeq() > startSeq, "An empty physical page must still return bounded cursor progress");
-
-        CdcBatch secondPage = db.cdcPollBatchAsyncInternal(subscriptionId, firstPage.nextSeq(), 1)
-                .block(CDC_POLL_TIMEOUT);
-
-        assertNotNull(secondPage);
-        assertEquals(1, secondPage.events().size());
-        assertEquals("match", new String(secondPage.events().getFirst().value().toByteArray(), StandardCharsets.UTF_8));
-        assertTrue(secondPage.nextSeq() > firstPage.nextSeq());
+        assertNotNull(batch);
+        assertEquals(1, batch.events().size());
+        assertEquals("match", new String(batch.events().getFirst().value().toByteArray(), StandardCharsets.UTF_8));
+        assertTrue(batch.nextSeq() > startSeq);
     }
 
     @Test

@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.WriteBatchIterator;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import java.io.IOException;
@@ -172,12 +173,12 @@ class CdcAsyncCancellationTest {
 		}
 
 		@Override
-		protected void iterateCdcWriteBatch(WriteBatch writeBatch, WriteBatch.Handler handler)
+		protected WriteBatchIterator.Cursor createCdcWriteBatchCursor(WriteBatch writeBatch)
 				throws org.rocksdb.RocksDBException {
 			parserStarted.countDown();
 			awaitUninterruptibly(releaseParser);
-			super.iterateCdcWriteBatch(writeBatch, handler);
 			completedParses.incrementAndGet();
+			return super.createCdcWriteBatchCursor(writeBatch);
 		}
 	}
 }

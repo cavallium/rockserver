@@ -39,6 +39,7 @@ public class RocksDBException extends RuntimeException {
 		TRANSACTION_NOT_FOUND,
 		NULL_ARGUMENT,
 		CDC_GAP_DETECTED,
+		CDC_RESPONSE_TOO_LARGE,
 		READ_DEADLINE_EXCEEDED
 	}
 

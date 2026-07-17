@@ -39,171 +39,235 @@ public class WriteBatchIterator {
     private static final int HEADER_SIZE = 12; // 8 seq + 4 count
 
     public static void iterate(byte[] data, WriteBatch.Handler handler) throws RocksDBException {
-        Objects.requireNonNull(data, "data");
-        Objects.requireNonNull(handler, "handler");
-        if (data.length < HEADER_SIZE) {
-            throw malformed("header is shorter than " + HEADER_SIZE + " bytes");
+        cursor(data).iterate(handler, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Create a resumable decoder over one serialized WriteBatch. The cursor owns the
+     * byte-array view and can safely move between scheduler threads as long as callers
+     * serialize access to it. Each call decodes at most {@code maxRecords}
+     * sequence-consuming mutations, retaining the byte offset for the next slice.
+     */
+    public static Cursor cursor(byte[] data) throws RocksDBException {
+        return new Cursor(data);
+    }
+
+    public static final class Cursor {
+
+        private final byte[] data;
+        private final long expectedRecords;
+        private int offset = HEADER_SIZE;
+        private long foundRecords;
+        private boolean emptyBatch = true;
+        private boolean finished;
+        private int lastSequenceRecordOffset = -1;
+        private boolean emptyBatchBeforeLastSequenceRecord;
+
+        private Cursor(byte[] data) throws RocksDBException {
+            this.data = Objects.requireNonNull(data, "data");
+            if (data.length < HEADER_SIZE) {
+                throw malformed("header is shorter than " + HEADER_SIZE + " bytes");
+            }
+            this.expectedRecords = readRecordCount(data);
+            finishIfAtEnd();
         }
 
-        long expectedRecords = readRecordCount(data);
-        long foundRecords = 0;
-        int offset = HEADER_SIZE;
-        boolean emptyBatch = true;
-        while (offset < data.length) {
-            if (!handler.shouldContinue()) {
+        public int iterate(WriteBatch.Handler handler, int maxRecords) throws RocksDBException {
+            Objects.requireNonNull(handler, "handler");
+            if (maxRecords <= 0) {
+                throw new IllegalArgumentException("maxRecords must be positive");
+            }
+            if (finished) {
+                return 0;
+            }
+
+            int decodedRecords = 0;
+            lastSequenceRecordOffset = -1;
+            while (offset < data.length && decodedRecords < maxRecords) {
+                if (!handler.shouldContinue()) {
+                    break;
+                }
+
+                int nextOffset = offset;
+                int recordOffset = offset;
+                boolean emptyBatchBeforeRecord = emptyBatch;
+                int type = data[nextOffset++] & 0xFF;
+                boolean sequenceRecord = false;
+
+                // Default-column-family records.
+                if (type == kTypeValue) {
+                    VarString key = readVarString(data, nextOffset);
+                    VarString value = readVarString(data, key.nextOffset);
+                    handler.put(key.data, value.data);
+                    nextOffset = value.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeDeletion) {
+                    VarString key = readVarString(data, nextOffset);
+                    handler.delete(key.data);
+                    nextOffset = key.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeSingleDeletion) {
+                    VarString key = readVarString(data, nextOffset);
+                    handler.singleDelete(key.data);
+                    nextOffset = key.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeMerge) {
+                    VarString key = readVarString(data, nextOffset);
+                    VarString value = readVarString(data, key.nextOffset);
+                    handler.merge(key.data, value.data);
+                    nextOffset = value.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeRangeDeletion) {
+                    VarString begin = readVarString(data, nextOffset);
+                    VarString end = readVarString(data, begin.nextOffset);
+                    handler.deleteRange(begin.data, end.data);
+                    nextOffset = end.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeLogData) {
+                    VarString blob = readVarString(data, nextOffset);
+                    handler.logData(blob.data);
+                    nextOffset = blob.nextOffset;
+                } else if (type == kTypeBlobIndex) {
+                    VarString key = readVarString(data, nextOffset);
+                    VarString value = readVarString(data, key.nextOffset);
+                    handler.putBlobIndex(0, key.data, value.data);
+                    nextOffset = value.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeNoop) {
+                    handler.markNoop(emptyBatch);
+                    emptyBatch = true;
+                }
+                // Explicit-column-family records.
+                else if (type == kTypeColumnFamilyValue) {
+                    VarInt cfId = readVarInt(data, nextOffset);
+                    VarString key = readVarString(data, cfId.nextOffset);
+                    VarString value = readVarString(data, key.nextOffset);
+                    handler.put(cfId.value, key.data, value.data);
+                    nextOffset = value.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeColumnFamilyDeletion) {
+                    VarInt cfId = readVarInt(data, nextOffset);
+                    VarString key = readVarString(data, cfId.nextOffset);
+                    handler.delete(cfId.value, key.data);
+                    nextOffset = key.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeColumnFamilySingleDeletion) {
+                    VarInt cfId = readVarInt(data, nextOffset);
+                    VarString key = readVarString(data, cfId.nextOffset);
+                    handler.singleDelete(cfId.value, key.data);
+                    nextOffset = key.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeColumnFamilyMerge) {
+                    VarInt cfId = readVarInt(data, nextOffset);
+                    VarString key = readVarString(data, cfId.nextOffset);
+                    VarString value = readVarString(data, key.nextOffset);
+                    handler.merge(cfId.value, key.data, value.data);
+                    nextOffset = value.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeColumnFamilyRangeDeletion) {
+                    VarInt cfId = readVarInt(data, nextOffset);
+                    VarString begin = readVarString(data, cfId.nextOffset);
+                    VarString end = readVarString(data, begin.nextOffset);
+                    handler.deleteRange(cfId.value, begin.data, end.data);
+                    nextOffset = end.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                } else if (type == kTypeColumnFamilyBlobIndex) {
+                    VarInt cfId = readVarInt(data, nextOffset);
+                    VarString key = readVarString(data, cfId.nextOffset);
+                    VarString value = readVarString(data, key.nextOffset);
+                    handler.putBlobIndex(cfId.value, key.data, value.data);
+                    nextOffset = value.nextOffset;
+                    sequenceRecord = true;
+                    emptyBatch = false;
+                }
+                // Transaction/control records do not consume sequence numbers.
+                else if (type == kTypeBeginPrepareXID
+                        || type == kTypeBeginPersistedPrepareXID
+                        || type == kTypeBeginUnprepareXID) {
+                    handler.markBeginPrepare();
+                } else if (type == kTypeEndPrepareXID) {
+                    VarString xid = readVarString(data, nextOffset);
+                    handler.markEndPrepare(xid.data);
+                    nextOffset = xid.nextOffset;
+                    emptyBatch = true;
+                } else if (type == kTypeCommitXID) {
+                    VarString xid = readVarString(data, nextOffset);
+                    handler.markCommit(xid.data);
+                    nextOffset = xid.nextOffset;
+                    emptyBatch = true;
+                } else if (type == kTypeRollbackXID) {
+                    VarString xid = readVarString(data, nextOffset);
+                    handler.markRollback(xid.data);
+                    nextOffset = xid.nextOffset;
+                    emptyBatch = true;
+                } else if (type == kTypeCommitWithTimestamp) {
+                    VarString timestamp = readVarString(data, nextOffset);
+                    VarString xid = readVarString(data, timestamp.nextOffset);
+                    handler.markCommitWithTimestamp(xid.data, timestamp.data);
+                    nextOffset = xid.nextOffset;
+                    emptyBatch = true;
+                } else {
+                    throw unsupported(type);
+                }
+
+                // Commit cursor state only after the handler accepted the record. A
+                // handler failure therefore never leaves a half-consumed record.
+                offset = nextOffset;
+                if (sequenceRecord) {
+                    foundRecords++;
+                    decodedRecords++;
+                    lastSequenceRecordOffset = recordOffset;
+                    emptyBatchBeforeLastSequenceRecord = emptyBatchBeforeRecord;
+                }
+            }
+
+            finishIfAtEnd();
+            return decodedRecords;
+        }
+
+        public long recordsRead() {
+            return foundRecords;
+        }
+
+        public boolean isFinished() {
+            return finished;
+        }
+
+        /**
+         * Rewind the last sequence-consuming record decoded by the most recent slice.
+         * This is used when a consumer inspected an event but could not accept it due
+         * to a byte boundary. No subsequent record may have been decoded.
+         */
+        public void rewindLastRecord() {
+            if (lastSequenceRecordOffset < 0) {
+                throw new IllegalStateException("No sequence record is available to rewind");
+            }
+            offset = lastSequenceRecordOffset;
+            foundRecords--;
+            emptyBatch = emptyBatchBeforeLastSequenceRecord;
+            finished = false;
+            lastSequenceRecordOffset = -1;
+        }
+
+        private void finishIfAtEnd() throws RocksDBException {
+            if (offset != data.length) {
                 return;
             }
-            int type = data[offset++] & 0xFF;
-            
-            // Check for variants of ops
-            // Default CF ops
-            if (type == kTypeValue) {
-                VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.put(key.data, val.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeDeletion) {
-                VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                handler.delete(key.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeSingleDeletion) {
-                VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                handler.singleDelete(key.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeMerge) {
-                VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.merge(key.data, val.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeRangeDeletion) {
-                VarString begin = readVarString(data, offset);
-                offset = begin.nextOffset;
-                VarString end = readVarString(data, offset);
-                offset = end.nextOffset;
-                handler.deleteRange(begin.data, end.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeLogData) {
-                VarString blob = readVarString(data, offset);
-                offset = blob.nextOffset;
-                handler.logData(blob.data);
-            } else if (type == kTypeBlobIndex) {
-                 VarString key = readVarString(data, offset);
-                 offset = key.nextOffset;
-                 VarString val = readVarString(data, offset);
-                 offset = val.nextOffset;
-                 handler.putBlobIndex(0, key.data, val.data);
-                 foundRecords++;
-                 emptyBatch = false;
-            } else if (type == kTypeNoop) {
-                handler.markNoop(emptyBatch);
-                emptyBatch = true;
+            if (foundRecords != expectedRecords) {
+                throw malformed("header declares " + expectedRecords + " records, but decoded " + foundRecords);
             }
-            // CF ops
-            else if (type == kTypeColumnFamilyValue) {
-                VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
-                VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.put(cfId.value, key.data, val.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeColumnFamilyDeletion) {
-                VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
-                VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                handler.delete(cfId.value, key.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeColumnFamilySingleDeletion) {
-                VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
-                VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                handler.singleDelete(cfId.value, key.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeColumnFamilyMerge) {
-                VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
-                VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.merge(cfId.value, key.data, val.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeColumnFamilyRangeDeletion) {
-                VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
-                VarString begin = readVarString(data, offset);
-                offset = begin.nextOffset;
-                VarString end = readVarString(data, offset);
-                offset = end.nextOffset;
-                handler.deleteRange(cfId.value, begin.data, end.data);
-                foundRecords++;
-                emptyBatch = false;
-            } else if (type == kTypeColumnFamilyBlobIndex) {
-                VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
-                VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.putBlobIndex(cfId.value, key.data, val.data);
-                foundRecords++;
-                emptyBatch = false;
-            }
-            // Transaction ops
-            else if (type == kTypeBeginPrepareXID) {
-                handler.markBeginPrepare();
-            } else if (type == kTypeEndPrepareXID) {
-                VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
-                handler.markEndPrepare(xid.data);
-                emptyBatch = true;
-            } else if (type == kTypeCommitXID) {
-                VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
-                handler.markCommit(xid.data);
-                emptyBatch = true;
-            } else if (type == kTypeRollbackXID) {
-                VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
-                handler.markRollback(xid.data);
-                emptyBatch = true;
-            } else if (type == kTypeBeginPersistedPrepareXID) {
-                handler.markBeginPrepare();
-            } else if (type == kTypeBeginUnprepareXID) {
-                handler.markBeginPrepare();
-            } else if (type == kTypeCommitWithTimestamp) {
-                VarString ts = readVarString(data, offset);
-                offset = ts.nextOffset;
-                VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
-                handler.markCommitWithTimestamp(xid.data, ts.data);
-                emptyBatch = true;
-            }
-            else {
-                throw unsupported(type);
-            }
-        }
-
-        if (foundRecords != expectedRecords) {
-            throw malformed("header declares " + expectedRecords + " records, but decoded " + foundRecords);
+            finished = true;
         }
     }
 

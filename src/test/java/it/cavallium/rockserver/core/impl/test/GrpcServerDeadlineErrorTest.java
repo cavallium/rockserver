@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -23,7 +24,9 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -128,6 +131,117 @@ class GrpcServerDeadlineErrorTest {
 		}
 	}
 
+	@Test
+	void transportDeadlineClampsTheNativeReadBudget() throws Exception {
+		var backend = new RecordingTimeoutBackendConnection();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			var channel = io.grpc.ManagedChannelBuilder
+					.forAddress("127.0.0.1", server.getPort())
+					.directExecutor()
+					.usePlaintext()
+					.build();
+			try {
+				var request = it.cavallium.rockserver.core.common.api.proto.GetRangeRequest.newBuilder()
+						.setTimeoutMs(10_000)
+						.build();
+				it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newFutureStub(channel)
+						.withDeadlineAfter(2, TimeUnit.SECONDS)
+						.reduceRangeFirstAndLast(request)
+						.get(5, TimeUnit.SECONDS);
+
+				assertTrue(backend.observedTimeoutMs.get() >= 0);
+				assertTrue(backend.observedTimeoutMs.get() <= 2_000,
+						"the server must not grant the payload a fresh timeout beyond the gRPC deadline");
+			} finally {
+				channel.shutdownNow();
+				channel.awaitTermination(5, TimeUnit.SECONDS);
+			}
+		}
+	}
+
+	@Test
+	void transportDeadlineClampsTheNativeStreamingReadBudget() throws Exception {
+		var backend = new RecordingTimeoutBackendConnection();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			var channel = io.grpc.ManagedChannelBuilder
+					.forAddress("127.0.0.1", server.getPort())
+					.directExecutor()
+					.usePlaintext()
+					.build();
+			try {
+				var request = it.cavallium.rockserver.core.common.api.proto.GetRangeRequest.newBuilder()
+						.setTimeoutMs(10_000)
+						.build();
+				it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc
+						.newReactorStub(channel)
+						.withDeadlineAfter(2, TimeUnit.SECONDS)
+						.getAllInRange(request)
+						.collectList()
+						.block(java.time.Duration.ofSeconds(5));
+
+				assertTrue(backend.observedTimeoutMs.get() >= 0);
+				assertTrue(backend.observedTimeoutMs.get() <= 2_000,
+						"the server must cap a streaming RocksDB read to the gRPC deadline");
+			} finally {
+				channel.shutdownNow();
+				channel.awaitTermination(5, TimeUnit.SECONDS);
+			}
+		}
+	}
+
+	@Test
+	void clientReadTimeoutIsAlsoTheGrpcCallDeadline() throws Exception {
+		var backend = new CancellableNeverCompletingBackendConnection();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			try (var client = GrpcConnection.forHostAndPort("grpc-call-deadline",
+					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
+				var response = client.getAsyncApi().reduceRangeAsync(0,
+						0,
+						null,
+						null,
+						false,
+						RequestType.firstAndLast(),
+						1_000);
+				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
+
+				var failure = assertThrows(ExecutionException.class,
+						() -> response.get(5, TimeUnit.SECONDS));
+				var rocksFailure = assertInstanceOf(RocksDBException.class, failure.getCause());
+				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						rocksFailure.getErrorUniqueId());
+				assertTrue(backend.cancelObserved.await(5, TimeUnit.SECONDS));
+				assertTrue(backend.observedTimeoutMs.get() >= 0);
+				assertTrue(backend.observedTimeoutMs.get() <= 1_000);
+			}
+		}
+	}
+
+	@Test
+	void existsMultiUsesTheSameEndToEndReadDeadline() throws Exception {
+		var backend = new CancellableNeverCompletingBackendConnection();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			try (var client = GrpcConnection.forHostAndPort("grpc-exists-multi-deadline",
+					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
+				var response = client.getAsyncApi().existsMultiAsync(
+						0, 0, List.of(new it.cavallium.rockserver.core.common.Keys()), 1_000);
+				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
+
+				var failure = assertThrows(ExecutionException.class,
+						() -> response.get(5, TimeUnit.SECONDS));
+				var rocksFailure = assertInstanceOf(RocksDBException.class, failure.getCause());
+				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						rocksFailure.getErrorUniqueId());
+				assertTrue(backend.cancelObserved.await(5, TimeUnit.SECONDS));
+				assertTrue(backend.observedTimeoutMs.get() >= 0);
+				assertTrue(backend.observedTimeoutMs.get() <= 1_000);
+			}
+		}
+	}
+
 	private static final class DeadlineBackendConnection implements RocksDBConnection {
 
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {};
@@ -205,6 +319,95 @@ class GrpcServerDeadlineErrorTest {
 		@Override
 		public RocksDBSyncAPI getSyncApi() {
 			return syncApi;
+		}
+
+		@Override
+		public RocksDBAsyncAPI getAsyncApi() {
+			return asyncApi;
+		}
+
+		@Override
+		public void close() {
+		}
+	}
+
+	private static final class RecordingTimeoutBackendConnection implements RocksDBConnection {
+
+		private final AtomicLong observedTimeoutMs = new AtomicLong(-1);
+		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+			@Override
+			@SuppressWarnings("unchecked")
+			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
+				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?> range) {
+					observedTimeoutMs.set(range.timeoutMs());
+					return (RA) CompletableFuture.completedFuture(
+							new it.cavallium.rockserver.core.common.FirstAndLast<>(null, null));
+				}
+				if (request instanceof RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> range) {
+					observedTimeoutMs.set(range.timeoutMs());
+					return (RA) Flux.empty();
+				}
+				throw new UnsupportedOperationException("Unexpected request: " + request);
+			}
+		};
+
+		@Override
+		public URI getUrl() {
+			return URI.create("test://recording-timeout-backend");
+		}
+
+		@Override
+		public RocksDBSyncAPI getSyncApi() {
+			return new RocksDBSyncAPI() {};
+		}
+
+		@Override
+		public RocksDBAsyncAPI getAsyncApi() {
+			return asyncApi;
+		}
+
+		@Override
+		public void close() {
+		}
+	}
+
+	private static final class CancellableNeverCompletingBackendConnection implements RocksDBConnection {
+
+		private final CountDownLatch entered = new CountDownLatch(1);
+		private final CountDownLatch cancelObserved = new CountDownLatch(1);
+		private final AtomicLong observedTimeoutMs = new AtomicLong(-1);
+		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+			@Override
+			@SuppressWarnings("unchecked")
+			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
+				long timeoutMs;
+				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?> range) {
+					timeoutMs = range.timeoutMs();
+				} else if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti existsMulti) {
+					timeoutMs = existsMulti.timeoutMs();
+				} else {
+					throw new UnsupportedOperationException("Unexpected request: " + request);
+				}
+				observedTimeoutMs.set(timeoutMs);
+				entered.countDown();
+				return (RA) new CompletableFuture<>() {
+					@Override
+					public boolean cancel(boolean mayInterruptIfRunning) {
+						cancelObserved.countDown();
+						return super.cancel(mayInterruptIfRunning);
+					}
+				};
+			}
+		};
+
+		@Override
+		public URI getUrl() {
+			return URI.create("test://never-completing-backend");
+		}
+
+		@Override
+		public RocksDBSyncAPI getSyncApi() {
+			return new RocksDBSyncAPI() {};
 		}
 
 		@Override

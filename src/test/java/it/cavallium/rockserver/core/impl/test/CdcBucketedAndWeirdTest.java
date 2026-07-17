@@ -104,6 +104,36 @@ class CdcBucketedAndWeirdTest {
         assertArrayEquals("V2".getBytes(), ev2.value().toByteArray(), "Value should be resolved V2");
     }
 
+	@Test
+	void resolvedBucketSequenceGroupsAreNeverSplitByTheEventBudget() throws Exception {
+		long colId = db.createColumn("bucket-col-atomic", ColumnSchema.of(
+				IntList.of(4),
+				ObjectList.of(ColumnHashType.ALLSAME8),
+				true));
+		long startSeq = db.cdcCreate("sub-bucket-atomic", null, List.of(colId), true);
+
+		for (String suffix : List.of("A", "B", "C")) {
+			db.put(0,
+					colId,
+					new Keys(new Buf[]{Buf.wrap(intToBytes(1)), Buf.wrap(suffix.getBytes(StandardCharsets.UTF_8))}),
+					Buf.wrap(("V-" + suffix).getBytes(StandardCharsets.UTF_8)),
+					RequestType.none());
+		}
+
+		CdcBatch first = db.cdcPollBatchAsyncInternal("sub-bucket-atomic", startSeq, 3).block();
+		assertNotNull(first);
+		assertEquals(3, first.events().size());
+		long firstGroupSeq = first.events().getFirst().seq();
+		assertTrue(first.events().stream().allMatch(event -> event.seq() == firstGroupSeq));
+
+		CdcBatch second = db.cdcPollBatchAsyncInternal("sub-bucket-atomic", first.nextSeq(), 3).block();
+		assertNotNull(second);
+		assertEquals(3, second.events().size());
+		assertEquals(first.nextSeq(), second.events().getFirst().seq(),
+				"The first complete group that did not fit must be the exact continuation");
+		assertTrue(second.events().stream().allMatch(event -> event.seq() == second.events().getFirst().seq()));
+	}
+
     @Test
     void testBucketedColumnRaw() throws Exception {
         // Control test: resolved=false

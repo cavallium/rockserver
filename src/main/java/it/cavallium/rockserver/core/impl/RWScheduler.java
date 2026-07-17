@@ -242,6 +242,20 @@ public final class RWScheduler {
 		return cdcExecutor;
 	}
 
+	/**
+	 * Remove work that has not started from either scheduling view. Interactive reads are
+	 * wrapped only to classify them in the shared weighted queue, so cancellation must remove
+	 * that wrapper rather than the original runnable.
+	 */
+	public boolean removeQueuedTask(Executor schedulingView, Runnable task) {
+		Objects.requireNonNull(schedulingView, "schedulingView");
+		Objects.requireNonNull(task, "task");
+		if (schedulingView instanceof InteractiveExecutor interactiveExecutor) {
+			return interactiveExecutor.remove(task);
+		}
+		return schedulingView instanceof ThreadPoolExecutor threadPool && threadPool.remove(task);
+	}
+
 	/** Preserve the value semantics of the original four-component public record. */
 	@Override
 	public boolean equals(Object object) {
@@ -357,6 +371,15 @@ public final class RWScheduler {
 		@Override
 		public void execute(@NotNull Runnable command) {
 			delegate.execute(command instanceof InteractiveTask ? command : new InteractiveTask(command));
+		}
+
+		private boolean remove(Runnable command) {
+			if (!(delegate instanceof ThreadPoolExecutor threadPool)) {
+				return false;
+			}
+			return threadPool.remove(command instanceof InteractiveTask
+					? command
+					: new InteractiveTask(command));
 		}
 	}
 

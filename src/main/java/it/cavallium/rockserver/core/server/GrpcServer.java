@@ -9,6 +9,8 @@ import com.google.protobuf.Descriptors.FieldDescriptor;
 import com.google.protobuf.Empty;
 import com.google.protobuf.Message;
 import com.google.protobuf.UnsafeByteOperations;
+import io.grpc.Context;
+import io.grpc.Deadline;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCall.Listener;
@@ -313,6 +315,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<ExistsMultiResponse> existsMulti(ExistsMultiRequest request) {
+			var transportDeadline = Context.current().getDeadline();
 			return Mono.defer(() -> {
 					var keys = request.getKeysMultiList().stream()
 							.map(keyTuple -> mapKeys(keyTuple.getKeysCount(), keyTuple::getKeys))
@@ -321,7 +324,7 @@ public class GrpcServer extends Server {
 							request.getTransactionId(),
 							request.getColumnId(),
 							keys,
-							request.getTimeoutMs()));
+							effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline)));
 				})
 					.map(present -> ExistsMultiResponse.newBuilder().addAllPresent(present).build())
 					.transform(this.onErrorMapMonoWithRequestInfo("existsMulti", request));
@@ -969,6 +972,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
+			var transportDeadline = Context.current().getDeadline();
 			return Mono.defer(() -> fromCancellableFuture(asyncApi.reduceRangeAsync(
 						request.getTransactionId(),
 						request.getColumnId(),
@@ -976,7 +980,7 @@ public class GrpcServer extends Server {
 						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 						request.getReverse(),
 						RequestType.firstAndLast(),
-						request.getTimeoutMs())))
+						effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline))))
 					.map(range -> {
 						if (range.first() == null || range.last() == null) {
 							return FirstAndLast.getDefaultInstance();
@@ -991,6 +995,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<EntriesCount> reduceRangeEntriesCount(GetRangeRequest request) {
+			var transportDeadline = Context.current().getDeadline();
 			return Mono.defer(() -> fromCancellableFuture(asyncApi.reduceRangeAsync(
 						request.getTransactionId(),
 						request.getColumnId(),
@@ -998,9 +1003,18 @@ public class GrpcServer extends Server {
 						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 						request.getReverse(),
 						RequestType.entriesCount(),
-						request.getTimeoutMs())))
+						effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline))))
 					.map(count -> EntriesCount.newBuilder().setCount(count).build())
 					.transform(this.onErrorMapMonoWithRequestInfo("reduceRangeEntriesCount", request));
+		}
+
+		private long effectiveReadTimeoutMillis(long requestedTimeoutMs, @Nullable Deadline transportDeadline) {
+			if (requestedTimeoutMs < 0 || transportDeadline == null) {
+				return requestedTimeoutMs;
+			}
+			long transportRemainingMs = Math.max(0L,
+					transportDeadline.timeRemaining(TimeUnit.MILLISECONDS));
+			return Math.min(requestedTimeoutMs, transportRemainingMs);
 		}
 
 		@Override
@@ -1017,6 +1031,7 @@ public class GrpcServer extends Server {
 				RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV,
 						it.cavallium.rockserver.core.common.KV> requestType,
 				String requestName) {
+			var transportDeadline = Context.current().getDeadline();
 			return Flux.defer(() -> Flux
 					.from(asyncApi.getRangeAsync(request.getTransactionId(),
 							request.getColumnId(),
@@ -1024,7 +1039,7 @@ public class GrpcServer extends Server {
 							mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
 							request.getReverse(),
 							requestType,
-							request.getTimeoutMs())))
+							effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline))))
 					.map(GrpcServerImpl::unmapKVHeap)
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, request));
 		}
@@ -1854,7 +1869,9 @@ public class GrpcServer extends Server {
 				return handleError(exx.getCause());
 			} else {
 				return switch (ex) {
-					case RocksDBException e -> Status.INTERNAL.withDescription(e.getLocalizedMessage()).withCause(e);
+					case RocksDBException e -> e.getErrorUniqueId() == RocksDBErrorType.CDC_RESPONSE_TOO_LARGE
+							? Status.FAILED_PRECONDITION.withDescription(e.getLocalizedMessage()).withCause(e)
+							: Status.INTERNAL.withDescription(e.getLocalizedMessage()).withCause(e);
 					case StatusException ex2 -> ex2.getStatus();
 					case StatusRuntimeException ex3 -> ex3.getStatus();
 					case null, default -> Status.INTERNAL.withCause(ex);

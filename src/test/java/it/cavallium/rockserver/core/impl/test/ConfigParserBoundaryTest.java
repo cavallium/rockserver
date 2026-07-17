@@ -35,12 +35,21 @@ class ConfigParserBoundaryTest {
 				() -> assertFalse(config.metrics().influx().enabled()),
 				() -> assertTrue(config.metrics().influx().allowInsecureCertificates()),
 				() -> assertTrue(config.metrics().jmx().enabled()),
+				() -> assertTrue(config.global().followRocksdbOptimizations()),
+				() -> assertTrue(config.global().paranoidChecks()),
+				() -> assertFalse(config.global().useClockCache()),
 				() -> assertTrue(config.global().enableFastGet()),
 				() -> assertTrue(config.global().checksum()),
 				() -> assertTrue(config.global().absoluteConsistency()),
 				() -> assertFalse(config.global().unorderedWrite()),
+				() -> assertFalse(config.global().allowRocksdbMmapWrites()),
+				() -> assertFalse(config.global().disableAutoCompactions()),
+				() -> assertFalse(config.global().disableWriteSlowdown()),
 				() -> assertEquals(new DataSize("512MiB"), config.global().blockCache()),
+				() -> assertEquals(0.5d, config.global().blockCacheHighPriorityRatio()),
+				() -> assertNull(config.global().databaseWriteBufferSize()),
 				() -> assertEquals(Duration.ofSeconds(5), config.global().delayWalFlushDuration()),
+				() -> assertNull(config.global().maxSubcompactions()),
 				() -> assertNull(config.global().maxBackgroundJobs()),
 				() -> assertEquals("default", config.global().columnOptions()[0].name())
 		);
@@ -113,7 +122,22 @@ class ConfigParserBoundaryTest {
 				() -> assertEquals(original.parallelism().read(), reparsed.parallelism().read()),
 				() -> assertEquals(original.parallelism().write(), reparsed.parallelism().write()),
 				() -> assertEquals(original.metrics().databaseName(), reparsed.metrics().databaseName()),
+				() -> assertEquals(original.global().followRocksdbOptimizations(),
+						reparsed.global().followRocksdbOptimizations()),
+				() -> assertEquals(original.global().paranoidChecks(), reparsed.global().paranoidChecks()),
+				() -> assertEquals(original.global().useClockCache(), reparsed.global().useClockCache()),
+				() -> assertEquals(original.global().allowRocksdbMmapWrites(),
+						reparsed.global().allowRocksdbMmapWrites()),
+				() -> assertEquals(original.global().disableAutoCompactions(),
+						reparsed.global().disableAutoCompactions()),
+				() -> assertEquals(original.global().disableWriteSlowdown(),
+						reparsed.global().disableWriteSlowdown()),
 				() -> assertEquals(original.global().blockCache(), reparsed.global().blockCache()),
+				() -> assertEquals(original.global().blockCacheHighPriorityRatio(),
+						reparsed.global().blockCacheHighPriorityRatio()),
+				() -> assertEquals(original.global().databaseWriteBufferSize(),
+						reparsed.global().databaseWriteBufferSize()),
+				() -> assertEquals(original.global().maxSubcompactions(), reparsed.global().maxSubcompactions()),
 				() -> assertEquals(original.global().fallbackColumnOptions().levels().length,
 						reparsed.global().fallbackColumnOptions().levels().length),
 				() -> assertEquals(original.global().fallbackColumnOptions().levels()[0].compression(),
@@ -134,10 +158,19 @@ class ConfigParserBoundaryTest {
 	@Test
 	void printedConfigurationPreservesNonDefaultGlobalValues() throws IOException {
 		Path custom = write("custom.conf", """
+				database.global.follow-rocksdb-optimizations = false
+				database.global.paranoid-checks = false
+				database.global.use-clock-cache = true
+				database.global.allow-rocksdb-mmap-writes = true
+				database.global.disable-auto-compactions = true
+				database.global.disable-write-slowdown = true
 				database.global.temp-sst-path = ./custom-temp
 				database.global.delay-wal-flush-duration = PT0.125S
 				database.global.unordered-write = true
 				database.global.max-background-jobs = 3
+				database.global.max-subcompactions = 2
+				database.global.database-write-buffer-size = 2GiB
+				database.global.block-cache-high-priority-ratio = 0.25
 				""");
 		var original = ConfigParser.parse(custom);
 		Path printed = write("printed-custom.conf", "database: " + ConfigPrinter.stringify(original));
@@ -145,10 +178,19 @@ class ConfigParserBoundaryTest {
 		var reparsed = ConfigParser.parse(printed);
 
 		assertAll(
+				() -> assertFalse(reparsed.global().followRocksdbOptimizations()),
+				() -> assertFalse(reparsed.global().paranoidChecks()),
+				() -> assertTrue(reparsed.global().useClockCache()),
+				() -> assertTrue(reparsed.global().allowRocksdbMmapWrites()),
+				() -> assertTrue(reparsed.global().disableAutoCompactions()),
+				() -> assertTrue(reparsed.global().disableWriteSlowdown()),
 				() -> assertEquals(original.global().tempSstPath(), reparsed.global().tempSstPath()),
 				() -> assertEquals(original.global().delayWalFlushDuration(), reparsed.global().delayWalFlushDuration()),
 				() -> assertEquals(original.global().unorderedWrite(), reparsed.global().unorderedWrite()),
-				() -> assertEquals(original.global().maxBackgroundJobs(), reparsed.global().maxBackgroundJobs())
+				() -> assertEquals(2, reparsed.global().maxSubcompactions()),
+				() -> assertEquals(new DataSize("2GiB"), reparsed.global().databaseWriteBufferSize()),
+				() -> assertEquals(original.global().maxBackgroundJobs(), reparsed.global().maxBackgroundJobs()),
+				() -> assertEquals(0.25d, reparsed.global().blockCacheHighPriorityRatio())
 		);
 	}
 

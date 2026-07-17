@@ -160,9 +160,9 @@ class CdcWalPurgeTest {
         }
     }
     
-    private long extractWalSeq(long seq) {
-        return seq >>> 20;
-    }
+	private long extractWalSeq(long seq) {
+		return seq >>> 20;
+	}
 
     private void writeBatch(int startId, int count, String val) throws RocksDBException {
         List<Keys> keys = new ArrayList<>();

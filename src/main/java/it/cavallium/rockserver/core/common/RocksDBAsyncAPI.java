@@ -50,6 +50,7 @@ import java.util.function.Function;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
+import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.util.retry.Retry;
@@ -328,10 +329,10 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
      * - Backpressure-aware: events are fetched in bounded batches and only when downstream requests.
      * - Crash/restart behavior depends on the chosen {@link CdcCommitMode}:
      *   - {@link it.cavallium.rockserver.core.common.cdc.CdcCommitMode#PER_EVENT PER_EVENT}: each event is
-     *     processed via {@code processor}, then the offset is committed, and only after a successful commit the
-     *     event is emitted to downstream. If the client crashes, upon resume the next event will be the first
-     *     uncommitted one – i.e., already processed events will not be re-delivered. This is the safest mode if you
-     *     want to avoid duplicates on unexpected crashes, at the cost of more frequent commits.
+     *     processed via {@code processor}, then its offset is committed, and only after a successful commit the
+     *     event is emitted to downstream. Resolved bucket siblings share one raw CDC sequence, so that sequence
+     *     group is processed and committed atomically; a crash before the group commit replays the whole group.
+     *     For ordinary events this remains one commit per event.
      *   - {@link it.cavallium.rockserver.core.common.cdc.CdcCommitMode#BATCH BATCH}: the whole polled batch is
      *     processed first; then a single commit of the last event’s sequence happens; finally the events are emitted.
      *     If a crash happens mid-batch before the commit, some events in the tail of that batch will be replayed on
@@ -398,9 +399,11 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
                         long lastSeq = events.get(events.size() - 1).seq();
                         if (commitMode == CdcCommitMode.PER_EVENT) {
                             return Flux.fromIterable(events)
-                                    .concatMap(event -> processor.apply(event)
-                                            .then(commitFn.apply(event.seq()))
-                                            .thenReturn(event));
+                                    .bufferUntilChanged(CDCEvent::seq)
+                                    .concatMap(sequenceGroup -> Flux.fromIterable(sequenceGroup)
+                                            .concatMap(processor::apply)
+                                            .then(commitFn.apply(sequenceGroup.getLast().seq()))
+                                            .thenMany(Flux.fromIterable(sequenceGroup)));
                         } else { // BATCH default
                             return Flux.fromIterable(events)
                                     .concatMap(processor::apply)
@@ -425,7 +428,10 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
      *
      * Notes and guarantees:
      * - Backpressure: identical to {@link #cdcStream}; events are fetched in bounded batches only when requested.
-     * - Durability: ack() persists the offset via {@link #cdcCommitAsync(String, long)} with retry/backoff.
+     * - Durability: ack() persists a crash-safe offset via {@link #cdcCommitAsync(String, long)} with retry/backoff.
+     *   Resolved bucket siblings can share one sequence and therefore form one atomic acknowledgment group. In
+     *   ordered consumption, acknowledgments before the final sibling persist the position immediately before the
+     *   group; the final sibling advances past it. A crash in the middle consequently replays the complete group.
      * - Ordering: you should acknowledge events in the same order they are received. Committing a higher sequence
      *   while earlier events are not yet processed may cause those earlier ones to be skipped after a crash because
      *   the server keeps only the maximum committed sequence. Keep ack order to avoid data loss.
@@ -451,7 +457,9 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
                         }
                     })
                     .retryWhen(retrySpec)
-                    .doOnSuccess(__ -> cursor.set(targetSeq + 1));
+                    .doOnSuccess(__ -> cursor.updateAndGet(previous -> previous == null
+                            ? targetSeq + 1
+                            : Math.max(previous, targetSeq + 1)));
 
             return Flux.generate(sink -> sink.next(cursor))
                     .concatMap(state -> {
@@ -472,8 +480,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
                                 return Mono.delay(idle).then(Mono.empty());
                             }
 
-                            return Flux.fromIterable(events)
-                                    .map(ev -> new CDCEventAck(ev, () -> commitFn.apply(ev.seq())));
+                            return Flux.range(0, events.size())
+                                    .map(index -> {
+                                        CDCEvent event = events.get(index);
+                                        boolean finalSibling = index + 1 == events.size()
+                                                || events.get(index + 1).seq() != event.seq();
+                                        long safeCommitSeq = finalSibling ? event.seq() : event.seq() - 1;
+                                        return new CDCEventAck(event, () -> commitFn.apply(safeCommitSeq));
+                                    });
                         });
                     });
         });
@@ -498,13 +512,32 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
      */
     private static Retry defaultCdcStreamRetry() {
         return Retry.backoff(Long.MAX_VALUE, Duration.ofMillis(50))
-                .doBeforeRetry(s -> System.err.println("CDC RETRY: " + s.failure()))
+                .doBeforeRetry(signal -> {
+                    Throwable failure = signal.failure();
+                    LoggerFactory.getLogger(RocksDBAsyncAPI.class).warn(
+                            "Transient CDC stream failure; retrying (attempt {}): {}: {}",
+                            signal.totalRetries() + 1,
+                            failure.getClass().getSimpleName(),
+                            failure.getMessage());
+                })
                 .maxBackoff(Duration.ofSeconds(5))
                 .transientErrors(true)
                 .filter(RocksDBAsyncAPI::isRetryableCdcStreamFailure);
     }
 
     private static boolean isRetryableCdcStreamFailure(Throwable failure) {
+        Throwable current = failure;
+        for (int depth = 0; current != null && depth < 32; depth++) {
+            if (current instanceof RocksDBException rocksDBException
+                    && rocksDBException.getErrorUniqueId() == RocksDBException.RocksDBErrorType.CDC_RESPONSE_TOO_LARGE) {
+                return false;
+            }
+            Throwable cause = current.getCause();
+            if (cause == current) {
+                break;
+            }
+            current = cause;
+        }
         Status status = Status.fromThrowable(failure);
         if (status.getCode() == Status.Code.FAILED_PRECONDITION) {
             return false;

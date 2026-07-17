@@ -24,7 +24,6 @@ import java.nio.file.Path;
 import org.slf4j.Logger;
 
 import static it.cavallium.rockserver.core.common.Utils.mapList;
-import static java.lang.Boolean.parseBoolean;
 import static java.util.Objects.requireNonNull;
 import static org.rocksdb.ColumnFamilyOptionsInterface.DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET;
 
@@ -33,16 +32,13 @@ public class RocksDBLoader {
     static final String WAL_TTL_SECONDS_PROPERTY = "it.cavallium.dbengine.wal.ttl.seconds";
     static final long DEFAULT_WAL_TTL_SECONDS = 24L * 60L * 60L;
 
-    private static final boolean FOLLOW_ROCKSDB_OPTIMIZATIONS = true;
     private static final long AUTO_MEMTABLE_MAX_RANGE_DELETION_BYTES_PER_TOMBSTONE = 64L * SizeUnit.KB;
     private static final int AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MIN = 64;
     private static final int AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MAX = 65_536;
+    private static final double DEFAULT_BLOCK_CACHE_HIGH_PRIORITY_RATIO = 0.5d;
 
-    private static final boolean PARANOID_CHECKS
-            = Boolean.parseBoolean(System.getProperty("it.cavallium.dbengine.checks.paranoid", "true"));
-    private static final boolean USE_CLOCK_CACHE
-            = Boolean.parseBoolean(System.getProperty("it.cavallium.dbengine.clockcache.enable", "false"));
-    private static final CacheFactory CACHE_FACTORY = USE_CLOCK_CACHE ? new ClockCacheFactory() : new LRUCacheFactory();
+    private static final CacheFactory LRU_CACHE_FACTORY = new LRUCacheFactory();
+    private static final CacheFactory CLOCK_CACHE_FACTORY = new ClockCacheFactory();
     private static final String bugJniLibraryFileName = Environment.getJniLibraryFileName("rocksdbjni");
     private static final String jniLibraryFileName = Environment.getJniLibraryFileName("rocksdb");
     @Nullable
@@ -175,7 +171,9 @@ public class RocksDBLoader {
             }
             columnFamilyOptions.setMemtableMaxRangeDeletions(resolveMemtableMaxRangeDeletions(columnOptions));
 
-            if (isDisableAutoCompactions()) {
+            boolean disableAutoCompactions = globalDatabaseConfig.disableAutoCompactions();
+            boolean disableWriteSlowdown = disableAutoCompactions || globalDatabaseConfig.disableWriteSlowdown();
+            if (disableAutoCompactions) {
                 columnFamilyOptions.setDisableAutoCompactions(true);
             }
             try {
@@ -238,16 +236,16 @@ public class RocksDBLoader {
                     .setMaxBytesForLevelBase(firstLevelSstSize * 8)
                     .setTargetFileSizeMultiplier(targetFileSizeMultiplier);
 
-            if (isDisableAutoCompactions()) {
+            if (disableAutoCompactions) {
                 columnFamilyOptions.setLevel0FileNumCompactionTrigger(-1);
-            } else if (!FOLLOW_ROCKSDB_OPTIMIZATIONS) {
+            } else if (!globalDatabaseConfig.followRocksdbOptimizations()) {
                 // ArangoDB uses a value of 2: https://www.arangodb.com/docs/stable/programs-arangod-rocksdb.html
                 // Higher values speed up writes, but slow down reads
                 columnFamilyOptions.setLevel0FileNumCompactionTrigger(2);
             } else {
                 columnFamilyOptions.setLevel0FileNumCompactionTrigger(4);
             }
-            if (isDisableSlowdown()) {
+            if (disableWriteSlowdown) {
                 columnFamilyOptions.setLevel0SlowdownWritesTrigger(-1);
                 columnFamilyOptions.setLevel0StopWritesTrigger(Integer.MAX_VALUE);
                 columnFamilyOptions.setHardPendingCompactionBytesLimit(Long.MAX_VALUE);
@@ -305,7 +303,7 @@ public class RocksDBLoader {
 
             final BlockBasedTableConfig tableOptions = new BlockBasedTableConfig();
 
-            if (!FOLLOW_ROCKSDB_OPTIMIZATIONS) {
+            if (!globalDatabaseConfig.followRocksdbOptimizations()) {
                 columnFamilyOptions.setWriteBufferSize(256 * SizeUnit.MB);
             }
             Optional.ofNullable(columnOptions.writeBufferSize())
@@ -358,6 +356,8 @@ public class RocksDBLoader {
                         // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
                         .setPinL0FilterAndIndexBlocksInCache(!inMemory)
                         // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+                        // RocksDB applies this priority to index, filter, and compression-dictionary
+                        // blocks. The LRU cache's configured high-priority pool provides the reserve.
                         .setCacheIndexAndFilterBlocksWithHighPriority(true)
                         .setCacheIndexAndFilterBlocks(cacheIndexAndFilterBlocks)
                         // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
@@ -479,7 +479,7 @@ public class RocksDBLoader {
               }
             };
             refs.add(options);
-            options.setParanoidChecks(PARANOID_CHECKS);
+            options.setParanoidChecks(databaseOptions.global().paranoidChecks());
             options.setSkipCheckingSstFileSizesOnDbOpen(true);
 
             var statistics = new Statistics() {
@@ -494,9 +494,15 @@ public class RocksDBLoader {
             if (!databaseOptions.global().unorderedWrite()) {
                 options.setEnablePipelinedWrite(true);
             }
-            var maxSubCompactions = Integer.parseInt(System.getProperty("it.cavallium.dbengine.compactions.max.sub", "-1"));
-            if (maxSubCompactions > 0) {
-                options.setMaxSubcompactions(maxSubCompactions);
+            var maxSubcompactions = databaseOptions.global().maxSubcompactions();
+            if (maxSubcompactions != null) {
+                if (maxSubcompactions <= 0) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(
+                            RocksDBErrorType.CONFIG_ERROR,
+                            "database.global.max-subcompactions must be greater than zero, but was "
+                                    + maxSubcompactions);
+                }
+                options.setMaxSubcompactions(maxSubcompactions);
             }
             var customWriteRate = Long.parseLong(System.getProperty("it.cavallium.dbengine.write.delayedrate", "-1"));
             if (customWriteRate >= 0) {
@@ -510,7 +516,6 @@ public class RocksDBLoader {
             }
 
             options.setCreateIfMissing(true);
-            options.setSkipStatsUpdateOnDbOpen(true);
             options.setCreateMissingColumnFamilies(true);
             options.setInfoLogLevel(InfoLogLevel.WARN_LEVEL);
 
@@ -542,11 +547,11 @@ public class RocksDBLoader {
             final boolean useDirectIO = path != null && databaseOptions.global().useDirectIo();
             final boolean allowMmapReads = (path == null) || (!useDirectIO && databaseOptions.global().allowRocksdbMemoryMapping());
             final boolean allowMmapWrites = (path != null) && (!useDirectIO && (databaseOptions.global().allowRocksdbMemoryMapping()
-                    || parseBoolean(System.getProperty("it.cavallium.dbengine.mmapwrites.enable", "false"))));
+                    || databaseOptions.global().allowRocksdbMmapWrites()));
 
-            // todo: replace with a real option called database-write-buffer-size
-            // 0 = default = disabled
-            long dbWriteBufferSize = Long.parseLong(System.getProperty("it.cavallium.dbengine.dbwritebuffer.size", "0"));
+            long dbWriteBufferSize = Optional.ofNullable(databaseOptions.global().databaseWriteBufferSize())
+                    .map(DataSize::longValue)
+                    .orElse(0L);
             long walTtlSeconds = resolveWalTtlSeconds(databaseOptions.global());
 
             options
@@ -561,7 +566,16 @@ public class RocksDBLoader {
             long blockCacheSize;
             if (path != null) {
                 blockCacheSize = writeBufferManagerSize + Optional.ofNullable(databaseOptions.global().blockCache()).map(DataSize::longValue).orElse( 512 * SizeUnit.MB);
-                blockCache = CACHE_FACTORY.newCache(blockCacheSize);
+                double highPriorityPoolRatio = resolveBlockCacheHighPriorityRatio(databaseOptions.global());
+                CacheFactory cacheFactory = databaseOptions.global().useClockCache()
+                        ? CLOCK_CACHE_FACTORY
+                        : LRU_CACHE_FACTORY;
+                if (highPriorityPoolRatio > 0.0d && !cacheFactory.supportsHighPriorityPool()) {
+                    logger.warn("HyperClockCache cannot reserve capacity for RocksDB metadata with this JNI; "
+                            + "using LRUCache because block-cache-high-priority-ratio={}", highPriorityPoolRatio);
+                    cacheFactory = LRU_CACHE_FACTORY;
+                }
+                blockCache = cacheFactory.newCache(blockCacheSize, highPriorityPoolRatio);
                 refs.add(blockCache);
             } else {
                 blockCacheSize = 0;
@@ -588,7 +602,7 @@ public class RocksDBLoader {
 
             // Apply max-background-jobs after setIncreaseParallelism, since that method
             // internally overrides maxBackgroundJobs with the parallelism value.
-            if (isDisableAutoCompactions()) {
+            if (databaseOptions.global().disableAutoCompactions()) {
                 options.setMaxBackgroundJobs(0);
             } else {
                 var configuredMaxBackgroundJobs = databaseOptions.global().maxBackgroundJobs();
@@ -644,6 +658,19 @@ public class RocksDBLoader {
         } catch (GestaltException e) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, e);
         }
+    }
+
+    private static double resolveBlockCacheHighPriorityRatio(GlobalDatabaseConfig globalConfig)
+            throws GestaltException {
+        Double configured = globalConfig.blockCacheHighPriorityRatio();
+        double ratio = configured != null ? configured : DEFAULT_BLOCK_CACHE_HIGH_PRIORITY_RATIO;
+        if (!Double.isFinite(ratio) || ratio < 0.0d || ratio > 1.0d) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(
+                    RocksDBErrorType.CONFIG_ERROR,
+                    "database.global.block-cache-high-priority-ratio must be between 0 and 1, but was "
+                            + ratio);
+        }
+        return ratio;
     }
 
     private static Duration getWalFlushDelayConfig(DatabaseConfig databaseOptions) throws GestaltException {
@@ -849,15 +876,6 @@ public class RocksDBLoader {
     }
 
     public record DbPathRecord(Path path, long targetSize) {}
-
-    public static boolean isDisableAutoCompactions() {
-        return parseBoolean(System.getProperty("it.cavallium.dbengine.compactions.auto.disable", "false"));
-    }
-
-    public static boolean isDisableSlowdown() {
-        return isDisableAutoCompactions()
-                || parseBoolean(System.getProperty("it.cavallium.dbengine.disableslowdown", "false"));
-    }
 
     private record RocksLevelOptions(CompressionType compressionType, CompressionOptions compressionOptions) {}
     private static RocksLevelOptions getRocksLevelOptions(ColumnLevelConfig levelOptions, RocksDBObjects refs) throws GestaltException {

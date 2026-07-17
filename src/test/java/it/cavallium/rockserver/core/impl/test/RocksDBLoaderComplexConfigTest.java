@@ -28,8 +28,11 @@ import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.api.parallel.Resources;
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.ChecksumType;
+import org.rocksdb.HyperClockCache;
 import org.rocksdb.IndexType;
+import org.rocksdb.LRUCache;
 import org.rocksdb.RocksObject;
+import org.rocksdb.StatsLevel;
 import org.rocksdb.WALRecoveryMode;
 import org.slf4j.LoggerFactory;
 
@@ -37,12 +40,7 @@ import org.slf4j.LoggerFactory;
 class RocksDBLoaderComplexConfigTest {
 
     private static final List<String> LOADER_PROPERTIES = List.of(
-            "it.cavallium.dbengine.compactions.auto.disable",
-            "it.cavallium.dbengine.disableslowdown",
-            "it.cavallium.dbengine.compactions.max.sub",
             "it.cavallium.dbengine.write.delayedrate",
-            "it.cavallium.dbengine.dbwritebuffer.size",
-            "it.cavallium.dbengine.mmapwrites.enable",
             "it.cavallium.dbengine.jobs.background.num"
     );
 
@@ -68,22 +66,24 @@ class RocksDBLoaderComplexConfigTest {
 
     @Test
     void appliesPersistentPessimisticAndSpinningConfiguration(@TempDir Path tempDir) throws Exception {
-        System.setProperty("it.cavallium.dbengine.compactions.max.sub", "3");
         System.setProperty("it.cavallium.dbengine.write.delayedrate", "1234567");
-        System.setProperty("it.cavallium.dbengine.dbwritebuffer.size", "1048576");
-        System.setProperty("it.cavallium.dbengine.mmapwrites.enable", "true");
 
         var config = parse(tempDir, "persistent-modes", """
                 database: {
                   global: {
+                    follow-rocksdb-optimizations: false
+                    paranoid-checks: false
                     spinning: true
                     absolute-consistency: false
                     use-direct-io: false
                     allow-rocksdb-memory-mapping: false
+                    allow-rocksdb-mmap-writes: true
                     maximum-open-files: 37
                     optimistic: false
                     block-cache: "8MiB"
                     write-buffer-manager: "4MiB"
+                    database-write-buffer-size: "1MiB"
+                    max-subcompactions: 3
                     log-path: "./custom-log"
                     wal-path: "./custom-wal"
                     delay-wal-flush-duration: PT1S
@@ -109,6 +109,13 @@ class RocksDBLoaderComplexConfigTest {
         var loaded = RocksDBLoader.load(dbPath, config, LoggerFactory.getLogger(getClass()));
         try {
             assertInstanceOf(TransactionalDB.PessimisticTransactionalDB.class, loaded.db());
+            assertInstanceOf(LRUCache.class, loaded.cache(),
+                    "metadata reservation requires the LRU priority-pool implementation");
+            assertNotNull(loaded.dbOptions().statistics(), "runtime RocksDB statistics must stay enabled");
+            assertEquals(StatsLevel.EXCEPT_TIME_FOR_MUTEX, loaded.dbOptions().statistics().statsLevel());
+            assertFalse(loaded.dbOptions().skipStatsUpdateOnDbOpen(),
+                    "startup must retain per-SST statistics used for compaction decisions");
+            assertFalse(loaded.dbOptions().paranoidChecks());
             assertTrue(loaded.dbOptions().isOwningHandle(),
                     "successful load must transfer live native-reference ownership to LoadedDb");
             assertEquals(3, loaded.dbOptions().maxSubcompactions());
@@ -131,6 +138,7 @@ class RocksDBLoaderComplexConfigTest {
 
             var columnOptions = loaded.definitiveColumnFamilyOptionsMap().get("default");
             assertNotNull(columnOptions);
+            assertEquals(2, columnOptions.level0FileNumCompactionTrigger());
             assertEquals(3, columnOptions.minWriteBufferNumberToMerge());
             assertEquals(4, columnOptions.maxWriteBufferNumber());
             var table = assertInstanceOf(BlockBasedTableConfig.class, columnOptions.tableFormatConfig());
@@ -138,6 +146,7 @@ class RocksDBLoaderComplexConfigTest {
             assertEquals(ChecksumType.kXXH3, table.checksumType());
             assertEquals(32L * 1024L, table.blockSize());
             assertTrue(table.partitionFilters());
+            assertTrue(table.cacheIndexAndFilterBlocksWithHighPriority());
             assertFalse(table.cacheIndexAndFilterBlocks());
         } finally {
             loaded.db().close();
@@ -146,11 +155,59 @@ class RocksDBLoaderComplexConfigTest {
     }
 
     @Test
-    void disableSlowdownKeepsAllWriteStallThresholdsDisabled(@TempDir Path tempDir) throws Exception {
-        System.setProperty("it.cavallium.dbengine.compactions.auto.disable", "true");
-        System.setProperty("it.cavallium.dbengine.disableslowdown", "true");
+    void useClockCacheSelectsHyperClockWhenPriorityPoolIsDisabled(@TempDir Path tempDir) throws Exception {
+        var config = parse(tempDir, "clock-cache", """
+                database.global.use-clock-cache = true
+                database.global.block-cache-high-priority-ratio = 0
+                database.global.block-cache = 8MiB
+                database.global.write-buffer-manager = 4MiB
+                """);
 
-        var loaded = RocksDBLoader.load(tempDir.resolve("no-compactions"), ConfigParser.parseDefault(),
+        var loaded = RocksDBLoader.load(tempDir.resolve("clock-cache-db"), config,
+                LoggerFactory.getLogger(getClass()));
+        try {
+            assertInstanceOf(HyperClockCache.class, loaded.cache());
+        } finally {
+            loaded.db().close();
+            loaded.refs().close();
+        }
+    }
+
+    @Test
+    void rejectsInvalidBlockCacheHighPriorityRatioBeforeOpeningDatabase(@TempDir Path tempDir) throws Exception {
+        var config = parse(tempDir, "invalid-cache-ratio", """
+                database.global.block-cache-high-priority-ratio = 1.01
+                """);
+
+        var failure = assertThrows(RocksDBException.class,
+                () -> RocksDBLoader.load(tempDir.resolve("invalid-cache-ratio-db"), config,
+                        LoggerFactory.getLogger(getClass())));
+
+        assertEquals(RocksDBErrorType.CONFIG_ERROR, failure.getErrorUniqueId());
+        assertTrue(failure.getMessage().contains("block-cache-high-priority-ratio"));
+    }
+
+    @Test
+    void rejectsNonPositiveMaxSubcompactionsBeforeOpeningDatabase(@TempDir Path tempDir) throws Exception {
+        var config = parse(tempDir, "invalid-max-subcompactions", """
+                database.global.max-subcompactions = 0
+                """);
+
+        var failure = assertThrows(RocksDBException.class,
+                () -> RocksDBLoader.load(tempDir.resolve("invalid-max-subcompactions-db"), config,
+                        LoggerFactory.getLogger(getClass())));
+
+        assertEquals(RocksDBErrorType.CONFIG_ERROR, failure.getErrorUniqueId());
+        assertTrue(failure.getMessage().contains("max-subcompactions"));
+    }
+
+    @Test
+    void disableSlowdownKeepsAllWriteStallThresholdsDisabled(@TempDir Path tempDir) throws Exception {
+        var config = parse(tempDir, "no-compactions", """
+                database.global.disable-auto-compactions = true
+                database.global.disable-write-slowdown = true
+                """);
+        var loaded = RocksDBLoader.load(tempDir.resolve("no-compactions"), config,
                 LoggerFactory.getLogger(getClass()));
         try {
             var columnOptions = loaded.definitiveColumnFamilyOptionsMap().get("default");

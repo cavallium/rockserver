@@ -890,7 +890,9 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 			@Override
 			public ReadWorkClass readWorkClass() {
-				return ReadWorkClass.COMPOSITE;
+				return requestType.getRequestTypeId() == RequestType.RequestTypeId.FIRST_AND_LAST
+						? ReadWorkClass.INTERACTIVE
+						: ReadWorkClass.COMPOSITE;
 			}
 
 		}
