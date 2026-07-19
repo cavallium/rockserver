@@ -73,6 +73,57 @@ class ThriftAsyncDispatchRegressionTest {
 	}
 
 	@Test
+	void prefixlessCdcWorkUsesTheAsyncBridgeForTheDedicatedCdcLane() {
+		var connection = new TrackingConnection();
+		var api = ThriftServer.createDispatchingSyncApiForTesting(connection);
+
+		assertEquals(RocksDBAPICommand.ReadWorkClass.COMPOSITE,
+				new RocksDBAPICommand.CdcGetEarliestAvailableSequence().readWorkClass());
+		assertEquals(37L, api.cdcGetEarliestAvailableSequence());
+		assertEquals(41L, api.cdcCreate("prefixless", 0L, null, false));
+
+		assertTrue(connection.syncRequests.isEmpty());
+		assertEquals(List.of(
+				RocksDBAPICommand.CdcGetEarliestAvailableSequence.class,
+				RocksDBAPICommand.CdcCreate.class), connection.asyncRequests);
+	}
+
+	@Test
+	void transactionCleanupAndCommitUseTheAsyncSchedulerBridge() {
+		var connection = new TrackingConnection();
+		var api = ThriftServer.createDispatchingSyncApiForTesting(connection);
+
+		api.closeFailedUpdate(71L);
+		assertTrue(api.closeTransaction(72L, false));
+		assertTrue(api.closeTransaction(73L, true));
+
+		assertTrue(connection.syncRequests.isEmpty());
+		assertEquals(List.of(
+				RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate.class,
+				RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction.class,
+				RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction.class),
+				connection.asyncRequests);
+	}
+
+	@Test
+	void cdcCommitUsesTheAsyncBridgeAndSurvivesWorkerInterruption() throws Exception {
+		var connection = new TrackingConnection();
+		connection.cdcCommitFuture = new CompletableFuture<>();
+		var api = ThriftServer.createDispatchingSyncApiForTesting(connection);
+
+		var interrupted = runInterrupted(
+				() -> api.cdcCommit("progress", 42L), connection.cdcCommitRequested);
+
+		assertInstanceOf(RocksDBException.class, interrupted.failure());
+		assertTrue(interrupted.interruptRestored());
+		assertFalse(connection.cdcCommitFuture.isCancelled(),
+				"an interrupted CDC checkpoint must remain live after the Thrift worker returns");
+		assertEquals(List.of(RocksDBAPICommand.CdcCommit.class), connection.asyncRequests);
+		connection.cdcCommitFuture.complete(null);
+		connection.cdcCommitFuture.get(1, SECONDS);
+	}
+
+	@Test
 	void interruptedQueuedOpenIteratorClosesTheHandleAfterItEventuallyOpens() throws Exception {
 		assertInterruptedOpenIteratorCleanup(false);
 	}
@@ -262,9 +313,11 @@ class ThriftAsyncDispatchRegressionTest {
 		private final List<Long> closedIteratorIds = new CopyOnWriteArrayList<>();
 		private final CountDownLatch openIteratorRequested = new CountDownLatch(1);
 		private final CountDownLatch closeIteratorRequested = new CountDownLatch(1);
+		private final CountDownLatch cdcCommitRequested = new CountDownLatch(1);
 		private final AtomicBoolean openIteratorRunning = new AtomicBoolean();
 		private final CompletableFuture<Long> openIteratorFuture = new CompletableFuture<>();
 		private volatile CompletableFuture<Void> closeIteratorFuture = CompletableFuture.completedFuture(null);
+		private volatile CompletableFuture<Void> cdcCommitFuture = CompletableFuture.completedFuture(null);
 		private volatile Buf pointReadResult;
 
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
@@ -291,6 +344,17 @@ class ThriftAsyncDispatchRegressionTest {
 							CompletableFuture.completedFuture(List.of(false));
 					case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch _ ->
 							CompletableFuture.completedFuture(null);
+					case RocksDBAPICommand.CdcGetEarliestAvailableSequence _ ->
+							CompletableFuture.completedFuture(37L);
+					case RocksDBAPICommand.CdcCreate _ -> CompletableFuture.completedFuture(41L);
+					case RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate _ ->
+							CompletableFuture.completedFuture(null);
+					case RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction _ ->
+							CompletableFuture.completedFuture(true);
+					case RocksDBAPICommand.CdcCommit _ -> {
+						cdcCommitRequested.countDown();
+						yield cdcCommitFuture;
+					}
 					case RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator _ -> {
 						openIteratorRequested.countDown();
 						yield openIteratorFuture;

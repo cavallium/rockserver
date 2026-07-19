@@ -89,9 +89,9 @@ public class Delta implements org.apache.thrift.TBase<Delta, Delta._Fields>, jav
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
-    tmpMap.put(_Fields.PREVIOUS, new org.apache.thrift.meta_data.FieldMetaData("previous", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+    tmpMap.put(_Fields.PREVIOUS, new org.apache.thrift.meta_data.FieldMetaData("previous", org.apache.thrift.TFieldRequirementType.OPTIONAL,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
-    tmpMap.put(_Fields.CURRENT, new org.apache.thrift.meta_data.FieldMetaData("current", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+    tmpMap.put(_Fields.CURRENT, new org.apache.thrift.meta_data.FieldMetaData("current", org.apache.thrift.TFieldRequirementType.OPTIONAL,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(Delta.class, metaDataMap);
@@ -412,7 +412,7 @@ public class Delta implements org.apache.thrift.TBase<Delta, Delta._Fields>, jav
       while (true)
       {
         schemeField = iprot.readFieldBegin();
-        if (schemeField.type == org.apache.thrift.protocol.TType.STOP) { 
+        if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
           break;
         }
         switch (schemeField.id) {
@@ -420,7 +420,7 @@ public class Delta implements org.apache.thrift.TBase<Delta, Delta._Fields>, jav
             if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
               struct.previous = iprot.readBinary();
               struct.setPreviousIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
@@ -428,7 +428,7 @@ public class Delta implements org.apache.thrift.TBase<Delta, Delta._Fields>, jav
             if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
               struct.current = iprot.readBinary();
               struct.setCurrentIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;

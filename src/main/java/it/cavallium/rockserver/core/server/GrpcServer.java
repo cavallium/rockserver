@@ -67,6 +67,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map.Entry;
+import java.util.OptionalLong;
 import java.util.StringJoiner;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
@@ -186,6 +187,7 @@ public class GrpcServer extends Server {
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
+		ExpectedGrpcStreamCloseLogFilter.install();
 		if (client instanceof InternalConnection internalConnection) {
 			this.scheduler = internalConnection.getScheduler();
 			this.ownsScheduler = false;
@@ -242,6 +244,11 @@ public class GrpcServer extends Server {
 		LATE_READ_DEADLINE_LOG_STATES.clear();
 	}
 
+	@VisibleForTesting
+	public static boolean isExpectedGrpcClientCancellationForTesting(java.util.logging.LogRecord record) {
+		return ExpectedGrpcStreamCloseLogFilter.isExpectedClientCancellation(record);
+	}
+
 	private static class GzipCompressorInterceptor implements ServerInterceptor {
 
 		@Override
@@ -281,18 +288,19 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<CloseTransactionResponse> closeTransaction(CloseTransactionRequest request) {
-			return executeSync(() -> {
+			var executionScheduler = request.getCommit() ? scheduler.write() : scheduler.control();
+			return executeScheduled(() -> {
 				var committed = api.closeTransaction(request.getTransactionId(), request.getCommit());
                 return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
+			}, executionScheduler).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
 		}
 
 		@Override
 		public Mono<Empty> closeFailedUpdate(CloseFailedUpdateRequest request) {
-			return executeSync(() -> {
+			return executeScheduled(() -> {
 				api.closeFailedUpdate(request.getUpdateId());
 				return Empty.getDefaultInstance();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
+			}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
 		}
 
 		@Override
@@ -309,6 +317,14 @@ public class GrpcServer extends Server {
 				api.deleteColumn(request.getColumnId());
 				return Empty.getDefaultInstance();
 			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteColumn", request));
+		}
+
+		@Override
+		public Mono<DeleteColumnIfExistsResponse> deleteColumnIfExists(DeleteColumnIfExistsRequest request) {
+			return executeSync(() -> DeleteColumnIfExistsResponse.newBuilder()
+					.setDeleted(api.deleteColumnIfExists(request.getName()))
+					.build(), false)
+					.transform(this.onErrorMapMonoWithRequestInfo("deleteColumnIfExists", request));
 		}
 
 		@Override
@@ -1162,16 +1178,25 @@ public class GrpcServer extends Server {
 
             // ============ CDC RPCs ============
 
-            @Override
-            public Mono<CdcCreateResponse> cdcCreate(CdcCreateRequest request) {
-                return executeSync(() -> {
-                    Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
-                    var cols = request.getColumnIdsCount() > 0 ? request.getColumnIdsList().stream().map(Long::valueOf).toList() : null;
-                    Boolean resolvedValues = request.hasResolvedValues() ? request.getResolvedValues() : null;
-                    long startSeq = api.cdcCreate(request.getId(), fromSeq, cols, resolvedValues);
-                    return CdcCreateResponse.newBuilder().setStartSeq(startSeq).build();
-                }, false).transform(this.onErrorMapMonoWithRequestInfo("cdcCreate", request));
-            }
+			@Override
+			public Mono<CdcCreateResponse> cdcCreate(CdcCreateRequest request) {
+				Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
+				OptionalLong expectedLastCommitted = switch (request.getExpectedLastCommittedCase()) {
+					case EXPECTABSENT -> OptionalLong.empty();
+					case EXPECTEDLASTCOMMITTEDSEQ -> OptionalLong.of(request.getExpectedLastCommittedSeq());
+					case EXPECTEDLASTCOMMITTED_NOT_SET -> null;
+				};
+				var executionScheduler = fromSeq != null && fromSeq == 0L
+						? scheduler.cdc()
+						: scheduler.write();
+				return executeScheduled(() -> {
+					var cols = request.getColumnIdsCount() > 0 ? request.getColumnIdsList().stream().map(Long::valueOf).toList() : null;
+					Boolean resolvedValues = request.hasResolvedValues() ? request.getResolvedValues() : null;
+					long startSeq = api.cdcCreate(
+							request.getId(), fromSeq, cols, resolvedValues, expectedLastCommitted);
+					return CdcCreateResponse.newBuilder().setStartSeq(startSeq).build();
+				}, executionScheduler).transform(this.onErrorMapMonoWithRequestInfo("cdcCreate", request));
+			}
 
             @Override
             public Mono<Empty> cdcDelete(CdcDeleteRequest request) {
@@ -1179,6 +1204,27 @@ public class GrpcServer extends Server {
                     api.cdcDelete(request.getId());
                     return Empty.getDefaultInstance();
                 }, false).transform(this.onErrorMapMonoWithRequestInfo("cdcDelete", request));
+            }
+
+			@Override
+			public Mono<CdcGetEarliestAvailableSequenceResponse> cdcGetEarliestAvailableSequence(Empty request) {
+				return executeScheduled(() -> CdcGetEarliestAvailableSequenceResponse.newBuilder()
+						.setSequence(api.cdcGetEarliestAvailableSequence())
+						.build(), scheduler.cdc())
+						.transform(this.onErrorMapMonoWithRequestInfo(
+								"cdcGetEarliestAvailableSequence", request));
+			}
+
+            @Override
+            public Mono<CdcGetLastCommittedSequenceResponse> cdcGetLastCommittedSequence(
+                    CdcGetLastCommittedSequenceRequest request) {
+                return executeSync(() -> {
+                    var sequence = api.cdcGetLastCommittedSequence(request.getId());
+                    var response = CdcGetLastCommittedSequenceResponse.newBuilder();
+                    sequence.ifPresent(response::setLastCommittedSeq);
+                    return response.build();
+                }, true).transform(this.onErrorMapMonoWithRequestInfo(
+                        "cdcGetLastCommittedSequence", request));
             }
 
             @Override
@@ -1220,10 +1266,10 @@ public class GrpcServer extends Server {
 
             @Override
             public Mono<Empty> cdcCommit(CdcCommitRequest request) {
-                return executeSync(() -> {
+				return executeScheduled(() -> {
                     api.cdcCommit(request.getId(), request.getSeq());
                     return Empty.getDefaultInstance();
-                }, false).transform(this.onErrorMapMonoWithRequestInfo("cdcCommit", request));
+				}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("cdcCommit", request));
             }
 
 		// utils
@@ -1938,6 +1984,8 @@ public class GrpcServer extends Server {
 			} else {
 				return switch (ex) {
 					case RocksDBException e -> switch (e.getErrorUniqueId()) {
+						case CDC_SUBSCRIPTION_NOT_FOUND -> Status.NOT_FOUND
+								.withDescription(e.getLocalizedMessage()).withCause(e);
 						case CDC_RESPONSE_TOO_LARGE -> Status.FAILED_PRECONDITION
 								.withDescription(e.getLocalizedMessage()).withCause(e);
 						case READ_DEADLINE_EXCEEDED -> Status.DEADLINE_EXCEEDED

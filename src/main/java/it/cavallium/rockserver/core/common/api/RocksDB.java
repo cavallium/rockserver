@@ -21,6 +21,8 @@ public class RocksDB {
 
     public void deleteColumn(long columnId) throws RocksDBThriftException, org.apache.thrift.TException;
 
+    public boolean deleteColumnIfExists(java.lang.String name) throws RocksDBThriftException, org.apache.thrift.TException;
+
     public long getColumnId(java.lang.String name) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public long estimateNumKeys(long columnId) throws RocksDBThriftException, org.apache.thrift.TException;
@@ -109,6 +111,18 @@ public class RocksDB {
 
     public java.util.List<Column> getAllColumnDefinitions() throws RocksDBThriftException, org.apache.thrift.TException;
 
+    public long cdcCreate(CdcCreateRequest request) throws RocksDBThriftException, org.apache.thrift.TException;
+
+    public void cdcDelete(java.lang.String id) throws RocksDBThriftException, org.apache.thrift.TException;
+
+    public long cdcGetEarliestAvailableSequence() throws RocksDBThriftException, org.apache.thrift.TException;
+
+    public OptionalLongValue cdcGetLastCommittedSequence(java.lang.String id) throws RocksDBThriftException, org.apache.thrift.TException;
+
+    public CdcPollBatchResult cdcPollBatch(CdcPollRequest request) throws RocksDBThriftException, org.apache.thrift.TException;
+
+    public void cdcCommit(java.lang.String id, long seq) throws RocksDBThriftException, org.apache.thrift.TException;
+
   }
 
   public interface AsyncIface {
@@ -122,6 +136,8 @@ public class RocksDB {
     public void createColumn(java.lang.String name, ColumnSchema schema, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
     public void deleteColumn(long columnId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+
+    public void deleteColumnIfExists(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
 
     public void getColumnId(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
@@ -210,6 +226,18 @@ public class RocksDB {
     public void compact(org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
     public void getAllColumnDefinitions(org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler) throws org.apache.thrift.TException;
+
+    public void cdcCreate(CdcCreateRequest request, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+
+    public void cdcDelete(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+
+    public void cdcGetEarliestAvailableSequence(org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+
+    public void cdcGetLastCommittedSequence(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException;
+
+    public void cdcPollBatch(CdcPollRequest request, org.apache.thrift.async.AsyncMethodCallback<CdcPollBatchResult> resultHandler) throws org.apache.thrift.TException;
+
+    public void cdcCommit(java.lang.String id, long seq, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
   }
 
@@ -364,6 +392,33 @@ public class RocksDB {
         throw result.e;
       }
       return;
+    }
+
+    @Override
+    public boolean deleteColumnIfExists(java.lang.String name) throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_deleteColumnIfExists(name);
+      return recv_deleteColumnIfExists();
+    }
+
+    public void send_deleteColumnIfExists(java.lang.String name) throws org.apache.thrift.TException
+    {
+      deleteColumnIfExists_args args = new deleteColumnIfExists_args();
+      args.setName(name);
+      sendBase("deleteColumnIfExists", args);
+    }
+
+    public boolean recv_deleteColumnIfExists() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      deleteColumnIfExists_result result = new deleteColumnIfExists_result();
+      receiveBase(result, "deleteColumnIfExists");
+      if (result.isSetSuccess()) {
+        return result.success;
+      }
+      if (result.e != null) {
+        throw result.e;
+      }
+      throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "deleteColumnIfExists failed: unknown result");
     }
 
     @Override
@@ -1601,6 +1656,162 @@ public class RocksDB {
       throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "getAllColumnDefinitions failed: unknown result");
     }
 
+    @Override
+    public long cdcCreate(CdcCreateRequest request) throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_cdcCreate(request);
+      return recv_cdcCreate();
+    }
+
+    public void send_cdcCreate(CdcCreateRequest request) throws org.apache.thrift.TException
+    {
+      cdcCreate_args args = new cdcCreate_args();
+      args.setRequest(request);
+      sendBase("cdcCreate", args);
+    }
+
+    public long recv_cdcCreate() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      cdcCreate_result result = new cdcCreate_result();
+      receiveBase(result, "cdcCreate");
+      if (result.isSetSuccess()) {
+        return result.success;
+      }
+      if (result.e != null) {
+        throw result.e;
+      }
+      throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "cdcCreate failed: unknown result");
+    }
+
+    @Override
+    public void cdcDelete(java.lang.String id) throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_cdcDelete(id);
+      recv_cdcDelete();
+    }
+
+    public void send_cdcDelete(java.lang.String id) throws org.apache.thrift.TException
+    {
+      cdcDelete_args args = new cdcDelete_args();
+      args.setId(id);
+      sendBase("cdcDelete", args);
+    }
+
+    public void recv_cdcDelete() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      cdcDelete_result result = new cdcDelete_result();
+      receiveBase(result, "cdcDelete");
+      if (result.e != null) {
+        throw result.e;
+      }
+      return;
+    }
+
+    @Override
+    public long cdcGetEarliestAvailableSequence() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_cdcGetEarliestAvailableSequence();
+      return recv_cdcGetEarliestAvailableSequence();
+    }
+
+    public void send_cdcGetEarliestAvailableSequence() throws org.apache.thrift.TException
+    {
+      cdcGetEarliestAvailableSequence_args args = new cdcGetEarliestAvailableSequence_args();
+      sendBase("cdcGetEarliestAvailableSequence", args);
+    }
+
+    public long recv_cdcGetEarliestAvailableSequence() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      cdcGetEarliestAvailableSequence_result result = new cdcGetEarliestAvailableSequence_result();
+      receiveBase(result, "cdcGetEarliestAvailableSequence");
+      if (result.isSetSuccess()) {
+        return result.success;
+      }
+      if (result.e != null) {
+        throw result.e;
+      }
+      throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "cdcGetEarliestAvailableSequence failed: unknown result");
+    }
+
+    @Override
+    public OptionalLongValue cdcGetLastCommittedSequence(java.lang.String id) throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_cdcGetLastCommittedSequence(id);
+      return recv_cdcGetLastCommittedSequence();
+    }
+
+    public void send_cdcGetLastCommittedSequence(java.lang.String id) throws org.apache.thrift.TException
+    {
+      cdcGetLastCommittedSequence_args args = new cdcGetLastCommittedSequence_args();
+      args.setId(id);
+      sendBase("cdcGetLastCommittedSequence", args);
+    }
+
+    public OptionalLongValue recv_cdcGetLastCommittedSequence() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      cdcGetLastCommittedSequence_result result = new cdcGetLastCommittedSequence_result();
+      receiveBase(result, "cdcGetLastCommittedSequence");
+      if (result.isSetSuccess()) {
+        return result.success;
+      }
+      if (result.e != null) {
+        throw result.e;
+      }
+      throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "cdcGetLastCommittedSequence failed: unknown result");
+    }
+
+    @Override
+    public CdcPollBatchResult cdcPollBatch(CdcPollRequest request) throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_cdcPollBatch(request);
+      return recv_cdcPollBatch();
+    }
+
+    public void send_cdcPollBatch(CdcPollRequest request) throws org.apache.thrift.TException
+    {
+      cdcPollBatch_args args = new cdcPollBatch_args();
+      args.setRequest(request);
+      sendBase("cdcPollBatch", args);
+    }
+
+    public CdcPollBatchResult recv_cdcPollBatch() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      cdcPollBatch_result result = new cdcPollBatch_result();
+      receiveBase(result, "cdcPollBatch");
+      if (result.isSetSuccess()) {
+        return result.success;
+      }
+      if (result.e != null) {
+        throw result.e;
+      }
+      throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "cdcPollBatch failed: unknown result");
+    }
+
+    @Override
+    public void cdcCommit(java.lang.String id, long seq) throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_cdcCommit(id, seq);
+      recv_cdcCommit();
+    }
+
+    public void send_cdcCommit(java.lang.String id, long seq) throws org.apache.thrift.TException
+    {
+      cdcCommit_args args = new cdcCommit_args();
+      args.setId(id);
+      args.setSeq(seq);
+      sendBase("cdcCommit", args);
+    }
+
+    public void recv_cdcCommit() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      cdcCommit_result result = new cdcCommit_result();
+      receiveBase(result, "cdcCommit");
+      if (result.e != null) {
+        throw result.e;
+      }
+      return;
+    }
+
   }
   public static class AsyncClient extends org.apache.thrift.async.TAsyncClient implements AsyncIface {
     public static class Factory implements org.apache.thrift.async.TAsyncClientFactory<AsyncClient> {
@@ -1800,6 +2011,41 @@ public class RocksDB {
         org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
         (new Client(prot)).recv_deleteColumn();
         return null;
+      }
+    }
+
+    @Override
+    public void deleteColumnIfExists(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      deleteColumnIfExists_call method_call = new deleteColumnIfExists_call(name, resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class deleteColumnIfExists_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Boolean> {
+      private java.lang.String name;
+      public deleteColumnIfExists_call(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+        this.name = name;
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("deleteColumnIfExists", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        deleteColumnIfExists_args args = new deleteColumnIfExists_args();
+        args.setName(name);
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public java.lang.Boolean getResult() throws RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        return (new Client(prot)).recv_deleteColumnIfExists();
       }
     }
 
@@ -3666,6 +3912,218 @@ public class RocksDB {
       }
     }
 
+    @Override
+    public void cdcCreate(CdcCreateRequest request, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      cdcCreate_call method_call = new cdcCreate_call(request, resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class cdcCreate_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Long> {
+      private CdcCreateRequest request;
+      public cdcCreate_call(CdcCreateRequest request, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+        this.request = request;
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("cdcCreate", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        cdcCreate_args args = new cdcCreate_args();
+        args.setRequest(request);
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public java.lang.Long getResult() throws RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        return (new Client(prot)).recv_cdcCreate();
+      }
+    }
+
+    @Override
+    public void cdcDelete(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      cdcDelete_call method_call = new cdcDelete_call(id, resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class cdcDelete_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
+      private java.lang.String id;
+      public cdcDelete_call(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+        this.id = id;
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("cdcDelete", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        cdcDelete_args args = new cdcDelete_args();
+        args.setId(id);
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public Void getResult() throws RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        (new Client(prot)).recv_cdcDelete();
+        return null;
+      }
+    }
+
+    @Override
+    public void cdcGetEarliestAvailableSequence(org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      cdcGetEarliestAvailableSequence_call method_call = new cdcGetEarliestAvailableSequence_call(resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class cdcGetEarliestAvailableSequence_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Long> {
+      public cdcGetEarliestAvailableSequence_call(org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("cdcGetEarliestAvailableSequence", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        cdcGetEarliestAvailableSequence_args args = new cdcGetEarliestAvailableSequence_args();
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public java.lang.Long getResult() throws RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        return (new Client(prot)).recv_cdcGetEarliestAvailableSequence();
+      }
+    }
+
+    @Override
+    public void cdcGetLastCommittedSequence(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      cdcGetLastCommittedSequence_call method_call = new cdcGetLastCommittedSequence_call(id, resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class cdcGetLastCommittedSequence_call extends org.apache.thrift.async.TAsyncMethodCall<OptionalLongValue> {
+      private java.lang.String id;
+      public cdcGetLastCommittedSequence_call(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+        this.id = id;
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("cdcGetLastCommittedSequence", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        cdcGetLastCommittedSequence_args args = new cdcGetLastCommittedSequence_args();
+        args.setId(id);
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public OptionalLongValue getResult() throws RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        return (new Client(prot)).recv_cdcGetLastCommittedSequence();
+      }
+    }
+
+    @Override
+    public void cdcPollBatch(CdcPollRequest request, org.apache.thrift.async.AsyncMethodCallback<CdcPollBatchResult> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      cdcPollBatch_call method_call = new cdcPollBatch_call(request, resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class cdcPollBatch_call extends org.apache.thrift.async.TAsyncMethodCall<CdcPollBatchResult> {
+      private CdcPollRequest request;
+      public cdcPollBatch_call(CdcPollRequest request, org.apache.thrift.async.AsyncMethodCallback<CdcPollBatchResult> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+        this.request = request;
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("cdcPollBatch", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        cdcPollBatch_args args = new cdcPollBatch_args();
+        args.setRequest(request);
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public CdcPollBatchResult getResult() throws RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        return (new Client(prot)).recv_cdcPollBatch();
+      }
+    }
+
+    @Override
+    public void cdcCommit(java.lang.String id, long seq, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      cdcCommit_call method_call = new cdcCommit_call(id, seq, resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class cdcCommit_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
+      private java.lang.String id;
+      private long seq;
+      public cdcCommit_call(java.lang.String id, long seq, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+        this.id = id;
+        this.seq = seq;
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("cdcCommit", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        cdcCommit_args args = new cdcCommit_args();
+        args.setId(id);
+        args.setSeq(seq);
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public Void getResult() throws RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        (new Client(prot)).recv_cdcCommit();
+        return null;
+      }
+    }
+
   }
 
   public static class Processor<I extends Iface> extends org.apache.thrift.TBaseProcessor<I> implements org.apache.thrift.TProcessor {
@@ -3684,6 +4142,7 @@ public class RocksDB {
       processMap.put("closeFailedUpdate", new closeFailedUpdate());
       processMap.put("createColumn", new createColumn());
       processMap.put("deleteColumn", new deleteColumn());
+      processMap.put("deleteColumnIfExists", new deleteColumnIfExists());
       processMap.put("getColumnId", new getColumnId());
       processMap.put("estimateNumKeys", new estimateNumKeys());
       processMap.put("putFast", new putFast());
@@ -3728,6 +4187,12 @@ public class RocksDB {
       processMap.put("flush", new flush());
       processMap.put("compact", new compact());
       processMap.put("getAllColumnDefinitions", new getAllColumnDefinitions());
+      processMap.put("cdcCreate", new cdcCreate());
+      processMap.put("cdcDelete", new cdcDelete());
+      processMap.put("cdcGetEarliestAvailableSequence", new cdcGetEarliestAvailableSequence());
+      processMap.put("cdcGetLastCommittedSequence", new cdcGetLastCommittedSequence());
+      processMap.put("cdcPollBatch", new cdcPollBatch());
+      processMap.put("cdcCommit", new cdcCommit());
       return processMap;
     }
 
@@ -3912,6 +4377,44 @@ public class RocksDB {
         deleteColumn_result result = getEmptyResultInstance();
         try {
           iface.deleteColumn(args.columnId);
+        } catch (RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
+    }
+
+    public static class deleteColumnIfExists<I extends Iface> extends org.apache.thrift.ProcessFunction<I, deleteColumnIfExists_args, deleteColumnIfExists_result> {
+      public deleteColumnIfExists() {
+        super("deleteColumnIfExists");
+      }
+
+      @Override
+      public deleteColumnIfExists_args getEmptyArgsInstance() {
+        return new deleteColumnIfExists_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public deleteColumnIfExists_result getEmptyResultInstance() {
+        return new deleteColumnIfExists_result();
+      }
+
+      @Override
+      public deleteColumnIfExists_result getResult(I iface, deleteColumnIfExists_args args) throws org.apache.thrift.TException {
+        deleteColumnIfExists_result result = getEmptyResultInstance();
+        try {
+          result.success = iface.deleteColumnIfExists(args.name);
+          result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5552,6 +6055,230 @@ public class RocksDB {
       }
     }
 
+    public static class cdcCreate<I extends Iface> extends org.apache.thrift.ProcessFunction<I, cdcCreate_args, cdcCreate_result> {
+      public cdcCreate() {
+        super("cdcCreate");
+      }
+
+      @Override
+      public cdcCreate_args getEmptyArgsInstance() {
+        return new cdcCreate_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public cdcCreate_result getEmptyResultInstance() {
+        return new cdcCreate_result();
+      }
+
+      @Override
+      public cdcCreate_result getResult(I iface, cdcCreate_args args) throws org.apache.thrift.TException {
+        cdcCreate_result result = getEmptyResultInstance();
+        try {
+          result.success = iface.cdcCreate(args.request);
+          result.setSuccessIsSet(true);
+        } catch (RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
+    }
+
+    public static class cdcDelete<I extends Iface> extends org.apache.thrift.ProcessFunction<I, cdcDelete_args, cdcDelete_result> {
+      public cdcDelete() {
+        super("cdcDelete");
+      }
+
+      @Override
+      public cdcDelete_args getEmptyArgsInstance() {
+        return new cdcDelete_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public cdcDelete_result getEmptyResultInstance() {
+        return new cdcDelete_result();
+      }
+
+      @Override
+      public cdcDelete_result getResult(I iface, cdcDelete_args args) throws org.apache.thrift.TException {
+        cdcDelete_result result = getEmptyResultInstance();
+        try {
+          iface.cdcDelete(args.id);
+        } catch (RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
+    }
+
+    public static class cdcGetEarliestAvailableSequence<I extends Iface> extends org.apache.thrift.ProcessFunction<I, cdcGetEarliestAvailableSequence_args, cdcGetEarliestAvailableSequence_result> {
+      public cdcGetEarliestAvailableSequence() {
+        super("cdcGetEarliestAvailableSequence");
+      }
+
+      @Override
+      public cdcGetEarliestAvailableSequence_args getEmptyArgsInstance() {
+        return new cdcGetEarliestAvailableSequence_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public cdcGetEarliestAvailableSequence_result getEmptyResultInstance() {
+        return new cdcGetEarliestAvailableSequence_result();
+      }
+
+      @Override
+      public cdcGetEarliestAvailableSequence_result getResult(I iface, cdcGetEarliestAvailableSequence_args args) throws org.apache.thrift.TException {
+        cdcGetEarliestAvailableSequence_result result = getEmptyResultInstance();
+        try {
+          result.success = iface.cdcGetEarliestAvailableSequence();
+          result.setSuccessIsSet(true);
+        } catch (RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
+    }
+
+    public static class cdcGetLastCommittedSequence<I extends Iface> extends org.apache.thrift.ProcessFunction<I, cdcGetLastCommittedSequence_args, cdcGetLastCommittedSequence_result> {
+      public cdcGetLastCommittedSequence() {
+        super("cdcGetLastCommittedSequence");
+      }
+
+      @Override
+      public cdcGetLastCommittedSequence_args getEmptyArgsInstance() {
+        return new cdcGetLastCommittedSequence_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public cdcGetLastCommittedSequence_result getEmptyResultInstance() {
+        return new cdcGetLastCommittedSequence_result();
+      }
+
+      @Override
+      public cdcGetLastCommittedSequence_result getResult(I iface, cdcGetLastCommittedSequence_args args) throws org.apache.thrift.TException {
+        cdcGetLastCommittedSequence_result result = getEmptyResultInstance();
+        try {
+          result.success = iface.cdcGetLastCommittedSequence(args.id);
+        } catch (RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
+    }
+
+    public static class cdcPollBatch<I extends Iface> extends org.apache.thrift.ProcessFunction<I, cdcPollBatch_args, cdcPollBatch_result> {
+      public cdcPollBatch() {
+        super("cdcPollBatch");
+      }
+
+      @Override
+      public cdcPollBatch_args getEmptyArgsInstance() {
+        return new cdcPollBatch_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public cdcPollBatch_result getEmptyResultInstance() {
+        return new cdcPollBatch_result();
+      }
+
+      @Override
+      public cdcPollBatch_result getResult(I iface, cdcPollBatch_args args) throws org.apache.thrift.TException {
+        cdcPollBatch_result result = getEmptyResultInstance();
+        try {
+          result.success = iface.cdcPollBatch(args.request);
+        } catch (RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
+    }
+
+    public static class cdcCommit<I extends Iface> extends org.apache.thrift.ProcessFunction<I, cdcCommit_args, cdcCommit_result> {
+      public cdcCommit() {
+        super("cdcCommit");
+      }
+
+      @Override
+      public cdcCommit_args getEmptyArgsInstance() {
+        return new cdcCommit_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public cdcCommit_result getEmptyResultInstance() {
+        return new cdcCommit_result();
+      }
+
+      @Override
+      public cdcCommit_result getResult(I iface, cdcCommit_args args) throws org.apache.thrift.TException {
+        cdcCommit_result result = getEmptyResultInstance();
+        try {
+          iface.cdcCommit(args.id, args.seq);
+        } catch (RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
+    }
+
   }
 
   public static class AsyncProcessor<I extends AsyncIface> extends org.apache.thrift.TBaseAsyncProcessor<I> {
@@ -5570,6 +6297,7 @@ public class RocksDB {
       processMap.put("closeFailedUpdate", new closeFailedUpdate());
       processMap.put("createColumn", new createColumn());
       processMap.put("deleteColumn", new deleteColumn());
+      processMap.put("deleteColumnIfExists", new deleteColumnIfExists());
       processMap.put("getColumnId", new getColumnId());
       processMap.put("estimateNumKeys", new estimateNumKeys());
       processMap.put("putFast", new putFast());
@@ -5614,6 +6342,12 @@ public class RocksDB {
       processMap.put("flush", new flush());
       processMap.put("compact", new compact());
       processMap.put("getAllColumnDefinitions", new getAllColumnDefinitions());
+      processMap.put("cdcCreate", new cdcCreate());
+      processMap.put("cdcDelete", new cdcDelete());
+      processMap.put("cdcGetEarliestAvailableSequence", new cdcGetEarliestAvailableSequence());
+      processMap.put("cdcGetLastCommittedSequence", new cdcGetLastCommittedSequence());
+      processMap.put("cdcPollBatch", new cdcPollBatch());
+      processMap.put("cdcCommit", new cdcCommit());
       return processMap;
     }
 
@@ -5995,6 +6729,83 @@ public class RocksDB {
       @Override
       public void start(I iface, deleteColumn_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
         iface.deleteColumn(args.columnId,resultHandler);
+      }
+    }
+
+    public static class deleteColumnIfExists<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, deleteColumnIfExists_args, java.lang.Boolean, deleteColumnIfExists_result> {
+      public deleteColumnIfExists() {
+        super("deleteColumnIfExists");
+      }
+
+      @Override
+      public deleteColumnIfExists_result getEmptyResultInstance() {
+        return new deleteColumnIfExists_result();
+      }
+
+      @Override
+      public deleteColumnIfExists_args getEmptyArgsInstance() {
+        return new deleteColumnIfExists_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean>() {
+          @Override
+          public void onComplete(java.lang.Boolean o) {
+            deleteColumnIfExists_result result = new deleteColumnIfExists_result();
+            result.success = o;
+            result.setSuccessIsSet(true);
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            deleteColumnIfExists_result result = new deleteColumnIfExists_result();
+            if (e instanceof RocksDBThriftException) {
+              result.e = (RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, deleteColumnIfExists_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
+        iface.deleteColumnIfExists(args.name,resultHandler);
       }
     }
 
@@ -9304,6 +10115,462 @@ public class RocksDB {
       @Override
       public void start(I iface, getAllColumnDefinitions_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler) throws org.apache.thrift.TException {
         iface.getAllColumnDefinitions(resultHandler);
+      }
+    }
+
+    public static class cdcCreate<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, cdcCreate_args, java.lang.Long, cdcCreate_result> {
+      public cdcCreate() {
+        super("cdcCreate");
+      }
+
+      @Override
+      public cdcCreate_result getEmptyResultInstance() {
+        return new cdcCreate_result();
+      }
+
+      @Override
+      public cdcCreate_args getEmptyArgsInstance() {
+        return new cdcCreate_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<java.lang.Long>() {
+          @Override
+          public void onComplete(java.lang.Long o) {
+            cdcCreate_result result = new cdcCreate_result();
+            result.success = o;
+            result.setSuccessIsSet(true);
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            cdcCreate_result result = new cdcCreate_result();
+            if (e instanceof RocksDBThriftException) {
+              result.e = (RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, cdcCreate_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+        iface.cdcCreate(args.request,resultHandler);
+      }
+    }
+
+    public static class cdcDelete<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, cdcDelete_args, Void, cdcDelete_result> {
+      public cdcDelete() {
+        super("cdcDelete");
+      }
+
+      @Override
+      public cdcDelete_result getEmptyResultInstance() {
+        return new cdcDelete_result();
+      }
+
+      @Override
+      public cdcDelete_args getEmptyArgsInstance() {
+        return new cdcDelete_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<Void> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<Void>() {
+          @Override
+          public void onComplete(Void o) {
+            cdcDelete_result result = new cdcDelete_result();
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            cdcDelete_result result = new cdcDelete_result();
+            if (e instanceof RocksDBThriftException) {
+              result.e = (RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, cdcDelete_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+        iface.cdcDelete(args.id,resultHandler);
+      }
+    }
+
+    public static class cdcGetEarliestAvailableSequence<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, cdcGetEarliestAvailableSequence_args, java.lang.Long, cdcGetEarliestAvailableSequence_result> {
+      public cdcGetEarliestAvailableSequence() {
+        super("cdcGetEarliestAvailableSequence");
+      }
+
+      @Override
+      public cdcGetEarliestAvailableSequence_result getEmptyResultInstance() {
+        return new cdcGetEarliestAvailableSequence_result();
+      }
+
+      @Override
+      public cdcGetEarliestAvailableSequence_args getEmptyArgsInstance() {
+        return new cdcGetEarliestAvailableSequence_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<java.lang.Long>() {
+          @Override
+          public void onComplete(java.lang.Long o) {
+            cdcGetEarliestAvailableSequence_result result = new cdcGetEarliestAvailableSequence_result();
+            result.success = o;
+            result.setSuccessIsSet(true);
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            cdcGetEarliestAvailableSequence_result result = new cdcGetEarliestAvailableSequence_result();
+            if (e instanceof RocksDBThriftException) {
+              result.e = (RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, cdcGetEarliestAvailableSequence_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+        iface.cdcGetEarliestAvailableSequence(resultHandler);
+      }
+    }
+
+    public static class cdcGetLastCommittedSequence<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, cdcGetLastCommittedSequence_args, OptionalLongValue, cdcGetLastCommittedSequence_result> {
+      public cdcGetLastCommittedSequence() {
+        super("cdcGetLastCommittedSequence");
+      }
+
+      @Override
+      public cdcGetLastCommittedSequence_result getEmptyResultInstance() {
+        return new cdcGetLastCommittedSequence_result();
+      }
+
+      @Override
+      public cdcGetLastCommittedSequence_args getEmptyArgsInstance() {
+        return new cdcGetLastCommittedSequence_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue>() {
+          @Override
+          public void onComplete(OptionalLongValue o) {
+            cdcGetLastCommittedSequence_result result = new cdcGetLastCommittedSequence_result();
+            result.success = o;
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            cdcGetLastCommittedSequence_result result = new cdcGetLastCommittedSequence_result();
+            if (e instanceof RocksDBThriftException) {
+              result.e = (RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, cdcGetLastCommittedSequence_args args, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException {
+        iface.cdcGetLastCommittedSequence(args.id,resultHandler);
+      }
+    }
+
+    public static class cdcPollBatch<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, cdcPollBatch_args, CdcPollBatchResult, cdcPollBatch_result> {
+      public cdcPollBatch() {
+        super("cdcPollBatch");
+      }
+
+      @Override
+      public cdcPollBatch_result getEmptyResultInstance() {
+        return new cdcPollBatch_result();
+      }
+
+      @Override
+      public cdcPollBatch_args getEmptyArgsInstance() {
+        return new cdcPollBatch_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<CdcPollBatchResult> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<CdcPollBatchResult>() {
+          @Override
+          public void onComplete(CdcPollBatchResult o) {
+            cdcPollBatch_result result = new cdcPollBatch_result();
+            result.success = o;
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            cdcPollBatch_result result = new cdcPollBatch_result();
+            if (e instanceof RocksDBThriftException) {
+              result.e = (RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, cdcPollBatch_args args, org.apache.thrift.async.AsyncMethodCallback<CdcPollBatchResult> resultHandler) throws org.apache.thrift.TException {
+        iface.cdcPollBatch(args.request,resultHandler);
+      }
+    }
+
+    public static class cdcCommit<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, cdcCommit_args, Void, cdcCommit_result> {
+      public cdcCommit() {
+        super("cdcCommit");
+      }
+
+      @Override
+      public cdcCommit_result getEmptyResultInstance() {
+        return new cdcCommit_result();
+      }
+
+      @Override
+      public cdcCommit_args getEmptyArgsInstance() {
+        return new cdcCommit_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<Void> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<Void>() {
+          @Override
+          public void onComplete(Void o) {
+            cdcCommit_result result = new cdcCommit_result();
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            cdcCommit_result result = new cdcCommit_result();
+            if (e instanceof RocksDBThriftException) {
+              result.e = (RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, cdcCommit_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+        iface.cdcCommit(args.id, args.seq,resultHandler);
       }
     }
 
@@ -13559,6 +14826,860 @@ public class RocksDB {
   }
 
   @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class deleteColumnIfExists_args implements org.apache.thrift.TBase<deleteColumnIfExists_args, deleteColumnIfExists_args._Fields>, java.io.Serializable, Cloneable, Comparable<deleteColumnIfExists_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("deleteColumnIfExists_args");
+
+    private static final org.apache.thrift.protocol.TField NAME_FIELD_DESC = new org.apache.thrift.protocol.TField("name", org.apache.thrift.protocol.TType.STRING, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteColumnIfExists_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteColumnIfExists_argsTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable java.lang.String name; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      NAME((short)1, "name");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // NAME
+            return NAME;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.NAME, new org.apache.thrift.meta_data.FieldMetaData("name", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteColumnIfExists_args.class, metaDataMap);
+    }
+
+    public deleteColumnIfExists_args() {
+    }
+
+    public deleteColumnIfExists_args(
+      java.lang.String name)
+    {
+      this();
+      this.name = name;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public deleteColumnIfExists_args(deleteColumnIfExists_args other) {
+      if (other.isSetName()) {
+        this.name = other.name;
+      }
+    }
+
+    @Override
+    public deleteColumnIfExists_args deepCopy() {
+      return new deleteColumnIfExists_args(this);
+    }
+
+    @Override
+    public void clear() {
+      this.name = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.lang.String getName() {
+      return this.name;
+    }
+
+    public deleteColumnIfExists_args setName(@org.apache.thrift.annotation.Nullable java.lang.String name) {
+      this.name = name;
+      return this;
+    }
+
+    public void unsetName() {
+      this.name = null;
+    }
+
+    /** Returns true if field name is set (has been assigned a value) and false otherwise */
+    public boolean isSetName() {
+      return this.name != null;
+    }
+
+    public void setNameIsSet(boolean value) {
+      if (!value) {
+        this.name = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case NAME:
+        if (value == null) {
+          unsetName();
+        } else {
+          setName((java.lang.String)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case NAME:
+        return getName();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case NAME:
+        return isSetName();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof deleteColumnIfExists_args)
+        return this.equals((deleteColumnIfExists_args)that);
+      return false;
+    }
+
+    public boolean equals(deleteColumnIfExists_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_name = true && this.isSetName();
+      boolean that_present_name = true && that.isSetName();
+      if (this_present_name || that_present_name) {
+        if (!(this_present_name && that_present_name))
+          return false;
+        if (!this.name.equals(that.name))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetName()) ? 131071 : 524287);
+      if (isSetName())
+        hashCode = hashCode * 8191 + name.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(deleteColumnIfExists_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetName(), other.isSetName());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetName()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.name, other.name);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("deleteColumnIfExists_args(");
+      boolean first = true;
+
+      sb.append("name:");
+      if (this.name == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.name);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      if (name == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'name' was not present! Struct: " + toString());
+      }
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class deleteColumnIfExists_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public deleteColumnIfExists_argsStandardScheme getScheme() {
+        return new deleteColumnIfExists_argsStandardScheme();
+      }
+    }
+
+    private static class deleteColumnIfExists_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<deleteColumnIfExists_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, deleteColumnIfExists_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // NAME
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+                struct.name = iprot.readString();
+                struct.setNameIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, deleteColumnIfExists_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.name != null) {
+          oprot.writeFieldBegin(NAME_FIELD_DESC);
+          oprot.writeString(struct.name);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class deleteColumnIfExists_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public deleteColumnIfExists_argsTupleScheme getScheme() {
+        return new deleteColumnIfExists_argsTupleScheme();
+      }
+    }
+
+    private static class deleteColumnIfExists_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<deleteColumnIfExists_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, deleteColumnIfExists_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        oprot.writeString(struct.name);
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, deleteColumnIfExists_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.name = iprot.readString();
+        struct.setNameIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class deleteColumnIfExists_result implements org.apache.thrift.TBase<deleteColumnIfExists_result, deleteColumnIfExists_result._Fields>, java.io.Serializable, Cloneable, Comparable<deleteColumnIfExists_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("deleteColumnIfExists_result");
+
+    private static final org.apache.thrift.protocol.TField SUCCESS_FIELD_DESC = new org.apache.thrift.protocol.TField("success", org.apache.thrift.protocol.TType.BOOL, (short)0);
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteColumnIfExists_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteColumnIfExists_resultTupleSchemeFactory();
+
+    public boolean success; // required
+    public @org.apache.thrift.annotation.Nullable RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      SUCCESS((short)0, "success"),
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 0: // SUCCESS
+            return SUCCESS;
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    private static final int __SUCCESS_ISSET_ID = 0;
+    private byte __isset_bitfield = 0;
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.SUCCESS, new org.apache.thrift.meta_data.FieldMetaData("success", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteColumnIfExists_result.class, metaDataMap);
+    }
+
+    public deleteColumnIfExists_result() {
+    }
+
+    public deleteColumnIfExists_result(
+      boolean success,
+      RocksDBThriftException e)
+    {
+      this();
+      this.success = success;
+      setSuccessIsSet(true);
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public deleteColumnIfExists_result(deleteColumnIfExists_result other) {
+      __isset_bitfield = other.__isset_bitfield;
+      this.success = other.success;
+      if (other.isSetE()) {
+        this.e = new RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public deleteColumnIfExists_result deepCopy() {
+      return new deleteColumnIfExists_result(this);
+    }
+
+    @Override
+    public void clear() {
+      setSuccessIsSet(false);
+      this.success = false;
+      this.e = null;
+    }
+
+    public boolean isSuccess() {
+      return this.success;
+    }
+
+    public deleteColumnIfExists_result setSuccess(boolean success) {
+      this.success = success;
+      setSuccessIsSet(true);
+      return this;
+    }
+
+    public void unsetSuccess() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __SUCCESS_ISSET_ID);
+    }
+
+    /** Returns true if field success is set (has been assigned a value) and false otherwise */
+    public boolean isSetSuccess() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __SUCCESS_ISSET_ID);
+    }
+
+    public void setSuccessIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __SUCCESS_ISSET_ID, value);
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public deleteColumnIfExists_result setE(@org.apache.thrift.annotation.Nullable RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case SUCCESS:
+        if (value == null) {
+          unsetSuccess();
+        } else {
+          setSuccess((java.lang.Boolean)value);
+        }
+        break;
+
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case SUCCESS:
+        return isSuccess();
+
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case SUCCESS:
+        return isSetSuccess();
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof deleteColumnIfExists_result)
+        return this.equals((deleteColumnIfExists_result)that);
+      return false;
+    }
+
+    public boolean equals(deleteColumnIfExists_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_success = true;
+      boolean that_present_success = true;
+      if (this_present_success || that_present_success) {
+        if (!(this_present_success && that_present_success))
+          return false;
+        if (this.success != that.success)
+          return false;
+      }
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((success) ? 131071 : 524287);
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(deleteColumnIfExists_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetSuccess(), other.isSetSuccess());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetSuccess()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.success, other.success);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("deleteColumnIfExists_result(");
+      boolean first = true;
+
+      sb.append("success:");
+      sb.append(this.success);
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class deleteColumnIfExists_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public deleteColumnIfExists_resultStandardScheme getScheme() {
+        return new deleteColumnIfExists_resultStandardScheme();
+      }
+    }
+
+    private static class deleteColumnIfExists_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<deleteColumnIfExists_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, deleteColumnIfExists_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 0: // SUCCESS
+              if (schemeField.type == org.apache.thrift.protocol.TType.BOOL) {
+                struct.success = iprot.readBool();
+                struct.setSuccessIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, deleteColumnIfExists_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.isSetSuccess()) {
+          oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+          oprot.writeBool(struct.success);
+          oprot.writeFieldEnd();
+        }
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class deleteColumnIfExists_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public deleteColumnIfExists_resultTupleScheme getScheme() {
+        return new deleteColumnIfExists_resultTupleScheme();
+      }
+    }
+
+    private static class deleteColumnIfExists_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<deleteColumnIfExists_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, deleteColumnIfExists_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetSuccess()) {
+          optionals.set(0);
+        }
+        if (struct.isSetE()) {
+          optionals.set(1);
+        }
+        oprot.writeBitSet(optionals, 2);
+        if (struct.isSetSuccess()) {
+          oprot.writeBool(struct.success);
+        }
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, deleteColumnIfExists_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(2);
+        if (incoming.get(0)) {
+          struct.success = iprot.readBool();
+          struct.setSuccessIsSet(true);
+        }
+        if (incoming.get(1)) {
+          struct.e = new RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
   public static class getColumnId_args implements org.apache.thrift.TBase<getColumnId_args, getColumnId_args._Fields>, java.io.Serializable, Cloneable, Comparable<getColumnId_args>   {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("getColumnId_args");
 
@@ -15862,13 +17983,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list24 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list24.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem25;
-                  for (int _i26 = 0; _i26 < _list24.size; ++_i26)
+                  org.apache.thrift.protocol.TList _list40 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list40.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem41;
+                  for (int _i42 = 0; _i42 < _list40.size; ++_i42)
                   {
-                    _elem25 = iprot.readBinary();
-                    struct.keys.add(_elem25);
+                    _elem41 = iprot.readBinary();
+                    struct.keys.add(_elem41);
                   }
                   iprot.readListEnd();
                 }
@@ -15917,9 +18038,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter27 : struct.keys)
+            for (java.nio.ByteBuffer _iter43 : struct.keys)
             {
-              oprot.writeBinary(_iter27);
+              oprot.writeBinary(_iter43);
             }
             oprot.writeListEnd();
           }
@@ -15952,9 +18073,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter28 : struct.keys)
+          for (java.nio.ByteBuffer _iter44 : struct.keys)
           {
-            oprot.writeBinary(_iter28);
+            oprot.writeBinary(_iter44);
           }
         }
         oprot.writeBinary(struct.value);
@@ -15968,13 +18089,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list29 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list29.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem30;
-          for (int _i31 = 0; _i31 < _list29.size; ++_i31)
+          org.apache.thrift.protocol.TList _list45 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list45.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem46;
+          for (int _i47 = 0; _i47 < _list45.size; ++_i47)
           {
-            _elem30 = iprot.readBinary();
-            struct.keys.add(_elem30);
+            _elem46 = iprot.readBinary();
+            struct.keys.add(_elem46);
           }
         }
         struct.setKeysIsSet(true);
@@ -16588,13 +18709,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list32 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list32.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem33;
-                  for (int _i34 = 0; _i34 < _list32.size; ++_i34)
+                  org.apache.thrift.protocol.TList _list48 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list48.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem49;
+                  for (int _i50 = 0; _i50 < _list48.size; ++_i50)
                   {
-                    _elem33 = iprot.readBinary();
-                    struct.keys.add(_elem33);
+                    _elem49 = iprot.readBinary();
+                    struct.keys.add(_elem49);
                   }
                   iprot.readListEnd();
                 }
@@ -16643,9 +18764,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter35 : struct.keys)
+            for (java.nio.ByteBuffer _iter51 : struct.keys)
             {
-              oprot.writeBinary(_iter35);
+              oprot.writeBinary(_iter51);
             }
             oprot.writeListEnd();
           }
@@ -16678,9 +18799,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter36 : struct.keys)
+          for (java.nio.ByteBuffer _iter52 : struct.keys)
           {
-            oprot.writeBinary(_iter36);
+            oprot.writeBinary(_iter52);
           }
         }
         oprot.writeBinary(struct.value);
@@ -16694,13 +18815,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list37 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list37.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem38;
-          for (int _i39 = 0; _i39 < _list37.size; ++_i39)
+          org.apache.thrift.protocol.TList _list53 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list53.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem54;
+          for (int _i55 = 0; _i55 < _list53.size; ++_i55)
           {
-            _elem38 = iprot.readBinary();
-            struct.keys.add(_elem38);
+            _elem54 = iprot.readBinary();
+            struct.keys.add(_elem54);
           }
         }
         struct.setKeysIsSet(true);
@@ -17704,23 +19825,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list40 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list40.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem41;
-                  for (int _i42 = 0; _i42 < _list40.size; ++_i42)
+                  org.apache.thrift.protocol.TList _list56 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list56.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem57;
+                  for (int _i58 = 0; _i58 < _list56.size; ++_i58)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list43 = iprot.readListBegin();
-                      _elem41 = new java.util.ArrayList<java.nio.ByteBuffer>(_list43.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem44;
-                      for (int _i45 = 0; _i45 < _list43.size; ++_i45)
+                      org.apache.thrift.protocol.TList _list59 = iprot.readListBegin();
+                      _elem57 = new java.util.ArrayList<java.nio.ByteBuffer>(_list59.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem60;
+                      for (int _i61 = 0; _i61 < _list59.size; ++_i61)
                       {
-                        _elem44 = iprot.readBinary();
-                        _elem41.add(_elem44);
+                        _elem60 = iprot.readBinary();
+                        _elem57.add(_elem60);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem41);
+                    struct.keysMulti.add(_elem57);
                   }
                   iprot.readListEnd();
                 }
@@ -17732,13 +19853,13 @@ public class RocksDB {
             case 4: // VALUE_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list46 = iprot.readListBegin();
-                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list46.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem47;
-                  for (int _i48 = 0; _i48 < _list46.size; ++_i48)
+                  org.apache.thrift.protocol.TList _list62 = iprot.readListBegin();
+                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list62.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem63;
+                  for (int _i64 = 0; _i64 < _list62.size; ++_i64)
                   {
-                    _elem47 = iprot.readBinary();
-                    struct.valueMulti.add(_elem47);
+                    _elem63 = iprot.readBinary();
+                    struct.valueMulti.add(_elem63);
                   }
                   iprot.readListEnd();
                 }
@@ -17779,13 +19900,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter49 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter65 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter49.size()));
-                for (java.nio.ByteBuffer _iter50 : _iter49)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter65.size()));
+                for (java.nio.ByteBuffer _iter66 : _iter65)
                 {
-                  oprot.writeBinary(_iter50);
+                  oprot.writeBinary(_iter66);
                 }
                 oprot.writeListEnd();
               }
@@ -17798,9 +19919,9 @@ public class RocksDB {
           oprot.writeFieldBegin(VALUE_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.valueMulti.size()));
-            for (java.nio.ByteBuffer _iter51 : struct.valueMulti)
+            for (java.nio.ByteBuffer _iter67 : struct.valueMulti)
             {
-              oprot.writeBinary(_iter51);
+              oprot.writeBinary(_iter67);
             }
             oprot.writeListEnd();
           }
@@ -17828,22 +19949,22 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter52 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter68 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter52.size());
-              for (java.nio.ByteBuffer _iter53 : _iter52)
+              oprot.writeI32(_iter68.size());
+              for (java.nio.ByteBuffer _iter69 : _iter68)
               {
-                oprot.writeBinary(_iter53);
+                oprot.writeBinary(_iter69);
               }
             }
           }
         }
         {
           oprot.writeI32(struct.valueMulti.size());
-          for (java.nio.ByteBuffer _iter54 : struct.valueMulti)
+          for (java.nio.ByteBuffer _iter70 : struct.valueMulti)
           {
-            oprot.writeBinary(_iter54);
+            oprot.writeBinary(_iter70);
           }
         }
       }
@@ -17856,33 +19977,33 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list55 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list55.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem56;
-          for (int _i57 = 0; _i57 < _list55.size; ++_i57)
+          org.apache.thrift.protocol.TList _list71 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list71.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem72;
+          for (int _i73 = 0; _i73 < _list71.size; ++_i73)
           {
             {
-              org.apache.thrift.protocol.TList _list58 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem56 = new java.util.ArrayList<java.nio.ByteBuffer>(_list58.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem59;
-              for (int _i60 = 0; _i60 < _list58.size; ++_i60)
+              org.apache.thrift.protocol.TList _list74 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem72 = new java.util.ArrayList<java.nio.ByteBuffer>(_list74.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem75;
+              for (int _i76 = 0; _i76 < _list74.size; ++_i76)
               {
-                _elem59 = iprot.readBinary();
-                _elem56.add(_elem59);
+                _elem75 = iprot.readBinary();
+                _elem72.add(_elem75);
               }
             }
-            struct.keysMulti.add(_elem56);
+            struct.keysMulti.add(_elem72);
           }
         }
         struct.setKeysMultiIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list61 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list61.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem62;
-          for (int _i63 = 0; _i63 < _list61.size; ++_i63)
+          org.apache.thrift.protocol.TList _list77 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list77.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem78;
+          for (int _i79 = 0; _i79 < _list77.size; ++_i79)
           {
-            _elem62 = iprot.readBinary();
-            struct.valueMulti.add(_elem62);
+            _elem78 = iprot.readBinary();
+            struct.valueMulti.add(_elem78);
           }
         }
         struct.setValueMultiIsSet(true);
@@ -18874,13 +20995,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list64 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list64.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem65;
-                  for (int _i66 = 0; _i66 < _list64.size; ++_i66)
+                  org.apache.thrift.protocol.TList _list80 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list80.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem81;
+                  for (int _i82 = 0; _i82 < _list80.size; ++_i82)
                   {
-                    _elem65 = iprot.readBinary();
-                    struct.keys.add(_elem65);
+                    _elem81 = iprot.readBinary();
+                    struct.keys.add(_elem81);
                   }
                   iprot.readListEnd();
                 }
@@ -18929,9 +21050,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter67 : struct.keys)
+            for (java.nio.ByteBuffer _iter83 : struct.keys)
             {
-              oprot.writeBinary(_iter67);
+              oprot.writeBinary(_iter83);
             }
             oprot.writeListEnd();
           }
@@ -18964,9 +21085,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter68 : struct.keys)
+          for (java.nio.ByteBuffer _iter84 : struct.keys)
           {
-            oprot.writeBinary(_iter68);
+            oprot.writeBinary(_iter84);
           }
         }
         oprot.writeBinary(struct.value);
@@ -18980,13 +21101,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list69 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list69.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem70;
-          for (int _i71 = 0; _i71 < _list69.size; ++_i71)
+          org.apache.thrift.protocol.TList _list85 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list85.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem86;
+          for (int _i87 = 0; _i87 < _list85.size; ++_i87)
           {
-            _elem70 = iprot.readBinary();
-            struct.keys.add(_elem70);
+            _elem86 = iprot.readBinary();
+            struct.keys.add(_elem86);
           }
         }
         struct.setKeysIsSet(true);
@@ -20090,13 +22211,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list72 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list72.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem73;
-                  for (int _i74 = 0; _i74 < _list72.size; ++_i74)
+                  org.apache.thrift.protocol.TList _list88 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list88.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem89;
+                  for (int _i90 = 0; _i90 < _list88.size; ++_i90)
                   {
-                    _elem73 = iprot.readBinary();
-                    struct.keys.add(_elem73);
+                    _elem89 = iprot.readBinary();
+                    struct.keys.add(_elem89);
                   }
                   iprot.readListEnd();
                 }
@@ -20145,9 +22266,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter75 : struct.keys)
+            for (java.nio.ByteBuffer _iter91 : struct.keys)
             {
-              oprot.writeBinary(_iter75);
+              oprot.writeBinary(_iter91);
             }
             oprot.writeListEnd();
           }
@@ -20180,9 +22301,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter76 : struct.keys)
+          for (java.nio.ByteBuffer _iter92 : struct.keys)
           {
-            oprot.writeBinary(_iter76);
+            oprot.writeBinary(_iter92);
           }
         }
         oprot.writeBinary(struct.value);
@@ -20196,13 +22317,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list77 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list77.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem78;
-          for (int _i79 = 0; _i79 < _list77.size; ++_i79)
+          org.apache.thrift.protocol.TList _list93 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list93.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem94;
+          for (int _i95 = 0; _i95 < _list93.size; ++_i95)
           {
-            _elem78 = iprot.readBinary();
-            struct.keys.add(_elem78);
+            _elem94 = iprot.readBinary();
+            struct.keys.add(_elem94);
           }
         }
         struct.setKeysIsSet(true);
@@ -21306,13 +23427,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list80 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list80.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem81;
-                  for (int _i82 = 0; _i82 < _list80.size; ++_i82)
+                  org.apache.thrift.protocol.TList _list96 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list96.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem97;
+                  for (int _i98 = 0; _i98 < _list96.size; ++_i98)
                   {
-                    _elem81 = iprot.readBinary();
-                    struct.keys.add(_elem81);
+                    _elem97 = iprot.readBinary();
+                    struct.keys.add(_elem97);
                   }
                   iprot.readListEnd();
                 }
@@ -21361,9 +23482,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter83 : struct.keys)
+            for (java.nio.ByteBuffer _iter99 : struct.keys)
             {
-              oprot.writeBinary(_iter83);
+              oprot.writeBinary(_iter99);
             }
             oprot.writeListEnd();
           }
@@ -21396,9 +23517,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter84 : struct.keys)
+          for (java.nio.ByteBuffer _iter100 : struct.keys)
           {
-            oprot.writeBinary(_iter84);
+            oprot.writeBinary(_iter100);
           }
         }
         oprot.writeBinary(struct.value);
@@ -21412,13 +23533,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list85 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list85.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem86;
-          for (int _i87 = 0; _i87 < _list85.size; ++_i87)
+          org.apache.thrift.protocol.TList _list101 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list101.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem102;
+          for (int _i103 = 0; _i103 < _list101.size; ++_i103)
           {
-            _elem86 = iprot.readBinary();
-            struct.keys.add(_elem86);
+            _elem102 = iprot.readBinary();
+            struct.keys.add(_elem102);
           }
         }
         struct.setKeysIsSet(true);
@@ -22514,13 +24635,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list88 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list88.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem89;
-                  for (int _i90 = 0; _i90 < _list88.size; ++_i90)
+                  org.apache.thrift.protocol.TList _list104 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list104.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem105;
+                  for (int _i106 = 0; _i106 < _list104.size; ++_i106)
                   {
-                    _elem89 = iprot.readBinary();
-                    struct.keys.add(_elem89);
+                    _elem105 = iprot.readBinary();
+                    struct.keys.add(_elem105);
                   }
                   iprot.readListEnd();
                 }
@@ -22569,9 +24690,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter91 : struct.keys)
+            for (java.nio.ByteBuffer _iter107 : struct.keys)
             {
-              oprot.writeBinary(_iter91);
+              oprot.writeBinary(_iter107);
             }
             oprot.writeListEnd();
           }
@@ -22604,9 +24725,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter92 : struct.keys)
+          for (java.nio.ByteBuffer _iter108 : struct.keys)
           {
-            oprot.writeBinary(_iter92);
+            oprot.writeBinary(_iter108);
           }
         }
         oprot.writeBinary(struct.value);
@@ -22620,13 +24741,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list93 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list93.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem94;
-          for (int _i95 = 0; _i95 < _list93.size; ++_i95)
+          org.apache.thrift.protocol.TList _list109 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list109.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem110;
+          for (int _i111 = 0; _i111 < _list109.size; ++_i111)
           {
-            _elem94 = iprot.readBinary();
-            struct.keys.add(_elem94);
+            _elem110 = iprot.readBinary();
+            struct.keys.add(_elem110);
           }
         }
         struct.setKeysIsSet(true);
@@ -23624,13 +25745,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list96 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list96.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem97;
-                  for (int _i98 = 0; _i98 < _list96.size; ++_i98)
+                  org.apache.thrift.protocol.TList _list112 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list112.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem113;
+                  for (int _i114 = 0; _i114 < _list112.size; ++_i114)
                   {
-                    _elem97 = iprot.readBinary();
-                    struct.keys.add(_elem97);
+                    _elem113 = iprot.readBinary();
+                    struct.keys.add(_elem113);
                   }
                   iprot.readListEnd();
                 }
@@ -23671,9 +25792,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter99 : struct.keys)
+            for (java.nio.ByteBuffer _iter115 : struct.keys)
             {
-              oprot.writeBinary(_iter99);
+              oprot.writeBinary(_iter115);
             }
             oprot.writeListEnd();
           }
@@ -23701,9 +25822,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter100 : struct.keys)
+          for (java.nio.ByteBuffer _iter116 : struct.keys)
           {
-            oprot.writeBinary(_iter100);
+            oprot.writeBinary(_iter116);
           }
         }
       }
@@ -23716,13 +25837,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list101 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list101.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem102;
-          for (int _i103 = 0; _i103 < _list101.size; ++_i103)
+          org.apache.thrift.protocol.TList _list117 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list117.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem118;
+          for (int _i119 = 0; _i119 < _list117.size; ++_i119)
           {
-            _elem102 = iprot.readBinary();
-            struct.keys.add(_elem102);
+            _elem118 = iprot.readBinary();
+            struct.keys.add(_elem118);
           }
         }
         struct.setKeysIsSet(true);
@@ -24616,13 +26737,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list104 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list104.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem105;
-                  for (int _i106 = 0; _i106 < _list104.size; ++_i106)
+                  org.apache.thrift.protocol.TList _list120 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list120.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem121;
+                  for (int _i122 = 0; _i122 < _list120.size; ++_i122)
                   {
-                    _elem105 = iprot.readBinary();
-                    struct.keys.add(_elem105);
+                    _elem121 = iprot.readBinary();
+                    struct.keys.add(_elem121);
                   }
                   iprot.readListEnd();
                 }
@@ -24663,9 +26784,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter107 : struct.keys)
+            for (java.nio.ByteBuffer _iter123 : struct.keys)
             {
-              oprot.writeBinary(_iter107);
+              oprot.writeBinary(_iter123);
             }
             oprot.writeListEnd();
           }
@@ -24693,9 +26814,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter108 : struct.keys)
+          for (java.nio.ByteBuffer _iter124 : struct.keys)
           {
-            oprot.writeBinary(_iter108);
+            oprot.writeBinary(_iter124);
           }
         }
       }
@@ -24708,13 +26829,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list109 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list109.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem110;
-          for (int _i111 = 0; _i111 < _list109.size; ++_i111)
+          org.apache.thrift.protocol.TList _list125 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list125.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem126;
+          for (int _i127 = 0; _i127 < _list125.size; ++_i127)
           {
-            _elem110 = iprot.readBinary();
-            struct.keys.add(_elem110);
+            _elem126 = iprot.readBinary();
+            struct.keys.add(_elem126);
           }
         }
         struct.setKeysIsSet(true);
@@ -25718,13 +27839,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list112 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list112.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem113;
-                  for (int _i114 = 0; _i114 < _list112.size; ++_i114)
+                  org.apache.thrift.protocol.TList _list128 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list128.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem129;
+                  for (int _i130 = 0; _i130 < _list128.size; ++_i130)
                   {
-                    _elem113 = iprot.readBinary();
-                    struct.keys.add(_elem113);
+                    _elem129 = iprot.readBinary();
+                    struct.keys.add(_elem129);
                   }
                   iprot.readListEnd();
                 }
@@ -25765,9 +27886,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter115 : struct.keys)
+            for (java.nio.ByteBuffer _iter131 : struct.keys)
             {
-              oprot.writeBinary(_iter115);
+              oprot.writeBinary(_iter131);
             }
             oprot.writeListEnd();
           }
@@ -25795,9 +27916,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter116 : struct.keys)
+          for (java.nio.ByteBuffer _iter132 : struct.keys)
           {
-            oprot.writeBinary(_iter116);
+            oprot.writeBinary(_iter132);
           }
         }
       }
@@ -25810,13 +27931,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list117 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list117.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem118;
-          for (int _i119 = 0; _i119 < _list117.size; ++_i119)
+          org.apache.thrift.protocol.TList _list133 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list133.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem134;
+          for (int _i135 = 0; _i135 < _list133.size; ++_i135)
           {
-            _elem118 = iprot.readBinary();
-            struct.keys.add(_elem118);
+            _elem134 = iprot.readBinary();
+            struct.keys.add(_elem134);
           }
         }
         struct.setKeysIsSet(true);
@@ -26817,23 +28938,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list120 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list120.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem121;
-                  for (int _i122 = 0; _i122 < _list120.size; ++_i122)
+                  org.apache.thrift.protocol.TList _list136 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list136.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem137;
+                  for (int _i138 = 0; _i138 < _list136.size; ++_i138)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list123 = iprot.readListBegin();
-                      _elem121 = new java.util.ArrayList<java.nio.ByteBuffer>(_list123.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem124;
-                      for (int _i125 = 0; _i125 < _list123.size; ++_i125)
+                      org.apache.thrift.protocol.TList _list139 = iprot.readListBegin();
+                      _elem137 = new java.util.ArrayList<java.nio.ByteBuffer>(_list139.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem140;
+                      for (int _i141 = 0; _i141 < _list139.size; ++_i141)
                       {
-                        _elem124 = iprot.readBinary();
-                        _elem121.add(_elem124);
+                        _elem140 = iprot.readBinary();
+                        _elem137.add(_elem140);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem121);
+                    struct.keysMulti.add(_elem137);
                   }
                   iprot.readListEnd();
                 }
@@ -26874,13 +28995,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter126 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter142 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter126.size()));
-                for (java.nio.ByteBuffer _iter127 : _iter126)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter142.size()));
+                for (java.nio.ByteBuffer _iter143 : _iter142)
                 {
-                  oprot.writeBinary(_iter127);
+                  oprot.writeBinary(_iter143);
                 }
                 oprot.writeListEnd();
               }
@@ -26911,13 +29032,13 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter128 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter144 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter128.size());
-              for (java.nio.ByteBuffer _iter129 : _iter128)
+              oprot.writeI32(_iter144.size());
+              for (java.nio.ByteBuffer _iter145 : _iter144)
               {
-                oprot.writeBinary(_iter129);
+                oprot.writeBinary(_iter145);
               }
             }
           }
@@ -26932,22 +29053,22 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list130 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list130.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem131;
-          for (int _i132 = 0; _i132 < _list130.size; ++_i132)
+          org.apache.thrift.protocol.TList _list146 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list146.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem147;
+          for (int _i148 = 0; _i148 < _list146.size; ++_i148)
           {
             {
-              org.apache.thrift.protocol.TList _list133 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem131 = new java.util.ArrayList<java.nio.ByteBuffer>(_list133.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem134;
-              for (int _i135 = 0; _i135 < _list133.size; ++_i135)
+              org.apache.thrift.protocol.TList _list149 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem147 = new java.util.ArrayList<java.nio.ByteBuffer>(_list149.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem150;
+              for (int _i151 = 0; _i151 < _list149.size; ++_i151)
               {
-                _elem134 = iprot.readBinary();
-                _elem131.add(_elem134);
+                _elem150 = iprot.readBinary();
+                _elem147.add(_elem150);
               }
             }
-            struct.keysMulti.add(_elem131);
+            struct.keysMulti.add(_elem147);
           }
         }
         struct.setKeysMultiIsSet(true);
@@ -27846,23 +29967,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list136 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list136.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem137;
-                  for (int _i138 = 0; _i138 < _list136.size; ++_i138)
+                  org.apache.thrift.protocol.TList _list152 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list152.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem153;
+                  for (int _i154 = 0; _i154 < _list152.size; ++_i154)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list139 = iprot.readListBegin();
-                      _elem137 = new java.util.ArrayList<java.nio.ByteBuffer>(_list139.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem140;
-                      for (int _i141 = 0; _i141 < _list139.size; ++_i141)
+                      org.apache.thrift.protocol.TList _list155 = iprot.readListBegin();
+                      _elem153 = new java.util.ArrayList<java.nio.ByteBuffer>(_list155.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem156;
+                      for (int _i157 = 0; _i157 < _list155.size; ++_i157)
                       {
-                        _elem140 = iprot.readBinary();
-                        _elem137.add(_elem140);
+                        _elem156 = iprot.readBinary();
+                        _elem153.add(_elem156);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem137);
+                    struct.keysMulti.add(_elem153);
                   }
                   iprot.readListEnd();
                 }
@@ -27903,13 +30024,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter142 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter158 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter142.size()));
-                for (java.nio.ByteBuffer _iter143 : _iter142)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter158.size()));
+                for (java.nio.ByteBuffer _iter159 : _iter158)
                 {
-                  oprot.writeBinary(_iter143);
+                  oprot.writeBinary(_iter159);
                 }
                 oprot.writeListEnd();
               }
@@ -27940,13 +30061,13 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter144 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter160 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter144.size());
-              for (java.nio.ByteBuffer _iter145 : _iter144)
+              oprot.writeI32(_iter160.size());
+              for (java.nio.ByteBuffer _iter161 : _iter160)
               {
-                oprot.writeBinary(_iter145);
+                oprot.writeBinary(_iter161);
               }
             }
           }
@@ -27961,22 +30082,22 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list146 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list146.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem147;
-          for (int _i148 = 0; _i148 < _list146.size; ++_i148)
+          org.apache.thrift.protocol.TList _list162 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list162.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem163;
+          for (int _i164 = 0; _i164 < _list162.size; ++_i164)
           {
             {
-              org.apache.thrift.protocol.TList _list149 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem147 = new java.util.ArrayList<java.nio.ByteBuffer>(_list149.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem150;
-              for (int _i151 = 0; _i151 < _list149.size; ++_i151)
+              org.apache.thrift.protocol.TList _list165 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem163 = new java.util.ArrayList<java.nio.ByteBuffer>(_list165.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem166;
+              for (int _i167 = 0; _i167 < _list165.size; ++_i167)
               {
-                _elem150 = iprot.readBinary();
-                _elem147.add(_elem150);
+                _elem166 = iprot.readBinary();
+                _elem163.add(_elem166);
               }
             }
-            struct.keysMulti.add(_elem147);
+            struct.keysMulti.add(_elem163);
           }
         }
         struct.setKeysMultiIsSet(true);
@@ -28399,14 +30520,14 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list152 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<OptionalBinary>(_list152.size);
-                  @org.apache.thrift.annotation.Nullable OptionalBinary _elem153;
-                  for (int _i154 = 0; _i154 < _list152.size; ++_i154)
+                  org.apache.thrift.protocol.TList _list168 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<OptionalBinary>(_list168.size);
+                  @org.apache.thrift.annotation.Nullable OptionalBinary _elem169;
+                  for (int _i170 = 0; _i170 < _list168.size; ++_i170)
                   {
-                    _elem153 = new OptionalBinary();
-                    _elem153.read(iprot);
-                    struct.success.add(_elem153);
+                    _elem169 = new OptionalBinary();
+                    _elem169.read(iprot);
+                    struct.success.add(_elem169);
                   }
                   iprot.readListEnd();
                 }
@@ -28444,9 +30565,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
-            for (OptionalBinary _iter155 : struct.success)
+            for (OptionalBinary _iter171 : struct.success)
             {
-              _iter155.write(oprot);
+              _iter171.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -28486,9 +30607,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (OptionalBinary _iter156 : struct.success)
+            for (OptionalBinary _iter172 : struct.success)
             {
-              _iter156.write(oprot);
+              _iter172.write(oprot);
             }
           }
         }
@@ -28503,14 +30624,14 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list157 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-            struct.success = new java.util.ArrayList<OptionalBinary>(_list157.size);
-            @org.apache.thrift.annotation.Nullable OptionalBinary _elem158;
-            for (int _i159 = 0; _i159 < _list157.size; ++_i159)
+            org.apache.thrift.protocol.TList _list173 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<OptionalBinary>(_list173.size);
+            @org.apache.thrift.annotation.Nullable OptionalBinary _elem174;
+            for (int _i175 = 0; _i175 < _list173.size; ++_i175)
             {
-              _elem158 = new OptionalBinary();
-              _elem158.read(iprot);
-              struct.success.add(_elem158);
+              _elem174 = new OptionalBinary();
+              _elem174.read(iprot);
+              struct.success.add(_elem174);
             }
           }
           struct.setSuccessIsSet(true);
@@ -29035,23 +31156,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list160 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list160.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem161;
-                  for (int _i162 = 0; _i162 < _list160.size; ++_i162)
+                  org.apache.thrift.protocol.TList _list176 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list176.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem177;
+                  for (int _i178 = 0; _i178 < _list176.size; ++_i178)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list163 = iprot.readListBegin();
-                      _elem161 = new java.util.ArrayList<java.nio.ByteBuffer>(_list163.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem164;
-                      for (int _i165 = 0; _i165 < _list163.size; ++_i165)
+                      org.apache.thrift.protocol.TList _list179 = iprot.readListBegin();
+                      _elem177 = new java.util.ArrayList<java.nio.ByteBuffer>(_list179.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem180;
+                      for (int _i181 = 0; _i181 < _list179.size; ++_i181)
                       {
-                        _elem164 = iprot.readBinary();
-                        _elem161.add(_elem164);
+                        _elem180 = iprot.readBinary();
+                        _elem177.add(_elem180);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem161);
+                    struct.keysMulti.add(_elem177);
                   }
                   iprot.readListEnd();
                 }
@@ -29092,13 +31213,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter166 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter182 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter166.size()));
-                for (java.nio.ByteBuffer _iter167 : _iter166)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter182.size()));
+                for (java.nio.ByteBuffer _iter183 : _iter182)
                 {
-                  oprot.writeBinary(_iter167);
+                  oprot.writeBinary(_iter183);
                 }
                 oprot.writeListEnd();
               }
@@ -29129,13 +31250,13 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter168 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter184 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter168.size());
-              for (java.nio.ByteBuffer _iter169 : _iter168)
+              oprot.writeI32(_iter184.size());
+              for (java.nio.ByteBuffer _iter185 : _iter184)
               {
-                oprot.writeBinary(_iter169);
+                oprot.writeBinary(_iter185);
               }
             }
           }
@@ -29150,22 +31271,22 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list170 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list170.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem171;
-          for (int _i172 = 0; _i172 < _list170.size; ++_i172)
+          org.apache.thrift.protocol.TList _list186 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list186.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem187;
+          for (int _i188 = 0; _i188 < _list186.size; ++_i188)
           {
             {
-              org.apache.thrift.protocol.TList _list173 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem171 = new java.util.ArrayList<java.nio.ByteBuffer>(_list173.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem174;
-              for (int _i175 = 0; _i175 < _list173.size; ++_i175)
+              org.apache.thrift.protocol.TList _list189 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem187 = new java.util.ArrayList<java.nio.ByteBuffer>(_list189.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem190;
+              for (int _i191 = 0; _i191 < _list189.size; ++_i191)
               {
-                _elem174 = iprot.readBinary();
-                _elem171.add(_elem174);
+                _elem190 = iprot.readBinary();
+                _elem187.add(_elem190);
               }
             }
-            struct.keysMulti.add(_elem171);
+            struct.keysMulti.add(_elem187);
           }
         }
         struct.setKeysMultiIsSet(true);
@@ -29585,13 +31706,13 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list176 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<java.lang.Boolean>(_list176.size);
-                  boolean _elem177;
-                  for (int _i178 = 0; _i178 < _list176.size; ++_i178)
+                  org.apache.thrift.protocol.TList _list192 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<java.lang.Boolean>(_list192.size);
+                  boolean _elem193;
+                  for (int _i194 = 0; _i194 < _list192.size; ++_i194)
                   {
-                    _elem177 = iprot.readBool();
-                    struct.success.add(_elem177);
+                    _elem193 = iprot.readBool();
+                    struct.success.add(_elem193);
                   }
                   iprot.readListEnd();
                 }
@@ -29629,9 +31750,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.BOOL, struct.success.size()));
-            for (boolean _iter179 : struct.success)
+            for (boolean _iter195 : struct.success)
             {
-              oprot.writeBool(_iter179);
+              oprot.writeBool(_iter195);
             }
             oprot.writeListEnd();
           }
@@ -29671,9 +31792,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (boolean _iter180 : struct.success)
+            for (boolean _iter196 : struct.success)
             {
-              oprot.writeBool(_iter180);
+              oprot.writeBool(_iter196);
             }
           }
         }
@@ -29688,13 +31809,13 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list181 = iprot.readListBegin(org.apache.thrift.protocol.TType.BOOL);
-            struct.success = new java.util.ArrayList<java.lang.Boolean>(_list181.size);
-            boolean _elem182;
-            for (int _i183 = 0; _i183 < _list181.size; ++_i183)
+            org.apache.thrift.protocol.TList _list197 = iprot.readListBegin(org.apache.thrift.protocol.TType.BOOL);
+            struct.success = new java.util.ArrayList<java.lang.Boolean>(_list197.size);
+            boolean _elem198;
+            for (int _i199 = 0; _i199 < _list197.size; ++_i199)
             {
-              _elem182 = iprot.readBool();
-              struct.success.add(_elem182);
+              _elem198 = iprot.readBool();
+              struct.success.add(_elem198);
             }
           }
           struct.setSuccessIsSet(true);
@@ -30214,13 +32335,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list184 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list184.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem185;
-                  for (int _i186 = 0; _i186 < _list184.size; ++_i186)
+                  org.apache.thrift.protocol.TList _list200 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list200.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem201;
+                  for (int _i202 = 0; _i202 < _list200.size; ++_i202)
                   {
-                    _elem185 = iprot.readBinary();
-                    struct.keys.add(_elem185);
+                    _elem201 = iprot.readBinary();
+                    struct.keys.add(_elem201);
                   }
                   iprot.readListEnd();
                 }
@@ -30261,9 +32382,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter187 : struct.keys)
+            for (java.nio.ByteBuffer _iter203 : struct.keys)
             {
-              oprot.writeBinary(_iter187);
+              oprot.writeBinary(_iter203);
             }
             oprot.writeListEnd();
           }
@@ -30291,9 +32412,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter188 : struct.keys)
+          for (java.nio.ByteBuffer _iter204 : struct.keys)
           {
-            oprot.writeBinary(_iter188);
+            oprot.writeBinary(_iter204);
           }
         }
       }
@@ -30306,13 +32427,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list189 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list189.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem190;
-          for (int _i191 = 0; _i191 < _list189.size; ++_i191)
+          org.apache.thrift.protocol.TList _list205 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list205.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem206;
+          for (int _i207 = 0; _i207 < _list205.size; ++_i207)
           {
-            _elem190 = iprot.readBinary();
-            struct.keys.add(_elem190);
+            _elem206 = iprot.readBinary();
+            struct.keys.add(_elem206);
           }
         }
         struct.setKeysIsSet(true);
@@ -31316,13 +33437,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list192 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list192.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem193;
-                  for (int _i194 = 0; _i194 < _list192.size; ++_i194)
+                  org.apache.thrift.protocol.TList _list208 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list208.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem209;
+                  for (int _i210 = 0; _i210 < _list208.size; ++_i210)
                   {
-                    _elem193 = iprot.readBinary();
-                    struct.keys.add(_elem193);
+                    _elem209 = iprot.readBinary();
+                    struct.keys.add(_elem209);
                   }
                   iprot.readListEnd();
                 }
@@ -31363,9 +33484,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter195 : struct.keys)
+            for (java.nio.ByteBuffer _iter211 : struct.keys)
             {
-              oprot.writeBinary(_iter195);
+              oprot.writeBinary(_iter211);
             }
             oprot.writeListEnd();
           }
@@ -31393,9 +33514,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter196 : struct.keys)
+          for (java.nio.ByteBuffer _iter212 : struct.keys)
           {
-            oprot.writeBinary(_iter196);
+            oprot.writeBinary(_iter212);
           }
         }
       }
@@ -31408,13 +33529,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list197 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list197.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem198;
-          for (int _i199 = 0; _i199 < _list197.size; ++_i199)
+          org.apache.thrift.protocol.TList _list213 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list213.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem214;
+          for (int _i215 = 0; _i215 < _list213.size; ++_i215)
           {
-            _elem198 = iprot.readBinary();
-            struct.keys.add(_elem198);
+            _elem214 = iprot.readBinary();
+            struct.keys.add(_elem214);
           }
         }
         struct.setKeysIsSet(true);
@@ -32418,13 +34539,13 @@ public class RocksDB {
             case 4: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list200 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list200.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem201;
-                  for (int _i202 = 0; _i202 < _list200.size; ++_i202)
+                  org.apache.thrift.protocol.TList _list216 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list216.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem217;
+                  for (int _i218 = 0; _i218 < _list216.size; ++_i218)
                   {
-                    _elem201 = iprot.readBinary();
-                    struct.keys.add(_elem201);
+                    _elem217 = iprot.readBinary();
+                    struct.keys.add(_elem217);
                   }
                   iprot.readListEnd();
                 }
@@ -32465,9 +34586,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter203 : struct.keys)
+            for (java.nio.ByteBuffer _iter219 : struct.keys)
             {
-              oprot.writeBinary(_iter203);
+              oprot.writeBinary(_iter219);
             }
             oprot.writeListEnd();
           }
@@ -32495,9 +34616,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter204 : struct.keys)
+          for (java.nio.ByteBuffer _iter220 : struct.keys)
           {
-            oprot.writeBinary(_iter204);
+            oprot.writeBinary(_iter220);
           }
         }
       }
@@ -32510,13 +34631,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list205 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list205.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem206;
-          for (int _i207 = 0; _i207 < _list205.size; ++_i207)
+          org.apache.thrift.protocol.TList _list221 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list221.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem222;
+          for (int _i223 = 0; _i223 < _list221.size; ++_i223)
           {
-            _elem206 = iprot.readBinary();
-            struct.keys.add(_elem206);
+            _elem222 = iprot.readBinary();
+            struct.keys.add(_elem222);
           }
         }
         struct.setKeysIsSet(true);
@@ -33593,23 +35714,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list208 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list208.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem209;
-                  for (int _i210 = 0; _i210 < _list208.size; ++_i210)
+                  org.apache.thrift.protocol.TList _list224 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list224.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem225;
+                  for (int _i226 = 0; _i226 < _list224.size; ++_i226)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list211 = iprot.readListBegin();
-                      _elem209 = new java.util.ArrayList<java.nio.ByteBuffer>(_list211.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem212;
-                      for (int _i213 = 0; _i213 < _list211.size; ++_i213)
+                      org.apache.thrift.protocol.TList _list227 = iprot.readListBegin();
+                      _elem225 = new java.util.ArrayList<java.nio.ByteBuffer>(_list227.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem228;
+                      for (int _i229 = 0; _i229 < _list227.size; ++_i229)
                       {
-                        _elem212 = iprot.readBinary();
-                        _elem209.add(_elem212);
+                        _elem228 = iprot.readBinary();
+                        _elem225.add(_elem228);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem209);
+                    struct.keysMulti.add(_elem225);
                   }
                   iprot.readListEnd();
                 }
@@ -33661,13 +35782,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter214 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter230 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter214.size()));
-                for (java.nio.ByteBuffer _iter215 : _iter214)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter230.size()));
+                for (java.nio.ByteBuffer _iter231 : _iter230)
                 {
-                  oprot.writeBinary(_iter215);
+                  oprot.writeBinary(_iter231);
                 }
                 oprot.writeListEnd();
               }
@@ -33701,13 +35822,13 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter216 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter232 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter216.size());
-              for (java.nio.ByteBuffer _iter217 : _iter216)
+              oprot.writeI32(_iter232.size());
+              for (java.nio.ByteBuffer _iter233 : _iter232)
               {
-                oprot.writeBinary(_iter217);
+                oprot.writeBinary(_iter233);
               }
             }
           }
@@ -33723,22 +35844,22 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list218 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list218.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem219;
-          for (int _i220 = 0; _i220 < _list218.size; ++_i220)
+          org.apache.thrift.protocol.TList _list234 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list234.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem235;
+          for (int _i236 = 0; _i236 < _list234.size; ++_i236)
           {
             {
-              org.apache.thrift.protocol.TList _list221 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem219 = new java.util.ArrayList<java.nio.ByteBuffer>(_list221.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem222;
-              for (int _i223 = 0; _i223 < _list221.size; ++_i223)
+              org.apache.thrift.protocol.TList _list237 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem235 = new java.util.ArrayList<java.nio.ByteBuffer>(_list237.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem238;
+              for (int _i239 = 0; _i239 < _list237.size; ++_i239)
               {
-                _elem222 = iprot.readBinary();
-                _elem219.add(_elem222);
+                _elem238 = iprot.readBinary();
+                _elem235.add(_elem238);
               }
             }
-            struct.keysMulti.add(_elem219);
+            struct.keysMulti.add(_elem235);
           }
         }
         struct.setKeysMultiIsSet(true);
@@ -34160,13 +36281,13 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list224 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<java.lang.Boolean>(_list224.size);
-                  boolean _elem225;
-                  for (int _i226 = 0; _i226 < _list224.size; ++_i226)
+                  org.apache.thrift.protocol.TList _list240 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<java.lang.Boolean>(_list240.size);
+                  boolean _elem241;
+                  for (int _i242 = 0; _i242 < _list240.size; ++_i242)
                   {
-                    _elem225 = iprot.readBool();
-                    struct.success.add(_elem225);
+                    _elem241 = iprot.readBool();
+                    struct.success.add(_elem241);
                   }
                   iprot.readListEnd();
                 }
@@ -34204,9 +36325,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.BOOL, struct.success.size()));
-            for (boolean _iter227 : struct.success)
+            for (boolean _iter243 : struct.success)
             {
-              oprot.writeBool(_iter227);
+              oprot.writeBool(_iter243);
             }
             oprot.writeListEnd();
           }
@@ -34246,9 +36367,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (boolean _iter228 : struct.success)
+            for (boolean _iter244 : struct.success)
             {
-              oprot.writeBool(_iter228);
+              oprot.writeBool(_iter244);
             }
           }
         }
@@ -34263,13 +36384,13 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list229 = iprot.readListBegin(org.apache.thrift.protocol.TType.BOOL);
-            struct.success = new java.util.ArrayList<java.lang.Boolean>(_list229.size);
-            boolean _elem230;
-            for (int _i231 = 0; _i231 < _list229.size; ++_i231)
+            org.apache.thrift.protocol.TList _list245 = iprot.readListBegin(org.apache.thrift.protocol.TType.BOOL);
+            struct.success = new java.util.ArrayList<java.lang.Boolean>(_list245.size);
+            boolean _elem246;
+            for (int _i247 = 0; _i247 < _list245.size; ++_i247)
             {
-              _elem230 = iprot.readBool();
-              struct.success.add(_elem230);
+              _elem246 = iprot.readBool();
+              struct.success.add(_elem246);
             }
           }
           struct.setSuccessIsSet(true);
@@ -35038,13 +37159,13 @@ public class RocksDB {
             case 3: // START_KEYS_INCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list232 = iprot.readListBegin();
-                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list232.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem233;
-                  for (int _i234 = 0; _i234 < _list232.size; ++_i234)
+                  org.apache.thrift.protocol.TList _list248 = iprot.readListBegin();
+                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list248.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem249;
+                  for (int _i250 = 0; _i250 < _list248.size; ++_i250)
                   {
-                    _elem233 = iprot.readBinary();
-                    struct.startKeysInclusive.add(_elem233);
+                    _elem249 = iprot.readBinary();
+                    struct.startKeysInclusive.add(_elem249);
                   }
                   iprot.readListEnd();
                 }
@@ -35056,13 +37177,13 @@ public class RocksDB {
             case 4: // END_KEYS_EXCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list235 = iprot.readListBegin();
-                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list235.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem236;
-                  for (int _i237 = 0; _i237 < _list235.size; ++_i237)
+                  org.apache.thrift.protocol.TList _list251 = iprot.readListBegin();
+                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list251.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem252;
+                  for (int _i253 = 0; _i253 < _list251.size; ++_i253)
                   {
-                    _elem236 = iprot.readBinary();
-                    struct.endKeysExclusive.add(_elem236);
+                    _elem252 = iprot.readBinary();
+                    struct.endKeysExclusive.add(_elem252);
                   }
                   iprot.readListEnd();
                 }
@@ -35125,9 +37246,9 @@ public class RocksDB {
           oprot.writeFieldBegin(START_KEYS_INCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.startKeysInclusive.size()));
-            for (java.nio.ByteBuffer _iter238 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter254 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter238);
+              oprot.writeBinary(_iter254);
             }
             oprot.writeListEnd();
           }
@@ -35137,9 +37258,9 @@ public class RocksDB {
           oprot.writeFieldBegin(END_KEYS_EXCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.endKeysExclusive.size()));
-            for (java.nio.ByteBuffer _iter239 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter255 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter239);
+              oprot.writeBinary(_iter255);
             }
             oprot.writeListEnd();
           }
@@ -35184,18 +37305,18 @@ public class RocksDB {
         if (struct.isSetStartKeysInclusive()) {
           {
             oprot.writeI32(struct.startKeysInclusive.size());
-            for (java.nio.ByteBuffer _iter240 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter256 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter240);
+              oprot.writeBinary(_iter256);
             }
           }
         }
         if (struct.isSetEndKeysExclusive()) {
           {
             oprot.writeI32(struct.endKeysExclusive.size());
-            for (java.nio.ByteBuffer _iter241 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter257 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter241);
+              oprot.writeBinary(_iter257);
             }
           }
         }
@@ -35215,26 +37336,26 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list242 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list242.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem243;
-            for (int _i244 = 0; _i244 < _list242.size; ++_i244)
+            org.apache.thrift.protocol.TList _list258 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list258.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem259;
+            for (int _i260 = 0; _i260 < _list258.size; ++_i260)
             {
-              _elem243 = iprot.readBinary();
-              struct.startKeysInclusive.add(_elem243);
+              _elem259 = iprot.readBinary();
+              struct.startKeysInclusive.add(_elem259);
             }
           }
           struct.setStartKeysInclusiveIsSet(true);
         }
         if (incoming.get(1)) {
           {
-            org.apache.thrift.protocol.TList _list245 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list245.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem246;
-            for (int _i247 = 0; _i247 < _list245.size; ++_i247)
+            org.apache.thrift.protocol.TList _list261 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list261.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem262;
+            for (int _i263 = 0; _i263 < _list261.size; ++_i263)
             {
-              _elem246 = iprot.readBinary();
-              struct.endKeysExclusive.add(_elem246);
+              _elem262 = iprot.readBinary();
+              struct.endKeysExclusive.add(_elem262);
             }
           }
           struct.setEndKeysExclusiveIsSet(true);
@@ -36895,13 +39016,13 @@ public class RocksDB {
             case 2: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list248 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list248.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem249;
-                  for (int _i250 = 0; _i250 < _list248.size; ++_i250)
+                  org.apache.thrift.protocol.TList _list264 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list264.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem265;
+                  for (int _i266 = 0; _i266 < _list264.size; ++_i266)
                   {
-                    _elem249 = iprot.readBinary();
-                    struct.keys.add(_elem249);
+                    _elem265 = iprot.readBinary();
+                    struct.keys.add(_elem265);
                   }
                   iprot.readListEnd();
                 }
@@ -36936,9 +39057,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter251 : struct.keys)
+            for (java.nio.ByteBuffer _iter267 : struct.keys)
             {
-              oprot.writeBinary(_iter251);
+              oprot.writeBinary(_iter267);
             }
             oprot.writeListEnd();
           }
@@ -36965,9 +39086,9 @@ public class RocksDB {
         oprot.writeI64(struct.iterationId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter252 : struct.keys)
+          for (java.nio.ByteBuffer _iter268 : struct.keys)
           {
-            oprot.writeBinary(_iter252);
+            oprot.writeBinary(_iter268);
           }
         }
       }
@@ -36978,13 +39099,13 @@ public class RocksDB {
         struct.iterationId = iprot.readI64();
         struct.setIterationIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list253 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list253.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem254;
-          for (int _i255 = 0; _i255 < _list253.size; ++_i255)
+          org.apache.thrift.protocol.TList _list269 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list269.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem270;
+          for (int _i271 = 0; _i271 < _list269.size; ++_i271)
           {
-            _elem254 = iprot.readBinary();
-            struct.keys.add(_elem254);
+            _elem270 = iprot.readBinary();
+            struct.keys.add(_elem270);
           }
         }
         struct.setKeysIsSet(true);
@@ -40311,14 +42432,14 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list256 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<OptionalBinary>(_list256.size);
-                  @org.apache.thrift.annotation.Nullable OptionalBinary _elem257;
-                  for (int _i258 = 0; _i258 < _list256.size; ++_i258)
+                  org.apache.thrift.protocol.TList _list272 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<OptionalBinary>(_list272.size);
+                  @org.apache.thrift.annotation.Nullable OptionalBinary _elem273;
+                  for (int _i274 = 0; _i274 < _list272.size; ++_i274)
                   {
-                    _elem257 = new OptionalBinary();
-                    _elem257.read(iprot);
-                    struct.success.add(_elem257);
+                    _elem273 = new OptionalBinary();
+                    _elem273.read(iprot);
+                    struct.success.add(_elem273);
                   }
                   iprot.readListEnd();
                 }
@@ -40356,9 +42477,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
-            for (OptionalBinary _iter259 : struct.success)
+            for (OptionalBinary _iter275 : struct.success)
             {
-              _iter259.write(oprot);
+              _iter275.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -40398,9 +42519,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (OptionalBinary _iter260 : struct.success)
+            for (OptionalBinary _iter276 : struct.success)
             {
-              _iter260.write(oprot);
+              _iter276.write(oprot);
             }
           }
         }
@@ -40415,14 +42536,14 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list261 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-            struct.success = new java.util.ArrayList<OptionalBinary>(_list261.size);
-            @org.apache.thrift.annotation.Nullable OptionalBinary _elem262;
-            for (int _i263 = 0; _i263 < _list261.size; ++_i263)
+            org.apache.thrift.protocol.TList _list277 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<OptionalBinary>(_list277.size);
+            @org.apache.thrift.annotation.Nullable OptionalBinary _elem278;
+            for (int _i279 = 0; _i279 < _list277.size; ++_i279)
             {
-              _elem262 = new OptionalBinary();
-              _elem262.read(iprot);
-              struct.success.add(_elem262);
+              _elem278 = new OptionalBinary();
+              _elem278.read(iprot);
+              struct.success.add(_elem278);
             }
           }
           struct.setSuccessIsSet(true);
@@ -40962,14 +43083,14 @@ public class RocksDB {
             case 2: // DATA
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list264 = iprot.readListBegin();
-                  struct.data = new java.util.ArrayList<KV>(_list264.size);
-                  @org.apache.thrift.annotation.Nullable KV _elem265;
-                  for (int _i266 = 0; _i266 < _list264.size; ++_i266)
+                  org.apache.thrift.protocol.TList _list280 = iprot.readListBegin();
+                  struct.data = new java.util.ArrayList<KV>(_list280.size);
+                  @org.apache.thrift.annotation.Nullable KV _elem281;
+                  for (int _i282 = 0; _i282 < _list280.size; ++_i282)
                   {
-                    _elem265 = new KV();
-                    _elem265.read(iprot);
-                    struct.data.add(_elem265);
+                    _elem281 = new KV();
+                    _elem281.read(iprot);
+                    struct.data.add(_elem281);
                   }
                   iprot.readListEnd();
                 }
@@ -41012,9 +43133,9 @@ public class RocksDB {
           oprot.writeFieldBegin(DATA_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.data.size()));
-            for (KV _iter267 : struct.data)
+            for (KV _iter283 : struct.data)
             {
-              _iter267.write(oprot);
+              _iter283.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -41046,9 +43167,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.data.size());
-          for (KV _iter268 : struct.data)
+          for (KV _iter284 : struct.data)
           {
-            _iter268.write(oprot);
+            _iter284.write(oprot);
           }
         }
         oprot.writeI32(struct.mode.getValue());
@@ -41060,14 +43181,14 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list269 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-          struct.data = new java.util.ArrayList<KV>(_list269.size);
-          @org.apache.thrift.annotation.Nullable KV _elem270;
-          for (int _i271 = 0; _i271 < _list269.size; ++_i271)
+          org.apache.thrift.protocol.TList _list285 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+          struct.data = new java.util.ArrayList<KV>(_list285.size);
+          @org.apache.thrift.annotation.Nullable KV _elem286;
+          for (int _i287 = 0; _i287 < _list285.size; ++_i287)
           {
-            _elem270 = new KV();
-            _elem270.read(iprot);
-            struct.data.add(_elem270);
+            _elem286 = new KV();
+            _elem286.read(iprot);
+            struct.data.add(_elem286);
           }
         }
         struct.setDataIsSet(true);
@@ -42061,13 +44182,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list272 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list272.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem273;
-                  for (int _i274 = 0; _i274 < _list272.size; ++_i274)
+                  org.apache.thrift.protocol.TList _list288 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list288.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem289;
+                  for (int _i290 = 0; _i290 < _list288.size; ++_i290)
                   {
-                    _elem273 = iprot.readBinary();
-                    struct.keys.add(_elem273);
+                    _elem289 = iprot.readBinary();
+                    struct.keys.add(_elem289);
                   }
                   iprot.readListEnd();
                 }
@@ -42116,9 +44237,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter275 : struct.keys)
+            for (java.nio.ByteBuffer _iter291 : struct.keys)
             {
-              oprot.writeBinary(_iter275);
+              oprot.writeBinary(_iter291);
             }
             oprot.writeListEnd();
           }
@@ -42151,9 +44272,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter276 : struct.keys)
+          for (java.nio.ByteBuffer _iter292 : struct.keys)
           {
-            oprot.writeBinary(_iter276);
+            oprot.writeBinary(_iter292);
           }
         }
         oprot.writeBinary(struct.value);
@@ -42167,13 +44288,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list277 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list277.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem278;
-          for (int _i279 = 0; _i279 < _list277.size; ++_i279)
+          org.apache.thrift.protocol.TList _list293 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list293.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem294;
+          for (int _i295 = 0; _i295 < _list293.size; ++_i295)
           {
-            _elem278 = iprot.readBinary();
-            struct.keys.add(_elem278);
+            _elem294 = iprot.readBinary();
+            struct.keys.add(_elem294);
           }
         }
         struct.setKeysIsSet(true);
@@ -43177,23 +45298,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list280 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list280.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem281;
-                  for (int _i282 = 0; _i282 < _list280.size; ++_i282)
+                  org.apache.thrift.protocol.TList _list296 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list296.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem297;
+                  for (int _i298 = 0; _i298 < _list296.size; ++_i298)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list283 = iprot.readListBegin();
-                      _elem281 = new java.util.ArrayList<java.nio.ByteBuffer>(_list283.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem284;
-                      for (int _i285 = 0; _i285 < _list283.size; ++_i285)
+                      org.apache.thrift.protocol.TList _list299 = iprot.readListBegin();
+                      _elem297 = new java.util.ArrayList<java.nio.ByteBuffer>(_list299.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem300;
+                      for (int _i301 = 0; _i301 < _list299.size; ++_i301)
                       {
-                        _elem284 = iprot.readBinary();
-                        _elem281.add(_elem284);
+                        _elem300 = iprot.readBinary();
+                        _elem297.add(_elem300);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem281);
+                    struct.keysMulti.add(_elem297);
                   }
                   iprot.readListEnd();
                 }
@@ -43205,13 +45326,13 @@ public class RocksDB {
             case 4: // VALUE_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list286 = iprot.readListBegin();
-                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list286.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem287;
-                  for (int _i288 = 0; _i288 < _list286.size; ++_i288)
+                  org.apache.thrift.protocol.TList _list302 = iprot.readListBegin();
+                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list302.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem303;
+                  for (int _i304 = 0; _i304 < _list302.size; ++_i304)
                   {
-                    _elem287 = iprot.readBinary();
-                    struct.valueMulti.add(_elem287);
+                    _elem303 = iprot.readBinary();
+                    struct.valueMulti.add(_elem303);
                   }
                   iprot.readListEnd();
                 }
@@ -43252,13 +45373,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter289 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter305 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter289.size()));
-                for (java.nio.ByteBuffer _iter290 : _iter289)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter305.size()));
+                for (java.nio.ByteBuffer _iter306 : _iter305)
                 {
-                  oprot.writeBinary(_iter290);
+                  oprot.writeBinary(_iter306);
                 }
                 oprot.writeListEnd();
               }
@@ -43271,9 +45392,9 @@ public class RocksDB {
           oprot.writeFieldBegin(VALUE_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.valueMulti.size()));
-            for (java.nio.ByteBuffer _iter291 : struct.valueMulti)
+            for (java.nio.ByteBuffer _iter307 : struct.valueMulti)
             {
-              oprot.writeBinary(_iter291);
+              oprot.writeBinary(_iter307);
             }
             oprot.writeListEnd();
           }
@@ -43301,22 +45422,22 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter292 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter308 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter292.size());
-              for (java.nio.ByteBuffer _iter293 : _iter292)
+              oprot.writeI32(_iter308.size());
+              for (java.nio.ByteBuffer _iter309 : _iter308)
               {
-                oprot.writeBinary(_iter293);
+                oprot.writeBinary(_iter309);
               }
             }
           }
         }
         {
           oprot.writeI32(struct.valueMulti.size());
-          for (java.nio.ByteBuffer _iter294 : struct.valueMulti)
+          for (java.nio.ByteBuffer _iter310 : struct.valueMulti)
           {
-            oprot.writeBinary(_iter294);
+            oprot.writeBinary(_iter310);
           }
         }
       }
@@ -43329,33 +45450,33 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list295 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list295.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem296;
-          for (int _i297 = 0; _i297 < _list295.size; ++_i297)
+          org.apache.thrift.protocol.TList _list311 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list311.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem312;
+          for (int _i313 = 0; _i313 < _list311.size; ++_i313)
           {
             {
-              org.apache.thrift.protocol.TList _list298 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem296 = new java.util.ArrayList<java.nio.ByteBuffer>(_list298.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem299;
-              for (int _i300 = 0; _i300 < _list298.size; ++_i300)
+              org.apache.thrift.protocol.TList _list314 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem312 = new java.util.ArrayList<java.nio.ByteBuffer>(_list314.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem315;
+              for (int _i316 = 0; _i316 < _list314.size; ++_i316)
               {
-                _elem299 = iprot.readBinary();
-                _elem296.add(_elem299);
+                _elem315 = iprot.readBinary();
+                _elem312.add(_elem315);
               }
             }
-            struct.keysMulti.add(_elem296);
+            struct.keysMulti.add(_elem312);
           }
         }
         struct.setKeysMultiIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list301 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list301.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem302;
-          for (int _i303 = 0; _i303 < _list301.size; ++_i303)
+          org.apache.thrift.protocol.TList _list317 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list317.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem318;
+          for (int _i319 = 0; _i319 < _list317.size; ++_i319)
           {
-            _elem302 = iprot.readBinary();
-            struct.valueMulti.add(_elem302);
+            _elem318 = iprot.readBinary();
+            struct.valueMulti.add(_elem318);
           }
         }
         struct.setValueMultiIsSet(true);
@@ -44269,14 +46390,14 @@ public class RocksDB {
             case 2: // DATA
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list304 = iprot.readListBegin();
-                  struct.data = new java.util.ArrayList<KV>(_list304.size);
-                  @org.apache.thrift.annotation.Nullable KV _elem305;
-                  for (int _i306 = 0; _i306 < _list304.size; ++_i306)
+                  org.apache.thrift.protocol.TList _list320 = iprot.readListBegin();
+                  struct.data = new java.util.ArrayList<KV>(_list320.size);
+                  @org.apache.thrift.annotation.Nullable KV _elem321;
+                  for (int _i322 = 0; _i322 < _list320.size; ++_i322)
                   {
-                    _elem305 = new KV();
-                    _elem305.read(iprot);
-                    struct.data.add(_elem305);
+                    _elem321 = new KV();
+                    _elem321.read(iprot);
+                    struct.data.add(_elem321);
                   }
                   iprot.readListEnd();
                 }
@@ -44319,9 +46440,9 @@ public class RocksDB {
           oprot.writeFieldBegin(DATA_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.data.size()));
-            for (KV _iter307 : struct.data)
+            for (KV _iter323 : struct.data)
             {
-              _iter307.write(oprot);
+              _iter323.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -44353,9 +46474,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.data.size());
-          for (KV _iter308 : struct.data)
+          for (KV _iter324 : struct.data)
           {
-            _iter308.write(oprot);
+            _iter324.write(oprot);
           }
         }
         oprot.writeI32(struct.mode.getValue());
@@ -44367,14 +46488,14 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list309 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-          struct.data = new java.util.ArrayList<KV>(_list309.size);
-          @org.apache.thrift.annotation.Nullable KV _elem310;
-          for (int _i311 = 0; _i311 < _list309.size; ++_i311)
+          org.apache.thrift.protocol.TList _list325 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+          struct.data = new java.util.ArrayList<KV>(_list325.size);
+          @org.apache.thrift.annotation.Nullable KV _elem326;
+          for (int _i327 = 0; _i327 < _list325.size; ++_i327)
           {
-            _elem310 = new KV();
-            _elem310.read(iprot);
-            struct.data.add(_elem310);
+            _elem326 = new KV();
+            _elem326.read(iprot);
+            struct.data.add(_elem326);
           }
         }
         struct.setDataIsSet(true);
@@ -45283,13 +47404,13 @@ public class RocksDB {
             case 2: // START_KEYS_INCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list312 = iprot.readListBegin();
-                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list312.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem313;
-                  for (int _i314 = 0; _i314 < _list312.size; ++_i314)
+                  org.apache.thrift.protocol.TList _list328 = iprot.readListBegin();
+                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list328.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem329;
+                  for (int _i330 = 0; _i330 < _list328.size; ++_i330)
                   {
-                    _elem313 = iprot.readBinary();
-                    struct.startKeysInclusive.add(_elem313);
+                    _elem329 = iprot.readBinary();
+                    struct.startKeysInclusive.add(_elem329);
                   }
                   iprot.readListEnd();
                 }
@@ -45301,13 +47422,13 @@ public class RocksDB {
             case 3: // END_KEYS_EXCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list315 = iprot.readListBegin();
-                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list315.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem316;
-                  for (int _i317 = 0; _i317 < _list315.size; ++_i317)
+                  org.apache.thrift.protocol.TList _list331 = iprot.readListBegin();
+                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list331.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem332;
+                  for (int _i333 = 0; _i333 < _list331.size; ++_i333)
                   {
-                    _elem316 = iprot.readBinary();
-                    struct.endKeysExclusive.add(_elem316);
+                    _elem332 = iprot.readBinary();
+                    struct.endKeysExclusive.add(_elem332);
                   }
                   iprot.readListEnd();
                 }
@@ -45342,9 +47463,9 @@ public class RocksDB {
           oprot.writeFieldBegin(START_KEYS_INCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.startKeysInclusive.size()));
-            for (java.nio.ByteBuffer _iter318 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter334 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter318);
+              oprot.writeBinary(_iter334);
             }
             oprot.writeListEnd();
           }
@@ -45354,9 +47475,9 @@ public class RocksDB {
           oprot.writeFieldBegin(END_KEYS_EXCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.endKeysExclusive.size()));
-            for (java.nio.ByteBuffer _iter319 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter335 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter319);
+              oprot.writeBinary(_iter335);
             }
             oprot.writeListEnd();
           }
@@ -45392,18 +47513,18 @@ public class RocksDB {
         if (struct.isSetStartKeysInclusive()) {
           {
             oprot.writeI32(struct.startKeysInclusive.size());
-            for (java.nio.ByteBuffer _iter320 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter336 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter320);
+              oprot.writeBinary(_iter336);
             }
           }
         }
         if (struct.isSetEndKeysExclusive()) {
           {
             oprot.writeI32(struct.endKeysExclusive.size());
-            for (java.nio.ByteBuffer _iter321 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter337 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter321);
+              oprot.writeBinary(_iter337);
             }
           }
         }
@@ -45417,26 +47538,26 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list322 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list322.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem323;
-            for (int _i324 = 0; _i324 < _list322.size; ++_i324)
+            org.apache.thrift.protocol.TList _list338 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list338.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem339;
+            for (int _i340 = 0; _i340 < _list338.size; ++_i340)
             {
-              _elem323 = iprot.readBinary();
-              struct.startKeysInclusive.add(_elem323);
+              _elem339 = iprot.readBinary();
+              struct.startKeysInclusive.add(_elem339);
             }
           }
           struct.setStartKeysInclusiveIsSet(true);
         }
         if (incoming.get(1)) {
           {
-            org.apache.thrift.protocol.TList _list325 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list325.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem326;
-            for (int _i327 = 0; _i327 < _list325.size; ++_i327)
+            org.apache.thrift.protocol.TList _list341 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list341.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem342;
+            for (int _i343 = 0; _i343 < _list341.size; ++_i343)
             {
-              _elem326 = iprot.readBinary();
-              struct.endKeysExclusive.add(_elem326);
+              _elem342 = iprot.readBinary();
+              struct.endKeysExclusive.add(_elem342);
             }
           }
           struct.setEndKeysExclusiveIsSet(true);
@@ -46429,13 +48550,13 @@ public class RocksDB {
             case 3: // KEYS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list328 = iprot.readListBegin();
-                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list328.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem329;
-                  for (int _i330 = 0; _i330 < _list328.size; ++_i330)
+                  org.apache.thrift.protocol.TList _list344 = iprot.readListBegin();
+                  struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list344.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem345;
+                  for (int _i346 = 0; _i346 < _list344.size; ++_i346)
                   {
-                    _elem329 = iprot.readBinary();
-                    struct.keys.add(_elem329);
+                    _elem345 = iprot.readBinary();
+                    struct.keys.add(_elem345);
                   }
                   iprot.readListEnd();
                 }
@@ -46484,9 +48605,9 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-            for (java.nio.ByteBuffer _iter331 : struct.keys)
+            for (java.nio.ByteBuffer _iter347 : struct.keys)
             {
-              oprot.writeBinary(_iter331);
+              oprot.writeBinary(_iter347);
             }
             oprot.writeListEnd();
           }
@@ -46519,9 +48640,9 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter332 : struct.keys)
+          for (java.nio.ByteBuffer _iter348 : struct.keys)
           {
-            oprot.writeBinary(_iter332);
+            oprot.writeBinary(_iter348);
           }
         }
         oprot.writeBinary(struct.value);
@@ -46535,13 +48656,13 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list333 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list333.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem334;
-          for (int _i335 = 0; _i335 < _list333.size; ++_i335)
+          org.apache.thrift.protocol.TList _list349 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list349.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem350;
+          for (int _i351 = 0; _i351 < _list349.size; ++_i351)
           {
-            _elem334 = iprot.readBinary();
-            struct.keys.add(_elem334);
+            _elem350 = iprot.readBinary();
+            struct.keys.add(_elem350);
           }
         }
         struct.setKeysIsSet(true);
@@ -47655,23 +49776,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list336 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list336.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem337;
-                  for (int _i338 = 0; _i338 < _list336.size; ++_i338)
+                  org.apache.thrift.protocol.TList _list352 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list352.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem353;
+                  for (int _i354 = 0; _i354 < _list352.size; ++_i354)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list339 = iprot.readListBegin();
-                      _elem337 = new java.util.ArrayList<java.nio.ByteBuffer>(_list339.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem340;
-                      for (int _i341 = 0; _i341 < _list339.size; ++_i341)
+                      org.apache.thrift.protocol.TList _list355 = iprot.readListBegin();
+                      _elem353 = new java.util.ArrayList<java.nio.ByteBuffer>(_list355.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem356;
+                      for (int _i357 = 0; _i357 < _list355.size; ++_i357)
                       {
-                        _elem340 = iprot.readBinary();
-                        _elem337.add(_elem340);
+                        _elem356 = iprot.readBinary();
+                        _elem353.add(_elem356);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem337);
+                    struct.keysMulti.add(_elem353);
                   }
                   iprot.readListEnd();
                 }
@@ -47683,13 +49804,13 @@ public class RocksDB {
             case 4: // VALUE_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list342 = iprot.readListBegin();
-                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list342.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem343;
-                  for (int _i344 = 0; _i344 < _list342.size; ++_i344)
+                  org.apache.thrift.protocol.TList _list358 = iprot.readListBegin();
+                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list358.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem359;
+                  for (int _i360 = 0; _i360 < _list358.size; ++_i360)
                   {
-                    _elem343 = iprot.readBinary();
-                    struct.valueMulti.add(_elem343);
+                    _elem359 = iprot.readBinary();
+                    struct.valueMulti.add(_elem359);
                   }
                   iprot.readListEnd();
                 }
@@ -47730,13 +49851,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter345 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter361 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter345.size()));
-                for (java.nio.ByteBuffer _iter346 : _iter345)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter361.size()));
+                for (java.nio.ByteBuffer _iter362 : _iter361)
                 {
-                  oprot.writeBinary(_iter346);
+                  oprot.writeBinary(_iter362);
                 }
                 oprot.writeListEnd();
               }
@@ -47749,9 +49870,9 @@ public class RocksDB {
           oprot.writeFieldBegin(VALUE_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.valueMulti.size()));
-            for (java.nio.ByteBuffer _iter347 : struct.valueMulti)
+            for (java.nio.ByteBuffer _iter363 : struct.valueMulti)
             {
-              oprot.writeBinary(_iter347);
+              oprot.writeBinary(_iter363);
             }
             oprot.writeListEnd();
           }
@@ -47779,22 +49900,22 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter348 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter364 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter348.size());
-              for (java.nio.ByteBuffer _iter349 : _iter348)
+              oprot.writeI32(_iter364.size());
+              for (java.nio.ByteBuffer _iter365 : _iter364)
               {
-                oprot.writeBinary(_iter349);
+                oprot.writeBinary(_iter365);
               }
             }
           }
         }
         {
           oprot.writeI32(struct.valueMulti.size());
-          for (java.nio.ByteBuffer _iter350 : struct.valueMulti)
+          for (java.nio.ByteBuffer _iter366 : struct.valueMulti)
           {
-            oprot.writeBinary(_iter350);
+            oprot.writeBinary(_iter366);
           }
         }
       }
@@ -47807,33 +49928,33 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list351 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list351.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem352;
-          for (int _i353 = 0; _i353 < _list351.size; ++_i353)
+          org.apache.thrift.protocol.TList _list367 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list367.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem368;
+          for (int _i369 = 0; _i369 < _list367.size; ++_i369)
           {
             {
-              org.apache.thrift.protocol.TList _list354 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem352 = new java.util.ArrayList<java.nio.ByteBuffer>(_list354.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem355;
-              for (int _i356 = 0; _i356 < _list354.size; ++_i356)
+              org.apache.thrift.protocol.TList _list370 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem368 = new java.util.ArrayList<java.nio.ByteBuffer>(_list370.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem371;
+              for (int _i372 = 0; _i372 < _list370.size; ++_i372)
               {
-                _elem355 = iprot.readBinary();
-                _elem352.add(_elem355);
+                _elem371 = iprot.readBinary();
+                _elem368.add(_elem371);
               }
             }
-            struct.keysMulti.add(_elem352);
+            struct.keysMulti.add(_elem368);
           }
         }
         struct.setKeysMultiIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list357 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list357.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem358;
-          for (int _i359 = 0; _i359 < _list357.size; ++_i359)
+          org.apache.thrift.protocol.TList _list373 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list373.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem374;
+          for (int _i375 = 0; _i375 < _list373.size; ++_i375)
           {
-            _elem358 = iprot.readBinary();
-            struct.valueMulti.add(_elem358);
+            _elem374 = iprot.readBinary();
+            struct.valueMulti.add(_elem374);
           }
         }
         struct.setValueMultiIsSet(true);
@@ -48256,14 +50377,14 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list360 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<OptionalBinary>(_list360.size);
-                  @org.apache.thrift.annotation.Nullable OptionalBinary _elem361;
-                  for (int _i362 = 0; _i362 < _list360.size; ++_i362)
+                  org.apache.thrift.protocol.TList _list376 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<OptionalBinary>(_list376.size);
+                  @org.apache.thrift.annotation.Nullable OptionalBinary _elem377;
+                  for (int _i378 = 0; _i378 < _list376.size; ++_i378)
                   {
-                    _elem361 = new OptionalBinary();
-                    _elem361.read(iprot);
-                    struct.success.add(_elem361);
+                    _elem377 = new OptionalBinary();
+                    _elem377.read(iprot);
+                    struct.success.add(_elem377);
                   }
                   iprot.readListEnd();
                 }
@@ -48301,9 +50422,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
-            for (OptionalBinary _iter363 : struct.success)
+            for (OptionalBinary _iter379 : struct.success)
             {
-              _iter363.write(oprot);
+              _iter379.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -48343,9 +50464,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (OptionalBinary _iter364 : struct.success)
+            for (OptionalBinary _iter380 : struct.success)
             {
-              _iter364.write(oprot);
+              _iter380.write(oprot);
             }
           }
         }
@@ -48360,14 +50481,14 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list365 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-            struct.success = new java.util.ArrayList<OptionalBinary>(_list365.size);
-            @org.apache.thrift.annotation.Nullable OptionalBinary _elem366;
-            for (int _i367 = 0; _i367 < _list365.size; ++_i367)
+            org.apache.thrift.protocol.TList _list381 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<OptionalBinary>(_list381.size);
+            @org.apache.thrift.annotation.Nullable OptionalBinary _elem382;
+            for (int _i383 = 0; _i383 < _list381.size; ++_i383)
             {
-              _elem366 = new OptionalBinary();
-              _elem366.read(iprot);
-              struct.success.add(_elem366);
+              _elem382 = new OptionalBinary();
+              _elem382.read(iprot);
+              struct.success.add(_elem382);
             }
           }
           struct.setSuccessIsSet(true);
@@ -49136,13 +51257,13 @@ public class RocksDB {
             case 3: // START_KEYS_INCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list368 = iprot.readListBegin();
-                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list368.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem369;
-                  for (int _i370 = 0; _i370 < _list368.size; ++_i370)
+                  org.apache.thrift.protocol.TList _list384 = iprot.readListBegin();
+                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list384.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem385;
+                  for (int _i386 = 0; _i386 < _list384.size; ++_i386)
                   {
-                    _elem369 = iprot.readBinary();
-                    struct.startKeysInclusive.add(_elem369);
+                    _elem385 = iprot.readBinary();
+                    struct.startKeysInclusive.add(_elem385);
                   }
                   iprot.readListEnd();
                 }
@@ -49154,13 +51275,13 @@ public class RocksDB {
             case 4: // END_KEYS_EXCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list371 = iprot.readListBegin();
-                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list371.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem372;
-                  for (int _i373 = 0; _i373 < _list371.size; ++_i373)
+                  org.apache.thrift.protocol.TList _list387 = iprot.readListBegin();
+                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list387.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem388;
+                  for (int _i389 = 0; _i389 < _list387.size; ++_i389)
                   {
-                    _elem372 = iprot.readBinary();
-                    struct.endKeysExclusive.add(_elem372);
+                    _elem388 = iprot.readBinary();
+                    struct.endKeysExclusive.add(_elem388);
                   }
                   iprot.readListEnd();
                 }
@@ -49223,9 +51344,9 @@ public class RocksDB {
           oprot.writeFieldBegin(START_KEYS_INCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.startKeysInclusive.size()));
-            for (java.nio.ByteBuffer _iter374 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter390 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter374);
+              oprot.writeBinary(_iter390);
             }
             oprot.writeListEnd();
           }
@@ -49235,9 +51356,9 @@ public class RocksDB {
           oprot.writeFieldBegin(END_KEYS_EXCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.endKeysExclusive.size()));
-            for (java.nio.ByteBuffer _iter375 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter391 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter375);
+              oprot.writeBinary(_iter391);
             }
             oprot.writeListEnd();
           }
@@ -49282,18 +51403,18 @@ public class RocksDB {
         if (struct.isSetStartKeysInclusive()) {
           {
             oprot.writeI32(struct.startKeysInclusive.size());
-            for (java.nio.ByteBuffer _iter376 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter392 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter376);
+              oprot.writeBinary(_iter392);
             }
           }
         }
         if (struct.isSetEndKeysExclusive()) {
           {
             oprot.writeI32(struct.endKeysExclusive.size());
-            for (java.nio.ByteBuffer _iter377 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter393 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter377);
+              oprot.writeBinary(_iter393);
             }
           }
         }
@@ -49313,26 +51434,26 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list378 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list378.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem379;
-            for (int _i380 = 0; _i380 < _list378.size; ++_i380)
+            org.apache.thrift.protocol.TList _list394 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list394.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem395;
+            for (int _i396 = 0; _i396 < _list394.size; ++_i396)
             {
-              _elem379 = iprot.readBinary();
-              struct.startKeysInclusive.add(_elem379);
+              _elem395 = iprot.readBinary();
+              struct.startKeysInclusive.add(_elem395);
             }
           }
           struct.setStartKeysInclusiveIsSet(true);
         }
         if (incoming.get(1)) {
           {
-            org.apache.thrift.protocol.TList _list381 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list381.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem382;
-            for (int _i383 = 0; _i383 < _list381.size; ++_i383)
+            org.apache.thrift.protocol.TList _list397 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list397.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem398;
+            for (int _i399 = 0; _i399 < _list397.size; ++_i399)
             {
-              _elem382 = iprot.readBinary();
-              struct.endKeysExclusive.add(_elem382);
+              _elem398 = iprot.readBinary();
+              struct.endKeysExclusive.add(_elem398);
             }
           }
           struct.setEndKeysExclusiveIsSet(true);
@@ -50586,13 +52707,13 @@ public class RocksDB {
             case 3: // START_KEYS_INCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list384 = iprot.readListBegin();
-                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list384.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem385;
-                  for (int _i386 = 0; _i386 < _list384.size; ++_i386)
+                  org.apache.thrift.protocol.TList _list400 = iprot.readListBegin();
+                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list400.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem401;
+                  for (int _i402 = 0; _i402 < _list400.size; ++_i402)
                   {
-                    _elem385 = iprot.readBinary();
-                    struct.startKeysInclusive.add(_elem385);
+                    _elem401 = iprot.readBinary();
+                    struct.startKeysInclusive.add(_elem401);
                   }
                   iprot.readListEnd();
                 }
@@ -50604,13 +52725,13 @@ public class RocksDB {
             case 4: // END_KEYS_EXCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list387 = iprot.readListBegin();
-                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list387.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem388;
-                  for (int _i389 = 0; _i389 < _list387.size; ++_i389)
+                  org.apache.thrift.protocol.TList _list403 = iprot.readListBegin();
+                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list403.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem404;
+                  for (int _i405 = 0; _i405 < _list403.size; ++_i405)
                   {
-                    _elem388 = iprot.readBinary();
-                    struct.endKeysExclusive.add(_elem388);
+                    _elem404 = iprot.readBinary();
+                    struct.endKeysExclusive.add(_elem404);
                   }
                   iprot.readListEnd();
                 }
@@ -50673,9 +52794,9 @@ public class RocksDB {
           oprot.writeFieldBegin(START_KEYS_INCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.startKeysInclusive.size()));
-            for (java.nio.ByteBuffer _iter390 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter406 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter390);
+              oprot.writeBinary(_iter406);
             }
             oprot.writeListEnd();
           }
@@ -50685,9 +52806,9 @@ public class RocksDB {
           oprot.writeFieldBegin(END_KEYS_EXCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.endKeysExclusive.size()));
-            for (java.nio.ByteBuffer _iter391 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter407 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter391);
+              oprot.writeBinary(_iter407);
             }
             oprot.writeListEnd();
           }
@@ -50732,18 +52853,18 @@ public class RocksDB {
         if (struct.isSetStartKeysInclusive()) {
           {
             oprot.writeI32(struct.startKeysInclusive.size());
-            for (java.nio.ByteBuffer _iter392 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter408 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter392);
+              oprot.writeBinary(_iter408);
             }
           }
         }
         if (struct.isSetEndKeysExclusive()) {
           {
             oprot.writeI32(struct.endKeysExclusive.size());
-            for (java.nio.ByteBuffer _iter393 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter409 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter393);
+              oprot.writeBinary(_iter409);
             }
           }
         }
@@ -50763,26 +52884,26 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list394 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list394.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem395;
-            for (int _i396 = 0; _i396 < _list394.size; ++_i396)
+            org.apache.thrift.protocol.TList _list410 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list410.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem411;
+            for (int _i412 = 0; _i412 < _list410.size; ++_i412)
             {
-              _elem395 = iprot.readBinary();
-              struct.startKeysInclusive.add(_elem395);
+              _elem411 = iprot.readBinary();
+              struct.startKeysInclusive.add(_elem411);
             }
           }
           struct.setStartKeysInclusiveIsSet(true);
         }
         if (incoming.get(1)) {
           {
-            org.apache.thrift.protocol.TList _list397 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list397.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem398;
-            for (int _i399 = 0; _i399 < _list397.size; ++_i399)
+            org.apache.thrift.protocol.TList _list413 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list413.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem414;
+            for (int _i415 = 0; _i415 < _list413.size; ++_i415)
             {
-              _elem398 = iprot.readBinary();
-              struct.endKeysExclusive.add(_elem398);
+              _elem414 = iprot.readBinary();
+              struct.endKeysExclusive.add(_elem414);
             }
           }
           struct.setEndKeysExclusiveIsSet(true);
@@ -52028,13 +54149,13 @@ public class RocksDB {
             case 3: // START_KEYS_INCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list400 = iprot.readListBegin();
-                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list400.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem401;
-                  for (int _i402 = 0; _i402 < _list400.size; ++_i402)
+                  org.apache.thrift.protocol.TList _list416 = iprot.readListBegin();
+                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list416.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem417;
+                  for (int _i418 = 0; _i418 < _list416.size; ++_i418)
                   {
-                    _elem401 = iprot.readBinary();
-                    struct.startKeysInclusive.add(_elem401);
+                    _elem417 = iprot.readBinary();
+                    struct.startKeysInclusive.add(_elem417);
                   }
                   iprot.readListEnd();
                 }
@@ -52046,13 +54167,13 @@ public class RocksDB {
             case 4: // END_KEYS_EXCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list403 = iprot.readListBegin();
-                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list403.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem404;
-                  for (int _i405 = 0; _i405 < _list403.size; ++_i405)
+                  org.apache.thrift.protocol.TList _list419 = iprot.readListBegin();
+                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list419.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem420;
+                  for (int _i421 = 0; _i421 < _list419.size; ++_i421)
                   {
-                    _elem404 = iprot.readBinary();
-                    struct.endKeysExclusive.add(_elem404);
+                    _elem420 = iprot.readBinary();
+                    struct.endKeysExclusive.add(_elem420);
                   }
                   iprot.readListEnd();
                 }
@@ -52115,9 +54236,9 @@ public class RocksDB {
           oprot.writeFieldBegin(START_KEYS_INCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.startKeysInclusive.size()));
-            for (java.nio.ByteBuffer _iter406 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter422 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter406);
+              oprot.writeBinary(_iter422);
             }
             oprot.writeListEnd();
           }
@@ -52127,9 +54248,9 @@ public class RocksDB {
           oprot.writeFieldBegin(END_KEYS_EXCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.endKeysExclusive.size()));
-            for (java.nio.ByteBuffer _iter407 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter423 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter407);
+              oprot.writeBinary(_iter423);
             }
             oprot.writeListEnd();
           }
@@ -52174,18 +54295,18 @@ public class RocksDB {
         if (struct.isSetStartKeysInclusive()) {
           {
             oprot.writeI32(struct.startKeysInclusive.size());
-            for (java.nio.ByteBuffer _iter408 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter424 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter408);
+              oprot.writeBinary(_iter424);
             }
           }
         }
         if (struct.isSetEndKeysExclusive()) {
           {
             oprot.writeI32(struct.endKeysExclusive.size());
-            for (java.nio.ByteBuffer _iter409 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter425 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter409);
+              oprot.writeBinary(_iter425);
             }
           }
         }
@@ -52205,26 +54326,26 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list410 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list410.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem411;
-            for (int _i412 = 0; _i412 < _list410.size; ++_i412)
+            org.apache.thrift.protocol.TList _list426 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list426.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem427;
+            for (int _i428 = 0; _i428 < _list426.size; ++_i428)
             {
-              _elem411 = iprot.readBinary();
-              struct.startKeysInclusive.add(_elem411);
+              _elem427 = iprot.readBinary();
+              struct.startKeysInclusive.add(_elem427);
             }
           }
           struct.setStartKeysInclusiveIsSet(true);
         }
         if (incoming.get(1)) {
           {
-            org.apache.thrift.protocol.TList _list413 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list413.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem414;
-            for (int _i415 = 0; _i415 < _list413.size; ++_i415)
+            org.apache.thrift.protocol.TList _list429 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list429.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem430;
+            for (int _i431 = 0; _i431 < _list429.size; ++_i431)
             {
-              _elem414 = iprot.readBinary();
-              struct.endKeysExclusive.add(_elem414);
+              _elem430 = iprot.readBinary();
+              struct.endKeysExclusive.add(_elem430);
             }
           }
           struct.setEndKeysExclusiveIsSet(true);
@@ -52648,14 +54769,14 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list416 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<KV>(_list416.size);
-                  @org.apache.thrift.annotation.Nullable KV _elem417;
-                  for (int _i418 = 0; _i418 < _list416.size; ++_i418)
+                  org.apache.thrift.protocol.TList _list432 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<KV>(_list432.size);
+                  @org.apache.thrift.annotation.Nullable KV _elem433;
+                  for (int _i434 = 0; _i434 < _list432.size; ++_i434)
                   {
-                    _elem417 = new KV();
-                    _elem417.read(iprot);
-                    struct.success.add(_elem417);
+                    _elem433 = new KV();
+                    _elem433.read(iprot);
+                    struct.success.add(_elem433);
                   }
                   iprot.readListEnd();
                 }
@@ -52693,9 +54814,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
-            for (KV _iter419 : struct.success)
+            for (KV _iter435 : struct.success)
             {
-              _iter419.write(oprot);
+              _iter435.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -52735,9 +54856,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (KV _iter420 : struct.success)
+            for (KV _iter436 : struct.success)
             {
-              _iter420.write(oprot);
+              _iter436.write(oprot);
             }
           }
         }
@@ -52752,14 +54873,14 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list421 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-            struct.success = new java.util.ArrayList<KV>(_list421.size);
-            @org.apache.thrift.annotation.Nullable KV _elem422;
-            for (int _i423 = 0; _i423 < _list421.size; ++_i423)
+            org.apache.thrift.protocol.TList _list437 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<KV>(_list437.size);
+            @org.apache.thrift.annotation.Nullable KV _elem438;
+            for (int _i439 = 0; _i439 < _list437.size; ++_i439)
             {
-              _elem422 = new KV();
-              _elem422.read(iprot);
-              struct.success.add(_elem422);
+              _elem438 = new KV();
+              _elem438.read(iprot);
+              struct.success.add(_elem438);
             }
           }
           struct.setSuccessIsSet(true);
@@ -53528,13 +55649,13 @@ public class RocksDB {
             case 3: // START_KEYS_INCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list424 = iprot.readListBegin();
-                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list424.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem425;
-                  for (int _i426 = 0; _i426 < _list424.size; ++_i426)
+                  org.apache.thrift.protocol.TList _list440 = iprot.readListBegin();
+                  struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list440.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem441;
+                  for (int _i442 = 0; _i442 < _list440.size; ++_i442)
                   {
-                    _elem425 = iprot.readBinary();
-                    struct.startKeysInclusive.add(_elem425);
+                    _elem441 = iprot.readBinary();
+                    struct.startKeysInclusive.add(_elem441);
                   }
                   iprot.readListEnd();
                 }
@@ -53546,13 +55667,13 @@ public class RocksDB {
             case 4: // END_KEYS_EXCLUSIVE
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list427 = iprot.readListBegin();
-                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list427.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem428;
-                  for (int _i429 = 0; _i429 < _list427.size; ++_i429)
+                  org.apache.thrift.protocol.TList _list443 = iprot.readListBegin();
+                  struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list443.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem444;
+                  for (int _i445 = 0; _i445 < _list443.size; ++_i445)
                   {
-                    _elem428 = iprot.readBinary();
-                    struct.endKeysExclusive.add(_elem428);
+                    _elem444 = iprot.readBinary();
+                    struct.endKeysExclusive.add(_elem444);
                   }
                   iprot.readListEnd();
                 }
@@ -53615,9 +55736,9 @@ public class RocksDB {
           oprot.writeFieldBegin(START_KEYS_INCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.startKeysInclusive.size()));
-            for (java.nio.ByteBuffer _iter430 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter446 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter430);
+              oprot.writeBinary(_iter446);
             }
             oprot.writeListEnd();
           }
@@ -53627,9 +55748,9 @@ public class RocksDB {
           oprot.writeFieldBegin(END_KEYS_EXCLUSIVE_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.endKeysExclusive.size()));
-            for (java.nio.ByteBuffer _iter431 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter447 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter431);
+              oprot.writeBinary(_iter447);
             }
             oprot.writeListEnd();
           }
@@ -53674,18 +55795,18 @@ public class RocksDB {
         if (struct.isSetStartKeysInclusive()) {
           {
             oprot.writeI32(struct.startKeysInclusive.size());
-            for (java.nio.ByteBuffer _iter432 : struct.startKeysInclusive)
+            for (java.nio.ByteBuffer _iter448 : struct.startKeysInclusive)
             {
-              oprot.writeBinary(_iter432);
+              oprot.writeBinary(_iter448);
             }
           }
         }
         if (struct.isSetEndKeysExclusive()) {
           {
             oprot.writeI32(struct.endKeysExclusive.size());
-            for (java.nio.ByteBuffer _iter433 : struct.endKeysExclusive)
+            for (java.nio.ByteBuffer _iter449 : struct.endKeysExclusive)
             {
-              oprot.writeBinary(_iter433);
+              oprot.writeBinary(_iter449);
             }
           }
         }
@@ -53705,26 +55826,26 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list434 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list434.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem435;
-            for (int _i436 = 0; _i436 < _list434.size; ++_i436)
+            org.apache.thrift.protocol.TList _list450 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.startKeysInclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list450.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem451;
+            for (int _i452 = 0; _i452 < _list450.size; ++_i452)
             {
-              _elem435 = iprot.readBinary();
-              struct.startKeysInclusive.add(_elem435);
+              _elem451 = iprot.readBinary();
+              struct.startKeysInclusive.add(_elem451);
             }
           }
           struct.setStartKeysInclusiveIsSet(true);
         }
         if (incoming.get(1)) {
           {
-            org.apache.thrift.protocol.TList _list437 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list437.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem438;
-            for (int _i439 = 0; _i439 < _list437.size; ++_i439)
+            org.apache.thrift.protocol.TList _list453 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(_list453.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem454;
+            for (int _i455 = 0; _i455 < _list453.size; ++_i455)
             {
-              _elem438 = iprot.readBinary();
-              struct.endKeysExclusive.add(_elem438);
+              _elem454 = iprot.readBinary();
+              struct.endKeysExclusive.add(_elem454);
             }
           }
           struct.setEndKeysExclusiveIsSet(true);
@@ -54148,14 +56269,14 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list440 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<KV>(_list440.size);
-                  @org.apache.thrift.annotation.Nullable KV _elem441;
-                  for (int _i442 = 0; _i442 < _list440.size; ++_i442)
+                  org.apache.thrift.protocol.TList _list456 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<KV>(_list456.size);
+                  @org.apache.thrift.annotation.Nullable KV _elem457;
+                  for (int _i458 = 0; _i458 < _list456.size; ++_i458)
                   {
-                    _elem441 = new KV();
-                    _elem441.read(iprot);
-                    struct.success.add(_elem441);
+                    _elem457 = new KV();
+                    _elem457.read(iprot);
+                    struct.success.add(_elem457);
                   }
                   iprot.readListEnd();
                 }
@@ -54193,9 +56314,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
-            for (KV _iter443 : struct.success)
+            for (KV _iter459 : struct.success)
             {
-              _iter443.write(oprot);
+              _iter459.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -54235,9 +56356,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (KV _iter444 : struct.success)
+            for (KV _iter460 : struct.success)
             {
-              _iter444.write(oprot);
+              _iter460.write(oprot);
             }
           }
         }
@@ -54252,14 +56373,14 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list445 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-            struct.success = new java.util.ArrayList<KV>(_list445.size);
-            @org.apache.thrift.annotation.Nullable KV _elem446;
-            for (int _i447 = 0; _i447 < _list445.size; ++_i447)
+            org.apache.thrift.protocol.TList _list461 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<KV>(_list461.size);
+            @org.apache.thrift.annotation.Nullable KV _elem462;
+            for (int _i463 = 0; _i463 < _list461.size; ++_i463)
             {
-              _elem446 = new KV();
-              _elem446.read(iprot);
-              struct.success.add(_elem446);
+              _elem462 = new KV();
+              _elem462.read(iprot);
+              struct.success.add(_elem462);
             }
           }
           struct.setSuccessIsSet(true);
@@ -55956,23 +58077,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list448 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list448.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem449;
-                  for (int _i450 = 0; _i450 < _list448.size; ++_i450)
+                  org.apache.thrift.protocol.TList _list464 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list464.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem465;
+                  for (int _i466 = 0; _i466 < _list464.size; ++_i466)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list451 = iprot.readListBegin();
-                      _elem449 = new java.util.ArrayList<java.nio.ByteBuffer>(_list451.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem452;
-                      for (int _i453 = 0; _i453 < _list451.size; ++_i453)
+                      org.apache.thrift.protocol.TList _list467 = iprot.readListBegin();
+                      _elem465 = new java.util.ArrayList<java.nio.ByteBuffer>(_list467.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem468;
+                      for (int _i469 = 0; _i469 < _list467.size; ++_i469)
                       {
-                        _elem452 = iprot.readBinary();
-                        _elem449.add(_elem452);
+                        _elem468 = iprot.readBinary();
+                        _elem465.add(_elem468);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem449);
+                    struct.keysMulti.add(_elem465);
                   }
                   iprot.readListEnd();
                 }
@@ -55984,13 +58105,13 @@ public class RocksDB {
             case 4: // VALUE_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list454 = iprot.readListBegin();
-                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list454.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem455;
-                  for (int _i456 = 0; _i456 < _list454.size; ++_i456)
+                  org.apache.thrift.protocol.TList _list470 = iprot.readListBegin();
+                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list470.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem471;
+                  for (int _i472 = 0; _i472 < _list470.size; ++_i472)
                   {
-                    _elem455 = iprot.readBinary();
-                    struct.valueMulti.add(_elem455);
+                    _elem471 = iprot.readBinary();
+                    struct.valueMulti.add(_elem471);
                   }
                   iprot.readListEnd();
                 }
@@ -56031,13 +58152,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter457 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter473 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter457.size()));
-                for (java.nio.ByteBuffer _iter458 : _iter457)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter473.size()));
+                for (java.nio.ByteBuffer _iter474 : _iter473)
                 {
-                  oprot.writeBinary(_iter458);
+                  oprot.writeBinary(_iter474);
                 }
                 oprot.writeListEnd();
               }
@@ -56050,9 +58171,9 @@ public class RocksDB {
           oprot.writeFieldBegin(VALUE_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.valueMulti.size()));
-            for (java.nio.ByteBuffer _iter459 : struct.valueMulti)
+            for (java.nio.ByteBuffer _iter475 : struct.valueMulti)
             {
-              oprot.writeBinary(_iter459);
+              oprot.writeBinary(_iter475);
             }
             oprot.writeListEnd();
           }
@@ -56080,22 +58201,22 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter460 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter476 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter460.size());
-              for (java.nio.ByteBuffer _iter461 : _iter460)
+              oprot.writeI32(_iter476.size());
+              for (java.nio.ByteBuffer _iter477 : _iter476)
               {
-                oprot.writeBinary(_iter461);
+                oprot.writeBinary(_iter477);
               }
             }
           }
         }
         {
           oprot.writeI32(struct.valueMulti.size());
-          for (java.nio.ByteBuffer _iter462 : struct.valueMulti)
+          for (java.nio.ByteBuffer _iter478 : struct.valueMulti)
           {
-            oprot.writeBinary(_iter462);
+            oprot.writeBinary(_iter478);
           }
         }
       }
@@ -56108,33 +58229,33 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list463 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list463.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem464;
-          for (int _i465 = 0; _i465 < _list463.size; ++_i465)
+          org.apache.thrift.protocol.TList _list479 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list479.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem480;
+          for (int _i481 = 0; _i481 < _list479.size; ++_i481)
           {
             {
-              org.apache.thrift.protocol.TList _list466 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem464 = new java.util.ArrayList<java.nio.ByteBuffer>(_list466.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem467;
-              for (int _i468 = 0; _i468 < _list466.size; ++_i468)
+              org.apache.thrift.protocol.TList _list482 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem480 = new java.util.ArrayList<java.nio.ByteBuffer>(_list482.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem483;
+              for (int _i484 = 0; _i484 < _list482.size; ++_i484)
               {
-                _elem467 = iprot.readBinary();
-                _elem464.add(_elem467);
+                _elem483 = iprot.readBinary();
+                _elem480.add(_elem483);
               }
             }
-            struct.keysMulti.add(_elem464);
+            struct.keysMulti.add(_elem480);
           }
         }
         struct.setKeysMultiIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list469 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list469.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem470;
-          for (int _i471 = 0; _i471 < _list469.size; ++_i471)
+          org.apache.thrift.protocol.TList _list485 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list485.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem486;
+          for (int _i487 = 0; _i487 < _list485.size; ++_i487)
           {
-            _elem470 = iprot.readBinary();
-            struct.valueMulti.add(_elem470);
+            _elem486 = iprot.readBinary();
+            struct.valueMulti.add(_elem486);
           }
         }
         struct.setValueMultiIsSet(true);
@@ -56557,14 +58678,14 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list472 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<OptionalBinary>(_list472.size);
-                  @org.apache.thrift.annotation.Nullable OptionalBinary _elem473;
-                  for (int _i474 = 0; _i474 < _list472.size; ++_i474)
+                  org.apache.thrift.protocol.TList _list488 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<OptionalBinary>(_list488.size);
+                  @org.apache.thrift.annotation.Nullable OptionalBinary _elem489;
+                  for (int _i490 = 0; _i490 < _list488.size; ++_i490)
                   {
-                    _elem473 = new OptionalBinary();
-                    _elem473.read(iprot);
-                    struct.success.add(_elem473);
+                    _elem489 = new OptionalBinary();
+                    _elem489.read(iprot);
+                    struct.success.add(_elem489);
                   }
                   iprot.readListEnd();
                 }
@@ -56602,9 +58723,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
-            for (OptionalBinary _iter475 : struct.success)
+            for (OptionalBinary _iter491 : struct.success)
             {
-              _iter475.write(oprot);
+              _iter491.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -56644,9 +58765,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (OptionalBinary _iter476 : struct.success)
+            for (OptionalBinary _iter492 : struct.success)
             {
-              _iter476.write(oprot);
+              _iter492.write(oprot);
             }
           }
         }
@@ -56661,14 +58782,14 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list477 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-            struct.success = new java.util.ArrayList<OptionalBinary>(_list477.size);
-            @org.apache.thrift.annotation.Nullable OptionalBinary _elem478;
-            for (int _i479 = 0; _i479 < _list477.size; ++_i479)
+            org.apache.thrift.protocol.TList _list493 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<OptionalBinary>(_list493.size);
+            @org.apache.thrift.annotation.Nullable OptionalBinary _elem494;
+            for (int _i495 = 0; _i495 < _list493.size; ++_i495)
             {
-              _elem478 = new OptionalBinary();
-              _elem478.read(iprot);
-              struct.success.add(_elem478);
+              _elem494 = new OptionalBinary();
+              _elem494.read(iprot);
+              struct.success.add(_elem494);
             }
           }
           struct.setSuccessIsSet(true);
@@ -57296,23 +59417,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list480 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list480.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem481;
-                  for (int _i482 = 0; _i482 < _list480.size; ++_i482)
+                  org.apache.thrift.protocol.TList _list496 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list496.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem497;
+                  for (int _i498 = 0; _i498 < _list496.size; ++_i498)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list483 = iprot.readListBegin();
-                      _elem481 = new java.util.ArrayList<java.nio.ByteBuffer>(_list483.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem484;
-                      for (int _i485 = 0; _i485 < _list483.size; ++_i485)
+                      org.apache.thrift.protocol.TList _list499 = iprot.readListBegin();
+                      _elem497 = new java.util.ArrayList<java.nio.ByteBuffer>(_list499.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem500;
+                      for (int _i501 = 0; _i501 < _list499.size; ++_i501)
                       {
-                        _elem484 = iprot.readBinary();
-                        _elem481.add(_elem484);
+                        _elem500 = iprot.readBinary();
+                        _elem497.add(_elem500);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem481);
+                    struct.keysMulti.add(_elem497);
                   }
                   iprot.readListEnd();
                 }
@@ -57324,13 +59445,13 @@ public class RocksDB {
             case 4: // VALUE_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list486 = iprot.readListBegin();
-                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list486.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem487;
-                  for (int _i488 = 0; _i488 < _list486.size; ++_i488)
+                  org.apache.thrift.protocol.TList _list502 = iprot.readListBegin();
+                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list502.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem503;
+                  for (int _i504 = 0; _i504 < _list502.size; ++_i504)
                   {
-                    _elem487 = iprot.readBinary();
-                    struct.valueMulti.add(_elem487);
+                    _elem503 = iprot.readBinary();
+                    struct.valueMulti.add(_elem503);
                   }
                   iprot.readListEnd();
                 }
@@ -57371,13 +59492,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter489 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter505 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter489.size()));
-                for (java.nio.ByteBuffer _iter490 : _iter489)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter505.size()));
+                for (java.nio.ByteBuffer _iter506 : _iter505)
                 {
-                  oprot.writeBinary(_iter490);
+                  oprot.writeBinary(_iter506);
                 }
                 oprot.writeListEnd();
               }
@@ -57390,9 +59511,9 @@ public class RocksDB {
           oprot.writeFieldBegin(VALUE_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.valueMulti.size()));
-            for (java.nio.ByteBuffer _iter491 : struct.valueMulti)
+            for (java.nio.ByteBuffer _iter507 : struct.valueMulti)
             {
-              oprot.writeBinary(_iter491);
+              oprot.writeBinary(_iter507);
             }
             oprot.writeListEnd();
           }
@@ -57420,22 +59541,22 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter492 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter508 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter492.size());
-              for (java.nio.ByteBuffer _iter493 : _iter492)
+              oprot.writeI32(_iter508.size());
+              for (java.nio.ByteBuffer _iter509 : _iter508)
               {
-                oprot.writeBinary(_iter493);
+                oprot.writeBinary(_iter509);
               }
             }
           }
         }
         {
           oprot.writeI32(struct.valueMulti.size());
-          for (java.nio.ByteBuffer _iter494 : struct.valueMulti)
+          for (java.nio.ByteBuffer _iter510 : struct.valueMulti)
           {
-            oprot.writeBinary(_iter494);
+            oprot.writeBinary(_iter510);
           }
         }
       }
@@ -57448,33 +59569,33 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list495 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list495.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem496;
-          for (int _i497 = 0; _i497 < _list495.size; ++_i497)
+          org.apache.thrift.protocol.TList _list511 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list511.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem512;
+          for (int _i513 = 0; _i513 < _list511.size; ++_i513)
           {
             {
-              org.apache.thrift.protocol.TList _list498 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem496 = new java.util.ArrayList<java.nio.ByteBuffer>(_list498.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem499;
-              for (int _i500 = 0; _i500 < _list498.size; ++_i500)
+              org.apache.thrift.protocol.TList _list514 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem512 = new java.util.ArrayList<java.nio.ByteBuffer>(_list514.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem515;
+              for (int _i516 = 0; _i516 < _list514.size; ++_i516)
               {
-                _elem499 = iprot.readBinary();
-                _elem496.add(_elem499);
+                _elem515 = iprot.readBinary();
+                _elem512.add(_elem515);
               }
             }
-            struct.keysMulti.add(_elem496);
+            struct.keysMulti.add(_elem512);
           }
         }
         struct.setKeysMultiIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list501 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list501.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem502;
-          for (int _i503 = 0; _i503 < _list501.size; ++_i503)
+          org.apache.thrift.protocol.TList _list517 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list517.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem518;
+          for (int _i519 = 0; _i519 < _list517.size; ++_i519)
           {
-            _elem502 = iprot.readBinary();
-            struct.valueMulti.add(_elem502);
+            _elem518 = iprot.readBinary();
+            struct.valueMulti.add(_elem518);
           }
         }
         struct.setValueMultiIsSet(true);
@@ -57897,14 +60018,14 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list504 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<Delta>(_list504.size);
-                  @org.apache.thrift.annotation.Nullable Delta _elem505;
-                  for (int _i506 = 0; _i506 < _list504.size; ++_i506)
+                  org.apache.thrift.protocol.TList _list520 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<Delta>(_list520.size);
+                  @org.apache.thrift.annotation.Nullable Delta _elem521;
+                  for (int _i522 = 0; _i522 < _list520.size; ++_i522)
                   {
-                    _elem505 = new Delta();
-                    _elem505.read(iprot);
-                    struct.success.add(_elem505);
+                    _elem521 = new Delta();
+                    _elem521.read(iprot);
+                    struct.success.add(_elem521);
                   }
                   iprot.readListEnd();
                 }
@@ -57942,9 +60063,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
-            for (Delta _iter507 : struct.success)
+            for (Delta _iter523 : struct.success)
             {
-              _iter507.write(oprot);
+              _iter523.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -57984,9 +60105,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (Delta _iter508 : struct.success)
+            for (Delta _iter524 : struct.success)
             {
-              _iter508.write(oprot);
+              _iter524.write(oprot);
             }
           }
         }
@@ -58001,14 +60122,14 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list509 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-            struct.success = new java.util.ArrayList<Delta>(_list509.size);
-            @org.apache.thrift.annotation.Nullable Delta _elem510;
-            for (int _i511 = 0; _i511 < _list509.size; ++_i511)
+            org.apache.thrift.protocol.TList _list525 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<Delta>(_list525.size);
+            @org.apache.thrift.annotation.Nullable Delta _elem526;
+            for (int _i527 = 0; _i527 < _list525.size; ++_i527)
             {
-              _elem510 = new Delta();
-              _elem510.read(iprot);
-              struct.success.add(_elem510);
+              _elem526 = new Delta();
+              _elem526.read(iprot);
+              struct.success.add(_elem526);
             }
           }
           struct.setSuccessIsSet(true);
@@ -58636,23 +60757,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list512 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list512.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem513;
-                  for (int _i514 = 0; _i514 < _list512.size; ++_i514)
+                  org.apache.thrift.protocol.TList _list528 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list528.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem529;
+                  for (int _i530 = 0; _i530 < _list528.size; ++_i530)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list515 = iprot.readListBegin();
-                      _elem513 = new java.util.ArrayList<java.nio.ByteBuffer>(_list515.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem516;
-                      for (int _i517 = 0; _i517 < _list515.size; ++_i517)
+                      org.apache.thrift.protocol.TList _list531 = iprot.readListBegin();
+                      _elem529 = new java.util.ArrayList<java.nio.ByteBuffer>(_list531.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem532;
+                      for (int _i533 = 0; _i533 < _list531.size; ++_i533)
                       {
-                        _elem516 = iprot.readBinary();
-                        _elem513.add(_elem516);
+                        _elem532 = iprot.readBinary();
+                        _elem529.add(_elem532);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem513);
+                    struct.keysMulti.add(_elem529);
                   }
                   iprot.readListEnd();
                 }
@@ -58664,13 +60785,13 @@ public class RocksDB {
             case 4: // VALUE_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list518 = iprot.readListBegin();
-                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list518.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem519;
-                  for (int _i520 = 0; _i520 < _list518.size; ++_i520)
+                  org.apache.thrift.protocol.TList _list534 = iprot.readListBegin();
+                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list534.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem535;
+                  for (int _i536 = 0; _i536 < _list534.size; ++_i536)
                   {
-                    _elem519 = iprot.readBinary();
-                    struct.valueMulti.add(_elem519);
+                    _elem535 = iprot.readBinary();
+                    struct.valueMulti.add(_elem535);
                   }
                   iprot.readListEnd();
                 }
@@ -58711,13 +60832,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter521 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter537 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter521.size()));
-                for (java.nio.ByteBuffer _iter522 : _iter521)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter537.size()));
+                for (java.nio.ByteBuffer _iter538 : _iter537)
                 {
-                  oprot.writeBinary(_iter522);
+                  oprot.writeBinary(_iter538);
                 }
                 oprot.writeListEnd();
               }
@@ -58730,9 +60851,9 @@ public class RocksDB {
           oprot.writeFieldBegin(VALUE_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.valueMulti.size()));
-            for (java.nio.ByteBuffer _iter523 : struct.valueMulti)
+            for (java.nio.ByteBuffer _iter539 : struct.valueMulti)
             {
-              oprot.writeBinary(_iter523);
+              oprot.writeBinary(_iter539);
             }
             oprot.writeListEnd();
           }
@@ -58760,22 +60881,22 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter524 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter540 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter524.size());
-              for (java.nio.ByteBuffer _iter525 : _iter524)
+              oprot.writeI32(_iter540.size());
+              for (java.nio.ByteBuffer _iter541 : _iter540)
               {
-                oprot.writeBinary(_iter525);
+                oprot.writeBinary(_iter541);
               }
             }
           }
         }
         {
           oprot.writeI32(struct.valueMulti.size());
-          for (java.nio.ByteBuffer _iter526 : struct.valueMulti)
+          for (java.nio.ByteBuffer _iter542 : struct.valueMulti)
           {
-            oprot.writeBinary(_iter526);
+            oprot.writeBinary(_iter542);
           }
         }
       }
@@ -58788,33 +60909,33 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list527 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list527.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem528;
-          for (int _i529 = 0; _i529 < _list527.size; ++_i529)
+          org.apache.thrift.protocol.TList _list543 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list543.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem544;
+          for (int _i545 = 0; _i545 < _list543.size; ++_i545)
           {
             {
-              org.apache.thrift.protocol.TList _list530 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem528 = new java.util.ArrayList<java.nio.ByteBuffer>(_list530.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem531;
-              for (int _i532 = 0; _i532 < _list530.size; ++_i532)
+              org.apache.thrift.protocol.TList _list546 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem544 = new java.util.ArrayList<java.nio.ByteBuffer>(_list546.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem547;
+              for (int _i548 = 0; _i548 < _list546.size; ++_i548)
               {
-                _elem531 = iprot.readBinary();
-                _elem528.add(_elem531);
+                _elem547 = iprot.readBinary();
+                _elem544.add(_elem547);
               }
             }
-            struct.keysMulti.add(_elem528);
+            struct.keysMulti.add(_elem544);
           }
         }
         struct.setKeysMultiIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list533 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list533.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem534;
-          for (int _i535 = 0; _i535 < _list533.size; ++_i535)
+          org.apache.thrift.protocol.TList _list549 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list549.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem550;
+          for (int _i551 = 0; _i551 < _list549.size; ++_i551)
           {
-            _elem534 = iprot.readBinary();
-            struct.valueMulti.add(_elem534);
+            _elem550 = iprot.readBinary();
+            struct.valueMulti.add(_elem550);
           }
         }
         struct.setValueMultiIsSet(true);
@@ -59234,13 +61355,13 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list536 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<java.lang.Boolean>(_list536.size);
-                  boolean _elem537;
-                  for (int _i538 = 0; _i538 < _list536.size; ++_i538)
+                  org.apache.thrift.protocol.TList _list552 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<java.lang.Boolean>(_list552.size);
+                  boolean _elem553;
+                  for (int _i554 = 0; _i554 < _list552.size; ++_i554)
                   {
-                    _elem537 = iprot.readBool();
-                    struct.success.add(_elem537);
+                    _elem553 = iprot.readBool();
+                    struct.success.add(_elem553);
                   }
                   iprot.readListEnd();
                 }
@@ -59278,9 +61399,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.BOOL, struct.success.size()));
-            for (boolean _iter539 : struct.success)
+            for (boolean _iter555 : struct.success)
             {
-              oprot.writeBool(_iter539);
+              oprot.writeBool(_iter555);
             }
             oprot.writeListEnd();
           }
@@ -59320,9 +61441,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (boolean _iter540 : struct.success)
+            for (boolean _iter556 : struct.success)
             {
-              oprot.writeBool(_iter540);
+              oprot.writeBool(_iter556);
             }
           }
         }
@@ -59337,13 +61458,13 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list541 = iprot.readListBegin(org.apache.thrift.protocol.TType.BOOL);
-            struct.success = new java.util.ArrayList<java.lang.Boolean>(_list541.size);
-            boolean _elem542;
-            for (int _i543 = 0; _i543 < _list541.size; ++_i543)
+            org.apache.thrift.protocol.TList _list557 = iprot.readListBegin(org.apache.thrift.protocol.TType.BOOL);
+            struct.success = new java.util.ArrayList<java.lang.Boolean>(_list557.size);
+            boolean _elem558;
+            for (int _i559 = 0; _i559 < _list557.size; ++_i559)
             {
-              _elem542 = iprot.readBool();
-              struct.success.add(_elem542);
+              _elem558 = iprot.readBool();
+              struct.success.add(_elem558);
             }
           }
           struct.setSuccessIsSet(true);
@@ -59971,23 +62092,23 @@ public class RocksDB {
             case 3: // KEYS_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list544 = iprot.readListBegin();
-                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list544.size);
-                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem545;
-                  for (int _i546 = 0; _i546 < _list544.size; ++_i546)
+                  org.apache.thrift.protocol.TList _list560 = iprot.readListBegin();
+                  struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list560.size);
+                  @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem561;
+                  for (int _i562 = 0; _i562 < _list560.size; ++_i562)
                   {
                     {
-                      org.apache.thrift.protocol.TList _list547 = iprot.readListBegin();
-                      _elem545 = new java.util.ArrayList<java.nio.ByteBuffer>(_list547.size);
-                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem548;
-                      for (int _i549 = 0; _i549 < _list547.size; ++_i549)
+                      org.apache.thrift.protocol.TList _list563 = iprot.readListBegin();
+                      _elem561 = new java.util.ArrayList<java.nio.ByteBuffer>(_list563.size);
+                      @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem564;
+                      for (int _i565 = 0; _i565 < _list563.size; ++_i565)
                       {
-                        _elem548 = iprot.readBinary();
-                        _elem545.add(_elem548);
+                        _elem564 = iprot.readBinary();
+                        _elem561.add(_elem564);
                       }
                       iprot.readListEnd();
                     }
-                    struct.keysMulti.add(_elem545);
+                    struct.keysMulti.add(_elem561);
                   }
                   iprot.readListEnd();
                 }
@@ -59999,13 +62120,13 @@ public class RocksDB {
             case 4: // VALUE_MULTI
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list550 = iprot.readListBegin();
-                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list550.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem551;
-                  for (int _i552 = 0; _i552 < _list550.size; ++_i552)
+                  org.apache.thrift.protocol.TList _list566 = iprot.readListBegin();
+                  struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list566.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem567;
+                  for (int _i568 = 0; _i568 < _list566.size; ++_i568)
                   {
-                    _elem551 = iprot.readBinary();
-                    struct.valueMulti.add(_elem551);
+                    _elem567 = iprot.readBinary();
+                    struct.valueMulti.add(_elem567);
                   }
                   iprot.readListEnd();
                 }
@@ -60046,13 +62167,13 @@ public class RocksDB {
           oprot.writeFieldBegin(KEYS_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.LIST, struct.keysMulti.size()));
-            for (java.util.List<java.nio.ByteBuffer> _iter553 : struct.keysMulti)
+            for (java.util.List<java.nio.ByteBuffer> _iter569 : struct.keysMulti)
             {
               {
-                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter553.size()));
-                for (java.nio.ByteBuffer _iter554 : _iter553)
+                oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, _iter569.size()));
+                for (java.nio.ByteBuffer _iter570 : _iter569)
                 {
-                  oprot.writeBinary(_iter554);
+                  oprot.writeBinary(_iter570);
                 }
                 oprot.writeListEnd();
               }
@@ -60065,9 +62186,9 @@ public class RocksDB {
           oprot.writeFieldBegin(VALUE_MULTI_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.valueMulti.size()));
-            for (java.nio.ByteBuffer _iter555 : struct.valueMulti)
+            for (java.nio.ByteBuffer _iter571 : struct.valueMulti)
             {
-              oprot.writeBinary(_iter555);
+              oprot.writeBinary(_iter571);
             }
             oprot.writeListEnd();
           }
@@ -60095,22 +62216,22 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         {
           oprot.writeI32(struct.keysMulti.size());
-          for (java.util.List<java.nio.ByteBuffer> _iter556 : struct.keysMulti)
+          for (java.util.List<java.nio.ByteBuffer> _iter572 : struct.keysMulti)
           {
             {
-              oprot.writeI32(_iter556.size());
-              for (java.nio.ByteBuffer _iter557 : _iter556)
+              oprot.writeI32(_iter572.size());
+              for (java.nio.ByteBuffer _iter573 : _iter572)
               {
-                oprot.writeBinary(_iter557);
+                oprot.writeBinary(_iter573);
               }
             }
           }
         }
         {
           oprot.writeI32(struct.valueMulti.size());
-          for (java.nio.ByteBuffer _iter558 : struct.valueMulti)
+          for (java.nio.ByteBuffer _iter574 : struct.valueMulti)
           {
-            oprot.writeBinary(_iter558);
+            oprot.writeBinary(_iter574);
           }
         }
       }
@@ -60123,33 +62244,33 @@ public class RocksDB {
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list559 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
-          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list559.size);
-          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem560;
-          for (int _i561 = 0; _i561 < _list559.size; ++_i561)
+          org.apache.thrift.protocol.TList _list575 = iprot.readListBegin(org.apache.thrift.protocol.TType.LIST);
+          struct.keysMulti = new java.util.ArrayList<java.util.List<java.nio.ByteBuffer>>(_list575.size);
+          @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> _elem576;
+          for (int _i577 = 0; _i577 < _list575.size; ++_i577)
           {
             {
-              org.apache.thrift.protocol.TList _list562 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-              _elem560 = new java.util.ArrayList<java.nio.ByteBuffer>(_list562.size);
-              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem563;
-              for (int _i564 = 0; _i564 < _list562.size; ++_i564)
+              org.apache.thrift.protocol.TList _list578 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+              _elem576 = new java.util.ArrayList<java.nio.ByteBuffer>(_list578.size);
+              @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem579;
+              for (int _i580 = 0; _i580 < _list578.size; ++_i580)
               {
-                _elem563 = iprot.readBinary();
-                _elem560.add(_elem563);
+                _elem579 = iprot.readBinary();
+                _elem576.add(_elem579);
               }
             }
-            struct.keysMulti.add(_elem560);
+            struct.keysMulti.add(_elem576);
           }
         }
         struct.setKeysMultiIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list565 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list565.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem566;
-          for (int _i567 = 0; _i567 < _list565.size; ++_i567)
+          org.apache.thrift.protocol.TList _list581 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(_list581.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem582;
+          for (int _i583 = 0; _i583 < _list581.size; ++_i583)
           {
-            _elem566 = iprot.readBinary();
-            struct.valueMulti.add(_elem566);
+            _elem582 = iprot.readBinary();
+            struct.valueMulti.add(_elem582);
           }
         }
         struct.setValueMultiIsSet(true);
@@ -60569,13 +62690,13 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list568 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<java.lang.Boolean>(_list568.size);
-                  boolean _elem569;
-                  for (int _i570 = 0; _i570 < _list568.size; ++_i570)
+                  org.apache.thrift.protocol.TList _list584 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<java.lang.Boolean>(_list584.size);
+                  boolean _elem585;
+                  for (int _i586 = 0; _i586 < _list584.size; ++_i586)
                   {
-                    _elem569 = iprot.readBool();
-                    struct.success.add(_elem569);
+                    _elem585 = iprot.readBool();
+                    struct.success.add(_elem585);
                   }
                   iprot.readListEnd();
                 }
@@ -60613,9 +62734,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.BOOL, struct.success.size()));
-            for (boolean _iter571 : struct.success)
+            for (boolean _iter587 : struct.success)
             {
-              oprot.writeBool(_iter571);
+              oprot.writeBool(_iter587);
             }
             oprot.writeListEnd();
           }
@@ -60655,9 +62776,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (boolean _iter572 : struct.success)
+            for (boolean _iter588 : struct.success)
             {
-              oprot.writeBool(_iter572);
+              oprot.writeBool(_iter588);
             }
           }
         }
@@ -60672,13 +62793,13 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list573 = iprot.readListBegin(org.apache.thrift.protocol.TType.BOOL);
-            struct.success = new java.util.ArrayList<java.lang.Boolean>(_list573.size);
-            boolean _elem574;
-            for (int _i575 = 0; _i575 < _list573.size; ++_i575)
+            org.apache.thrift.protocol.TList _list589 = iprot.readListBegin(org.apache.thrift.protocol.TType.BOOL);
+            struct.success = new java.util.ArrayList<java.lang.Boolean>(_list589.size);
+            boolean _elem590;
+            for (int _i591 = 0; _i591 < _list589.size; ++_i591)
             {
-              _elem574 = iprot.readBool();
-              struct.success.add(_elem574);
+              _elem590 = iprot.readBool();
+              struct.success.add(_elem590);
             }
           }
           struct.setSuccessIsSet(true);
@@ -62665,14 +64786,14 @@ public class RocksDB {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list576 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<Column>(_list576.size);
-                  @org.apache.thrift.annotation.Nullable Column _elem577;
-                  for (int _i578 = 0; _i578 < _list576.size; ++_i578)
+                  org.apache.thrift.protocol.TList _list592 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<Column>(_list592.size);
+                  @org.apache.thrift.annotation.Nullable Column _elem593;
+                  for (int _i594 = 0; _i594 < _list592.size; ++_i594)
                   {
-                    _elem577 = new Column();
-                    _elem577.read(iprot);
-                    struct.success.add(_elem577);
+                    _elem593 = new Column();
+                    _elem593.read(iprot);
+                    struct.success.add(_elem593);
                   }
                   iprot.readListEnd();
                 }
@@ -62710,9 +64831,9 @@ public class RocksDB {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
-            for (Column _iter579 : struct.success)
+            for (Column _iter595 : struct.success)
             {
-              _iter579.write(oprot);
+              _iter595.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -62752,9 +64873,9 @@ public class RocksDB {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (Column _iter580 : struct.success)
+            for (Column _iter596 : struct.success)
             {
-              _iter580.write(oprot);
+              _iter596.write(oprot);
             }
           }
         }
@@ -62769,19 +64890,4956 @@ public class RocksDB {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list581 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-            struct.success = new java.util.ArrayList<Column>(_list581.size);
-            @org.apache.thrift.annotation.Nullable Column _elem582;
-            for (int _i583 = 0; _i583 < _list581.size; ++_i583)
+            org.apache.thrift.protocol.TList _list597 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<Column>(_list597.size);
+            @org.apache.thrift.annotation.Nullable Column _elem598;
+            for (int _i599 = 0; _i599 < _list597.size; ++_i599)
             {
-              _elem582 = new Column();
-              _elem582.read(iprot);
-              struct.success.add(_elem582);
+              _elem598 = new Column();
+              _elem598.read(iprot);
+              struct.success.add(_elem598);
             }
           }
           struct.setSuccessIsSet(true);
         }
         if (incoming.get(1)) {
+          struct.e = new RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcCreate_args implements org.apache.thrift.TBase<cdcCreate_args, cdcCreate_args._Fields>, java.io.Serializable, Cloneable, Comparable<cdcCreate_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcCreate_args");
+
+    private static final org.apache.thrift.protocol.TField REQUEST_FIELD_DESC = new org.apache.thrift.protocol.TField("request", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcCreate_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcCreate_argsTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable CdcCreateRequest request; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      REQUEST((short)1, "request");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // REQUEST
+            return REQUEST;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.REQUEST, new org.apache.thrift.meta_data.FieldMetaData("request", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, CdcCreateRequest.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcCreate_args.class, metaDataMap);
+    }
+
+    public cdcCreate_args() {
+    }
+
+    public cdcCreate_args(
+      CdcCreateRequest request)
+    {
+      this();
+      this.request = request;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcCreate_args(cdcCreate_args other) {
+      if (other.isSetRequest()) {
+        this.request = new CdcCreateRequest(other.request);
+      }
+    }
+
+    @Override
+    public cdcCreate_args deepCopy() {
+      return new cdcCreate_args(this);
+    }
+
+    @Override
+    public void clear() {
+      this.request = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public CdcCreateRequest getRequest() {
+      return this.request;
+    }
+
+    public cdcCreate_args setRequest(@org.apache.thrift.annotation.Nullable CdcCreateRequest request) {
+      this.request = request;
+      return this;
+    }
+
+    public void unsetRequest() {
+      this.request = null;
+    }
+
+    /** Returns true if field request is set (has been assigned a value) and false otherwise */
+    public boolean isSetRequest() {
+      return this.request != null;
+    }
+
+    public void setRequestIsSet(boolean value) {
+      if (!value) {
+        this.request = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case REQUEST:
+        if (value == null) {
+          unsetRequest();
+        } else {
+          setRequest((CdcCreateRequest)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case REQUEST:
+        return getRequest();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case REQUEST:
+        return isSetRequest();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcCreate_args)
+        return this.equals((cdcCreate_args)that);
+      return false;
+    }
+
+    public boolean equals(cdcCreate_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_request = true && this.isSetRequest();
+      boolean that_present_request = true && that.isSetRequest();
+      if (this_present_request || that_present_request) {
+        if (!(this_present_request && that_present_request))
+          return false;
+        if (!this.request.equals(that.request))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetRequest()) ? 131071 : 524287);
+      if (isSetRequest())
+        hashCode = hashCode * 8191 + request.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcCreate_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetRequest(), other.isSetRequest());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetRequest()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.request, other.request);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcCreate_args(");
+      boolean first = true;
+
+      sb.append("request:");
+      if (this.request == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.request);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      if (request == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'request' was not present! Struct: " + toString());
+      }
+      // check for sub-struct validity
+      if (request != null) {
+        request.validate();
+      }
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcCreate_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcCreate_argsStandardScheme getScheme() {
+        return new cdcCreate_argsStandardScheme();
+      }
+    }
+
+    private static class cdcCreate_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcCreate_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcCreate_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // REQUEST
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.request = new CdcCreateRequest();
+                struct.request.read(iprot);
+                struct.setRequestIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcCreate_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.request != null) {
+          oprot.writeFieldBegin(REQUEST_FIELD_DESC);
+          struct.request.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcCreate_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcCreate_argsTupleScheme getScheme() {
+        return new cdcCreate_argsTupleScheme();
+      }
+    }
+
+    private static class cdcCreate_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcCreate_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcCreate_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.request.write(oprot);
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcCreate_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.request = new CdcCreateRequest();
+        struct.request.read(iprot);
+        struct.setRequestIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcCreate_result implements org.apache.thrift.TBase<cdcCreate_result, cdcCreate_result._Fields>, java.io.Serializable, Cloneable, Comparable<cdcCreate_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcCreate_result");
+
+    private static final org.apache.thrift.protocol.TField SUCCESS_FIELD_DESC = new org.apache.thrift.protocol.TField("success", org.apache.thrift.protocol.TType.I64, (short)0);
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcCreate_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcCreate_resultTupleSchemeFactory();
+
+    public long success; // required
+    public @org.apache.thrift.annotation.Nullable RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      SUCCESS((short)0, "success"),
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 0: // SUCCESS
+            return SUCCESS;
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    private static final int __SUCCESS_ISSET_ID = 0;
+    private byte __isset_bitfield = 0;
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.SUCCESS, new org.apache.thrift.meta_data.FieldMetaData("success", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcCreate_result.class, metaDataMap);
+    }
+
+    public cdcCreate_result() {
+    }
+
+    public cdcCreate_result(
+      long success,
+      RocksDBThriftException e)
+    {
+      this();
+      this.success = success;
+      setSuccessIsSet(true);
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcCreate_result(cdcCreate_result other) {
+      __isset_bitfield = other.__isset_bitfield;
+      this.success = other.success;
+      if (other.isSetE()) {
+        this.e = new RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public cdcCreate_result deepCopy() {
+      return new cdcCreate_result(this);
+    }
+
+    @Override
+    public void clear() {
+      setSuccessIsSet(false);
+      this.success = 0;
+      this.e = null;
+    }
+
+    public long getSuccess() {
+      return this.success;
+    }
+
+    public cdcCreate_result setSuccess(long success) {
+      this.success = success;
+      setSuccessIsSet(true);
+      return this;
+    }
+
+    public void unsetSuccess() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __SUCCESS_ISSET_ID);
+    }
+
+    /** Returns true if field success is set (has been assigned a value) and false otherwise */
+    public boolean isSetSuccess() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __SUCCESS_ISSET_ID);
+    }
+
+    public void setSuccessIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __SUCCESS_ISSET_ID, value);
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public cdcCreate_result setE(@org.apache.thrift.annotation.Nullable RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case SUCCESS:
+        if (value == null) {
+          unsetSuccess();
+        } else {
+          setSuccess((java.lang.Long)value);
+        }
+        break;
+
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case SUCCESS:
+        return getSuccess();
+
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case SUCCESS:
+        return isSetSuccess();
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcCreate_result)
+        return this.equals((cdcCreate_result)that);
+      return false;
+    }
+
+    public boolean equals(cdcCreate_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_success = true;
+      boolean that_present_success = true;
+      if (this_present_success || that_present_success) {
+        if (!(this_present_success && that_present_success))
+          return false;
+        if (this.success != that.success)
+          return false;
+      }
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(success);
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcCreate_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetSuccess(), other.isSetSuccess());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetSuccess()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.success, other.success);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcCreate_result(");
+      boolean first = true;
+
+      sb.append("success:");
+      sb.append(this.success);
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcCreate_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcCreate_resultStandardScheme getScheme() {
+        return new cdcCreate_resultStandardScheme();
+      }
+    }
+
+    private static class cdcCreate_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcCreate_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcCreate_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 0: // SUCCESS
+              if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+                struct.success = iprot.readI64();
+                struct.setSuccessIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcCreate_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.isSetSuccess()) {
+          oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+          oprot.writeI64(struct.success);
+          oprot.writeFieldEnd();
+        }
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcCreate_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcCreate_resultTupleScheme getScheme() {
+        return new cdcCreate_resultTupleScheme();
+      }
+    }
+
+    private static class cdcCreate_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcCreate_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcCreate_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetSuccess()) {
+          optionals.set(0);
+        }
+        if (struct.isSetE()) {
+          optionals.set(1);
+        }
+        oprot.writeBitSet(optionals, 2);
+        if (struct.isSetSuccess()) {
+          oprot.writeI64(struct.success);
+        }
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcCreate_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(2);
+        if (incoming.get(0)) {
+          struct.success = iprot.readI64();
+          struct.setSuccessIsSet(true);
+        }
+        if (incoming.get(1)) {
+          struct.e = new RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcDelete_args implements org.apache.thrift.TBase<cdcDelete_args, cdcDelete_args._Fields>, java.io.Serializable, Cloneable, Comparable<cdcDelete_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcDelete_args");
+
+    private static final org.apache.thrift.protocol.TField ID_FIELD_DESC = new org.apache.thrift.protocol.TField("id", org.apache.thrift.protocol.TType.STRING, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcDelete_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcDelete_argsTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable java.lang.String id; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      ID((short)1, "id");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // ID
+            return ID;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.ID, new org.apache.thrift.meta_data.FieldMetaData("id", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcDelete_args.class, metaDataMap);
+    }
+
+    public cdcDelete_args() {
+    }
+
+    public cdcDelete_args(
+      java.lang.String id)
+    {
+      this();
+      this.id = id;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcDelete_args(cdcDelete_args other) {
+      if (other.isSetId()) {
+        this.id = other.id;
+      }
+    }
+
+    @Override
+    public cdcDelete_args deepCopy() {
+      return new cdcDelete_args(this);
+    }
+
+    @Override
+    public void clear() {
+      this.id = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.lang.String getId() {
+      return this.id;
+    }
+
+    public cdcDelete_args setId(@org.apache.thrift.annotation.Nullable java.lang.String id) {
+      this.id = id;
+      return this;
+    }
+
+    public void unsetId() {
+      this.id = null;
+    }
+
+    /** Returns true if field id is set (has been assigned a value) and false otherwise */
+    public boolean isSetId() {
+      return this.id != null;
+    }
+
+    public void setIdIsSet(boolean value) {
+      if (!value) {
+        this.id = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case ID:
+        if (value == null) {
+          unsetId();
+        } else {
+          setId((java.lang.String)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case ID:
+        return getId();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case ID:
+        return isSetId();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcDelete_args)
+        return this.equals((cdcDelete_args)that);
+      return false;
+    }
+
+    public boolean equals(cdcDelete_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_id = true && this.isSetId();
+      boolean that_present_id = true && that.isSetId();
+      if (this_present_id || that_present_id) {
+        if (!(this_present_id && that_present_id))
+          return false;
+        if (!this.id.equals(that.id))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetId()) ? 131071 : 524287);
+      if (isSetId())
+        hashCode = hashCode * 8191 + id.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcDelete_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetId(), other.isSetId());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetId()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.id, other.id);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcDelete_args(");
+      boolean first = true;
+
+      sb.append("id:");
+      if (this.id == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.id);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      if (id == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'id' was not present! Struct: " + toString());
+      }
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcDelete_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcDelete_argsStandardScheme getScheme() {
+        return new cdcDelete_argsStandardScheme();
+      }
+    }
+
+    private static class cdcDelete_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcDelete_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcDelete_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // ID
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+                struct.id = iprot.readString();
+                struct.setIdIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcDelete_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.id != null) {
+          oprot.writeFieldBegin(ID_FIELD_DESC);
+          oprot.writeString(struct.id);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcDelete_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcDelete_argsTupleScheme getScheme() {
+        return new cdcDelete_argsTupleScheme();
+      }
+    }
+
+    private static class cdcDelete_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcDelete_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcDelete_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        oprot.writeString(struct.id);
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcDelete_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.id = iprot.readString();
+        struct.setIdIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcDelete_result implements org.apache.thrift.TBase<cdcDelete_result, cdcDelete_result._Fields>, java.io.Serializable, Cloneable, Comparable<cdcDelete_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcDelete_result");
+
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcDelete_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcDelete_resultTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcDelete_result.class, metaDataMap);
+    }
+
+    public cdcDelete_result() {
+    }
+
+    public cdcDelete_result(
+      RocksDBThriftException e)
+    {
+      this();
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcDelete_result(cdcDelete_result other) {
+      if (other.isSetE()) {
+        this.e = new RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public cdcDelete_result deepCopy() {
+      return new cdcDelete_result(this);
+    }
+
+    @Override
+    public void clear() {
+      this.e = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public cdcDelete_result setE(@org.apache.thrift.annotation.Nullable RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcDelete_result)
+        return this.equals((cdcDelete_result)that);
+      return false;
+    }
+
+    public boolean equals(cdcDelete_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcDelete_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcDelete_result(");
+      boolean first = true;
+
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcDelete_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcDelete_resultStandardScheme getScheme() {
+        return new cdcDelete_resultStandardScheme();
+      }
+    }
+
+    private static class cdcDelete_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcDelete_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcDelete_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcDelete_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcDelete_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcDelete_resultTupleScheme getScheme() {
+        return new cdcDelete_resultTupleScheme();
+      }
+    }
+
+    private static class cdcDelete_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcDelete_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcDelete_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetE()) {
+          optionals.set(0);
+        }
+        oprot.writeBitSet(optionals, 1);
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcDelete_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(1);
+        if (incoming.get(0)) {
+          struct.e = new RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcGetEarliestAvailableSequence_args implements org.apache.thrift.TBase<cdcGetEarliestAvailableSequence_args, cdcGetEarliestAvailableSequence_args._Fields>, java.io.Serializable, Cloneable, Comparable<cdcGetEarliestAvailableSequence_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcGetEarliestAvailableSequence_args");
+
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcGetEarliestAvailableSequence_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcGetEarliestAvailableSequence_argsTupleSchemeFactory();
+
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+;
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcGetEarliestAvailableSequence_args.class, metaDataMap);
+    }
+
+    public cdcGetEarliestAvailableSequence_args() {
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcGetEarliestAvailableSequence_args(cdcGetEarliestAvailableSequence_args other) {
+    }
+
+    @Override
+    public cdcGetEarliestAvailableSequence_args deepCopy() {
+      return new cdcGetEarliestAvailableSequence_args(this);
+    }
+
+    @Override
+    public void clear() {
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcGetEarliestAvailableSequence_args)
+        return this.equals((cdcGetEarliestAvailableSequence_args)that);
+      return false;
+    }
+
+    public boolean equals(cdcGetEarliestAvailableSequence_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcGetEarliestAvailableSequence_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcGetEarliestAvailableSequence_args(");
+      boolean first = true;
+
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcGetEarliestAvailableSequence_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcGetEarliestAvailableSequence_argsStandardScheme getScheme() {
+        return new cdcGetEarliestAvailableSequence_argsStandardScheme();
+      }
+    }
+
+    private static class cdcGetEarliestAvailableSequence_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcGetEarliestAvailableSequence_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcGetEarliestAvailableSequence_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcGetEarliestAvailableSequence_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcGetEarliestAvailableSequence_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcGetEarliestAvailableSequence_argsTupleScheme getScheme() {
+        return new cdcGetEarliestAvailableSequence_argsTupleScheme();
+      }
+    }
+
+    private static class cdcGetEarliestAvailableSequence_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcGetEarliestAvailableSequence_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcGetEarliestAvailableSequence_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcGetEarliestAvailableSequence_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcGetEarliestAvailableSequence_result implements org.apache.thrift.TBase<cdcGetEarliestAvailableSequence_result, cdcGetEarliestAvailableSequence_result._Fields>, java.io.Serializable, Cloneable, Comparable<cdcGetEarliestAvailableSequence_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcGetEarliestAvailableSequence_result");
+
+    private static final org.apache.thrift.protocol.TField SUCCESS_FIELD_DESC = new org.apache.thrift.protocol.TField("success", org.apache.thrift.protocol.TType.I64, (short)0);
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcGetEarliestAvailableSequence_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcGetEarliestAvailableSequence_resultTupleSchemeFactory();
+
+    public long success; // required
+    public @org.apache.thrift.annotation.Nullable RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      SUCCESS((short)0, "success"),
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 0: // SUCCESS
+            return SUCCESS;
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    private static final int __SUCCESS_ISSET_ID = 0;
+    private byte __isset_bitfield = 0;
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.SUCCESS, new org.apache.thrift.meta_data.FieldMetaData("success", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcGetEarliestAvailableSequence_result.class, metaDataMap);
+    }
+
+    public cdcGetEarliestAvailableSequence_result() {
+    }
+
+    public cdcGetEarliestAvailableSequence_result(
+      long success,
+      RocksDBThriftException e)
+    {
+      this();
+      this.success = success;
+      setSuccessIsSet(true);
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcGetEarliestAvailableSequence_result(cdcGetEarliestAvailableSequence_result other) {
+      __isset_bitfield = other.__isset_bitfield;
+      this.success = other.success;
+      if (other.isSetE()) {
+        this.e = new RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public cdcGetEarliestAvailableSequence_result deepCopy() {
+      return new cdcGetEarliestAvailableSequence_result(this);
+    }
+
+    @Override
+    public void clear() {
+      setSuccessIsSet(false);
+      this.success = 0;
+      this.e = null;
+    }
+
+    public long getSuccess() {
+      return this.success;
+    }
+
+    public cdcGetEarliestAvailableSequence_result setSuccess(long success) {
+      this.success = success;
+      setSuccessIsSet(true);
+      return this;
+    }
+
+    public void unsetSuccess() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __SUCCESS_ISSET_ID);
+    }
+
+    /** Returns true if field success is set (has been assigned a value) and false otherwise */
+    public boolean isSetSuccess() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __SUCCESS_ISSET_ID);
+    }
+
+    public void setSuccessIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __SUCCESS_ISSET_ID, value);
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public cdcGetEarliestAvailableSequence_result setE(@org.apache.thrift.annotation.Nullable RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case SUCCESS:
+        if (value == null) {
+          unsetSuccess();
+        } else {
+          setSuccess((java.lang.Long)value);
+        }
+        break;
+
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case SUCCESS:
+        return getSuccess();
+
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case SUCCESS:
+        return isSetSuccess();
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcGetEarliestAvailableSequence_result)
+        return this.equals((cdcGetEarliestAvailableSequence_result)that);
+      return false;
+    }
+
+    public boolean equals(cdcGetEarliestAvailableSequence_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_success = true;
+      boolean that_present_success = true;
+      if (this_present_success || that_present_success) {
+        if (!(this_present_success && that_present_success))
+          return false;
+        if (this.success != that.success)
+          return false;
+      }
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(success);
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcGetEarliestAvailableSequence_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetSuccess(), other.isSetSuccess());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetSuccess()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.success, other.success);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcGetEarliestAvailableSequence_result(");
+      boolean first = true;
+
+      sb.append("success:");
+      sb.append(this.success);
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcGetEarliestAvailableSequence_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcGetEarliestAvailableSequence_resultStandardScheme getScheme() {
+        return new cdcGetEarliestAvailableSequence_resultStandardScheme();
+      }
+    }
+
+    private static class cdcGetEarliestAvailableSequence_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcGetEarliestAvailableSequence_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcGetEarliestAvailableSequence_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 0: // SUCCESS
+              if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+                struct.success = iprot.readI64();
+                struct.setSuccessIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcGetEarliestAvailableSequence_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.isSetSuccess()) {
+          oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+          oprot.writeI64(struct.success);
+          oprot.writeFieldEnd();
+        }
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcGetEarliestAvailableSequence_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcGetEarliestAvailableSequence_resultTupleScheme getScheme() {
+        return new cdcGetEarliestAvailableSequence_resultTupleScheme();
+      }
+    }
+
+    private static class cdcGetEarliestAvailableSequence_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcGetEarliestAvailableSequence_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcGetEarliestAvailableSequence_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetSuccess()) {
+          optionals.set(0);
+        }
+        if (struct.isSetE()) {
+          optionals.set(1);
+        }
+        oprot.writeBitSet(optionals, 2);
+        if (struct.isSetSuccess()) {
+          oprot.writeI64(struct.success);
+        }
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcGetEarliestAvailableSequence_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(2);
+        if (incoming.get(0)) {
+          struct.success = iprot.readI64();
+          struct.setSuccessIsSet(true);
+        }
+        if (incoming.get(1)) {
+          struct.e = new RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcGetLastCommittedSequence_args implements org.apache.thrift.TBase<cdcGetLastCommittedSequence_args, cdcGetLastCommittedSequence_args._Fields>, java.io.Serializable, Cloneable, Comparable<cdcGetLastCommittedSequence_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcGetLastCommittedSequence_args");
+
+    private static final org.apache.thrift.protocol.TField ID_FIELD_DESC = new org.apache.thrift.protocol.TField("id", org.apache.thrift.protocol.TType.STRING, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcGetLastCommittedSequence_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcGetLastCommittedSequence_argsTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable java.lang.String id; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      ID((short)1, "id");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // ID
+            return ID;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.ID, new org.apache.thrift.meta_data.FieldMetaData("id", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcGetLastCommittedSequence_args.class, metaDataMap);
+    }
+
+    public cdcGetLastCommittedSequence_args() {
+    }
+
+    public cdcGetLastCommittedSequence_args(
+      java.lang.String id)
+    {
+      this();
+      this.id = id;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcGetLastCommittedSequence_args(cdcGetLastCommittedSequence_args other) {
+      if (other.isSetId()) {
+        this.id = other.id;
+      }
+    }
+
+    @Override
+    public cdcGetLastCommittedSequence_args deepCopy() {
+      return new cdcGetLastCommittedSequence_args(this);
+    }
+
+    @Override
+    public void clear() {
+      this.id = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.lang.String getId() {
+      return this.id;
+    }
+
+    public cdcGetLastCommittedSequence_args setId(@org.apache.thrift.annotation.Nullable java.lang.String id) {
+      this.id = id;
+      return this;
+    }
+
+    public void unsetId() {
+      this.id = null;
+    }
+
+    /** Returns true if field id is set (has been assigned a value) and false otherwise */
+    public boolean isSetId() {
+      return this.id != null;
+    }
+
+    public void setIdIsSet(boolean value) {
+      if (!value) {
+        this.id = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case ID:
+        if (value == null) {
+          unsetId();
+        } else {
+          setId((java.lang.String)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case ID:
+        return getId();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case ID:
+        return isSetId();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcGetLastCommittedSequence_args)
+        return this.equals((cdcGetLastCommittedSequence_args)that);
+      return false;
+    }
+
+    public boolean equals(cdcGetLastCommittedSequence_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_id = true && this.isSetId();
+      boolean that_present_id = true && that.isSetId();
+      if (this_present_id || that_present_id) {
+        if (!(this_present_id && that_present_id))
+          return false;
+        if (!this.id.equals(that.id))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetId()) ? 131071 : 524287);
+      if (isSetId())
+        hashCode = hashCode * 8191 + id.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcGetLastCommittedSequence_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetId(), other.isSetId());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetId()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.id, other.id);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcGetLastCommittedSequence_args(");
+      boolean first = true;
+
+      sb.append("id:");
+      if (this.id == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.id);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      if (id == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'id' was not present! Struct: " + toString());
+      }
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcGetLastCommittedSequence_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcGetLastCommittedSequence_argsStandardScheme getScheme() {
+        return new cdcGetLastCommittedSequence_argsStandardScheme();
+      }
+    }
+
+    private static class cdcGetLastCommittedSequence_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcGetLastCommittedSequence_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcGetLastCommittedSequence_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // ID
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+                struct.id = iprot.readString();
+                struct.setIdIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcGetLastCommittedSequence_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.id != null) {
+          oprot.writeFieldBegin(ID_FIELD_DESC);
+          oprot.writeString(struct.id);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcGetLastCommittedSequence_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcGetLastCommittedSequence_argsTupleScheme getScheme() {
+        return new cdcGetLastCommittedSequence_argsTupleScheme();
+      }
+    }
+
+    private static class cdcGetLastCommittedSequence_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcGetLastCommittedSequence_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcGetLastCommittedSequence_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        oprot.writeString(struct.id);
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcGetLastCommittedSequence_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.id = iprot.readString();
+        struct.setIdIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcGetLastCommittedSequence_result implements org.apache.thrift.TBase<cdcGetLastCommittedSequence_result, cdcGetLastCommittedSequence_result._Fields>, java.io.Serializable, Cloneable, Comparable<cdcGetLastCommittedSequence_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcGetLastCommittedSequence_result");
+
+    private static final org.apache.thrift.protocol.TField SUCCESS_FIELD_DESC = new org.apache.thrift.protocol.TField("success", org.apache.thrift.protocol.TType.STRUCT, (short)0);
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcGetLastCommittedSequence_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcGetLastCommittedSequence_resultTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable OptionalLongValue success; // required
+    public @org.apache.thrift.annotation.Nullable RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      SUCCESS((short)0, "success"),
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 0: // SUCCESS
+            return SUCCESS;
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.SUCCESS, new org.apache.thrift.meta_data.FieldMetaData("success", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, OptionalLongValue.class)));
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcGetLastCommittedSequence_result.class, metaDataMap);
+    }
+
+    public cdcGetLastCommittedSequence_result() {
+    }
+
+    public cdcGetLastCommittedSequence_result(
+      OptionalLongValue success,
+      RocksDBThriftException e)
+    {
+      this();
+      this.success = success;
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcGetLastCommittedSequence_result(cdcGetLastCommittedSequence_result other) {
+      if (other.isSetSuccess()) {
+        this.success = new OptionalLongValue(other.success);
+      }
+      if (other.isSetE()) {
+        this.e = new RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public cdcGetLastCommittedSequence_result deepCopy() {
+      return new cdcGetLastCommittedSequence_result(this);
+    }
+
+    @Override
+    public void clear() {
+      this.success = null;
+      this.e = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public OptionalLongValue getSuccess() {
+      return this.success;
+    }
+
+    public cdcGetLastCommittedSequence_result setSuccess(@org.apache.thrift.annotation.Nullable OptionalLongValue success) {
+      this.success = success;
+      return this;
+    }
+
+    public void unsetSuccess() {
+      this.success = null;
+    }
+
+    /** Returns true if field success is set (has been assigned a value) and false otherwise */
+    public boolean isSetSuccess() {
+      return this.success != null;
+    }
+
+    public void setSuccessIsSet(boolean value) {
+      if (!value) {
+        this.success = null;
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public cdcGetLastCommittedSequence_result setE(@org.apache.thrift.annotation.Nullable RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case SUCCESS:
+        if (value == null) {
+          unsetSuccess();
+        } else {
+          setSuccess((OptionalLongValue)value);
+        }
+        break;
+
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case SUCCESS:
+        return getSuccess();
+
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case SUCCESS:
+        return isSetSuccess();
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcGetLastCommittedSequence_result)
+        return this.equals((cdcGetLastCommittedSequence_result)that);
+      return false;
+    }
+
+    public boolean equals(cdcGetLastCommittedSequence_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_success = true && this.isSetSuccess();
+      boolean that_present_success = true && that.isSetSuccess();
+      if (this_present_success || that_present_success) {
+        if (!(this_present_success && that_present_success))
+          return false;
+        if (!this.success.equals(that.success))
+          return false;
+      }
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetSuccess()) ? 131071 : 524287);
+      if (isSetSuccess())
+        hashCode = hashCode * 8191 + success.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcGetLastCommittedSequence_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetSuccess(), other.isSetSuccess());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetSuccess()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.success, other.success);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcGetLastCommittedSequence_result(");
+      boolean first = true;
+
+      sb.append("success:");
+      if (this.success == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.success);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+      if (success != null) {
+        success.validate();
+      }
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcGetLastCommittedSequence_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcGetLastCommittedSequence_resultStandardScheme getScheme() {
+        return new cdcGetLastCommittedSequence_resultStandardScheme();
+      }
+    }
+
+    private static class cdcGetLastCommittedSequence_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcGetLastCommittedSequence_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcGetLastCommittedSequence_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 0: // SUCCESS
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.success = new OptionalLongValue();
+                struct.success.read(iprot);
+                struct.setSuccessIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcGetLastCommittedSequence_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.success != null) {
+          oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+          struct.success.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcGetLastCommittedSequence_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcGetLastCommittedSequence_resultTupleScheme getScheme() {
+        return new cdcGetLastCommittedSequence_resultTupleScheme();
+      }
+    }
+
+    private static class cdcGetLastCommittedSequence_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcGetLastCommittedSequence_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcGetLastCommittedSequence_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetSuccess()) {
+          optionals.set(0);
+        }
+        if (struct.isSetE()) {
+          optionals.set(1);
+        }
+        oprot.writeBitSet(optionals, 2);
+        if (struct.isSetSuccess()) {
+          struct.success.write(oprot);
+        }
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcGetLastCommittedSequence_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(2);
+        if (incoming.get(0)) {
+          struct.success = new OptionalLongValue();
+          struct.success.read(iprot);
+          struct.setSuccessIsSet(true);
+        }
+        if (incoming.get(1)) {
+          struct.e = new RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcPollBatch_args implements org.apache.thrift.TBase<cdcPollBatch_args, cdcPollBatch_args._Fields>, java.io.Serializable, Cloneable, Comparable<cdcPollBatch_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcPollBatch_args");
+
+    private static final org.apache.thrift.protocol.TField REQUEST_FIELD_DESC = new org.apache.thrift.protocol.TField("request", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcPollBatch_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcPollBatch_argsTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable CdcPollRequest request; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      REQUEST((short)1, "request");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // REQUEST
+            return REQUEST;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.REQUEST, new org.apache.thrift.meta_data.FieldMetaData("request", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, CdcPollRequest.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcPollBatch_args.class, metaDataMap);
+    }
+
+    public cdcPollBatch_args() {
+    }
+
+    public cdcPollBatch_args(
+      CdcPollRequest request)
+    {
+      this();
+      this.request = request;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcPollBatch_args(cdcPollBatch_args other) {
+      if (other.isSetRequest()) {
+        this.request = new CdcPollRequest(other.request);
+      }
+    }
+
+    @Override
+    public cdcPollBatch_args deepCopy() {
+      return new cdcPollBatch_args(this);
+    }
+
+    @Override
+    public void clear() {
+      this.request = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public CdcPollRequest getRequest() {
+      return this.request;
+    }
+
+    public cdcPollBatch_args setRequest(@org.apache.thrift.annotation.Nullable CdcPollRequest request) {
+      this.request = request;
+      return this;
+    }
+
+    public void unsetRequest() {
+      this.request = null;
+    }
+
+    /** Returns true if field request is set (has been assigned a value) and false otherwise */
+    public boolean isSetRequest() {
+      return this.request != null;
+    }
+
+    public void setRequestIsSet(boolean value) {
+      if (!value) {
+        this.request = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case REQUEST:
+        if (value == null) {
+          unsetRequest();
+        } else {
+          setRequest((CdcPollRequest)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case REQUEST:
+        return getRequest();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case REQUEST:
+        return isSetRequest();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcPollBatch_args)
+        return this.equals((cdcPollBatch_args)that);
+      return false;
+    }
+
+    public boolean equals(cdcPollBatch_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_request = true && this.isSetRequest();
+      boolean that_present_request = true && that.isSetRequest();
+      if (this_present_request || that_present_request) {
+        if (!(this_present_request && that_present_request))
+          return false;
+        if (!this.request.equals(that.request))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetRequest()) ? 131071 : 524287);
+      if (isSetRequest())
+        hashCode = hashCode * 8191 + request.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcPollBatch_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetRequest(), other.isSetRequest());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetRequest()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.request, other.request);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcPollBatch_args(");
+      boolean first = true;
+
+      sb.append("request:");
+      if (this.request == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.request);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      if (request == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'request' was not present! Struct: " + toString());
+      }
+      // check for sub-struct validity
+      if (request != null) {
+        request.validate();
+      }
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcPollBatch_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcPollBatch_argsStandardScheme getScheme() {
+        return new cdcPollBatch_argsStandardScheme();
+      }
+    }
+
+    private static class cdcPollBatch_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcPollBatch_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcPollBatch_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // REQUEST
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.request = new CdcPollRequest();
+                struct.request.read(iprot);
+                struct.setRequestIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcPollBatch_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.request != null) {
+          oprot.writeFieldBegin(REQUEST_FIELD_DESC);
+          struct.request.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcPollBatch_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcPollBatch_argsTupleScheme getScheme() {
+        return new cdcPollBatch_argsTupleScheme();
+      }
+    }
+
+    private static class cdcPollBatch_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcPollBatch_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcPollBatch_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.request.write(oprot);
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcPollBatch_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.request = new CdcPollRequest();
+        struct.request.read(iprot);
+        struct.setRequestIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcPollBatch_result implements org.apache.thrift.TBase<cdcPollBatch_result, cdcPollBatch_result._Fields>, java.io.Serializable, Cloneable, Comparable<cdcPollBatch_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcPollBatch_result");
+
+    private static final org.apache.thrift.protocol.TField SUCCESS_FIELD_DESC = new org.apache.thrift.protocol.TField("success", org.apache.thrift.protocol.TType.STRUCT, (short)0);
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcPollBatch_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcPollBatch_resultTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable CdcPollBatchResult success; // required
+    public @org.apache.thrift.annotation.Nullable RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      SUCCESS((short)0, "success"),
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 0: // SUCCESS
+            return SUCCESS;
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.SUCCESS, new org.apache.thrift.meta_data.FieldMetaData("success", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, CdcPollBatchResult.class)));
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcPollBatch_result.class, metaDataMap);
+    }
+
+    public cdcPollBatch_result() {
+    }
+
+    public cdcPollBatch_result(
+      CdcPollBatchResult success,
+      RocksDBThriftException e)
+    {
+      this();
+      this.success = success;
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcPollBatch_result(cdcPollBatch_result other) {
+      if (other.isSetSuccess()) {
+        this.success = new CdcPollBatchResult(other.success);
+      }
+      if (other.isSetE()) {
+        this.e = new RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public cdcPollBatch_result deepCopy() {
+      return new cdcPollBatch_result(this);
+    }
+
+    @Override
+    public void clear() {
+      this.success = null;
+      this.e = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public CdcPollBatchResult getSuccess() {
+      return this.success;
+    }
+
+    public cdcPollBatch_result setSuccess(@org.apache.thrift.annotation.Nullable CdcPollBatchResult success) {
+      this.success = success;
+      return this;
+    }
+
+    public void unsetSuccess() {
+      this.success = null;
+    }
+
+    /** Returns true if field success is set (has been assigned a value) and false otherwise */
+    public boolean isSetSuccess() {
+      return this.success != null;
+    }
+
+    public void setSuccessIsSet(boolean value) {
+      if (!value) {
+        this.success = null;
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public cdcPollBatch_result setE(@org.apache.thrift.annotation.Nullable RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case SUCCESS:
+        if (value == null) {
+          unsetSuccess();
+        } else {
+          setSuccess((CdcPollBatchResult)value);
+        }
+        break;
+
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case SUCCESS:
+        return getSuccess();
+
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case SUCCESS:
+        return isSetSuccess();
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcPollBatch_result)
+        return this.equals((cdcPollBatch_result)that);
+      return false;
+    }
+
+    public boolean equals(cdcPollBatch_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_success = true && this.isSetSuccess();
+      boolean that_present_success = true && that.isSetSuccess();
+      if (this_present_success || that_present_success) {
+        if (!(this_present_success && that_present_success))
+          return false;
+        if (!this.success.equals(that.success))
+          return false;
+      }
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetSuccess()) ? 131071 : 524287);
+      if (isSetSuccess())
+        hashCode = hashCode * 8191 + success.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcPollBatch_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetSuccess(), other.isSetSuccess());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetSuccess()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.success, other.success);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcPollBatch_result(");
+      boolean first = true;
+
+      sb.append("success:");
+      if (this.success == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.success);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+      if (success != null) {
+        success.validate();
+      }
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcPollBatch_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcPollBatch_resultStandardScheme getScheme() {
+        return new cdcPollBatch_resultStandardScheme();
+      }
+    }
+
+    private static class cdcPollBatch_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcPollBatch_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcPollBatch_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 0: // SUCCESS
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.success = new CdcPollBatchResult();
+                struct.success.read(iprot);
+                struct.setSuccessIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcPollBatch_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.success != null) {
+          oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+          struct.success.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcPollBatch_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcPollBatch_resultTupleScheme getScheme() {
+        return new cdcPollBatch_resultTupleScheme();
+      }
+    }
+
+    private static class cdcPollBatch_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcPollBatch_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcPollBatch_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetSuccess()) {
+          optionals.set(0);
+        }
+        if (struct.isSetE()) {
+          optionals.set(1);
+        }
+        oprot.writeBitSet(optionals, 2);
+        if (struct.isSetSuccess()) {
+          struct.success.write(oprot);
+        }
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcPollBatch_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(2);
+        if (incoming.get(0)) {
+          struct.success = new CdcPollBatchResult();
+          struct.success.read(iprot);
+          struct.setSuccessIsSet(true);
+        }
+        if (incoming.get(1)) {
+          struct.e = new RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcCommit_args implements org.apache.thrift.TBase<cdcCommit_args, cdcCommit_args._Fields>, java.io.Serializable, Cloneable, Comparable<cdcCommit_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcCommit_args");
+
+    private static final org.apache.thrift.protocol.TField ID_FIELD_DESC = new org.apache.thrift.protocol.TField("id", org.apache.thrift.protocol.TType.STRING, (short)1);
+    private static final org.apache.thrift.protocol.TField SEQ_FIELD_DESC = new org.apache.thrift.protocol.TField("seq", org.apache.thrift.protocol.TType.I64, (short)2);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcCommit_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcCommit_argsTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable java.lang.String id; // required
+    public long seq; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      ID((short)1, "id"),
+      SEQ((short)2, "seq");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // ID
+            return ID;
+          case 2: // SEQ
+            return SEQ;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    private static final int __SEQ_ISSET_ID = 0;
+    private byte __isset_bitfield = 0;
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.ID, new org.apache.thrift.meta_data.FieldMetaData("id", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+      tmpMap.put(_Fields.SEQ, new org.apache.thrift.meta_data.FieldMetaData("seq", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcCommit_args.class, metaDataMap);
+    }
+
+    public cdcCommit_args() {
+    }
+
+    public cdcCommit_args(
+      java.lang.String id,
+      long seq)
+    {
+      this();
+      this.id = id;
+      this.seq = seq;
+      setSeqIsSet(true);
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcCommit_args(cdcCommit_args other) {
+      __isset_bitfield = other.__isset_bitfield;
+      if (other.isSetId()) {
+        this.id = other.id;
+      }
+      this.seq = other.seq;
+    }
+
+    @Override
+    public cdcCommit_args deepCopy() {
+      return new cdcCommit_args(this);
+    }
+
+    @Override
+    public void clear() {
+      this.id = null;
+      setSeqIsSet(false);
+      this.seq = 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.lang.String getId() {
+      return this.id;
+    }
+
+    public cdcCommit_args setId(@org.apache.thrift.annotation.Nullable java.lang.String id) {
+      this.id = id;
+      return this;
+    }
+
+    public void unsetId() {
+      this.id = null;
+    }
+
+    /** Returns true if field id is set (has been assigned a value) and false otherwise */
+    public boolean isSetId() {
+      return this.id != null;
+    }
+
+    public void setIdIsSet(boolean value) {
+      if (!value) {
+        this.id = null;
+      }
+    }
+
+    public long getSeq() {
+      return this.seq;
+    }
+
+    public cdcCommit_args setSeq(long seq) {
+      this.seq = seq;
+      setSeqIsSet(true);
+      return this;
+    }
+
+    public void unsetSeq() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __SEQ_ISSET_ID);
+    }
+
+    /** Returns true if field seq is set (has been assigned a value) and false otherwise */
+    public boolean isSetSeq() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __SEQ_ISSET_ID);
+    }
+
+    public void setSeqIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __SEQ_ISSET_ID, value);
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case ID:
+        if (value == null) {
+          unsetId();
+        } else {
+          setId((java.lang.String)value);
+        }
+        break;
+
+      case SEQ:
+        if (value == null) {
+          unsetSeq();
+        } else {
+          setSeq((java.lang.Long)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case ID:
+        return getId();
+
+      case SEQ:
+        return getSeq();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case ID:
+        return isSetId();
+      case SEQ:
+        return isSetSeq();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcCommit_args)
+        return this.equals((cdcCommit_args)that);
+      return false;
+    }
+
+    public boolean equals(cdcCommit_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_id = true && this.isSetId();
+      boolean that_present_id = true && that.isSetId();
+      if (this_present_id || that_present_id) {
+        if (!(this_present_id && that_present_id))
+          return false;
+        if (!this.id.equals(that.id))
+          return false;
+      }
+
+      boolean this_present_seq = true;
+      boolean that_present_seq = true;
+      if (this_present_seq || that_present_seq) {
+        if (!(this_present_seq && that_present_seq))
+          return false;
+        if (this.seq != that.seq)
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetId()) ? 131071 : 524287);
+      if (isSetId())
+        hashCode = hashCode * 8191 + id.hashCode();
+
+      hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(seq);
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcCommit_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetId(), other.isSetId());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetId()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.id, other.id);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetSeq(), other.isSetSeq());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetSeq()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.seq, other.seq);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcCommit_args(");
+      boolean first = true;
+
+      sb.append("id:");
+      if (this.id == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.id);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("seq:");
+      sb.append(this.seq);
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      if (id == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'id' was not present! Struct: " + toString());
+      }
+      // alas, we cannot check 'seq' because it's a primitive and you chose the non-beans generator.
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcCommit_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcCommit_argsStandardScheme getScheme() {
+        return new cdcCommit_argsStandardScheme();
+      }
+    }
+
+    private static class cdcCommit_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcCommit_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcCommit_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // ID
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+                struct.id = iprot.readString();
+                struct.setIdIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 2: // SEQ
+              if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+                struct.seq = iprot.readI64();
+                struct.setSeqIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        if (!struct.isSetSeq()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'seq' was not found in serialized data! Struct: " + toString());
+        }
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcCommit_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.id != null) {
+          oprot.writeFieldBegin(ID_FIELD_DESC);
+          oprot.writeString(struct.id);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldBegin(SEQ_FIELD_DESC);
+        oprot.writeI64(struct.seq);
+        oprot.writeFieldEnd();
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcCommit_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcCommit_argsTupleScheme getScheme() {
+        return new cdcCommit_argsTupleScheme();
+      }
+    }
+
+    private static class cdcCommit_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcCommit_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcCommit_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        oprot.writeString(struct.id);
+        oprot.writeI64(struct.seq);
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcCommit_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.id = iprot.readString();
+        struct.setIdIsSet(true);
+        struct.seq = iprot.readI64();
+        struct.setSeqIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class cdcCommit_result implements org.apache.thrift.TBase<cdcCommit_result, cdcCommit_result._Fields>, java.io.Serializable, Cloneable, Comparable<cdcCommit_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcCommit_result");
+
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcCommit_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcCommit_resultTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcCommit_result.class, metaDataMap);
+    }
+
+    public cdcCommit_result() {
+    }
+
+    public cdcCommit_result(
+      RocksDBThriftException e)
+    {
+      this();
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public cdcCommit_result(cdcCommit_result other) {
+      if (other.isSetE()) {
+        this.e = new RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public cdcCommit_result deepCopy() {
+      return new cdcCommit_result(this);
+    }
+
+    @Override
+    public void clear() {
+      this.e = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public cdcCommit_result setE(@org.apache.thrift.annotation.Nullable RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof cdcCommit_result)
+        return this.equals((cdcCommit_result)that);
+      return false;
+    }
+
+    public boolean equals(cdcCommit_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(cdcCommit_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcCommit_result(");
+      boolean first = true;
+
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class cdcCommit_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcCommit_resultStandardScheme getScheme() {
+        return new cdcCommit_resultStandardScheme();
+      }
+    }
+
+    private static class cdcCommit_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<cdcCommit_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, cdcCommit_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, cdcCommit_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class cdcCommit_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public cdcCommit_resultTupleScheme getScheme() {
+        return new cdcCommit_resultTupleScheme();
+      }
+    }
+
+    private static class cdcCommit_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<cdcCommit_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, cdcCommit_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetE()) {
+          optionals.set(0);
+        }
+        oprot.writeBitSet(optionals, 1);
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, cdcCommit_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(1);
+        if (incoming.get(0)) {
           struct.e = new RocksDBThriftException();
           struct.e.read(iprot);
           struct.setEIsSet(true);

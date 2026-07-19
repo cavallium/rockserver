@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import java.util.concurrent.CancellationException;
@@ -123,6 +124,11 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public boolean deleteColumnIfExists(@NotNull String name) throws RocksDBException {
+		return db.deleteColumnIfExists(name);
+	}
+
+	@Override
 	public long getColumnId(@NotNull String name) {
 		return db.getColumnId(name);
 	}
@@ -170,12 +176,24 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
     }
 
 	private java.util.concurrent.Executor commandExecutor(RocksDBAPICommand<?, ?, ?> command) {
-		if (command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator) {
+		if (command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator
+				|| command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate
+				|| (command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction closeTransaction
+				&& !closeTransaction.commit())
+				|| command instanceof RocksDBAPICommand.CdcCommit) {
 			return db.getScheduler().controlExecutor();
 		}
 		if (command instanceof RocksDBAPICommand.Flush
-				|| command instanceof RocksDBAPICommand.Compact) {
+					|| command instanceof RocksDBAPICommand.Compact) {
 			return db.getScheduler().maintenanceExecutor();
+		}
+		if (command instanceof RocksDBAPICommand.CdcGetEarliestAvailableSequence) {
+			return db.getScheduler().cdcExecutor();
+		}
+		if (command instanceof RocksDBAPICommand.CdcCreate create
+				&& create.fromSeq() != null
+				&& create.fromSeq() == 0L) {
+			return db.getScheduler().cdcExecutor();
 		}
 		if (!command.isReadOnly()) {
 			return db.getScheduler().writeExecutor();
@@ -809,18 +827,37 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
     // CDC API implementation stubs delegating to EmbeddedDB
     public long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-        return db.cdcCreate(id, fromSeq, columnIds, null);
+        return db.cdcCreate(id, fromSeq, columnIds, null, null);
     }
 
     public long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
-        return db.cdcCreate(id, fromSeq, columnIds, resolvedValues);
+        return db.cdcCreate(id, fromSeq, columnIds, resolvedValues, null);
     }
 
-    public void cdcDelete(@NotNull String id) throws RocksDBException {
-        db.cdcDelete(id);
+    @Override
+    public long cdcCreate(@NotNull String id,
+                          @Nullable Long fromSeq,
+                          @Nullable List<Long> columnIds,
+                          @Nullable Boolean resolvedValues,
+                          @Nullable OptionalLong expectedLastCommitted) throws RocksDBException {
+        return db.cdcCreate(id, fromSeq, columnIds, resolvedValues, expectedLastCommitted);
     }
 
-    public void cdcCommit(@NotNull String id, long seq) throws RocksDBException {
+	public void cdcDelete(@NotNull String id) throws RocksDBException {
+		db.cdcDelete(id);
+	}
+
+	@Override
+	public long cdcGetEarliestAvailableSequence() throws RocksDBException {
+		return db.cdcGetEarliestAvailableSequence();
+	}
+
+	@Override
+	public java.util.OptionalLong cdcGetLastCommittedSequence(@NotNull String id) throws RocksDBException {
+		return db.cdcGetLastCommittedSequence(id);
+	}
+
+	public void cdcCommit(@NotNull String id, long seq) throws RocksDBException {
         db.cdcCommit(id, seq);
     }
 

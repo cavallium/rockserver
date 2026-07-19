@@ -7,15 +7,14 @@
 package it.cavallium.rockserver.core.common.api;
 
 
-public enum PutBatchMode implements org.apache.thrift.TEnum {
-  WRITE_BATCH(0),
-  WRITE_BATCH_NO_WAL(1),
-  SST_INGESTION(2),
-  SST_INGEST_BEHIND(3);
+public enum CDCOperation implements org.apache.thrift.TEnum {
+  PUT(0),
+  DELETE(1),
+  MERGE(2);
 
   private final int value;
 
-  private PutBatchMode(int value) {
+  private CDCOperation(int value) {
     this.value = value;
   }
 
@@ -32,16 +31,14 @@ public enum PutBatchMode implements org.apache.thrift.TEnum {
    * @return null if the value is not found.
    */
   @org.apache.thrift.annotation.Nullable
-  public static PutBatchMode findByValue(int value) {
+  public static CDCOperation findByValue(int value) {
     switch (value) {
       case 0:
-        return WRITE_BATCH;
+        return PUT;
       case 1:
-        return WRITE_BATCH_NO_WAL;
+        return DELETE;
       case 2:
-        return SST_INGESTION;
-      case 3:
-        return SST_INGEST_BEHIND;
+        return MERGE;
       default:
         return null;
     }

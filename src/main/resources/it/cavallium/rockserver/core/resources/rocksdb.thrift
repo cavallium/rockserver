@@ -56,6 +56,47 @@ struct OptionalBinary {
   1: optional binary value
 }
 
+struct OptionalLongValue {
+  1: optional i64 value
+}
+
+enum CDCOperation {
+  PUT = 0,
+  DELETE = 1,
+  MERGE = 2
+}
+
+struct CDCEvent {
+  1: required i64 seq,
+  2: required i64 columnId,
+  3: required binary key,
+  4: optional binary value,
+  5: required CDCOperation op
+}
+
+struct CdcPollBatchResult {
+  1: required list<CDCEvent> events,
+  2: required i64 nextSeq
+}
+
+struct CdcCreateRequest {
+  1: required string id,
+  2: optional i64 fromSeq,
+  3: optional list<i64> columnIds,
+  4: optional bool emitLatestValues,
+  // Both absent means unchecked. expectAbsent=true requires no metadata;
+  // expectedLastCommittedSeq requires an exact durable checkpoint.
+  5: optional bool expectAbsent,
+  6: optional i64 expectedLastCommittedSeq
+}
+
+struct CdcPollRequest {
+  1: required string id,
+  2: optional i64 fromSeq,
+  3: required i64 maxEvents,
+  4: optional i32 maxResponseBytes
+}
+
 struct UpdateBegin {
   1: optional binary previous,
   2: optional i64 updateId
@@ -110,7 +151,11 @@ enum RocksDBErrorType {
   INTERNAL_ERROR = 35,
   TRANSACTION_NOT_FOUND = 36,
   NULL_ARGUMENT = 37,
-  READ_DEADLINE_EXCEEDED = 38
+  READ_DEADLINE_EXCEEDED = 38,
+	CDC_GAP_DETECTED = 39,
+	CDC_RESPONSE_TOO_LARGE = 40,
+	CDC_SUBSCRIPTION_CHANGED = 41,
+	CDC_SUBSCRIPTION_NOT_FOUND = 42
 }
 
 exception RocksDBThriftException {
@@ -129,6 +174,8 @@ service RocksDB {
    i64 createColumn(1: required string name, 2: required ColumnSchema schema) throws (1: RocksDBThriftException e),
 
    void deleteColumn(1: required i64 columnId) throws (1: RocksDBThriftException e),
+
+   bool deleteColumnIfExists(1: required string name) throws (1: RocksDBThriftException e),
 
    i64 getColumnId(1: required string name) throws (1: RocksDBThriftException e),
 
@@ -217,5 +264,17 @@ service RocksDB {
    void compact() throws (1: RocksDBThriftException e),
 
    list<Column> getAllColumnDefinitions() throws (1: RocksDBThriftException e),
+
+   i64 cdcCreate(1: required CdcCreateRequest request) throws (1: RocksDBThriftException e),
+
+   void cdcDelete(1: required string id) throws (1: RocksDBThriftException e),
+
+   i64 cdcGetEarliestAvailableSequence() throws (1: RocksDBThriftException e),
+
+   OptionalLongValue cdcGetLastCommittedSequence(1: required string id) throws (1: RocksDBThriftException e),
+
+   CdcPollBatchResult cdcPollBatch(1: required CdcPollRequest request) throws (1: RocksDBThriftException e),
+
+   void cdcCommit(1: required string id, 2: required i64 seq) throws (1: RocksDBThriftException e),
 
 }

@@ -40,6 +40,33 @@ class CdcPollErrorPropagationTest {
 	Path tempDir;
 
 	@Test
+	void missingSubscriptionIsTypedForCommitAndEveryEmbeddedPollPath() throws Exception {
+		try (var db = new EmbeddedDB(tempDir, "cdc-missing-subscription", null)) {
+			var commitError = assertThrows(RocksDBException.class,
+					() -> db.cdcCommit("missing", 1L));
+			assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
+					commitError.getErrorUniqueId());
+
+			var syncPollError = assertThrows(RocksDBException.class,
+					() -> db.cdcPoll("missing", null, 10).toList());
+			assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
+					syncPollError.getErrorUniqueId());
+
+			var streamPollError = assertThrows(RocksDBException.class,
+					() -> Flux.from(db.cdcPollAsyncInternal("missing", null, 10))
+							.collectList()
+							.block());
+			assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
+					streamPollError.getErrorUniqueId());
+
+			var batchPollError = assertThrows(RocksDBException.class,
+					() -> db.cdcPollBatchAsyncInternal("missing", null, 10).block());
+			assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
+					batchPollError.getErrorUniqueId());
+		}
+	}
+
+	@Test
 	void writeBatchParserFailureFailsThePollInsteadOfReturningAPartialBatch() throws Exception {
 		try (var db = new ParserFailingEmbeddedDB(tempDir, "cdc-parser-failure")) {
 			long columnId = db.createColumn("data", ColumnSchema.of(
@@ -245,7 +272,7 @@ class CdcPollErrorPropagationTest {
 	@Test
 	void prefixlessProbeReflushesAndReopensAfterTailRefresh() throws Exception {
 		try (var db = new TailRefreshingEmbeddedDB(tempDir, "cdc-prefixless-refresh", 2, 37)) {
-			long startSeq = db.cdcCreate("probe", 0L, List.of(), false);
+			long startSeq = db.cdcGetEarliestAvailableSequence();
 
 			assertEquals(37L << 20, startSeq);
 			assertEquals(3, db.flushes);
@@ -258,7 +285,7 @@ class CdcPollErrorPropagationTest {
 		try (var db = new TailRefreshingEmbeddedDB(tempDir, "cdc-prefixless-cap", Integer.MAX_VALUE, 37)) {
 			var error = assertTimeoutPreemptively(Duration.ofSeconds(2),
 					() -> assertThrows(RocksDBRetryException.class,
-							() -> db.cdcCreate("probe", 0L, List.of(), false)));
+						() -> db.cdcGetEarliestAvailableSequence()));
 
 			assertEquals(RocksDBErrorType.UPDATE_RETRY, error.getErrorUniqueId());
 			assertEquals(3, db.flushes);
@@ -269,7 +296,7 @@ class CdcPollErrorPropagationTest {
 	@Test
 	void prefixlessEmptyFallbackRetriesWhenTheSequenceMoves() throws Exception {
 		try (var db = new MovingEmptyEmbeddedDB(tempDir, "cdc-prefixless-moving-empty")) {
-			long startSeq = db.cdcCreate("probe", 0L, List.of(), false);
+			long startSeq = db.cdcGetEarliestAvailableSequence();
 
 			assertEquals(10L << 20, startSeq);
 			assertEquals(3, db.flushes);

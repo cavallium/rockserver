@@ -91,9 +91,9 @@ public class UpdateBegin implements org.apache.thrift.TBase<UpdateBegin, UpdateB
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
-    tmpMap.put(_Fields.PREVIOUS, new org.apache.thrift.meta_data.FieldMetaData("previous", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+    tmpMap.put(_Fields.PREVIOUS, new org.apache.thrift.meta_data.FieldMetaData("previous", org.apache.thrift.TFieldRequirementType.OPTIONAL,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
-    tmpMap.put(_Fields.UPDATE_ID, new org.apache.thrift.meta_data.FieldMetaData("updateId", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+    tmpMap.put(_Fields.UPDATE_ID, new org.apache.thrift.meta_data.FieldMetaData("updateId", org.apache.thrift.TFieldRequirementType.OPTIONAL,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(UpdateBegin.class, metaDataMap);
@@ -397,7 +397,7 @@ public class UpdateBegin implements org.apache.thrift.TBase<UpdateBegin, UpdateB
       while (true)
       {
         schemeField = iprot.readFieldBegin();
-        if (schemeField.type == org.apache.thrift.protocol.TType.STOP) { 
+        if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
           break;
         }
         switch (schemeField.id) {
@@ -405,7 +405,7 @@ public class UpdateBegin implements org.apache.thrift.TBase<UpdateBegin, UpdateB
             if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
               struct.previous = iprot.readBinary();
               struct.setPreviousIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
@@ -413,7 +413,7 @@ public class UpdateBegin implements org.apache.thrift.TBase<UpdateBegin, UpdateB
             if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
               struct.updateId = iprot.readI64();
               struct.setUpdateIdIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;

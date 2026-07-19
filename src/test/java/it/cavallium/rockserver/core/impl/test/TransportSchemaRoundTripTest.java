@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertIterableEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -55,7 +56,10 @@ class TransportSchemaRoundTripTest {
 			Map<String, Long> firstIds = createAll(api, expected);
 			assertSnapshot(api, expected, firstIds, name + ", first creation");
 
-			firstIds.values().forEach(api::deleteColumn);
+			for (String columnName : expected.keySet()) {
+				assertTrue(api.deleteColumnIfExists(columnName), name + ", first deletion of " + columnName);
+				assertFalse(api.deleteColumnIfExists(columnName), name + ", repeated deletion of " + columnName);
+			}
 			assertTrue(api.getAllColumnDefinitions().isEmpty(), name + ", definitions after deletion");
 			for (String columnName : expected.keySet()) {
 				assertThrows(RocksDBException.class, () -> api.getColumnId(columnName),

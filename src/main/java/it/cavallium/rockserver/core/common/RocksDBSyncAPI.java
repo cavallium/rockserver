@@ -15,6 +15,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumnIfExists;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Delete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.EstimateNumKeys;
@@ -38,6 +39,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSt
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.stream.Stream;
 
 import org.jetbrains.annotations.NotNull;
@@ -92,6 +94,11 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	/** See: {@link DeleteColumn}. */
 	default void deleteColumn(long columnId) throws RocksDBException {
 		requestSync(new DeleteColumn(columnId));
+	}
+
+	/** Atomically delete a column by name when it exists. */
+	default boolean deleteColumnIfExists(@NotNull String name) throws RocksDBException {
+		return requestSync(new DeleteColumnIfExists(name));
 	}
 
 	/** See: {@link GetColumnId}. */
@@ -273,17 +280,40 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
     // CDC API
     /** Create or update a CDC subscription. Returns the start sequence. */
     default long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-        return requestSync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds, null));
+        return cdcCreate(id, fromSeq, columnIds, null, null);
     }
 
     /** Create or update a CDC subscription. Returns the start sequence. */
     default long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean emitLatestValues) throws RocksDBException {
-        return requestSync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds, emitLatestValues));
+        return cdcCreate(id, fromSeq, columnIds, emitLatestValues, null);
+    }
+
+    /**
+     * Atomically create or update a CDC subscription if its durable checkpoint still matches.
+     * {@code null} disables the precondition, empty requires absence, and a present value requires an exact match.
+     */
+    default long cdcCreate(@NotNull String id,
+                           @Nullable Long fromSeq,
+                           @Nullable List<Long> columnIds,
+                           @Nullable Boolean emitLatestValues,
+                           @Nullable OptionalLong expectedLastCommitted) throws RocksDBException {
+        return requestSync(new RocksDBAPICommand.CdcCreate(
+                id, fromSeq, columnIds, emitLatestValues, expectedLastCommitted));
     }
 
     /** Delete a CDC subscription */
     default void cdcDelete(@NotNull String id) throws RocksDBException {
         requestSync(new RocksDBAPICommand.CdcDelete(id));
+    }
+
+	/** Return the earliest CDC cursor still available in this database's WAL. */
+	default long cdcGetEarliestAvailableSequence() throws RocksDBException {
+		return requestSync(new RocksDBAPICommand.CdcGetEarliestAvailableSequence());
+	}
+
+    /** Return the durable last committed sequence for a CDC subscription, if it exists. */
+    default OptionalLong cdcGetLastCommittedSequence(@NotNull String id) throws RocksDBException {
+        return requestSync(new RocksDBAPICommand.CdcGetLastCommittedSequence(id));
     }
 
     /** Commit the last processed CDC sequence for a subscription */

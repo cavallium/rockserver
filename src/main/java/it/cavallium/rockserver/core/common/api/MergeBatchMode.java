@@ -32,7 +32,7 @@ public enum MergeBatchMode implements org.apache.thrift.TEnum {
    * @return null if the value is not found.
    */
   @org.apache.thrift.annotation.Nullable
-  public static MergeBatchMode findByValue(int value) { 
+  public static MergeBatchMode findByValue(int value) {
     switch (value) {
       case 0:
         return MERGE_WRITE_BATCH;

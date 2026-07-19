@@ -105,6 +105,15 @@ impl RockserverClient {
         Ok(())
     }
 
+    /// Deletes a column by name if it exists.
+    ///
+    /// Returns `true` when a physical column was deleted and `false` when it was already absent.
+    pub async fn delete_column_if_exists(&self, name: String) -> Result<bool> {
+        let req = DeleteColumnIfExistsRequest { name };
+        let resp = self.client.clone().delete_column_if_exists(req).await?;
+        Ok(resp.into_inner().deleted)
+    }
+
     /// Retrieves the ID of a column by its name.
     pub async fn get_column_id(&self, name: String) -> Result<i64> {
         let req = GetColumnIdRequest { name };
@@ -743,8 +752,43 @@ impl RockserverClient {
             from_seq,
             column_ids,
             resolved_values,
+            expected_last_committed: None,
         };
         let resp = self.client.clone().cdc_create(req).await?;
+        Ok(resp.into_inner().start_seq)
+    }
+
+    /// Creates or updates a CDC stream with an atomic durable-checkpoint precondition.
+    pub async fn cdc_create_checked(
+        &self,
+        id: String,
+        from_seq: Option<i64>,
+        column_ids: Vec<i64>,
+        resolved_values: Option<bool>,
+        precondition: CdcCreatePrecondition,
+    ) -> std::result::Result<i64, CdcCreateError> {
+        let expected_last_committed = match precondition {
+            CdcCreatePrecondition::Unchecked => None,
+            CdcCreatePrecondition::Absent => {
+                Some(cdc_create_request::ExpectedLastCommitted::ExpectAbsent(()))
+            }
+            CdcCreatePrecondition::LastCommitted(sequence) => {
+                Some(cdc_create_request::ExpectedLastCommitted::ExpectedLastCommittedSeq(sequence))
+            }
+        };
+        let req = CdcCreateRequest {
+            id,
+            from_seq,
+            column_ids,
+            resolved_values,
+            expected_last_committed,
+        };
+        let resp = self
+            .client
+            .clone()
+            .cdc_create(req)
+            .await
+            .map_err(CdcCreateError::from)?;
         Ok(resp.into_inner().start_seq)
     }
 
@@ -755,10 +799,48 @@ impl RockserverClient {
         Ok(())
     }
 
+    /// Returns the earliest CDC cursor still available in the database WAL.
+    pub async fn cdc_get_earliest_available_sequence(&self) -> Result<i64> {
+        let resp = self
+            .client
+            .clone()
+            .cdc_get_earliest_available_sequence(())
+            .await?;
+        Ok(resp.into_inner().sequence)
+    }
+
+    /// Returns the durable last committed sequence for a CDC subscription.
+    ///
+    /// `None` means that the subscription metadata does not exist.
+    pub async fn cdc_get_last_committed_sequence(&self, id: String) -> Result<Option<i64>> {
+        let req = CdcGetLastCommittedSequenceRequest { id };
+        let resp = self
+            .client
+            .clone()
+            .cdc_get_last_committed_sequence(req)
+            .await?;
+        Ok(resp.into_inner().last_committed_seq)
+    }
+
     /// Commits a sequence number for a CDC stream.
     pub async fn cdc_commit(&self, id: String, seq: i64) -> Result<()> {
         let req = CdcCommitRequest { id, seq };
         self.client.clone().cdc_commit(req).await?;
+        Ok(())
+    }
+
+    /// Commits a CDC sequence while preserving a typed missing-subscription failure.
+    pub async fn cdc_commit_checked(
+        &self,
+        id: String,
+        seq: i64,
+    ) -> std::result::Result<(), CdcError> {
+        let req = CdcCommitRequest { id, seq };
+        self.client
+            .clone()
+            .cdc_commit(req)
+            .await
+            .map_err(CdcError::from)?;
         Ok(())
     }
 
@@ -779,6 +861,29 @@ impl RockserverClient {
         Ok(resp.into_inner())
     }
 
+    /// Polls CDC events and classifies missing subscription metadata on both stream setup and items.
+    pub async fn cdc_poll_checked(
+        &self,
+        id: String,
+        from_seq: Option<i64>,
+        max_events: i64,
+    ) -> std::result::Result<impl Stream<Item = std::result::Result<CdcEvent, CdcError>>, CdcError>
+    {
+        let req = CdcPollRequest {
+            id,
+            from_seq,
+            max_events,
+            max_response_bytes: 0,
+        };
+        let resp = self
+            .client
+            .clone()
+            .cdc_poll(req)
+            .await
+            .map_err(CdcError::from)?;
+        Ok(resp.into_inner().map(|item| item.map_err(CdcError::from)))
+    }
+
     /// Polls a CDC batch and returns the server's exact next cursor. The cursor can advance
     /// even when column filtering leaves the returned event list empty.
     pub async fn cdc_poll_batch(
@@ -794,6 +899,28 @@ impl RockserverClient {
             max_response_bytes: 0,
         };
         let resp = self.client.clone().cdc_poll_batch(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Polls a CDC batch while preserving a typed missing-subscription failure.
+    pub async fn cdc_poll_batch_checked(
+        &self,
+        id: String,
+        from_seq: Option<i64>,
+        max_events: i64,
+    ) -> std::result::Result<CdcPollResponse, CdcError> {
+        let req = CdcPollRequest {
+            id,
+            from_seq,
+            max_events,
+            max_response_bytes: 0,
+        };
+        let resp = self
+            .client
+            .clone()
+            .cdc_poll_batch(req)
+            .await
+            .map_err(CdcError::from)?;
         Ok(resp.into_inner())
     }
 

@@ -26,6 +26,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -89,6 +90,62 @@ public class EmbeddedDBRobustColumnTest {
         // We ensure the new ID is valid.
         assertTrue(id2 > 0);
     }
+
+	@Test
+	public void testDeleteColumnIfExistsIsIdempotent() {
+		String colName = "DeleteIfExists";
+		ColumnSchema schema = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
+
+		db.createColumn(colName, schema);
+		assertTrue(db.deleteColumnIfExists(colName));
+		assertFalse(db.deleteColumnIfExists(colName));
+		RocksDBException ex = assertThrows(RocksDBException.class, () -> db.getColumnId(colName));
+		assertEquals(RocksDBErrorType.COLUMN_NOT_FOUND, ex.getErrorUniqueId());
+		assertTrue(db.createColumn(colName, schema) > 0);
+	}
+
+	@Test
+	public void testConcurrentDeleteColumnIfExists() throws Exception {
+		int threads = 10;
+		String colName = "ConcurrentDeleteIfExists";
+		ColumnSchema schema = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
+		db.createColumn(colName, schema);
+		ExecutorService executor = Executors.newFixedThreadPool(threads);
+		try {
+			List<Callable<Boolean>> tasks = new ArrayList<>();
+			for (int i = 0; i < threads; i++) {
+				tasks.add(() -> db.deleteColumnIfExists(colName));
+			}
+			List<Future<Boolean>> results = executor.invokeAll(tasks);
+			long deletedCount = 0;
+			for (Future<Boolean> result : results) {
+				if (result.get()) {
+					deletedCount++;
+				}
+			}
+			assertEquals(1, deletedCount);
+			assertFalse(db.deleteColumnIfExists(colName));
+		} finally {
+			executor.shutdownNow();
+		}
+	}
+
+	@Test
+	public void testDeletionRemovesPersistedSchemaMetadata() throws Exception {
+		ColumnSchema schema = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
+		String byName = "MetadataDeleteByName";
+		String byId = "MetadataDeleteById";
+		db.createColumn(byName, schema);
+		long byIdColumn = db.createColumn(byId, schema);
+
+		assertTrue(db.deleteColumnIfExists(byName));
+		db.deleteColumn(byIdColumn);
+		db.closeTesting();
+		db = null;
+
+		assertPersistedSchemasMissing(byName, byId);
+		db = new EmbeddedDB(tempDir, "robust_test", null);
+	}
 
     @Test
     public void testConcurrentCreationSameColumn() throws InterruptedException {
@@ -203,4 +260,77 @@ public class EmbeddedDBRobustColumnTest {
         long fetchedId = db.getColumnId("ManualCol");
         assertEquals(id, fetchedId);
     }
+
+	@Test
+	public void testDeleteColumnIfExistsDeletesUnconfiguredColumn() throws Exception {
+		db.closeTesting();
+		db = null;
+		createRawColumn("ManualDelete");
+
+		db = new EmbeddedDB(tempDir, "robust_test", null);
+		assertTrue(db.deleteColumnIfExists("ManualDelete"));
+		assertFalse(db.deleteColumnIfExists("ManualDelete"));
+		ColumnSchema schema = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
+		long recreatedId = db.createColumn("ManualDelete", schema);
+		assertEquals(recreatedId, db.getColumnId("ManualDelete"));
+		assertTrue(db.deleteColumnIfExists("ManualDelete"));
+		db.closeTesting();
+		db = null;
+
+		try (var options = new org.rocksdb.Options()) {
+			var families = RocksDB.listColumnFamilies(options, tempDir.toAbsolutePath().toString());
+			assertFalse(families.stream()
+					.map(name -> new String(name, StandardCharsets.UTF_8))
+					.anyMatch("ManualDelete"::equals));
+		}
+		db = new EmbeddedDB(tempDir, "robust_test", null);
+	}
+
+	private void createRawColumn(String columnName) throws Exception {
+		try (var options = new org.rocksdb.Options().setCreateIfMissing(true)) {
+			List<byte[]> families = RocksDB.listColumnFamilies(options, tempDir.toAbsolutePath().toString());
+			List<ColumnFamilyDescriptor> descriptors = families.stream()
+					.map(ColumnFamilyDescriptor::new)
+					.collect(Collectors.toCollection(ArrayList::new));
+			List<ColumnFamilyHandle> handles = new ArrayList<>();
+			try (DBOptions dbOptions = new DBOptions().setCreateIfMissing(true);
+					RocksDB rawDb = RocksDB.open(dbOptions,
+							tempDir.toAbsolutePath().toString(), descriptors, handles)) {
+				rawDb.createColumnFamily(new ColumnFamilyDescriptor(
+						columnName.getBytes(StandardCharsets.UTF_8))).close();
+				for (ColumnFamilyHandle handle : handles) {
+					handle.close();
+				}
+			}
+		}
+	}
+
+	private void assertPersistedSchemasMissing(String... columnNames) throws Exception {
+		try (var options = new org.rocksdb.Options()) {
+			List<byte[]> families = RocksDB.listColumnFamilies(options, tempDir.toAbsolutePath().toString());
+			List<ColumnFamilyDescriptor> descriptors = families.stream()
+					.map(ColumnFamilyDescriptor::new)
+					.collect(Collectors.toCollection(ArrayList::new));
+			List<ColumnFamilyHandle> handles = new ArrayList<>();
+			try (DBOptions dbOptions = new DBOptions();
+					RocksDB rawDb = RocksDB.open(dbOptions,
+							tempDir.toAbsolutePath().toString(), descriptors, handles)) {
+				ColumnFamilyHandle schemas = null;
+				for (ColumnFamilyHandle handle : handles) {
+					if ("_column_schemas_".equals(new String(handle.getName(), StandardCharsets.UTF_8))) {
+						schemas = handle;
+						break;
+					}
+				}
+				assertNotNull(schemas, "Schema metadata column family not found");
+				for (String columnName : columnNames) {
+					assertNull(rawDb.get(schemas, columnName.getBytes(StandardCharsets.UTF_8)),
+							"Persisted schema still exists for " + columnName);
+				}
+				for (ColumnFamilyHandle handle : handles) {
+					handle.close();
+				}
+			}
+		}
+	}
 }

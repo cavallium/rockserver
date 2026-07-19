@@ -36,8 +36,12 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
+import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.cdc.CDCEvent;
+import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
+import it.cavallium.rockserver.core.common.api.OptionalLongValue;
 import it.cavallium.rockserver.core.common.api.RocksDB;
 import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
@@ -51,6 +55,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -59,6 +64,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.thrift.TApplicationException;
+import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TSocket;
@@ -67,6 +73,7 @@ import org.apache.thrift.transport.TTransportException;
 import org.apache.thrift.transport.layered.TFramedTransport;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
@@ -75,6 +82,8 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	private final URI uri;
 	private final String host;
 	private final int port;
+	private final int maxFrameSize;
+	private final int maxCdcResponseSize;
 	private final List<ClientSlot> allClientSlots;
 	private final ArrayBlockingQueue<ClientSlot> availableClientSlots;
 	private final RocksDB.Iface client;
@@ -83,10 +92,28 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	private final AtomicBoolean closed = new AtomicBoolean();
 
 	public ThriftConnection(String name, String host, int port) throws TException {
+		this(name, host, port, ThriftTransportLimits.configuredClientLimits());
+	}
+
+	private ThriftConnection(String name,
+			String host,
+			int port,
+			ThriftTransportLimits.ClientLimits limits) throws TException {
+		this(name, host, port, limits.maxFrameSize(), limits.maxCdcResponseSize());
+	}
+
+	public ThriftConnection(String name,
+			String host,
+			int port,
+			int maxFrameSize,
+			int maxCdcResponseSize) throws TException {
 		super(name);
+		var validatedLimits = ThriftTransportLimits.validateClientLimits(maxFrameSize, maxCdcResponseSize);
 		this.uri = URI.create("thrift://" + host + ":" + port);
 		this.host = host;
 		this.port = port;
+		this.maxFrameSize = validatedLimits.maxFrameSize();
+		this.maxCdcResponseSize = validatedLimits.maxCdcResponseSize();
 		int poolSize = thriftClientPoolSize();
 		this.allClientSlots = new ArrayList<>(poolSize);
 		this.availableClientSlots = new ArrayBlockingQueue<>(poolSize);
@@ -201,6 +228,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	public void deleteColumn(long columnId) {
 		try {
 			client.deleteColumn(columnId);
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@Override
+	public boolean deleteColumnIfExists(String name) {
+		try {
+			return client.deleteColumnIfExists(name);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -556,6 +592,85 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 		}
 	}
 
+	@Override
+	public long cdcCreate(String id, Long fromSeq, List<Long> columnIds, Boolean emitLatestValues) {
+		return cdcCreate(id, fromSeq, columnIds, emitLatestValues, null);
+	}
+
+	@Override
+	public long cdcCreate(String id,
+			Long fromSeq,
+			List<Long> columnIds,
+			Boolean emitLatestValues,
+			OptionalLong expectedLastCommitted) {
+		try {
+			var request = new it.cavallium.rockserver.core.common.api.CdcCreateRequest().setId(id);
+			if (fromSeq != null) {
+				request.setFromSeq(fromSeq);
+			}
+			if (columnIds != null) {
+				request.setColumnIds(columnIds);
+			}
+			if (emitLatestValues != null) {
+				request.setEmitLatestValues(emitLatestValues);
+			}
+			if (expectedLastCommitted != null) {
+				if (expectedLastCommitted.isPresent()) {
+					request.setExpectedLastCommittedSeq(expectedLastCommitted.getAsLong());
+				} else {
+					request.setExpectAbsent(true);
+				}
+			}
+			return client.cdcCreate(request);
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@Override
+	public void cdcDelete(String id) {
+		try {
+			client.cdcDelete(id);
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@Override
+	public long cdcGetEarliestAvailableSequence() {
+		try {
+			return client.cdcGetEarliestAvailableSequence();
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@Override
+	public OptionalLong cdcGetLastCommittedSequence(String id) {
+		try {
+			OptionalLongValue response = client.cdcGetLastCommittedSequence(id);
+			return response.isSetValue()
+					? OptionalLong.of(response.getValue())
+					: OptionalLong.empty();
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@Override
+	public Stream<CDCEvent> cdcPoll(String id, Long fromSeq, long maxEvents) {
+		return cdcPollBatch(id, fromSeq, maxEvents).events().stream();
+	}
+
+	@Override
+	public void cdcCommit(String id, long seq) {
+		try {
+			client.cdcCommit(id, seq);
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
 	// --- Async API ---
 
 	@Override
@@ -591,6 +706,11 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public CompletableFuture<Void> deleteColumnAsync(long columnId) {
 		return CompletableFuture.runAsync(() -> deleteColumn(columnId), executor);
+	}
+
+	@Override
+	public CompletableFuture<Boolean> deleteColumnIfExistsAsync(String name) {
+		return CompletableFuture.supplyAsync(() -> deleteColumnIfExists(name), executor);
 	}
 
 	@Override
@@ -724,7 +844,57 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 		return CompletableFuture.supplyAsync(this::getAllColumnDefinitions, executor);
 	}
 
-    @Override
+	@Override
+	public CompletableFuture<Long> cdcCreateAsync(String id,
+			Long fromSeq,
+			List<Long> columnIds,
+			Boolean emitLatestValues) {
+		return cdcCreateAsync(id, fromSeq, columnIds, emitLatestValues, null);
+	}
+
+	@Override
+	public CompletableFuture<Long> cdcCreateAsync(String id,
+			Long fromSeq,
+			List<Long> columnIds,
+			Boolean emitLatestValues,
+			OptionalLong expectedLastCommitted) {
+		return CompletableFuture.supplyAsync(
+				() -> cdcCreate(id, fromSeq, columnIds, emitLatestValues, expectedLastCommitted), executor);
+	}
+
+	@Override
+	public CompletableFuture<Void> cdcDeleteAsync(String id) {
+		return CompletableFuture.runAsync(() -> cdcDelete(id), executor);
+	}
+
+	@Override
+	public CompletableFuture<Long> cdcGetEarliestAvailableSequenceAsync() {
+		return CompletableFuture.supplyAsync(this::cdcGetEarliestAvailableSequence, executor);
+	}
+
+	@Override
+	public CompletableFuture<OptionalLong> cdcGetLastCommittedSequenceAsync(String id) {
+		return CompletableFuture.supplyAsync(() -> cdcGetLastCommittedSequence(id), executor);
+	}
+
+	@Override
+	public Publisher<CDCEvent> cdcPollAsync(String id, Long fromSeq, long maxEvents) {
+		return cdcPollBatchAsync(id, fromSeq, maxEvents)
+				.flatMapMany(batch -> Flux.fromIterable(batch.events()));
+	}
+
+	@Override
+	public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+		return Mono.fromCallable(() -> cdcPollBatch(id, fromSeq, maxEvents))
+				.subscribeOn(executorScheduler);
+	}
+
+	@Override
+	public CompletableFuture<Void> cdcCommitAsync(String id, long seq) {
+		return CompletableFuture.runAsync(() -> cdcCommit(id, seq), executor);
+	}
+
+	@Override
 	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> req) {
 		return req.handleSync(this);
 	}
@@ -747,6 +917,33 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 					"rockserver.thrift.client.connections must be between 1 and 256, got " + configuredSize);
 		}
 		return configuredSize;
+	}
+
+	private CdcBatch cdcPollBatch(String id, Long fromSeq, long maxEvents) {
+		try {
+			var request = new it.cavallium.rockserver.core.common.api.CdcPollRequest()
+					.setId(id)
+					.setMaxEvents(maxEvents)
+					.setMaxResponseBytes(maxCdcResponseSize);
+			if (fromSeq != null) {
+				request.setFromSeq(fromSeq);
+			}
+			var batch = client.cdcPollBatch(request);
+			return new CdcBatch(batch.getEvents().stream()
+					.map(ThriftConnection::mapCdcEvent)
+					.toList(), batch.getNextSeq());
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	private static CDCEvent mapCdcEvent(
+			it.cavallium.rockserver.core.common.api.CDCEvent event) {
+		return new CDCEvent(event.getSeq(),
+				event.getColumnId(),
+				Utils.fromByteBuffer(event.bufferForKey()),
+				event.isSetValue() ? Utils.fromByteBuffer(event.bufferForValue()) : null,
+				CDCEvent.Op.valueOf(event.getOp().name()));
 	}
 
 	private Object invokeClient(Object proxy, Method method, Object[] args) throws Throwable {
@@ -803,7 +1000,13 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			if (physicalClient != null && transport != null && transport.isOpen()) {
 				return physicalClient;
 			}
-			var newTransport = new TFramedTransport(new TSocket(host, port));
+			var transportConfiguration = TConfiguration.custom()
+					.setMaxFrameSize(maxFrameSize)
+					.setMaxMessageSize(maxFrameSize)
+					.build();
+			var newTransport = new TFramedTransport(
+					new TSocket(transportConfiguration, host, port),
+					maxFrameSize);
 			try {
 				newTransport.open();
 				transport = newTransport;

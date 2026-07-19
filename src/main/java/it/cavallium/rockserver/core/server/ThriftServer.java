@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.api.Column;
@@ -19,6 +20,7 @@ import it.cavallium.rockserver.core.common.api.FirstAndLast;
 import it.cavallium.rockserver.core.common.api.KV;
 import it.cavallium.rockserver.core.common.api.MergeBatchMode;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
+import it.cavallium.rockserver.core.common.api.OptionalLongValue;
 import it.cavallium.rockserver.core.common.api.PutBatchMode;
 import it.cavallium.rockserver.core.common.api.RocksDB.Iface;
 import it.cavallium.rockserver.core.common.api.RocksDB.Processor;
@@ -32,14 +34,17 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.apache.thrift.TConfiguration;
 import org.reactivestreams.Publisher;
 import org.apache.thrift.server.TThreadedSelectorServer;
+import org.apache.thrift.transport.TNonblockingSocket;
 import org.apache.thrift.transport.TNonblockingServerSocket;
 import org.apache.thrift.transport.TTransportException;
 import org.jetbrains.annotations.NotNull;
@@ -52,16 +57,29 @@ import reactor.core.publisher.Flux;
 public class ThriftServer extends Server {
 
 	private static final Logger LOG = LoggerFactory.getLogger(ThriftServer.class.getName());
+	private static final int LEGACY_MAX_CDC_RESPONSE_SIZE = ThriftTransportLimits.safeCdcResponseSize(
+			TConfiguration.DEFAULT_MAX_FRAME_SIZE);
 
 	private final Thread thriftThread;
 	private final TThreadedSelectorServer server;
 
 	public ThriftServer(RocksDBConnection client, String http2Host, int http2Port) throws IOException {
+		this(client, http2Host, http2Port, ThriftTransportLimits.configuredServerMaxFrameSize());
+	}
+
+	public ThriftServer(RocksDBConnection client,
+			String http2Host,
+			int http2Port,
+			int maxFrameSize) throws IOException {
 		super(client);
-		var handler = new ThriftHandler(this.getClient());
+		int validatedMaxFrameSize = ThriftTransportLimits.validateServerMaxFrameSize(maxFrameSize);
+		var handler = new ThriftHandler(this.getClient(),
+				ThriftTransportLimits.safeCdcResponseSize(validatedMaxFrameSize));
 
 		try {
-			var serverTransport = new TNonblockingServerSocket(new InetSocketAddress(http2Host, http2Port));
+			var serverTransport = new ConfiguredNonblockingServerSocket(
+					new InetSocketAddress(http2Host, http2Port),
+					validatedMaxFrameSize);
 			this.server = new TThreadedSelectorServer(new TThreadedSelectorServer.Args(serverTransport)
 					.processor(new Processor<>(handler))
 			);
@@ -70,6 +88,27 @@ public class ThriftServer extends Server {
 			LOG.info("Thrift RocksDB server is listening at " + http2Host + ":" + http2Port);
 		} catch (TTransportException e) {
 			throw new IOException("Can't open server socket", e);
+		}
+	}
+
+	private static final class ConfiguredNonblockingServerSocket extends TNonblockingServerSocket {
+
+		private final int maxFrameSize;
+
+		private ConfiguredNonblockingServerSocket(InetSocketAddress address, int maxFrameSize)
+				throws TTransportException {
+			super(address, 0, maxFrameSize);
+			this.maxFrameSize = maxFrameSize;
+		}
+
+		@Override
+		public TNonblockingSocket accept() throws TTransportException {
+			var socket = super.accept();
+			if (socket != null) {
+				socket.getConfiguration().setMaxFrameSize(maxFrameSize);
+				socket.getConfiguration().setMaxMessageSize(maxFrameSize);
+			}
+			return socket;
 		}
 	}
 
@@ -190,9 +229,13 @@ public class ThriftServer extends Server {
 	private static class ThriftHandler implements Iface {
 
 		private final RocksDBSyncAPI api;
+		private final RocksDBAsyncAPI asyncApi;
+		private final int maxCdcResponseSize;
 
-		public ThriftHandler(RocksDBConnection client) {
+		public ThriftHandler(RocksDBConnection client, int maxCdcResponseSize) {
 			this.api = dispatchingSyncApi(client);
+			this.asyncApi = client.getAsyncApi();
+			this.maxCdcResponseSize = maxCdcResponseSize;
 		}
 
 		private static RocksDBSyncAPI dispatchingSyncApi(RocksDBConnection client) {
@@ -235,6 +278,12 @@ public class ThriftServer extends Server {
 			if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction
+					|| request instanceof RocksDBAPICommand.CdcCommit
+					|| (request instanceof RocksDBAPICommand.CdcCreate create
+					&& create.fromSeq() != null
+					&& create.fromSeq() == 0L)
 					|| request instanceof RocksDBAPICommand.Flush
 					|| request instanceof RocksDBAPICommand.Compact) {
 				return true;
@@ -304,7 +353,8 @@ public class ThriftServer extends Server {
 		private static boolean mustCompleteAfterInterrupt(RocksDBAPICommand<?, ?, ?> request) {
 			return request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction
-					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate
+					|| request instanceof RocksDBAPICommand.CdcCommit;
 		}
 
 		private static @Nullable Function<Object, CompletableFuture<?>> lateSuccessCleanup(
@@ -419,6 +469,15 @@ public class ThriftServer extends Server {
 		public void deleteColumn(long columnId) throws RocksDBThriftException {
 			try {
 				api.deleteColumn(columnId);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public boolean deleteColumnIfExists(String name) throws RocksDBThriftException {
+			try {
+				return api.deleteColumnIfExists(name);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -887,6 +946,102 @@ public class ThriftServer extends Server {
 				List<Column> columns = new ArrayList<>();
 				map.forEach((name, schema) -> columns.add(new Column(name, mapSchemaToThrift(schema))));
 				return columns;
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public long cdcCreate(it.cavallium.rockserver.core.common.api.CdcCreateRequest request)
+				throws RocksDBThriftException {
+			try {
+				if (request.isSetExpectAbsent() && request.isSetExpectedLastCommittedSeq()) {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(
+							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
+							"CDC create request cannot set both expectAbsent and expectedLastCommittedSeq");
+				}
+				if (request.isSetExpectAbsent() && !request.isExpectAbsent()) {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(
+							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
+							"CDC create expectAbsent must be true when set");
+				}
+				OptionalLong expectedLastCommitted = request.isSetExpectAbsent()
+						? OptionalLong.empty()
+						: request.isSetExpectedLastCommittedSeq()
+								? OptionalLong.of(request.getExpectedLastCommittedSeq())
+								: null;
+				return api.cdcCreate(request.getId(),
+						request.isSetFromSeq() ? request.getFromSeq() : null,
+						request.isSetColumnIds() ? request.getColumnIds() : null,
+						request.isSetEmitLatestValues() ? request.isEmitLatestValues() : null,
+						expectedLastCommitted);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void cdcDelete(String id) throws RocksDBThriftException {
+			try {
+				api.cdcDelete(id);
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public long cdcGetEarliestAvailableSequence() throws RocksDBThriftException {
+			try {
+				return api.cdcGetEarliestAvailableSequence();
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public OptionalLongValue cdcGetLastCommittedSequence(String id) throws RocksDBThriftException {
+			try {
+				var sequence = api.cdcGetLastCommittedSequence(id);
+				var response = new OptionalLongValue();
+				sequence.ifPresent(response::setValue);
+				return response;
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public it.cavallium.rockserver.core.common.api.CdcPollBatchResult cdcPollBatch(
+				it.cavallium.rockserver.core.common.api.CdcPollRequest request)
+				throws RocksDBThriftException {
+			try {
+				int requestedMaxResponseSize = request.isSetMaxResponseBytes()
+						? request.getMaxResponseBytes()
+						: LEGACY_MAX_CDC_RESPONSE_SIZE;
+				if (requestedMaxResponseSize <= 0) {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(
+							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
+							"maxResponseBytes must be positive: " + requestedMaxResponseSize);
+				}
+				var batch = asyncApi.cdcPollBatchAsync(request.getId(),
+						request.isSetFromSeq() ? request.getFromSeq() : null,
+						request.getMaxEvents()).block();
+				if (batch == null) {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(
+							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.INTERNAL_ERROR,
+							"CDC poll completed without a batch");
+				}
+				return ThriftCdcResponseBudget.build(batch,
+						Math.min(requestedMaxResponseSize, maxCdcResponseSize));
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void cdcCommit(String id, long seq) throws RocksDBThriftException {
+			try {
+				api.cdcCommit(id, seq);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}

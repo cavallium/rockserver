@@ -10,6 +10,8 @@ import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.buffer.Buf;
 import java.util.Arrays;
 import java.util.StringJoiner;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.ColumnFamilyHandle;
@@ -17,16 +19,24 @@ import org.rocksdb.ColumnFamilyHandle;
 public record ColumnInstance(ColumnFamilyHandle cfh,
 				    ColumnSchema schema,
 				    int finalKeySizeBytes,
-				    @Nullable FFMAbstractMergeOperator mergeOperator) implements AutoCloseable {
+				    @Nullable FFMAbstractMergeOperator mergeOperator,
+				    SafeShutdown uses) implements AutoCloseable {
 
 	private static final Buf[] EMPTY_BUF_ARRAY = new Buf[0];
 
 	public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema) {
-		this(cfh, schema, calculateFinalKeySizeBytes(schema), null);
+		this(cfh, schema, calculateFinalKeySizeBytes(schema), null, new SafeShutdown());
 	}
 
 	public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, @Nullable FFMAbstractMergeOperator mergeOperator) {
-		this(cfh, schema, calculateFinalKeySizeBytes(schema), mergeOperator);
+		this(cfh, schema, calculateFinalKeySizeBytes(schema), mergeOperator, new SafeShutdown());
+	}
+
+	private ColumnInstance(ColumnFamilyHandle cfh,
+			ColumnSchema schema,
+			@Nullable FFMAbstractMergeOperator mergeOperator,
+			SafeShutdown uses) {
+		this(cfh, schema, calculateFinalKeySizeBytes(schema), mergeOperator, uses);
 	}
 
 	private static int calculateFinalKeySizeBytes(ColumnSchema schema) {
@@ -39,7 +49,77 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 
 	@Override
 	public void close() {
+		stopNewUsesAndWait();
 		cfh.close();
+	}
+
+	public ColumnInstance withSchema(ColumnSchema newSchema, @Nullable FFMAbstractMergeOperator newMergeOperator) {
+		return new ColumnInstance(cfh, newSchema, newMergeOperator, uses);
+	}
+
+	public void beginUse() {
+		uses.beginOp();
+	}
+
+	public void endUse() {
+		uses.endOp();
+	}
+
+	public ColumnUse acquireUse() {
+		beginUse();
+		return new ColumnUse(this, uses);
+	}
+
+	public boolean isAcceptingUses() {
+		return uses.isOpen();
+	}
+
+	public void stopNewUsesAndWait() {
+		boolean interrupted = false;
+		for (;;) {
+			try {
+				uses.closeAndWait(Long.MAX_VALUE);
+				break;
+			} catch (TimeoutException exception) {
+				// SafeShutdown reports interruption as TimeoutException and restores the
+				// interrupt bit. Admission is already permanently closed at this point,
+				// so abandoning retirement would strand a registered unusable column.
+				if (!Thread.interrupted()) {
+					throw new IllegalStateException("Unexpected timeout while draining column uses", exception);
+				}
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	public void closeHandle() {
+		cfh.close();
+	}
+
+	public static final class ColumnUse implements AutoCloseable {
+
+		private final ColumnInstance column;
+		private final SafeShutdown uses;
+		private final AtomicBoolean closed = new AtomicBoolean();
+
+		private ColumnUse(ColumnInstance column, SafeShutdown uses) {
+			this.column = column;
+			this.uses = uses;
+		}
+
+		public ColumnInstance column() {
+			return column;
+		}
+
+		@Override
+		public void close() {
+			if (closed.compareAndSet(false, true)) {
+				uses.endOp();
+			}
+		}
 	}
 
 	public boolean requiresWriteTransaction() {

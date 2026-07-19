@@ -105,6 +105,96 @@ pub enum CdcCommitMode {
     None,
 }
 
+/// Atomic precondition for creating or updating a CDC subscription.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CdcCreatePrecondition {
+    /// Preserve legacy behavior and do not compare the durable checkpoint.
+    Unchecked,
+    /// Require that the subscription metadata does not exist.
+    Absent,
+    /// Require that the subscription exists at exactly this durable checkpoint.
+    LastCommitted(i64),
+}
+
+/// Typed failure returned by checked CDC operations.
+#[derive(Debug)]
+pub enum CdcError {
+    /// The subscription was absent, present, or at a checkpoint different from the requested precondition.
+    SubscriptionChanged(tonic::Status),
+    /// The subscription metadata was deleted or never created.
+    SubscriptionNotFound(tonic::Status),
+    /// Any other transport or server failure.
+    Rpc(tonic::Status),
+}
+
+impl CdcError {
+    pub fn status(&self) -> &tonic::Status {
+        match self {
+            Self::SubscriptionChanged(status)
+            | Self::SubscriptionNotFound(status)
+            | Self::Rpc(status) => status,
+        }
+    }
+
+    pub fn into_status(self) -> tonic::Status {
+        match self {
+            Self::SubscriptionChanged(status)
+            | Self::SubscriptionNotFound(status)
+            | Self::Rpc(status) => status,
+        }
+    }
+}
+
+impl std::fmt::Display for CdcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.status().fmt(formatter)
+    }
+}
+
+impl std::error::Error for CdcError {}
+
+impl From<tonic::Status> for CdcError {
+    fn from(status: tonic::Status) -> Self {
+        const SUBSCRIPTION_CHANGED: &str = "RocksDBError: [uid:CDC_SUBSCRIPTION_CHANGED]";
+        const SUBSCRIPTION_NOT_FOUND: &str = "RocksDBError: [uid:CDC_SUBSCRIPTION_NOT_FOUND]";
+        if status.message().starts_with(SUBSCRIPTION_CHANGED) {
+            Self::SubscriptionChanged(status)
+        } else if status.message().starts_with(SUBSCRIPTION_NOT_FOUND) {
+            Self::SubscriptionNotFound(status)
+        } else {
+            Self::Rpc(status)
+        }
+    }
+}
+
+/// Backward-compatible name for the error returned by checked CDC creation.
+pub type CdcCreateError = CdcError;
+
+#[cfg(test)]
+mod cdc_error_tests {
+    use super::CdcError;
+
+    #[test]
+    fn classifies_subscription_not_found() {
+        let status = tonic::Status::not_found(
+            "RocksDBError: [uid:CDC_SUBSCRIPTION_NOT_FOUND] CDC subscription not found: missing",
+        );
+
+        assert!(matches!(
+            CdcError::from(status),
+            CdcError::SubscriptionNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn leaves_unrelated_statuses_as_rpc_errors() {
+        assert!(matches!(
+            CdcError::from(tonic::Status::unavailable("temporarily unavailable")),
+            CdcError::Rpc(_)
+        ));
+    }
+}
+
 impl Default for CdcStreamOptions {
     fn default() -> Self {
         Self {

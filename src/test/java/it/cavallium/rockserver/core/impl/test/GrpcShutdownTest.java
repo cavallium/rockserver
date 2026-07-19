@@ -29,6 +29,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -81,7 +82,12 @@ class GrpcShutdownTest {
 
 		dbDir = Files.createTempDirectory("rockserver-grpc-shutdown-test");
 		configFile = Files.createTempFile("rockserver-config", ".conf");
-		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
+		Files.writeString(configFile, """
+				database: {
+				  parallelism: { read: 2, write: 1 }
+				  global: { ingest-behind: false, optimistic: false }
+				}
+				""");
 		embeddedConnection = new EmbeddedConnection(dbDir, "grpc-shutdown-test", configFile);
 		grpcServer = new GrpcServer(embeddedConnection, new InetSocketAddress("127.0.0.1", 0));
 		grpcServer.start();
@@ -213,6 +219,40 @@ class GrpcShutdownTest {
 			assertEquals(0L, embeddedConnection.getInternalDB().getPendingOpsCount());
 		} finally {
 			releaseMaintenance.countDown();
+		}
+	}
+
+	@Test
+	void remoteCleanupBypassesASaturatedWriteLane() throws Exception {
+		var client = newClient();
+		var api = client.getAsyncApi();
+		client.getSyncApi().cdcCreate("progress", 1L, null, false);
+		var writeStarted = new CountDownLatch(1);
+		var releaseWrite = new CountDownLatch(1);
+		embeddedConnection.getScheduler().writeExecutor().execute(() -> {
+			writeStarted.countDown();
+			try {
+				releaseWrite.await();
+			} catch (InterruptedException ex) {
+				Thread.currentThread().interrupt();
+			}
+		});
+		try {
+			assertTrue(writeStarted.await(5, TimeUnit.SECONDS));
+			api.closeFailedUpdateAsync(Long.MAX_VALUE).get(5, TimeUnit.SECONDS);
+			assertTrue(api.closeTransactionAsync(Long.MAX_VALUE, false).get(5, TimeUnit.SECONDS));
+			api.cdcCommitAsync("progress", 42L).get(5, TimeUnit.SECONDS);
+			assertEquals(java.util.OptionalLong.of(42L),
+					embeddedConnection.getSyncApi().cdcGetLastCommittedSequence("progress"));
+
+			var commit = api.closeTransactionAsync(Long.MAX_VALUE, true);
+			assertThrows(TimeoutException.class, () -> commit.get(200, TimeUnit.MILLISECONDS),
+					"remote commit=true must remain queued on the saturated write lane");
+			releaseWrite.countDown();
+			commit.handle((_, _) -> null).get(5, TimeUnit.SECONDS);
+			assertTrue(commit.isCompletedExceptionally());
+		} finally {
+			releaseWrite.countDown();
 		}
 	}
 

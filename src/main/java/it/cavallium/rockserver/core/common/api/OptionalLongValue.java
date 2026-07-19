@@ -7,15 +7,15 @@
 package it.cavallium.rockserver.core.common.api;
 
 @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
-public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, OptionalBinary._Fields>, java.io.Serializable, Cloneable, Comparable<OptionalBinary> {
-  private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("OptionalBinary");
+public class OptionalLongValue implements org.apache.thrift.TBase<OptionalLongValue, OptionalLongValue._Fields>, java.io.Serializable, Cloneable, Comparable<OptionalLongValue> {
+  private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("OptionalLongValue");
 
-  private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)1);
+  private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.I64, (short)1);
 
-  private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new OptionalBinaryStandardSchemeFactory();
-  private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new OptionalBinaryTupleSchemeFactory();
+  private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new OptionalLongValueStandardSchemeFactory();
+  private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new OptionalLongValueTupleSchemeFactory();
 
-  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // optional
+  public long value; // optional
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -80,70 +80,61 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
   }
 
   // isset id assignments
+  private static final int __VALUE_ISSET_ID = 0;
+  private byte __isset_bitfield = 0;
   private static final _Fields[] optionals = {_Fields.VALUE};
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
     tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.OPTIONAL,
-        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
-    org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(OptionalBinary.class, metaDataMap);
+    org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(OptionalLongValue.class, metaDataMap);
   }
 
-  public OptionalBinary() {
+  public OptionalLongValue() {
   }
 
   /**
    * Performs a deep copy on <i>other</i>.
    */
-  public OptionalBinary(OptionalBinary other) {
-    if (other.isSetValue()) {
-      this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
-    }
+  public OptionalLongValue(OptionalLongValue other) {
+    __isset_bitfield = other.__isset_bitfield;
+    this.value = other.value;
   }
 
   @Override
-  public OptionalBinary deepCopy() {
-    return new OptionalBinary(this);
+  public OptionalLongValue deepCopy() {
+    return new OptionalLongValue(this);
   }
 
   @Override
   public void clear() {
-    this.value = null;
+    setValueIsSet(false);
+    this.value = 0;
   }
 
-  public byte[] getValue() {
-    setValue(org.apache.thrift.TBaseHelper.rightSize(value));
-    return value == null ? null : value.array();
+  public long getValue() {
+    return this.value;
   }
 
-  public java.nio.ByteBuffer bufferForValue() {
-    return org.apache.thrift.TBaseHelper.copyBinary(value);
-  }
-
-  public OptionalBinary setValue(byte[] value) {
-    this.value = value == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(value.clone());
-    return this;
-  }
-
-  public OptionalBinary setValue(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value) {
-    this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
+  public OptionalLongValue setValue(long value) {
+    this.value = value;
+    setValueIsSet(true);
     return this;
   }
 
   public void unsetValue() {
-    this.value = null;
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __VALUE_ISSET_ID);
   }
 
   /** Returns true if field value is set (has been assigned a value) and false otherwise */
   public boolean isSetValue() {
-    return this.value != null;
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __VALUE_ISSET_ID);
   }
 
   public void setValueIsSet(boolean value) {
-    if (!value) {
-      this.value = null;
-    }
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __VALUE_ISSET_ID, value);
   }
 
   @Override
@@ -153,11 +144,7 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
       if (value == null) {
         unsetValue();
       } else {
-        if (value instanceof byte[]) {
-          setValue((byte[])value);
-        } else {
-          setValue((java.nio.ByteBuffer)value);
-        }
+        setValue((java.lang.Long)value);
       }
       break;
 
@@ -191,12 +178,12 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
 
   @Override
   public boolean equals(java.lang.Object that) {
-    if (that instanceof OptionalBinary)
-      return this.equals((OptionalBinary)that);
+    if (that instanceof OptionalLongValue)
+      return this.equals((OptionalLongValue)that);
     return false;
   }
 
-  public boolean equals(OptionalBinary that) {
+  public boolean equals(OptionalLongValue that) {
     if (that == null)
       return false;
     if (this == that)
@@ -207,7 +194,7 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
     if (this_present_value || that_present_value) {
       if (!(this_present_value && that_present_value))
         return false;
-      if (!this.value.equals(that.value))
+      if (this.value != that.value)
         return false;
     }
 
@@ -220,13 +207,13 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
 
     hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
     if (isSetValue())
-      hashCode = hashCode * 8191 + value.hashCode();
+      hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(value);
 
     return hashCode;
   }
 
   @Override
-  public int compareTo(OptionalBinary other) {
+  public int compareTo(OptionalLongValue other) {
     if (!getClass().equals(other.getClass())) {
       return getClass().getName().compareTo(other.getClass().getName());
     }
@@ -264,16 +251,12 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
 
   @Override
   public java.lang.String toString() {
-    java.lang.StringBuilder sb = new java.lang.StringBuilder("OptionalBinary(");
+    java.lang.StringBuilder sb = new java.lang.StringBuilder("OptionalLongValue(");
     boolean first = true;
 
     if (isSetValue()) {
       sb.append("value:");
-      if (this.value == null) {
-        sb.append("null");
-      } else {
-        org.apache.thrift.TBaseHelper.toString(this.value, sb);
-      }
+      sb.append(this.value);
       first = false;
     }
     sb.append(")");
@@ -295,23 +278,25 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
 
   private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
     try {
+      // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+      __isset_bitfield = 0;
       read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
     } catch (org.apache.thrift.TException te) {
       throw new java.io.IOException(te);
     }
   }
 
-  private static class OptionalBinaryStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+  private static class OptionalLongValueStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
     @Override
-    public OptionalBinaryStandardScheme getScheme() {
-      return new OptionalBinaryStandardScheme();
+    public OptionalLongValueStandardScheme getScheme() {
+      return new OptionalLongValueStandardScheme();
     }
   }
 
-  private static class OptionalBinaryStandardScheme extends org.apache.thrift.scheme.StandardScheme<OptionalBinary> {
+  private static class OptionalLongValueStandardScheme extends org.apache.thrift.scheme.StandardScheme<OptionalLongValue> {
 
     @Override
-    public void read(org.apache.thrift.protocol.TProtocol iprot, OptionalBinary struct) throws org.apache.thrift.TException {
+    public void read(org.apache.thrift.protocol.TProtocol iprot, OptionalLongValue struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TField schemeField;
       iprot.readStructBegin();
       while (true)
@@ -322,8 +307,8 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
         }
         switch (schemeField.id) {
           case 1: // VALUE
-            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
-              struct.value = iprot.readBinary();
+            if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+              struct.value = iprot.readI64();
               struct.setValueIsSet(true);
             } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
@@ -341,16 +326,14 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
     }
 
     @Override
-    public void write(org.apache.thrift.protocol.TProtocol oprot, OptionalBinary struct) throws org.apache.thrift.TException {
+    public void write(org.apache.thrift.protocol.TProtocol oprot, OptionalLongValue struct) throws org.apache.thrift.TException {
       struct.validate();
 
       oprot.writeStructBegin(STRUCT_DESC);
-      if (struct.value != null) {
-        if (struct.isSetValue()) {
-          oprot.writeFieldBegin(VALUE_FIELD_DESC);
-          oprot.writeBinary(struct.value);
-          oprot.writeFieldEnd();
-        }
+      if (struct.isSetValue()) {
+        oprot.writeFieldBegin(VALUE_FIELD_DESC);
+        oprot.writeI64(struct.value);
+        oprot.writeFieldEnd();
       }
       oprot.writeFieldStop();
       oprot.writeStructEnd();
@@ -358,17 +341,17 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
 
   }
 
-  private static class OptionalBinaryTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+  private static class OptionalLongValueTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
     @Override
-    public OptionalBinaryTupleScheme getScheme() {
-      return new OptionalBinaryTupleScheme();
+    public OptionalLongValueTupleScheme getScheme() {
+      return new OptionalLongValueTupleScheme();
     }
   }
 
-  private static class OptionalBinaryTupleScheme extends org.apache.thrift.scheme.TupleScheme<OptionalBinary> {
+  private static class OptionalLongValueTupleScheme extends org.apache.thrift.scheme.TupleScheme<OptionalLongValue> {
 
     @Override
-    public void write(org.apache.thrift.protocol.TProtocol prot, OptionalBinary struct) throws org.apache.thrift.TException {
+    public void write(org.apache.thrift.protocol.TProtocol prot, OptionalLongValue struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       java.util.BitSet optionals = new java.util.BitSet();
       if (struct.isSetValue()) {
@@ -376,16 +359,16 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
       }
       oprot.writeBitSet(optionals, 1);
       if (struct.isSetValue()) {
-        oprot.writeBinary(struct.value);
+        oprot.writeI64(struct.value);
       }
     }
 
     @Override
-    public void read(org.apache.thrift.protocol.TProtocol prot, OptionalBinary struct) throws org.apache.thrift.TException {
+    public void read(org.apache.thrift.protocol.TProtocol prot, OptionalLongValue struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       java.util.BitSet incoming = iprot.readBitSet(1);
       if (incoming.get(0)) {
-        struct.value = iprot.readBinary();
+        struct.value = iprot.readI64();
         struct.setValueIsSet(true);
       }
     }
@@ -395,4 +378,3 @@ public class OptionalBinary implements org.apache.thrift.TBase<OptionalBinary, O
     return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
   }
 }
-

@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -18,6 +19,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -30,6 +32,47 @@ class EmbeddedRangeSchedulingTest {
 
 	@TempDir
 	Path tempDir;
+
+	@Test
+	void cleanupCommandsBypassASaturatedWriteLane() throws Exception {
+		var configFile = tempDir.resolve("single-writer-cleanup.conf");
+		Files.writeString(configFile, """
+				database: {
+				  parallelism: { read: 1, write: 1 }
+				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
+				}
+				""");
+		try (var connection = new EmbeddedConnection(tempDir.resolve("cleanup-db"),
+				"cleanup-scheduling", configFile)) {
+			connection.getSyncApi().cdcCreate("progress", 1L, null, false);
+			var writeStarted = new CountDownLatch(1);
+			var releaseWrite = new CountDownLatch(1);
+			connection.getScheduler().writeExecutor().execute(() -> {
+				writeStarted.countDown();
+				await(releaseWrite);
+			});
+			try {
+				assertTrue(writeStarted.await(5, TimeUnit.SECONDS));
+				connection.getAsyncApi().closeFailedUpdateAsync(Long.MAX_VALUE)
+						.get(5, TimeUnit.SECONDS);
+				assertTrue(connection.getAsyncApi().closeTransactionAsync(Long.MAX_VALUE, false)
+						.get(5, TimeUnit.SECONDS));
+				connection.getAsyncApi().cdcCommitAsync("progress", 42L)
+						.get(5, TimeUnit.SECONDS);
+				assertEquals(java.util.OptionalLong.of(42L),
+						connection.getSyncApi().cdcGetLastCommittedSequence("progress"));
+
+				var commit = connection.getAsyncApi().closeTransactionAsync(Long.MAX_VALUE, true);
+				assertThrows(TimeoutException.class, () -> commit.get(200, TimeUnit.MILLISECONDS),
+						"commit=true must remain queued on the saturated write lane");
+				releaseWrite.countDown();
+				commit.handle((_, _) -> null).get(5, TimeUnit.SECONDS);
+				assertTrue(commit.isCompletedExceptionally());
+			} finally {
+				releaseWrite.countDown();
+			}
+		}
+	}
 
 	@Test
 	void blockedRangeConsumerDoesNotParkTheOnlyReadWorker() throws Exception {

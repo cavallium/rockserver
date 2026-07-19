@@ -8,6 +8,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Stream;
 
@@ -211,6 +212,30 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			}
 
 		}
+
+		/**
+		 * Atomically delete a column by name if it exists.
+		 *
+		 * @param name column name
+		 */
+		record DeleteColumnIfExists(@NotNull String name) implements RocksDBAPICommandSingle<Boolean> {
+
+			@Override
+			public Boolean handleSync(RocksDBSyncAPI api) {
+				return api.deleteColumnIfExists(name);
+			}
+
+			@Override
+			public CompletableFuture<Boolean> handleAsync(RocksDBAsyncAPI api) {
+				return api.deleteColumnIfExistsAsync(name);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return false;
+			}
+		}
+
 		/**
 		 * Get column id by name
 		 * <p>
@@ -1079,16 +1104,20 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 	/**
 	 * Create or update a CDC subscription
 	 */
- record CdcCreate(String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean emitLatestValues) implements RocksDBAPICommandSingle<Long> {
+	record CdcCreate(String id,
+			@Nullable Long fromSeq,
+			@Nullable List<Long> columnIds,
+			@Nullable Boolean emitLatestValues,
+			@Nullable OptionalLong expectedLastCommitted) implements RocksDBAPICommandSingle<Long> {
 
         @Override
         public Long handleSync(RocksDBSyncAPI api) {
-            return api.cdcCreate(id, fromSeq, columnIds, emitLatestValues);
+			return api.cdcCreate(id, fromSeq, columnIds, emitLatestValues, expectedLastCommitted);
         }
 
         @Override
         public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
-            return api.cdcCreateAsync(id, fromSeq, columnIds, emitLatestValues);
+			return api.cdcCreateAsync(id, fromSeq, columnIds, emitLatestValues, expectedLastCommitted);
         }
 
         @Override
@@ -1116,6 +1145,53 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		@Override
 		public boolean isReadOnly() {
 			return false;
+		}
+	}
+
+	/**
+	 * Return the earliest CDC cursor still available in the database WAL.
+	 */
+	record CdcGetEarliestAvailableSequence() implements RocksDBAPICommandSingle<Long> {
+
+		@Override
+		public Long handleSync(RocksDBSyncAPI api) {
+			return api.cdcGetEarliestAvailableSequence();
+		}
+
+		@Override
+		public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
+			return api.cdcGetEarliestAvailableSequenceAsync();
+		}
+
+		@Override
+		public boolean isReadOnly() {
+			return true;
+		}
+
+		@Override
+		public ReadWorkClass readWorkClass() {
+			return ReadWorkClass.COMPOSITE;
+		}
+	}
+
+	/**
+	 * Return the durable last committed sequence for a CDC subscription.
+	 */
+	record CdcGetLastCommittedSequence(String id) implements RocksDBAPICommandSingle<OptionalLong> {
+
+		@Override
+		public OptionalLong handleSync(RocksDBSyncAPI api) {
+			return api.cdcGetLastCommittedSequence(id);
+		}
+
+		@Override
+		public CompletableFuture<OptionalLong> handleAsync(RocksDBAsyncAPI api) {
+			return api.cdcGetLastCommittedSequenceAsync(id);
+		}
+
+		@Override
+		public boolean isReadOnly() {
+			return true;
 		}
 	}
 

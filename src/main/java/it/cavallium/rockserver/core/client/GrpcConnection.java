@@ -6,6 +6,7 @@ import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Empty;
 import com.google.protobuf.UnsafeByteOperations;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
@@ -68,6 +69,7 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
@@ -342,6 +344,14 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setColumnId(columnId)
 				.build();
 		return toResponse(this.futureStub.deleteColumn(request), _ -> null);
+	}
+
+	@Override
+	public CompletableFuture<Boolean> deleteColumnIfExistsAsync(@NotNull String name) throws RocksDBException {
+		var request = DeleteColumnIfExistsRequest.newBuilder()
+				.setName(name)
+				.build();
+		return toResponse(this.futureStub.deleteColumnIfExists(request), DeleteColumnIfExistsResponse::getDeleted);
 	}
 
 	@Override
@@ -835,24 +845,52 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
     @Override
     public CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-        var builder = CdcCreateRequest.newBuilder().setId(id);
-        if (fromSeq != null) builder.setFromSeq(fromSeq);
-        if (columnIds != null) builder.addAllColumnIds(columnIds);
-        return toResponse(futureStub.cdcCreate(builder.build()), CdcCreateResponse::getStartSeq);
+		return cdcCreateAsync(id, fromSeq, columnIds, null, null);
     }
 
     @Override
     public CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
+		return cdcCreateAsync(id, fromSeq, columnIds, resolvedValues, null);
+	}
+
+	@Override
+	public CompletableFuture<Long> cdcCreateAsync(@NotNull String id,
+			@Nullable Long fromSeq,
+			@Nullable List<Long> columnIds,
+			@Nullable Boolean resolvedValues,
+			@Nullable OptionalLong expectedLastCommitted) throws RocksDBException {
         var builder = CdcCreateRequest.newBuilder().setId(id);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
         if (columnIds != null) builder.addAllColumnIds(columnIds);
         if (resolvedValues != null) builder.setResolvedValues(resolvedValues);
+		if (expectedLastCommitted != null) {
+			if (expectedLastCommitted.isPresent()) {
+				builder.setExpectedLastCommittedSeq(expectedLastCommitted.getAsLong());
+			} else {
+				builder.setExpectAbsent(Empty.getDefaultInstance());
+			}
+		}
         return toResponse(futureStub.cdcCreate(builder.build()), CdcCreateResponse::getStartSeq);
     }
 
     @Override
     public CompletableFuture<Void> cdcDeleteAsync(@NotNull String id) throws RocksDBException {
         return toResponse(futureStub.cdcDelete(CdcDeleteRequest.newBuilder().setId(id).build()), _ -> null);
+    }
+
+	@Override
+	public CompletableFuture<Long> cdcGetEarliestAvailableSequenceAsync() throws RocksDBException {
+		return toResponse(futureStub.cdcGetEarliestAvailableSequence(Empty.getDefaultInstance()),
+				CdcGetEarliestAvailableSequenceResponse::getSequence);
+	}
+
+    @Override
+    public CompletableFuture<OptionalLong> cdcGetLastCommittedSequenceAsync(@NotNull String id) throws RocksDBException {
+        var request = CdcGetLastCommittedSequenceRequest.newBuilder().setId(id).build();
+        return toResponse(futureStub.cdcGetLastCommittedSequence(request), response ->
+                response.hasLastCommittedSeq()
+                        ? OptionalLong.of(response.getLastCommittedSeq())
+                        : OptionalLong.empty());
     }
 
     @Override

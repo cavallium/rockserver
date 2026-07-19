@@ -17,7 +17,7 @@ public class RocksDBThriftException extends org.apache.thrift.TException impleme
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new RocksDBThriftExceptionTupleSchemeFactory();
 
   /**
-   * 
+   *
    * @see RocksDBErrorType
    */
   public @org.apache.thrift.annotation.Nullable RocksDBErrorType errorType; // required
@@ -26,7 +26,7 @@ public class RocksDBThriftException extends org.apache.thrift.TException impleme
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
     /**
-     * 
+     *
      * @see RocksDBErrorType
      */
     ERROR_TYPE((short)1, "errorType"),
@@ -96,9 +96,9 @@ public class RocksDBThriftException extends org.apache.thrift.TException impleme
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
-    tmpMap.put(_Fields.ERROR_TYPE, new org.apache.thrift.meta_data.FieldMetaData("errorType", org.apache.thrift.TFieldRequirementType.REQUIRED, 
+    tmpMap.put(_Fields.ERROR_TYPE, new org.apache.thrift.meta_data.FieldMetaData("errorType", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, RocksDBErrorType.class)));
-    tmpMap.put(_Fields.MESSAGE, new org.apache.thrift.meta_data.FieldMetaData("message", org.apache.thrift.TFieldRequirementType.REQUIRED, 
+    tmpMap.put(_Fields.MESSAGE, new org.apache.thrift.meta_data.FieldMetaData("message", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(RocksDBThriftException.class, metaDataMap);
@@ -140,7 +140,7 @@ public class RocksDBThriftException extends org.apache.thrift.TException impleme
   }
 
   /**
-   * 
+   *
    * @see RocksDBErrorType
    */
   @org.apache.thrift.annotation.Nullable
@@ -149,7 +149,7 @@ public class RocksDBThriftException extends org.apache.thrift.TException impleme
   }
 
   /**
-   * 
+   *
    * @see RocksDBErrorType
    */
   public RocksDBThriftException setErrorType(@org.apache.thrift.annotation.Nullable RocksDBErrorType errorType) {
@@ -412,7 +412,7 @@ public class RocksDBThriftException extends org.apache.thrift.TException impleme
       while (true)
       {
         schemeField = iprot.readFieldBegin();
-        if (schemeField.type == org.apache.thrift.protocol.TType.STOP) { 
+        if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
           break;
         }
         switch (schemeField.id) {
@@ -420,7 +420,7 @@ public class RocksDBThriftException extends org.apache.thrift.TException impleme
             if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
               struct.errorType = it.cavallium.rockserver.core.common.api.RocksDBErrorType.findByValue(iprot.readI32());
               struct.setErrorTypeIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
@@ -428,7 +428,7 @@ public class RocksDBThriftException extends org.apache.thrift.TException impleme
             if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
               struct.message = iprot.readString();
               struct.setMessageIsSet(true);
-            } else { 
+            } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;

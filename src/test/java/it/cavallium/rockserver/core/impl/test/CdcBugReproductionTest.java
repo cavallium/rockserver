@@ -1072,11 +1072,12 @@ class CdcBugReproductionTest {
         // Delete
         db.cdcDelete(lifeSub);
 
-        // Poll should fail or return empty/error depending on implementation.
-        // In EmbeddedDB.cdcPollOnce: "CDC subscription not found" -> throws RocksDBException (Internal Error)
-        assertThrows(RocksDBException.class, () -> {
-            db.cdcPollBatchAsyncInternal(lifeSub, null, 10).block();
-        });
+		// Deleted metadata is a permanent, typed condition so consumers can reinitialize once.
+		var missing = assertThrows(RocksDBException.class, () -> {
+			db.cdcPollBatchAsyncInternal(lifeSub, null, 10).block();
+		});
+		assertEquals(RocksDBException.RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
+				missing.getErrorUniqueId());
 
         // Re-create
         db.cdcCreate(lifeSub, null, List.of(columnId), false);

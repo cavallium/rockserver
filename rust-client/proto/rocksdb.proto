@@ -116,6 +116,8 @@ message CreateColumnRequest {string name = 1; ColumnSchema schema = 2;}
 message CreateColumnResponse {int64 columnId = 1;}
 
 message DeleteColumnRequest {int64 columnId = 1;}
+message DeleteColumnIfExistsRequest {string name = 1;}
+message DeleteColumnIfExistsResponse {bool deleted = 1;}
 
 message GetColumnIdRequest {string name = 1;}
 message GetColumnIdResponse {int64 columnId = 1;}
@@ -207,6 +209,7 @@ service RocksDBService {
   rpc closeFailedUpdate(CloseFailedUpdateRequest) returns (google.protobuf.Empty);
   rpc createColumn(CreateColumnRequest) returns (CreateColumnResponse);
   rpc deleteColumn(DeleteColumnRequest) returns (google.protobuf.Empty);
+  rpc deleteColumnIfExists(DeleteColumnIfExistsRequest) returns (DeleteColumnIfExistsResponse);
   rpc getColumnId(GetColumnIdRequest) returns (GetColumnIdResponse);
   rpc estimateNumKeys(EstimateNumKeysRequest) returns (EntriesCount);
   rpc put(PutRequest) returns (google.protobuf.Empty);
@@ -251,6 +254,10 @@ service RocksDBService {
   rpc cdcCreate(CdcCreateRequest) returns (CdcCreateResponse);
   // Delete a CDC subscription
   rpc cdcDelete(CdcDeleteRequest) returns (google.protobuf.Empty);
+  // Return the earliest CDC cursor still available in the database WAL.
+  rpc cdcGetEarliestAvailableSequence(google.protobuf.Empty) returns (CdcGetEarliestAvailableSequenceResponse);
+  // Return the durable last committed sequence, or an empty response when the subscription is absent.
+  rpc cdcGetLastCommittedSequence(CdcGetLastCommittedSequenceRequest) returns (CdcGetLastCommittedSequenceResponse);
   // Stream CDC events starting from fromSeq (inclusive). If fromSeq is not provided, starts from last committed + 1
   rpc cdcPoll(CdcPollRequest) returns (stream CDCEvent);
   // Poll a CDC batch together with the server cursor. Unlike cdcPoll, this preserves cursor
@@ -270,6 +277,13 @@ message CdcCreateRequest {
   // If true, CDC will emit the resolved current values as seen by readers (post-merge),
   // instead of raw operands for MERGE operations. Defaults to false if not set.
   optional bool resolvedValues = 4;
+  // Optional atomic checkpoint precondition. Not setting either field preserves unchecked legacy behavior.
+  oneof expectedLastCommitted {
+    // Require that the subscription metadata does not exist.
+    google.protobuf.Empty expectAbsent = 5;
+    // Require that the subscription exists at exactly this durable checkpoint.
+    int64 expectedLastCommittedSeq = 6;
+  }
 }
 
 message CdcCreateResponse {
@@ -278,6 +292,16 @@ message CdcCreateResponse {
 }
 
 message CdcDeleteRequest { string id = 1; }
+
+message CdcGetEarliestAvailableSequenceResponse {
+  int64 sequence = 1;
+}
+
+message CdcGetLastCommittedSequenceRequest { string id = 1; }
+
+message CdcGetLastCommittedSequenceResponse {
+  optional int64 lastCommittedSeq = 1;
+}
 
 message CdcPollRequest {
   string id = 1;

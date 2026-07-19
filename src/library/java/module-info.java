@@ -53,5 +53,6 @@ module rockserver.core {
 	exports it.cavallium.rockserver.core.impl.rocksdb;
 	exports it.cavallium.rockserver.core.impl;
 	exports it.cavallium.rockserver.core.common.api.proto;
+	exports it.cavallium.rockserver.core.common.api to rockserver.core.test;
 	exports it.cavallium.rockserver.core.server to rockserver.core.test;
 }

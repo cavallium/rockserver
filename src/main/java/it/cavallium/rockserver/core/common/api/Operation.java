@@ -37,7 +37,7 @@ public enum Operation implements org.apache.thrift.TEnum {
    * @return null if the value is not found.
    */
   @org.apache.thrift.annotation.Nullable
-  public static Operation findByValue(int value) { 
+  public static Operation findByValue(int value) {
     switch (value) {
       case 1:
         return NOTHING;

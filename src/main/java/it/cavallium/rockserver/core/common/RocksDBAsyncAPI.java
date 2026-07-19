@@ -15,6 +15,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumnIfExists;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Delete;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.EstimateNumKeys;
@@ -44,6 +45,7 @@ import it.cavallium.rockserver.core.common.cdc.CdcStreamOptions;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -106,6 +108,11 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	/** See: {@link DeleteColumn}. */
 	default CompletableFuture<Void> deleteColumnAsync(long columnId) throws RocksDBException {
 		return requestAsync(new DeleteColumn(columnId));
+	}
+
+	/** Atomically delete a column by name when it exists. */
+	default CompletableFuture<Boolean> deleteColumnIfExistsAsync(@NotNull String name) throws RocksDBException {
+		return requestAsync(new DeleteColumnIfExists(name));
 	}
 
 	/** See: {@link GetColumnId}. */
@@ -302,15 +309,38 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 
     // CDC API
     default CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-        return requestAsync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds, null));
+        return cdcCreateAsync(id, fromSeq, columnIds, null, null);
     }
 
     default CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
-        return requestAsync(new RocksDBAPICommand.CdcCreate(id, fromSeq, columnIds, resolvedValues));
+        return cdcCreateAsync(id, fromSeq, columnIds, resolvedValues, null);
+    }
+
+    /**
+     * Atomically create or update a CDC subscription if its durable checkpoint still matches.
+     * {@code null} disables the precondition, empty requires absence, and a present value requires an exact match.
+     */
+    default CompletableFuture<Long> cdcCreateAsync(@NotNull String id,
+                                                    @Nullable Long fromSeq,
+                                                    @Nullable List<Long> columnIds,
+                                                    @Nullable Boolean resolvedValues,
+                                                    @Nullable OptionalLong expectedLastCommitted) throws RocksDBException {
+        return requestAsync(new RocksDBAPICommand.CdcCreate(
+                id, fromSeq, columnIds, resolvedValues, expectedLastCommitted));
     }
 
     default CompletableFuture<Void> cdcDeleteAsync(@NotNull String id) throws RocksDBException {
         return requestAsync(new RocksDBAPICommand.CdcDelete(id));
+    }
+
+	/** Return the earliest CDC cursor still available in this database's WAL. */
+	default CompletableFuture<Long> cdcGetEarliestAvailableSequenceAsync() throws RocksDBException {
+		return requestAsync(new RocksDBAPICommand.CdcGetEarliestAvailableSequence());
+	}
+
+    /** Return the durable last committed sequence for a CDC subscription, if it exists. */
+    default CompletableFuture<OptionalLong> cdcGetLastCommittedSequenceAsync(@NotNull String id) throws RocksDBException {
+        return requestAsync(new RocksDBAPICommand.CdcGetLastCommittedSequence(id));
     }
 
     default CompletableFuture<Void> cdcCommitAsync(@NotNull String id, long seq) throws RocksDBException {
@@ -528,10 +558,13 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
     private static boolean isRetryableCdcStreamFailure(Throwable failure) {
         Throwable current = failure;
         for (int depth = 0; current != null && depth < 32; depth++) {
-            if (current instanceof RocksDBException rocksDBException
-                    && rocksDBException.getErrorUniqueId() == RocksDBException.RocksDBErrorType.CDC_RESPONSE_TOO_LARGE) {
-                return false;
-            }
+            if (current instanceof RocksDBException rocksDBException) {
+				var errorType = rocksDBException.getErrorUniqueId();
+				if (errorType == RocksDBException.RocksDBErrorType.CDC_RESPONSE_TOO_LARGE
+						|| errorType == RocksDBException.RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND) {
+					return false;
+				}
+			}
             Throwable cause = current.getCause();
             if (cause == current) {
                 break;

@@ -122,6 +122,37 @@ public class CdcGrpcTest {
         client.getSyncApi().cdcCommit("sub1", events.get(1).seq());
     }
 
+	@Test
+	void missingSubscriptionErrorsRemainTypedOverGrpc() {
+		var commitError = assertThrows(RocksDBException.class,
+				() -> client.getSyncApi().cdcCommit("missing", 1L));
+		assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
+				commitError.getErrorUniqueId());
+
+		var batchError = assertThrows(RocksDBException.class,
+				() -> client.getAsyncApi().cdcPollBatchAsync("missing", null, 10).block());
+		assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
+				batchError.getErrorUniqueId());
+
+		var streamError = assertThrows(RocksDBException.class,
+				() -> Flux.from(client.getAsyncApi().cdcPollAsync("missing", null, 10))
+						.collectList()
+						.block());
+		assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
+				streamError.getErrorUniqueId());
+
+		var highLevelStreamError = assertTimeoutPreemptively(Duration.ofSeconds(2),
+				() -> assertThrows(RocksDBException.class,
+						() -> client.getAsyncApi().cdcStream(
+								"missing",
+								new CdcStreamOptions(null, 10, Duration.ofMillis(10), CdcCommitMode.NONE),
+								null)
+								.blockFirst()));
+		assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
+				highLevelStreamError.getErrorUniqueId(),
+				"metadata loss must escape the transient retry loop so the consumer can reinitialize");
+	}
+
     @Test
     void filteredEmptyBatchCarriesServerNextSequenceOverGrpc() throws Exception {
         var selectedColumn = client.getSyncApi().createColumn(
