@@ -51,7 +51,6 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                     .setUseDirectIoForFlushAndCompaction(true)
                     .setBytesPerSync(5 * SizeUnit.MB)
                     .setParanoidChecks(false)
-                    .setSkipCheckingSstFileSizesOnDbOpen(true)
                     .setForceConsistencyChecks(false)
                     .setParanoidFileChecks(false);
             if (columnConifg != null) {

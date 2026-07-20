@@ -24,7 +24,7 @@ import org.rocksdb.RocksDB;
  * Feasibility prototype for calling RocksDB's exported C get functions through FFM.
  *
  * <p><strong>Not production API:</strong> RocksJava exposes raw C++ pointers, while the C API expects opaque wrapper
- * structs. This prototype relies on the exact RocksDB 10.10.1 layout: {@code rocksdb_t} starts with a {@code DB*},
+ * structs. This prototype relies on the exact RocksDB 11.1.2 layout: {@code rocksdb_t} starts with a {@code DB*},
  * {@code rocksdb_column_family_handle_t} starts with a {@code ColumnFamilyHandle*}, and
  * {@code rocksdb_readoptions_t} starts with an inline {@code ReadOptions}. It therefore wraps the DB and column-family
  * pointers and passes the raw RocksJava {@code ReadOptions*} as the address of that first inline member. This is an ABI

@@ -36,6 +36,8 @@ public class RocksDBLoader {
     private static final int AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MIN = 64;
     private static final int AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MAX = 65_536;
     private static final double DEFAULT_BLOCK_CACHE_HIGH_PRIORITY_RATIO = 0.5d;
+    private static final String ENFORCE_WRITE_BUFFER_MANAGER_DURING_RECOVERY =
+            "enforce_write_buffer_manager_during_recovery";
 
     private static final CacheFactory LRU_CACHE_FACTORY = new LRUCacheFactory();
     private static final CacheFactory CLOCK_CACHE_FACTORY = new ClockCacheFactory();
@@ -124,7 +126,81 @@ public class RocksDBLoader {
                            Map<String, @Nullable FFMAbstractMergeOperator> mergeOperators,
                            RocksDBObjects refs, @Nullable Cache cache) {}
 
+    private static final class OpenedDbGuard implements AutoCloseable {
+
+        private final RocksDB db;
+        private final List<ColumnFamilyHandle> handles;
+        private boolean released;
+
+        private OpenedDbGuard(RocksDB db, List<ColumnFamilyHandle> handles) {
+            this.db = db;
+            this.handles = handles;
+        }
+
+        private void release() {
+            released = true;
+        }
+
+        @Override
+        public void close() {
+            if (released) {
+                return;
+            }
+
+            RuntimeException cleanupFailure = null;
+            try {
+                db.cancelAllBackgroundWork(true);
+            } catch (Exception ex) {
+                cleanupFailure = recordCleanupFailure(cleanupFailure, ex);
+            }
+            for (ColumnFamilyHandle handle : handles) {
+                try {
+                    if (handle.isOwningHandle()) {
+                        handle.close();
+                    }
+                } catch (Exception ex) {
+                    cleanupFailure = recordCleanupFailure(cleanupFailure, ex);
+                }
+            }
+            try {
+                if (db.isOwningHandle()) {
+                    db.closeE();
+                }
+            } catch (Exception ex) {
+                cleanupFailure = recordCleanupFailure(cleanupFailure, ex);
+            }
+            if (cleanupFailure != null) {
+                throw cleanupFailure;
+            }
+        }
+
+        private static RuntimeException recordCleanupFailure(RuntimeException failure, Exception next) {
+            if (failure == null) {
+                return new RuntimeException("Failed to close RocksDB after startup handoff failure", next);
+            }
+            failure.addSuppressed(next);
+            return failure;
+        }
+    }
+
     public record ColumnOptionsWithMerge(@NotNull ColumnFamilyOptions options, @Nullable FFMAbstractMergeOperator mergeOperator) {}
+
+    /**
+     * Creates the otherwise-default options used by Rockserver's internal column families while
+     * retaining the RocksDB 10.10 SST compatibility boundary.
+     */
+    public static ColumnFamilyOptions getCompatibilityColumnOptions(@NotNull RocksDBObjects refs) {
+        var columnFamilyOptions = new ColumnFamilyOptions() {
+          {
+            RocksLeakDetector.register(this, "cf-options", owningHandle_);
+          }
+        };
+        refs.add(columnFamilyOptions);
+        var tableOptions = new BlockBasedTableConfig();
+        applyTableFormatCompatibility(tableOptions);
+        columnFamilyOptions.setTableFormatConfig(tableOptions);
+        return columnFamilyOptions;
+    }
 
     public static ColumnOptionsWithMerge getColumnOptions(String name,
         @Nullable Path path,
@@ -346,6 +422,7 @@ public class RocksDBLoader {
                 columnFamilyOptions.setMaxWriteBufferNumber(4);
             }
             if (tableOptions instanceof BlockBasedTableConfig blockBasedTableConfig) {
+                applyTableFormatCompatibility(blockBasedTableConfig);
                 blockBasedTableConfig
                         // http://rocksdb.org/blog/2018/08/23/data-block-hash-index.html
                         .setDataBlockIndexType(DataBlockIndexType.kDataBlockBinaryAndHash)
@@ -431,6 +508,16 @@ public class RocksDBLoader {
         return (int) autoValue;
     }
 
+    private static void applyTableFormatCompatibility(BlockBasedTableConfig tableOptions) {
+        tableOptions
+                // RocksDB 10.10 used format 6. Version 11 changed the default to 7, which is only
+                // required for custom CompressionManagers; keep production compaction output stable.
+                .setFormatVersion(6)
+                // RocksJava 11 enables index-key uniformity tracking by default. RocksDB 10.10 did
+                // not understand the resulting index-block footer flag, so preserve compatible output.
+                .setUniformCvThreshold(-1);
+    }
+
     private static void setZstdCompressionOptions(CompressionOptions compressionOptions) {
         // https://rocksdb.org/blog/2021/05/31/dictionary-compression.html#:~:text=(zstd%20only,it%20to%20100x
         compressionOptions
@@ -465,6 +552,30 @@ public class RocksDBLoader {
 
     record OptionsWithCache(DBOptions options, @Nullable Cache standardCache) {}
 
+    private static DBOptions newCompatibleDBOptions() {
+        // DBOptions.getDBOptionsFromProps(), unlike the public constructor, does not bootstrap JNI itself.
+        RocksDB.loadLibrary();
+        var properties = new Properties();
+        // RocksDB 11 changed this default to true, but RocksJava 11.1.2 does not expose its setter.
+        // Preserve the 10.10 recovery behavior so this startup-focused upgrade does not introduce
+        // extra recovery flushes, a different L0 layout, or a new recovery-time memory policy.
+        properties.setProperty(ENFORCE_WRITE_BUFFER_MANAGER_DURING_RECOVERY, Boolean.FALSE.toString());
+        var parsedOptions = DBOptions.getDBOptionsFromProps(properties);
+        if (parsedOptions == null) {
+            throw new IllegalStateException("The bundled RocksDB JNI does not recognize "
+                    + ENFORCE_WRITE_BUFFER_MANAGER_DURING_RECOVERY);
+        }
+        try (parsedOptions) {
+            return new DBOptions(parsedOptions) {
+              {
+                // The property-based RocksJava factory does not initialize its Java-side Env reference.
+                setEnv(Env.getDefault());
+                RocksLeakDetector.register(this, "db-options", owningHandle_);
+              }
+            };
+        }
+    }
+
     private static OptionsWithCache makeRocksDBOptions(@Nullable Path path,
         Path definitiveDbPath,
         DatabaseConfig databaseOptions,
@@ -473,14 +584,9 @@ public class RocksDBLoader {
         try {
             // the Options class contains a set of configurable DB options
             // that determines the behaviour of the database.
-            var options = new DBOptions() {
-              {
-                RocksLeakDetector.register(this, "db-options", owningHandle_);
-              }
-            };
+            var options = newCompatibleDBOptions();
             refs.add(options);
             options.setParanoidChecks(databaseOptions.global().paranoidChecks());
-            options.setSkipCheckingSstFileSizesOnDbOpen(true);
 
             var statistics = new Statistics() {
               {
@@ -532,8 +638,33 @@ public class RocksDBLoader {
             options.setDeleteObsoleteFilesPeriodMicros(20 * 1000000); // 20 seconds
             options.setKeepLogFileNum(10);
 
-            options.setMaxOpenFiles(Optional.ofNullable(databaseOptions.global().maximumOpenFiles()).orElse(-1));
-            options.setMaxFileOpeningThreads(Runtime.getRuntime().availableProcessors());
+            var globalOptions = databaseOptions.global();
+            int maximumOpenFiles = Objects.requireNonNullElse(globalOptions.maximumOpenFiles(), -1);
+            int maxFileOpeningThreads = Objects.requireNonNullElse(globalOptions.maxFileOpeningThreads(),
+                    Runtime.getRuntime().availableProcessors());
+            boolean openFilesAsync = globalOptions.openFilesAsync();
+            if (maxFileOpeningThreads <= 0) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(
+                        RocksDBErrorType.CONFIG_ERROR,
+                        "database.global.max-file-opening-threads must be greater than zero, but was "
+                                + maxFileOpeningThreads);
+            }
+            if (openFilesAsync && maximumOpenFiles != -1) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(
+                        RocksDBErrorType.CONFIG_ERROR,
+                        "database.global.open-files-async requires database.global.maximum-open-files=-1, but was "
+                                + maximumOpenFiles);
+            }
+            options
+                    .setMaxOpenFiles(maximumOpenFiles)
+                    .setMaxFileOpeningThreads(maxFileOpeningThreads)
+                    .setSkipStatsUpdateOnDbOpen(openFilesAsync)
+                    .setOpenFilesAsync(openFilesAsync);
+            if (openFilesAsync) {
+                logger.info("RocksDB will open and pin existing SST files asynchronously using {} workers; "
+                                + "first access can be slower until background warm-up completes",
+                        maxFileOpeningThreads);
+            }
             if (databaseOptions.global().spinning()) {
                 // https://nightlies.apache.org/flink/flink-docs-release-1.3/api/java/org/apache/flink/contrib/streaming/state/PredefinedOptions.html
                 options.setUseFsync(false);
@@ -755,19 +886,18 @@ public class RocksDBLoader {
                 Files.createDirectories(logPath.get());
             }
 
-            var defaultColumnOptions = new ColumnFamilyOptions() {
-              {
-                RocksLeakDetector.register(this, "cf-options", owningHandle_);
-              }
-            };
-            refs.add(defaultColumnOptions);
-            descriptors.add(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, defaultColumnOptions));
-
-            var rocksLogger = new RocksLogger(rocksdbOptions, logger);
+            var rocksLogger = new RocksLogger(logger);
+            refs.add(rocksLogger);
+            rocksdbOptions.setListeners(List.of(rocksLogger));
 
             var columnConfigs = databaseOptions.global().columnOptions();
 
             SequencedMap<String, FallbackColumnConfig> columnConfigMap = new LinkedHashMap<>();
+
+            // RocksDB requires the default column-family descriptor first and exactly once. Inserting
+            // the fallback before named configurations preserves that position, while a named
+            // "default" configuration replaces the value without changing the insertion order.
+            columnConfigMap.put("default", databaseOptions.global().fallbackColumnOptions());
 
             for (NamedColumnConfig columnConfig : columnConfigs) {
                 columnConfigMap.put(columnConfig.name(), columnConfig);
@@ -845,24 +975,29 @@ public class RocksDBLoader {
                 }
             }
 
-					handles.forEach(refs::add);
+            try (var openedDbGuard = new OpenedDbGuard(db, handles)) {
+                handles.forEach(refs::add);
 
-            try {
-                for (ColumnFamilyHandle cfh : handles) {
-                    var props = db.getProperty(cfh, "rocksdb.stats");
-                    logger.trace("Stats for database column {}: {}", new String(cfh.getName(), StandardCharsets.UTF_8),
-                        props);
+                if (logger.isTraceEnabled()) {
+                    try {
+                        for (ColumnFamilyHandle cfh : handles) {
+                            var props = db.getProperty(cfh, "rocksdb.stats");
+                            logger.trace("Stats for database column {}: {}",
+                                    new String(cfh.getName(), StandardCharsets.UTF_8), props);
+                        }
+                    } catch (RocksDBException ex) {
+                        logger.debug("Failed to obtain stats", ex);
+                    }
                 }
-            } catch (RocksDBException ex) {
-                logger.debug("Failed to obtain stats", ex);
-            }
 
-            var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
-            var dbTasks = new DatabaseTasks(db, inMemory, delayWalFlushConfig);
-            try {
+                var delayWalFlushConfig = getWalFlushDelayConfig(databaseOptions);
+                var dbTasks = new DatabaseTasks(db, inMemory, delayWalFlushConfig);
                 var transactionalDB = TransactionalDB.create(definitiveDbPath.toString(), db, descriptors, handles, dbTasks);
+                var loadedDb = new LoadedDb(transactionalDB, path, definitiveDbPath, rocksdbOptions,
+                        definitiveColumnFamilyOptionsMap, mergeOperators, refs, optionsWithCache.standardCache());
+                openedDbGuard.release();
                 envRegistered = false;
-                return new LoadedDb(transactionalDB, path, definitiveDbPath, rocksdbOptions, definitiveColumnFamilyOptionsMap, mergeOperators, refs, optionsWithCache.standardCache());
+                return loadedDb;
             } finally {
                 if (envRegistered) {
                     RocksDBEnvLifecycle.openFailed();

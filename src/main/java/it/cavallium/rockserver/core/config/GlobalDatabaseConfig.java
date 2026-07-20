@@ -26,6 +26,10 @@ public interface GlobalDatabaseConfig {
 
 	@Nullable Integer maximumOpenFiles() throws GestaltException;
 
+	boolean openFilesAsync() throws GestaltException;
+
+	@Nullable Integer maxFileOpeningThreads() throws GestaltException;
+
 	boolean optimistic() throws GestaltException;
 
 	@Nullable DataSize blockCache() throws GestaltException;

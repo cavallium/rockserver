@@ -236,6 +236,28 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.unconfiguredColumns = new ConcurrentHashMap<>();
 		this.ops = new SafeShutdown();
 		DatabaseConfig config = ConfigParser.parse(embeddedConfigPath);
+		this.config = config;
+		int readCap;
+		int writeCap;
+		try {
+			readCap = Objects.requireNonNullElse(
+					config.parallelism().read(), Runtime.getRuntime().availableProcessors());
+			writeCap = Objects.requireNonNullElse(
+					config.parallelism().write(), Runtime.getRuntime().availableProcessors());
+			this.fastGet = config.global().enableFastGet();
+		} catch (GestaltException e) {
+			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+					"Can't get scheduler parallelism or fast-get configuration",
+					e);
+		}
+		if (readCap < 1 || writeCap < 1) {
+			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+					"Database read and write parallelism must be positive, but was read="
+							+ readCap + ", write=" + writeCap);
+		}
+		if (fastGet) {
+			FFMRocksDBGet.ensureRuntimeCompatible();
+		}
 
 		this.metrics = new MetricsManager(config);
 		Timer loadTimer = createTimer(Tags.of("action", "load"));
@@ -334,7 +356,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		var beforeLoad = Instant.now();
-		this.config = config;
 		var loadedDb = RocksDBLoader.load(path, config, logger);
 		this.db = loadedDb.db();
 		this.dbOptions = loadedDb.dbOptions();
@@ -372,17 +393,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					Runtime.getRuntime().availableProcessors(), 0, 0);
 		}
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache, this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig);
-		try {
-			int readCap = Objects.requireNonNullElse(config.parallelism().read(), Runtime.getRuntime().availableProcessors());
-			int writeCap = Objects.requireNonNullElse(config.parallelism().write(),
-					Runtime.getRuntime().availableProcessors()
-			);
-			this.scheduler = new RWScheduler(readCap, writeCap, "db[" + name + "]");
-			this.fastGet = config.global().enableFastGet();
-			this.fastGetReader = fastGet ? new FFMRocksDBGet(db.get(), (long) readCap + writeCap) : null;
-		} catch (GestaltException e) {
-			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Can't get the scheduler parallelism");
-		}
+		this.scheduler = new RWScheduler(readCap, writeCap, "db[" + name + "]");
+		this.fastGetReader = fastGet ? new FFMRocksDBGet(db.get(), (long) readCap + writeCap) : null;
 		this.leakScheduler = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("db-leak-scheduler"));
 
 		leakScheduler.scheduleWithFixedDelay(this::cleanupExpiredTransactionsNow, 1, 1, TimeUnit.MINUTES);
@@ -404,9 +416,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				.filter(e -> Arrays.equals(e.getKey().getName(), COLUMN_SCHEMAS_COLUMN))
 				.findAny();
 		if (existingColumnSchemasColumnDescriptorOptional.isEmpty()) {
-			var columnSchemasColumnDescriptor = new ColumnFamilyDescriptor(COLUMN_SCHEMAS_COLUMN);
+			var columnSchemasColumnOptions = RocksDBLoader.getCompatibilityColumnOptions(refs);
+			var columnSchemasColumnDescriptor = new ColumnFamilyDescriptor(COLUMN_SCHEMAS_COLUMN,
+					columnSchemasColumnOptions);
 			try {
 				columnSchemasColumnDescriptorHandle = db.get().createColumnFamily(columnSchemasColumnDescriptor);
+				columnsConifg.put(new String(COLUMN_SCHEMAS_COLUMN, StandardCharsets.UTF_8),
+						columnSchemasColumnOptions);
 			} catch (org.rocksdb.RocksDBException e) {
 				throw new IOException("Cannot create system column", e);
 			}
@@ -421,9 +437,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				.filter(e -> Arrays.equals(e.getKey().getName(), MERGE_OPERATORS_COLUMN))
 				.findAny();
 		if (existingMergeOperatorsColumnDescriptorOptional.isEmpty()) {
-			var mergeOperatorsColumnDescriptor = new ColumnFamilyDescriptor(MERGE_OPERATORS_COLUMN);
+			var mergeOperatorsColumnOptions = RocksDBLoader.getCompatibilityColumnOptions(refs);
+			var mergeOperatorsColumnDescriptor = new ColumnFamilyDescriptor(MERGE_OPERATORS_COLUMN,
+					mergeOperatorsColumnOptions);
 			try {
 				mergeOperatorsColumnDescriptorHandle = db.get().createColumnFamily(mergeOperatorsColumnDescriptor);
+				columnsConifg.put(new String(MERGE_OPERATORS_COLUMN, StandardCharsets.UTF_8),
+						mergeOperatorsColumnOptions);
 			} catch (org.rocksdb.RocksDBException e) {
 				throw new IOException("Cannot create system column", e);
 			}
@@ -440,9 +460,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				.filter(e -> Arrays.equals(e.getKey().getName(), CDC_META_COLUMN))
 				.findAny();
 		if (existingCdcMetaColumnDescriptorOptional.isEmpty()) {
-			var cdcMetaDescriptor = new ColumnFamilyDescriptor(CDC_META_COLUMN);
+			var cdcMetaColumnOptions = RocksDBLoader.getCompatibilityColumnOptions(refs);
+			var cdcMetaDescriptor = new ColumnFamilyDescriptor(CDC_META_COLUMN, cdcMetaColumnOptions);
 			try {
 				cdcMetaColumnDescriptorHandle = db.get().createColumnFamily(cdcMetaDescriptor);
+				columnsConifg.put(new String(CDC_META_COLUMN, StandardCharsets.UTF_8), cdcMetaColumnOptions);
 			} catch (org.rocksdb.RocksDBException e) {
 				throw new IOException("Cannot create CDC meta column", e);
 			}
@@ -6462,7 +6484,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return true;
 		}
 
-		// These are the exact continuity-loss states emitted by RocksDB 10.10.1's
+		// These are the exact continuity-loss states emitted by RocksDB 11.1.2's
 		// TransactionLogIteratorImpl. Do not classify unrelated Corruption/IOError statuses as
 		// CDC gaps: those must remain operational failures rather than trigger a projection rebuild.
 		boolean missingWalContinuity = (code == Code.NotFound && CDC_GAP_STATUS.equals(state))

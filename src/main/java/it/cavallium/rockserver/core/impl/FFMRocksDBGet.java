@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.regex.Pattern;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ReadOptions;
@@ -22,11 +23,12 @@ import org.rocksdb.RocksDB;
  * MemorySegment-based access to RocksDB's pinned C Get API.
  *
  * <p>RocksJava exposes raw {@code DB*}, {@code ColumnFamilyHandle*}, and {@code ReadOptions*} handles, while the
- * RocksDB C API accepts opaque wrappers. In the pinned {@code 10.10.1.1:linux64} ABI, {@code rocksdb_t} and
+ * RocksDB C API accepts opaque wrappers. In the pinned {@code 11.1.2.2:linux64} ABI, {@code rocksdb_t} and
  * {@code rocksdb_column_family_handle_t} start with those respective pointers, and {@code rocksdb_readoptions_t}
  * starts with an inline {@code ReadOptions}. This adapter supplies the two pointer wrappers and passes the raw
- * ReadOptions address as that first inline member. The exact artifact check below deliberately turns a future ABI
- * change into a clear startup failure instead of memory corruption.
+ * ReadOptions address as that first inline member. The artifact checks below accept the exact release and its
+ * full-commit Maven snapshots, while deliberately turning a future ABI change into a clear startup failure instead
+ * of memory corruption.
  *
  * <p>The Get downcall is intentionally not marked critical: a RocksDB read can block, decompress data, or execute a
  * merge operator. Keys are copied into bounded, reusable pooled native memory. Values remain pinned only while they
@@ -37,13 +39,15 @@ import org.rocksdb.RocksDB;
  */
 final class FFMRocksDBGet implements AutoCloseable {
 
-	private static final String SUPPORTED_ROCKSDBJNI_VERSION = "10.10.1.1";
+	private static final String SUPPORTED_ROCKSDBJNI_VERSION = "11.1.2.2";
+	private static final Pattern SUPPORTED_ROCKSDBJNI_COORDINATE = Pattern.compile(
+			Pattern.quote(SUPPORTED_ROCKSDBJNI_VERSION) + "(?:-master\\.[0-9a-f]{40}-SNAPSHOT)?");
 	private static final int INITIAL_KEY_CAPACITY = 256;
 	private static final int MAX_RETAINED_STATES = 256;
 	private static final long MAX_ERROR_BYTES = 64L * 1024;
-	private static final int EXPECTED_NATIVE_MAJOR = 10;
-	private static final int EXPECTED_NATIVE_MINOR = 10;
-	private static final int EXPECTED_NATIVE_PATCH = 1;
+	private static final int EXPECTED_NATIVE_MAJOR = 11;
+	private static final int EXPECTED_NATIVE_MINOR = 1;
+	private static final int EXPECTED_NATIVE_PATCH = 2;
 	private static final Linker LINKER = Linker.nativeLinker();
 	private static final MethodHandle GET_PINNED_CF;
 	private static final MethodHandle PINNED_GET_VALUE;
@@ -57,10 +61,11 @@ final class FFMRocksDBGet implements AutoCloseable {
 
 	static {
 		RocksDB.loadLibrary();
-		String implementationVersion = RocksDBMetadata.getRocksDBVersionHash();
-		if (!SUPPORTED_ROCKSDBJNI_VERSION.equals(implementationVersion)) {
+		String artifactCoordinateVersion = RocksDBMetadata.getRocksDBVersionHash();
+		if (!SUPPORTED_ROCKSDBJNI_COORDINATE.matcher(artifactCoordinateVersion).matches()) {
 			throw new ExceptionInInitializerError("FFM fast-get requires rocksdbjni "
-					+ SUPPORTED_ROCKSDBJNI_VERSION + ", found " + implementationVersion);
+					+ SUPPORTED_ROCKSDBJNI_VERSION + " or its full-commit master snapshot, found "
+					+ artifactCoordinateVersion);
 		}
 		String packageVersion = RocksDB.class.getPackage().getImplementationVersion();
 		if (packageVersion != null && !SUPPORTED_ROCKSDBJNI_VERSION.equals(packageVersion)) {
@@ -112,6 +117,11 @@ final class FFMRocksDBGet implements AutoCloseable {
 				FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_BYTE));
 		READ_OPTIONS_DESTROY = LINKER.downcallHandle(find(lookup, "rocksdb_readoptions_destroy"),
 				FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+	}
+
+	static void ensureRuntimeCompatible() {
+		// Calling this method forces the compatibility and symbol checks in the static initializer
+		// to finish before EmbeddedDB acquires metrics, native handles, the DB lock, or threads.
 	}
 
 	private final MemorySegment databaseWrapper;

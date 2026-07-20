@@ -43,6 +43,9 @@ class ConfigParserBoundaryTest {
 				() -> assertTrue(config.global().absoluteConsistency()),
 				() -> assertFalse(config.global().unorderedWrite()),
 				() -> assertFalse(config.global().allowRocksdbMmapWrites()),
+				() -> assertEquals(-1, config.global().maximumOpenFiles()),
+				() -> assertFalse(config.global().openFilesAsync()),
+				() -> assertNull(config.global().maxFileOpeningThreads()),
 				() -> assertFalse(config.global().disableAutoCompactions()),
 				() -> assertFalse(config.global().disableWriteSlowdown()),
 				() -> assertEquals(new DataSize("512MiB"), config.global().blockCache()),
@@ -128,6 +131,9 @@ class ConfigParserBoundaryTest {
 				() -> assertEquals(original.global().useClockCache(), reparsed.global().useClockCache()),
 				() -> assertEquals(original.global().allowRocksdbMmapWrites(),
 						reparsed.global().allowRocksdbMmapWrites()),
+				() -> assertEquals(original.global().openFilesAsync(), reparsed.global().openFilesAsync()),
+				() -> assertEquals(original.global().maxFileOpeningThreads(),
+						reparsed.global().maxFileOpeningThreads()),
 				() -> assertEquals(original.global().disableAutoCompactions(),
 						reparsed.global().disableAutoCompactions()),
 				() -> assertEquals(original.global().disableWriteSlowdown(),
@@ -162,6 +168,8 @@ class ConfigParserBoundaryTest {
 				database.global.paranoid-checks = false
 				database.global.use-clock-cache = true
 				database.global.allow-rocksdb-mmap-writes = true
+				database.global.open-files-async = true
+				database.global.max-file-opening-threads = 7
 				database.global.disable-auto-compactions = true
 				database.global.disable-write-slowdown = true
 				database.global.temp-sst-path = ./custom-temp
@@ -182,6 +190,8 @@ class ConfigParserBoundaryTest {
 				() -> assertFalse(reparsed.global().paranoidChecks()),
 				() -> assertTrue(reparsed.global().useClockCache()),
 				() -> assertTrue(reparsed.global().allowRocksdbMmapWrites()),
+				() -> assertTrue(reparsed.global().openFilesAsync()),
+				() -> assertEquals(7, reparsed.global().maxFileOpeningThreads()),
 				() -> assertTrue(reparsed.global().disableAutoCompactions()),
 				() -> assertTrue(reparsed.global().disableWriteSlowdown()),
 				() -> assertEquals(original.global().tempSstPath(), reparsed.global().tempSstPath()),

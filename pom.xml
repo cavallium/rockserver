@@ -15,7 +15,7 @@
     <maven.compiler.release>25</maven.compiler.release>
     <native.maven.plugin.version>0.10.6</native.maven.plugin.version>
     <gestalt.version>0.37.2</gestalt.version>
-    <rocksdb.version>10.10.1.1</rocksdb.version>
+    <rocksdb.version>11.1.2.2</rocksdb.version>
     <slf4j.version>2.0.17</slf4j.version>
     <imageName>rockserver-core</imageName>
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
@@ -42,6 +42,17 @@
       <id>maven_central</id>
       <name>Maven Central</name>
       <url>https://repo.maven.apache.org/maven2/</url>
+    </repository>
+    <repository>
+      <id>gitea</id>
+      <name>Rockserver RocksDB JNI Packages</name>
+      <url>https://git.tgdb.org/api/packages/andreacavalli/maven</url>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
     </repository>
     <repository>
       <id>mchv-release</id>
@@ -95,7 +106,7 @@
   </dependencyManagement>
   <dependencies>
     <dependency>
-      <groupId>org.rocksdb</groupId>
+      <groupId>it.cavallium</groupId>
       <artifactId>rocksdbjni</artifactId>
       <version>${rocksdb.version}</version>
       <classifier>linux64</classifier>
