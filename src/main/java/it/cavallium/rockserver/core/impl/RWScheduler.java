@@ -13,6 +13,8 @@ import reactor.core.scheduler.Schedulers;
 
 public record RWScheduler(Scheduler read, Scheduler write, Executor readExecutor, Executor writeExecutor) {
 
+	private static final int EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS = 10;
+
 	public RWScheduler(Scheduler read, Scheduler write) {
 		this(read, write, read::schedule, write::schedule);
 	}
@@ -47,21 +49,73 @@ public record RWScheduler(Scheduler read, Scheduler write, Executor readExecutor
 	}
 
 	public void dispose() {
-		read.dispose();
-		write.dispose();
-		shutdownExecutor(readExecutor);
-		shutdownExecutor(writeExecutor);
+		var interruption = new CloseInterruption();
+		try {
+			RuntimeException failure = cleanup(null, read::dispose);
+			failure = cleanup(failure, write::dispose);
+			failure = cleanup(failure, () -> shutdownExecutor(readExecutor, "read", interruption));
+			failure = cleanup(failure, () -> shutdownExecutor(writeExecutor, "write", interruption));
+			if (failure != null) {
+				throw failure;
+			}
+		} finally {
+			interruption.restore();
+		}
 	}
 
-	private void shutdownExecutor(Executor executor) {
+	private static RuntimeException cleanup(RuntimeException failure, Runnable cleanup) {
+		try {
+			cleanup.run();
+		} catch (RuntimeException e) {
+			if (failure == null) {
+				return e;
+			}
+			if (failure != e) {
+				failure.addSuppressed(e);
+			}
+		}
+		return failure;
+	}
+
+	private static void shutdownExecutor(Executor executor, String name, CloseInterruption interruption) {
 		if (executor instanceof java.util.concurrent.ExecutorService es) {
 			es.shutdown();
-			try {
-				if (!es.awaitTermination(10, TimeUnit.SECONDS)) {
-					es.shutdownNow();
-				}
-			} catch (InterruptedException e) {
+			if (executorTerminationTimedOut(es, interruption)) {
 				es.shutdownNow();
+				if (executorTerminationTimedOut(es, interruption)) {
+					throw new IllegalStateException(name + " executor did not terminate after forced shutdown");
+				}
+			}
+		}
+	}
+
+	private static boolean executorTerminationTimedOut(java.util.concurrent.ExecutorService executor,
+	                                                   CloseInterruption interruption) {
+		var deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS);
+		while (true) {
+			try {
+				var remainingNanos = deadlineNanos - System.nanoTime();
+				if (remainingNanos <= 0) {
+					return true;
+				}
+				return !executor.awaitTermination(remainingNanos, TimeUnit.NANOSECONDS);
+			} catch (InterruptedException _) {
+				interruption.record();
+				executor.shutdownNow();
+			}
+		}
+	}
+
+	private static final class CloseInterruption {
+
+		private boolean interrupted;
+
+		void record() {
+			interrupted = true;
+		}
+
+		void restore() {
+			if (interrupted) {
 				Thread.currentThread().interrupt();
 			}
 		}

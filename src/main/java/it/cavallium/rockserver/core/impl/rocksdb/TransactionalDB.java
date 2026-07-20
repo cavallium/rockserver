@@ -6,12 +6,16 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
 import org.rocksdb.AbstractImmutableNativeReference;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.Env;
 import org.rocksdb.FlushOptions;
 import org.rocksdb.OptimisticTransactionDB;
 import org.rocksdb.OptimisticTransactionOptions;
+import org.rocksdb.Priority;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.Transaction;
@@ -21,298 +25,348 @@ import org.rocksdb.WriteOptions;
 
 public sealed interface TransactionalDB extends Closeable {
 
-	static TransactionalDB create(String path, RocksDB db,
-			List<ColumnFamilyDescriptor> descriptors,
-			ArrayList<ColumnFamilyHandle> handles,
-			DatabaseTasks databaseTasks) {
-		return switch (db) {
-			case OptimisticTransactionDB optimisticTransactionDB -> new OptimisticTransactionalDB(path, optimisticTransactionDB, descriptors, handles, databaseTasks);
-			case TransactionDB transactionDB -> new PessimisticTransactionalDB(path, transactionDB, descriptors, handles, databaseTasks);
-			default -> throw new UnsupportedOperationException("This database is not transactional");
-		};
-	}
+    static TransactionalDB create(String path, RocksDB db,
+                                  List<ColumnFamilyDescriptor> descriptors,
+                                  ArrayList<ColumnFamilyHandle> handles,
+                                  DatabaseTasks databaseTasks) {
+        if (db == null) {
+            throw new IllegalArgumentException("db must not be null");
+        }
+        return switch (db) {
+            case OptimisticTransactionDB optimisticTransactionDB ->
+                    new OptimisticTransactionalDB(path, optimisticTransactionDB, descriptors, handles, databaseTasks);
+            case TransactionDB transactionDB ->
+                    new PessimisticTransactionalDB(path, transactionDB, descriptors, handles, databaseTasks);
+            default -> throw new IllegalArgumentException("This database is not transactional");
+        };
+    }
 
-	TransactionalOptions createTransactionalOptions(long timeoutMs);
+    TransactionalOptions createTransactionalOptions(long timeoutMs);
 
-	String getPath();
+    String getPath();
 
-	RocksDB get();
-	Map<ColumnFamilyDescriptor, ColumnFamilyHandle> getStartupColumns();
-	/**
-	 * Starts a new Transaction.
-	 * <p>
-	 * Caller is responsible for calling {@link #close()} on the returned
-	 * transaction when it is no longer needed.
-	 *
-	 * @param writeOptions Any write options for the transaction
-	 * @return a new transaction
-	 */
-	Transaction beginTransaction(final WriteOptions writeOptions);
+    RocksDB get();
 
-	/**
-	 * Starts a new Transaction.
-	 * <p>
-	 * Caller is responsible for calling {@link #close()} on the returned
-	 * transaction when it is no longer needed.
-	 *
-	 * @param writeOptions Any write options for the transaction
-	 * @param transactionOptions Any options for the transaction
-	 * @return a new transaction
-	 */
-	Transaction beginTransaction(final WriteOptions writeOptions,
-			final TransactionalOptions transactionOptions);
+    Map<ColumnFamilyDescriptor, ColumnFamilyHandle> getStartupColumns();
 
-	/**
-	 * Starts a new Transaction.
-	 * <p>
-	 * Caller is responsible for calling {@link #close()} on the returned
-	 * transaction when it is no longer needed.
-	 *
-	 * @param writeOptions Any write options for the transaction
-	 * @param oldTransaction this Transaction will be reused instead of allocating
-	 *     a new one. This is an optimization to avoid extra allocations
-	 *     when repeatedly creating transactions.
-	 * @return The oldTransaction which has been reinitialized as a new
-	 *     transaction
-	 */
-	Transaction beginTransaction(final WriteOptions writeOptions,
-			final Transaction oldTransaction);
+    /**
+     * Starts a new Transaction.
+     * <p>
+     * Caller is responsible for calling {@link #close()} on the returned
+     * transaction when it is no longer needed.
+     *
+     * @param writeOptions Any write options for the transaction
+     * @return a new transaction
+     */
+    Transaction beginTransaction(final WriteOptions writeOptions);
 
-	/**
-	 * Starts a new Transaction.
-	 * <p>
-	 * Caller is responsible for calling {@link #close()} on the returned
-	 * transaction when it is no longer needed.
-	 *
-	 * @param writeOptions Any write options for the transaction
-	 * @param transactionOptions Any options for the transaction
-	 * @param oldTransaction this Transaction will be reused instead of allocating
-	 *     a new one. This is an optimization to avoid extra allocations
-	 *     when repeatedly creating transactions.
-	 * @return The oldTransaction which has been reinitialized as a new
-	 *     transaction
-	 */
-	Transaction beginTransaction(final WriteOptions writeOptions,
-			final TransactionalOptions transactionOptions, final Transaction oldTransaction);
+    /**
+     * Starts a new Transaction.
+     * <p>
+     * Caller is responsible for calling {@link #close()} on the returned
+     * transaction when it is no longer needed.
+     *
+     * @param writeOptions       Any write options for the transaction
+     * @param transactionOptions Any options for the transaction
+     * @return a new transaction
+     */
+    Transaction beginTransaction(final WriteOptions writeOptions,
+                                 final TransactionalOptions transactionOptions);
 
-	sealed interface TransactionalOptions extends Closeable {
+    /**
+     * Starts a new Transaction.
+     * <p>
+     * Caller is responsible for calling {@link #close()} on the returned
+     * transaction when it is no longer needed.
+     *
+     * @param writeOptions   Any write options for the transaction
+     * @param oldTransaction this Transaction will be reused instead of allocating
+     *                       a new one. This is an optimization to avoid extra allocations
+     *                       when repeatedly creating transactions.
+     * @return The oldTransaction which has been reinitialized as a new
+     * transaction
+     */
+    Transaction beginTransaction(final WriteOptions writeOptions,
+                                 final Transaction oldTransaction);
 
-		@Override
-		void close();
-	}
+    /**
+     * Starts a new Transaction.
+     * <p>
+     * Caller is responsible for calling {@link #close()} on the returned
+     * transaction when it is no longer needed.
+     *
+     * @param writeOptions       Any write options for the transaction
+     * @param transactionOptions Any options for the transaction
+     * @param oldTransaction     this Transaction will be reused instead of allocating
+     *                           a new one. This is an optimization to avoid extra allocations
+     *                           when repeatedly creating transactions.
+     * @return The oldTransaction which has been reinitialized as a new
+     * transaction
+     */
+    Transaction beginTransaction(final WriteOptions writeOptions,
+                                 final TransactionalOptions transactionOptions, final Transaction oldTransaction);
 
-	abstract sealed class BaseTransactionalDB<RDB extends RocksDB> implements TransactionalDB {
+    sealed interface TransactionalOptions extends Closeable {
 
-		private final String path;
-		protected final RDB db;
-		private final DatabaseTasks databaseTasks;
-		private final List<ColumnFamilyDescriptor> descriptors;
-		private final ArrayList<ColumnFamilyHandle> handles;
-		private final Object closeLock = new Object();
-		private volatile boolean closed = false;
+        @Override
+        void close();
+    }
 
-		public BaseTransactionalDB(String path, RDB db,
-				List<ColumnFamilyDescriptor> descriptors,
-				ArrayList<ColumnFamilyHandle> handles,
-				DatabaseTasks databaseTasks) {
-			this.path = path;
-			this.db = db;
-			this.descriptors = descriptors;
-			this.handles = handles;
-			this.databaseTasks = databaseTasks;
+    abstract sealed class BaseTransactionalDB<RDB extends RocksDB> implements TransactionalDB {
 
-			databaseTasks.start();
-		}
+        private static final AtomicInteger OPEN_DATABASES = new AtomicInteger();
 
-		@Override
-		public final String getPath() {
-			return path;
-		}
+        private final String path;
+        protected final RDB db;
+        private final DatabaseTasks databaseTasks;
+        private final List<ColumnFamilyDescriptor> descriptors;
+        private final ArrayList<ColumnFamilyHandle> handles;
+        private final Object closeLock = new Object();
+        private volatile boolean closed = false;
 
-		@Override
-		public final RocksDB get() {
-			return db;
-		}
+        public BaseTransactionalDB(String path, RDB db,
+                                   List<ColumnFamilyDescriptor> descriptors,
+                                   ArrayList<ColumnFamilyHandle> handles,
+                                   DatabaseTasks databaseTasks) {
+            this.path = requireArgument(path, "path");
+            this.db = requireArgument(db, "db");
+            this.databaseTasks = requireArgument(databaseTasks, "databaseTasks");
+            validateStartupColumns(descriptors, handles);
+            this.descriptors = List.copyOf(descriptors);
+            this.handles = new ArrayList<>(handles);
 
-		@Override
-		public Map<ColumnFamilyDescriptor, ColumnFamilyHandle> getStartupColumns() {
-			var cols = new HashMap<ColumnFamilyDescriptor, ColumnFamilyHandle>();
-			assert this.descriptors.size() == this.handles.size();
-			for (int i = 0; i < descriptors.size(); i++) {
-				cols.put(this.descriptors.get(i), this.handles.get(i));
-			}
-			return cols;
-		}
+            OPEN_DATABASES.incrementAndGet();
+            databaseTasks.start();
+        }
 
-		@Override
-		public void close() throws IOException {
-			if (this.closed) {
-				return;
-			}
-			synchronized (this.closeLock) {
-				if (this.closed) {
-					return;
-				}
-				this.closed = true;
-				List<Exception> exceptions = new ArrayList<>();
-				try {
-					databaseTasks.close();
-				} catch (Exception ex) {
-					exceptions.add(ex);
-				}
-				try {
-					if (db.isOwningHandle()) {
-						db.flushWal(true);
-					}
-				} catch (RocksDBException e) {
-					exceptions.add(e);
-				}
-				try (var options = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
-					if (db.isOwningHandle()) {
-						var openHandles = handles.stream().filter(AbstractImmutableNativeReference::isOwningHandle).toList();
-						db.flush(options, openHandles);
-					}
-				} catch (RocksDBException e) {
-					exceptions.add(e);
-				}
-				db.cancelAllBackgroundWork(true);
-				try {
-					if (db.isOwningHandle()) {
-						db.closeE();
-					}
-				} catch (RocksDBException e) {
-					exceptions.add(e);
-				}
-				for (ColumnFamilyHandle handle : handles) {
-					try {
-						if (handle.isOwningHandle()) {
-							handle.close();
-						}
-					} catch (Exception ex) {
-						exceptions.add(ex);
-					}
-				}
-				if (!exceptions.isEmpty()) {
-					IOException ex;
-					if (exceptions.size() == 1) {
-						ex = new IOException("Failed to close the database", exceptions.getFirst());
-					} else {
-						ex = new IOException("Failed to close the database");
-						exceptions.forEach(ex::addSuppressed);
-					}
-					throw ex;
-				}
-			}
-		}
-	}
+        @Override
+        public final String getPath() {
+            return path;
+        }
 
-	final class PessimisticTransactionalDB extends BaseTransactionalDB<TransactionDB> {
+        @Override
+        public final RocksDB get() {
+            return db;
+        }
 
-		public PessimisticTransactionalDB(String path, TransactionDB db,
-				List<ColumnFamilyDescriptor> descriptors,
-				ArrayList<ColumnFamilyHandle> handles,
-				DatabaseTasks databaseTasks) {
-			super(path, db, descriptors, handles, databaseTasks);
-		}
+        @Override
+        public Map<ColumnFamilyDescriptor, ColumnFamilyHandle> getStartupColumns() {
+            var cols = new HashMap<ColumnFamilyDescriptor, ColumnFamilyHandle>();
+            for (int i = 0; i < descriptors.size(); i++) {
+                cols.put(this.descriptors.get(i), this.handles.get(i));
+            }
+            return cols;
+        }
 
-		@Override
-		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
-			return new TransactionalOptionsPessimistic(new TransactionOptions() {
-				{
-					RocksLeakDetector.register(this, "create-transactional-options-transaction-options", owningHandle_);
-				}
-			}.setExpiration(timeoutMs));
-		}
+        private static void validateStartupColumns(List<ColumnFamilyDescriptor> descriptors,
+                                                   ArrayList<ColumnFamilyHandle> handles) {
+            requireArgument(descriptors, "descriptors");
+            requireArgument(handles, "handles");
+            if (descriptors.size() != handles.size()) {
+                throw new IllegalArgumentException("Startup column descriptors and handles size mismatch: descriptors="
+                        + descriptors.size() + ", handles=" + handles.size());
+            }
+            for (int i = 0; i < descriptors.size(); i++) {
+                if (descriptors.get(i) == null) {
+                    throw new IllegalArgumentException("descriptors entry " + i + " must not be null");
+                }
+                if (handles.get(i) == null) {
+                    throw new IllegalArgumentException("handles entry " + i + " must not be null");
+                }
+            }
+        }
 
-		@Override
-		public Transaction beginTransaction(WriteOptions writeOptions) {
-			return db.beginTransaction(writeOptions);
-		}
+        private static <T> T requireArgument(T value, String name) {
+            if (value == null) {
+                throw new IllegalArgumentException(name + " must not be null");
+            }
+            return value;
+        }
 
-		@Override
-		public Transaction beginTransaction(WriteOptions writeOptions, TransactionalOptions transactionOptions) {
-			return db.beginTransaction(writeOptions,
-					((TransactionalOptionsPessimistic) transactionOptions).transactionOptions
-			);
-		}
+        @Override
+        public void close() throws IOException {
+            if (this.closed) {
+                return;
+            }
+            synchronized (this.closeLock) {
+                if (this.closed) {
+                    return;
+                }
+                this.closed = true;
+                List<Exception> exceptions = new ArrayList<>();
+                try {
+                    databaseTasks.close();
+                } catch (Exception ex) {
+                    exceptions.add(ex);
+                }
+                try {
+                    if (db.isOwningHandle()) {
+                        db.flushWal(true);
+                    }
+                } catch (RocksDBException e) {
+                    exceptions.add(e);
+                }
+                try (var options = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
+                    if (db.isOwningHandle()) {
+                        var openHandles = handles.stream().filter(AbstractImmutableNativeReference::isOwningHandle).toList();
+                        db.flush(options, openHandles);
+                    }
+                } catch (RocksDBException e) {
+                    exceptions.add(e);
+                }
+                db.cancelAllBackgroundWork(true);
+                try {
+                    if (db.isOwningHandle()) {
+                        db.closeE();
+                    }
+                } catch (RocksDBException e) {
+                    exceptions.add(e);
+                }
+                for (ColumnFamilyHandle handle : handles) {
+                    try {
+                        if (handle.isOwningHandle()) {
+                            handle.close();
+                        }
+                    } catch (Exception ex) {
+                        exceptions.add(ex);
+                    }
+                }
+                try {
+                    quiesceSharedEnvIfLastDatabase();
+                } catch (Exception ex) {
+                    exceptions.add(ex);
+                }
+                if (!exceptions.isEmpty()) {
+                    IOException ex;
+                    if (exceptions.size() == 1) {
+                        ex = new IOException("Failed to close the database", exceptions.getFirst());
+                    } else {
+                        ex = new IOException("Failed to close the database");
+                        exceptions.forEach(ex::addSuppressed);
+                    }
+                    throw ex;
+                }
+            }
+        }
 
-		@Override
-		public Transaction beginTransaction(WriteOptions writeOptions, Transaction oldTransaction) {
-			return db.beginTransaction(writeOptions, oldTransaction);
-		}
+        private static void quiesceSharedEnvIfLastDatabase() {
+            if (OPEN_DATABASES.decrementAndGet() != 0) {
+                return;
+            }
+            var env = Env.getDefault();
+            env.setBackgroundThreads(0, Priority.BOTTOM);
+            env.setBackgroundThreads(0, Priority.LOW);
+            env.setBackgroundThreads(0, Priority.HIGH);
+        }
+    }
 
-		@Override
-		public Transaction beginTransaction(WriteOptions writeOptions,
-				TransactionalOptions transactionOptions,
-				Transaction oldTransaction) {
-			return db.beginTransaction(writeOptions,
-					((TransactionalOptionsPessimistic) transactionOptions).transactionOptions,
-					oldTransaction
-			);
-		}
+    final class PessimisticTransactionalDB extends BaseTransactionalDB<TransactionDB> {
 
-		private record TransactionalOptionsPessimistic(TransactionOptions transactionOptions) implements
-				TransactionalOptions {
+        public PessimisticTransactionalDB(String path, TransactionDB db,
+                                          List<ColumnFamilyDescriptor> descriptors,
+                                          ArrayList<ColumnFamilyHandle> handles,
+                                          DatabaseTasks databaseTasks) {
+            super(path, db, descriptors, handles, databaseTasks);
+        }
 
-			@Override
-			public void close() {
-				transactionOptions.close();
-			}
-		}
-	}
+        @Override
+        public TransactionalOptions createTransactionalOptions(long timeoutMs) {
+            return new TransactionalOptionsPessimistic(new TransactionOptions() {
+                {
+                    RocksLeakDetector.register(this, "create-transactional-options-transaction-options", owningHandle_);
+                }
+            }.setExpiration(timeoutMs));
+        }
 
-	final class OptimisticTransactionalDB extends BaseTransactionalDB<OptimisticTransactionDB> {
+        @Override
+        public Transaction beginTransaction(WriteOptions writeOptions) {
+            return db.beginTransaction(writeOptions);
+        }
 
-		public OptimisticTransactionalDB(String path, OptimisticTransactionDB db,
-				List<ColumnFamilyDescriptor> descriptors,
-				ArrayList<ColumnFamilyHandle> handles,
-				DatabaseTasks databaseTasks) {
-			super(path, db, descriptors, handles, databaseTasks);
-		}
+        @Override
+        public Transaction beginTransaction(WriteOptions writeOptions, TransactionalOptions transactionOptions) {
+            return db.beginTransaction(writeOptions,
+                    ((TransactionalOptionsPessimistic) transactionOptions).transactionOptions
+            );
+        }
 
-		@Override
-		public TransactionalOptions createTransactionalOptions(long timeoutMs) {
-			return new TransactionalOptionsOptimistic(new OptimisticTransactionOptions() {
-				{
-					RocksLeakDetector.register(this, "create-transactional-options-optimistic-transaction-options", owningHandle_);
-				}
-			});
-		}
+        @Override
+        public Transaction beginTransaction(WriteOptions writeOptions, Transaction oldTransaction) {
+            return db.beginTransaction(writeOptions, oldTransaction);
+        }
 
-		@Override
-		public Transaction beginTransaction(WriteOptions writeOptions) {
-			return db.beginTransaction(writeOptions);
-		}
+        @Override
+        public Transaction beginTransaction(WriteOptions writeOptions,
+                                            TransactionalOptions transactionOptions,
+                                            Transaction oldTransaction) {
+            return db.beginTransaction(writeOptions,
+                    ((TransactionalOptionsPessimistic) transactionOptions).transactionOptions,
+                    oldTransaction
+            );
+        }
 
-		@Override
-		public Transaction beginTransaction(WriteOptions writeOptions, TransactionalOptions transactionOptions) {
-			return db.beginTransaction(writeOptions,
-					((TransactionalOptionsOptimistic) transactionOptions).transactionOptions
-			);
-		}
+        private record TransactionalOptionsPessimistic(TransactionOptions transactionOptions) implements
+                TransactionalOptions {
 
-		@Override
-		public Transaction beginTransaction(WriteOptions writeOptions, Transaction oldTransaction) {
-			return db.beginTransaction(writeOptions, oldTransaction);
-		}
+            @Override
+            public void close() {
+                transactionOptions.close();
+            }
+        }
+    }
 
-		@Override
-		public Transaction beginTransaction(WriteOptions writeOptions,
-				TransactionalOptions transactionOptions,
-				Transaction oldTransaction) {
-			return db.beginTransaction(writeOptions,
-					((TransactionalOptionsOptimistic) transactionOptions).transactionOptions,
-					oldTransaction
-			);
-		}
+    final class OptimisticTransactionalDB extends BaseTransactionalDB<OptimisticTransactionDB> {
 
-		private record TransactionalOptionsOptimistic(OptimisticTransactionOptions transactionOptions) implements
-				TransactionalOptions {
+        public OptimisticTransactionalDB(String path, OptimisticTransactionDB db,
+                                         List<ColumnFamilyDescriptor> descriptors,
+                                         ArrayList<ColumnFamilyHandle> handles,
+                                         DatabaseTasks databaseTasks) {
+            super(path, db, descriptors, handles, databaseTasks);
+        }
 
-			@Override
-			public void close() {
-				transactionOptions.close();
-			}
-		}
-	}
+        @Override
+        public TransactionalOptions createTransactionalOptions(long timeoutMs) {
+            return new TransactionalOptionsOptimistic(new OptimisticTransactionOptions() {
+                {
+                    RocksLeakDetector.register(this, "create-transactional-options-optimistic-transaction-options", owningHandle_);
+                }
+            });
+        }
+
+        @Override
+        public Transaction beginTransaction(WriteOptions writeOptions) {
+            return db.beginTransaction(writeOptions);
+        }
+
+        @Override
+        public Transaction beginTransaction(WriteOptions writeOptions, TransactionalOptions transactionOptions) {
+            return db.beginTransaction(writeOptions,
+                    ((TransactionalOptionsOptimistic) transactionOptions).transactionOptions
+            );
+        }
+
+        @Override
+        public Transaction beginTransaction(WriteOptions writeOptions, Transaction oldTransaction) {
+            return db.beginTransaction(writeOptions, oldTransaction);
+        }
+
+        @Override
+        public Transaction beginTransaction(WriteOptions writeOptions,
+                                            TransactionalOptions transactionOptions,
+                                            Transaction oldTransaction) {
+            return db.beginTransaction(writeOptions,
+                    ((TransactionalOptionsOptimistic) transactionOptions).transactionOptions,
+                    oldTransaction
+            );
+        }
+
+        private record TransactionalOptionsOptimistic(OptimisticTransactionOptions transactionOptions) implements
+                TransactionalOptions {
+
+            @Override
+            public void close() {
+                transactionOptions.close();
+            }
+        }
+    }
 }

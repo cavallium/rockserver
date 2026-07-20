@@ -2,9 +2,11 @@ package it.cavallium.rockserver.core.impl;
 
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.impl.rocksdb.LeakSafeWriteOptions;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
+import org.rocksdb.WriteBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -60,7 +62,7 @@ public class MergeOperatorRegistry implements Closeable {
             java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
             hash = digest.digest(jarData);
         } catch (java.security.NoSuchAlgorithmException e) {
-            throw new RuntimeException(e);
+            throw new IllegalStateException("SHA-256 message digest is unavailable", e);
         }
 
         synchronized (this) {
@@ -76,23 +78,30 @@ public class MergeOperatorRegistry implements Closeable {
                     }
                 }
                 
-                long version = getNextVersion(name);
+                long version = readCurrentVersion(name) + 1;
                 byte[] key = encodeKey(name, version);
                 byte[] value = encodeValue(className, jarData);
-                
-                // Write data
-                db.put(cfh, key, value);
-
-                // Write hash index
                 byte[] hashKey = encodeHashKey(name, hash);
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                try (DataOutputStream dos = new DataOutputStream(baos)) {
-                    dos.writeLong(version);
-                }
-                db.put(cfh, hashKey, baos.toByteArray());
+                byte[] versionBytes = encodeVersion(version);
+                byte[] metaKey = encodeMetaKey(name);
 
-                // Pre-load to verify instantiation and cache it
-                loadAndCache(name, version, className, jarData);
+                FFMAbstractMergeOperator op = loadAndInstantiate(className, jarData);
+                boolean cached = false;
+                try {
+                    try (var wb = new WriteBatch(); var writeOptions = new LeakSafeWriteOptions("merge-operator-upload")) {
+                        wb.put(cfh, key, value);
+                        wb.put(cfh, hashKey, versionBytes);
+                        wb.put(cfh, metaKey, versionBytes);
+                        db.write(writeOptions, wb);
+                    }
+
+                    cache.computeIfAbsent(name, k -> new ConcurrentHashMap<>()).put(version, op);
+                    cached = true;
+                } finally {
+                    if (!cached) {
+                        closeInstantiatedOperator(op);
+                    }
+                }
 
                 LOG.info("Uploaded merge operator '{}' version {} (class: {})", name, version, className);
                 return version;
@@ -183,22 +192,27 @@ public class MergeOperatorRegistry implements Closeable {
         }
     }
 
-    private long getNextVersion(String name) throws org.rocksdb.RocksDBException, IOException {
-        byte[] metaKey = ("meta:" + name).getBytes(StandardCharsets.UTF_8);
-        byte[] val = db.get(cfh, metaKey);
-        long ver = 0;
-        if (val != null) {
-            try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(val))) {
-                ver = dis.readLong();
-            }
-        }
-        long newVer = ver + 1;
+    private byte[] encodeMetaKey(String name) {
+        return ("meta:" + name).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private byte[] encodeVersion(long version) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (DataOutputStream dos = new DataOutputStream(baos)) {
-            dos.writeLong(newVer);
+            dos.writeLong(version);
         }
-        db.put(cfh, metaKey, baos.toByteArray());
-        return newVer;
+        return baos.toByteArray();
+    }
+
+    private long readCurrentVersion(String name) throws org.rocksdb.RocksDBException, IOException {
+        byte[] metaKey = encodeMetaKey(name);
+        byte[] val = db.get(cfh, metaKey);
+        if (val != null) {
+            try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(val))) {
+                return dis.readLong();
+            }
+        }
+        return 0;
     }
 
     private byte[] encodeKey(String name, long version) {
@@ -216,12 +230,6 @@ public class MergeOperatorRegistry implements Closeable {
         return baos.toByteArray();
     }
 
-    private FFMAbstractMergeOperator loadAndCache(String name, long version, String className, byte[] jarData) {
-        FFMAbstractMergeOperator op = loadAndInstantiate(className, jarData);
-        cache.computeIfAbsent(name, k -> new ConcurrentHashMap<>()).put(version, op);
-        return op;
-    }
-
     private FFMAbstractMergeOperator loadAndInstantiate(String className, byte[] jarData) {
         try {
             InMemoryClassLoader cl = new InMemoryClassLoader(jarData, this.getClass().getClassLoader());
@@ -236,7 +244,24 @@ public class MergeOperatorRegistry implements Closeable {
                  return (FFMAbstractMergeOperator) clazz.getConstructor().newInstance();
             }
         } catch (Exception e) {
-            throw new RuntimeException("Failed to instantiate " + className, e);
+            throw RocksDBException.of(
+                    RocksDBErrorType.CONFIG_ERROR,
+                    "Failed to instantiate merge operator: " + className,
+                    e
+            );
+        }
+    }
+
+    private void closeInstantiatedOperator(FFMAbstractMergeOperator op) {
+        if (op == null) {
+            return;
+        }
+        try {
+            if (op.isOwningHandle()) {
+                op.close();
+            }
+        } catch (Throwable e) {
+            LOG.debug("Ignoring error while closing unregistered merge operator", e);
         }
     }
     

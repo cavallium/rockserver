@@ -909,71 +909,25 @@ class CdcBugReproductionTest {
     }
 
     @Test
-    void testDeleteRangeSkipping() throws RocksDBException {
-        // We need to invoke deleteRange.
-        // Assuming EmbeddedDB exposes it via 'deleteRange' or we access the raw DB handle for testing.
-        // Since EmbeddedDB doesn't expose deleteRange in the interface provided in snippets,
-        // we will use the raw db handle available in the test class via 'db.getDb().get()'.
-
-        // 1. Write Key 1 (PUT)
+    void testLogDataAndDefaultColumnFamilyBatchIsSkipped() throws RocksDBException {
         db.put(0, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A".getBytes()), RequestType.none());
 
-        // 2. Write DeleteRange (Hidden Op)
-        // Access raw handle (reflection or package-private access if in same package).
-        // Since test is in 'it.cavallium.rockserver.core.impl', we can cast or access package-private if exposed.
-        // Assuming we can use db.getDb() if visible, or we just rely on the fact that we can't easily invoke it.
-        // IF we cannot invoke it, we skip this test.
-        // HOWEVER, we can simulate a gap in sequence numbers if we could, but let's try to use the 'db' object.
-
-        // If 'db.getDb()' is visible (it is @VisibleForTesting public in snippet):
         var rocks = db.getDb().get();
-        // We need the column handle. 'db.columns' is private.
-        // We can get column ID. We can try to use default CF or just hope 'db.put' used the CF we want.
-        // Actually, we can't easily get the CF handle from outside without reflection.
 
-        // ALTERNATIVE: Use a "Filtered" Put as a proxy for a "Hidden Op" that consumes sequence.
-        // We already tested that in 'testColumnFilteringResumption'.
-        // So this test is redundant unless we specifically want to test the `deleteRange` callback in `EventCollector`.
-
-        // Let's assume we can skip this if we can't invoke deleteRange easily.
-        // Instead, let's add a test for "Empty Batch" (e.g. only LogData).
-        // WriteBatch allows putLogData.
-
-        try (var wb = new org.rocksdb.WriteBatch()) {
+        // A batch containing only default-CF data for this subscription must still advance CDC sequencing.
+        try (var wb = new org.rocksdb.WriteBatch(); var writeOptions = new org.rocksdb.WriteOptions()) {
             wb.putLogData("Meta".getBytes());
-            wb.put(intToBytes(2), "B".getBytes()); // Default CF
-            rocks.write(new org.rocksdb.WriteOptions(), wb);
+            wb.put(intToBytes(2), "B".getBytes());
+            rocks.write(writeOptions, wb);
         } catch (org.rocksdb.RocksDBException e) {
             fail(e);
         }
 
-        // The WriteBatch above went to Default CF.
-        // If our subscription is on 'columnId', and we scan the WAL, we see this batch.
-        // It has 1 Put (to default CF) and 1 LogData.
-        // Our subscription filters for 'columnId'.
-        // The event collector sees the batch. 'seenOps' increments for the Put.
-        // Does 'seenOps' increment for LogData? The handler override for logData is empty.
-        // So seenOps increases by 1 (for the Put).
-        // Correct behavior: The poller consumes the batch, emits nothing (filtered), and advances seq.
-
         CdcBatch res = db.cdcPollBatchAsyncInternal(subId, null, 10).block();
-        // Should find nothing new (assuming "A" was consumed or we started after).
-        // If we started from beginning:
-        // 1. "A" (from step 1)
-        // 2. The WriteBatch (Default CF) -> Ignored
-
-        // Let's verify we see "A" and then stop.
-        // Note: db.cdcCreate was called in setUp with 'null' (start from now).
-        // So "A" is seen.
-
-        // Actually, wait. The setUp creates sub starting from "now".
-        // Step 1 writes "A".
-        // So we see "A".
-
         assertNotNull(res);
         assertFalse(res.events().isEmpty());
         assertEquals(1, res.events().size());
-        assertEquals(1, bytesToInt(res.events().get(0).key().toByteArray()));
+        assertEquals(1, bytesToInt(res.events().getFirst().key().toByteArray()));
 
         // Next poll should skip the manual WriteBatch cleanly
         CdcBatch res2 = db.cdcPollBatchAsyncInternal(subId, res.nextSeq(), 10).block();
@@ -1161,24 +1115,10 @@ class CdcBugReproductionTest {
     }
 
     @Test
-    void testTransactionSavepoints() throws RocksDBException {
+    void testCommittedTransactionEmitsAllWritesAtomically() throws RocksDBException {
         long txId = db.openTransaction(10_000);
 
-        // 1. Write "A"
         db.put(txId, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A".getBytes()), RequestType.none());
-
-        // 2. Create Savepoint
-        // Note: EmbeddedDB interface in snippets doesn't show 'setSavePoint' directly exposed on 'db',
-        // but it is internal to the Tx object.
-        // We will assume standard RocksDB behavior:
-        // If we can't invoke setSavePoint via EmbeddedDB, we test the atomicity principle:
-        // "A transaction is atomic".
-        // If we can't test savepoints specifically, we can test that an uncommitted Put doesn't leak.
-
-        // Assuming we can't access savepoints easily without casting:
-        // We'll skip the explicit savepoint logic if methods aren't available
-        // and instead verify a simple Commit atomicity again with multiple keys.
-
         db.put(txId, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("B".getBytes()), RequestType.none());
         db.put(txId, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(3))}), Buf.wrap("C".getBytes()), RequestType.none());
 
@@ -1186,7 +1126,7 @@ class CdcBugReproductionTest {
 
         CdcBatch batch = db.cdcPollBatchAsyncInternal(subId, null, 10).block();
         assertEquals(3, batch.events().size());
-        assertEquals(1, bytesToInt(batch.events().get(0).key().toByteArray()));
+        assertEquals(1, bytesToInt(batch.events().getFirst().key().toByteArray()));
         assertEquals(3, bytesToInt(batch.events().get(2).key().toByteArray()));
     }
 

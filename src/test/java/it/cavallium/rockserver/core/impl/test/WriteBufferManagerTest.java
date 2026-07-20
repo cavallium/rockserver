@@ -1,6 +1,10 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.config.ConfigParser;
+import it.cavallium.rockserver.core.config.DataSize;
+import it.cavallium.rockserver.core.config.FallbackColumnConfig;
+import it.cavallium.rockserver.core.config.VolumeConfig;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -8,6 +12,7 @@ import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.WriteBufferManager;
 import org.slf4j.LoggerFactory;
 
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -19,6 +24,17 @@ import static org.junit.jupiter.api.Assertions.*;
  * and is not tracked by the block cache.
  */
 class WriteBufferManagerTest {
+
+	@Test
+	void volumeConfigRejectsNullVolumePathWithExplicitDiagnostic(@TempDir Path tempDir) {
+		var columnConfig = fallbackColumnConfig(volumeConfig(null, new DataSize("1GiB")));
+
+		var failure = assertThrows(RocksDBException.class,
+				() -> RocksDBLoader.getVolumeConfigs(tempDir, columnConfig));
+
+		assertEquals(RocksDBException.RocksDBErrorType.CONFIG_ERROR, failure.getErrorUniqueId());
+		assertEquals("Volume configurations entry 0 volumePath must not be null", failure.getMessage());
+	}
 
 	@Test
 	void writeBufferManagerCreatedWithoutExplicitConfig(@TempDir Path tempDir) throws Exception {
@@ -205,5 +221,30 @@ database: {
 		} finally {
 			Files.deleteIfExists(configFile);
 		}
+	}
+
+	private static FallbackColumnConfig fallbackColumnConfig(VolumeConfig... volumes) {
+		return (FallbackColumnConfig) Proxy.newProxyInstance(WriteBufferManagerTest.class.getClassLoader(),
+				new Class<?>[] {FallbackColumnConfig.class},
+				(proxy, method, args) -> switch (method.getName()) {
+					case "volumes" -> volumes;
+					case "toString" -> "fallbackColumnConfig";
+					case "hashCode" -> System.identityHashCode(proxy);
+					case "equals" -> proxy == args[0];
+					default -> null;
+				});
+	}
+
+	private static VolumeConfig volumeConfig(Path volumePath, DataSize targetSize) {
+		return (VolumeConfig) Proxy.newProxyInstance(WriteBufferManagerTest.class.getClassLoader(),
+				new Class<?>[] {VolumeConfig.class},
+				(proxy, method, args) -> switch (method.getName()) {
+					case "volumePath" -> volumePath;
+					case "targetSize" -> targetSize;
+					case "toString" -> "volumeConfig";
+					case "hashCode" -> System.identityHashCode(proxy);
+					case "equals" -> proxy == args[0];
+					default -> null;
+				});
 	}
 }

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.MyStringAppendOperator;
 import org.junit.jupiter.api.AfterEach;
@@ -67,6 +68,28 @@ class CheckMergeOperatorTest {
         long v4 = db.ensureMergeOperator(name, className, jarData2);
         assertNotEquals(v1, v4, "Different content should produce new version");
         assertTrue(v4 > v1);
+    }
+
+    @Test
+    void uploadMissingMergeOperatorClassFailsAsConfigErrorWithoutPersistingHashIndex() throws Exception {
+        String name = "bad-op";
+        String missingClass = "it.cavallium.rockserver.core.impl.DoesNotExistMergeOperator";
+        byte[] jarData = createJarWithEntry();
+        byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(jarData);
+
+        RocksDBException error = assertThrows(
+                RocksDBException.class,
+                () -> db.uploadMergeOperator(name, missingClass, jarData)
+        );
+
+        assertEquals(RocksDBException.RocksDBErrorType.CONFIG_ERROR, error.getErrorUniqueId());
+        assertTrue(error.getMessage().contains("Failed to instantiate merge operator: " + missingClass));
+        assertNull(db.checkMergeOperator(name, hash), "Rejected operator upload must not persist the hash index");
+        assertThrows(
+                RocksDBException.class,
+                () -> db.ensureMergeOperator(name, missingClass, jarData)
+        );
+        assertNull(db.checkMergeOperator(name, hash), "Rejected ensure must not deduplicate to the failed upload");
     }
 
     private byte[] createJar() throws Exception {

@@ -52,25 +52,71 @@ public class CdcGrpcTest {
     }
 
     private void stopServer() throws IOException {
+        Throwable failure = null;
         if (client != null) {
-            try {
-                client.close();
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
+            failure = closeForCleanup(failure, client::close);
+            client = null;
         }
+        failure = waitForClientShutdown(failure);
+        if (grpcServer != null) {
+            failure = closeForCleanup(failure, grpcServer::close);
+            grpcServer = null;
+        }
+        if (embeddedConnection != null) {
+            failure = closeForCleanup(failure, embeddedConnection::closeTesting);
+            embeddedConnection = null;
+        }
+        throwCleanupFailure(failure);
+    }
+
+    private static Throwable waitForClientShutdown(Throwable failure) {
         try {
             Thread.sleep(200);
         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return addCleanupFailure(failure, new IOException("Interrupted while waiting for gRPC client shutdown", e));
         }
-        if (grpcServer != null) {
-            try {
-                grpcServer.close();
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
+        return failure;
+    }
+
+    private static Throwable closeForCleanup(Throwable failure, CleanupAction action) {
+        try {
+            action.run();
+        } catch (Throwable cleanupFailure) {
+            return addCleanupFailure(failure, cleanupFailure);
         }
-        if (embeddedConnection != null) embeddedConnection.closeTesting();
+        return failure;
+    }
+
+    private static Throwable addCleanupFailure(Throwable failure, Throwable cleanupFailure) {
+        if (failure == null) {
+            return cleanupFailure;
+        }
+        if (failure != cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+        }
+        return failure;
+    }
+
+    private static void throwCleanupFailure(Throwable failure) throws IOException {
+        if (failure == null) {
+            return;
+        }
+        if (failure instanceof IOException ioException) {
+            throw ioException;
+        }
+        if (failure instanceof RuntimeException runtimeException) {
+            throw runtimeException;
+        }
+        if (failure instanceof Error error) {
+            throw error;
+        }
+        throw new IOException("CDC gRPC test cleanup failed", failure);
+    }
+
+    @FunctionalInterface
+    private interface CleanupAction {
+        void run() throws Exception;
     }
 
     @AfterEach
@@ -245,13 +291,12 @@ public class CdcGrpcTest {
         assertEquals(2, events.size());
         CDCEvent ev1 = events.get(0);
         CDCEvent ev2 = events.get(1);
-        System.out.println("[DEBUG_LOG] ev1 value: " + new String(ev1.value().toByteArray(), StandardCharsets.UTF_8));
-        System.out.println("[DEBUG_LOG] ev2 value: " + new String(ev2.value().toByteArray(), StandardCharsets.UTF_8));
-        assertEquals(CDCEvent.Op.PUT, ev1.op());
-        assertTrue(new String(ev1.value().toByteArray(), StandardCharsets.UTF_8).contains("Initial"));
-        assertEquals(CDCEvent.Op.PUT, ev2.op());
+        String val1 = new String(ev1.value().toByteArray(), StandardCharsets.UTF_8);
         String val2 = new String(ev2.value().toByteArray(), StandardCharsets.UTF_8);
-        assertTrue(val2.contains("Initial"));
-        assertTrue(val2.contains("Patched"));
+        assertEquals(CDCEvent.Op.PUT, ev1.op());
+        assertTrue(val1.contains("Initial"), () -> "Expected first resolved CDC value to contain Initial, got: " + val1);
+        assertEquals(CDCEvent.Op.PUT, ev2.op());
+        assertTrue(val2.contains("Initial"), () -> "Expected second resolved CDC value to contain Initial, got: " + val2);
+        assertTrue(val2.contains("Patched"), () -> "Expected second resolved CDC value to contain Patched, got: " + val2);
     }
 }

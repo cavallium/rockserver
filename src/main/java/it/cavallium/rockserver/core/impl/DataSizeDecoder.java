@@ -34,12 +34,17 @@ public class DataSizeDecoder implements Decoder<DataSize> {
 			ConfigNode node,
 			TypeCapture<?> type,
 			DecoderContext decoderContext) {
+		var value = ConfigDecoderSupport.leafValue(path, node, name());
+		if (value.hasErrors()) {
+			return GResultOf.errors(value.getErrors());
+		}
 		try {
-			return GResultOf.resultOf(new DataSize(node.getValue().orElseThrow()), List.of());
-		} catch (Exception ex) {
-			return GResultOf.errors(new ValidationError.DecodingNumberFormatException(path,
+			return GResultOf.resultOf(new DataSize(value.results()), List.of());
+		} catch (RuntimeException ex) {
+			return GResultOf.errors(new ValidationError.ErrorDecodingException(path,
 					node,
 					name(),
+					ex.getMessage(),
 					decoderContext
 			));
 		}

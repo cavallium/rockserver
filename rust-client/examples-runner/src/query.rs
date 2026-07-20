@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 #[derive(Debug)]
 pub enum Query {
     And(Vec<Query>),
@@ -39,17 +37,19 @@ impl Query {
                 }
                 false
             }
-            Query::Text(pattern) => {
-                ctx.text.iter().any(|text| text.to_lowercase().contains(pattern))
-            }
-            Query::ChatId(id) => {
-                ctx.chat_id == Some(*id)
-            }
-            Query::SenderId(id) => {
-                ctx.sender_id == Some(*id)
-            }
+            Query::Text(pattern) => ctx
+                .text
+                .iter()
+                .any(|text| text.to_lowercase().contains(pattern)),
+            Query::ChatId(id) => ctx.chat_id == Some(*id),
+            Query::SenderId(id) => ctx.sender_id == Some(*id),
             Query::CheckKeyMatchesValue => {
-                if let (Some(k_cid), Some(k_mid), Some(v_cid), Some(v_mid)) = (ctx.key_chat_id, ctx.key_message_id, ctx.val_chat_id, ctx.val_message_id) {
+                if let (Some(k_cid), Some(k_mid), Some(v_cid), Some(v_mid)) = (
+                    ctx.key_chat_id,
+                    ctx.key_message_id,
+                    ctx.val_chat_id,
+                    ctx.val_message_id,
+                ) {
                     k_cid != v_cid || k_mid != v_mid
                 } else {
                     false
@@ -72,7 +72,7 @@ enum Token {
     And,
     Or,
     KeyOpValue(String, String), // key, value
-    StringLit(String), // Fallback for plain text search or error
+    StringLit(String),          // Fallback for plain text search or error
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, String> {
@@ -81,17 +81,29 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
 
     while let Some(&c) = chars.peek() {
         match c {
-            ' ' | '\t' | '\r' | '\n' => { chars.next(); }
-            '(' => { tokens.push(Token::LParen); chars.next(); }
-            ')' => { tokens.push(Token::RParen); chars.next(); }
+            ' ' | '\t' | '\r' | '\n' => {
+                chars.next();
+            }
+            '(' => {
+                tokens.push(Token::LParen);
+                chars.next();
+            }
+            ')' => {
+                tokens.push(Token::RParen);
+                chars.next();
+            }
             '&' => {
                 chars.next();
-                if let Some('&') = chars.peek() { chars.next(); }
+                if let Some('&') = chars.peek() {
+                    chars.next();
+                }
                 tokens.push(Token::And);
             }
             '|' => {
                 chars.next();
-                if let Some('|') = chars.peek() { chars.next(); }
+                if let Some('|') = chars.peek() {
+                    chars.next();
+                }
                 tokens.push(Token::Or);
             }
             '"' => {
@@ -122,7 +134,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                         break;
                     }
                 }
-                
+
                 if s.eq_ignore_ascii_case("AND") {
                     tokens.push(Token::And);
                 } else if s.eq_ignore_ascii_case("OR") {
@@ -131,27 +143,34 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     // Check for operator
                     let mut op_found = false;
                     if let Some(&next_c) = chars.peek() {
-                         if next_c == ':' || next_c == '=' {
-                             chars.next();
-                             if next_c == '=' && chars.peek() == Some(&'=') {
-                                 chars.next(); // skip second =
-                             }
-                             op_found = true;
-                         }
+                        if next_c == ':' || next_c == '=' {
+                            chars.next();
+                            if next_c == '=' && chars.peek() == Some(&'=') {
+                                chars.next(); // skip second =
+                            }
+                            op_found = true;
+                        }
                     }
 
                     if op_found {
                         // Read value
                         // Skip whitespace
                         while let Some(&c) = chars.peek() {
-                            if c.is_whitespace() { chars.next(); } else { break; }
+                            if c.is_whitespace() {
+                                chars.next();
+                            } else {
+                                break;
+                            }
                         }
-                        
+
                         let mut value = String::new();
                         if let Some(&'"') = chars.peek() {
-                             chars.next();
-                             while let Some(&c) = chars.peek() {
-                                if c == '"' { chars.next(); break; }
+                            chars.next();
+                            while let Some(&c) = chars.peek() {
+                                if c == '"' {
+                                    chars.next();
+                                    break;
+                                }
                                 value.push(c);
                                 chars.next();
                             }
@@ -173,11 +192,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                         // My lexing above stops at `(`, so `s` is `text_contains`.
                         // But `(` is separate token.
                         // This tokenizing is too simple for function calls.
-                        // I will rely on `text:"foo"` syntax primarily, 
+                        // I will rely on `text:"foo"` syntax primarily,
                         // but if user writes `text_contains` it might appear as identifier.
                         tokens.push(Token::StringLit(s)); // Treat as bare string? No.
                     } else {
-                         tokens.push(Token::StringLit(s));
+                        tokens.push(Token::StringLit(s));
                     }
                 }
             }
@@ -214,12 +233,15 @@ impl Parser {
 
     fn parse_or(&mut self) -> Result<Query, String> {
         let mut left = self.parse_and()?;
-        
+
         while let Some(Token::Or) = self.peek() {
             self.advance();
             let right = self.parse_and()?;
             left = match left {
-                Query::Or(mut list) => { list.push(right); Query::Or(list) },
+                Query::Or(mut list) => {
+                    list.push(right);
+                    Query::Or(list)
+                }
                 _ => Query::Or(vec![left, right]),
             };
         }
@@ -228,12 +250,15 @@ impl Parser {
 
     fn parse_and(&mut self) -> Result<Query, String> {
         let mut left = self.parse_primary()?;
-        
+
         while let Some(Token::And) = self.peek() {
             self.advance();
             let right = self.parse_primary()?;
             left = match left {
-                Query::And(mut list) => { list.push(right); Query::And(list) },
+                Query::And(mut list) => {
+                    list.push(right);
+                    Query::And(list)
+                }
                 _ => Query::And(vec![left, right]),
             };
         }
@@ -258,22 +283,24 @@ impl Parser {
                 match key.as_str() {
                     "text" | "text_contains" => Ok(Query::Text(val.to_lowercase())),
                     "chat" | "chat_id" | "chatid" => {
-                         let id = val.parse::<i64>().map_err(|_| format!("Invalid chat id: {}", val))?;
-                         Ok(Query::ChatId(id))
-                    },
+                        let id = val
+                            .parse::<i64>()
+                            .map_err(|_| format!("Invalid chat id: {}", val))?;
+                        Ok(Query::ChatId(id))
+                    }
                     "sender" | "sender_id" | "user" | "userid" => {
-                        let id = val.parse::<i64>().map_err(|_| format!("Invalid sender id: {}", val))?;
+                        let id = val
+                            .parse::<i64>()
+                            .map_err(|_| format!("Invalid sender id: {}", val))?;
                         Ok(Query::SenderId(id))
-                    },
-                    "check_integrity" | "corrupt" => {
-                        Ok(Query::CheckKeyMatchesValue)
-                    },
+                    }
+                    "check_integrity" | "corrupt" => Ok(Query::CheckKeyMatchesValue),
                     _ => Err(format!("Unknown key: {}", key)),
                 }
             }
             Some(Token::StringLit(s)) => {
-                 self.advance();
-                 Ok(Query::Text(s.to_lowercase()))
+                self.advance();
+                Ok(Query::Text(s.to_lowercase()))
             }
             _ => Err("Unexpected token".to_string()),
         }

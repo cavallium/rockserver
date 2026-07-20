@@ -15,12 +15,12 @@ import io.micrometer.core.instrument.binder.system.FileDescriptorMetrics;
 import io.micrometer.core.instrument.binder.system.ProcessorMetrics;
 import io.micrometer.core.instrument.binder.system.UptimeMetrics;
 import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
-import io.micrometer.core.instrument.util.NamedThreadFactory;
 import io.micrometer.core.ipc.http.HttpUrlConnectionSender;
 import io.micrometer.influx.InfluxConfig;
 import io.micrometer.influx.InfluxMeterRegistry;
 import io.micrometer.jmx.JmxConfig;
 import io.micrometer.jmx.JmxMeterRegistry;
+import io.reactivex.rxjava3.core.Completable;
 import io.vertx.core.MultiMap;
 import io.vertx.core.VertxOptions;
 import io.vertx.core.buffer.Buffer;
@@ -36,7 +36,7 @@ import it.cavallium.rockserver.core.config.DatabaseConfig;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map.Entry;
-import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -45,6 +45,7 @@ import org.slf4j.LoggerFactory;
 public class MetricsManager implements AutoCloseable {
 
 	private static final Logger LOG = LoggerFactory.getLogger(MetricsManager.class);
+	private static final long CLOSE_TIMEOUT_SECONDS = 5L;
 
 	private final JvmGcMetrics gcMetrics;
 	private final JvmHeapPressureMetrics heapPressureMetrics;
@@ -54,10 +55,11 @@ public class MetricsManager implements AutoCloseable {
  private Vertx vertx;
 
 	public MetricsManager(DatabaseConfig config) {
+		var resolvedConfig = requireArgument(config, "config");
 		try {
 			this.startTime = System.currentTimeMillis();
 			compositeRegistry = new CompositeMeterRegistry();
-			if (config.metrics().jmx().enabled()) {
+			if (resolvedConfig.metrics().jmx().enabled()) {
 				try {
 					JmxMeterRegistry jmxMeterRegistry = new JmxMeterRegistry(new JmxConfig() {
 
@@ -81,25 +83,25 @@ public class MetricsManager implements AutoCloseable {
 					LOG.error("Failed to initialize jmx metrics");
 				}
 			}
-   if (config.metrics().influx().enabled()) {
+   if (resolvedConfig.metrics().influx().enabled()) {
                 try {
                     preloadClasses();
 
                     // Create a dedicated Vertx instance for metrics HTTP client
                     this.vertx = Vertx.vertx(new VertxOptions().setUseDaemonThread(false));
                     this.httpClient = vertx.createHttpClient(new HttpClientOptions()
-                            .setTrustAll(config.metrics().influx().allowInsecureCertificates())
-                            .setVerifyHost(!config.metrics().influx().allowInsecureCertificates())
+                            .setTrustAll(resolvedConfig.metrics().influx().allowInsecureCertificates())
+                            .setVerifyHost(!resolvedConfig.metrics().influx().allowInsecureCertificates())
                             .setDecompressionSupported(true)
                             .setProtocolVersion(HttpVersion.HTTP_2)
                             .setUseAlpn(true)
                             .setConnectTimeout(1000)
                             .setReadIdleTimeout(10000));
-					var influxUrl = config.metrics().influx().url();
-					var bucket = config.metrics().influx().bucket();
-					var userName = config.metrics().influx().user();
-					var token = config.metrics().influx().token();
-					var org = config.metrics().influx().org();
+					var influxUrl = resolvedConfig.metrics().influx().url();
+					var bucket = resolvedConfig.metrics().influx().bucket();
+					var userName = resolvedConfig.metrics().influx().user();
+					var token = resolvedConfig.metrics().influx().token();
+					var org = resolvedConfig.metrics().influx().org();
 					var step = Duration.ofMinutes(1);
 					InfluxMeterRegistry influxMeterRegistry = InfluxMeterRegistry
 							.builder(new InfluxConfig() {
@@ -191,7 +193,11 @@ public class MetricsManager implements AutoCloseable {
                 this.vertx = null;
             }
 
-			compositeRegistry.config().commonTags("appname", "rockserver", "database-name", Objects.requireNonNullElse(config.metrics().databaseName(), "default"));
+			var databaseName = resolvedConfig.metrics().databaseName();
+			if (databaseName == null) {
+				databaseName = "default";
+			}
+			compositeRegistry.config().commonTags("appname", "rockserver", "database-name", databaseName);
 
 			new JvmCompilationMetrics().bindTo(compositeRegistry);
 			new JvmMemoryMetrics().bindTo(compositeRegistry);
@@ -226,7 +232,7 @@ public class MetricsManager implements AutoCloseable {
 						var tmpDir = fs.createTempDirectoryBlocking("tmp");
 						fs.deleteRecursiveBlocking(tmpDir);
 					} finally {
-						vertx.close().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
+						awaitClose(vertx.close(), "preload Vertx instance");
 					}
         } catch (Throwable t) {
             // best-effort; this is only to trigger classloading
@@ -302,14 +308,14 @@ public class MetricsManager implements AutoCloseable {
 	public void close() {
 		if (httpClient != null) {
 			try {
-				httpClient.rxClose().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
+				awaitClose(httpClient.rxClose(), "metrics HTTP client");
 			} catch (Throwable t) {
 				LOG.warn("Failed to close http client for metrics", t);
 			}
 		}
 		if (vertx != null) {
 			try {
-				vertx.rxClose().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
+				awaitClose(vertx.rxClose(), "metrics Vertx instance");
 			} catch (Throwable t) {
 				LOG.warn("Failed to close Vertx instance for metrics", t);
 			}
@@ -321,5 +327,45 @@ public class MetricsManager implements AutoCloseable {
 
 	public MeterRegistry getRegistry() {
 		return compositeRegistry;
+	}
+
+	static void awaitClose(Completable closeOperation, String resourceName) {
+		awaitClose(closeOperation, resourceName, CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+	}
+
+	@SuppressWarnings("SameParameterValue")
+	static void awaitClose(Completable closeOperation, String resourceName, long timeout, TimeUnit unit) {
+		requireArgument(closeOperation, "closeOperation");
+		requireArgument(resourceName, "resourceName");
+		requireArgument(unit, "unit");
+		if (timeout <= 0) {
+			throw new IllegalArgumentException("timeout must be positive");
+		}
+		try {
+			if (!closeOperation.blockingAwait(timeout, unit)) {
+				throw new IllegalStateException(resourceName + " close did not complete within timeout");
+			}
+		} catch (RuntimeException e) {
+			restoreInterruptedStatus(e);
+			throw e;
+		}
+	}
+
+	private static void restoreInterruptedStatus(Throwable failure) {
+		var current = failure;
+		while (current != null) {
+			if (current instanceof InterruptedException) {
+				Thread.currentThread().interrupt();
+				return;
+			}
+			current = current.getCause();
+		}
+	}
+
+	private static <T> T requireArgument(T value, String name) {
+		if (value == null) {
+			throw new IllegalArgumentException(name + " must not be null");
+		}
+		return value;
 	}
 }

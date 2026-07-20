@@ -41,6 +41,7 @@ public abstract class FFMByteArrayMergeOperator extends FFMAbstractMergeOperator
     /**
      * Legacy pair-wise partial merge hook. Deprecated in RocksDB in favor of {@link #partialMergeMulti(byte[], List)}.
      */
+    @SuppressWarnings("DeprecatedIsStillUsed")
     @Deprecated
     public byte[] partialMerge(byte[] key, byte[] leftOperand, byte[] rightOperand) {
         return null;
@@ -55,8 +56,8 @@ public abstract class FFMByteArrayMergeOperator extends FFMAbstractMergeOperator
         byte[] existingArr = (existingValue != null) ? existingValue.asArray() : null;
 
         List<byte[]> operandsArr = new ArrayList<>(operands.size());
-        for (int i = 0; i < operands.size(); i++) {
-            operandsArr.add(operands.get(i).asArray());
+        for (Buf operand : operands) {
+            operandsArr.add(operand.asArray());
         }
 
         // Invoke legacy user logic
@@ -72,8 +73,8 @@ public abstract class FFMByteArrayMergeOperator extends FFMAbstractMergeOperator
         byte[] keyArr = key.asArray();
 
         List<byte[]> operandsArr = new ArrayList<>(operands.size());
-        for (int i = 0; i < operands.size(); i++) {
-            operandsArr.add(operands.get(i).asArray());
+        for (Buf operand : operands) {
+            operandsArr.add(operand.asArray());
         }
 
         byte[] result = partialMergeMulti(keyArr, operandsArr);
@@ -85,6 +86,7 @@ public abstract class FFMByteArrayMergeOperator extends FFMAbstractMergeOperator
     }
 
     @Override
+    @SuppressWarnings("deprecation")
     public final Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
         // Copy inputs to heap
         byte[] keyArr = key.asArray();
@@ -106,7 +108,6 @@ public abstract class FFMByteArrayMergeOperator extends FFMAbstractMergeOperator
     /**
      * Backward-compatible hook for subclasses that previously overrode onMergeError(Throwable, boolean).
      */
-    @SuppressWarnings("deprecation")
     protected void onMergeError(Throwable t, boolean partial) {
         super.onMergeError(t, partial, null);
     }

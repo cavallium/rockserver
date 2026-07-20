@@ -77,7 +77,7 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 			java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
 			hash = digest.digest(jarData);
 		} catch (java.security.NoSuchAlgorithmException e) {
-			throw new RuntimeException(e);
+			throw new IllegalStateException("SHA-256 message digest is unavailable", e);
 		}
 		Long existing = checkMergeOperator(name, hash);
 		if (existing != null) {

@@ -39,11 +39,15 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
     private static final Logger LOG = LoggerFactory.getLogger(FFMAbstractMergeOperator.class);
     
     // Critical Downcalls for speed
+    @SuppressWarnings("FieldMayBeFinal")
     private static MethodHandle MALLOC;
+    @SuppressWarnings("FieldMayBeFinal")
     private static MethodHandle FREE;
     private static final String ALLOCATOR_TYPE;
     
+    @SuppressWarnings("FieldMayBeFinal")
     private static MethodHandle CREATE_OP;
+    @SuppressWarnings("FieldMayBeFinal")
     private static MethodHandle DESTROY_OP;
 
     // Cache layout sizes for hot-path arithmetic
@@ -89,8 +93,8 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
 
         try {
             LOG.info("FFM merge-operator allocator: {}", ALLOCATOR_TYPE);
-        } catch (Throwable ignored) {
-            // Logging must not fail class initialization
+        } catch (Throwable loggingFailure) {
+            // Logging must not fail class initialization.
         }
 
         CREATE_OP = LINKER.downcallHandle(
@@ -144,7 +148,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
             );
 
             if (rawCpObject.equals(MemorySegment.NULL)) {
-                throw new RuntimeException("rocksdb_mergeoperator_create returned NULL");
+                throw new IllegalStateException("rocksdb_mergeoperator_create returned NULL");
             }
 
             this.sharedPtrContainer = instanceArena.allocate(16, 8);
@@ -155,7 +159,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
 
         } catch (Throwable t) {
             instanceArena.close();
-            throw new RuntimeException("Failed to construct FFM MergeOperator", t);
+            throw new IllegalStateException("Failed to construct FFM MergeOperator", t);
         }
     }
 
@@ -182,13 +186,14 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
      * Default returns {@code null} to request a full merge.
      */
     @Deprecated
+    @SuppressWarnings("DeprecatedIsStillUsed")
     public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
         return null;
     }
 
     /**
      * Hook invoked when user merge logic throws. Override to monitor or log errors.
-     * This is called for both full and partial merges. Default implementation prints the stack trace.
+     * This is called for both full and partial merges. The default implementation logs the failure.
      */
     protected void onMergeError(Throwable t, boolean partial, Buf key) {
         LOG.error("Merge error (partial={})", partial, t);
@@ -198,8 +203,11 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
         try {
             onMergeError(t, partial, key);
         } catch (Throwable hookEx) {
-            // Swallow hook errors to keep RocksDB stable
-            LOG.error("Error in onMergeError hook", hookEx);
+            try {
+                LOG.error("Error in onMergeError hook", hookEx);
+            } catch (Throwable loggingFailure) {
+                // Native callbacks cannot let diagnostic logging failures escape.
+            }
         }
     }
 
@@ -207,7 +215,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
         try {
             injectNativeHandle(handle);
         } catch (Exception e) {
-            throw new RuntimeException("Could not inject native handle", e);
+            throw new IllegalStateException("Could not inject native handle", e);
         }
     }
 
@@ -248,9 +256,12 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 MethodType.methodType(MemorySegment.class, MemorySegment.class)
             ).bindTo(this);
             return LINKER.upcallStub(mh, desc, instanceArena);
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (Exception e) {
+            throw callbackCreationFailure("name", e);
+        }
     }
 
+    @SuppressWarnings("unused")
     private MemorySegment nameCallback(MemorySegment state) {
         return nameSegment;
     }
@@ -264,9 +275,12 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 MethodType.methodType(void.class, MemorySegment.class)
             );
             return LINKER.upcallStub(mh, desc, instanceArena);
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (Exception e) {
+            throw callbackCreationFailure("destructor", e);
+        }
     }
 
+    @SuppressWarnings("unused")
     private static void noOpCallback(MemorySegment state) {
         // No-op to prevent SIGSEGV
     }
@@ -287,9 +301,12 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                             MemorySegment.class, MemorySegment.class)
             ).bindTo(this);
             return LINKER.upcallStub(mh, desc, instanceArena);
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (Exception e) {
+            throw callbackCreationFailure("full merge", e);
+        }
     }
 
+    @SuppressWarnings("unused")
     private MemorySegment fullMerge(MemorySegment state, MemorySegment keyPtr, long keyLen,
                                     MemorySegment existPtr, long existLen,
                                     MemorySegment opListPtr, MemorySegment opLenPtr, int numOps,
@@ -307,17 +324,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 existing = new MemorySegmentBuf(existPtr.reinterpret(existLen));
             }
 
-            // Access native array of pointers
-            MemorySegment opsPtrs = opListPtr.reinterpret(numOps * ADDRESS_SIZE);
-            MemorySegment opsLens = opLenPtr.reinterpret(numOps * LONG_SIZE);
-
-            List<Buf> operands = new ArrayList<>(numOps);
-            for (int i = 0; i < numOps; i++) {
-                MemorySegment opPtr = opsPtrs.getAtIndex(ValueLayout.ADDRESS, i);
-                long len = opsLens.getAtIndex(ValueLayout.JAVA_LONG, i);
-                // Zero-Copy Wrapper
-                operands.add(new MemorySegmentBuf(opPtr.reinterpret(len)));
-            }
+            List<Buf> operands = nativeOperands(opListPtr, opLenPtr, numOps);
 
             try {
                 Buf result = merge(key, existing, operands);
@@ -326,12 +333,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                     return allocateResult(result, successPtr, newValLenPtr);
                 }
             } catch (Throwable t) {
-                // System.err.println("DEBUG: Caught exception in fullMerge: " + t);
-                try {
-                    handleMergeError(t, false, key);
-                } catch (Throwable ignored) {
-                    LOG.error("Swallowed exception in fullMerge handleMergeError", ignored);
-                }
+                handleMergeError(t, false, key);
             }
 
             // Fallback: preserve existing value (or first operand) to avoid corruption
@@ -339,11 +341,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
             // Returning NULL allows RocksDB to handle the failure (e.g. aborting compaction or preserving operands).
             return MemorySegment.NULL;
         } catch (Throwable t) {
-            try {
-                handleMergeError(t, false, key);
-            } catch (Throwable ignored) {
-                LOG.error("Swallowed exception in fullMerge outer catch", ignored);
-            }
+            handleMergeError(t, false, key);
             return MemorySegment.NULL;
         }
     }
@@ -363,9 +361,12 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                             MemorySegment.class, MemorySegment.class)
             ).bindTo(this);
             return LINKER.upcallStub(mh, desc, instanceArena);
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (Exception e) {
+            throw callbackCreationFailure("partial merge", e);
+        }
     }
 
+    @SuppressWarnings("unused")
     private MemorySegment partialMergeCb(MemorySegment state, MemorySegment keyPtr, long keyLen,
                                          MemorySegment opListPtr, MemorySegment opLenListPtr, int numOps,
                                          MemorySegment successPtr, MemorySegment newValLenPtr) {
@@ -379,18 +380,8 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
         try {
             key = new MemorySegmentBuf(keyPtr.reinterpret(keyLen));
 
-            MemorySegment opsPtrs = opListPtr.reinterpret(numOps * ADDRESS_SIZE);
-            MemorySegment opsLens = opLenListPtr.reinterpret(numOps * LONG_SIZE);
-
             try {
-                // Build operands list (Zero-Copy)
-                List<Buf> operands = new ArrayList<>(numOps);
-                for (int i = 0; i < numOps; i++) {
-                    MemorySegment ptr = opsPtrs.getAtIndex(ValueLayout.ADDRESS, i);
-                    long len = opsLens.getAtIndex(ValueLayout.JAVA_LONG, i);
-                    operands.add(new MemorySegmentBuf(ptr.reinterpret(len)));
-                }
-
+                List<Buf> operands = nativeOperands(opListPtr, opLenListPtr, numOps);
                 Buf merged = partialMergeMulti(key, operands);
                 if (merged == null && operands.size() == 2) {
                     merged = partialMerge(key, operands.getFirst(), operands.getLast());
@@ -400,22 +391,26 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                     return allocateResult(merged, successPtr, newValLenPtr);
                 }
             } catch (Throwable t) { 
-                try {
-                    handleMergeError(t, true, key); 
-                } catch (Throwable ignored) {
-                    LOG.error("Swallowed exception in partialMergeCb handleMergeError", ignored);
-                }
+                handleMergeError(t, true, key);
             }
 
             return MemorySegment.NULL;
         } catch (Throwable t) {
-            try {
-                handleMergeError(t, true, key);
-            } catch (Throwable ignored) {
-                LOG.error("Swallowed exception in partialMergeCb outer catch", ignored);
-            }
+            handleMergeError(t, true, key);
             return MemorySegment.NULL;
         }
+    }
+
+    private static List<Buf> nativeOperands(MemorySegment opListPtr, MemorySegment opLenPtr, int numOps) {
+        MemorySegment opsPtrs = opListPtr.reinterpret(numOps * ADDRESS_SIZE);
+        MemorySegment opsLens = opLenPtr.reinterpret(numOps * LONG_SIZE);
+        List<Buf> operands = new ArrayList<>(numOps);
+        for (int i = 0; i < numOps; i++) {
+            MemorySegment opPtr = opsPtrs.getAtIndex(ValueLayout.ADDRESS, i);
+            long len = opsLens.getAtIndex(ValueLayout.JAVA_LONG, i);
+            operands.add(new MemorySegmentBuf(opPtr.reinterpret(len)));
+        }
+        return operands;
     }
 
     private MemorySegment createDeleteValueCallback() {
@@ -428,9 +423,16 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 MethodType.methodType(void.class, MemorySegment.class, MemorySegment.class, long.class)
             ).bindTo(this);
             return LINKER.upcallStub(mh, desc, instanceArena);
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (Exception e) {
+            throw callbackCreationFailure("delete-value", e);
+        }
     }
 
+    private static IllegalStateException callbackCreationFailure(String callbackName, Exception e) {
+        return new IllegalStateException("Failed to create FFM merge-operator " + callbackName + " callback", e);
+    }
+
+    @SuppressWarnings("unused")
     private void deleteValueCb(MemorySegment state, MemorySegment valuePtr, long len) {
         try {
             if (!valuePtr.equals(MemorySegment.NULL)) {
@@ -459,6 +461,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
             // and tell it to pull bytes from the source 'data' Buf.
             // If 'data' is also a MemorySegmentBuf (e.g. from partial merge), this triggers 
             // a fast MemorySegment.copy() (memcpy), bypassing the Java Heap completely.
+            //noinspection MismatchedQueryAndUpdateOfCollection
             Buf resultWrapper = new MemorySegmentBuf(resMem);
             resultWrapper.setBytesFromBuf(0, data, 0, (int) size);
         }

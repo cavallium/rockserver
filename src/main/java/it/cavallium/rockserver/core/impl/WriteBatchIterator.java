@@ -45,88 +45,88 @@ public class WriteBatchIterator {
             // Default CF ops
             if (type == kTypeValue) {
                 VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
+                offset = key.nextOffset();
                 VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.put(key.data, val.data);
+                offset = val.nextOffset();
+                handler.put(key.data(), val.data());
             } else if (type == kTypeDeletion) {
                 VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                handler.delete(key.data);
+                offset = key.nextOffset();
+                handler.delete(key.data());
             } else if (type == kTypeSingleDeletion) {
                 VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                handler.singleDelete(key.data);
+                offset = key.nextOffset();
+                handler.singleDelete(key.data());
             } else if (type == kTypeMerge) {
                 VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
+                offset = key.nextOffset();
                 VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.merge(key.data, val.data);
+                offset = val.nextOffset();
+                handler.merge(key.data(), val.data());
             } else if (type == kTypeRangeDeletion) {
                 VarString begin = readVarString(data, offset);
-                offset = begin.nextOffset;
+                offset = begin.nextOffset();
                 VarString end = readVarString(data, offset);
-                offset = end.nextOffset;
-                handler.deleteRange(begin.data, end.data);
+                offset = end.nextOffset();
+                handler.deleteRange(begin.data(), end.data());
             } else if (type == kTypeLogData) {
                 VarString blob = readVarString(data, offset);
-                offset = blob.nextOffset;
-                handler.logData(blob.data);
+                offset = blob.nextOffset();
+                handler.logData(blob.data());
             } else if (type == kTypeBlobIndex) {
                  VarString key = readVarString(data, offset);
-                 offset = key.nextOffset;
+                 offset = key.nextOffset();
                  VarString val = readVarString(data, offset);
-                 offset = val.nextOffset;
-                 handler.putBlobIndex(0, key.data, val.data); // Default CF?
+                 offset = val.nextOffset();
+                 handler.putBlobIndex(0, key.data(), val.data()); // Default CF?
             } else if (type == kTypeNoop) {
                 handler.markNoop(false);
             }
             // CF ops
             else if (type == kTypeColumnFamilyValue) {
                 VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
+                offset = cfId.nextOffset();
                 VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
+                offset = key.nextOffset();
                 VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.put(cfId.value, key.data, val.data);
+                offset = val.nextOffset();
+                handler.put(cfId.value(), key.data(), val.data());
             } else if (type == kTypeColumnFamilyDeletion) {
                 VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
+                offset = cfId.nextOffset();
                 VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                handler.delete(cfId.value, key.data);
+                offset = key.nextOffset();
+                handler.delete(cfId.value(), key.data());
             } else if (type == kTypeColumnFamilySingleDeletion) {
                 VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
+                offset = cfId.nextOffset();
                 VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
-                handler.singleDelete(cfId.value, key.data);
+                offset = key.nextOffset();
+                handler.singleDelete(cfId.value(), key.data());
             } else if (type == kTypeColumnFamilyMerge) {
                 VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
+                offset = cfId.nextOffset();
                 VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
+                offset = key.nextOffset();
                 VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.merge(cfId.value, key.data, val.data);
+                offset = val.nextOffset();
+                handler.merge(cfId.value(), key.data(), val.data());
             } else if (type == kTypeColumnFamilyRangeDeletion) {
                 VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
+                offset = cfId.nextOffset();
                 VarString begin = readVarString(data, offset);
-                offset = begin.nextOffset;
+                offset = begin.nextOffset();
                 VarString end = readVarString(data, offset);
-                offset = end.nextOffset;
-                handler.deleteRange(cfId.value, begin.data, end.data);
+                offset = end.nextOffset();
+                handler.deleteRange(cfId.value(), begin.data(), end.data());
             } else if (type == kTypeColumnFamilyBlobIndex) {
                 VarInt cfId = readVarInt(data, offset);
-                offset = cfId.nextOffset;
+                offset = cfId.nextOffset();
                 VarString key = readVarString(data, offset);
-                offset = key.nextOffset;
+                offset = key.nextOffset();
                 VarString val = readVarString(data, offset);
-                offset = val.nextOffset;
-                handler.putBlobIndex(cfId.value, key.data, val.data);
+                offset = val.nextOffset();
+                handler.putBlobIndex(cfId.value(), key.data(), val.data());
             }
             // Transaction ops
             else if (type == kTypeBeginPrepareXID) {
@@ -141,35 +141,35 @@ public class WriteBatchIterator {
                 // rocksdbjni Handler: markBeginPrepare()
                 // Let's check payload.
                 VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
+                offset = xid.nextOffset();
                 handler.markBeginPrepare(); // Ignoring XID as per Java API limitation?
             } else if (type == kTypeEndPrepareXID) {
                 VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
-                handler.markEndPrepare(xid.data);
+                offset = xid.nextOffset();
+                handler.markEndPrepare(xid.data());
             } else if (type == kTypeCommitXID) {
                 VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
-                handler.markCommit(xid.data);
+                offset = xid.nextOffset();
+                handler.markCommit(xid.data());
             } else if (type == kTypeRollbackXID) {
                 VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
-                handler.markRollback(xid.data);
+                offset = xid.nextOffset();
+                handler.markRollback(xid.data());
             } else if (type == kTypeBeginPersistedPrepareXID) {
                 VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
+                offset = xid.nextOffset();
                 handler.markBeginPrepare(); // Mapping to markBeginPrepare
             } else if (type == kTypeBeginUnprepareXID) {
                  VarString xid = readVarString(data, offset);
-                 offset = xid.nextOffset;
+                 offset = xid.nextOffset();
                  // No Java API for unprepare? Ignore or map to rollback?
                  // Ignore for now but consume.
             } else if (type == kTypeCommitWithTimestamp) {
                 VarString ts = readVarString(data, offset);
-                offset = ts.nextOffset;
+                offset = ts.nextOffset();
                 VarString xid = readVarString(data, offset);
-                offset = xid.nextOffset;
-                handler.markCommitWithTimestamp(xid.data, ts.data);
+                offset = xid.nextOffset();
+                handler.markCommitWithTimestamp(xid.data(), ts.data());
             }
             else {
                 throw new RocksDBException("Unsupported operation type in WriteBatch: " + type);
@@ -177,38 +177,44 @@ public class WriteBatchIterator {
         }
     }
 
-    private static class VarInt {
-        final int value;
-        final int nextOffset;
-        VarInt(int value, int nextOffset) { this.value = value; this.nextOffset = nextOffset; }
+    private record VarInt(int value, int nextOffset) {
     }
 
-    private static class VarString {
-        final byte[] data;
-        final int nextOffset;
-        VarString(byte[] data, int nextOffset) { this.data = data; this.nextOffset = nextOffset; }
+    private record VarString(byte[] data, int nextOffset) {
     }
 
-    private static VarInt readVarInt(byte[] data, int offset) {
-        int result = 0;
+    private static VarInt readVarInt(byte[] data, int offset) throws RocksDBException {
+        long result = 0;
         int shift = 0;
+        int startOffset = offset;
         while (true) {
-            if (offset >= data.length) throw new IndexOutOfBoundsException("Malformed VarInt");
+            if (offset >= data.length) {
+                throw new RocksDBException("Malformed VarInt at offset " + startOffset + ": truncated payload");
+            }
             byte b = data[offset++];
-            result |= (b & 0x7F) << shift;
+            result |= (long) (b & 0x7F) << shift;
+            if (result > Integer.MAX_VALUE) {
+                throw new RocksDBException("Malformed VarInt at offset " + startOffset + ": value exceeds int range");
+            }
             if ((b & 0x80) == 0) {
                 break;
             }
             shift += 7;
+            if (shift >= Integer.SIZE) {
+                throw new RocksDBException("Malformed VarInt at offset " + startOffset + ": too many bytes");
+            }
         }
-        return new VarInt(result, offset);
+        return new VarInt((int) result, offset);
     }
 
-    private static VarString readVarString(byte[] data, int offset) {
+    private static VarString readVarString(byte[] data, int offset) throws RocksDBException {
         VarInt len = readVarInt(data, offset);
-        int length = len.value;
-        offset = len.nextOffset;
-        if (offset + length > data.length) throw new IndexOutOfBoundsException("Malformed VarString");
+        int length = len.value();
+        offset = len.nextOffset();
+        if (offset > data.length - length) {
+            throw new RocksDBException("Malformed VarString at offset " + offset
+                    + ": length " + length + " exceeds remaining payload");
+        }
         byte[] str = Arrays.copyOfRange(data, offset, offset + length);
         return new VarString(str, offset + length);
     }

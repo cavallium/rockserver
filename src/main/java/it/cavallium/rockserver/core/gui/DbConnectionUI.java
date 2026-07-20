@@ -4,6 +4,7 @@ import com.google.common.primitives.Ints;
 import it.cavallium.rockserver.core.client.ClientBuilder;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+
 import java.net.UnixDomainSocketAddress;
 import java.nio.file.Path;
 import javax.swing.*;
@@ -11,354 +12,388 @@ import java.awt.*;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * A modern Java Swing UI for connecting to a custom database.
  * This UI dynamically adjusts input fields based on the selected connection mode
  * (e.g., Embedded, gRPC, Unix Socket) and runs connection attempts on a
  * background thread to keep the UI responsive.
- *
+ * <p>
  * This implementation does NOT use JDBC.
  */
 public class DbConnectionUI extends JFrame {
 
-	// --- Connection Modes Enum ---
-	// Using an enum is safer and cleaner than strings.
-	private enum ConnectionMode {
-		EMBEDDED("Embedded"),
-		EMBEDDED_IN_MEMORY("Embedded (In-Memory)"),
-		UNIX_SOCKET("Unix Socket"),
-		GRPC("gRPC"),
-		THRIFT("Thrift (Not Implemented)");
+    private static final Logger LOGGER = LoggerFactory.getLogger(DbConnectionUI.class);
 
-		private final String displayName;
+    // --- Connection Modes Enum ---
+    // Using an enum is safer and cleaner than strings.
+    private enum ConnectionMode {
+        EMBEDDED("Embedded"),
+        EMBEDDED_IN_MEMORY("Embedded (In-Memory)"),
+        UNIX_SOCKET("Unix Socket"),
+        GRPC("gRPC"),
+        THRIFT("Thrift (Not Implemented)");
 
-		ConnectionMode(String displayName) {
-			this.displayName = displayName;
-		}
+        private final String displayName;
 
-		@Override
-		public String toString() {
-			return displayName;
-		}
-	}
+        ConnectionMode(String displayName) {
+            this.displayName = displayName;
+        }
 
-	// --- UI Components ---
-	private JComboBox<ConnectionMode> modeComboBox;
-	private JTextField dbNameField;
-	private JTextField pathField;
-	private JTextField socketField;
-	private JTextField hostField;
-	private JTextField portField;
-	private JButton testButton;
-	private JButton connectButton;
-	private JTextArea statusArea;
+        @Override
+        public String toString() {
+            return displayName;
+        }
+    }
 
-	// --- Labels for dynamic show/hide ---
-	private JLabel pathLabel;
-	private JLabel socketLabel;
-	private JLabel hostLabel;
-	private JLabel portLabel;
+    // --- UI Components ---
+    private JComboBox<ConnectionMode> modeComboBox;
+    private JTextField dbNameField;
+    private JTextField pathField;
+    private JTextField socketField;
+    private JTextField hostField;
+    private JTextField portField;
+    private JButton testButton;
+    private JButton connectButton;
+    private JTextArea statusArea;
 
-	public DbConnectionUI() {
-		super("Custom DB Connection");
+    // --- Labels for dynamic show/hide ---
+    private JLabel pathLabel;
+    private JLabel socketLabel;
+    private JLabel hostLabel;
+    private JLabel portLabel;
 
-		initComponents();
-		layoutComponents();
-		addListeners();
+    public DbConnectionUI() {
+        super("Custom DB Connection");
 
-		// Set initial state based on the default selected mode
-		updateUiForSelectedMode();
+        initComponents();
+        layoutComponents();
+        addListeners();
 
-		// Frame setup
-		setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-		pack();
-		setLocationRelativeTo(null);
-		setMinimumSize(getSize());
-	}
+        // Set initial state based on the default selected mode
+        updateUiForSelectedMode();
 
-	private void initComponents() {
-		modeComboBox = new JComboBox<>(ConnectionMode.values());
+        // Frame setup
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        pack();
+        setLocationRelativeTo(null);
+        setMinimumSize(getSize());
+    }
 
-		// --- Add a custom renderer to disable the "Thrift" option ---
-		modeComboBox.setRenderer(new DefaultListCellRenderer() {
-			@Override
-			public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
-				super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
-				if (value == ConnectionMode.THRIFT) {
-					setEnabled(false);
-					setForeground(Color.GRAY);
-				}
-				return this;
-			}
-		});
+    private void initComponents() {
+        modeComboBox = new JComboBox<>(ConnectionMode.values());
 
-		// Set a default that is not disabled
-		modeComboBox.setSelectedItem(ConnectionMode.GRPC);
+        // --- Add a custom renderer to disable the "Thrift" option ---
+        modeComboBox.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                if (value == ConnectionMode.THRIFT) {
+                    setEnabled(false);
+                    setForeground(Color.GRAY);
+                }
+                return this;
+            }
+        });
 
-		dbNameField = new JTextField("main", 25);
-		pathField = new JTextField(25);
-		socketField = new JTextField(25);
-		hostField = new JTextField("10.0.0.9", 25);
-		portField = new JTextField("5333", 8);
+        // Set a default that is not disabled
+        modeComboBox.setSelectedItem(ConnectionMode.GRPC);
 
-		pathLabel = new JLabel("Embedded Path:");
-		socketLabel = new JLabel("Unix Socket Address:");
-		hostLabel = new JLabel("Host:");
-		portLabel = new JLabel("Port:");
+        dbNameField = new JTextField("main", 25);
+        pathField = new JTextField(25);
+        socketField = new JTextField(25);
+        hostField = new JTextField("10.0.0.9", 25);
+        portField = new JTextField("5333", 8);
 
-		testButton = new JButton("Test Connection");
-		connectButton = new JButton("Connect");
+        pathLabel = new JLabel("Embedded Path:");
+        socketLabel = new JLabel("Unix Socket Address:");
+        hostLabel = new JLabel("Host:");
+        portLabel = new JLabel("Port:");
 
-		statusArea = new JTextArea("Status: Ready", 4, 30);
-		statusArea.setEditable(false);
-		statusArea.setWrapStyleWord(true);
-		statusArea.setLineWrap(true);
-		statusArea.setFont(new Font("Monospaced", Font.PLAIN, 12));
-		statusArea.setBorder(BorderFactory.createTitledBorder("Log"));
-	}
+        testButton = new JButton("Test Connection");
+        connectButton = new JButton("Connect");
 
-	private void layoutComponents() {
-		JPanel formPanel = new JPanel(new GridBagLayout());
-		formPanel.setBorder(BorderFactory.createEmptyBorder(15, 15, 15, 15));
-		var gbc = new GridBagConstraints();
+        statusArea = new JTextArea("Status: Ready", 4, 30);
+        statusArea.setEditable(false);
+        statusArea.setWrapStyleWord(true);
+        statusArea.setLineWrap(true);
+        statusArea.setFont(new Font("Monospaced", Font.PLAIN, 12));
+        statusArea.setBorder(BorderFactory.createTitledBorder("Log"));
+    }
 
-		gbc.insets = new Insets(5, 5, 5, 5);
-		gbc.anchor = GridBagConstraints.LINE_END;
+    private void layoutComponents() {
+        JPanel formPanel = new JPanel(new GridBagLayout());
+        formPanel.setBorder(BorderFactory.createEmptyBorder(15, 15, 15, 15));
+        var gbc = new GridBagConstraints();
 
-		// Row 0: Connection Mode
-		gbc.gridx = 0; gbc.gridy = 0;
-		formPanel.add(new JLabel("Connection Mode:"), gbc);
-		gbc.gridx = 1; gbc.anchor = GridBagConstraints.LINE_START;
-		gbc.fill = GridBagConstraints.HORIZONTAL;
-		formPanel.add(modeComboBox, gbc);
+        gbc.insets = new Insets(5, 5, 5, 5);
+        gbc.anchor = GridBagConstraints.LINE_END;
 
-		// Row 1: DB Name (always visible)
-		gbc.gridx = 0; gbc.gridy = 1; gbc.fill = GridBagConstraints.NONE; gbc.anchor = GridBagConstraints.LINE_END;
-		formPanel.add(new JLabel("DB Name:"), gbc);
-		gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL; gbc.anchor = GridBagConstraints.LINE_START;
-		formPanel.add(dbNameField, gbc);
+        // Row 0: Connection Mode
+        gbc.gridx = 0;
+        gbc.gridy = 0;
+        formPanel.add(new JLabel("Connection Mode:"), gbc);
+        gbc.gridx = 1;
+        gbc.anchor = GridBagConstraints.LINE_START;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        formPanel.add(modeComboBox, gbc);
 
-		// --- Dynamic Fields ---
-		// Row 2: Path
-		gbc.gridx = 0; gbc.gridy = 2; gbc.fill = GridBagConstraints.NONE; gbc.anchor = GridBagConstraints.LINE_END;
-		formPanel.add(pathLabel, gbc);
-		gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL; gbc.anchor = GridBagConstraints.LINE_START;
-		formPanel.add(pathField, gbc);
+        // Row 1: DB Name (always visible)
+        gbc.gridx = 0;
+        gbc.gridy = 1;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.anchor = GridBagConstraints.LINE_END;
+        formPanel.add(new JLabel("DB Name:"), gbc);
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.anchor = GridBagConstraints.LINE_START;
+        formPanel.add(dbNameField, gbc);
 
-		// Row 3: Socket
-		gbc.gridx = 0; gbc.gridy = 3; gbc.fill = GridBagConstraints.NONE; gbc.anchor = GridBagConstraints.LINE_END;
-		formPanel.add(socketLabel, gbc);
-		gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL; gbc.anchor = GridBagConstraints.LINE_START;
-		formPanel.add(socketField, gbc);
+        // --- Dynamic Fields ---
+        // Row 2: Path
+        gbc.gridx = 0;
+        gbc.gridy = 2;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.anchor = GridBagConstraints.LINE_END;
+        formPanel.add(pathLabel, gbc);
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.anchor = GridBagConstraints.LINE_START;
+        formPanel.add(pathField, gbc);
 
-		// Row 4: Host
-		gbc.gridx = 0; gbc.gridy = 4; gbc.fill = GridBagConstraints.NONE; gbc.anchor = GridBagConstraints.LINE_END;
-		formPanel.add(hostLabel, gbc);
-		gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL; gbc.anchor = GridBagConstraints.LINE_START;
-		formPanel.add(hostField, gbc);
+        // Row 3: Socket
+        gbc.gridx = 0;
+        gbc.gridy = 3;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.anchor = GridBagConstraints.LINE_END;
+        formPanel.add(socketLabel, gbc);
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.anchor = GridBagConstraints.LINE_START;
+        formPanel.add(socketField, gbc);
 
-		// Row 5: Port
-		gbc.gridx = 0; gbc.gridy = 5; gbc.fill = GridBagConstraints.NONE; gbc.anchor = GridBagConstraints.LINE_END;
-		formPanel.add(portLabel, gbc);
-		gbc.gridx = 1; gbc.fill = GridBagConstraints.NONE; gbc.anchor = GridBagConstraints.LINE_START; // Port field is smaller
-		formPanel.add(portField, gbc);
+        // Row 4: Host
+        gbc.gridx = 0;
+        gbc.gridy = 4;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.anchor = GridBagConstraints.LINE_END;
+        formPanel.add(hostLabel, gbc);
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.anchor = GridBagConstraints.LINE_START;
+        formPanel.add(hostField, gbc);
 
-		// --- Button Panel ---
-		JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
-		buttonPanel.add(testButton);
-		buttonPanel.add(connectButton);
+        // Row 5: Port
+        gbc.gridx = 0;
+        gbc.gridy = 5;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.anchor = GridBagConstraints.LINE_END;
+        formPanel.add(portLabel, gbc);
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.anchor = GridBagConstraints.LINE_START; // Port field is smaller
+        formPanel.add(portField, gbc);
 
-		// --- Main Layout ---
-		setLayout(new BorderLayout(10, 10));
-		add(formPanel, BorderLayout.CENTER);
-		add(buttonPanel, BorderLayout.NORTH);
-		add(new JScrollPane(statusArea), BorderLayout.SOUTH);
-	}
+        // --- Button Panel ---
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        buttonPanel.add(testButton);
+        buttonPanel.add(connectButton);
 
-	private void addListeners() {
-		modeComboBox.addActionListener(e -> updateUiForSelectedMode());
-		testButton.addActionListener(e -> performConnectionAttempt());
-		connectButton.addActionListener(e -> performConnectionAttempt());
-	}
+        // --- Main Layout ---
+        setLayout(new BorderLayout(10, 10));
+        add(formPanel, BorderLayout.CENTER);
+        add(buttonPanel, BorderLayout.NORTH);
+        add(new JScrollPane(statusArea), BorderLayout.SOUTH);
+    }
 
-	/**
-	 * Updates the visibility and enabled state of UI components based on the
-	 * selected connection mode.
-	 */
-	private void updateUiForSelectedMode() {
-		var selectedMode = (ConnectionMode) Objects.requireNonNull(modeComboBox.getSelectedItem());
+    private void addListeners() {
+        modeComboBox.addActionListener(e -> updateUiForSelectedMode());
+        testButton.addActionListener(e -> performConnectionAttempt());
+        connectButton.addActionListener(e -> performConnectionAttempt());
+    }
 
-		// Prevent selection of the disabled "Thrift" mode
-		if (selectedMode == ConnectionMode.THRIFT) {
-			modeComboBox.setSelectedItem(ConnectionMode.GRPC); // Revert to a safe default
-			return;
-		}
+    /**
+     * Updates the visibility and enabled state of UI components based on the
+     * selected connection mode.
+     */
+    private void updateUiForSelectedMode() {
+        var selectedMode = (ConnectionMode) Objects.requireNonNull(modeComboBox.getSelectedItem());
 
-		// Reset all fields to a non-visible state first
-		setFieldVisible(pathLabel, pathField, false);
-		setFieldVisible(socketLabel, socketField, false);
-		setFieldVisible(hostLabel, hostField, false);
-		setFieldVisible(portLabel, portField, false);
-		dbNameField.setEnabled(true);
+        // Prevent selection of the disabled "Thrift" mode
+        if (selectedMode == ConnectionMode.THRIFT) {
+            modeComboBox.setSelectedItem(ConnectionMode.GRPC); // Revert to a safe default
+            return;
+        }
 
-		// Enable fields based on the selected mode
-		switch (selectedMode) {
-			case EMBEDDED ->
-					setFieldVisible(pathLabel, pathField, true);
-			case EMBEDDED_IN_MEMORY -> {
-				// No extra fields needed, only DB Name
-			}
-			case UNIX_SOCKET ->
-					setFieldVisible(socketLabel, socketField, true);
-			case GRPC -> {
-				setFieldVisible(hostLabel, hostField, true);
-				setFieldVisible(portLabel, portField, true);
-			}
-			// Thrift case is handled by the renderer and selection listener
-		}
-	}
+        // Reset all fields to a non-visible state first
+        setFieldVisible(pathLabel, pathField, false);
+        setFieldVisible(socketLabel, socketField, false);
+        setFieldVisible(hostLabel, hostField, false);
+        setFieldVisible(portLabel, portField, false);
+        dbNameField.setEnabled(true);
 
-	/** Helper to toggle visibility of a label and its corresponding text field. */
-	private void setFieldVisible(JLabel label, JTextField field, boolean visible) {
-		label.setVisible(visible);
-		field.setVisible(visible);
-	}
+        // Enable fields based on the selected mode
+        switch (selectedMode) {
+            case EMBEDDED -> setFieldVisible(pathLabel, pathField, true);
+            case EMBEDDED_IN_MEMORY -> {
+                // No extra fields needed, only DB Name
+            }
+            case UNIX_SOCKET -> setFieldVisible(socketLabel, socketField, true);
+            case GRPC -> {
+                setFieldVisible(hostLabel, hostField, true);
+                setFieldVisible(portLabel, portField, true);
+            }
+            // Thrift case is handled by the renderer and selection listener
+        }
+    }
 
-	/**
-	 * Simulates a connection attempt in a background thread.
-	 */
-	private void performConnectionAttempt() {
-		testButton.setEnabled(false);
-		connectButton.setEnabled(false);
-		statusArea.setForeground(Color.BLACK);
-		statusArea.setText("Status: Attempting to connect...");
+    /**
+     * Helper to toggle visibility of a label and its corresponding text field.
+     */
+    private void setFieldVisible(JLabel label, JTextField field, boolean visible) {
+        label.setVisible(visible);
+        field.setVisible(visible);
+    }
 
-		var worker = new SwingWorker<RocksDBConnection, Void>() {
-			@Override
-			protected RocksDBConnection doInBackground() throws Exception {
-				// This runs on a background thread.
-				// In a real app, you would call your custom connection library here.
-				var mode = (ConnectionMode) modeComboBox.getSelectedItem();
-				String dbName = dbNameField.getText().trim();
+    /**
+     * Simulates a connection attempt in a background thread.
+     */
+    private void performConnectionAttempt() {
+        testButton.setEnabled(false);
+        connectButton.setEnabled(false);
+        statusArea.setForeground(Color.BLACK);
+        statusArea.setText("Status: Attempting to connect...");
 
-				if (dbName.isEmpty()) {
-					throw new IllegalArgumentException("Database Name cannot be empty.");
-				}
+        var worker = new SwingWorker<RocksDBConnection, Void>() {
+            @Override
+            protected RocksDBConnection doInBackground() throws Exception {
+                // This runs on a background thread.
+                // In a real app, you would call your custom connection library here.
+                var mode = (ConnectionMode) modeComboBox.getSelectedItem();
+                String dbName = dbNameField.getText().trim();
 
-				var clientBuilder = new ClientBuilder();
-				clientBuilder.setName(dbName);
+                if (dbName.isEmpty()) {
+                    throw new IllegalArgumentException("Database Name cannot be empty.");
+                }
 
-				// Build a descriptive string based on the connection details
-				return switch (Objects.requireNonNull(mode)) {
-					case EMBEDDED -> {
-						String path = pathField.getText().trim();
-						if (path.isEmpty()) throw new IllegalArgumentException("Embedded Path cannot be empty.");
-						System.out.printf("Connected in EMBEDDED mode.\nDB Name: %s\nPath: %s%n", dbName, path);
-						clientBuilder.setEmbeddedInMemory(false);
-						clientBuilder.setEmbeddedPath(Path.of(path));
-						yield clientBuilder.build();
-					}
-					case EMBEDDED_IN_MEMORY -> {
-						System.out.printf("Connected in IN-MEMORY mode.\nDB Name: %s%n", dbName);
-						clientBuilder.setEmbeddedInMemory(true);
-						yield clientBuilder.build();
-					}
-					case UNIX_SOCKET -> {
-						String socket = socketField.getText().trim();
-						if (socket.isEmpty()) throw new IllegalArgumentException("Unix Socket Address cannot be empty.");
-						System.out.printf("Connected via UNIX SOCKET.\nDB Name: %s\nSocket: %s%n", dbName, socket);
-						clientBuilder.setUnixSocket(UnixDomainSocketAddress.of(socket));
-						yield clientBuilder.build();
-					}
-					case GRPC -> {
-						String host = hostField.getText().trim();
-						Integer port = Ints.tryParse(portField.getText().trim());
-						if (host.isEmpty() || port == null || port <= 0) throw new IllegalArgumentException("Host and Port cannot be empty for gRPC.");
+                var clientBuilder = new ClientBuilder();
+                clientBuilder.setName(dbName);
 
-						clientBuilder.setUseThrift(false);
-						clientBuilder.setHttpAddress(new HostAndPort(host, port));
+                // Build a descriptive string based on the connection details
+                return switch (Objects.requireNonNull(mode)) {
+                    case EMBEDDED -> {
+                        String path = pathField.getText().trim();
+                        if (path.isEmpty()) throw new IllegalArgumentException("Embedded Path cannot be empty.");
+                        LOGGER.info("Connected in embedded mode. dbName={}, path={}", dbName, path);
+                        clientBuilder.setEmbeddedInMemory(false);
+                        clientBuilder.setEmbeddedPath(Path.of(path));
+                        yield clientBuilder.build();
+                    }
+                    case EMBEDDED_IN_MEMORY -> {
+                        LOGGER.info("Connected in in-memory embedded mode. dbName={}", dbName);
+                        clientBuilder.setEmbeddedInMemory(true);
+                        yield clientBuilder.build();
+                    }
+                    case UNIX_SOCKET -> {
+                        String socket = socketField.getText().trim();
+                        if (socket.isEmpty())
+                            throw new IllegalArgumentException("Unix Socket Address cannot be empty.");
+                        LOGGER.info("Connected via Unix socket. dbName={}, socket={}", dbName, socket);
+                        clientBuilder.setUnixSocket(UnixDomainSocketAddress.of(socket));
+                        yield clientBuilder.build();
+                    }
+                    case GRPC -> {
+                        String host = hostField.getText().trim();
+                        Integer port = Ints.tryParse(portField.getText().trim());
+                        if (host.isEmpty() || port == null || port <= 0)
+                            throw new IllegalArgumentException("Host and Port cannot be empty for gRPC.");
 
-						System.out.printf("Connected via gRPC.\nDB Name: %s\nAddress: %s:%s%n", dbName, host, port);
-						yield clientBuilder.build();
-					}
-					default -> throw new IllegalStateException("Unsupported connection mode.");
-				};
-			}
+                        clientBuilder.setUseThrift(false);
+                        clientBuilder.setHttpAddress(new HostAndPort(host, port));
 
-			@Override
-			protected void done() {
-				// This runs on the Event Dispatch Thread (EDT) after completion.
-				try {
-					RocksDBConnection result = get(); // This will throw an exception if doInBackground() did.
+                        LOGGER.info("Connected via gRPC. dbName={}, host={}, port={}", dbName, host, port);
+                        yield clientBuilder.build();
+                    }
+                    default -> throw new IllegalStateException("Unsupported connection mode.");
+                };
+            }
 
-					// 2. Create and show the viewer window.
-					DbViewerUI viewer = new DbViewerUI(result);
-					viewer.setVisible(true);
+            @Override
+            protected void done() {
+                // This runs on the Event Dispatch Thread (EDT) after completion.
+                try {
+                    RocksDBConnection result = get(); // This will throw an exception if doInBackground() did.
 
-					// 3. Close this login window.
-					DbConnectionUI.this.dispose();
+                    // 2. Create and show the viewer window.
+                    DbViewerUI viewer = new DbViewerUI(result);
+                    viewer.setVisible(true);
 
-					statusArea.setForeground(new Color(0, 128, 0)); // Dark Green
-					statusArea.setText("Status: Success!\n" + result);
-					// On success, you might dispose this window and open the main application
-				} catch (InterruptedException | ExecutionException e) {
-					statusArea.setForeground(Color.RED);
-					Throwable cause = e.getCause() != null ? e.getCause() : e;
-					statusArea.setText("Status: Connection Failed!\nError: " + cause.getMessage());
-				} finally {
-					testButton.setEnabled(true);
-					connectButton.setEnabled(true);
-				}
-			}
-		};
-		worker.execute();
-	}
+                    // 3. Close this login window.
+                    DbConnectionUI.this.dispose();
 
-	/**
-	 * Calculates the system's DPI scaling factor.
-	 * @return A string representation of the scaling factor (e.g., "1.0", "1.5", "2.0").
-	 */
-	private static String getSystemScalingFactor() {
-		// On macOS, the scaling is handled by the OS automatically.
-		// The uiScale property can sometimes interfere, so we can skip it.
-		String os = System.getProperty("os.name").toLowerCase();
-		if (os.contains("mac")) {
-			return "1.0"; // Let macOS handle it
-		}
+                    statusArea.setForeground(new Color(0, 128, 0)); // Dark Green
+                    statusArea.setText("Status: Success!\n" + result);
+                    // On success, you might dispose this window and open the main application
+                } catch (InterruptedException | ExecutionException e) {
+                    statusArea.setForeground(Color.RED);
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    statusArea.setText("Status: Connection Failed!\nError: " + cause.getMessage());
+                } finally {
+                    testButton.setEnabled(true);
+                    connectButton.setEnabled(true);
+                }
+            }
+        };
+        worker.execute();
+    }
 
-		try {
-			// This is the standard way to get the screen's default transform.
-			GraphicsConfiguration gc = GraphicsEnvironment.getLocalGraphicsEnvironment()
-					.getDefaultScreenDevice()
-					.getDefaultConfiguration();
+    /**
+     * Calculates the system's DPI scaling factor.
+     *
+     * @return A string representation of the scaling factor (e.g., "1.0", "1.5", "2.0").
+     */
+    private static String getSystemScalingFactor() {
+        // On macOS, the scaling is handled by the OS automatically.
+        // The uiScale property can sometimes interfere, so we can skip it.
+        String os = System.getProperty("os.name").toLowerCase();
+        if (os.contains("mac")) {
+            return "1.0"; // Let macOS handle it
+        }
 
-			// The scale factor is embedded in the AffineTransform.
-			double scale = gc.getNormalizingTransform().getScaleX();
-			return String.valueOf(scale);
+        try {
+            // This is the standard way to get the screen's default transform.
+            GraphicsConfiguration gc = GraphicsEnvironment.getLocalGraphicsEnvironment()
+                    .getDefaultScreenDevice()
+                    .getDefaultConfiguration();
 
-		} catch (Exception e) {
-			// In case of any error (e.g., headless environment), default to 1.0.
-			return "1.0";
-		}
-	}
+            // The scale factor is embedded in the AffineTransform.
+            double scale = gc.getNormalizingTransform().getScaleX();
+            return String.valueOf(scale);
 
-	public static void main(String[] args) {
-		// 1. SET THE SCALING PROPERTY FIRST.
-		// This is the critical step. Do it before touching any Swing code.
-		System.setProperty("sun.java2d.uiScale", getSystemScalingFactor());
+        } catch (Exception e) {
+            // In case of any error (e.g., headless environment), default to 1.0.
+            return "1.0";
+        }
+    }
 
-		// Create and show the GUI on the Event Dispatch Thread (EDT)
-		SwingUtilities.invokeLater(() -> {
-			try {
-				// 3. SET THE LOOK AND FEEL *INSIDE* THE EDT.
-				// Now that the scaling property is set, the L&F will respect it
-				// when it initializes. The System L&F is best for this.
-				UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-			} catch (Exception e) {
-				System.err.println("Could not set the system look and feel.");
-				e.printStackTrace();
-			}
-			new DbConnectionUI().setVisible(true);
-		});
-	}
+    public static void main(String[] args) {
+        // 1. SET THE SCALING PROPERTY FIRST.
+        // This is the critical step. Do it before touching any Swing code.
+        System.setProperty("sun.java2d.uiScale", getSystemScalingFactor());
+
+        // Create and show the GUI on the Event Dispatch Thread (EDT)
+        SwingUtilities.invokeLater(() -> {
+            try {
+                // 3. SET THE LOOK AND FEEL *INSIDE* THE EDT.
+                // Now that the scaling property is set, the L&F will respect it
+                // when it initializes. The System L&F is best for this.
+                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            } catch (Exception e) {
+                LOGGER.warn("Could not set the system look and feel.", e);
+            }
+            new DbConnectionUI().setVisible(true);
+        });
+    }
 }

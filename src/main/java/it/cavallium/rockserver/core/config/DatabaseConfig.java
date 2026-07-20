@@ -4,9 +4,11 @@ import org.github.gestalt.config.exceptions.GestaltException;
 
 public interface DatabaseConfig {
 
-	GlobalDatabaseConfig global() throws GestaltException;
+    GlobalDatabaseConfig global() throws GestaltException;
 
-	ParallelismConfig parallelism() throws GestaltException;
+    ParallelismConfig parallelism() throws GestaltException;
 
-	MetricsConfig metrics() throws GestaltException;
+    MetricsConfig metrics() throws GestaltException;
+
+    ReplicationConfig replication() throws GestaltException;
 }

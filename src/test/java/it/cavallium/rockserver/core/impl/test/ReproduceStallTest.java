@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -29,6 +30,7 @@ public class ReproduceStallTest {
                 .bufferTimeout(10, Duration.ofMillis(50));
 
         AtomicInteger receivedItemsCount = new AtomicInteger();
+        AtomicReference<Throwable> streamFailure = new AtomicReference<>();
         CountDownLatch done = new CountDownLatch(1);
 
         AdaptiveBatcher.buffer(source, 5, 20, Duration.ofMillis(10), Schedulers.parallel())
@@ -47,6 +49,11 @@ public class ReproduceStallTest {
                         try {
                             Thread.sleep(0, 100); // 100ns
                         } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            streamFailure.set(e);
+                            done.countDown();
+                            cancel();
+                            return;
                         }
                         request(1);
                     }
@@ -58,13 +65,14 @@ public class ReproduceStallTest {
 
                     @Override
                     protected void hookOnError(Throwable throwable) {
-                        throwable.printStackTrace();
+                        streamFailure.set(throwable);
                         done.countDown();
                     }
                 });
 
         boolean finished = done.await(20, TimeUnit.SECONDS);
         Assertions.assertTrue(finished, "Stream stalled! Received so far: " + receivedItemsCount.get());
+        Assertions.assertNull(streamFailure.get(), () -> "Stream failed: " + streamFailure.get());
         Assertions.assertEquals(totalItems, receivedItemsCount.get());
     }
 }

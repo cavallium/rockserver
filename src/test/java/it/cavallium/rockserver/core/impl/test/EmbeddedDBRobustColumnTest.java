@@ -17,6 +17,7 @@ import org.rocksdb.DBOptions;
 import org.rocksdb.RocksDB;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -88,6 +89,16 @@ public class EmbeddedDBRobustColumnTest {
         
         // We ensure the new ID is valid.
         assertTrue(id2 > 0);
+    }
+
+    @Test
+    public void unregisterColumnRejectsMissingIdWithTypedFailure() throws Throwable {
+        long missingId = Long.MAX_VALUE;
+
+        RocksDBException ex = assertThrows(RocksDBException.class, () -> invokeUnregisterColumn(missingId));
+
+        assertEquals(RocksDBErrorType.COLUMN_NOT_FOUND, ex.getErrorUniqueId());
+        assertEquals("No column with id " + missingId, ex.getMessage());
     }
 
     @Test
@@ -202,5 +213,15 @@ public class EmbeddedDBRobustColumnTest {
         // Now it should be accessible
         long fetchedId = db.getColumnId("ManualCol");
         assertEquals(id, fetchedId);
+    }
+
+    private void invokeUnregisterColumn(long columnId) throws Throwable {
+        var method = EmbeddedDB.class.getDeclaredMethod("unregisterColumn", long.class);
+        method.setAccessible(true);
+        try {
+            method.invoke(db, columnId);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
     }
 }

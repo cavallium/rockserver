@@ -13,6 +13,7 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode;
 import java.util.function.BiFunction;
@@ -31,6 +32,7 @@ import org.slf4j.LoggerFactory;
 public class RocksDBStatistics {
 
 	private static final Logger LOG = LoggerFactory.getLogger(RocksDBStatistics.class);
+	private static final long STATISTICS_THREAD_CLOSE_TIMEOUT_MILLIS = 5000L;
 
 	private final Statistics statistics;
 	private final MetricsManager metrics;
@@ -230,15 +232,8 @@ public class RocksDBStatistics {
 
 				var taskEndTime = System.nanoTime();
 
-				long nextTaskStartTime = taskStartTime;
-				while (nextTaskStartTime <= taskEndTime) {
-					nextTaskStartTime += 60000000000L;
-				}
-
-				try {
-					Thread.sleep(Duration.ofNanos(nextTaskStartTime - taskEndTime));
-				} catch (InterruptedException e) {
-					LOG.debug("Statistics sleep interrupted");
+				if (!sleepUntilNextStatisticsCollection(taskStartTime, taskEndTime)) {
+					return;
 				}
 			}
 		});
@@ -253,13 +248,52 @@ public class RocksDBStatistics {
 
 	private record CacheStats(long usage, long pinnedUsage) {}
 
+	private static boolean sleepUntilNextStatisticsCollection(long taskStartTime, long taskEndTime) {
+		long nextTaskStartTime = taskStartTime;
+		while (nextTaskStartTime <= taskEndTime) {
+			nextTaskStartTime += TimeUnit.MINUTES.toNanos(1L);
+		}
+
+		try {
+			Thread.sleep(Duration.ofNanos(nextTaskStartTime - taskEndTime));
+			return true;
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			LOG.debug("Statistics sleep interrupted");
+			return false;
+		}
+	}
+
 	public void close() {
 		stopRequested = true;
 		executor.interrupt();
+		awaitStatisticsThreadTermination(executor, STATISTICS_THREAD_CLOSE_TIMEOUT_MILLIS);
+	}
+
+	@SuppressWarnings("SameParameterValue")
+	static void awaitStatisticsThreadTermination(Thread thread, long timeoutMillis) {
+		var timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+		var startNanos = System.nanoTime();
+		var interrupted = false;
 		try {
-			executor.join();
-		} catch (InterruptedException e) {
-			LOG.error("Failed to close executor", e);
+			while (thread.isAlive()) {
+				var elapsedNanos = System.nanoTime() - startNanos;
+				var remainingNanos = timeoutNanos - elapsedNanos;
+				if (remainingNanos <= 0L) {
+					throw new IllegalStateException("Timed out while closing RocksDB statistics executor");
+				}
+				try {
+					var remainingMillis = TimeUnit.NANOSECONDS.toMillis(remainingNanos);
+					var remainingSubMillisNanos = (int) (remainingNanos - TimeUnit.MILLISECONDS.toNanos(remainingMillis));
+					thread.join(remainingMillis, remainingSubMillisNanos);
+				} catch (InterruptedException _) {
+					interrupted = true;
+				}
+			}
+		} finally {
+			if (interrupted) {
+				Thread.currentThread().interrupt();
+			}
 		}
 	}
 }

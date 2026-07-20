@@ -89,7 +89,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		} catch (java.security.NoSuchAlgorithmException e) {
 			return CompletableFuture.failedFuture(e);
 		}
-		return checkMergeOperatorAsync(name, hash).thenCompose(existing -> {
+		return FutureUtils.composeCancellation(checkMergeOperatorAsync(name, hash), existing -> {
 			if (existing != null) {
 				return CompletableFuture.completedFuture(existing);
 			} else {
@@ -471,8 +471,17 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
      */
     private static Retry defaultCdcStreamRetry() {
         return Retry.backoff(Long.MAX_VALUE, Duration.ofMillis(50))
-                .doBeforeRetry(s -> System.err.println("CDC RETRY: " + s.failure()))
+                .doBeforeRetry(RocksDBAsyncAPI::logCdcStreamRetry)
                 .maxBackoff(Duration.ofSeconds(5))
                 .transientErrors(true);
+    }
+
+    private static void logCdcStreamRetry(Retry.RetrySignal signal) {
+        org.slf4j.LoggerFactory.getLogger(RocksDBAsyncAPI.class).warn(
+                "CDC stream retrying after failure; totalRetries={}, totalRetriesInARow={}",
+                signal.totalRetries(),
+                signal.totalRetriesInARow(),
+                signal.failure()
+        );
     }
 }

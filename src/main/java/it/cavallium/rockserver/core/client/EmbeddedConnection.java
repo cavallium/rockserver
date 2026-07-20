@@ -121,7 +121,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
             case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
             case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> CompletableFuture.supplyAsync(() -> req.handleSync(this),
                     (req.isReadOnly() ? db.getScheduler().readExecutor() : db.getScheduler().writeExecutor()));
-            case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
+            case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request type " + req.getClass().getName() + " is not supported by " + this.getClass().getName() + " asynchronous routing");
         };
     }
 
@@ -196,7 +196,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			try {
 				return db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType);
 			} catch (RocksDBException e) {
-				throw new RuntimeException(e);
+				throw e;
 			}
 		}, (java.util.concurrent.Executor) db.getScheduler().write()::schedule);
 	}

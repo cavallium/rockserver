@@ -11,6 +11,7 @@ import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.impl.MyStringAppendOperator;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+
 import java.io.IOException;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
@@ -23,6 +24,7 @@ import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.*;
@@ -41,865 +43,912 @@ import it.cavallium.rockserver.core.impl.EmbeddedDB;
 @TestMethodOrder(MethodOrderer.MethodName.class)
 abstract class DBTest {
 
-	protected EmbeddedConnection db;
-	protected long colId = 0L;
-	protected Arena arena;
-	protected Buf bigValue;
-	protected Keys key1;
-	protected Keys collidingKey1;
-	protected Keys key2;
-	protected Buf value1;
-	protected Buf value2;
-	private Path configFile;
+    protected EmbeddedConnection db;
+    protected long colId = 0L;
+    protected Arena arena;
+    protected Buf bigValue;
+    protected Keys key1;
+    protected Keys collidingKey1;
+    protected Keys key2;
+    protected Buf value1;
+    protected Buf value2;
+    private Path configFile;
 
-	protected enum ConnectionMethod {
-		EMBEDDED,
-		GRPC,
-		THRIFT
-	}
-
-	protected enum ConnectionType {
-		SYNC,
-		ASYNC
-	}
-
-	public record ConnectionConfig(ConnectionType type, ConnectionMethod method) {
-
-		public String getName() {
-			return type.name() + ", " + method.name();
-		}
-	}
-
-	public static Stream<Arguments> allImplementations() {
-		return Stream
-				.of(ConnectionMethod.values())
-				.flatMap(method -> Stream.of(ConnectionType.values())
-						.map(type -> new ConnectionConfig(type, method)))
-				.map(cfg -> Arguments.arguments(cfg.getName(), cfg));
-	}
-
-	@ParameterizedTest(name = "{0}")
-	@MethodSource("allImplementations")
-	@Retention(RetentionPolicy.RUNTIME)
-	private @interface TestAllImplementations {
-	}
-
-	@org.junit.jupiter.api.BeforeEach
-	void setUp() throws IOException {
-		if (System.getProperty("rockserver.core.print-config", null) == null) {
-			System.setProperty("rockserver.core.print-config", "false");
-		}
-		configFile = Files.createTempFile("dbtest-merge", ".conf");
-		Files.writeString(configFile, """
-database: {
-  global: {
-    ingest-behind: true
-    fallback-column-options: {
-      merge-operator-class: "it.cavallium.rockserver.core.impl.MyStringAppendOperator"
+    protected enum ConnectionMethod {
+        EMBEDDED,
+        GRPC,
+        THRIFT
     }
-  }
-}
-""");
-		arena = Arena.ofShared();
-		db = new EmbeddedConnection(null, "test", configFile);
-		createStandardColumn();
-
-		bigValue = getBigValue();
-		key1 = getKey1();
-		collidingKey1 = getCollidingKey1();
-		key2 = getKey2();
-
-		value1 = getValue1();
-		value2 = getValue2();
-	}
-
-	protected Buf getBigValue() {
-		var bigValueArray = new byte[10_000];
-		ThreadLocalRandom.current().nextBytes(bigValueArray);
-		return Utils.toBuf(bigValueArray);
-	}
-
-	protected Keys getKey2() {
-		return new Keys(new Buf[] {
-				toBufSimple(3),
-				toBufSimple(4, 6),
-				toBufSimple(3),
-				toBufSimple(1, 2, 3),
-				toBufSimple(6, 7, 7)
-		});
-	}
-
-	protected Keys getCollidingKey1() {
-		return new Keys(new Buf[] {
-				toBufSimple(3),
-				toBufSimple(4, 6),
-				toBufSimple(3),
-				toBufSimple(1, 2, 3),
-				toBufSimple(6, 7, -48)
-		});
-	}
-
-	protected Keys getKey1() {
-		return new Keys(new Buf[] {
-				toBufSimple(3),
-				toBufSimple(4, 6),
-				toBufSimple(3),
-				toBufSimple(1, 2, 3),
-				toBufSimple(6, 7, 8)
-		});
-	}
-
-	/**
-	 * @return a sorted sequence of k-v pairs
-	 */
-	protected List<KV> getKVSequence() {
-		var result = new ArrayList<KV>();
-		for (int i = 0; i < Byte.MAX_VALUE; i++) {
-			result.add(new KV(getKeyI(i), getValueI(i)));
-		}
-		return result;
-	}
-
-	protected KV getKVSequenceFirst() {
-		return getKVSequence().getFirst();
-	}
-
-	protected KV getKVSequenceLast() {
-		return getKVSequence().getLast();
-	}
-
-	protected boolean getHasValues() {
-		return true;
-	}
-
-	protected Buf getValue1() {
-		return Utils.toBufSimple(0, 0, 3);
-	}
-
-	protected Buf getValue2() {
-		return Utils.toBufSimple(0, 0, 5);
-	}
-
-	private void createStandardColumn() {
-		createColumn(getSchema());
-	}
-
-	private void createColumn(ColumnSchema schema) {
-		if (colId != 0L) {
-			db.deleteColumn(colId);
-		}
-		colId = db.createColumn("column-test", schema);
-	}
-
-	void fillSomeKeys() {
-		Assertions.assertNull(db.put(0, colId, key1, value1, RequestType.none()));
-		Assertions.assertNull(db.put(0, colId, collidingKey1, value2, RequestType.none()));
-		Assertions.assertNull(db.put(0, colId, key2, bigValue, RequestType.none()));
-		for (int i = 0; i < Byte.MAX_VALUE; i++) {
-			var keyI = getKeyI(i);
-			var valueI = getValueI(i);
-			Assertions.assertNull(db.put(0, colId, keyI, valueI, RequestType.none()));
-		}
-	}
-
-	protected Keys getKeyI(int i) {
-		return new Keys(new Buf[] {
-				toBufSimple(3),
-				toBufSimple(4, 6),
-				toBufSimple(3),
-				toBufSimple(1, 2, 3),
-				toBufSimple(8, 2, 5, 1, 7, i)
-		});
-	}
-
-	protected Keys getNotFoundKeyI(int i) {
-		return new Keys(new Buf[] {
-				toBufSimple(3),
-				toBufSimple(4, 6),
-				toBufSimple(3),
-				toBufSimple(1, 2, 3),
-				toBufSimple(8, 2, 5, 1, 0, i)
-		});
-	}
-
-	protected Buf getValueI(int i) {
-		return toBufSimple(i, i, i, i, i);
-	}
-
-	@org.junit.jupiter.api.AfterEach
-	void tearDown() throws IOException {
-		db.deleteColumn(colId);
-		db.close();
-		arena.close();
-		Files.deleteIfExists(configFile);
-	}
-
-	@SuppressWarnings("DataFlowIssue")
-	@TestAllImplementations
-	void testCdcResolvedValues(String name, ConnectionConfig connection) throws Exception {
-		// Resolved-values CDC currently supported on embedded API path in this change.
-		if (connection.method() == ConnectionMethod.THRIFT) {
-			return;
-		}
-
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-
-			String subId = "resolved-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null, true);
-
-			// Use a dedicated column with merge operator enabled via fallback config
-			long mergeColId = api.createColumn("resolved-col-" + name,
-					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-
-			var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0,0,0,1})});
-			Buf initial = Buf.wrap("Initial".getBytes(java.nio.charset.StandardCharsets.UTF_8));
-			Buf delta = Buf.wrap("-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
-
-			api.put(0, mergeColId, key, initial, RequestType.none());
-			api.merge(0, mergeColId, key, delta, RequestType.none());
-
-			// Expect 2 events; in resolved mode, second (MERGE) must carry fully merged value
-			var events = api.cdcStream(subId,
-					new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
-							startSeq,
-							10,
-							Duration.ofMillis(10),
-							it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE
-					),
-					null)
-					.take(2)
-					.collectList()
-					.block(Duration.ofSeconds(5));
-
-			Assertions.assertNotNull(events);
-			Assertions.assertEquals(2, events.size());
-			CDCEvent ev1 = events.get(0);
-			CDCEvent ev2 = events.get(1);
-			
-			// With emitLatestValues=true, all events are resolved to the current value (Initial,-Patched)
-			// and emitted as PUT operations (replacing MERGE).
-			Buf expected = Buf.wrap("Initial,-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
-			
-			Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
-			assertSegmentEquals(expected, ev1.value());
-			
-			Assertions.assertEquals(CDCEvent.Op.PUT, ev2.op());
-			assertSegmentEquals(expected, ev2.value());
-		}
-	}
-
-	@TestAllImplementations
-	void putTestErrors(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			var key = getKey1();
-
-			if (!getHasValues()) {
-				Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, toBufSimple(123), RequestType.delta()));
-			} else {
-				Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, emptyBuf(), RequestType.delta()));
-				Assertions.assertThrows(RocksDBException.class, () -> {
-					try {
-						db.put(0, colId, key, null, RequestType.delta());
-					} catch (IllegalArgumentException ex) {
-						throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
-					}
-				});
-			}
-
-			Assertions.assertThrows(RocksDBException.class, () -> {
-				try {
-					db.put(0, colId, null, value1, RequestType.delta());
-				} catch (IllegalArgumentException ex) {
-					throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
-				}
-			});
-			Assertions.assertThrows(RocksDBException.class, () -> {
-				try {
-					db.put(0, colId, null, null, RequestType.delta());
-				} catch (IllegalArgumentException ex) {
-					throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
-				}
-			});
-			Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, value1, null));
-			Assertions.assertThrows(RocksDBException.class, () -> db.put(1, colId, key, value1, RequestType.delta()));
-			Assertions.assertThrows(RocksDBException.class, () -> db.put(0, 21203, key, value1, RequestType.delta()));
-		}
-	}
-
-	@TestAllImplementations
-	void putSameBucketSameKey(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			var key = getKey1();
-			var value1 = getValue1();
-			var value2 = getValue2();
-
-			Delta<Buf> delta;
-
-			delta = db.put(0, colId, key, value1, RequestType.delta());
-			Assertions.assertNull(delta.previous());
-			assertSegmentEquals(value1, delta.current());
-
-			delta = db.put(0, colId, key, value2, RequestType.delta());
-			assertSegmentEquals(value1, delta.previous());
-			assertSegmentEquals(value2, delta.current());
-		}
-	}
-
-	@TestAllImplementations
-	void putSameBucketDifferentKey(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			if (getSchemaVarKeys().isEmpty()) {
-				return;
-			}
-			createColumn(ColumnSchema.of(getSchemaFixedKeys(), ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.ALLSAME8), getHasValues()));
-
-			var key1 = getKey1();
-			var key2 = getCollidingKey1();
-
-			var value1 = getValue1();
-			var value2 = getValue2();
-
-			Delta<Buf> delta;
-
-			Assertions.assertFalse(db.put(0, colId, getKeyI(3), value2, RequestType.previousPresence()));
-			Assertions.assertFalse(db.put(0, colId, getKeyI(4), value2, RequestType.previousPresence()));
-
-
-			delta = db.put(0, colId, key1, value1, RequestType.delta());
-			Assertions.assertNull(delta.previous());
-			assertSegmentEquals(value1, delta.current());
-
-			delta = db.put(0, colId, key2, value2, RequestType.delta());
-			Assertions.assertNull(delta.previous());
-			assertSegmentEquals(value2, delta.current());
-
-			delta = db.put(0, colId, key2, value1, RequestType.delta());
-			assertSegmentEquals(value2, delta.previous());
-			assertSegmentEquals(value1, delta.current());
-
-			delta = db.put(0, colId, key2, value1, RequestType.delta());
-			assertSegmentEquals(value1, delta.previous());
-			assertSegmentEquals(value1, delta.current());
-
-
-			Assertions.assertTrue(db.put(0, colId, key1, value2, RequestType.previousPresence()));
-			Assertions.assertTrue(db.put(0, colId, key2, value2, RequestType.previousPresence()));
-
-
-			delta = db.put(0, colId, key1, value1, RequestType.delta());
-			assertSegmentEquals(value2, delta.previous());
-			assertSegmentEquals(value1, delta.current());
-
-			delta = db.put(0, colId, key2, value1, RequestType.delta());
-			assertSegmentEquals(value2, delta.previous());
-			assertSegmentEquals(value1, delta.current());
-
-
-			Assertions.assertNull(db.put(0, colId, key1, value2, RequestType.none()));
-			Assertions.assertNull(db.put(0, colId, key2, value2, RequestType.none()));
-
-
-			assertSegmentEquals(value2, db.put(0, colId, key1, value1, RequestType.previous()));
-			assertSegmentEquals(value2, db.put(0, colId, key2, value1, RequestType.previous()));
-
-			assertSegmentEquals(value1, db.put(0, colId, key1, value1, RequestType.previous()));
-			assertSegmentEquals(value1, db.put(0, colId, key2, value1, RequestType.previous()));
-
-			if (!Utils.valueEquals(value1, value2)) {
-				Assertions.assertTrue(db.put(0, colId, key1, value2, RequestType.changed()));
-				Assertions.assertTrue(db.put(0, colId, key2, value2, RequestType.changed()));
-			}
-
-			Assertions.assertFalse(db.put(0, colId, key1, value2, RequestType.changed()));
-			Assertions.assertFalse(db.put(0, colId, key2, value2, RequestType.changed()));
-
-
-			assertSegmentEquals(value2, db.put(0, colId, key1, value1, RequestType.previous()));
-			assertSegmentEquals(value2, db.put(0, colId, key2, value1, RequestType.previous()));
-		}
-	}
-
-	protected ColumnSchema getSchema() {
-		return ColumnSchema.of(getSchemaFixedKeys(), getSchemaVarKeys(), getHasValues());
-	}
-
-	protected IntList getSchemaFixedKeys() {
-		return IntList.of(1, 2, 1);
-	}
-
-	protected ObjectList<ColumnHashType> getSchemaVarKeys() {
-		return ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.XXHASH8);
-	}
-
-	/**
-	 * Some keys have same bucket, some not
-	 */
-	@TestAllImplementations
-	void putMixedBucketMixedKey(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			var key1 = getKey1();
-			var collidingKey1 = getCollidingKey1();
-			var key2 = getKey2();
-
-			var value1 = getValue1();
-			var value2 = getValue2();
-
-			var delta = db.put(0, colId, key1, value1, RequestType.delta());
-			Assertions.assertNull(delta.previous());
-			assertSegmentEquals(value1, delta.current());
-
-			delta = db.put(0, colId, collidingKey1, value2, RequestType.delta());
-			Assertions.assertNull(delta.previous());
-			assertSegmentEquals(value2, delta.current());
-
-			delta = db.put(0, colId, collidingKey1, value1, RequestType.delta());
-			assertSegmentEquals(value2, delta.previous());
-			assertSegmentEquals(value1, delta.current());
-
-			delta = db.put(0, colId, key2, value1, RequestType.delta());
-			Assertions.assertNull(delta.previous());
-			assertSegmentEquals(value1, delta.current());
-
-			delta = db.put(0, colId, key2, value2, RequestType.delta());
-			assertSegmentEquals(value1, delta.previous());
-			assertSegmentEquals(value2, delta.current());
-		}
-	}
-
-	@TestAllImplementations
-	void get(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			if (getHasValues()) {
-				Assertions.assertNull(db.get(0, colId, key1, RequestType.current()));
-				Assertions.assertNull(db.get(0, colId, collidingKey1, RequestType.current()));
-				Assertions.assertNull(db.get(0, colId, key2, RequestType.current()));
-			}
-			Assertions.assertFalse(db.get(0, colId, key1, RequestType.exists()));
-			Assertions.assertFalse(db.get(0, colId, collidingKey1, RequestType.exists()));
-			Assertions.assertFalse(db.get(0, colId, key2, RequestType.exists()));
-
-			fillSomeKeys();
-
-			if (getHasValues()) {
-				assertSegmentEquals(value1, db.get(0, colId, key1, RequestType.current()));
-				Assertions.assertNull(db.get(0, colId, getNotFoundKeyI(0), RequestType.current()));
-				assertSegmentEquals(value2, db.get(0, colId, collidingKey1, RequestType.current()));
-				assertSegmentEquals(bigValue, db.get(0, colId, key2, RequestType.current()));
-			}
-
-			Assertions.assertTrue(db.get(0, colId, key1, RequestType.exists()));
-			Assertions.assertFalse(db.get(0, colId, getNotFoundKeyI(0), RequestType.exists()));
-			Assertions.assertTrue(db.get(0, colId, collidingKey1, RequestType.exists()));
-			Assertions.assertTrue(db.get(0, colId, key2, RequestType.exists()));
-		}
-	}
-
-	@TestAllImplementations
-	void update(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			if (getHasValues()) {
-				var forUpdate = db.get(0, colId, key1, RequestType.forUpdate());
-				Assertions.assertNull(forUpdate.previous());
-				Assertions.assertTrue(forUpdate.updateId() != 0);
-				db.put(forUpdate.updateId(), colId, key1, value1, RequestType.none());
-
-				Assertions.assertThrows(Exception.class, () -> db.put(forUpdate.updateId(), colId, key1, value2, RequestType.none()));
-			}
-		}
-	}
-
-	@TestAllImplementations
-	void reduceRangeFirstAndLast(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			var firstKey = getKVSequenceFirst().keys();
-			var lastKey = getKVSequenceLast().keys();
-			var prevLastKV = getKVSequence().get(getKVSequence().size() - 2);
-			if (getSchemaVarKeys().isEmpty()) {
-				FirstAndLast<KV> firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
-				Assertions.assertNull(firstAndLast.first(), "First should be empty because the db is empty");
-				Assertions.assertNull(firstAndLast.last(), "Last should be empty because the db is empty");
-
-				fillSomeKeys();
-
-				firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
-				Assertions.assertEquals(getKVSequenceFirst(), firstAndLast.first(), "First key mismatch");
-				Assertions.assertEquals(prevLastKV, firstAndLast.last(), "Last key mismatch");
-
-				firstAndLast = db.reduceRange(0, colId, firstKey, firstKey, false, RequestType.firstAndLast(), 1000);
-				Assertions.assertNull(firstAndLast.first(), "First should be empty because the range is empty");
-				Assertions.assertNull(firstAndLast.last(), "Last should be empty because the range is empty");
-			} else {
-				db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
-			}
-		}
-	}
-
-	@TestAllImplementations
-	void getRangeAll(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			int initIndex = 1;
-			int count = 5;
-
-			var rangeInitKey = getKVSequence().get(initIndex);
-			var rangeEndKeyExcl = getKVSequence().get(initIndex + count);
-			var rangeEndKeyIncl = getKVSequence().get(initIndex + count - 1);
-			System.out.println("[DEBUG_LOG] " + this.getClass().getName() + " VarKeys: " + getSchemaVarKeys());
-			if (getSchemaVarKeys().isEmpty()) {
-				var results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000).toList();
-				Assertions.assertEquals(0, results.size(), "Results count must be 0");
-
-				fillSomeKeys();
-
-				boolean reverse = false;
-				while (true) {
-					results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), reverse, RequestType.allInRange(), 1000).toList();
-
-					var expectedResults = getKVSequence().stream().skip(initIndex).limit(count).collect(Collectors.toCollection(ArrayList::new));
-					if (reverse) {
-						Collections.reverse(expectedResults);
-					}
-					assert expectedResults.size() == count;
-
-					Assertions.assertEquals(count, results.size(), "Results count is not as expected. Reverse = " + reverse);
-
-					for (int i = 0; i < expectedResults.size(); i++) {
-						var currentI = results.get(i);
-						var expectedI = expectedResults.get(i);
-						Assertions.assertEquals(expectedI, currentI, "Element at index " + i + " mismatch. Reverse = " + reverse);
-					}
-
-					if (!reverse) {
-						reverse = true;
-					} else {
-						break;
-					}
-				}
-			} else {
-				// For hashed keys, strictly verify full content via full scan
-				fillSomeKeys();
-				if (connection.method() != ConnectionMethod.THRIFT) {
-					var allResults = db.getRange(0, colId, null, null, false, RequestType.allInRange(), 10000).toList();
-					// Range scans on hashed keys are problematic or not fully implemented in some backends.
-					// We only verify if we got results, otherwise warn or skip.
-					if (!allResults.isEmpty()) {
-						var resultSet = new HashSet<>(allResults);
-						for (var kv : getKVSequence()) {
-							Assertions.assertTrue(resultSet.contains(kv), "Result set missing KV: " + kv);
-						}
-					}
-				}
-			}
-		}
-	}
-
-
-	@TestAllImplementations
-	void putBatchSST(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			@NotNull Publisher<@NotNull KVBatch> batchPublisher = new Publisher<KVBatch>() {
-				@Override
-				public void subscribe(Subscriber<? super KVBatch> subscriber) {
-					subscriber.onSubscribe(new Subscription() {
-						Iterator<KVBatch> it;
-						{
-							ArrayList<KVBatch> items = new ArrayList<>();
-							ArrayList<Keys> keys = new ArrayList<>();
-							ArrayList<Buf> values = new ArrayList<>();
-							for (int i = 0; i < 2; i++) {
-								var keyI = getKeyI(i);
-								var valueI = getValueI(i);
-								keys.add(keyI);
-								values.add(valueI);
-							}
-							items.add(new KVBatchRef(keys, values));
-							keys = new ArrayList<>();
-							values = new ArrayList<>();
-							for (int i = 2; i < 4; i++) {
-								var keyI = getKeyI(i);
-								var valueI = getValueI(i);
-								keys.add(keyI);
-								values.add(valueI);
-							}
-							items.add(new KVBatchRef(keys, values));
-							it = items.iterator();
-						}
-						@Override
-						public void request(long l) {
-							while (l-- > 0) {
-								if (it.hasNext()) {
-									subscriber.onNext(it.next());
-								} else {
-									subscriber.onComplete();
-									return;
-								}
-							}
-						}
-
-						@Override
-						public void cancel() {
-
-						}
-					});
-				}
-			};
-			if (this.getSchema().variableLengthKeysCount() <= 0) {
-				db.putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
-
-				if (getHasValues()) {
-					for (int i = 0; i < 4; i++) {
-						assertSegmentEquals(getValueI(i), db.get(0, colId, getKeyI(i), RequestType.current()));
-					}
-				}
-				for (int i = 0; i < 4; i++) {
-					Assertions.assertTrue(db.get(0, colId, getKeyI(i), RequestType.exists()));
-				}
-			} else {
-				Assertions.assertThrows(RocksDBException.class, () -> {
-					db.putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
-				});
-
-			}
-		}
-	}
-
-	@TestAllImplementations
-	void mergeSingleMergedValue(String name, ConnectionConfig connection) {
-		if (!getHasValues()) {
-			return;
-		}
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			var key = getKey1();
-			Buf merged;
-
-			merged = api.merge(0, colId, key, value1, RequestType.merged());
-			assertSegmentEquals(value1, merged);
-			assertSegmentEquals(value1, api.get(0, colId, key, RequestType.current()));
-
-			merged = api.merge(0, colId, key, value2, RequestType.merged());
-			var expected = mergeExpect(value1, value2);
-			assertSegmentEquals(expected, merged);
-			assertSegmentEquals(expected, api.get(0, colId, key, RequestType.current()));
-
-			Assertions.assertNull(api.merge(0, colId, key, value1, RequestType.none()));
-			var expected3 = mergeExpect(expected, value1);
-			assertSegmentEquals(expected3, api.get(0, colId, key, RequestType.current()));
-		}
-	}
-
-	@TestAllImplementations
-	void mergeMultiReturnsMerged(String name, ConnectionConfig connection) {
-		if (!getHasValues()) {
-			return;
-		}
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			var keys = List.of(getKey1(), getKey2());
-			var merged = api.mergeMulti(0, colId, keys, List.of(value1, value2), RequestType.merged());
-			Assertions.assertEquals(List.of(value1, value2), merged);
-
-			var more = List.of(bigValue, value1);
-			var merged2 = api.mergeMulti(0, colId, keys, more, RequestType.merged());
-			Assertions.assertEquals(2, merged2.size());
-			assertSegmentEquals(mergeExpect(value1, bigValue), merged2.getFirst());
-			assertSegmentEquals(mergeExpect(value2, value1), merged2.getLast());
-		}
-	}
-
-	@TestAllImplementations
-	void mergeBatchAppends(String name, ConnectionConfig connection) {
-		if (!getHasValues() || !getSchemaVarKeys().isEmpty()) {
-			return; // mergeBatch not supported for bucketed columns
-		}
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			var keys = List.of(getKey1(), getKey2());
-			var batch1 = new KVBatchRef(keys, List.of(value1, value2));
-			api.mergeBatch(colId, Flux.just(batch1), MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL);
-
-			var batch2 = new KVBatchRef(keys, List.of(bigValue, value1));
-			api.mergeBatch(colId, Flux.just(batch2), MergeBatchMode.MERGE_WRITE_BATCH);
-
-			assertSegmentEquals(mergeExpect(value1, bigValue), api.get(0, colId, getKey1(), RequestType.current()));
-			assertSegmentEquals(mergeExpect(value2, value1), api.get(0, colId, getKey2(), RequestType.current()));
-		}
-	}
-
-	@TestAllImplementations
-	void mergeBatchSstModes(String name, ConnectionConfig connection) {
-		// Requires value schema and non-bucketed column
-		if (!getHasValues()) {
-			return;
-		}
-		var nonBucketSchema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
-		createColumn(nonBucketSchema);
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			var keyA = new Keys(toBufSimple(21));
-			var keyB = new Keys(toBufSimple(22));
-			var batch1 = new KVBatchRef(List.of(keyA, keyB), List.of(toBufSimple(1), toBufSimple(2)));
-			api.mergeBatch(colId, Flux.just(batch1), MergeBatchMode.MERGE_SST_INGESTION);
-
-			var batch2 = new KVBatchRef(List.of(keyA, keyB), List.of(toBufSimple(3), toBufSimple(4)));
-			api.mergeBatch(colId, Flux.just(batch2), MergeBatchMode.MERGE_SST_INGEST_BEHIND);
-
-			assertSegmentEquals(mergeExpect(toBufSimple(1), toBufSimple(3)), api.get(0, colId, keyA, RequestType.current()));
-			assertSegmentEquals(mergeExpect(toBufSimple(2), toBufSimple(4)), api.get(0, colId, keyB, RequestType.current()));
-		}
-	}
-
-	@TestAllImplementations
-	void mergeBatchBucketed(String name, ConnectionConfig connection) {
-		if (!getHasValues() || getSchemaVarKeys().isEmpty()) {
-			return;
-		}
-		// Ensure bucketed column
-		createColumn(getSchema());
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			var keys = List.of(getKey1(), getCollidingKey1());
-			var batch1 = new KVBatchRef(keys, List.of(value1, value2));
-			api.mergeBatch(colId, Flux.just(batch1), MergeBatchMode.MERGE_WRITE_BATCH);
-
-			var batch2 = new KVBatchRef(keys, List.of(bigValue, value1));
-			api.mergeBatch(colId, Flux.just(batch2), MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL);
-
-			assertSegmentEquals(mergeExpect(value1, bigValue), api.get(0, colId, getKey1(), RequestType.current()));
-			assertSegmentEquals(mergeExpect(value2, value1), api.get(0, colId, getCollidingKey1(), RequestType.current()));
-		}
-	}
-
-	@TestAllImplementations
-	void mergeBucketedMergedValue(String name, ConnectionConfig connection) {
-		if (getSchemaVarKeys().isEmpty() || !getHasValues()) {
-			return;
-		}
-		createColumn(ColumnSchema.of(getSchemaFixedKeys(), getSchemaVarKeys(), getHasValues()));
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			var key = getKey1();
-			Buf merged = api.merge(0, colId, key, value1, RequestType.merged());
-			assertSegmentEquals(value1, merged);
-
-			merged = api.merge(0, colId, key, value2, RequestType.merged());
-			assertSegmentEquals(mergeExpect(value1, value2), merged);
-		}
-	}
-
-	private Buf mergeExpect(@Nullable Buf existing, Buf operand) {
-		var op = new MyStringAppendOperator();
-		byte[] res = op.merge(null, existing != null ? existing.asArray() : null, List.of(operand.asArray()));
-		return Buf.wrap(res);
-	}
-
-	@TestAllImplementations
-	void concurrentUpdate(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			if (getHasValues()) {
-				{
-					var forUpdate1 = db.get(0, colId, key1, RequestType.forUpdate());
-					try {
-						var forUpdate2 = db.get(0, colId, key1, RequestType.forUpdate());
-						try {
-							db.put(forUpdate1.updateId(), colId, key1, value1, RequestType.none());
-							Assertions.assertThrowsExactly(RocksDBRetryException.class, () -> db.put(forUpdate2.updateId(), colId, key1, value2, RequestType.none()));
-							// Retrying
-							var forUpdate3 = db.get(forUpdate2.updateId(), colId, key1, RequestType.forUpdate());
-							try {
-								assertSegmentEquals(value1, forUpdate3.previous());
-								db.put(forUpdate3.updateId(), colId, key1, value2, RequestType.none());
-							} catch (Throwable ex3) {
-								db.closeFailedUpdate(forUpdate3.updateId());
-								throw ex3;
-							}
-						} catch (Throwable ex2) {
-							db.closeFailedUpdate(forUpdate2.updateId());
-							throw ex2;
-						}
-					} catch (Throwable ex) {
-						throw ex;
-					}
-				}
-			}
-		}
-	}
-
-	public static void assertSegmentEquals(Buf expected, Buf input) {
-		if (!Utils.valueEquals(expected, input)) {
-			Assertions.fail(
-					"Memory segments are not equal! Expected: "
-							+ (expected != null ? Arrays.toString(Utils.toByteArray(expected)) : "null")
-							+ ", Input: " + (input != null ? Arrays.toString(Utils.toByteArray(input)) : "null"));
-		}
-	}
-
-
-	@TestAllImplementations
-	void getTestError(String name, ConnectionConfig connection) {
-		try (var testDB = new TestDB(db, connection)) {
-			var db = testDB.getAPI();
-
-			fillSomeKeys();
-			Assertions.assertThrows(Exception.class,
-					() -> Utils.valueEquals(value1, db.get(0, colId, null, RequestType.current()))
-			);
-			Assertions.assertThrows(Exception.class,
-					() -> Utils.valueEquals(value1, db.get(0, 18239, key1, RequestType.current()))
-			);
-			Assertions.assertThrows(Exception.class,
-					() -> Utils.valueEquals(value1, db.get(1, colId, key1, RequestType.current()))
-			);
-			Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(0, colId, key1, null)));
-		}
-	}
-
-	@TestAllImplementations
-	void testCdcStream(String name, ConnectionConfig connection) throws Exception {
-		// Skip for THRIFT if CDC is not implemented there (it's not implemented in Thrift yet based on previous steps)
-		// But connection config might cover Thrift.
-		// Let's assume only GRPC and EMBEDDED support CDC for now.
-		// The error "Method not found" or similar might occur.
-		if (connection.method() == ConnectionMethod.THRIFT) {
-			return;
-		}
-
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			
-			// 1. Create CDC subscription
-			// Use a unique ID to avoid conflicts if parallel tests run (though DBTest usually sequential per instance)
-			String subId = "sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
-			
-			// 2. Put data
-			fillSomeKeys();
-			
-			// 3. Consume via stream
-			// We expect 3 events from fillSomeKeys
-			int expectedEvents = 3;
-			
-   List<CDCEvent> events = api.cdcStream(subId,
+
+    protected enum ConnectionType {
+        SYNC,
+        ASYNC
+    }
+
+    public record ConnectionConfig(ConnectionType type, ConnectionMethod method) {
+
+        public String getName() {
+            return type.name() + ", " + method.name();
+        }
+    }
+
+    public static Stream<Arguments> allImplementations() {
+        return Stream
+                .of(ConnectionMethod.values())
+                .flatMap(method -> Stream.of(ConnectionType.values())
+                        .map(type -> new ConnectionConfig(type, method)))
+                .map(cfg -> Arguments.arguments(cfg.getName(), cfg));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("allImplementations")
+    @Retention(RetentionPolicy.RUNTIME)
+    private @interface TestAllImplementations {
+    }
+
+    @org.junit.jupiter.api.BeforeEach
+    void setUp() throws IOException {
+        if (System.getProperty("rockserver.core.print-config", null) == null) {
+            System.setProperty("rockserver.core.print-config", "false");
+        }
+        configFile = Files.createTempFile("dbtest-merge", ".conf");
+        Files.writeString(configFile, """
+                database: {
+                  global: {
+                    ingest-behind: true
+                    fallback-column-options: {
+                      merge-operator-class: "it.cavallium.rockserver.core.impl.MyStringAppendOperator"
+                    }
+                  }
+                }
+                """);
+        arena = Arena.ofShared();
+        db = new EmbeddedConnection(null, "test", configFile);
+        createStandardColumn();
+
+        bigValue = getBigValue();
+        key1 = getKey1();
+        collidingKey1 = getCollidingKey1();
+        key2 = getKey2();
+
+        value1 = getValue1();
+        value2 = getValue2();
+    }
+
+    protected Buf getBigValue() {
+        var bigValueArray = new byte[10_000];
+        ThreadLocalRandom.current().nextBytes(bigValueArray);
+        return Utils.toBuf(bigValueArray);
+    }
+
+    protected Keys getKey2() {
+        return new Keys(new Buf[]{
+                toBufSimple(3),
+                toBufSimple(4, 6),
+                toBufSimple(3),
+                toBufSimple(1, 2, 3),
+                toBufSimple(6, 7, 7)
+        });
+    }
+
+    protected Keys getCollidingKey1() {
+        return new Keys(new Buf[]{
+                toBufSimple(3),
+                toBufSimple(4, 6),
+                toBufSimple(3),
+                toBufSimple(1, 2, 3),
+                toBufSimple(6, 7, -48)
+        });
+    }
+
+    protected Keys getKey1() {
+        return new Keys(new Buf[]{
+                toBufSimple(3),
+                toBufSimple(4, 6),
+                toBufSimple(3),
+                toBufSimple(1, 2, 3),
+                toBufSimple(6, 7, 8)
+        });
+    }
+
+    /**
+     * @return a sorted sequence of k-v pairs
+     */
+    protected List<KV> getKVSequence() {
+        var result = new ArrayList<KV>();
+        for (int i = 0; i < Byte.MAX_VALUE; i++) {
+            result.add(new KV(getKeyI(i), getValueI(i)));
+        }
+        return result;
+    }
+
+    protected KV getKVSequenceFirst() {
+        return getKVSequence().getFirst();
+    }
+
+    protected KV getKVSequenceLast() {
+        return getKVSequence().getLast();
+    }
+
+    protected boolean getHasValues() {
+        return true;
+    }
+
+    protected Buf getValue1() {
+        return Utils.toBufSimple(0, 0, 3);
+    }
+
+    protected Buf getValue2() {
+        return Utils.toBufSimple(0, 0, 5);
+    }
+
+    private void createStandardColumn() {
+        createColumn(getSchema());
+    }
+
+    private void createColumn(ColumnSchema schema) {
+        if (colId != 0L) {
+            db.deleteColumn(colId);
+        }
+        colId = db.createColumn("column-test", schema);
+    }
+
+    void fillSomeKeys() {
+        Assertions.assertNull(db.put(0, colId, key1, value1, RequestType.none()));
+        Assertions.assertNull(db.put(0, colId, collidingKey1, value2, RequestType.none()));
+        Assertions.assertNull(db.put(0, colId, key2, bigValue, RequestType.none()));
+        for (int i = 0; i < Byte.MAX_VALUE; i++) {
+            var keyI = getKeyI(i);
+            var valueI = getValueI(i);
+            Assertions.assertNull(db.put(0, colId, keyI, valueI, RequestType.none()));
+        }
+    }
+
+    protected Keys getKeyI(int i) {
+        return new Keys(new Buf[]{
+                toBufSimple(3),
+                toBufSimple(4, 6),
+                toBufSimple(3),
+                toBufSimple(1, 2, 3),
+                toBufSimple(8, 2, 5, 1, 7, i)
+        });
+    }
+
+    protected Keys getNotFoundKeyI(int i) {
+        return new Keys(new Buf[]{
+                toBufSimple(3),
+                toBufSimple(4, 6),
+                toBufSimple(3),
+                toBufSimple(1, 2, 3),
+                toBufSimple(8, 2, 5, 1, 0, i)
+        });
+    }
+
+    protected Buf getValueI(int i) {
+        return toBufSimple(i, i, i, i, i);
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void tearDown() throws IOException {
+        db.deleteColumn(colId);
+        db.close();
+        arena.close();
+        Files.deleteIfExists(configFile);
+    }
+
+    @SuppressWarnings("DataFlowIssue")
+    @TestAllImplementations
+    void testCdcResolvedValues(String name, ConnectionConfig connection) throws Exception {
+        // Resolved-values CDC currently supported on embedded API path in this change.
+        if (connection.method() == ConnectionMethod.THRIFT) {
+            return;
+        }
+
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+
+            String subId = "resolved-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+            long startSeq = api.cdcCreate(subId, null, null, true);
+
+            // Use a dedicated column with merge operator enabled via fallback config
+            long mergeColId = api.createColumn("resolved-col-" + name,
+                    ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+
+            var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
+            Buf initial = Buf.wrap("Initial".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            Buf delta = Buf.wrap("-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+            api.put(0, mergeColId, key, initial, RequestType.none());
+            api.merge(0, mergeColId, key, delta, RequestType.none());
+
+            // Expect 2 events; in resolved mode, second (MERGE) must carry fully merged value
+            var events = api.cdcStream(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    startSeq,
+                                    10,
+                                    Duration.ofMillis(10),
+                                    it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE
+                            ),
+                            null)
+                    .take(2)
+                    .collectList()
+                    .block(Duration.ofSeconds(5));
+
+            Assertions.assertNotNull(events);
+            Assertions.assertEquals(2, events.size());
+            CDCEvent ev1 = events.get(0);
+            CDCEvent ev2 = events.get(1);
+
+            // With emitLatestValues=true, all events are resolved to the current value (Initial,-Patched)
+            // and emitted as PUT operations (replacing MERGE).
+            Buf expected = Buf.wrap("Initial,-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+            Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
+            assertSegmentEquals(expected, ev1.value());
+
+            Assertions.assertEquals(CDCEvent.Op.PUT, ev2.op());
+            assertSegmentEquals(expected, ev2.value());
+        }
+    }
+
+    @TestAllImplementations
+    void putTestErrors(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            var key = getKey1();
+
+            if (!getHasValues()) {
+                Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, toBufSimple(123), RequestType.delta()));
+            } else {
+                Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, emptyBuf(), RequestType.delta()));
+                Assertions.assertThrows(RocksDBException.class, () -> {
+                    try {
+                        db.put(0, colId, key, null, RequestType.delta());
+                    } catch (IllegalArgumentException ex) {
+                        throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
+                    }
+                });
+            }
+
+            Assertions.assertThrows(RocksDBException.class, () -> {
+                try {
+                    db.put(0, colId, null, value1, RequestType.delta());
+                } catch (IllegalArgumentException ex) {
+                    throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
+                }
+            });
+            Assertions.assertThrows(RocksDBException.class, () -> {
+                try {
+                    db.put(0, colId, null, null, RequestType.delta());
+                } catch (IllegalArgumentException ex) {
+                    throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
+                }
+            });
+            Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, value1, null));
+            Assertions.assertThrows(RocksDBException.class, () -> db.put(1, colId, key, value1, RequestType.delta()));
+            Assertions.assertThrows(RocksDBException.class, () -> db.put(0, 21203, key, value1, RequestType.delta()));
+        }
+    }
+
+    @TestAllImplementations
+    void putSameBucketSameKey(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            var key = getKey1();
+            var value1 = getValue1();
+            var value2 = getValue2();
+
+            Delta<Buf> delta;
+
+            delta = db.put(0, colId, key, value1, RequestType.delta());
+            Assertions.assertNull(delta.previous());
+            assertSegmentEquals(value1, delta.current());
+
+            delta = db.put(0, colId, key, value2, RequestType.delta());
+            assertSegmentEquals(value1, delta.previous());
+            assertSegmentEquals(value2, delta.current());
+        }
+    }
+
+    @TestAllImplementations
+    void putSameBucketDifferentKey(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            if (getSchemaVarKeys().isEmpty()) {
+                return;
+            }
+            createColumn(ColumnSchema.of(getSchemaFixedKeys(), ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.ALLSAME8), getHasValues()));
+
+            var key1 = getKey1();
+            var key2 = getCollidingKey1();
+
+            var value1 = getValue1();
+            var value2 = getValue2();
+
+            Delta<Buf> delta;
+
+            Assertions.assertFalse(db.put(0, colId, getKeyI(3), value2, RequestType.previousPresence()));
+            Assertions.assertFalse(db.put(0, colId, getKeyI(4), value2, RequestType.previousPresence()));
+
+
+            delta = db.put(0, colId, key1, value1, RequestType.delta());
+            Assertions.assertNull(delta.previous());
+            assertSegmentEquals(value1, delta.current());
+
+            delta = db.put(0, colId, key2, value2, RequestType.delta());
+            Assertions.assertNull(delta.previous());
+            assertSegmentEquals(value2, delta.current());
+
+            delta = db.put(0, colId, key2, value1, RequestType.delta());
+            assertSegmentEquals(value2, delta.previous());
+            assertSegmentEquals(value1, delta.current());
+
+            delta = db.put(0, colId, key2, value1, RequestType.delta());
+            assertSegmentEquals(value1, delta.previous());
+            assertSegmentEquals(value1, delta.current());
+
+
+            Assertions.assertTrue(db.put(0, colId, key1, value2, RequestType.previousPresence()));
+            Assertions.assertTrue(db.put(0, colId, key2, value2, RequestType.previousPresence()));
+
+
+            delta = db.put(0, colId, key1, value1, RequestType.delta());
+            assertSegmentEquals(value2, delta.previous());
+            assertSegmentEquals(value1, delta.current());
+
+            delta = db.put(0, colId, key2, value1, RequestType.delta());
+            assertSegmentEquals(value2, delta.previous());
+            assertSegmentEquals(value1, delta.current());
+
+
+            Assertions.assertNull(db.put(0, colId, key1, value2, RequestType.none()));
+            Assertions.assertNull(db.put(0, colId, key2, value2, RequestType.none()));
+
+
+            assertSegmentEquals(value2, db.put(0, colId, key1, value1, RequestType.previous()));
+            assertSegmentEquals(value2, db.put(0, colId, key2, value1, RequestType.previous()));
+
+            assertSegmentEquals(value1, db.put(0, colId, key1, value1, RequestType.previous()));
+            assertSegmentEquals(value1, db.put(0, colId, key2, value1, RequestType.previous()));
+
+            if (!Utils.valueEquals(value1, value2)) {
+                Assertions.assertTrue(db.put(0, colId, key1, value2, RequestType.changed()));
+                Assertions.assertTrue(db.put(0, colId, key2, value2, RequestType.changed()));
+            }
+
+            Assertions.assertFalse(db.put(0, colId, key1, value2, RequestType.changed()));
+            Assertions.assertFalse(db.put(0, colId, key2, value2, RequestType.changed()));
+
+
+            assertSegmentEquals(value2, db.put(0, colId, key1, value1, RequestType.previous()));
+            assertSegmentEquals(value2, db.put(0, colId, key2, value1, RequestType.previous()));
+        }
+    }
+
+    protected ColumnSchema getSchema() {
+        return ColumnSchema.of(getSchemaFixedKeys(), getSchemaVarKeys(), getHasValues());
+    }
+
+    protected IntList getSchemaFixedKeys() {
+        return IntList.of(1, 2, 1);
+    }
+
+    protected ObjectList<ColumnHashType> getSchemaVarKeys() {
+        return ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.XXHASH8);
+    }
+
+    /**
+     * Some keys have same bucket, some not
+     */
+    @TestAllImplementations
+    void putMixedBucketMixedKey(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            var key1 = getKey1();
+            var collidingKey1 = getCollidingKey1();
+            var key2 = getKey2();
+
+            var value1 = getValue1();
+            var value2 = getValue2();
+
+            var delta = db.put(0, colId, key1, value1, RequestType.delta());
+            Assertions.assertNull(delta.previous());
+            assertSegmentEquals(value1, delta.current());
+
+            delta = db.put(0, colId, collidingKey1, value2, RequestType.delta());
+            Assertions.assertNull(delta.previous());
+            assertSegmentEquals(value2, delta.current());
+
+            delta = db.put(0, colId, collidingKey1, value1, RequestType.delta());
+            assertSegmentEquals(value2, delta.previous());
+            assertSegmentEquals(value1, delta.current());
+
+            delta = db.put(0, colId, key2, value1, RequestType.delta());
+            Assertions.assertNull(delta.previous());
+            assertSegmentEquals(value1, delta.current());
+
+            delta = db.put(0, colId, key2, value2, RequestType.delta());
+            assertSegmentEquals(value1, delta.previous());
+            assertSegmentEquals(value2, delta.current());
+        }
+    }
+
+    @TestAllImplementations
+    void get(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            if (getHasValues()) {
+                Assertions.assertNull(db.get(0, colId, key1, RequestType.current()));
+                Assertions.assertNull(db.get(0, colId, collidingKey1, RequestType.current()));
+                Assertions.assertNull(db.get(0, colId, key2, RequestType.current()));
+            }
+            Assertions.assertFalse(db.get(0, colId, key1, RequestType.exists()));
+            Assertions.assertFalse(db.get(0, colId, collidingKey1, RequestType.exists()));
+            Assertions.assertFalse(db.get(0, colId, key2, RequestType.exists()));
+
+            fillSomeKeys();
+
+            if (getHasValues()) {
+                assertSegmentEquals(value1, db.get(0, colId, key1, RequestType.current()));
+                Assertions.assertNull(db.get(0, colId, getNotFoundKeyI(0), RequestType.current()));
+                assertSegmentEquals(value2, db.get(0, colId, collidingKey1, RequestType.current()));
+                assertSegmentEquals(bigValue, db.get(0, colId, key2, RequestType.current()));
+            }
+
+            Assertions.assertTrue(db.get(0, colId, key1, RequestType.exists()));
+            Assertions.assertFalse(db.get(0, colId, getNotFoundKeyI(0), RequestType.exists()));
+            Assertions.assertTrue(db.get(0, colId, collidingKey1, RequestType.exists()));
+            Assertions.assertTrue(db.get(0, colId, key2, RequestType.exists()));
+        }
+    }
+
+    @TestAllImplementations
+    void update(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            if (getHasValues()) {
+                var forUpdate = db.get(0, colId, key1, RequestType.forUpdate());
+                Assertions.assertNull(forUpdate.previous());
+                Assertions.assertTrue(forUpdate.updateId() != 0);
+                db.put(forUpdate.updateId(), colId, key1, value1, RequestType.none());
+
+                Assertions.assertThrows(Exception.class, () -> db.put(forUpdate.updateId(), colId, key1, value2, RequestType.none()));
+            }
+        }
+    }
+
+    @TestAllImplementations
+    void reduceRangeFirstAndLast(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            var firstKey = getKVSequenceFirst().keys();
+            var lastKey = getKVSequenceLast().keys();
+            var prevLastKV = getKVSequence().get(getKVSequence().size() - 2);
+            if (getSchemaVarKeys().isEmpty()) {
+                FirstAndLast<KV> firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+                Assertions.assertNull(firstAndLast.first(), "First should be empty because the db is empty");
+                Assertions.assertNull(firstAndLast.last(), "Last should be empty because the db is empty");
+
+                fillSomeKeys();
+
+                firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+                Assertions.assertEquals(getKVSequenceFirst(), firstAndLast.first(), "First key mismatch");
+                Assertions.assertEquals(prevLastKV, firstAndLast.last(), "Last key mismatch");
+
+                firstAndLast = db.reduceRange(0, colId, firstKey, firstKey, false, RequestType.firstAndLast(), 1000);
+                Assertions.assertNull(firstAndLast.first(), "First should be empty because the range is empty");
+                Assertions.assertNull(firstAndLast.last(), "Last should be empty because the range is empty");
+            } else {
+                db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+            }
+        }
+    }
+
+    @TestAllImplementations
+    void getRangeAll(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            int initIndex = 1;
+            int count = 5;
+
+            var rangeInitKey = getKVSequence().get(initIndex);
+            var rangeEndKeyExcl = getKVSequence().get(initIndex + count);
+            if (getSchemaVarKeys().isEmpty()) {
+                var results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000).toList();
+                Assertions.assertEquals(0, results.size(), "Results count must be 0");
+
+                fillSomeKeys();
+
+                boolean reverse = false;
+                while (true) {
+                    results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), reverse, RequestType.allInRange(), 1000).toList();
+
+                    var expectedResults = getKVSequence().stream().skip(initIndex).limit(count).collect(Collectors.toCollection(ArrayList::new));
+                    if (reverse) {
+                        Collections.reverse(expectedResults);
+                    }
+                    Assertions.assertEquals(count, expectedResults.size(), "Expected range fixture size must match requested count");
+
+                    Assertions.assertEquals(count, results.size(), "Results count is not as expected. Reverse = " + reverse);
+
+                    for (int i = 0; i < expectedResults.size(); i++) {
+                        var currentI = results.get(i);
+                        var expectedI = expectedResults.get(i);
+                        Assertions.assertEquals(expectedI, currentI, "Element at index " + i + " mismatch. Reverse = " + reverse);
+                    }
+
+                    if (!reverse) {
+                        reverse = true;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                // For hashed keys, strictly verify full content via full scan
+                fillSomeKeys();
+                if (connection.method() != ConnectionMethod.THRIFT) {
+                    var allResults = db.getRange(0, colId, null, null, false, RequestType.allInRange(), 10000).toList();
+                    // Range scans on hashed keys are problematic or not fully implemented in some backends.
+                    // We only verify if we got results, otherwise warn or skip.
+                    if (!allResults.isEmpty()) {
+                        var resultSet = new HashSet<>(allResults);
+                        for (var kv : getKVSequence()) {
+                            Assertions.assertTrue(resultSet.contains(kv), "Result set missing KV: " + kv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    @TestAllImplementations
+    void putBatchSST(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            @NotNull Publisher<@NotNull KVBatch> batchPublisher = new Publisher<KVBatch>() {
+                @Override
+                public void subscribe(Subscriber<? super KVBatch> subscriber) {
+                    subscriber.onSubscribe(new Subscription() {
+                        Iterator<KVBatch> it;
+
+                        {
+                            ArrayList<KVBatch> items = new ArrayList<>();
+                            ArrayList<Keys> keys = new ArrayList<>();
+                            ArrayList<Buf> values = new ArrayList<>();
+                            for (int i = 0; i < 2; i++) {
+                                var keyI = getKeyI(i);
+                                var valueI = getValueI(i);
+                                keys.add(keyI);
+                                values.add(valueI);
+                            }
+                            items.add(new KVBatchRef(keys, values));
+                            keys = new ArrayList<>();
+                            values = new ArrayList<>();
+                            for (int i = 2; i < 4; i++) {
+                                var keyI = getKeyI(i);
+                                var valueI = getValueI(i);
+                                keys.add(keyI);
+                                values.add(valueI);
+                            }
+                            items.add(new KVBatchRef(keys, values));
+                            it = items.iterator();
+                        }
+
+                        @Override
+                        public void request(long l) {
+                            while (l-- > 0) {
+                                if (it.hasNext()) {
+                                    subscriber.onNext(it.next());
+                                } else {
+                                    subscriber.onComplete();
+                                    return;
+                                }
+                            }
+                        }
+
+                        @Override
+                        public void cancel() {
+
+                        }
+                    });
+                }
+            };
+            if (this.getSchema().variableLengthKeysCount() <= 0) {
+                db.putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
+
+                if (getHasValues()) {
+                    for (int i = 0; i < 4; i++) {
+                        assertSegmentEquals(getValueI(i), db.get(0, colId, getKeyI(i), RequestType.current()));
+                    }
+                }
+                for (int i = 0; i < 4; i++) {
+                    Assertions.assertTrue(db.get(0, colId, getKeyI(i), RequestType.exists()));
+                }
+            } else {
+                Assertions.assertThrows(RocksDBException.class, () -> {
+                    db.putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
+                });
+
+            }
+        }
+    }
+
+    @TestAllImplementations
+    void mergeSingleMergedValue(String name, ConnectionConfig connection) {
+        if (!getHasValues()) {
+            return;
+        }
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            var key = getKey1();
+            Buf merged;
+
+            merged = api.merge(0, colId, key, value1, RequestType.merged());
+            assertSegmentEquals(value1, merged);
+            assertSegmentEquals(value1, api.get(0, colId, key, RequestType.current()));
+
+            merged = api.merge(0, colId, key, value2, RequestType.merged());
+            var expected = mergeExpect(value1, value2);
+            assertSegmentEquals(expected, merged);
+            assertSegmentEquals(expected, api.get(0, colId, key, RequestType.current()));
+
+            Assertions.assertNull(api.merge(0, colId, key, value1, RequestType.none()));
+            var expected3 = mergeExpect(expected, value1);
+            assertSegmentEquals(expected3, api.get(0, colId, key, RequestType.current()));
+        }
+    }
+
+    @TestAllImplementations
+    void mergeMultiReturnsMerged(String name, ConnectionConfig connection) {
+        if (!getHasValues()) {
+            return;
+        }
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            var keys = List.of(getKey1(), getKey2());
+            var merged = api.mergeMulti(0, colId, keys, List.of(value1, value2), RequestType.merged());
+            Assertions.assertEquals(List.of(value1, value2), merged);
+
+            var more = List.of(bigValue, value1);
+            var merged2 = api.mergeMulti(0, colId, keys, more, RequestType.merged());
+            Assertions.assertEquals(2, merged2.size());
+            assertSegmentEquals(mergeExpect(value1, bigValue), merged2.getFirst());
+            assertSegmentEquals(mergeExpect(value2, value1), merged2.getLast());
+        }
+    }
+
+    @TestAllImplementations
+    void mergeBatchAppends(String name, ConnectionConfig connection) {
+        if (!getHasValues() || !getSchemaVarKeys().isEmpty()) {
+            return; // mergeBatch not supported for bucketed columns
+        }
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            var keys = List.of(getKey1(), getKey2());
+            var batch1 = new KVBatchRef(keys, List.of(value1, value2));
+            api.mergeBatch(colId, Flux.just(batch1), MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL);
+
+            var batch2 = new KVBatchRef(keys, List.of(bigValue, value1));
+            api.mergeBatch(colId, Flux.just(batch2), MergeBatchMode.MERGE_WRITE_BATCH);
+
+            assertSegmentEquals(mergeExpect(value1, bigValue), api.get(0, colId, getKey1(), RequestType.current()));
+            assertSegmentEquals(mergeExpect(value2, value1), api.get(0, colId, getKey2(), RequestType.current()));
+        }
+    }
+
+    @TestAllImplementations
+    void mergeBatchSstModes(String name, ConnectionConfig connection) {
+        // Requires value schema and non-bucketed column
+        if (!getHasValues()) {
+            return;
+        }
+        var nonBucketSchema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
+        createColumn(nonBucketSchema);
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            var keyA = new Keys(toBufSimple(21));
+            var keyB = new Keys(toBufSimple(22));
+            var batch1 = new KVBatchRef(List.of(keyA, keyB), List.of(toBufSimple(1), toBufSimple(2)));
+            api.mergeBatch(colId, Flux.just(batch1), MergeBatchMode.MERGE_SST_INGESTION);
+
+            var batch2 = new KVBatchRef(List.of(keyA, keyB), List.of(toBufSimple(3), toBufSimple(4)));
+            api.mergeBatch(colId, Flux.just(batch2), MergeBatchMode.MERGE_SST_INGEST_BEHIND);
+
+            assertSegmentEquals(mergeExpect(toBufSimple(1), toBufSimple(3)), api.get(0, colId, keyA, RequestType.current()));
+            assertSegmentEquals(mergeExpect(toBufSimple(2), toBufSimple(4)), api.get(0, colId, keyB, RequestType.current()));
+        }
+    }
+
+    @TestAllImplementations
+    void mergeBatchBucketed(String name, ConnectionConfig connection) {
+        if (!getHasValues() || getSchemaVarKeys().isEmpty()) {
+            return;
+        }
+        // Ensure bucketed column
+        createColumn(getSchema());
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            var keys = List.of(getKey1(), getCollidingKey1());
+            var batch1 = new KVBatchRef(keys, List.of(value1, value2));
+            api.mergeBatch(colId, Flux.just(batch1), MergeBatchMode.MERGE_WRITE_BATCH);
+
+            var batch2 = new KVBatchRef(keys, List.of(bigValue, value1));
+            api.mergeBatch(colId, Flux.just(batch2), MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL);
+
+            assertSegmentEquals(mergeExpect(value1, bigValue), api.get(0, colId, getKey1(), RequestType.current()));
+            assertSegmentEquals(mergeExpect(value2, value1), api.get(0, colId, getCollidingKey1(), RequestType.current()));
+        }
+    }
+
+    @TestAllImplementations
+    void mergeBucketedMergedValue(String name, ConnectionConfig connection) {
+        if (getSchemaVarKeys().isEmpty() || !getHasValues()) {
+            return;
+        }
+        createColumn(ColumnSchema.of(getSchemaFixedKeys(), getSchemaVarKeys(), getHasValues()));
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            var key = getKey1();
+            Buf merged = api.merge(0, colId, key, value1, RequestType.merged());
+            assertSegmentEquals(value1, merged);
+
+            merged = api.merge(0, colId, key, value2, RequestType.merged());
+            assertSegmentEquals(mergeExpect(value1, value2), merged);
+        }
+    }
+
+    private Buf mergeExpect(@Nullable Buf existing, Buf operand) {
+        try (var op = new MyStringAppendOperator()) {
+            byte[] res = op.merge(null, existing != null ? existing.asArray() : null, List.of(operand.asArray()));
+            return Buf.wrap(res);
+        }
+    }
+
+    @TestAllImplementations
+    void concurrentUpdate(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            if (getHasValues()) {
+                {
+                    var forUpdate1 = db.get(0, colId, key1, RequestType.forUpdate());
+                    var forUpdate2 = db.get(0, colId, key1, RequestType.forUpdate());
+                    try {
+                        db.put(forUpdate1.updateId(), colId, key1, value1, RequestType.none());
+                        Assertions.assertThrowsExactly(RocksDBRetryException.class, () -> db.put(forUpdate2.updateId(), colId, key1, value2, RequestType.none()));
+                        // Retrying
+                        var forUpdate3 = db.get(forUpdate2.updateId(), colId, key1, RequestType.forUpdate());
+                        try {
+                            assertSegmentEquals(value1, forUpdate3.previous());
+                            db.put(forUpdate3.updateId(), colId, key1, value2, RequestType.none());
+                        } catch (Throwable ex3) {
+                            db.closeFailedUpdate(forUpdate3.updateId());
+                            throw ex3;
+                        }
+                    } catch (Throwable ex2) {
+                        db.closeFailedUpdate(forUpdate2.updateId());
+                        throw ex2;
+                    }
+                }
+            }
+        }
+    }
+
+    public static void assertSegmentEquals(Buf expected, Buf input) {
+        if (!Utils.valueEquals(expected, input)) {
+            Assertions.fail(
+                    "Memory segments are not equal! Expected: "
+                            + (expected != null ? Arrays.toString(Utils.toByteArray(expected)) : "null")
+                            + ", Input: " + (input != null ? Arrays.toString(Utils.toByteArray(input)) : "null"));
+        }
+    }
+
+    @TestAllImplementations
+    void iteratorSubsequentReadsAndSeeks(String name, ConnectionConfig connection) {
+        if (connection.method() == ConnectionMethod.THRIFT) {
+            return;
+        }
+
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            long fixedColId = api.createColumn("iterator-fixed-" + name,
+                    ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+            try {
+                for (int i = 0; i < 6; i++) {
+                    api.put(0, fixedColId, fixedKey(i), toBufSimple(i), RequestType.none());
+                }
+
+                long iteratorId = api.openIterator(0, fixedColId, new Keys(new Buf[0]), null, false, 30_000);
+                try {
+                    List<Buf> values = api.subsequent(iteratorId, 1, 2, RequestType.multi());
+                    Assertions.assertEquals(2, values.size());
+                    assertSegmentEquals(toBufSimple(1), values.get(0));
+                    assertSegmentEquals(toBufSimple(2), values.get(1));
+
+                    api.seekTo(iteratorId, fixedKey(3));
+                    values = api.subsequent(iteratorId, 0, 2, RequestType.multi());
+                    Assertions.assertEquals(2, values.size());
+                    assertSegmentEquals(toBufSimple(3), values.get(0));
+                    assertSegmentEquals(toBufSimple(4), values.get(1));
+
+                    Assertions.assertTrue(api.subsequent(iteratorId, 0, 10, RequestType.exists()));
+                    Assertions.assertFalse(api.subsequent(iteratorId, 0, 1, RequestType.exists()));
+                } finally {
+                    api.closeIterator(iteratorId);
+                }
+
+                long reverseIteratorId = api.openIterator(0, fixedColId, new Keys(new Buf[0]), null, true, 30_000);
+                try {
+                    List<Buf> values = api.subsequent(reverseIteratorId, 0, 2, RequestType.multi());
+                    Assertions.assertEquals(2, values.size());
+                    assertSegmentEquals(toBufSimple(5), values.get(0));
+                    assertSegmentEquals(toBufSimple(4), values.get(1));
+                } finally {
+                    api.closeIterator(reverseIteratorId);
+                }
+            } finally {
+                api.deleteColumn(fixedColId);
+            }
+        }
+    }
+
+    private static Keys fixedKey(int value) {
+        return new Keys(new Buf[]{toBufSimple(0, 0, 0, value)});
+    }
+
+
+    @TestAllImplementations
+    void getTestError(String name, ConnectionConfig connection) {
+        try (var testDB = new TestDB(db, connection)) {
+            var db = testDB.getAPI();
+
+            fillSomeKeys();
+            Assertions.assertThrows(Exception.class,
+                    () -> Utils.valueEquals(value1, db.get(0, colId, null, RequestType.current()))
+            );
+            Assertions.assertThrows(Exception.class,
+                    () -> Utils.valueEquals(value1, db.get(0, 18239, key1, RequestType.current()))
+            );
+            Assertions.assertThrows(Exception.class,
+                    () -> Utils.valueEquals(value1, db.get(1, colId, key1, RequestType.current()))
+            );
+            Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(0, colId, key1, null)));
+        }
+    }
+
+    @TestAllImplementations
+    void testCdcStream(String name, ConnectionConfig connection) throws Exception {
+        // The legacy Thrift transport does not expose CDC streams; only gRPC and embedded connections cover this path.
+        if (connection.method() == ConnectionMethod.THRIFT) {
+            return;
+        }
+
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+
+            // 1. Create CDC subscription
+            // Use a unique ID to avoid conflicts if parallel tests run (though DBTest usually sequential per instance)
+            String subId = "sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+            long startSeq = api.cdcCreate(subId, null, null);
+
+            // 2. Put data
+            fillSomeKeys();
+
+            // 3. Consume via stream
+            // We expect 3 events from fillSomeKeys
+            int expectedEvents = 3;
+
+            List<CDCEvent> events = api.cdcStream(subId,
                             new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
                                     startSeq,
                                     10,
@@ -910,52 +959,52 @@ database: {
                     .take(expectedEvents)
                     .collectList()
                     .block(Duration.ofSeconds(10));
-			
-			Assertions.assertNotNull(events);
-			Assertions.assertEquals(expectedEvents, events.size());
-			
-			// Verify sequence strictly increasing
-			long lastSeq = startSeq - 1;
-			for (CDCEvent ev : events) {
-				Assertions.assertTrue(ev.seq() > lastSeq, "Sequence should increase: " + ev.seq() + " > " + lastSeq);
-				lastSeq = ev.seq();
-				Assertions.assertEquals(colId, ev.columnId());
-				Assertions.assertEquals(CDCEvent.Op.PUT, ev.op());
-			}
-			
-			// 4. Commit last
-			api.cdcCommit(subId, lastSeq);
-		}
-	}
 
-	@TestAllImplementations
-	void testCdcWithMergeAndReactiveClient(String name, ConnectionConfig connection) throws Exception {
-		if (connection.method() == ConnectionMethod.THRIFT) {
-			return;
-		}
+            Assertions.assertNotNull(events);
+            Assertions.assertEquals(expectedEvents, events.size());
 
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			// Use fallback options which include MyStringAppendOperator
-			long mergeColId = api.createColumn("messages-merge-" + name,
-					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+            // Verify sequence strictly increasing
+            long lastSeq = startSeq - 1;
+            for (CDCEvent ev : events) {
+                Assertions.assertTrue(ev.seq() > lastSeq, "Sequence should increase: " + ev.seq() + " > " + lastSeq);
+                lastSeq = ev.seq();
+                Assertions.assertEquals(colId, ev.columnId());
+                Assertions.assertEquals(CDCEvent.Op.PUT, ev.op());
+            }
 
-			String subId = "merge-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
+            // 4. Commit last
+            api.cdcCommit(subId, lastSeq);
+        }
+    }
 
-			var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
-			var val1 = Buf.wrap("Initial".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    @TestAllImplementations
+    void testCdcWithMergeAndReactiveClient(String name, ConnectionConfig connection) throws Exception {
+        if (connection.method() == ConnectionMethod.THRIFT) {
+            return;
+        }
 
-			// 1. Initial Put
-			api.putAsync(0, mergeColId, key1, val1, RequestType.none()).join();
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            // Use fallback options which include MyStringAppendOperator
+            long mergeColId = api.createColumn("messages-merge-" + name,
+                    ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 
-			// 2. Merge (Patch)
-			var patchVal = Buf.wrap("-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
-			api.mergeAsync(0, mergeColId, key1, patchVal, RequestType.none()).join();
+            String subId = "merge-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+            long startSeq = api.cdcCreate(subId, null, null);
 
-			// 3. Verify CDC Stream
-			// We expect: PUT(Initial) -> MERGE(-Patched)
-   List<CDCEvent> events = api.cdcStream(subId,
+            var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
+            var val1 = Buf.wrap("Initial".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+            // 1. Initial Put
+            api.putAsync(0, mergeColId, key1, val1, RequestType.none()).join();
+
+            // 2. Merge (Patch)
+            var patchVal = Buf.wrap("-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            api.mergeAsync(0, mergeColId, key1, patchVal, RequestType.none()).join();
+
+            // 3. Verify CDC Stream
+            // We expect: PUT(Initial) -> MERGE(-Patched)
+            List<CDCEvent> events = api.cdcStream(subId,
                             new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
                                     startSeq,
                                     100,
@@ -967,59 +1016,59 @@ database: {
                     .collectList()
                     .block(Duration.ofSeconds(5));
 
-			Assertions.assertNotNull(events);
-			Assertions.assertEquals(2, events.size());
+            Assertions.assertNotNull(events);
+            Assertions.assertEquals(2, events.size());
 
-			// Event 1: PUT
-			CDCEvent ev1 = events.get(0);
-			Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
-			assertSegmentEquals(val1, ev1.value());
+            // Event 1: PUT
+            CDCEvent ev1 = events.get(0);
+            Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
+            assertSegmentEquals(val1, ev1.value());
 
-			// Event 2: MERGE
-			CDCEvent ev2 = events.get(1);
-			Assertions.assertEquals(CDCEvent.Op.MERGE, ev2.op());
-			// In CDC MERGE event, value is the operand (patch)
-			assertSegmentEquals(patchVal, ev2.value());
+            // Event 2: MERGE
+            CDCEvent ev2 = events.get(1);
+            Assertions.assertEquals(CDCEvent.Op.MERGE, ev2.op());
+            // In CDC MERGE event, value is the operand (patch)
+            assertSegmentEquals(patchVal, ev2.value());
 
-			// 4. Verify Final State in DB
-			Buf current = api.get(0, mergeColId, key1, RequestType.current());
-			// MyStringAppendOperator appends with a comma separator
-			Buf expected = Buf.wrap("Initial,-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
-			assertSegmentEquals(expected, current);
+            // 4. Verify Final State in DB
+            Buf current = api.get(0, mergeColId, key1, RequestType.current());
+            // MyStringAppendOperator appends with a comma separator
+            Buf expected = Buf.wrap("Initial,-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            assertSegmentEquals(expected, current);
 
-			// 5. Commit
-			api.cdcCommit(subId, ev2.seq());
-		}
-	}
+            // 5. Commit
+            api.cdcCommit(subId, ev2.seq());
+        }
+    }
 
-	@TestAllImplementations
-	void testCdcRobustness(String name, ConnectionConfig connection) throws Exception {
-		if (connection.method() == ConnectionMethod.THRIFT) {
-			return;
-		}
+    @TestAllImplementations
+    void testCdcRobustness(String name, ConnectionConfig connection) throws Exception {
+        if (connection.method() == ConnectionMethod.THRIFT) {
+            return;
+        }
 
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			String subId = "robust-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            String subId = "robust-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+            long startSeq = api.cdcCreate(subId, null, null);
 
-			int countBatch1 = 50;
-			int countBatch2 = 50;
-			var kvSequence = getKVSequence();
-			
-			// 1. Put batch 1
-			for (int i = 0; i < countBatch1; i++) {
-				var kv = kvSequence.get(i);
-				api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
-			}
+            int countBatch1 = 50;
+            int countBatch2 = 50;
+            var kvSequence = getKVSequence();
 
-			// 2. Consume with stream (backpressure check via limit/iterator)
-			// Use small internal batch size to force multiple fetches
-			long cdcBatchSize = 10;
+            // 1. Put batch 1
+            for (int i = 0; i < countBatch1; i++) {
+                var kv = kvSequence.get(i);
+                api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
+            }
 
-			// Consume first 30 events
-			int consumeCount1 = 30;
-   List<CDCEvent> received1 = api.cdcStream(subId,
+            // 2. Consume with stream (backpressure check via limit/iterator)
+            // Use small internal batch size to force multiple fetches
+            long cdcBatchSize = 10;
+
+            // Consume first 30 events
+            int consumeCount1 = 30;
+            List<CDCEvent> received1 = api.cdcStream(subId,
                             new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
                                     null,
                                     cdcBatchSize,
@@ -1031,25 +1080,25 @@ database: {
                     .collectList()
                     .block(Duration.ofSeconds(10));
 
-			Assertions.assertNotNull(received1);
-			Assertions.assertEquals(consumeCount1, received1.size());
-			Assertions.assertTrue(received1.get(0).seq() >= startSeq, "First event seq " + received1.get(0).seq() + " should be >= startSeq " + startSeq);
-			long lastSeq = received1.get(received1.size() - 1).seq();
+            Assertions.assertNotNull(received1);
+            Assertions.assertEquals(consumeCount1, received1.size());
+            Assertions.assertTrue(received1.get(0).seq() >= startSeq, "First event seq " + received1.get(0).seq() + " should be >= startSeq " + startSeq);
+            long lastSeq = received1.get(received1.size() - 1).seq();
 
-			// 3. Commit the last processed sequence
-			api.cdcCommit(subId, lastSeq);
+            // 3. Commit the last processed sequence
+            api.cdcCommit(subId, lastSeq);
 
-			// 4. Put batch 2
-			for (int i = 0; i < countBatch2; i++) {
-				var kv = kvSequence.get(countBatch1 + i);
-				api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
-			}
+            // 4. Put batch 2
+            for (int i = 0; i < countBatch2; i++) {
+                var kv = kvSequence.get(countBatch1 + i);
+                api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
+            }
 
-			// 5. Resume stream (from null -> should pick up from commit)
-			// We expect to see remaining 20 from batch1 + 50 from batch2 = 70 events
-			int expectedRemaining = (countBatch1 - consumeCount1) + countBatch2;
+            // 5. Resume stream (from null -> should pick up from commit)
+            // We expect to see remaining 20 from batch1 + 50 from batch2 = 70 events
+            int expectedRemaining = (countBatch1 - consumeCount1) + countBatch2;
 
-   List<CDCEvent> received2 = api.cdcStream(subId,
+            List<CDCEvent> received2 = api.cdcStream(subId,
                             new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
                                     null,
                                     cdcBatchSize,
@@ -1061,312 +1110,312 @@ database: {
                     .collectList()
                     .block(Duration.ofSeconds(10));
 
-			Assertions.assertNotNull(received2);
-			Assertions.assertEquals(expectedRemaining, received2.size());
+            Assertions.assertNotNull(received2);
+            Assertions.assertEquals(expectedRemaining, received2.size());
 
-			// Verify strictly increasing
-			long prev = lastSeq;
-			for (CDCEvent ev : received2) {
-				Assertions.assertTrue(ev.seq() > prev, "Seq increasing: " + ev.seq() + " > " + prev);
-				prev = ev.seq();
-			}
-		}
-	}
+            // Verify strictly increasing
+            long prev = lastSeq;
+            for (CDCEvent ev : received2) {
+                Assertions.assertTrue(ev.seq() > prev, "Seq increasing: " + ev.seq() + " > " + prev);
+                prev = ev.seq();
+            }
+        }
+    }
 
-	@TestAllImplementations
-	void testCdcStreamWithProcessor(String name, ConnectionConfig connection) throws Exception {
-		if (connection.method() == ConnectionMethod.THRIFT) {
-			return;
-		}
+    @TestAllImplementations
+    void testCdcStreamWithProcessor(String name, ConnectionConfig connection) throws Exception {
+        if (connection.method() == ConnectionMethod.THRIFT) {
+            return;
+        }
 
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			String subId = "proc-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            String subId = "proc-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+            long startSeq = api.cdcCreate(subId, null, null);
 
-			int count = 20;
-			var kvSequence = getKVSequence();
-			for (int i = 0; i < count; i++) {
-				var kv = kvSequence.get(i);
-				api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
-			}
+            int count = 20;
+            var kvSequence = getKVSequence();
+            for (int i = 0; i < count; i++) {
+                var kv = kvSequence.get(i);
+                api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
+            }
 
-			java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(count);
+            java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(count);
 
-			// Batch size 5. We expect 4 batches of 5.
-   var disposable = api.cdcStream(subId,
-                    new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
-                            startSeq,
-                            5,
-                            Duration.ofMillis(50),
-                            it.cavallium.rockserver.core.common.cdc.CdcCommitMode.BATCH
-                    ),
-                    event -> {
-                latch.countDown();
-                return Mono.empty();
-            })
-            .subscribe();
+            // Batch size 5. We expect 4 batches of 5.
+            var disposable = api.cdcStream(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    startSeq,
+                                    5,
+                                    Duration.ofMillis(50),
+                                    it.cavallium.rockserver.core.common.cdc.CdcCommitMode.BATCH
+                            ),
+                            event -> {
+                                latch.countDown();
+                                return Mono.empty();
+                            })
+                    .subscribe();
 
-			boolean finished = latch.await(10, java.util.concurrent.TimeUnit.SECONDS);
-			// Wait a tiny bit to allow the commit of the last batch to potentially complete (async)
-			Thread.sleep(200);
-			disposable.dispose();
-			
-			Assertions.assertTrue(finished, "Did not process all events in time");
-		}
-	}
+            boolean finished = latch.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            // Wait a tiny bit to allow the commit of the last batch to potentially complete (async)
+            Thread.sleep(200);
+            disposable.dispose();
 
-	@TestAllImplementations
-	void testCdcStreamAck(String name, ConnectionConfig connection) throws Exception {
-		// Thrift currently lacks CDC support in this project setup
-		if (connection.method() == ConnectionMethod.THRIFT) {
-			return;
-		}
+            Assertions.assertTrue(finished, "Did not process all events in time");
+        }
+    }
 
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
+    @TestAllImplementations
+    void testCdcStreamAck(String name, ConnectionConfig connection) throws Exception {
+        // Thrift currently lacks CDC support in this project setup
+        if (connection.method() == ConnectionMethod.THRIFT) {
+            return;
+        }
 
-			String subId = "ack-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
 
-			int total = 20;
-			var kvSequence = getKVSequence();
-			for (int i = 0; i < total; i++) {
-				var kv = kvSequence.get(i);
-				api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
-			}
+            String subId = "ack-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+            long startSeq = api.cdcCreate(subId, null, null);
 
-			int ackCount = 12; // acknowledge first N events and then "crash"
-			java.util.concurrent.atomic.AtomicLong lastAcked = new java.util.concurrent.atomic.AtomicLong(startSeq - 1);
+            int total = 20;
+            var kvSequence = getKVSequence();
+            for (int i = 0; i < total; i++) {
+                var kv = kvSequence.get(i);
+                api.put(0, colId, kv.keys(), kv.value(), RequestType.none());
+            }
 
-			// Consume and ack first ackCount events
-			api.cdcStreamAck(subId,
-					new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
-							startSeq,
-							5,
-							Duration.ofMillis(20),
-							it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE // ignored by ack variant
-					))
-				.take(ackCount)
-				.concatMap(ack -> {
-					// simulate processing, then ACK
-					return ack.ack().doOnSuccess(__ -> lastAcked.set(ack.event().seq())).thenReturn(ack);
-				})
-				.collectList()
-				.block(Duration.ofSeconds(10));
+            int ackCount = 12; // acknowledge first N events and then "crash"
+            java.util.concurrent.atomic.AtomicLong lastAcked = new java.util.concurrent.atomic.AtomicLong(startSeq - 1);
 
-			// Now simulate a crash by simply stopping the stream and resuming with server-managed offset (null fromSeq)
-			var resumedFirst = api.cdcStream(subId,
-					new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
-							null,
-							5,
-							Duration.ofMillis(20),
-							it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE),
-					null)
-				.take(1)
-				.collectList()
-				.block(Duration.ofSeconds(10));
+            // Consume and ack first ackCount events
+            api.cdcStreamAck(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    startSeq,
+                                    5,
+                                    Duration.ofMillis(20),
+                                    it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE // ignored by ack variant
+                            ))
+                    .take(ackCount)
+                    .concatMap(ack -> {
+                        // simulate processing, then ACK
+                        return ack.ack().doOnSuccess(__ -> lastAcked.set(ack.event().seq())).thenReturn(ack);
+                    })
+                    .collectList()
+                    .block(Duration.ofSeconds(10));
 
-			Assertions.assertNotNull(resumedFirst);
-			if (!resumedFirst.isEmpty()) {
-				long firstSeq = resumedFirst.get(0).seq();
-				Assertions.assertTrue(firstSeq > lastAcked.get(), "Resumed position should be after last acked. first=" + firstSeq + ", lastAcked=" + lastAcked.get());
-			}
-		}
-	}
+            // Now simulate a crash by simply stopping the stream and resuming with server-managed offset (null fromSeq)
+            var resumedFirst = api.cdcStream(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    null,
+                                    5,
+                                    Duration.ofMillis(20),
+                                    it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE),
+                            null)
+                    .take(1)
+                    .collectList()
+                    .block(Duration.ofSeconds(10));
 
-	@TestAllImplementations
-	void testComplexMergeAndCdc(String name, ConnectionConfig connection) throws Exception {
-		if (connection.method() == ConnectionMethod.THRIFT) {
-			return;
-		}
-		try (var testDB = new TestDB(db, connection)) {
-			var api = testDB.getAPI();
-			String subId = "complex-merge-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			// Use resolved=true to see merge results
-			long startSeq = api.cdcCreate(subId, null, null, true);
+            Assertions.assertNotNull(resumedFirst);
+            if (!resumedFirst.isEmpty()) {
+                long firstSeq = resumedFirst.get(0).seq();
+                Assertions.assertTrue(firstSeq > lastAcked.get(), "Resumed position should be after last acked. first=" + firstSeq + ", lastAcked=" + lastAcked.get());
+            }
+        }
+    }
 
-			// Create specific column to ensure merge operator is active and we control schema
-			long mColId = api.createColumn("complex-merge-col-" + name,
-					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+    @TestAllImplementations
+    void testComplexMergeAndCdc(String name, ConnectionConfig connection) throws Exception {
+        if (connection.method() == ConnectionMethod.THRIFT) {
+            return;
+        }
+        try (var testDB = new TestDB(db, connection)) {
+            var api = testDB.getAPI();
+            String subId = "complex-merge-" + name.replaceAll("[^a-zA-Z0-9]", "-");
+            // Use resolved=true to see merge results
+            long startSeq = api.cdcCreate(subId, null, null, true);
 
-			var key = new Keys(new Buf[]{Buf.wrap(new byte[]{1, 2, 3, 4})});
+            // Create specific column to ensure merge operator is active and we control schema
+            long mColId = api.createColumn("complex-merge-col-" + name,
+                    ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 
-			// 1. Put "Start"
-			api.put(0, mColId, key, Buf.wrap("Start".getBytes(java.nio.charset.StandardCharsets.UTF_8)), RequestType.none());
+            var key = new Keys(new Buf[]{Buf.wrap(new byte[]{1, 2, 3, 4})});
 
-			// 2. Merge ", Middle"
-			api.merge(0, mColId, key, Buf.wrap("Middle".getBytes(java.nio.charset.StandardCharsets.UTF_8)), RequestType.none());
+            // 1. Put "Start"
+            api.put(0, mColId, key, Buf.wrap("Start".getBytes(java.nio.charset.StandardCharsets.UTF_8)), RequestType.none());
 
-			// 3. Merge ", End"
-			api.merge(0, mColId, key, Buf.wrap("End".getBytes(java.nio.charset.StandardCharsets.UTF_8)), RequestType.none());
+            // 2. Merge ", Middle"
+            api.merge(0, mColId, key, Buf.wrap("Middle".getBytes(java.nio.charset.StandardCharsets.UTF_8)), RequestType.none());
 
-			// 4. Verify value
-			var current = api.get(0, mColId, key, RequestType.current());
-			assertSegmentEquals(Buf.wrap("Start,Middle,End".getBytes(java.nio.charset.StandardCharsets.UTF_8)), current);
+            // 3. Merge ", End"
+            api.merge(0, mColId, key, Buf.wrap("End".getBytes(java.nio.charset.StandardCharsets.UTF_8)), RequestType.none());
 
-			// 8. Verify CDC
-			var events = api.cdcStream(subId,
-					new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
-							startSeq,
-							100,
-							Duration.ofMillis(10),
-							it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE
-					),
-					null)
-					.take(3)
-					.collectList()
-					.block(Duration.ofSeconds(10));
+            // 4. Verify value
+            var current = api.get(0, mColId, key, RequestType.current());
+            assertSegmentEquals(Buf.wrap("Start,Middle,End".getBytes(java.nio.charset.StandardCharsets.UTF_8)), current);
 
-			Assertions.assertEquals(3, events.size());
-			// With resolved=true, all events reflect the CURRENT state of the key.
-			String expectedValue = "Start,Middle,End";
-			
-			// Ev 1: PUT Start -> Resolved to Current
-			Assertions.assertEquals(CDCEvent.Op.PUT, events.get(0).op());
-			Assertions.assertEquals(expectedValue, new String(events.get(0).value().toByteArray()));
-			// Ev 2: PUT Start, Middle -> Resolved to Current
-			Assertions.assertEquals(CDCEvent.Op.PUT, events.get(1).op());
-			Assertions.assertEquals(expectedValue, new String(events.get(1).value().toByteArray()));
-			// Ev 3: PUT Start, Middle, End -> Resolved to Current
-			Assertions.assertEquals(CDCEvent.Op.PUT, events.get(2).op());
-			Assertions.assertEquals(expectedValue, new String(events.get(2).value().toByteArray()));
-		}
-	}
+            // 8. Verify CDC
+            var events = api.cdcStream(subId,
+                            new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
+                                    startSeq,
+                                    100,
+                                    Duration.ofMillis(10),
+                                    it.cavallium.rockserver.core.common.cdc.CdcCommitMode.NONE
+                            ),
+                            null)
+                    .take(3)
+                    .collectList()
+                    .block(Duration.ofSeconds(10));
 
-	@TestAllImplementations
-	void testScanRaw(String name, ConnectionConfig connection) throws Exception {
-		if (connection.method() == ConnectionMethod.THRIFT) {
-			return;
-		}
-		try (var tdb = new TestDB(db, connection)) {
-			RocksDBAPI api = tdb.getAPI();
-			long colId = api.createColumn("scan-raw-col",
-					it.cavallium.rockserver.core.common.ColumnSchema.of(
-							it.unimi.dsi.fastutil.ints.IntList.of(8),
-							it.unimi.dsi.fastutil.objects.ObjectList.of(),
-							true));
+            Assertions.assertEquals(3, events.size());
+            // With resolved=true, all events reflect the CURRENT state of the key.
+            String expectedValue = "Start,Middle,End";
 
-			int count = 10000;
-			List<KVBatch> batches = new ArrayList<>();
+            // Ev 1: PUT Start -> Resolved to Current
+            Assertions.assertEquals(CDCEvent.Op.PUT, events.get(0).op());
+            Assertions.assertEquals(expectedValue, new String(events.get(0).value().toByteArray()));
+            // Ev 2: PUT Start, Middle -> Resolved to Current
+            Assertions.assertEquals(CDCEvent.Op.PUT, events.get(1).op());
+            Assertions.assertEquals(expectedValue, new String(events.get(1).value().toByteArray()));
+            // Ev 3: PUT Start, Middle, End -> Resolved to Current
+            Assertions.assertEquals(CDCEvent.Op.PUT, events.get(2).op());
+            Assertions.assertEquals(expectedValue, new String(events.get(2).value().toByteArray()));
+        }
+    }
 
-			int batchSize = 1000;
-			for (int i = 0; i < count; i += batchSize) {
-				List<Keys> keys = new ArrayList<>();
-				List<Buf> values = new ArrayList<>();
-				for (int j = 0; j < batchSize; j++) {
-					long val = i + j;
-					java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(8);
-					bb.putLong(val);
-					Keys k = new Keys(Buf.wrap(bb.array()));
+    @TestAllImplementations
+    void testScanRaw(String name, ConnectionConfig connection) throws Exception {
+        if (connection.method() == ConnectionMethod.THRIFT) {
+            return;
+        }
+        try (var tdb = new TestDB(db, connection)) {
+            RocksDBAPI api = tdb.getAPI();
+            long colId = api.createColumn("scan-raw-col",
+                    it.cavallium.rockserver.core.common.ColumnSchema.of(
+                            it.unimi.dsi.fastutil.ints.IntList.of(8),
+                            it.unimi.dsi.fastutil.objects.ObjectList.of(),
+                            true));
 
-					Buf v = Buf.wrap(("val-" + val).getBytes(StandardCharsets.UTF_8));
-					keys.add(k);
-					values.add(v);
-				}
-				batches.add(new KVBatch.KVBatchRef(keys, values));
-			}
+            int count = 10000;
+            List<KVBatch> batches = new ArrayList<>();
 
-			// Insert data
-			api.putBatch(colId, Flux.fromIterable(batches), PutBatchMode.WRITE_BATCH);
+            int batchSize = 1000;
+            for (int i = 0; i < count; i += batchSize) {
+                List<Keys> keys = new ArrayList<>();
+                List<Buf> values = new ArrayList<>();
+                for (int j = 0; j < batchSize; j++) {
+                    long val = i + j;
+                    java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(8);
+                    bb.putLong(val);
+                    Keys k = new Keys(Buf.wrap(bb.array()));
 
-			// Flush to ensure data is in SST files (ScanRaw reads from SSTs)
-			api.flush();
+                    Buf v = Buf.wrap(("val-" + val).getBytes(StandardCharsets.UTF_8));
+                    keys.add(k);
+                    values.add(v);
+                }
+                batches.add(new KVBatch.KVBatchRef(keys, values));
+            }
 
-			// ScanRaw
-			List<it.cavallium.rockserver.core.common.SerializedKVBatch> resultBatches;
-			try (var stream = api.scanRaw(colId, 0, 1)) {
-				resultBatches = stream.collect(Collectors.toList());
-			}
+            // Insert data
+            api.putBatch(colId, Flux.fromIterable(batches), PutBatchMode.WRITE_BATCH);
 
-			// Verify
-			int totalEntries = 0;
-			Set<Long> foundKeys = new HashSet<>();
+            // Flush to ensure data is in SST files (ScanRaw reads from SSTs)
+            api.flush();
 
-			for (var batch : resultBatches) {
-				var kvStream = batch.decode();
-				var kvList = kvStream.toList();
-				totalEntries += kvList.size();
+            // ScanRaw
+            List<it.cavallium.rockserver.core.common.SerializedKVBatch> resultBatches;
+            try (var stream = api.scanRaw(colId, 0, 1)) {
+                resultBatches = stream.collect(Collectors.toList());
+            }
 
-				for (var kv : kvList) {
-					Keys k = kv.keys();
-					Buf v = kv.value();
+            // Verify
+            int totalEntries = 0;
+            Set<Long> foundKeys = new HashSet<>();
 
-					long kLong = java.nio.ByteBuffer.wrap(k.keys()[0].toByteArray()).getLong();
-					String vStr = new String(v.toByteArray(), StandardCharsets.UTF_8);
-					Assertions.assertEquals("val-" + kLong, vStr);
-					foundKeys.add(kLong);
-				}
-			}
+            for (var batch : resultBatches) {
+                var kvStream = batch.decode();
+                var kvList = kvStream.toList();
+                totalEntries += kvList.size();
 
-			Assertions.assertEquals(count, totalEntries);
-			Assertions.assertEquals(count, foundKeys.size());
+                for (var kv : kvList) {
+                    Keys k = kv.keys();
+                    Buf v = kv.value();
 
-			for(long i=0; i<count; i++) {
-				Assertions.assertTrue(foundKeys.contains(i), "Missing key-" + i);
-			}
-		}
-	}
+                    long kLong = java.nio.ByteBuffer.wrap(k.keys()[0].toByteArray()).getLong();
+                    String vStr = new String(v.toByteArray(), StandardCharsets.UTF_8);
+                    Assertions.assertEquals("val-" + kLong, vStr);
+                    foundKeys.add(kLong);
+                }
+            }
 
-	@Test
-	void testTranscodeBatchKeysRegression() throws Exception {
-		var schema = ColumnSchema.of(
-				it.unimi.dsi.fastutil.ints.IntList.of(Integer.BYTES),
-				it.unimi.dsi.fastutil.objects.ObjectList.of(ColumnHashType.XXHASH32),
-				true
-		);
-		long testColId = db.createColumn("transcodeTest", schema);
-		try {
-			// Access ColumnInstance via InternalDB using Reflection
-			java.lang.reflect.Method getColumnMethod = EmbeddedDB.class.getDeclaredMethod("getColumn", long.class);
-			getColumnMethod.setAccessible(true);
-			ColumnInstance col = (ColumnInstance) getColumnMethod.invoke(db.getInternalDB(), testColId);
+            Assertions.assertEquals(count, totalEntries);
+            Assertions.assertEquals(count, foundKeys.size());
 
-			// 1. Prepare input
-			// Fixed Key: 0x01020304
-			// Full Key Size must correspond to Schema: 4 (Fixed) + 4 (Hash) = 8
-			Buf calculatedKey = Buf.createZeroes(8);
-			calculatedKey.setIntLE(0, 0x01020304);
-			calculatedKey.setIntLE(4, 0xDEADBEEF); // Hash part (ignored by transcode)
+            for (long i = 0; i < count; i++) {
+                Assertions.assertTrue(foundKeys.contains(i), "Missing key-" + i);
+            }
+        }
+    }
 
-			// Variable Key: "ABC" -> length 3
-			// Bucket Value: [Len(2 bytes)] + [Content]
-			Buf bucketValue = Buf.createZeroes(2 + 3);
-			bucketValue.setChar(0, (char) 3);
-			bucketValue.setBytesFromBuf(2, Buf.wrap("ABC".getBytes(StandardCharsets.UTF_8)), 0, 3);
+    @Test
+    void testTranscodeBatchKeysRegression() throws Exception {
+        var schema = ColumnSchema.of(
+                it.unimi.dsi.fastutil.ints.IntList.of(Integer.BYTES),
+                it.unimi.dsi.fastutil.objects.ObjectList.of(ColumnHashType.XXHASH32),
+                true
+        );
+        long testColId = db.createColumn("transcodeTest", schema);
+        try {
+            // Access ColumnInstance via InternalDB using Reflection
+            java.lang.reflect.Method getColumnMethod = EmbeddedDB.class.getDeclaredMethod("getColumn", long.class);
+            getColumnMethod.setAccessible(true);
+            ColumnInstance col = (ColumnInstance) getColumnMethod.invoke(db.getInternalDB(), testColId);
 
-			// Output buffer
-			Buf output = Buf.createZeroes(0);
+            // 1. Prepare input
+            // Fixed Key: 0x01020304
+            // Full Key Size must correspond to Schema: 4 (Fixed) + 4 (Hash) = 8
+            Buf calculatedKey = Buf.createZeroes(8);
+            calculatedKey.setIntLE(0, 0x01020304);
+            calculatedKey.setIntLE(4, 0xDEADBEEF); // Hash part (ignored by transcode)
 
-			// 2. Call transcodeBatchKeys
-			int written = col.transcodeBatchKeys(calculatedKey, bucketValue, 0, output);
+            // Variable Key: "ABC" -> length 3
+            // Bucket Value: [Len(2 bytes)] + [Content]
+            Buf bucketValue = Buf.createZeroes(2 + 3);
+            bucketValue.setChar(0, (char) 3);
+            bucketValue.setBytesFromBuf(2, Buf.wrap("ABC".getBytes(StandardCharsets.UTF_8)), 0, 3);
 
-			// 3. Verify Output
-			// keys count + key1 len + key1 + key2 len + key2
-			int expectedSize = 1 + 4 + 4 + 4 + 3;
-			Assertions.assertEquals(expectedSize, written);
-			Assertions.assertEquals(expectedSize, output.size());
+            // Output buffer
+            Buf output = Buf.createZeroes(0);
 
-			int offset = 0;
-			Assertions.assertEquals((byte) 2, output.getByte(offset));
-			offset += 1;
+            // 2. Call transcodeBatchKeys
+            int written = col.transcodeBatchKeys(calculatedKey, bucketValue, 0, output);
 
-			// Key 1
-			Assertions.assertEquals(4, output.getIntLE(offset));
-			offset += 4;
-			Assertions.assertEquals(0x01020304, output.getIntLE(offset));
-			offset += 4;
+            // 3. Verify Output
+            // keys count + key1 len + key1 + key2 len + key2
+            int expectedSize = 1 + 4 + 4 + 4 + 3;
+            Assertions.assertEquals(expectedSize, written);
+            Assertions.assertEquals(expectedSize, output.size());
 
-			// Key 2
-			Assertions.assertEquals(3, output.getIntLE(offset));
-			offset += 4;
-			byte[] expectedBytes = "ABC".getBytes(StandardCharsets.UTF_8);
-			for(int i=0; i<3; i++) {
-				Assertions.assertEquals(expectedBytes[i], output.getByte(offset + i));
-			}
+            int offset = 0;
+            Assertions.assertEquals((byte) 2, output.getByte(offset));
+            offset += 1;
 
-		} finally {
-			db.deleteColumn(testColId);
-		}
-	}
+            // Key 1
+            Assertions.assertEquals(4, output.getIntLE(offset));
+            offset += 4;
+            Assertions.assertEquals(0x01020304, output.getIntLE(offset));
+            offset += 4;
+
+            // Key 2
+            Assertions.assertEquals(3, output.getIntLE(offset));
+            offset += 4;
+            byte[] expectedBytes = "ABC".getBytes(StandardCharsets.UTF_8);
+            for (int i = 0; i < 3; i++) {
+                Assertions.assertEquals(expectedBytes[i], output.getByte(offset + i));
+            }
+
+        } finally {
+            db.deleteColumn(testColId);
+        }
+    }
 }

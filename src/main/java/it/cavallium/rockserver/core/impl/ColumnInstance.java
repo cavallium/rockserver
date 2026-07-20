@@ -8,366 +8,397 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.buffer.Buf;
+
 import java.util.Arrays;
 import java.util.StringJoiner;
+
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.ColumnFamilyHandle;
 
 public record ColumnInstance(ColumnFamilyHandle cfh,
-				    ColumnSchema schema,
-				    int finalKeySizeBytes,
-				    @Nullable FFMAbstractMergeOperator mergeOperator) implements AutoCloseable {
+                             ColumnSchema schema,
+                             int finalKeySizeBytes,
+                             @Nullable FFMAbstractMergeOperator mergeOperator) implements AutoCloseable {
 
-	private static final Buf[] EMPTY_BUF_ARRAY = new Buf[0];
+    private static final Buf[] EMPTY_BUF_ARRAY = new Buf[0];
 
-	public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema) {
-		this(cfh, schema, calculateFinalKeySizeBytes(schema), null);
-	}
+    public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema) {
+        this(cfh, schema, calculateFinalKeySizeBytes(schema), null);
+    }
 
-	public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, @Nullable FFMAbstractMergeOperator mergeOperator) {
-		this(cfh, schema, calculateFinalKeySizeBytes(schema), mergeOperator);
-	}
+    public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, @Nullable FFMAbstractMergeOperator mergeOperator) {
+        this(cfh, schema, calculateFinalKeySizeBytes(schema), mergeOperator);
+    }
 
-	private static int calculateFinalKeySizeBytes(ColumnSchema schema) {
-		int total = 0;
-		for (int i : schema.keys()) {
-			total += i;
-		}
-		return total;
-	}
+    private static int calculateFinalKeySizeBytes(ColumnSchema schema) {
+        int total = 0;
+        for (int i : schema.keys()) {
+            total += i;
+        }
+        return total;
+    }
 
-	@Override
-	public void close() {
-		cfh.close();
-	}
+    @Override
+    public void close() {
+        cfh.close();
+    }
 
-	public boolean requiresWriteTransaction() {
-		return schema.variableLengthKeysCount() > 0;
-	}
+    public boolean requiresWriteTransaction() {
+        return schema.variableLengthKeysCount() > 0;
+    }
 
-	public boolean hasBuckets() {
-		return schema.variableLengthKeysCount() > 0;
-	}
+    public boolean hasBuckets() {
+        return schema.variableLengthKeysCount() > 0;
+    }
 
-	@NotNull
-	public Buf calculateKey(Buf[] keys) {
-		validateKeyCount(keys);
-		Buf finalKey;
-		if (keys.length == 0) {
-			finalKey = emptyBuf();
-		} else if(keys.length == 1 && !hasBuckets()) {
-			finalKey = keys[0];
-		} else {
-			finalKey = Buf.createZeroes(finalKeySizeBytes);
-			int offsetBytes = 0;
-			for (int i = 0; i < schema.keysCount(); i++) {
-				var computedKeyAtI = computeKeyAt(i, keys);
-				var computedKeyAtISize = computedKeyAtI.size();
-				finalKey.setBytesFromBuf(offsetBytes, computedKeyAtI, 0, computedKeyAtISize);
-				offsetBytes += computedKeyAtISize;
-			}
-		}
-		validateFinalKeySize(finalKey);
-		return finalKey;
-	}
+    @NotNull
+    public Buf calculateKey(Buf[] keys) {
+        validateKeyCount(keys);
+        Buf finalKey;
+        if (keys.length == 0) {
+            finalKey = emptyBuf();
+        } else if (keys.length == 1 && !hasBuckets()) {
+            finalKey = keys[0];
+        } else {
+            finalKey = Buf.createZeroes(finalKeySizeBytes);
+            int offsetBytes = 0;
+            for (int i = 0; i < schema.keysCount(); i++) {
+                var computedKeyAtI = computeKeyAt(i, keys);
+                var computedKeyAtISize = computedKeyAtI.size();
+                finalKey.setBytesFromBuf(offsetBytes, computedKeyAtI, 0, computedKeyAtISize);
+                offsetBytes += computedKeyAtISize;
+            }
+        }
+        validateFinalKeySize(finalKey);
+        return finalKey;
+    }
 
-	/**
-	 * @param bucketValue pass this parameter only if the columnInstance has variable-length keys
-	 */
-	@NotNull
-	public Buf[] decodeKeys(Buf calculatedKey, @Nullable Buf bucketValue) {
-		validateFinalKeySize(calculatedKey);
-		Buf[] finalKeys;
-		if (calculatedKey.isEmpty()) {
-			finalKeys = EMPTY_BUF_ARRAY;
-		} else if (!hasBuckets()) {
-			if (schema.keysCount() == 1) {
-				finalKeys = new Buf[] {calculatedKey};
-			} else {
-				finalKeys = new Buf[schema.keysCount()];
-				int offsetBytes = 0;
-				for (int i = 0; i < schema.keysCount(); i++) {
-					var keyLength = schema.key(i);
-					var finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
-					finalKey.setBytesFromBuf(0, calculatedKey, offsetBytes, keyLength);
-					offsetBytes += keyLength;
-				}
-			}
-		} else {
-			if (bucketValue == null) {
-				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "bucketValue is required for decoding bucketed keys");
-			}
-			finalKeys = new Buf[schema.keysCount()];
-			int calculatedKeyOffset = 0;
-			int bucketValueOffset = 0;
+    /**
+     * @param bucketValue pass this parameter only if the columnInstance has variable-length keys
+     */
+    @NotNull
+    public Buf[] decodeKeys(Buf calculatedKey, @Nullable Buf bucketValue) {
+        validateFinalKeySize(calculatedKey);
+        Buf[] finalKeys;
+        if (calculatedKey.isEmpty()) {
+            finalKeys = EMPTY_BUF_ARRAY;
+        } else if (!hasBuckets()) {
+            if (schema.keysCount() == 1) {
+                finalKeys = new Buf[]{calculatedKey};
+            } else {
+                finalKeys = new Buf[schema.keysCount()];
+                int offsetBytes = 0;
+                for (int i = 0; i < schema.keysCount(); i++) {
+                    var keyLength = schema.key(i);
+                    var finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
+                    finalKey.setBytesFromBuf(0, calculatedKey, offsetBytes, keyLength);
+                    offsetBytes += keyLength;
+                }
+            }
+        } else {
+            if (bucketValue == null) {
+                throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "bucketValue is required for decoding bucketed keys");
+            }
+            finalKeys = new Buf[schema.keysCount()];
+            int calculatedKeyOffset = 0;
+            int bucketValueOffset = 0;
 
-			int firstVariableKeyIndex = schema.keysCount() - schema.variableLengthKeysCount();
+            int firstVariableKeyIndex = schema.keysCount() - schema.variableLengthKeysCount();
 
-			// 1. Decode Fixed Keys (from calculatedKey)
-			decodeFixedKeys(calculatedKey, finalKeys, firstVariableKeyIndex);
+            // 1. Decode Fixed Keys (from calculatedKey)
+            decodeFixedKeys(calculatedKey, finalKeys, firstVariableKeyIndex);
 
-			// 2. Decode Variable Keys (from bucketValue)
-			for (int i = firstVariableKeyIndex; i < schema.keysCount(); i++) {
-				// Read size (2 bytes - char)
-				if (bucketValueOffset + Character.BYTES > bucketValue.size()) {
-					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key length at index " + i);
-				}
-				char keyLengthChar = bucketValue.getChar(bucketValueOffset);
-				int keyLength = (int) keyLengthChar;
-				bucketValueOffset += Character.BYTES;
+            // 2. Decode Variable Keys (from bucketValue)
+            for (int i = firstVariableKeyIndex; i < schema.keysCount(); i++) {
+                // Read size (2 bytes - char)
+                if (bucketValueOffset + Character.BYTES > bucketValue.size()) {
+                    throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key length at index " + i);
+                }
+                char keyLengthChar = bucketValue.getChar(bucketValueOffset);
+                int keyLength = (int) keyLengthChar;
+                bucketValueOffset += Character.BYTES;
 
-				// Read bytes
-				if (bucketValueOffset + keyLength > bucketValue.size()) {
-					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
-				}
-				Buf finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
-				finalKey.setBytesFromBuf(0, bucketValue, bucketValueOffset, keyLength);
-				bucketValueOffset += keyLength;
-			}
-		}
-		validateKeyCount(finalKeys);
-		return finalKeys;
-	}
+                // Read bytes
+                if (bucketValueOffset + keyLength > bucketValue.size()) {
+                    throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
+                }
+                Buf finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
+                finalKey.setBytesFromBuf(0, bucketValue, bucketValueOffset, keyLength);
+                bucketValueOffset += keyLength;
+            }
+        }
+        validateKeyCount(finalKeys);
+        return finalKeys;
+    }
 
-	private static void ensureCapacity(Buf buf, int offset, int len) {
-		int required = offset + len;
-		if (buf.size() < required) {
-			int newSize = buf.size() + (buf.size() >> 1);
-			if (newSize < required) {
-				newSize = required;
-			}
-			buf.size(newSize);
-		}
-	}
+    private static void ensureCapacity(Buf buf, int offset, int len) {
+        int required = offset + len;
+        if (buf.size() < required) {
+            int newSize = buf.size() + (buf.size() >> 1);
+            if (newSize < required) {
+                newSize = required;
+            }
+            buf.size(newSize);
+        }
+    }
 
-	/**
-	 * @param bucketValue pass this parameter only if the columnInstance has variable-length keys
-	 * @return written bytes count
-	 */
-	public int transcodeBatchKeys(Buf calculatedKey, @Nullable Buf bucketValue, int outputOffset, Buf output) {
-		validateFinalKeySize(calculatedKey);
-		int initialOutputOffset = outputOffset;
-		if (calculatedKey.isEmpty()) {
-			ensureCapacity(output, outputOffset, Byte.BYTES);
-			output.setByte(outputOffset, (byte) 0);
-			outputOffset += Byte.BYTES;
-		} else if (!hasBuckets()) {
-			ensureCapacity(output, outputOffset, Byte.BYTES);
-			output.setByte(outputOffset, (byte) schema.keysCount());
-			outputOffset += Byte.BYTES;
+    /**
+     * @param bucketValue pass this parameter only if the columnInstance has variable-length keys
+     * @return written bytes count
+     */
+    public int transcodeBatchKeys(Buf calculatedKey, @Nullable Buf bucketValue, int outputOffset, Buf output) {
+        validateFinalKeySize(calculatedKey);
+        int initialOutputOffset = outputOffset;
+        if (calculatedKey.isEmpty()) {
+            ensureCapacity(output, outputOffset, Byte.BYTES);
+            output.setByte(outputOffset, (byte) 0);
+            outputOffset += Byte.BYTES;
+        } else if (!hasBuckets()) {
+            ensureCapacity(output, outputOffset, Byte.BYTES);
+            output.setByte(outputOffset, (byte) schema.keysCount());
+            outputOffset += Byte.BYTES;
 
-			if (schema.keysCount() == 1) {
-				var keySize = calculatedKey.size();
-				ensureCapacity(output, outputOffset, Integer.BYTES + keySize);
-				output.setIntLE(outputOffset, keySize);
-				output.setBytesFromBuf(outputOffset + Integer.BYTES, calculatedKey, 0, keySize);
-				outputOffset += Integer.BYTES + keySize;
-			} else {
-				int calculatedKeyOffset = 0;
-				for (int i = 0; i < schema.keysCount(); i++) {
-					var keySize = schema.key(i);
-					ensureCapacity(output, outputOffset, Integer.BYTES + keySize);
-					output.setIntLE(outputOffset, keySize);
-					output.setBytesFromBuf(outputOffset + Integer.BYTES, calculatedKey, calculatedKeyOffset, keySize);
-					outputOffset += Integer.BYTES + keySize;
-					calculatedKeyOffset += keySize;
-				}
-			}
-		} else {
-			if (bucketValue == null) {
-				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "bucketValue is required for transcoding bucketed keys");
-			}
-			ensureCapacity(output, outputOffset, Byte.BYTES);
-			output.setByte(outputOffset, (byte) schema.keysCount());
-			outputOffset += Byte.BYTES;
+            if (schema.keysCount() == 1) {
+                var keySize = calculatedKey.size();
+                ensureCapacity(output, outputOffset, Integer.BYTES + keySize);
+                output.setIntLE(outputOffset, keySize);
+                output.setBytesFromBuf(outputOffset + Integer.BYTES, calculatedKey, 0, keySize);
+                outputOffset += Integer.BYTES + keySize;
+            } else {
+                int calculatedKeyOffset = 0;
+                for (int i = 0; i < schema.keysCount(); i++) {
+                    var keySize = schema.key(i);
+                    ensureCapacity(output, outputOffset, Integer.BYTES + keySize);
+                    output.setIntLE(outputOffset, keySize);
+                    output.setBytesFromBuf(outputOffset + Integer.BYTES, calculatedKey, calculatedKeyOffset, keySize);
+                    outputOffset += Integer.BYTES + keySize;
+                    calculatedKeyOffset += keySize;
+                }
+            }
+        } else {
+            if (bucketValue == null) {
+                throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "bucketValue is required for transcoding bucketed keys");
+            }
+            ensureCapacity(output, outputOffset, Byte.BYTES);
+            output.setByte(outputOffset, (byte) schema.keysCount());
+            outputOffset += Byte.BYTES;
 
-			int calculatedKeyOffset = 0;
-			int bucketValueOffset = 0;
+            int calculatedKeyOffset = 0;
+            int bucketValueOffset = 0;
 
-			int firstVariableKeyIndex = schema.keysCount() - schema.variableLengthKeysCount();
+            int firstVariableKeyIndex = schema.keysCount() - schema.variableLengthKeysCount();
 
-			// 1. Transcode Fixed Keys (from calculatedKey)
-			for (int i = 0; i < firstVariableKeyIndex; i++) {
-				int keySize = schema.key(i);
-				ensureCapacity(output, outputOffset, Integer.BYTES + keySize);
-				output.setIntLE(outputOffset, keySize);
-				output.setBytesFromBuf(outputOffset + Integer.BYTES, calculatedKey, calculatedKeyOffset, keySize);
-				outputOffset += Integer.BYTES + keySize;
-				calculatedKeyOffset += keySize;
-			}
+            // 1. Transcode Fixed Keys (from calculatedKey)
+            for (int i = 0; i < firstVariableKeyIndex; i++) {
+                int keySize = schema.key(i);
+                ensureCapacity(output, outputOffset, Integer.BYTES + keySize);
+                output.setIntLE(outputOffset, keySize);
+                output.setBytesFromBuf(outputOffset + Integer.BYTES, calculatedKey, calculatedKeyOffset, keySize);
+                outputOffset += Integer.BYTES + keySize;
+                calculatedKeyOffset += keySize;
+            }
 
-			// 2. Transcode Variable Keys (from bucketValue)
-			for (int i = firstVariableKeyIndex; i < schema.keysCount(); i++) {
-				// Read size (2 bytes - char)
-				if (bucketValueOffset + Character.BYTES > bucketValue.size()) {
-					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key length at index " + i);
-				}
-				char keyLengthChar = bucketValue.getChar(bucketValueOffset);
-				int keyLength = (int) keyLengthChar;
-				bucketValueOffset += Character.BYTES;
+            // 2. Transcode Variable Keys (from bucketValue)
+            for (int i = firstVariableKeyIndex; i < schema.keysCount(); i++) {
+                // Read size (2 bytes - char)
+                if (bucketValueOffset + Character.BYTES > bucketValue.size()) {
+                    throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key length at index " + i);
+                }
+                char keyLengthChar = bucketValue.getChar(bucketValueOffset);
+                int keyLength = (int) keyLengthChar;
+                bucketValueOffset += Character.BYTES;
 
-				// Read bytes
-				if (bucketValueOffset + keyLength > bucketValue.size()) {
-					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
-				}
-				ensureCapacity(output, outputOffset, Integer.BYTES + keyLength);
-				output.setIntLE(outputOffset, keyLength);
-				output.setBytesFromBuf(outputOffset + Integer.BYTES, bucketValue, bucketValueOffset, keyLength);
-				outputOffset += Integer.BYTES + keyLength;
-				bucketValueOffset += keyLength;
-			}
-		}
-		return outputOffset - initialOutputOffset;
-	}
+                // Read bytes
+                if (bucketValueOffset + keyLength > bucketValue.size()) {
+                    throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
+                }
+                ensureCapacity(output, outputOffset, Integer.BYTES + keyLength);
+                output.setIntLE(outputOffset, keyLength);
+                output.setBytesFromBuf(outputOffset + Integer.BYTES, bucketValue, bucketValueOffset, keyLength);
+                outputOffset += Integer.BYTES + keyLength;
+                bucketValueOffset += keyLength;
+            }
+        }
+        return outputOffset - initialOutputOffset;
+    }
 
-	public void decodeFixedKeys(Buf calculatedKey, Buf[] finalKeys, int firstVariableKeyIndex) {
-		int calculatedKeyOffset = 0;
-		for (int i = 0; i < firstVariableKeyIndex; i++) {
-			int keyLength = schema.key(i);
-			Buf finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
-			finalKey.setBytesFromBuf(0, calculatedKey, calculatedKeyOffset, keyLength);
-			calculatedKeyOffset += keyLength;
-		}
-	}
+    public void decodeFixedKeys(Buf calculatedKey, Buf[] finalKeys, int firstVariableKeyIndex) {
+        int calculatedKeyOffset = 0;
+        for (int i = 0; i < firstVariableKeyIndex; i++) {
+            int keyLength = schema.key(i);
+            Buf finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
+            finalKey.setBytesFromBuf(0, calculatedKey, calculatedKeyOffset, keyLength);
+            calculatedKeyOffset += keyLength;
+        }
+    }
 
-	public Buf decodeValue(Buf calculatedValue) {
-		if (!hasBuckets()) {
-			return calculatedValue;
-		}
-		int bucketValueOffset = 0;
-		int firstVariableKeyIndex = schema.keysCount() - schema.variableLengthKeysCount();
+    public Buf decodeValue(Buf calculatedValue) {
+        if (!hasBuckets()) {
+            return calculatedValue;
+        }
+        int bucketValueOffset = 0;
+        int firstVariableKeyIndex = schema.keysCount() - schema.variableLengthKeysCount();
 
-		for (int i = firstVariableKeyIndex; i < schema.keysCount(); i++) {
-			// Read size (2 bytes - char)
-			if (bucketValueOffset + Character.BYTES > calculatedValue.size()) {
-				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key length at index " + i);
-			}
-			char keyLengthChar = calculatedValue.getChar(bucketValueOffset);
-			int keyLength = (int) keyLengthChar;
-			bucketValueOffset += Character.BYTES;
+        for (int i = firstVariableKeyIndex; i < schema.keysCount(); i++) {
+            // Read size (2 bytes - char)
+            if (bucketValueOffset + Character.BYTES > calculatedValue.size()) {
+                throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key length at index " + i);
+            }
+            char keyLengthChar = calculatedValue.getChar(bucketValueOffset);
+            int keyLength = (int) keyLengthChar;
+            bucketValueOffset += Character.BYTES;
 
-			// Skip bytes
-			if (bucketValueOffset + keyLength > calculatedValue.size()) {
-				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
-			}
-			bucketValueOffset += keyLength;
-		}
+            // Skip bytes
+            if (bucketValueOffset + keyLength > calculatedValue.size()) {
+                throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
+            }
+            bucketValueOffset += keyLength;
+        }
 
-		int valueSize = calculatedValue.size() - bucketValueOffset;
-		Buf value = Buf.createZeroes(valueSize);
-		value.setBytesFromBuf(0, calculatedValue, bucketValueOffset, valueSize);
-		return value;
-	}
+        int valueSize = calculatedValue.size() - bucketValueOffset;
+        Buf value = Buf.createZeroes(valueSize);
+        value.setBytesFromBuf(0, calculatedValue, bucketValueOffset, valueSize);
+        return value;
+    }
 
-	private Buf computeKeyAt(int i, Buf[] keys) {
-		if (i < schema.keysCount() - schema.variableLengthKeysCount()) {
-			if (keys[i].size() != schema.key(i)) {
-				throw RocksDBException.of(RocksDBErrorType.KEY_LENGTH_MISMATCH,
-						"Key at index " + i + " has a different length than expected! Expected: " + schema.key(i)
-								+ ", received: " + keys[i].size());
-			}
-			return keys[i];
-		} else {
-			var tailKey = schema.variableTailKey(i);
-			var hashResult = Buf.createZeroes(tailKey.bytesSize());
-			tailKey.hash(keys[i], hashResult);
-			return hashResult;
-		}
-	}
+    private Buf computeKeyAt(int i, Buf[] keys) {
+        if (i < schema.keysCount() - schema.variableLengthKeysCount()) {
+            if (keys[i].size() != schema.key(i)) {
+                throw RocksDBException.of(RocksDBErrorType.KEY_LENGTH_MISMATCH,
+                        "Key at index " + i + " has a different length than expected! Expected: " + schema.key(i)
+                                + ", received: " + keys[i].size());
+            }
+            return keys[i];
+        } else {
+            var tailKey = schema.variableTailKey(i);
+            var hashResult = Buf.createZeroes(tailKey.bytesSize());
+            tailKey.hash(keys[i], hashResult);
+            return hashResult;
+        }
+    }
 
-	private void validateFinalKeySize(Buf key) {
-		if (finalKeySizeBytes != key.size()) {
-			throw RocksDBException.of(RocksDBErrorType.RAW_KEY_LENGTH_MISMATCH,
-					"Keys size must be equal to the column keys size. Expected: "
-							+ finalKeySizeBytes + ", got: " + key.size());
-		}
-	}
+    private void validateFinalKeySize(Buf key) {
+        if (finalKeySizeBytes != key.size()) {
+            throw RocksDBException.of(RocksDBErrorType.RAW_KEY_LENGTH_MISMATCH,
+                    "Keys size must be equal to the column keys size. Expected: "
+                            + finalKeySizeBytes + ", got: " + key.size());
+        }
+    }
 
-	private void validateKeyCount(Buf[] keys) {
-		if (schema.keysCount() != keys.length) {
-			throw RocksDBException.of(RocksDBErrorType.KEYS_COUNT_MISMATCH,
-					"Keys count must be equal to the column keys count. Expected: " + schema.keysCount()
-							+ ", got: " + keys.length);
-		}
-	}
+    private void validateKeyCount(Buf[] keys) {
+        if (keys == null) {
+            throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "keys must not be null");
+        }
+        if (schema.keysCount() != keys.length) {
+            throw RocksDBException.of(RocksDBErrorType.KEYS_COUNT_MISMATCH,
+                    "Keys count must be equal to the column keys count. Expected: " + schema.keysCount()
+                            + ", got: " + keys.length);
+        }
+        for (int i = 0; i < keys.length; i++) {
+            if (keys[i] == null) {
+                throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT,
+                        "Key at index " + i + " must not be null");
+            }
+        }
+    }
 
-	public Buf computeBucketElementKey(Buf[] variableKeys) {
-		int totalSize = 0;
-		assert variableKeys.length == schema.variableLengthKeysCount();
-		for (Buf variableKey : variableKeys) {
-			totalSize += Character.BYTES + variableKey.size();
-		}
-		var bucketElementKey = Buf.createZeroes(totalSize);
-		int offset = 0;
-		for (Buf keyI : variableKeys) {
-			var keyISize = keyI.size();
-			bucketElementKey.setChar(offset, toCharExact(keyISize));
-			offset += Character.BYTES;
-			bucketElementKey.setBytesFromBuf(offset, keyI, 0, keyISize);
-			offset += keyISize;
-		}
-		assert offset == totalSize;
-		return bucketElementKey;
-	}
+    private void validateVariableKeyCount(Buf[] variableKeys) {
+        if (variableKeys == null) {
+            throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "variableKeys must not be null");
+        }
+        if (variableKeys.length != schema.variableLengthKeysCount()) {
+            throw RocksDBException.of(RocksDBErrorType.KEYS_COUNT_MISMATCH,
+                    "Variable keys count must be equal to the column variable-length keys count. Expected: "
+                            + schema.variableLengthKeysCount() + ", got: " + variableKeys.length);
+        }
+        for (int i = 0; i < variableKeys.length; i++) {
+            if (variableKeys[i] == null) {
+                throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT,
+                        "Variable key at index " + i + " must not be null");
+            }
+        }
+    }
 
-	public Buf computeBucketElementValue(@Nullable Buf value) {
-		checkNullableValue(value);
-		if (value != null) {
-			return value;
-		} else {
-			return Utils.emptyBuf();
-		}
-	}
+    public Buf computeBucketElementKey(Buf[] variableKeys) {
+        validateVariableKeyCount(variableKeys);
+        int totalSize = 0;
+        for (Buf variableKey : variableKeys) {
+            totalSize += Character.BYTES + variableKey.size();
+        }
+        var bucketElementKey = Buf.createZeroes(totalSize);
+        int offset = 0;
+        for (Buf keyI : variableKeys) {
+            var keyISize = keyI.size();
+            bucketElementKey.setChar(offset, toCharExact(keyISize));
+            offset += Character.BYTES;
+            bucketElementKey.setBytesFromBuf(offset, keyI, 0, keyISize);
+            offset += keyISize;
+        }
+        if (offset != totalSize) {
+            throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+                    "Bucket element key serialization size mismatch. Expected: " + totalSize + ", got: " + offset);
+        }
+        return bucketElementKey;
+    }
 
-	public void checkNullableValue(Buf value) {
-		if (schema.hasValue() && value == null) {
-			throw RocksDBException.of(RocksDBErrorType.UNEXPECTED_NULL_VALUE,
-					"Schema expects a value, but a null value has been passed");
-		} else if (!schema.hasValue() && value != null && !value.isEmpty()) {
-			throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
-					"Schema expects no value, but a non-null value has been passed");
-		}
-	}
+    public Buf computeBucketElementValue(@Nullable Buf value) {
+        checkNullableValue(value);
+        if (value != null) {
+            return value;
+        } else {
+            return Utils.emptyBuf();
+        }
+    }
 
-	public Buf computeBucketElementKeyValue(Buf computedBucketElementKey,
-			@Nullable Buf computedBucketElementValue) {
-		checkNullableValue(computedBucketElementValue);
-		var keySize = computedBucketElementKey.size();
-		var valueSize = computedBucketElementValue != null ? computedBucketElementValue.size() : 0;
-		var totalSize = keySize + valueSize;
-		var computedBucketElementKV = Buf.createZeroes(totalSize);
-		computedBucketElementKV.setBytesFromBuf(0, computedBucketElementKey, 0, keySize);
-		if (computedBucketElementValue != null) {
-			computedBucketElementKV.setBytesFromBuf(keySize, computedBucketElementValue, 0, valueSize);
-		}
-		return computedBucketElementKV;
-	}
+    public void checkNullableValue(Buf value) {
+        if (schema.hasValue() && value == null) {
+            throw RocksDBException.of(RocksDBErrorType.UNEXPECTED_NULL_VALUE,
+                    "Schema expects a value, but a null value has been passed");
+        } else if (!schema.hasValue() && value != null && !value.isEmpty()) {
+            throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
+                    "Schema expects no value, but a non-null value has been passed");
+        }
+    }
 
-	/**
-	 * Get only the variable-length keys
-	 */
-	public Buf[] getBucketElementKeys(Buf[] keys) {
-		assert keys.length == schema.keysCount();
-		return Arrays.copyOfRange(keys,
-				schema.keysCount() - schema.variableLengthKeysCount(),
-				schema.keysCount());
-	}
+    public Buf computeBucketElementKeyValue(Buf computedBucketElementKey,
+                                            @Nullable Buf computedBucketElementValue) {
+        checkNullableValue(computedBucketElementValue);
+        var keySize = computedBucketElementKey.size();
+        var valueSize = computedBucketElementValue != null ? computedBucketElementValue.size() : 0;
+        var totalSize = keySize + valueSize;
+        var computedBucketElementKV = Buf.createZeroes(totalSize);
+        computedBucketElementKV.setBytesFromBuf(0, computedBucketElementKey, 0, keySize);
+        if (computedBucketElementValue != null) {
+            computedBucketElementKV.setBytesFromBuf(keySize, computedBucketElementValue, 0, valueSize);
+        }
+        return computedBucketElementKV;
+    }
 
-	@Override
-	public String toString() {
-		return new StringJoiner(", ", ColumnInstance.class.getSimpleName() + "[", "]")
-				.add("cfh=" + getCfhName(cfh))
-				.add("schema=" + schema)
-				.add("finalKeySizeBytes=" + finalKeySizeBytes)
-				.toString();
-	}
+    /**
+     * Get only the variable-length keys
+     */
+    public Buf[] getBucketElementKeys(Buf[] keys) {
+        validateKeyCount(keys);
+        return Arrays.copyOfRange(keys,
+                schema.keysCount() - schema.variableLengthKeysCount(),
+                schema.keysCount());
+    }
 
-	private String getCfhName(ColumnFamilyHandle cfh) {
-		try {
-			return new String(cfh.getName());
-		} catch (org.rocksdb.RocksDBException e) {
-			return cfh.toString();
-		}
-	}
+    @Override
+    public String toString() {
+        return new StringJoiner(", ", ColumnInstance.class.getSimpleName() + "[", "]")
+                .add("cfh=" + getCfhName(cfh))
+                .add("schema=" + schema)
+                .add("finalKeySizeBytes=" + finalKeySizeBytes)
+                .toString();
+    }
+
+    private String getCfhName(ColumnFamilyHandle cfh) {
+        try {
+            return new String(cfh.getName());
+        } catch (org.rocksdb.RocksDBException e) {
+            return cfh.toString();
+        }
+    }
 }

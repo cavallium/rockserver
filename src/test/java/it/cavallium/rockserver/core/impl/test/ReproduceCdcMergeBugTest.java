@@ -51,11 +51,7 @@ public class ReproduceCdcMergeBugTest {
             Sinks.Many<KVBatch> sink = Sinks.many().multicast().onBackpressureBuffer(2000);
             
             // Start mergeBatchAsync
-            api.mergeBatchAsync(colId, sink.asFlux(), MergeBatchMode.MERGE_WRITE_BATCH)
-                    .exceptionally(e -> {
-                        e.printStackTrace();
-                        return null;
-                    });
+            var mergeBatch = api.mergeBatchAsync(colId, sink.asFlux(), MergeBatchMode.MERGE_WRITE_BATCH);
 
             // Start CDC listener
             int totalItems = 1000;
@@ -88,7 +84,9 @@ public class ReproduceCdcMergeBugTest {
             boolean received = latch.await(30, TimeUnit.SECONDS);
             
             cdcDisposable.dispose();
-            sink.tryEmitComplete();
+            var completeResult = sink.tryEmitComplete();
+            Assertions.assertFalse(completeResult.isFailure(), "Failed to complete merge batch sink: " + completeResult);
+            Assertions.assertDoesNotThrow(() -> mergeBatch.get(5, TimeUnit.SECONDS));
 
             Assertions.assertTrue(received, "CDC should receive " + totalItems + " events, but got " + receivedCount.get());
         }

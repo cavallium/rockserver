@@ -80,7 +80,6 @@ public class SchemaUpdateTest {
 
             Buf val = db.get(0, colId, new Keys(Buf.wrap(intToBytes(1))), RequestType.current());
             String valStr = new String(val.toByteArray());
-            System.out.println("[DEBUG_LOG] Result value: " + valStr);
             assertTrue(valStr.contains(";"), "Result " + valStr + " should contain semicolon, proving V2 was used");
 
             // --- CDC Verification ---

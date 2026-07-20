@@ -7,25 +7,24 @@ import org.jetbrains.annotations.Nullable;
 
 public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 
-	@SuppressWarnings("rawtypes")
 	enum RequestTypeId  {
-		NOTHING(new RequestNothing()),
-		PREVIOUS(new RequestPrevious()),
-		CURRENT(new RequestCurrent()),
-		FOR_UPDATE(new RequestForUpdate()),
-		EXISTS(new RequestExists()),
-		DELTA(new RequestDelta()),
-		MULTI(new RequestMulti()),
-		CHANGED(new RequestChanged()),
-		PREVIOUS_PRESENCE(new RequestPreviousPresence()),
-		MERGED(new RequestMerged()),
-		FIRST_AND_LAST(new RequestGetFirstAndLast()),
-		ALL_IN_RANGE(new RequestGetAllInRange()),
-		ENTRIES_COUNT(new RequestEntriesCount());
+		NOTHING(RequestType.none()),
+		PREVIOUS(RequestType.previous()),
+		CURRENT(RequestType.current()),
+		FOR_UPDATE(RequestType.forUpdate()),
+		EXISTS(RequestType.exists()),
+		DELTA(RequestType.delta()),
+		MULTI(RequestType.multi()),
+		CHANGED(RequestType.changed()),
+		PREVIOUS_PRESENCE(RequestType.previousPresence()),
+		MERGED(RequestType.merged()),
+		FIRST_AND_LAST(RequestType.firstAndLast()),
+		ALL_IN_RANGE(RequestType.allInRange()),
+		ENTRIES_COUNT(RequestType.entriesCount());
 
-		private final RequestType requestType;
+		private final RequestType<?, ?> requestType;
 
-		RequestTypeId(RequestType requestType) {
+		RequestTypeId(RequestType<?, ?> requestType) {
 			this.requestType = requestType;
 		}
 
@@ -59,8 +58,8 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 				|| requestType instanceof RequestType.RequestForUpdate<?>;
 	}
 
+	@SuppressWarnings("unchecked")
 	static <U> U safeCast(Object previousValue) {
-		//noinspection unchecked
 		return (U) previousValue;
 	}
 

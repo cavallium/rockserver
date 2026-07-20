@@ -19,16 +19,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 
-import sun.misc.Unsafe;
-
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@SuppressWarnings("deprecation")
 public class RocksDBMergeOperatorTest {
 
     @Test
@@ -635,7 +635,10 @@ public class RocksDBMergeOperatorTest {
 
         MethodHandle original = swapHandle("CREATE_OP", replacement);
         try {
-            RuntimeException ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, () -> new NoopOp("NullCreateOp"));
+            IllegalStateException ex = org.junit.jupiter.api.Assertions.assertThrows(
+                    IllegalStateException.class,
+                    () -> openAndCloseNoopOp("NullCreateOp")
+            );
             assertTrue(ex.getMessage().contains("Failed to construct FFM MergeOperator"));
             assertNotNull(ex.getCause());
             assertTrue(ex.getCause().getMessage().contains("rocksdb_mergeoperator_create returned NULL"));
@@ -656,17 +659,23 @@ public class RocksDBMergeOperatorTest {
 
         MethodHandle original = swapHandle("CREATE_OP", replacement);
         try {
-            RuntimeException ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, () -> new NoopOp("ThrowingCreateOp"));
+            IllegalStateException ex = org.junit.jupiter.api.Assertions.assertThrows(
+                    IllegalStateException.class,
+                    () -> openAndCloseNoopOp("ThrowingCreateOp")
+            );
             assertTrue(ex.getMessage().contains("Failed to construct FFM MergeOperator"));
-            assertTrue(ex.getCause() instanceof IllegalStateException);
+            assertInstanceOf(IllegalStateException.class, ex.getCause());
         } finally {
             swapHandle("CREATE_OP", original);
         }
     }
 
     @Test
-    void testConstructorFailsWhenNativeHandleInjectionBlocked() throws Exception {
-        RuntimeException ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, HandleInjectionFailOp::new);
+    void testConstructorFailsWhenNativeHandleInjectionBlocked() {
+        IllegalStateException ex = org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalStateException.class,
+                HandleInjectionFailOp::new
+        );
         assertTrue(ex.getMessage().contains("Failed to construct FFM MergeOperator"));
         assertNotNull(ex.getCause());
         assertTrue(ex.getCause().getMessage().contains("Could not inject native handle"));
@@ -718,21 +727,18 @@ public class RocksDBMergeOperatorTest {
         }
     }
 
-    @SuppressWarnings({"deprecation", "removal"})
     private static MethodHandle swapHandle(String fieldName, MethodHandle replacement) throws Exception {
         Field f = FFMAbstractMergeOperator.class.getDeclaredField(fieldName);
         f.setAccessible(true);
-        Object base = getUnsafe().staticFieldBase(f);
-        long offset = getUnsafe().staticFieldOffset(f);
-        MethodHandle original = (MethodHandle) getUnsafe().getObject(base, offset);
-        getUnsafe().putObject(base, offset, replacement);
+        MethodHandle original = (MethodHandle) f.get(null);
+        f.set(null, replacement);
         return original;
     }
 
-    private static Unsafe getUnsafe() throws Exception {
-        Field f = Unsafe.class.getDeclaredField("theUnsafe");
-        f.setAccessible(true);
-        return (Unsafe) f.get(null);
+    private static void openAndCloseNoopOp(String name) {
+        try (var ignored = new NoopOp(name)) {
+            assertNotNull(ignored);
+        }
     }
 
     private static MemorySegment getSharedPtrContainer(FFMAbstractMergeOperator op) throws Exception {

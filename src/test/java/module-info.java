@@ -11,12 +11,17 @@ module rockserver.core.test {
 	requires org.jetbrains.annotations;
 	requires org.junit.jupiter.params;
 	requires org.apache.httpcomponents.client5.httpclient5;
+	requires com.google.protobuf;
 	requires io.grpc;
+	requires io.grpc.netty;
+	requires io.netty.common;
+	requires io.netty.transport;
+	requires io.reactivex.rxjava3;
 	requires reactor.core;
 	requires org.apache.thrift;
 	requires jdk.unsupported;
+	requires java.xml;
 	requires reactor.test;
-	requires org.mockito;
 	opens it.cavallium.rockserver.core.test;
 	opens it.cavallium.rockserver.core.impl.test;
 }

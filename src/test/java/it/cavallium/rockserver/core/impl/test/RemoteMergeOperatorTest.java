@@ -44,7 +44,6 @@ public class RemoteMergeOperatorTest {
             var result = db.getSyncApi().get(0, colId, key, RequestType.current());
             assertNotNull(result);
             assertEquals("Hello,World", new String(result.toByteArray()));
-            System.out.println("Test passed!");
         }
     }
 

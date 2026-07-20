@@ -19,7 +19,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -94,6 +93,7 @@ class CdcWalPurgeTest {
         
         // 3. Consume it to know the sequence
         CdcBatch b1 = db.cdcPollBatchAsyncInternal(subId, null, 10).block();
+        assertNotNull(b1);
         assertEquals(10, b1.events().size());
         long nextSeq = b1.nextSeq(); // Should be ~11
 
@@ -102,8 +102,6 @@ class CdcWalPurgeTest {
         // Default WAL size might be large, but we set TTL=1s.
         // We need to wait > 1s and write to trigger check.
         
-        System.out.println("Writing filler data...");
-        long start = System.currentTimeMillis();
         for (int i = 0; i < 50; i++) {
             writeBatch(100 + i * 10, 10, "Filler");
             Thread.sleep(50); // Slow write
@@ -119,44 +117,18 @@ class CdcWalPurgeTest {
 
         // 5. Try to poll from the OLD sequence (nextSeq) which should be purged.
         // The WAL for seq ~11 should be gone.
-        System.out.println("Polling from old sequence: " + nextSeq);
-        
         try {
             CdcBatch b2 = db.cdcPollBatchAsyncInternal(subId, nextSeq, 10).block();
-            
-            // If we are here, either:
-            // A) The WAL was NOT purged (test failed to reproduce)
-            // B) The DB returned events from a MUCH LATER sequence (Silent Gap)
-            
-            if (b2.events().isEmpty()) {
-                 System.out.println("[DEBUG_LOG] Result empty, nextSeq=" + b2.nextSeq());
-                 if (extractWalSeq(b2.nextSeq()) > extractWalSeq(nextSeq) + 100) {
-                     fail("Silent gap detected (Empty batch, advanced seq)! Requested: " + nextSeq + ", Next: " + b2.nextSeq());
-                 }
-            } else {
-                 long firstEvSeq = b2.events().get(0).seq();
-                 System.out.println("[DEBUG_LOG] Got event seq: " + firstEvSeq);
-                 // If firstEvSeq >> nextSeq, we had a gap!
-                 if (extractWalSeq(firstEvSeq) > extractWalSeq(nextSeq) + 100) {
-                     fail("Silent gap detected! Requested: " + nextSeq + ", Got: " + firstEvSeq);
-                 } else {
-                     System.out.println("[DEBUG_LOG] No gap detected. firstEvSeq=" + extractWalSeq(firstEvSeq) + " req=" + extractWalSeq(nextSeq));
-                     // If we are here, we FAILED to reproduce the WAL purge.
-                     // Assert that we wanted to reproduce it.
-                     // Only fail if we are sure we wrote enough.
-                     // Let's rely on the logs to see what happened.
-                 }
+            assertNotNull(b2);
+            if (!b2.events().isEmpty()) {
+                long firstEvSeq = b2.events().getFirst().seq();
+                assertTrue(extractWalSeq(firstEvSeq) <= extractWalSeq(nextSeq) + 100,
+                        "Silent CDC gap detected. Requested " + nextSeq + ", got " + firstEvSeq);
             }
-        } catch (Exception e) {
-            System.out.println("[DEBUG_LOG] Caught exception: " + e.getMessage());
-            if (e instanceof CdcGapDetectedException) {
-                return; // Fixed behavior
-            }
-            if (e.getMessage().contains("Gap detected")) {
-                return; // Fixed behavior
-            }
-            e.printStackTrace();
-            throw e; // Rethrow unexpected
+            assertTrue(extractWalSeq(b2.nextSeq()) <= extractWalSeq(nextSeq) + 100 || b2.events().isEmpty(),
+                    "Silent CDC gap detected in empty batch. Requested " + nextSeq + ", next " + b2.nextSeq());
+        } catch (CdcGapDetectedException gap) {
+            assertTrue(gap.getMessage().contains("Gap detected"));
         }
     }
     

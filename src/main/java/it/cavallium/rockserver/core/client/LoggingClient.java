@@ -4,15 +4,19 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
+import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
 import java.net.URI;
 import java.util.concurrent.CompletableFuture;
 
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.event.Level;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 public class LoggingClient implements RocksDBConnection {
 
@@ -59,13 +63,13 @@ public class LoggingClient implements RocksDBConnection {
 		@Override
 		public <RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> SYNC_RESULT requestSync(RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> req) {
 			logger.trace("Request input (sync): {}", req);
-			SYNC_RESULT result;
-			try {
-				result = syncApi.requestSync(req);
-			} catch (Throwable e) {
-				logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
-				throw e;
-			}
+				SYNC_RESULT result;
+				try {
+					result = syncApi.requestSync(req);
+				} catch (Throwable e) {
+					logger.trace("Request failed: {}    Error: {}", req, formatErrorMessage(e));
+					throw e;
+				}
 			logger.trace("Request executed: {}    Result: {}", req, result);
 			return result;
 		}
@@ -88,26 +92,25 @@ public class LoggingClient implements RocksDBConnection {
 				logger.trace("Request input (async): {}", req);
 				var r = asyncApi.requestAsync(req);
 				return switch (req) {
-					case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ ->
-                            (ASYNC_RESULT) ((CompletableFuture<?>) r).whenComplete((result, e) -> {
-                                if (e != null) {
-                                    logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
-                                } else {
-                                    logger.trace("Request executed: {}    Result: {}", req, result);
-                                }
-                            });
+						case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ ->
+	                            (ASYNC_RESULT) ((CompletableFuture<?>) r).whenComplete((result, e) -> {
+	                                if (e != null) {
+	                                    logger.trace("Request failed: {}    Error: {}", req, formatErrorMessage(e));
+	                                } else {
+	                                    logger.trace("Request executed: {}    Result: {}", req, result);
+	                                }
+	                            });
 					case RocksDBAPICommand.RocksDBAPICommandStream<?> _ ->
                             (ASYNC_RESULT) Flux.from((Publisher<?>) r).doOnEach(signal -> {
                                 if (signal.isOnNext()) {
                                     logger.trace("Request: {}    Partial result: {}", req, signal);
-                                } else if (signal.isOnError()) {
-                                    var e = signal.getThrowable();
-                                    assert e != null;
-									logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
-                                } else if (signal.isOnComplete()) {
-                                    logger.trace("Request executed: {}    Result: terminated successfully", req);
-                                }
-                            });
+	                                } else if (signal.isOnError()) {
+	                                    var e = signal.getThrowable();
+										logger.trace("Request failed: {}    Error: {}", req, formatErrorMessage(e));
+	                                } else if (signal.isOnComplete()) {
+	                                    logger.trace("Request executed: {}    Result: terminated successfully", req);
+	                                }
+	                            });
 				};
 			}
 		}
@@ -116,5 +119,18 @@ public class LoggingClient implements RocksDBConnection {
 		public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
 			return requestAsync(new RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw(columnId, shardIndex, shardCount));
 		}
+
+		@Override
+		public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
+			return asyncApi.cdcPollBatchAsync(id, fromSeq, maxEvents);
+		}
+	}
+
+	public static String formatErrorMessage(@Nullable Throwable error) {
+		if (error == null) {
+			return "<missing error signal throwable>";
+		}
+		var message = error.getMessage();
+		return message != null ? message : error.toString();
 	}
 }

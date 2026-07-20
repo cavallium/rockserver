@@ -52,6 +52,8 @@ public record ColumnSchema(IntList keys,
 	}
 
 	public ColumnSchema {
+		mergeOperatorName = optionalSingleLine(mergeOperatorName, "merge operator name");
+		mergeOperatorClass = optionalSingleLine(mergeOperatorClass, "merge operator class");
 		final int keysSize = keys.size();
 		final int variableKeysSize = variableTailKeys.size();
 		if (variableKeysSize > keysSize) {
@@ -110,5 +112,18 @@ public record ColumnSchema(IntList keys,
 	 */
 	public ColumnHashType variableTailKey(int absoluteIndex) {
 		return variableTailKeys.get(absoluteIndex - fixedLengthKeysCount());
+	}
+
+	private static @Nullable String optionalSingleLine(@Nullable String value, String description) {
+		if (value == null) {
+			return null;
+		}
+		if (value.isBlank()) {
+			throw new IllegalArgumentException(description + " must not be blank");
+		}
+		if (value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) {
+			throw new IllegalArgumentException(description + " must be a single line");
+		}
+		return value;
 	}
 }

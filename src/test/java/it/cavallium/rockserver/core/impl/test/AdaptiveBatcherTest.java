@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.function.Executable;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
@@ -16,6 +17,29 @@ import reactor.test.StepVerifier;
 import reactor.test.publisher.TestPublisher;
 
 public class AdaptiveBatcherTest {
+
+    @Timeout(10)
+    @Test
+    @DisplayName("Invalid input arguments should fail before subscription")
+    @SuppressWarnings("ReactiveStreamsUnusedPublisher")
+    public void rejectsInvalidInputsWithExplicitDiagnostics() {
+        assertIllegalArgument("source must not be null",
+            () -> AdaptiveBatcher.buffer(null, 1, 2, Duration.ofMillis(1)));
+        assertIllegalArgument("minBatchSize must be positive",
+            () -> AdaptiveBatcher.buffer(Flux.empty(), 0, 2, Duration.ofMillis(1)));
+        assertIllegalArgument("maxBatchSize must be positive",
+            () -> AdaptiveBatcher.buffer(Flux.empty(), 1, 0, Duration.ofMillis(1)));
+        assertIllegalArgument("maxBatchSize must be greater than or equal to minBatchSize",
+            () -> AdaptiveBatcher.buffer(Flux.empty(), 2, 1, Duration.ofMillis(1)));
+        assertIllegalArgument("timeout must not be null",
+            () -> AdaptiveBatcher.buffer(Flux.empty(), 1, 2, null));
+        assertIllegalArgument("timeout must be positive",
+            () -> AdaptiveBatcher.buffer(Flux.empty(), 1, 2, Duration.ZERO));
+        assertIllegalArgument("timeout must be positive",
+            () -> AdaptiveBatcher.buffer(Flux.empty(), 1, 2, Duration.ofMillis(-1)));
+        assertIllegalArgument("scheduler must not be null",
+            () -> AdaptiveBatcher.buffer(Flux.empty(), 1, 2, Duration.ofMillis(1), null));
+    }
 
     @Timeout(10)
     @Test
@@ -148,5 +172,10 @@ public class AdaptiveBatcherTest {
             .expectNextCount(7) // 10+20+40+80+100+100+...
             .thenConsumeWhile(batch -> !batch.isEmpty())
             .verifyComplete();
+    }
+
+    private static void assertIllegalArgument(String message, Executable executable) {
+        var error = Assertions.assertThrows(IllegalArgumentException.class, executable);
+        Assertions.assertEquals(message, error.getMessage());
     }
 }

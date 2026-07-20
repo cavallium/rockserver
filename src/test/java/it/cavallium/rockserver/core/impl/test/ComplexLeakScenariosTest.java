@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -145,12 +146,77 @@ database: {
         assertEquals(0, internal.getOpenIteratorsCount(), "No open iterators after failing putBatch");
     }
 
+    @Test
+    void batch_processing_errors_cancel_publishers_and_release_resources() {
+        var malformedBatch = new KVBatch.KVBatchRef(
+                java.util.List.of(new Keys(new Buf[]{Buf.wrap(intKey(77))})),
+                java.util.List.of()
+        );
+        var publisher = new CancelAwareOneShotPublisher(malformedBatch);
+
+        var failure = assertThrows(RocksDBException.class,
+                () -> db.getSyncApi().putBatch(colId, publisher, PutBatchMode.WRITE_BATCH));
+        assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, failure.getErrorUniqueId());
+        assertTrue(failure.getMessage().contains("PutBatch batch keys count 1 does not match values count 0"));
+
+        sleep(50);
+        assertTrue(publisher.cancelled.get(), "Publisher must be cancelled after processing failure");
+        var internal = db.getInternalDB();
+        assertEquals(0, internal.getPendingOpsCount(), "No pending ops after malformed putBatch");
+        assertEquals(0, internal.getOpenTransactionsCount(), "No open tx after malformed putBatch");
+        assertEquals(0, internal.getOpenIteratorsCount(), "No open iterators after malformed putBatch");
+
+        var malformedMergeBatch = new KVBatch.KVBatchRef(
+                java.util.List.of(new Keys(new Buf[]{Buf.wrap(intKey(78))})),
+                java.util.List.of()
+        );
+        var mergePublisher = new CancelAwareOneShotPublisher(malformedMergeBatch);
+
+        var mergeFailure = assertThrows(RocksDBException.class,
+                () -> db.getSyncApi().mergeBatch(colId, mergePublisher, MergeBatchMode.MERGE_WRITE_BATCH));
+        assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, mergeFailure.getErrorUniqueId());
+        assertTrue(mergeFailure.getMessage().contains("MergeBatch batch keys count 1 does not match values count 0"));
+
+        sleep(50);
+        assertTrue(mergePublisher.cancelled.get(), "Publisher must be cancelled after merge processing failure");
+        assertEquals(0, internal.getPendingOpsCount(), "No pending ops after malformed mergeBatch");
+        assertEquals(0, internal.getOpenTransactionsCount(), "No open tx after malformed mergeBatch");
+        assertEquals(0, internal.getOpenIteratorsCount(), "No open iterators after malformed mergeBatch");
+    }
+
     private static byte[] intKey(int v) {
         return new byte[]{(byte) (v & 0xFF), (byte) ((v >> 8) & 0xFF), (byte) ((v >> 16) & 0xFF), (byte) ((v >> 24) & 0xFF)};
     }
 
     private static void sleep(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException ignored) { }
+    }
+
+    private static final class CancelAwareOneShotPublisher implements org.reactivestreams.Publisher<KVBatch> {
+        private final KVBatch batch;
+        private final AtomicBoolean emitted = new AtomicBoolean();
+        private final AtomicBoolean cancelled = new AtomicBoolean();
+
+        private CancelAwareOneShotPublisher(KVBatch batch) {
+            this.batch = batch;
+        }
+
+        @Override
+        public void subscribe(org.reactivestreams.Subscriber<? super KVBatch> subscriber) {
+            subscriber.onSubscribe(new org.reactivestreams.Subscription() {
+                @Override
+                public void request(long n) {
+                    if (n > 0 && emitted.compareAndSet(false, true)) {
+                        subscriber.onNext(batch);
+                    }
+                }
+
+                @Override
+                public void cancel() {
+                    cancelled.set(true);
+                }
+            });
+        }
     }
 
     private static void invokeCleanup(EmbeddedDB internal) {

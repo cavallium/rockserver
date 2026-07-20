@@ -2,7 +2,6 @@ package it.cavallium.rockserver.core.impl;
 
 import it.cavallium.buffer.Buf;
 import java.util.List;
-import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -12,13 +11,17 @@ public class DelegatingMergeOperator extends FFMAbstractMergeOperator {
 	private volatile FFMAbstractMergeOperator delegate;
 
 	public DelegatingMergeOperator(String name, FFMAbstractMergeOperator delegate) {
+		this(requireArgument(name, "name"), requireArgument(delegate, "delegate"), true);
+	}
+
+	private DelegatingMergeOperator(String name, FFMAbstractMergeOperator delegate, boolean ignored) {
 		super(name);
-		this.delegate = Objects.requireNonNull(delegate);
+		this.delegate = delegate;
 	}
 
 	public void setDelegate(FFMAbstractMergeOperator newDelegate) {
 		FFMAbstractMergeOperator old = this.delegate;
-		this.delegate = Objects.requireNonNull(newDelegate);
+		this.delegate = requireArgument(newDelegate, "newDelegate");
 		if (old != null && old != newDelegate) {
 			try {
 				old.close();
@@ -26,6 +29,13 @@ public class DelegatingMergeOperator extends FFMAbstractMergeOperator {
 				LOG.warn("Failed to close old delegate merge operator", e);
 			}
 		}
+	}
+
+	private static <T> T requireArgument(T value, String name) {
+		if (value == null) {
+			throw new IllegalArgumentException(name + " must not be null");
+		}
+		return value;
 	}
 
 	public FFMAbstractMergeOperator getDelegate() {

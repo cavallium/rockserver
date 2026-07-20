@@ -121,8 +121,8 @@ database: {
         assertEquals(0, internal.getOpenTransactionsCount(), "Open transactions must be zero after randomized run");
         assertEquals(0, internal.getOpenIteratorsCount(), "Open iterators must be zero after randomized run");
 
-        // Explicitly close DB
-        try { db.closeTesting(); db = null; } catch (Exception e) { e.printStackTrace(); }
+        // Explicitly close DB before checking for leaked background threads.
+        closeDbBeforeLeakCheck();
 
         // Wait for background threads to die
         long deadline = System.currentTimeMillis() + 5000;
@@ -136,7 +136,12 @@ database: {
                 }
             }
             if (clean) break;
-            try { Thread.sleep(100); } catch (InterruptedException e) { break; }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
 
         // Final verification
@@ -153,6 +158,19 @@ database: {
         }
         if (err.length() > 0) {
             throw new RuntimeException("Threads leaked:\n" + err);
+        }
+    }
+
+    private void closeDbBeforeLeakCheck() {
+        var connection = db;
+        db = null;
+        if (connection == null) {
+            return;
+        }
+        try {
+            connection.closeTesting();
+        } catch (Exception e) {
+            throw new AssertionError("Failed to close randomized leak stress database before thread leak check", e);
         }
     }
 

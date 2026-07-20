@@ -14,7 +14,6 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
-import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -135,17 +134,36 @@ database: {
 	void grpcMergeReturnsMergedValue() throws Exception {
 		var schema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
 		long colId = embedded.createColumn("c5", schema);
-		var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 8129));
-		server.start();
-		try (var client = GrpcConnection.forHostAndPort("test-client", new it.cavallium.rockserver.core.common.Utils.HostAndPort("127.0.0.1", 8129))) {
-			var api = client.getSyncApi();
-			var key = new Keys(toBufSimple(11));
-			Buf merged = api.merge(0, colId, key, s("q"), RequestType.merged());
-			assertEquals(s("q"), merged);
-			merged = api.merge(0, colId, key, s("r"), RequestType.merged());
-			assertEquals(s("q,r"), merged);
-		} finally {
-			server.close();
+		try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			try (var client = GrpcConnection.forHostAndPort("test-client",
+					new it.cavallium.rockserver.core.common.Utils.HostAndPort("127.0.0.1", server.getPort()))) {
+				var api = client.getSyncApi();
+				var key = new Keys(toBufSimple(11));
+				Buf merged = api.merge(0, colId, key, s("q"), RequestType.merged());
+				assertEquals(s("q"), merged);
+				merged = api.merge(0, colId, key, s("r"), RequestType.merged());
+				assertEquals(s("q,r"), merged);
+			}
+		}
+	}
+
+	@Test
+	void grpcMergeMultiReturnsMergedValues() throws Exception {
+		var schema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
+		long colId = embedded.createColumn("c6", schema);
+		try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			try (var client = GrpcConnection.forHostAndPort("test-client",
+					new it.cavallium.rockserver.core.common.Utils.HostAndPort("127.0.0.1", server.getPort()))) {
+				var api = client.getSyncApi();
+				var keys = List.of(new Keys(toBufSimple(12)), new Keys(toBufSimple(13)));
+				var merged = api.mergeMulti(0, colId, keys, List.of(s("x"), s("y")), RequestType.merged());
+				assertEquals(List.of(s("x"), s("y")), merged);
+
+				merged = api.mergeMulti(0, colId, keys, List.of(s("z"), s("w")), RequestType.merged());
+				assertEquals(List.of(s("x,z"), s("y,w")), merged);
+			}
 		}
 	}
 }

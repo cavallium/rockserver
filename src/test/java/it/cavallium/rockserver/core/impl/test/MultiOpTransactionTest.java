@@ -89,11 +89,7 @@ database: {
 
 		// Check if key1 was persisted.
 		Buf val1 = db.get(0, colIdNoBuckets, key1, RequestType.current());
-		if (val1 != null) {
-			System.out.println("Value 1 after failed putMulti: " + Arrays.toString(Utils.toByteArray(val1)));
-		} else {
-			System.out.println("Value 1 after failed putMulti: null");
-		}
+		Assertions.assertNull(val1, () -> "Failed putMulti persisted key1: " + Arrays.toString(Utils.toByteArray(val1)));
 	}
 
 	private static void assertBufEquals(Buf expected, Buf actual) {

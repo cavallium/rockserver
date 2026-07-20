@@ -20,13 +20,12 @@ import java.security.spec.InvalidKeySpecException;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
 import java.util.Set;
-import java.util.concurrent.LinkedBlockingDeque;
 import java.util.function.BooleanSupplier;
 
 import javax.crypto.NoSuchPaddingException;
 import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SNIServerName;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManagerFactory;
@@ -135,11 +134,31 @@ final class Target_io_netty_handler_ssl_OpenSsl {
 
 	@Alias
 	@RecomputeFieldValue(kind = Kind.FromAlias)
+	private static boolean USE_KEYMANAGER_FACTORY = false;
+
+	@Alias
+	@RecomputeFieldValue(kind = Kind.FromAlias)
 	private static boolean SUPPORTS_OCSP = false;
 
 	@Alias
 	@RecomputeFieldValue(kind = Kind.FromAlias)
-	static Set<String> SUPPORTED_PROTOCOLS_SET = Collections.emptySet();
+	private static boolean TLSV13_SUPPORTED = false;
+
+	@Alias
+	@RecomputeFieldValue(kind = Kind.FromAlias)
+	private static boolean IS_BORINGSSL = false;
+
+	@Alias
+	@RecomputeFieldValue(kind = Kind.FromAlias)
+	private static boolean IS_AWSLC = false;
+
+	@Alias
+	@RecomputeFieldValue(kind = Kind.FromAlias)
+	private static Set<String> CLIENT_DEFAULT_PROTOCOLS = Collections.emptySet();
+
+	@Alias
+	@RecomputeFieldValue(kind = Kind.FromAlias)
+	private static Set<String> SERVER_DEFAULT_PROTOCOLS = Collections.emptySet();
 
 	@Substitute
 	public static boolean isAvailable() {
@@ -182,7 +201,8 @@ final class Target_io_netty_handler_ssl_JdkSslServerContext {
 			String[] protocols,
 			boolean startTls,
 			SecureRandom secureRandom,
-			String keyStore) throws SSLException {
+			String keyStore,
+			Target_io_netty_handler_ssl_ResumptionController resumptionController) throws SSLException {
 	}
 }
 
@@ -204,8 +224,23 @@ final class Target_io_netty_handler_ssl_JdkSslClientContext {
 			long sessionCacheSize,
 			long sessionTimeout,
 			SecureRandom secureRandom,
-			String keyStoreType) throws SSLException {
+			String keyStoreType,
+			String endpointIdentificationAlgorithm,
+			List<SNIServerName> serverNames,
+			Target_io_netty_handler_ssl_ResumptionController resumptionController) throws SSLException {
 	}
+}
+
+@TargetClass(className = "io.netty.handler.ssl.ResumptionController")
+final class Target_io_netty_handler_ssl_ResumptionController {
+
+	@Alias
+	Target_io_netty_handler_ssl_ResumptionController() {
+	}
+}
+
+@TargetClass(className = "io.netty.handler.ssl.OpenSslCredential")
+final class Target_io_netty_handler_ssl_OpenSslCredential {
 }
 
 @TargetClass(className = "io.netty.handler.ssl.SslHandler$SslEngineType")
@@ -263,14 +298,15 @@ final class Target_io_netty_handler_ssl_SslContext {
 			boolean enableOcsp,
 			SecureRandom secureRandom,
 			String keyStoreType,
-			Map.Entry<SslContextOption<?>, Object>... ctxOptions) throws SSLException {
+			Map.Entry<SslContextOption<?>, Object>[] ctxOptions,
+			List<Target_io_netty_handler_ssl_OpenSslCredential> keyMaterialProvider) throws SSLException {
 		if (enableOcsp) {
 			throw new IllegalArgumentException("OCSP is not supported with this SslProvider: " + provider);
 		}
 		return (SslContext) (Object) new Target_io_netty_handler_ssl_JdkSslServerContext(sslContextProvider,
 				trustCertCollection, trustManagerFactory, keyCertChain, key, keyPassword,
 				keyManagerFactory, ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout, clientAuth, protocols,
-				startTls, secureRandom, keyStoreType);
+				startTls, secureRandom, keyStoreType, new Target_io_netty_handler_ssl_ResumptionController());
 	}
 
 	@Substitute
@@ -280,14 +316,17 @@ final class Target_io_netty_handler_ssl_SslContext {
 			KeyManagerFactory keyManagerFactory, Iterable<String> ciphers, CipherSuiteFilter cipherFilter,
 			ApplicationProtocolConfig apn, String[] protocols, long sessionCacheSize, long sessionTimeout,
 			boolean enableOcsp, SecureRandom secureRandom, String keyStoreType,
-			Map.Entry<SslContextOption<?>, Object>... options) throws SSLException {
+			String endpointIdentificationAlgorithm, List<SNIServerName> serverNames,
+			Map.Entry<SslContextOption<?>, Object>[] options,
+			List<Target_io_netty_handler_ssl_OpenSslCredential> keyMaterialProvider) throws SSLException {
 		if (enableOcsp) {
 			throw new IllegalArgumentException("OCSP is not supported with this SslProvider: " + provider);
 		}
 		return (SslContext) (Object) new Target_io_netty_handler_ssl_JdkSslClientContext(sslContextProvider,
 				trustCert, trustManagerFactory, keyCertChain, key, keyPassword,
 				keyManagerFactory, ciphers, cipherFilter, apn, protocols, sessionCacheSize,
-				sessionTimeout, secureRandom, keyStoreType);
+				sessionTimeout, secureRandom, keyStoreType, endpointIdentificationAlgorithm, serverNames,
+				new Target_io_netty_handler_ssl_ResumptionController());
 	}
 
 }
@@ -411,31 +450,6 @@ final class Target_io_netty_bootstrap_AbstractBootstrap {
 		return regFuture;
 
 	}
-}
-
-@TargetClass(className = "io.netty.channel.nio.NioEventLoop")
-final class Target_io_netty_channel_nio_NioEventLoop {
-
-	@Substitute
-	private static Queue<Runnable> newTaskQueue0(int maxPendingTasks) {
-		return new LinkedBlockingDeque<>();
-	}
-}
-
-@TargetClass(className = "io.netty.buffer.AbstractReferenceCountedByteBuf")
-final class Target_io_netty_buffer_AbstractReferenceCountedByteBuf {
-
-	@Alias
-	@RecomputeFieldValue(kind = RecomputeFieldValue.Kind.FieldOffset, name = "refCnt")
-	private static long REFCNT_FIELD_OFFSET;
-}
-
-@TargetClass(className = "io.netty.util.AbstractReferenceCounted")
-final class Target_io_netty_util_AbstractReferenceCounted {
-
-	@Alias
-	@RecomputeFieldValue(kind = RecomputeFieldValue.Kind.FieldOffset, name = "refCnt")
-	private static long REFCNT_FIELD_OFFSET;
 }
 
 // This class is runtime-initialized by NettyProcessor

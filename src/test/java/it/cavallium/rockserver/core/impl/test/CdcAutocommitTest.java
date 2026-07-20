@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.impl.test;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.cdc.CdcCommitMode;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.Keys;
@@ -13,7 +14,6 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -66,10 +66,10 @@ public class CdcAutocommitTest {
                 return Mono.empty();
             }).subscribe(
                     _ -> {},
-                    err -> { /* Expected error */ }
+                    _ -> { /* Expected error */ }
             );
 
-            latch.await(5, TimeUnit.SECONDS);
+            Assertions.assertTrue(latch.await(5, TimeUnit.SECONDS), "Timed out waiting for CDC crash simulation");
             Thread.sleep(100); // Wait for potential async commits
 
             // Resume
@@ -87,10 +87,8 @@ public class CdcAutocommitTest {
 
             Assertions.assertNotNull(resumed);
             Assertions.assertFalse(resumed.isEmpty());
-            long resumedSeq = resumed.get(0).seq();
-            
-            System.out.println("[DEBUG_LOG] StartSeq: " + startSeq + " FirstEvent: " + firstEventSeq.get() + " LastProcessed: " + lastProcessedSeq.get() + " ResumedSeq: " + resumedSeq);
-            
+            long resumedSeq = resumed.getFirst().seq();
+
             // To ensure "perfect" autocommit with no duplicates after crash,
             // we should have committed at least the ones we processed successfully?
             // If we processed 1..4 successfully, and 5 crashed.
@@ -103,9 +101,11 @@ public class CdcAutocommitTest {
             // With current batch implementation, resumedSeq == firstEventSeq.get().
             // This test asserts the DESIRED behavior (No Duplicates).
             Assertions.assertTrue(resumedSeq > firstEventSeq.get(), 
-                "Received duplicate events! Resumed at " + resumedSeq + " but already processed starting from " + firstEventSeq.get());
+                "Received duplicate events; startSeq=" + startSeq + ", firstEventSeq=" + firstEventSeq.get()
+                        + ", lastProcessedSeq=" + lastProcessedSeq.get() + ", resumedSeq=" + resumedSeq);
         } finally {
-            // cleanup
+            Utils.deleteDirectory(dbDir.toString());
+            Files.deleteIfExists(configFile);
         }
     }
 }

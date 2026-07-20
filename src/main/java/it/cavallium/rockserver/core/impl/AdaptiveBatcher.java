@@ -3,7 +3,6 @@ package it.cavallium.rockserver.core.impl;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -56,9 +55,36 @@ public final class AdaptiveBatcher {
      * @return A new Flux that emits lists of buffered items.
      */
     public static <T> Flux<List<T>> buffer(Flux<T> source, int minBatchSize, int maxBatchSize, Duration timeout, Scheduler scheduler) {
+        requireArgument(source, "source");
+        requirePositive(minBatchSize, "minBatchSize");
+        requirePositive(maxBatchSize, "maxBatchSize");
+        if (maxBatchSize < minBatchSize) {
+            throw new IllegalArgumentException("maxBatchSize must be greater than or equal to minBatchSize");
+        }
+        requirePositiveTimeout(timeout);
+        requireArgument(scheduler, "scheduler");
         return Flux.create(sink ->
                 source.subscribe(new AdaptiveSubscriber<>(sink, minBatchSize, maxBatchSize, timeout, scheduler)),
             FluxSink.OverflowStrategy.BUFFER);
+    }
+
+    private static void requireArgument(Object value, String name) {
+        if (value == null) {
+            throw new IllegalArgumentException(name + " must not be null");
+        }
+    }
+
+    private static void requirePositive(int value, String name) {
+        if (value <= 0) {
+            throw new IllegalArgumentException(name + " must be positive");
+        }
+    }
+
+    private static void requirePositiveTimeout(Duration value) {
+        requireArgument(value, "timeout");
+        if (value.isZero() || value.isNegative()) {
+            throw new IllegalArgumentException("timeout must be positive");
+        }
     }
 
     private static final class AdaptiveSubscriber<T> extends BaseSubscriber<T> {
@@ -93,7 +119,7 @@ public final class AdaptiveBatcher {
             this.minBatchSize = minBatchSize;
             this.maxBatchSize = maxBatchSize;
             this.timeoutMillis = timeout.toMillis();
-            this.scheduler = Objects.requireNonNull(scheduler, "scheduler must not be null");
+            this.scheduler = scheduler;
 
             this.currentBatchLimit = minBatchSize;
             this.buffer = new ArrayList<>(minBatchSize);

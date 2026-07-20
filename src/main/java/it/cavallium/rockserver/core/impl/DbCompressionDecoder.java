@@ -35,14 +35,14 @@ public class DbCompressionDecoder implements Decoder<CompressionType> {
 			ConfigNode node,
 			TypeCapture<?> type,
 			DecoderContext decoderContext) {
+		var value = ConfigDecoderSupport.leafValue(path, node, name());
+		if (value.hasErrors()) {
+			return GResultOf.errors(value.getErrors());
+		}
 		try {
-			return GResultOf.resultOf(DatabaseCompression.valueOf(node.getValue().orElseThrow()).compressionType(), List.of());
-		} catch (Exception ex) {
-			return GResultOf.errors(new ValidationError.DecodingNumberFormatException(path,
-					node,
-					name(),
-					decoderContext
-			));
+			return GResultOf.resultOf(DatabaseCompression.valueOf(value.results()).compressionType(), List.of());
+		} catch (IllegalArgumentException ex) {
+			return GResultOf.errors(new ValidationError.EnumValueNotFound(path, value.results(), DatabaseCompression.class));
 		}
 	}
 }

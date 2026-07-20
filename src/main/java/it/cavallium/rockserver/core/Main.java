@@ -1,23 +1,30 @@
 package it.cavallium.rockserver.core;
 
 import static it.cavallium.rockserver.core.client.EmbeddedConnection.PRIVATE_MEMORY_URL;
-import static java.util.Objects.requireNonNull;
 
+import it.cavallium.rockserver.core.cluster.ReplicatedModeConfiguration;
+import it.cavallium.rockserver.core.client.ClientBuilder;
+import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
+import it.cavallium.rockserver.core.replication.ratis.RatisProcessAdapterServerLifecycleFactory;
+import it.cavallium.rockserver.core.replication.ratis.RatisServerLifecycle;
+import it.cavallium.rockserver.core.resources.DefaultConfig;
 import it.cavallium.rockserver.core.server.ServerBuilder;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnixDomainSocketAddress;
-import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import net.sourceforge.argparse4j.ArgumentParsers;
 import net.sourceforge.argparse4j.inf.ArgumentParser;
 import net.sourceforge.argparse4j.inf.ArgumentParserException;
 import net.sourceforge.argparse4j.inf.Namespace;
+import org.github.gestalt.config.exceptions.GestaltException;
 import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,7 +33,8 @@ public class Main {
 
 	private static final Logger LOG = LoggerFactory.getLogger("rockserver-core");
 
-	public static void main(String[] args) throws IOException, URISyntaxException {
+	@SuppressWarnings("HttpUrlsUsage")
+	public static void main(String[] args) throws IOException, URISyntaxException, GestaltException {
 		ArgumentParser parser = ArgumentParsers.newFor("rockserver-core").build()
 				.defaultHelp(true)
 				.description("RocksDB server core");
@@ -60,12 +68,10 @@ public class Main {
 			parser.handleError(e);
 			System.exit(1);
 		}
-		var clientBuilder = new it.cavallium.rockserver.core.client.ClientBuilder();
+		var clientBuilder = new ClientBuilder();
 
 		if (ns.getBoolean("print_default_config")) {
-			requireNonNull(Main.class.getClassLoader()
-					.getResourceAsStream("it/cavallium/rockserver/core/resources/default.conf"))
-					.transferTo(System.out);
+			DefaultConfig.getDefaultConfig().transferTo(System.out);
 			System.exit(0);
 			return;
 		}
@@ -80,6 +86,7 @@ public class Main {
 		var rawGrpcListenUrl = ns.getString("grpc_listen_url");
 		var name = ns.getString("name");
 		var config = ns.getString("config");
+		var configPath = config == null ? null : Path.of(config);
 
 		var databaseUrl = new URI(rawDatabaseUrl);
 		var thriftListenUrl = new URI(rawThriftListenUrl);
@@ -91,9 +98,11 @@ public class Main {
 				System.exit(1);
 				return;
 			} else {
-				clientBuilder.setEmbeddedConfig(Path.of(config));
+				clientBuilder.setEmbeddedConfig(configPath);
 			}
 		}
+		var databaseConfig = configPath == null ? ConfigParser.parseDefault() : ConfigParser.parse(configPath);
+		var replication = ReplicatedModeConfiguration.from(databaseConfig);
 
 		var databaseUrlScheme = databaseUrl.getScheme();
 		switch (databaseUrlScheme) {
@@ -112,11 +121,16 @@ public class Main {
 		buildServerAddress(thriftServerBuilder, thriftListenUrl, true);
 		var grpcServerBuilder = new it.cavallium.rockserver.core.server.ServerBuilder();
 		buildServerAddress(grpcServerBuilder, grpcListenUrl, false);
+		var ratisLifecycle = configuredRatisLifecycle(replication);
+		if (ratisLifecycle != null) {
+			thriftServerBuilder.setRatisLifecycle(ratisLifecycle);
+			grpcServerBuilder.setRatisLifecycle(ratisLifecycle);
+		}
 
 		clientBuilder.setName(name);
 
 		LOG.info("Connecting...");
-		try (var connection = clientBuilder.build()) {
+		try (var connection = configuredConnection(name, clientBuilder, replication)) {
 			try {
 				LOG.info("Connected to {}", connection);
 
@@ -151,5 +165,27 @@ public class Main {
 			case "rocksdb" -> serverBuilder.setAddress(Utils.parseHostAndPort(listenUrl));
 			case null, default -> throw new IllegalArgumentException("Invalid scheme \"" + thriftListenUrlScheme + "\" for listen url: " + listenUrl);
 		}
+	}
+
+	private static RatisServerLifecycle configuredRatisLifecycle(ReplicatedModeConfiguration replication)
+			throws IOException {
+		if (!replication.enabled()) {
+			return null;
+		}
+		return RatisProcessAdapterServerLifecycleFactory.configuredSharedLifecycle(replication);
+	}
+
+	private static RocksDBConnection configuredConnection(String name,
+														 ClientBuilder clientBuilder,
+														 ReplicatedModeConfiguration replication)
+			throws IOException {
+		if (!replication.enabled()) {
+			return clientBuilder.build();
+		}
+		return RatisProcessAdapterServerLifecycleFactory.configuredReplicatedConnection(
+				name,
+				replication,
+				Duration.ofSeconds(10)
+		);
 	}
 }

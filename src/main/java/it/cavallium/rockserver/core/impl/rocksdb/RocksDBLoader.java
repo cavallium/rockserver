@@ -25,7 +25,6 @@ import org.slf4j.Logger;
 
 import static it.cavallium.rockserver.core.common.Utils.mapList;
 import static java.lang.Boolean.parseBoolean;
-import static java.util.Objects.requireNonNull;
 import static org.rocksdb.ColumnFamilyOptionsInterface.DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET;
 
 public class RocksDBLoader {
@@ -103,7 +102,7 @@ public class RocksDBLoader {
         }
 
         if (bugFallbackJniLibraryFileName == null) {
-            throw new RuntimeException("rocksdb was not found inside JAR.");
+            throw new IllegalStateException("RocksDB JNI library was not found inside JAR");
         }
 
         var temp2 = tmpDir.resolve(bugFallbackJniLibraryFileName);
@@ -114,7 +113,7 @@ public class RocksDBLoader {
             }
         }
 
-        throw new RuntimeException("rocksdb was not found inside JAR.");
+        throw new IllegalStateException("RocksDB JNI library was not found inside JAR");
     }
 
     public record LoadedDb(TransactionalDB db, @Nullable Path path, @NotNull Path definitiveDbPath,
@@ -187,8 +186,6 @@ public class RocksDBLoader {
 
             List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, columnOptions);
             if (parentPath != null) {
-                requireNonNull(parentPath);
-                requireNonNull(path.getFileName());
                 List<DbPath> paths = mapList(volumeConfigs, p -> new DbPath(p.path, p.targetSize));
                 columnFamilyOptions.setCfPaths(paths);
             } else if (!volumeConfigs.isEmpty() && (volumeConfigs.size() > 1 || definitiveDbPath.relativize(volumeConfigs.getFirst().path).isAbsolute())) {
@@ -409,7 +406,11 @@ public class RocksDBLoader {
             try {
                 definitiveDbPath = Files.createTempDirectory("temp-rocksdb");
             } catch (IOException e) {
-                throw new RuntimeException(e);
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(
+                        RocksDBErrorType.CONFIG_ERROR,
+                        "Failed to create temporary RocksDB directory",
+                        e
+                );
             }
         }
         var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
@@ -616,19 +617,47 @@ public class RocksDBLoader {
 
     public static List<DbPathRecord> getVolumeConfigs(@NotNull Path definitiveDbPath, FallbackColumnConfig columnConfig)
         throws GestaltException {
-        return ConfigPrinter
-            .getVolumeConfigs(columnConfig)
-            .stream()
-            .map(volumeConfig -> {
-                try {
-                    var volumePath = volumeConfig.volumePath();
-                    Objects.requireNonNull(volumePath, "volumePath is null");
-                    return new DbPathRecord(definitiveDbPath.resolve(volumePath), volumeConfig.targetSize().longValue());
-                } catch (NullPointerException | GestaltException e) {
-                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Failed to load volume configurations", e);
+        VolumeConfig[] volumeConfigs;
+        try {
+            volumeConfigs = columnConfig.volumes();
+        } catch (GestaltException e) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Failed to load volume configurations",
+                    e
+            );
+        }
+        if (volumeConfigs == null) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Volume configurations must not be null");
+        }
+
+        var dbPathRecords = new ArrayList<DbPathRecord>(volumeConfigs.length);
+        for (int i = 0; i < volumeConfigs.length; i++) {
+            var volumeConfig = volumeConfigs[i];
+            if (volumeConfig == null) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "Volume configurations entry " + i + " must not be null");
+            }
+            try {
+                var volumePath = volumeConfig.volumePath();
+                if (volumePath == null) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                            "Volume configurations entry " + i + " volumePath must not be null");
                 }
-            })
-            .toList();
+                var targetSize = volumeConfig.targetSize();
+                if (targetSize == null) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                            "Volume configurations entry " + i + " targetSize must not be null");
+                }
+                dbPathRecords.add(new DbPathRecord(definitiveDbPath.resolve(volumePath), targetSize.longValue()));
+            } catch (GestaltException e) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "Failed to load volume configurations",
+                        e
+                );
+            }
+        }
+        return List.copyOf(dbPathRecords);
     }
 
     private static LoadedDb loadDb(@Nullable Path path,

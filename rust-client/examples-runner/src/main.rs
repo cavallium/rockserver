@@ -1,25 +1,25 @@
-use rockserver_client::{RockserverClient, ColumnSchema};
-use rust_data_generator::stream::{SafeDataInputStream, SafeDataInput};
-use rust_data_generator::datagen::DataSerializer;
 use futures::StreamExt;
-use std::io::Cursor;
+use rockserver_client::{ColumnSchema, RockserverClient};
+use rust_data_generator::datagen::DataSerializer;
+use rust_data_generator::stream::SafeDataInputStream;
 use std::convert::TryInto;
-use std::io::Read;
-use std::io as std_io;
 use std::env;
-use std::time::{Instant, Duration};
+use std::fs::File;
+use std::io as std_io;
+use std::io::Cursor;
+use std::io::Read;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::fs::File;
-use std::io::Write;
+use std::time::{Duration, Instant};
 
 pub mod records {
     include!(concat!(env!("OUT_DIR"), "/generated_records/mod.rs"));
 }
 use records::v0_0_13::*;
 mod query;
-use query::{Query, MessageContext, parse_query};
+use query::{parse_query, MessageContext};
 use serde_json::json;
 
 fn get_chat_entity_id_value(id: &ChatEntityId) -> i64 {
@@ -62,13 +62,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(id) => {
             println!("Created column '{}' with ID: {}", column_name, id);
             id
-        },
+        }
         Err(e) => {
-            eprintln!("Failed to create column (might exist), trying to get ID. Error: {}", e);
+            eprintln!(
+                "Failed to create column (might exist), trying to get ID. Error: {}",
+                e
+            );
             client.get_column_id(column_name.clone()).await?
         }
     };
-    
+
     println!("Using Column ID: {}", column_id);
 
     // Open a transaction for consistent reading
@@ -87,12 +90,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let error_count_log = error_count.clone();
     let match_count_log = match_count.clone();
     let approx_total_count_log = approx_total_count;
-    
+
     tokio::spawn(async move {
         let mut last_log_time = Instant::now();
         let mut last_log_count = 0;
         let log_interval = Duration::from_secs(2);
-        
+
         loop {
             tokio::time::sleep(log_interval).await;
             let current_total = total_count_log.load(Ordering::Relaxed);
@@ -101,26 +104,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let elapsed = start_time.elapsed();
             let interval_elapsed = last_log_time.elapsed();
             let interval_count = current_total - last_log_count;
-            
+
             let current_speed = interval_count as f64 / interval_elapsed.as_secs_f64();
             let total_speed = current_total as f64 / elapsed.as_secs_f64();
 
             let mut log_msg = format!("Progress: {} messages", current_total);
 
             if let Some(total) = approx_total_count_log {
-                let percentage = if total > 0 { (current_total as f64 / total as f64) * 100.0 } else { 0.0 };
+                let percentage = if total > 0 {
+                    (current_total as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                };
                 log_msg.push_str(&format!(" ({:.2}%)", percentage));
             }
 
             log_msg.push_str(&format!(". Time: {:.2}s.", elapsed.as_secs_f64()));
 
             if let Some(total) = approx_total_count_log {
-                let remaining = if total > current_total { total - current_total } else { 0 };
-                let eta_seconds = if total_speed > 0.0 { remaining as f64 / total_speed } else { 0.0 };
+                let remaining = total.saturating_sub(current_total);
+                let eta_seconds = if total_speed > 0.0 {
+                    remaining as f64 / total_speed
+                } else {
+                    0.0
+                };
                 log_msg.push_str(&format!(" ETA: {}.", format_duration(eta_seconds)));
             }
 
-            let match_percent = if current_total > 0 { (current_matches as f64 / current_total as f64) * 100.0 } else { 0.0 };
+            let match_percent = if current_total > 0 {
+                (current_matches as f64 / current_total as f64) * 100.0
+            } else {
+                0.0
+            };
             log_msg.push_str(&format!(" Current Speed: {:.2} msg/s. Total Speed: {:.2} msg/s. Errors: {}. Matches: {} ({:.3}%)", 
                 current_speed, total_speed, current_errors, current_matches, match_percent));
 
@@ -130,7 +145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let parallelism = thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let parallelism = thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
     let shard_count = env::var("SHARD_COUNT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -185,11 +202,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut handles = Vec::new();
     for shard_index in 0..shard_count {
         let client = client.clone();
-        let column_id = column_id;
         let total_count = total_count.clone();
         let error_count = error_count.clone();
         let match_count = match_count.clone();
-        let errors_only = errors_only;
         let search_query = search_query.clone();
         let match_tx = match_tx.clone();
 
@@ -211,9 +226,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let mut batch_matches = 0;
                                         for kv in batch.entries {
                                             batch_count += 1;
-                                            
+
                                             // Decode ChatEntityId (Key Part 1)
-                                            let chat_entity_id_res = if let Some(bytes) = kv.keys.get(0) {
+                                            let chat_entity_id_res = if let Some(bytes) = kv.keys.first() {
                                                 let mut cursor = Cursor::new(bytes);
                                                 let mut input = SafeDataInputStream::new(&mut cursor);
                                                 ChatEntityIdSerializer.deserialize(&mut input)
@@ -231,13 +246,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             } else {
                                                 Err(std_io::Error::new(std_io::ErrorKind::InvalidData, "Missing"))
                                             };
-                                            
+
                                             // Decode Message (Value)
                                             let mut version = 0;
                                             let message_res = if !kv.value.is_empty() {
                                                 let mut cursor = Cursor::new(&kv.value);
                                                 let mut version_buf = [0u8; 1];
-                                                if let Ok(_) = cursor.read_exact(&mut version_buf) {
+                                                if cursor.read_exact(&mut version_buf).is_ok() {
                                                     version = version_buf[0];
                                                     let mut input = SafeDataInputStream::new(&mut cursor);
                                                     match version {
@@ -266,9 +281,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                             let is_missing_key0 = matches!(&chat_entity_id_res, Err(e) if e.to_string() == "Missing");
                                             let is_empty_val = matches!(&message_res, Err(e) if e.to_string() == "EmptyValue" || e.to_string() == "EmptyStream");
-                                            
+
                                             let has_error = (!is_missing_key0 && chat_entity_id_res.is_err()) || (!is_empty_val && message_res.is_err());
-                                            
+
                                             if has_error {
                                                 batch_errors += 1;
                                                 if let Err(e) = &chat_entity_id_res {
@@ -284,7 +299,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
 
                                             if !errors_only || has_error {
-                                                let mut matched = false;
                                                 let mut text_parts: Vec<&str> = Vec::new();
                                                 let mut sender_id_val: Option<i64> = None;
                                                 let mut chat_id_val: Option<i64> = None;
@@ -298,16 +312,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     chat_id_val = Some(cid);
                                                     key_chat_id = Some(cid);
                                                 }
-                                                
+
                                                 if let Ok(id) = &message_id_res {
                                                     key_message_id = Some(*id as i64);
                                                 }
-                                                
+
                                                 if let Ok(msg) = &message_res {
                                                     val_chat_id = Some(get_chat_entity_id_value(&msg.chat_entity_id));
                                                     val_message_id = Some(msg.id);
                                                     sender_id_val = Some(get_chat_entity_id_value(&msg.sender_id));
-                                                    
+
                                                     match &msg.content {
                                                         MessageContent::MessageText(m) => {
                                                             text_parts.push(&m.text.text);
@@ -402,9 +416,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     val_chat_id,
                                                     val_message_id,
                                                 };
-                                                
-                                                matched = search_query.matches(&ctx);
-                                                
+
+                                                let matched = search_query.matches(&ctx);
+
                                                 if matched {
                                                     batch_matches += 1;
 
@@ -419,13 +433,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                             "value": value_obj,
                                                             "serializedVersion": version
                                                         });
-                                                        
+
                                                         let log_line = serde_json::to_string(&json_output).unwrap();
                                                         let _ = tx.send(log_line);
                                                     } else {
-                                                        println!("Match found | ChatId: {} | MessageId: {} | Text: {:?}", 
-                                                            key_chat_id.unwrap_or(0), 
-                                                            key_message_id.unwrap_or(0), 
+                                                        println!("Match found | ChatId: {} | MessageId: {} | Text: {:?}",
+                                                            key_chat_id.unwrap_or(0),
+                                                            key_message_id.unwrap_or(0),
                                                             ctx.text
                                                         );
                                                     }

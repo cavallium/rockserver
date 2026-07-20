@@ -23,6 +23,7 @@ import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 class CdcRandomizedTest {
 
@@ -98,21 +99,21 @@ class CdcRandomizedTest {
 
         // Consume until we reach the end
         long processedEvents = 0;
-        
-        // We expect at least 'iterations' events if we consume everything, 
-        // BUT some ops might be filtered or compacted if we restart? 
+
+        // We expect at least 'iterations' events if we consume everything,
+        // BUT some ops might be filtered or compacted if we restart?
         // No, CDC WAL guarantees all ops are present unless deleted from WAL (which shouldn't happen this fast).
-        
+
         while (true) {
             CdcBatch batch = db.cdcPollBatchAsyncInternal(subId, startSeq, 100).block();
             assertNotNull(batch);
-            
+
             if (batch.events().isEmpty()) {
                 // Check if we are truly at the end (compare with latest seq)
                 // Or simply break if we've processed enough?
                 // The issue is cdcPoll returns empty if no MORE events.
                 // We should be able to read all written events.
-                
+
                 // Let's rely on the fact that we wrote synchronously, so they should be available.
                 // If the loop finishes too early, the size check below will fail.
                 break;
@@ -129,7 +130,7 @@ class CdcRandomizedTest {
                 }
                 processedEvents++;
             }
-            
+
             long lastSeq = batch.events().get(batch.events().size() - 1).seq();
             startSeq = batch.nextSeq();
 
@@ -145,10 +146,10 @@ class CdcRandomizedTest {
         assertEquals(expectedState.size(), reconstructedState.size(), "State size mismatch");
 
         for (Map.Entry<Integer, String> entry : expectedState.entrySet()) {
-            assertEquals(entry.getValue(), reconstructedState.get(entry.getKey()), 
+            assertEquals(entry.getValue(), reconstructedState.get(entry.getKey()),
                     "Mismatch for key " + entry.getKey());
         }
-        
+
         // 4. Verify against DB
         for (Map.Entry<Integer, String> entry : expectedState.entrySet()) {
             Keys key = new Keys(new Buf[]{Buf.wrap(intToBytes(entry.getKey()))});
@@ -156,20 +157,13 @@ class CdcRandomizedTest {
             assertNotNull(dbVal, "DB missing key " + entry.getKey());
             assertEquals(entry.getValue(), new String(dbVal.toByteArray(), StandardCharsets.UTF_8));
         }
-        
+
         // Verify deleted keys are gone from DB
         for (int k = 0; k < keyRange; k++) {
             if (!expectedState.containsKey(k)) {
                 Keys key = new Keys(new Buf[]{Buf.wrap(intToBytes(k))});
                 Buf dbVal = db.get(0, columnId, key, RequestType.current());
-                // Depending on implementation, get might return null or empty or throw.
-                // In embedded DB, usually returns null if not found.
-                if (dbVal != null) {
-                    // Check if it's really empty or just a tombstone?
-                    // RocksDB get returns null if not found.
-                    // EmbeddedDB.get returns null.
-                     assertEquals(null, dbVal, "Key " + k + " should be deleted");
-                }
+                assertNull(dbVal, "Key " + k + " should be deleted");
             }
         }
     }

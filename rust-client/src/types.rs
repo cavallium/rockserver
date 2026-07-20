@@ -1,11 +1,10 @@
-use std::time::Duration;
 use crate::proto;
+use std::time::Duration;
 
 // Re-export proto types that are part of the public API
 pub use crate::proto::{
-    ColumnHashType, Operation, PutBatchMode, MergeBatchMode,
-    Kv, KvBatch, Delta, Previous, Changed, PreviousPresence, Merged, UpdateBegin,
-    FirstAndLast, CdcEvent,
+    CdcEvent, Changed, ColumnHashType, Delta, FirstAndLast, Kv, KvBatch, MergeBatchMode, Merged,
+    Operation, Previous, PreviousPresence, PutBatchMode, UpdateBegin,
 };
 
 /// Schema definition for a column in RockServer.
@@ -30,7 +29,11 @@ impl From<ColumnSchema> for proto::ColumnSchema {
     fn from(val: ColumnSchema) -> Self {
         proto::ColumnSchema {
             fixed_keys: val.fixed_keys,
-            variable_tail_keys: val.variable_tail_keys.into_iter().map(|x| x as i32).collect(),
+            variable_tail_keys: val
+                .variable_tail_keys
+                .into_iter()
+                .map(|x| x as i32)
+                .collect(),
             has_value: val.has_value,
             merge_operator_name: val.merge_operator_name,
             merge_operator_version: val.merge_operator_version,
@@ -44,7 +47,9 @@ impl From<proto::ColumnSchema> for ColumnSchema {
     fn from(val: proto::ColumnSchema) -> Self {
         ColumnSchema {
             fixed_keys: val.fixed_keys,
-            variable_tail_keys: val.variable_tail_keys.into_iter()
+            variable_tail_keys: val
+                .variable_tail_keys
+                .into_iter()
                 .filter_map(|x| ColumnHashType::try_from(x).ok())
                 .collect(),
             has_value: val.has_value,

@@ -13,10 +13,12 @@ import static org.junit.jupiter.api.Assertions.*;
 public class TestReactiveLeak {
     @Test
     public void test() throws Exception {
-        AtomicInteger closedCount = new AtomicInteger();
+        AtomicInteger finalizedCount = new AtomicInteger();
         AtomicInteger createdCount = new AtomicInteger();
 
-        Flux<Integer> source = Flux.range(1, 100).publishOn(Schedulers.boundedElastic());
+        Flux<Integer> source = Flux.range(1, 100)
+                .publishOn(Schedulers.boundedElastic())
+                .doFinally(ignored -> finalizedCount.incrementAndGet());
         
         for (int i = 0; i < 10; i++) {
             source.subscribe(new Subscriber<>() {
@@ -34,17 +36,16 @@ public class TestReactiveLeak {
                 }
                 @Override
                 public void onError(Throwable t) {
-                    closedCount.incrementAndGet();
                 }
                 @Override
                 public void onComplete() {
-                    closedCount.incrementAndGet();
                 }
             });
         }
         
         Thread.sleep(1000);
-        System.out.println("Created: " + createdCount.get() + ", Closed: " + closedCount.get());
-        assertEquals(createdCount.get(), closedCount.get());
+        assertEquals(createdCount.get(), finalizedCount.get(),
+                () -> "Created subscriptions and finalized subscriptions diverged: created="
+                        + createdCount.get() + ", finalized=" + finalizedCount.get());
     }
 }

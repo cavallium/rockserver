@@ -5,12 +5,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.*;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class WriteBatchFormatTest {
 
@@ -103,5 +104,90 @@ public class WriteBatchFormatTest {
                 assertEquals("LOG log", events.get(2));
             }
         }
+    }
+
+    @Test
+    void malformedVarIntFailsAsRocksDBException() {
+        RocksDB.loadLibrary();
+        byte[] data = new byte[14];
+        data[12] = 1;
+        data[13] = (byte) 0x80;
+
+        var error = assertThrows(RocksDBException.class,
+                () -> WriteBatchIterator.iterate(data, noOpHandler()));
+
+        assertTrue(error.getMessage().contains("Malformed VarInt"));
+    }
+
+    @Test
+    void malformedVarStringFailsAsRocksDBException() {
+        RocksDB.loadLibrary();
+        byte[] data = new byte[15];
+        data[12] = 1;
+        data[13] = 2;
+        data[14] = 'a';
+
+        var error = assertThrows(RocksDBException.class,
+                () -> WriteBatchIterator.iterate(data, noOpHandler()));
+
+        assertTrue(error.getMessage().contains("Malformed VarString"));
+    }
+
+    private static WriteBatch.Handler noOpHandler() {
+        return new WriteBatch.Handler() {
+            @Override
+            public void put(int columnFamilyId, byte[] key, byte[] value) {}
+
+            @Override
+            public void put(byte[] key, byte[] value) {}
+
+            @Override
+            public void merge(int columnFamilyId, byte[] key, byte[] value) {}
+
+            @Override
+            public void merge(byte[] key, byte[] value) {}
+
+            @Override
+            public void delete(int columnFamilyId, byte[] key) {}
+
+            @Override
+            public void delete(byte[] key) {}
+
+            @Override
+            public void singleDelete(int columnFamilyId, byte[] key) {}
+
+            @Override
+            public void singleDelete(byte[] key) {}
+
+            @Override
+            public void deleteRange(int columnFamilyId, byte[] beginKey, byte[] endKey) {}
+
+            @Override
+            public void deleteRange(byte[] beginKey, byte[] endKey) {}
+
+            @Override
+            public void logData(byte[] blob) {}
+
+            @Override
+            public void putBlobIndex(int columnFamilyId, byte[] key, byte[] value) {}
+
+            @Override
+            public void markBeginPrepare() {}
+
+            @Override
+            public void markEndPrepare(byte[] xid) {}
+
+            @Override
+            public void markCommit(byte[] xid) {}
+
+            @Override
+            public void markRollback(byte[] xid) {}
+
+            @Override
+            public void markNoop(boolean emptyBatch) {}
+
+            @Override
+            public void markCommitWithTimestamp(byte[] xid, byte[] ts) {}
+        };
     }
 }
