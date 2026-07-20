@@ -1,13 +1,9 @@
 package it.cavallium.rockserver.core.impl;
 
 import it.cavallium.buffer.MemorySegmentBuf;
-import it.cavallium.rockserver.core.impl.rocksdb.RocksDBMetadata;
-import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.regex.Pattern;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.PinnedGet;
@@ -29,47 +25,13 @@ import org.rocksdb.RocksDBException;
  */
 final class NativeRocksDBGet implements AutoCloseable {
 
-	private static final String SUPPORTED_ROCKSDBJNI_VERSION = "11.1.2.4";
-	private static final Pattern SUPPORTED_ROCKSDBJNI_COORDINATE = Pattern.compile(
-			Pattern.quote(SUPPORTED_ROCKSDBJNI_VERSION) + "(?:-master\\.[0-9a-f]{40}-SNAPSHOT)?");
 	private static final int MAX_RETAINED_STATES = 256;
-	private static final int EXPECTED_NATIVE_MAJOR = 11;
-	private static final int EXPECTED_NATIVE_MINOR = 1;
-	private static final int EXPECTED_NATIVE_PATCH = 2;
-
-	static {
-		RocksDB.loadLibrary();
-		String artifactCoordinateVersion = RocksDBMetadata.getRocksDBVersionHash();
-		if (!SUPPORTED_ROCKSDBJNI_COORDINATE.matcher(artifactCoordinateVersion).matches()) {
-			throw new ExceptionInInitializerError("native fast-get requires rocksdbjni "
-					+ SUPPORTED_ROCKSDBJNI_VERSION + " or its full-commit master snapshot, found "
-					+ artifactCoordinateVersion);
-		}
-		String packageVersion = RocksDB.class.getPackage().getImplementationVersion();
-		if (packageVersion != null && !SUPPORTED_ROCKSDBJNI_VERSION.equals(packageVersion)) {
-			throw new ExceptionInInitializerError("native fast-get was built for rocksdbjni "
-					+ SUPPORTED_ROCKSDBJNI_VERSION + ", but the runtime package is " + packageVersion);
-		}
-		var nativeVersion = RocksDB.rocksdbVersion();
-		if (nativeVersion.getMajor() != EXPECTED_NATIVE_MAJOR
-				|| nativeVersion.getMinor() != EXPECTED_NATIVE_MINOR
-				|| nativeVersion.getPatch() != EXPECTED_NATIVE_PATCH) {
-			throw new ExceptionInInitializerError("native fast-get requires native RocksDB "
-					+ EXPECTED_NATIVE_MAJOR + "." + EXPECTED_NATIVE_MINOR + "." + EXPECTED_NATIVE_PATCH
-					+ ", found " + nativeVersion);
-		}
-	}
-
-	static void ensureRuntimeCompatible() {
-		// Force all coordinate and native-link checks before opening the database.
-	}
 
 	private final RocksDB database;
 	private final ReadOptions defaultReadOptions;
 	private final AtomicReferenceArray<State> availableStates;
 	private final AtomicReferenceArray<State> allRetainedStates;
 	private final AtomicInteger retainedStateCount = new AtomicInteger();
-	private final LongAdder releasedTransientCalls = new LongAdder();
 	private final AtomicBoolean closed = new AtomicBoolean();
 
 	NativeRocksDBGet(RocksDB database, long requestedRetainedStateCapacity) {
@@ -83,7 +45,7 @@ final class NativeRocksDBGet implements AutoCloseable {
 		this.database = database;
 		this.availableStates = new AtomicReferenceArray<>(capacity);
 		this.allRetainedStates = new AtomicReferenceArray<>(capacity);
-		this.defaultReadOptions = new ReadOptions().setAsyncIo(true);
+		this.defaultReadOptions = new ReadOptions();
 	}
 
 	byte @Nullable [] getHeap(ColumnFamilyHandle columnFamily,
@@ -105,7 +67,6 @@ final class NativeRocksDBGet implements AutoCloseable {
 			byte[] key,
 			int keyOffset,
 			int keyLength) throws RocksDBException {
-		validate(columnFamily, defaultReadOptions, key, keyOffset, keyLength);
 		State state = acquireState();
 		boolean leased = false;
 		try {
@@ -127,53 +88,12 @@ final class NativeRocksDBGet implements AutoCloseable {
 			byte[] key,
 			int keyOffset,
 			int keyLength) throws RocksDBException {
-		validate(columnFamily, readOptions, key, keyOffset, keyLength);
 		State state = acquireState();
 		try {
 			return state.getHeap(database, columnFamily, readOptions, key, keyOffset, keyLength);
 		} finally {
 			releaseState(state);
 		}
-	}
-
-	private void validate(ColumnFamilyHandle columnFamily,
-			ReadOptions readOptions,
-			byte[] key,
-			int keyOffset,
-			int keyLength) {
-		Objects.checkFromIndexSize(keyOffset, keyLength, key.length);
-		if (closed.get()) {
-			throw new IllegalStateException("native fast-get has already been closed");
-		}
-		if (columnFamily.getNativeHandle() == 0) {
-			throw new IllegalArgumentException("ColumnFamilyHandle has already been closed");
-		}
-		if (readOptions.getNativeHandle() == 0) {
-			throw new IllegalArgumentException("ReadOptions has already been closed");
-		}
-	}
-
-	long getCallsCount() {
-		long calls = releasedTransientCalls.sum();
-		for (int i = 0; i < allRetainedStates.length(); i++) {
-			State state = allRetainedStates.get(i);
-			if (state != null) {
-				calls += state.calls;
-			}
-		}
-		return calls;
-	}
-
-	int getRetainedStateCount() {
-		return retainedStateCount.get();
-	}
-
-	int getRetainedStateCapacity() {
-		return allRetainedStates.length();
-	}
-
-	boolean isClosed() {
-		return closed.get();
 	}
 
 	@Override
@@ -211,7 +131,7 @@ final class NativeRocksDBGet implements AutoCloseable {
 		State state = new State();
 		int retainedSlot = reserveRetainedStateSlot();
 		if (retainedSlot >= 0) {
-			state.retain(retainedSlot);
+			state.retain(retainedSlot, start);
 			allRetainedStates.set(retainedSlot, state);
 		}
 		return state;
@@ -231,11 +151,7 @@ final class NativeRocksDBGet implements AutoCloseable {
 
 	private void releaseState(State state) {
 		if (state.retainedSlot < 0) {
-			try {
-				state.close();
-			} finally {
-				releasedTransientCalls.add(state.calls);
-			}
+			state.close();
 			return;
 		}
 		int capacity = availableStates.length();
@@ -327,15 +243,14 @@ final class NativeRocksDBGet implements AutoCloseable {
 		private final PinnedGet pinnedGet = new PinnedGet();
 		private int retainedSlot = -1;
 		private int preferredSlot;
-		private long calls;
 		private boolean closed;
 
-		private void retain(int slot) {
+		private void retain(int slot, int initialPreferredSlot) {
 			if (retainedSlot >= 0) {
 				throw new IllegalStateException("native fast-get state is already retained");
 			}
 			retainedSlot = slot;
-			preferredSlot = slot;
+			preferredSlot = initialPreferredSlot;
 		}
 
 		private byte @Nullable [] getHeap(RocksDB database,
@@ -344,11 +259,7 @@ final class NativeRocksDBGet implements AutoCloseable {
 				byte[] key,
 				int keyOffset,
 				int keyLength) throws RocksDBException {
-			try {
-				return database.getPinnedCopy(columnFamily, readOptions, key, keyOffset, keyLength, pinnedGet);
-			} finally {
-				calls++;
-			}
+			return database.getPinnedCopy(columnFamily, readOptions, key, keyOffset, keyLength, pinnedGet);
 		}
 
 		private boolean getPinned(RocksDB database,
@@ -357,11 +268,7 @@ final class NativeRocksDBGet implements AutoCloseable {
 				byte[] key,
 				int keyOffset,
 				int keyLength) throws RocksDBException {
-			try {
-				return database.getPinned(columnFamily, readOptions, key, keyOffset, keyLength, pinnedGet);
-			} finally {
-				calls++;
-			}
+			return database.getPinned(columnFamily, readOptions, key, keyOffset, keyLength, pinnedGet);
 		}
 
 		@Override

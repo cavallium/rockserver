@@ -129,7 +129,7 @@ import reactor.core.publisher.SynchronousSink;
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
 	/** Output ownership requested by the embedded gRPC unary-Get fast path. */
-	public enum GrpcGetOutput {
+	public enum FastGetOutput {
 		EXACT_HEAP,
 		PINNED,
 		AUTOMATIC
@@ -139,7 +139,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * A wire-ready current value. Pinned values remain valid only until this
 	 * result is closed; heap and missing results are independently owned.
 	 */
-	public static final class GrpcGetResult implements AutoCloseable {
+	public static final class FastGetResult implements AutoCloseable {
 
 		private final boolean present;
 		private final @Nullable Buf value;
@@ -147,7 +147,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final @Nullable Runnable closeAction;
 		private final AtomicBoolean closed = new AtomicBoolean();
 
-		private GrpcGetResult(boolean present,
+		private FastGetResult(boolean present,
 				@Nullable Buf value,
 				boolean pinned,
 				@Nullable Runnable closeAction) {
@@ -180,8 +180,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private static final int GRPC_PINNED_MIN_BYTES_OVERRIDE = Integer.getInteger(
-			"rockserver.grpc.fast-get.pinned-min-bytes", -1);
+	private static final int PINNED_GET_MIN_BYTES_OVERRIDE = Integer.getInteger(
+			"rockserver.fast-get.pinned-min-bytes", -1);
 
 	private static final int RANGE_READ_CHUNK_SIZE = 1_024;
 	private static final int RANGE_READ_MAX_PHYSICAL_KEYS_PER_CHUNK = 4_096;
@@ -308,9 +308,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
 					"Database read and write parallelism must be positive, but was read="
 							+ readCap + ", write=" + writeCap);
-		}
-		if (fastGet) {
-			NativeRocksDBGet.ensureRuntimeCompatible();
 		}
 
 		this.metrics = new MetricsManager(config);
@@ -3614,12 +3611,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	/**
-	 * Attempts the embedded-only unary current-value Get path used by gRPC.
+	 * Attempts the embedded fast path for a current-value Get.
 	 *
 	 * @return a result (including a missing result), or {@code null} when this
 	 *     column/database must use the ordinary API path.
 	 */
-	public @Nullable GrpcGetResult tryGetForGrpc(long columnId, Keys keys, GrpcGetOutput output) {
+	public @Nullable FastGetResult tryGetFast(long columnId, Keys keys, FastGetOutput output) {
 		Objects.requireNonNull(keys, "keys");
 		Objects.requireNonNull(output, "output");
 		if (!fastGet) {
@@ -3644,33 +3641,32 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			int keyOffset = calculatedKey.getBackingByteArrayOffset();
 			int keyLength = calculatedKey.getBackingByteArrayLength();
 
-			if (output == GrpcGetOutput.EXACT_HEAP) {
+			if (output == FastGetOutput.EXACT_HEAP) {
 				byte[] value = reader.getHeap(col.cfh(), keyArray, keyOffset, keyLength);
 				return value == null
-						? new GrpcGetResult(false, null, false, null)
-						: new GrpcGetResult(true, Buf.wrap(value), false, null);
+						? new FastGetResult(false, null, false, null)
+						: new FastGetResult(true, Buf.wrap(value), false, null);
 			}
 
 			NativeRocksDBGet.PinnedGetLease lease = reader.getPinned(
 					col.cfh(), keyArray, keyOffset, keyLength);
 			if (lease == null) {
-				return new GrpcGetResult(false, null, false, null);
+				return new FastGetResult(false, null, false, null);
 			}
 			boolean leaseTransferred = false;
 			try {
-				var pinnedValue = lease.value();
-				boolean keepPinned = output == GrpcGetOutput.PINNED
-						|| prefersPinnedGrpcGet(pinnedValue.size());
-				if (!keepPinned) {
-					byte[] value = lease.copyAndClose();
-					return new GrpcGetResult(true, Buf.wrap(value), false, null);
-				}
+					if (output != FastGetOutput.PINNED
+							&& !prefersPinnedFastGet(lease.value().size())) {
+						byte[] value = lease.copyAndClose();
+						return new FastGetResult(true, Buf.wrap(value), false, null);
+					}
 
-				ColumnInstance leasedColumn = col;
-				var result = new GrpcGetResult(true,
+					var pinnedValue = lease.value();
+					ColumnInstance leasedColumn = col;
+				var result = new FastGetResult(true,
 						pinnedValue,
 						true,
-						() -> closeGrpcPinnedGet(lease, leasedColumn, start));
+						() -> closePinnedFastGet(lease, leasedColumn, start));
 				ownershipTransferred = true;
 				leaseTransferred = true;
 				return result;
@@ -3694,16 +3690,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private static boolean prefersPinnedGrpcGet(int valueBytes) {
-		if (GRPC_PINNED_MIN_BYTES_OVERRIDE >= 0) {
-			return valueBytes >= GRPC_PINNED_MIN_BYTES_OVERRIDE;
+	private static boolean prefersPinnedFastGet(int valueBytes) {
+		if (PINNED_GET_MIN_BYTES_OVERRIDE >= 0) {
+			return valueBytes >= PINNED_GET_MIN_BYTES_OVERRIDE;
 		}
-		return valueBytes <= 128
-				| valueBytes >= 512 && valueBytes <= 4 * 1024
-				| valueBytes >= 32 * 1024;
+		return valueBytes >= 32 * 1024;
 	}
 
-	private void closeGrpcPinnedGet(NativeRocksDBGet.PinnedGetLease lease,
+	private void closePinnedFastGet(NativeRocksDBGet.PinnedGetLease lease,
 			ColumnInstance col,
 			long start) {
 		Throwable failure = null;
@@ -6092,26 +6086,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public boolean isExpiredRangeCleanupScheduledForTesting() {
 		return !expiredRangeCleanupTask.isCancelled() && !expiredRangeCleanupTask.isDone();
-	}
-
-	@VisibleForTesting
-	public long getFastGetNativeCallsCount() {
-		return fastGetReader != null ? fastGetReader.getCallsCount() : 0;
-	}
-
-	@VisibleForTesting
-	public int getFastGetRetainedStateCount() {
-		return fastGetReader != null ? fastGetReader.getRetainedStateCount() : 0;
-	}
-
-	@VisibleForTesting
-	public int getFastGetRetainedStateCapacity() {
-		return fastGetReader != null ? fastGetReader.getRetainedStateCapacity() : 0;
-	}
-
-	@VisibleForTesting
-	public boolean isFastGetReaderClosed() {
-		return fastGetReader == null || fastGetReader.isClosed();
 	}
 
 	@VisibleForTesting

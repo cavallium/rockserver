@@ -73,7 +73,7 @@ class GrpcFastGetTest {
 		String previousStrategy = System.getProperty("rockserver.grpc.fast-get.strategy");
 		try (var embedded = openEmbedded("all-strategies")) {
 			long columnId = populate(embedded);
-			for (String strategy : new String[]{"legacy", "exact-heap", "pinned-streaming", "automatic"}) {
+			for (String strategy : new String[]{"legacy", "exact-heap", "pinned", "automatic"}) {
 				System.setProperty("rockserver.grpc.fast-get.strategy", strategy);
 				try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 					server.start();
@@ -177,7 +177,7 @@ class GrpcFastGetTest {
 		String previousStrategy = System.getProperty("rockserver.grpc.fast-get.strategy");
 		try (var embedded = openEmbedded("gzip")) {
 			long columnId = populate(embedded);
-			System.setProperty("rockserver.grpc.fast-get.strategy", "pinned-streaming");
+			System.setProperty("rockserver.grpc.fast-get.strategy", "pinned");
 			try (var server = new GrpcServer(embedded, new InetSocketAddress("0.0.0.0", 0))) {
 				server.start();
 				try (var client = ClientHandle.forTcp(remoteAddress.getHostAddress(), server.getPort())) {
@@ -201,7 +201,7 @@ class GrpcFastGetTest {
 					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 			int valueSize = 32 * 1024 * 1024;
 			api.put(0, columnId, keys(7), Buf.wrap(value(7, valueSize)), RequestType.none());
-			System.setProperty("rockserver.grpc.fast-get.strategy", "pinned-streaming");
+			System.setProperty("rockserver.grpc.fast-get.strategy", "pinned");
 
 			try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 				server.start();

@@ -1093,7 +1093,7 @@ public final class GrpcFastGetBenchmark {
 	}
 
 	private enum Strategy {
-		LEGACY("legacy"), EXACT_HEAP("exact-heap"), PINNED("pinned-streaming"), AUTOMATIC("automatic");
+		LEGACY("legacy"), EXACT_HEAP("exact-heap"), PINNED("pinned"), AUTOMATIC("automatic");
 
 		private final String propertyValue;
 

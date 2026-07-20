@@ -134,7 +134,7 @@ public class GrpcServer extends Server {
 	private enum GrpcGetStrategy {
 		LEGACY,
 		EXACT_HEAP,
-		PINNED_STREAMING,
+		PINNED,
 		AUTOMATIC;
 
 		private static GrpcGetStrategy configured() {
@@ -144,7 +144,7 @@ public class GrpcServer extends Server {
 			return switch (value) {
 				case "legacy" -> LEGACY;
 				case "exact-heap", "heap" -> EXACT_HEAP;
-				case "pinned-streaming", "pinned" -> PINNED_STREAMING;
+				case "pinned" -> PINNED;
 				case "automatic", "auto" -> AUTOMATIC;
 				default -> throw new IllegalArgumentException(
 						"Unknown rockserver.grpc.fast-get.strategy: " + value);
@@ -464,13 +464,13 @@ public class GrpcServer extends Server {
 		private final boolean present;
 		private final @Nullable Buf value;
 		private final boolean pinned;
-		private final @Nullable EmbeddedDB.GrpcGetResult owner;
+		private final @Nullable EmbeddedDB.FastGetResult owner;
 		private final AtomicBoolean closed = new AtomicBoolean();
 
 		private FastGetResponse(boolean present,
 				@Nullable Buf value,
 				boolean pinned,
-				@Nullable EmbeddedDB.GrpcGetResult owner) {
+				@Nullable EmbeddedDB.FastGetResult owner) {
 			if (present != (value != null)) {
 				throw new IllegalArgumentException("present Get responses must have a value, including empty values");
 			}
@@ -1327,13 +1327,13 @@ public class GrpcServer extends Server {
 				@Nullable EmbeddedDB embeddedDatabase) {
 			Keys keys = mapKeys(request.getKeysCount(), request::getKeys);
 			if (request.getTransactionOrUpdateId() == 0 && embeddedDatabase != null) {
-				EmbeddedDB.GrpcGetOutput output = switch (strategy) {
-					case EXACT_HEAP -> EmbeddedDB.GrpcGetOutput.EXACT_HEAP;
-					case PINNED_STREAMING -> EmbeddedDB.GrpcGetOutput.PINNED;
-					case AUTOMATIC -> EmbeddedDB.GrpcGetOutput.AUTOMATIC;
+				EmbeddedDB.FastGetOutput output = switch (strategy) {
+					case EXACT_HEAP -> EmbeddedDB.FastGetOutput.EXACT_HEAP;
+					case PINNED -> EmbeddedDB.FastGetOutput.PINNED;
+					case AUTOMATIC -> EmbeddedDB.FastGetOutput.AUTOMATIC;
 					case LEGACY -> throw new IllegalStateException("legacy Get cannot use the custom binding");
 				};
-				EmbeddedDB.GrpcGetResult result = embeddedDatabase.tryGetForGrpc(
+				EmbeddedDB.FastGetResult result = embeddedDatabase.tryGetFast(
 						request.getColumnId(), keys, output);
 				if (result != null) {
 					try {
