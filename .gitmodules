@@ -1,3 +1,6 @@
 [submodule "rust-client/rust-data-generator"]
 	path = rust-client/rust-data-generator
 	url = ssh://git@ssh.git.mchv.eu:2222/andreacavalli/rust-data-generator.git
+[submodule "rocksdbjni"]
+	path = rocksdbjni
+	url = ssh://git@git.tgdb.org:2222/andreacavalli/rocksdb-rockserver.git
