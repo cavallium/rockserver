@@ -16,7 +16,7 @@ through 4 KiB, and at or above 32 KiB. The remaining bands use independently
 owned heap output. Operators can replace that table with one cutoff by setting
 `-Drockserver.grpc.fast-get.pinned-min-bytes=<bytes>`. The
 `rockserver.grpc.fast-get.strategy` property accepts `legacy`, `exact-heap`,
-`pinned-streaming`, and `automatic`; the non-automatic values exist for the
+`pinned`, and `automatic`; the non-automatic values exist for the
 performance matrix and operational comparison.
 
 Run the five-round real-RocksDB/local-gRPC release gate with:
