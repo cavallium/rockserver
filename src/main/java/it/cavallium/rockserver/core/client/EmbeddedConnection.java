@@ -88,6 +88,11 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public EmbeddedDB getEmbeddedDB() {
+		return db;
+	}
+
+	@Override
 	public long openTransaction(long timeoutMs) {
 		return db.openTransaction(timeoutMs);
 	}

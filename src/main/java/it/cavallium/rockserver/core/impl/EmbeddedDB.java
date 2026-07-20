@@ -128,6 +128,61 @@ import reactor.core.publisher.SynchronousSink;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
+	/** Output ownership requested by the embedded gRPC unary-Get fast path. */
+	public enum GrpcGetOutput {
+		EXACT_HEAP,
+		PINNED,
+		AUTOMATIC
+	}
+
+	/**
+	 * A wire-ready current value. Pinned values remain valid only until this
+	 * result is closed; heap and missing results are independently owned.
+	 */
+	public static final class GrpcGetResult implements AutoCloseable {
+
+		private final boolean present;
+		private final @Nullable Buf value;
+		private final boolean pinned;
+		private final @Nullable Runnable closeAction;
+		private final AtomicBoolean closed = new AtomicBoolean();
+
+		private GrpcGetResult(boolean present,
+				@Nullable Buf value,
+				boolean pinned,
+				@Nullable Runnable closeAction) {
+			this.present = present;
+			this.value = value;
+			this.pinned = pinned;
+			this.closeAction = closeAction;
+		}
+
+		public boolean isPresent() {
+			return present;
+		}
+
+		public @Nullable Buf value() {
+			if (closed.get()) {
+				throw new IllegalStateException("gRPC Get result has already been closed");
+			}
+			return value;
+		}
+
+		public boolean isPinned() {
+			return pinned;
+		}
+
+		@Override
+		public void close() {
+			if (closed.compareAndSet(false, true) && closeAction != null) {
+				closeAction.run();
+			}
+		}
+	}
+
+	private static final int GRPC_PINNED_MIN_BYTES_OVERRIDE = Integer.getInteger(
+			"rockserver.grpc.fast-get.pinned-min-bytes", -1);
+
 	private static final int RANGE_READ_CHUNK_SIZE = 1_024;
 	private static final int RANGE_READ_MAX_PHYSICAL_KEYS_PER_CHUNK = 4_096;
 	private static final long RANGE_READ_MAX_DECODED_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
@@ -207,8 +262,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Counter cdcBytesEmitted;
 	private final RocksDBStatistics rocksDBStatistics;
 	private final boolean fastGet;
-	private final @Nullable FFMRocksDBGet fastGetReader;
-	private final LongAdder fastGetNativeErrorFallbacks = new LongAdder();
+	private final @Nullable NativeRocksDBGet fastGetReader;
 	private volatile @Nullable Consumer<Boolean> rangeReadOptionsObserver;
 	private volatile @Nullable Consumer<Boolean> reduceRangeAsyncIoObserver;
 	private volatile @Nullable Runnable rangeIteratorOpenObserver;
@@ -256,7 +310,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							+ readCap + ", write=" + writeCap);
 		}
 		if (fastGet) {
-			FFMRocksDBGet.ensureRuntimeCompatible();
+			NativeRocksDBGet.ensureRuntimeCompatible();
 		}
 
 		this.metrics = new MetricsManager(config);
@@ -394,7 +448,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache, this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig);
 		this.scheduler = new RWScheduler(readCap, writeCap, "db[" + name + "]");
-		this.fastGetReader = fastGet ? new FFMRocksDBGet(db.get(), (long) readCap + writeCap) : null;
+		this.fastGetReader = fastGet ? new NativeRocksDBGet(db.get(), (long) readCap + writeCap) : null;
 		this.leakScheduler = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("db-leak-scheduler"));
 
 		leakScheduler.scheduleWithFixedDelay(this::cleanupExpiredTransactionsNow, 1, 1, TimeUnit.MINUTES);
@@ -869,12 +923,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			logger.error("Error closing metrics manager{}", forced ? " (forced)" : "", t);
 		}
 
-		// No operations remain, so native key scratch and C-API wrapper segments can be released before their handles.
+		// No operations remain, so pinned values and native key segments can be released before their RocksDB handles.
 		if (fastGetReader != null) {
 			try {
 				fastGetReader.close();
 			} catch (Throwable t) {
-				logger.error("Error closing FFM fast-get{}", forced ? " (forced)" : "", t);
+				logger.error("Error closing native fast-get{}", forced ? " (forced)" : "", t);
 			}
 		}
 
@@ -3559,6 +3613,136 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return col.schema().hasValue() ? realPreviousValue : (realPreviousValue != null ? emptyBuf() : null);
 	}
 
+	/**
+	 * Attempts the embedded-only unary current-value Get path used by gRPC.
+	 *
+	 * @return a result (including a missing result), or {@code null} when this
+	 *     column/database must use the ordinary API path.
+	 */
+	public @Nullable GrpcGetResult tryGetForGrpc(long columnId, Keys keys, GrpcGetOutput output) {
+		Objects.requireNonNull(keys, "keys");
+		Objects.requireNonNull(output, "output");
+		if (!fastGet) {
+			return null;
+		}
+
+		long start = System.nanoTime();
+		ColumnInstance col = null;
+		boolean operationStarted = false;
+		boolean ownershipTransferred = false;
+		try {
+			col = beginColumnUse(columnId);
+			if (col.hasBuckets() || !col.schema().hasValue()) {
+				return null;
+			}
+			ops.beginOp();
+			operationStarted = true;
+
+			Buf calculatedKey = col.calculateKey(keys.keys());
+			var reader = Objects.requireNonNull(fastGetReader);
+			byte[] keyArray = calculatedKey.getBackingByteArray();
+			int keyOffset = calculatedKey.getBackingByteArrayOffset();
+			int keyLength = calculatedKey.getBackingByteArrayLength();
+
+			if (output == GrpcGetOutput.EXACT_HEAP) {
+				byte[] value = reader.getHeap(col.cfh(), keyArray, keyOffset, keyLength);
+				return value == null
+						? new GrpcGetResult(false, null, false, null)
+						: new GrpcGetResult(true, Buf.wrap(value), false, null);
+			}
+
+			NativeRocksDBGet.PinnedGetLease lease = reader.getPinned(
+					col.cfh(), keyArray, keyOffset, keyLength);
+			if (lease == null) {
+				return new GrpcGetResult(false, null, false, null);
+			}
+			boolean leaseTransferred = false;
+			try {
+				var pinnedValue = lease.value();
+				boolean keepPinned = output == GrpcGetOutput.PINNED
+						|| prefersPinnedGrpcGet(pinnedValue.size());
+				if (!keepPinned) {
+					byte[] value = lease.copyAndClose();
+					return new GrpcGetResult(true, Buf.wrap(value), false, null);
+				}
+
+				ColumnInstance leasedColumn = col;
+				var result = new GrpcGetResult(true,
+						pinnedValue,
+						true,
+						() -> closeGrpcPinnedGet(lease, leasedColumn, start));
+				ownershipTransferred = true;
+				leaseTransferred = true;
+				return result;
+			} finally {
+				if (!leaseTransferred) {
+					lease.close();
+				}
+			}
+		} catch (org.rocksdb.RocksDBException exception) {
+			throw RocksDBException.of(RocksDBErrorType.GET_1, exception);
+		} finally {
+			if (!ownershipTransferred) {
+				if (operationStarted) {
+					ops.endOp();
+				}
+				if (col != null) {
+					col.endUse();
+				}
+				getTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+			}
+		}
+	}
+
+	private static boolean prefersPinnedGrpcGet(int valueBytes) {
+		if (GRPC_PINNED_MIN_BYTES_OVERRIDE >= 0) {
+			return valueBytes >= GRPC_PINNED_MIN_BYTES_OVERRIDE;
+		}
+		return valueBytes <= 128
+				| valueBytes >= 512 && valueBytes <= 4 * 1024
+				| valueBytes >= 32 * 1024;
+	}
+
+	private void closeGrpcPinnedGet(NativeRocksDBGet.PinnedGetLease lease,
+			ColumnInstance col,
+			long start) {
+		Throwable failure = null;
+		try {
+			lease.close();
+		} catch (Throwable exception) {
+			failure = exception;
+		}
+		try {
+			ops.endOp();
+		} catch (Throwable exception) {
+			if (failure == null) {
+				failure = exception;
+			} else {
+				failure.addSuppressed(exception);
+			}
+		}
+		try {
+			col.endUse();
+		} catch (Throwable exception) {
+			if (failure == null) {
+				failure = exception;
+			} else {
+				failure.addSuppressed(exception);
+			}
+		} finally {
+			getTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+		}
+		if (failure instanceof RuntimeException runtimeException) {
+			throw runtimeException;
+		}
+		if (failure instanceof Error error) {
+			throw error;
+		}
+		if (failure != null) {
+			throw new IllegalStateException("Failed to close pinned gRPC Get", failure);
+		}
+	}
+
 	@Override
 	public <T> T get(long transactionOrUpdateId, long columnId, Keys keys, RequestGet<? super Buf, T> requestType)
 			throws RocksDBException {
@@ -5789,46 +5973,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Buf calculatedKey,
 			boolean useDefaultReadOptions)
 			throws org.rocksdb.RocksDBException {
-		var db = this.db.get();
-		try {
-			var reader = Objects.requireNonNull(fastGetReader);
-			byte[] value = useDefaultReadOptions
-					? reader.get(cfh,
-							calculatedKey.getBackingByteArray(),
-							calculatedKey.getBackingByteArrayOffset(),
-							calculatedKey.getBackingByteArrayLength())
-					: reader.get(cfh,
-							Objects.requireNonNull(readOptions),
-							calculatedKey.getBackingByteArray(),
-							calculatedKey.getBackingByteArrayOffset(),
-							calculatedKey.getBackingByteArrayLength());
-			return toBuf(value);
-		} catch (FFMRocksDBGet.NativeError nativeError) {
-			if (!nativeError.isRocksDBStatus()) {
-				var exception = new org.rocksdb.RocksDBException("FFM fast-get failed: " + nativeError.getMessage());
-				exception.initCause(nativeError);
-				throw exception;
-			}
-			// The C API exposes errors as strings. Retry only an actual RocksDB status through JNI so callers retain the
-			// exact typed Status (timeout, corruption, I/O error, etc.); infrastructure failures above never downgrade.
-			fastGetNativeErrorFallbacks.increment();
-			if (readOptions != null) {
-				return toBuf(db.get(cfh,
-						readOptions,
+		var reader = Objects.requireNonNull(fastGetReader);
+		byte[] value = useDefaultReadOptions
+				? reader.getHeap(cfh,
 						calculatedKey.getBackingByteArray(),
 						calculatedKey.getBackingByteArrayOffset(),
-						calculatedKey.getBackingByteArrayLength()
-				));
-			}
-			try (var fallbackReadOptions = newReadOptions("ffm-fast-get-error-fallback")) {
-				return toBuf(db.get(cfh,
-						fallbackReadOptions,
+						calculatedKey.getBackingByteArrayLength())
+				: reader.getHeap(cfh,
+						Objects.requireNonNull(readOptions),
 						calculatedKey.getBackingByteArray(),
 						calculatedKey.getBackingByteArrayOffset(),
-						calculatedKey.getBackingByteArrayLength()
-				));
-			}
-		}
+						calculatedKey.getBackingByteArrayLength());
+		return toBuf(value);
 	}
 
 	private ColumnInstance getColumn(long columnId) {
@@ -5941,11 +6097,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public long getFastGetNativeCallsCount() {
 		return fastGetReader != null ? fastGetReader.getCallsCount() : 0;
-	}
-
-	@VisibleForTesting
-	public long getFastGetNativeErrorFallbacksCount() {
-		return fastGetNativeErrorFallbacks.sum();
 	}
 
 	@VisibleForTesting

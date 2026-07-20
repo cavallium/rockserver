@@ -134,7 +134,6 @@ public final class FastGetBenchmark {
 			var keys = BenchmarkKeys.create(options.hotKeys(), options.writerKeys(), options.missKeyCount());
 			preload(api, columnId, keys, options);
 
-			long fallbackBeforeWarmup = connection.getInternalDB().getFastGetNativeErrorFallbacksCount();
 			if (options.warmupSeconds() > 0) {
 				System.out.printf("[%s] warmup %ds...%n", scenarioName, options.warmupSeconds());
 				runPhase(api,
@@ -148,7 +147,6 @@ public final class FastGetBenchmark {
 						false);
 			}
 
-			long fallbackAfterWarmup = connection.getInternalDB().getFastGetNativeErrorFallbacksCount();
 			System.out.printf("[%s] measuring %ds...%n", scenarioName, options.measureSeconds());
 			var phase = runPhase(api,
 					connection.getInternalDB(),
@@ -165,8 +163,6 @@ public final class FastGetBenchmark {
 					fastGet,
 					scanMode,
 					phase,
-					fallbackAfterWarmup - fallbackBeforeWarmup,
-					connection.getInternalDB().getFastGetNativeErrorFallbacksCount() - fallbackAfterWarmup,
 					connection.getInternalDB().getPendingOpsCount(),
 					connection.getInternalDB().getOpenIteratorsCount(),
 					connection.getInternalDB().getOpenTransactionsCount());
@@ -683,7 +679,7 @@ public final class FastGetBenchmark {
 		System.out.printf(Locale.ROOT,
 				"RESULT round=%d fast=%-5s scan=%-8s read=%10.0f ops/s (hit=%9.0f mutable=%8.0f miss=%8.0f) "
 						+ "p50=%7.1fus p95=%7.1fus p99=%7.1fus max=%8.1fus write=%9.0f/s scan=%7.1f MiB/s "
-						+ "firstLast=%d deadline=%d scanDeadline=%d nativeErrorFallback[warmup=%d measured=%d] "
+						+ "firstLast=%d deadline=%d scanDeadline=%d "
 						+ "samples=%d dropped=%d errors=%d cleanup[time=%.1fms pending=%d iter=%d tx=%d]%n",
 				result.round(),
 				result.fastGet(),
@@ -701,8 +697,6 @@ public final class FastGetBenchmark {
 				phase.firstLast(),
 				phase.firstLastDeadlines(),
 				phase.scanDeadlines(),
-				result.warmupNativeErrorFallbacks(),
-				result.measuredNativeErrorFallbacks(),
 				phase.latencySamples(),
 				phase.droppedLatencySamples(),
 				phase.errors(),
@@ -725,19 +719,14 @@ public final class FastGetBenchmark {
 			}
 			double normalRate = normal.stream().mapToDouble(ScenarioResult::readRate).average().orElseThrow();
 			double fastRate = fast.stream().mapToDouble(ScenarioResult::readRate).average().orElseThrow();
-			long fastFallbacks = fast.stream().mapToLong(ScenarioResult::measuredNativeErrorFallbacks).sum();
 			System.out.printf(Locale.ROOT,
-					"scan=%-8s normal=%,.0f ops/s fast=%,.0f ops/s speedup=%.3fx measured-native-error-fallbacks=%d%n",
+					"scan=%-8s normal=%,.0f ops/s fast=%,.0f ops/s speedup=%.3fx%n",
 					scanMode.cliName,
 					normalRate,
 					fastRate,
-					fastRate / normalRate,
-					fastFallbacks);
+					fastRate / normalRate);
 		}
-		long warmupFallbacks = results.stream().mapToLong(ScenarioResult::warmupNativeErrorFallbacks).sum();
-		long measuredFallbacks = results.stream().mapToLong(ScenarioResult::measuredNativeErrorFallbacks).sum();
 		long typedDeadlines = results.stream().mapToLong(result -> result.phase().firstLastDeadlines()).sum();
-		System.out.printf("Native-error fallbacks: warmup=%d measured=%d%n", warmupFallbacks, measuredFallbacks);
 		System.out.printf("firstAndLast typed deadlines: %d%n", typedDeadlines);
 	}
 
@@ -993,8 +982,6 @@ public final class FastGetBenchmark {
 			boolean fastGet,
 			ScanMode scanMode,
 			PhaseResult phase,
-			long warmupNativeErrorFallbacks,
-			long measuredNativeErrorFallbacks,
 			long pendingOps,
 			int openIterators,
 			int openTransactions) {

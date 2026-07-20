@@ -15,7 +15,7 @@
     <maven.compiler.release>25</maven.compiler.release>
     <native.maven.plugin.version>0.10.6</native.maven.plugin.version>
     <gestalt.version>0.37.2</gestalt.version>
-    <rocksdb.version>11.1.2.2</rocksdb.version>
+    <rocksdb.version>11.1.2.4</rocksdb.version>
     <slf4j.version>2.0.17</slf4j.version>
     <imageName>rockserver-core</imageName>
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
@@ -114,7 +114,7 @@
     <dependency>
       <groupId>it.cavallium</groupId>
       <artifactId>datagen</artifactId>
-      <version>1.1.49</version>
+      <version>1.1.56</version>
     </dependency>
     <dependency>
       <groupId>it.cavallium</groupId>
@@ -198,6 +198,11 @@
     <dependency>
       <groupId>io.netty</groupId>
       <artifactId>netty-transport-native-epoll</artifactId>
+      <version>${netty.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-transport-native-unix-common</artifactId>
       <version>${netty.version}</version>
     </dependency>
     <dependency>
@@ -388,10 +393,16 @@
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
+        <configuration>
+          <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+        </configuration>
       </plugin>
       <plugin>
         <artifactId>maven-failsafe-plugin</artifactId>
         <version>3.5.3</version>
+        <configuration>
+          <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+        </configuration>
       </plugin>
 
       <plugin>

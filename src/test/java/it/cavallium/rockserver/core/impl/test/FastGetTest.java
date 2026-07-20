@@ -29,7 +29,7 @@ class FastGetTest {
 	Path tempDir;
 
 	@Test
-	void ffmGetBypassesKeyMayExistAndMatchesOrdinaryGet() throws Exception {
+	void nativePinnedGetBypassesKeyMayExistAndMatchesOrdinaryGet() throws Exception {
 		System.setProperty("rockserver.core.print-config", "false");
 		Path configFile = writeConfig("rockserver.conf", true);
 
@@ -48,10 +48,12 @@ class FastGetTest {
 			api.put(0, columnId, emptyKey, emptyValue, RequestType.none());
 
 			long callsBefore = connection.getInternalDB().getFastGetNativeCallsCount();
-			assertEquals(nonEmptyValue, api.get(0, columnId, nonEmptyKey, RequestType.current()));
+			Buf retainedValue = api.get(0, columnId, nonEmptyKey, RequestType.current());
+			assertEquals(nonEmptyValue, retainedValue);
 			assertEquals(emptyValue, api.get(0, columnId, emptyKey, RequestType.current()));
+			assertEquals(nonEmptyValue, retainedValue,
+					"a returned Buf must remain valid after its pooled PinnedGet is reused");
 			assertEquals(callsBefore + 2, connection.getInternalDB().getFastGetNativeCallsCount());
-			assertEquals(0, connection.getInternalDB().getFastGetNativeErrorFallbacksCount());
 			api.flush();
 		}
 
@@ -62,11 +64,9 @@ class FastGetTest {
 
 			assertEquals(nonEmptyValue, api.get(0, columnId, nonEmptyKey, RequestType.current()));
 			assertEquals(emptyValue, api.get(0, columnId, emptyKey, RequestType.current()),
-					"FFM must distinguish a real zero-length value from a missing key");
+					"native pinned Get must distinguish a real zero-length value from a missing key");
 			assertNull(api.get(0, columnId, missingKey, RequestType.current()));
 			assertEquals(callsBefore + 3, connection.getInternalDB().getFastGetNativeCallsCount());
-			assertEquals(0, connection.getInternalDB().getFastGetNativeErrorFallbacksCount(),
-					"ordinary cold SST reads must not use an exception-driven cache-tier probe");
 		}
 
 		Path ordinaryConfigFile = writeConfig("rockserver-ordinary.conf", false);
@@ -81,7 +81,7 @@ class FastGetTest {
 	}
 
 	@Test
-	void ffmStatePoolIsBoundedAcrossVirtualThreadChurnAndCloses() throws Exception {
+	void nativePinnedStatePoolIsBoundedAcrossVirtualThreadChurnAndCloses() throws Exception {
 		System.setProperty("rockserver.core.print-config", "false");
 		Path configFile = writeConfig("rockserver-concurrent.conf", true);
 		Path databasePath = tempDir.resolve("concurrent-db");
@@ -133,11 +133,10 @@ class FastGetTest {
 					"short-lived virtual threads must reuse the bounded state pool");
 			assertEquals(callsBefore + (long) concurrentReaders * readsPerReader + churnReads,
 					internalDb.getFastGetNativeCallsCount());
-			assertEquals(0, internalDb.getFastGetNativeErrorFallbacksCount());
 		}
 
 		assertTrue(internalDb.isFastGetReaderClosed(),
-				"closing the database must release the reusable native ReadOptions and state memory");
+				"closing the database must release the reusable ReadOptions and PinnedGet holders");
 	}
 
 	private Path writeConfig(String fileName, boolean fastGet) throws Exception {

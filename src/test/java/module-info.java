@@ -12,8 +12,15 @@ module rockserver.core.test {
 	requires org.junit.jupiter.params;
 	requires org.apache.httpcomponents.client5.httpclient5;
 	requires io.grpc;
+	requires io.grpc.netty;
+	requires io.netty.common;
+	requires io.netty.transport;
+	requires io.netty.transport.classes.epoll;
+	requires io.netty.transport.unix.common;
 	requires io.netty.codec.http2;
 	requires java.logging;
+	requires java.management;
+	requires jdk.management;
 	requires reactor.core;
 	requires org.apache.thrift;
 	requires jdk.unsupported;

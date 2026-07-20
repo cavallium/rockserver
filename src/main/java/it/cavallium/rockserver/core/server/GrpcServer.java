@@ -11,11 +11,17 @@ import com.google.protobuf.Message;
 import com.google.protobuf.UnsafeByteOperations;
 import io.grpc.Context;
 import io.grpc.Deadline;
+import io.grpc.Drainable;
+import io.grpc.Grpc;
+import io.grpc.KnownLength;
 import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
 import io.grpc.ServerCall;
 import io.grpc.ServerCall.Listener;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
+import io.grpc.ServerMethodDefinition;
+import io.grpc.ServerServiceDefinition;
 import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.StatusException;
@@ -53,6 +59,7 @@ import it.cavallium.rockserver.core.common.api.proto.Delta;
 import it.cavallium.rockserver.core.common.api.proto.FirstAndLast;
 import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.impl.InternalConnection;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.Int2IntFunction;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
@@ -61,12 +68,19 @@ import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import it.cavallium.buffer.Buf;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.net.SocketAddress;
+import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.StringJoiner;
 import java.util.concurrent.Callable;
@@ -77,6 +91,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -87,6 +102,7 @@ import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.Disposables;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.util.context.ContextView;
@@ -112,6 +128,29 @@ public class GrpcServer extends Server {
 	private final io.grpc.Server server;
 	private final RWScheduler scheduler;
 	private final boolean ownsScheduler;
+	private final @Nullable EmbeddedDB embeddedDatabase;
+	private final GrpcGetStrategy grpcGetStrategy;
+
+	private enum GrpcGetStrategy {
+		LEGACY,
+		EXACT_HEAP,
+		PINNED_STREAMING,
+		AUTOMATIC;
+
+		private static GrpcGetStrategy configured() {
+			String value = System.getProperty("rockserver.grpc.fast-get.strategy", "automatic")
+					.strip()
+					.toLowerCase(Locale.ROOT);
+			return switch (value) {
+				case "legacy" -> LEGACY;
+				case "exact-heap", "heap" -> EXACT_HEAP;
+				case "pinned-streaming", "pinned" -> PINNED_STREAMING;
+				case "automatic", "auto" -> AUTOMATIC;
+				default -> throw new IllegalArgumentException(
+						"Unknown rockserver.grpc.fast-get.strategy: " + value);
+			};
+		}
+	}
 
 	private static void logUncontextualizedLateError(Throwable error) {
 		var rocksError = GrpcServerImpl.findRocksDBException(error);
@@ -191,13 +230,16 @@ public class GrpcServer extends Server {
 		if (client instanceof InternalConnection internalConnection) {
 			this.scheduler = internalConnection.getScheduler();
 			this.ownsScheduler = false;
+			this.embeddedDatabase = internalConnection.getEmbeddedDB();
 		} else {
 			this.scheduler = new RWScheduler(Runtime.getRuntime().availableProcessors(),
 					Runtime.getRuntime().availableProcessors(),
 					"grpc-db"
 			);
 			this.ownsScheduler = true;
+			this.embeddedDatabase = null;
 		}
+		this.grpcGetStrategy = GrpcGetStrategy.configured();
 		this.grpc = new GrpcServerImpl(this.getClient());
 		EventLoopGroup elg;
 		Class<? extends ServerChannel> channelType;
@@ -209,6 +251,9 @@ public class GrpcServer extends Server {
 			channelType = NioServerSocketChannel.class;
 		}
 		this.elg = elg;
+		ServerServiceDefinition service = grpcGetStrategy == GrpcGetStrategy.LEGACY
+				? grpc.bindService()
+				: bindFastGetService();
 		this.server = NettyServerBuilder
 				.forAddress(socketAddress)
 				.bossEventLoopGroup(elg)
@@ -217,10 +262,10 @@ public class GrpcServer extends Server {
 				.channelType(channelType)
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
 				.maxInboundMessageSize(512 * 1024 * 1024)
-				.addService(grpc)
+				.addService(service)
 				.permitKeepAliveWithoutCalls(true)
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)
-				.intercept(new GzipCompressorInterceptor())
+				.intercept(new AdaptiveCompressionInterceptor())
 				.build();
 		LOG.info("GRPC RocksDB server is listening at " + socketAddress);
 	}
@@ -249,14 +294,357 @@ public class GrpcServer extends Server {
 		return ExpectedGrpcStreamCloseLogFilter.isExpectedClientCancellation(record);
 	}
 
-	private static class GzipCompressorInterceptor implements ServerInterceptor {
+	private static class AdaptiveCompressionInterceptor implements ServerInterceptor {
 
 		@Override
 		public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
 				Metadata headers,
 				ServerCallHandler<ReqT, RespT> next) {
-			call.setCompression("gzip");
+			SocketAddress remoteAddress = call.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
+			call.setCompression(shouldCompressGrpcResponse(remoteAddress) ? "gzip" : "identity");
 			return next.startCall(call, headers);
+		}
+	}
+
+	@VisibleForTesting
+	public static boolean shouldCompressGrpcResponse(@Nullable SocketAddress remoteAddress) {
+		if (remoteAddress instanceof DomainSocketAddress) {
+			return false;
+		}
+		if (remoteAddress instanceof InetSocketAddress inetSocketAddress) {
+			var address = inetSocketAddress.getAddress();
+			if (address != null) {
+				return !address.isLoopbackAddress();
+			}
+			return !inetSocketAddress.getHostString().equalsIgnoreCase("localhost");
+		}
+		return true;
+	}
+
+	private ServerServiceDefinition bindFastGetService() {
+		ServerServiceDefinition generated = grpc.bindService();
+		var builder = ServerServiceDefinition.builder(generated.getServiceDescriptor().getName());
+		String getMethodName = RocksDBServiceGrpc.getGetMethod().getFullMethodName();
+		for (ServerMethodDefinition<?, ?> method : generated.getMethods()) {
+			if (method.getMethodDescriptor().getFullMethodName().equals(getMethodName)) {
+				builder.addMethod(fastGetMethodDescriptor(), new FastGetCallHandler());
+			} else {
+				addUnchangedMethod(builder, method);
+			}
+		}
+		return builder.build();
+	}
+
+	private static MethodDescriptor<GetRequest, FastGetResponse> fastGetMethodDescriptor() {
+		var generated = RocksDBServiceGrpc.getGetMethod();
+		return generated.toBuilder(generated.getRequestMarshaller(), FastGetResponseMarshaller.INSTANCE).build();
+	}
+
+	@SuppressWarnings({"rawtypes", "unchecked"})
+	private static void addUnchangedMethod(ServerServiceDefinition.Builder builder,
+			ServerMethodDefinition<?, ?> method) {
+		builder.addMethod((ServerMethodDefinition) method);
+	}
+
+	private final class FastGetCallHandler implements ServerCallHandler<GetRequest, FastGetResponse> {
+
+		@Override
+		public Listener<GetRequest> startCall(ServerCall<GetRequest, FastGetResponse> call, Metadata headers) {
+			call.request(2);
+			Context callContext = Context.current();
+			return new Listener<>() {
+				private final AtomicBoolean cancelled = new AtomicBoolean();
+				private final AtomicBoolean halfClosed = new AtomicBoolean();
+				private final AtomicReference<Disposable> task = new AtomicReference<>();
+				private @Nullable GetRequest request;
+
+				@Override
+				public void onMessage(GetRequest message) {
+					if (request != null) {
+						cancelled.set(true);
+						call.close(Status.INVALID_ARGUMENT.withDescription("Unary Get received multiple requests"),
+								new Metadata());
+						return;
+					}
+					request = message;
+				}
+
+				@Override
+				public void onHalfClose() {
+					if (!halfClosed.compareAndSet(false, true) || cancelled.get()) {
+						return;
+					}
+					GetRequest currentRequest = request;
+					if (currentRequest == null) {
+						cancelled.set(true);
+						call.close(Status.INVALID_ARGUMENT.withDescription("Unary Get received no request"),
+								new Metadata());
+						return;
+					}
+
+					Disposable scheduled;
+					try {
+						scheduled = scheduler.interactiveRead().schedule(callContext.wrap(
+								() -> runFastGetCall(call, currentRequest, cancelled)));
+					} catch (Throwable schedulingError) {
+						closeFastGetFailure(call, currentRequest, schedulingError, cancelled);
+						return;
+					}
+					task.set(scheduled);
+					if (cancelled.get()) {
+						scheduled.dispose();
+					}
+				}
+
+				@Override
+				public void onCancel() {
+					cancelled.set(true);
+					Disposable scheduled = task.get();
+					if (scheduled != null) {
+						scheduled.dispose();
+					}
+				}
+			};
+		}
+	}
+
+	private void runFastGetCall(ServerCall<GetRequest, FastGetResponse> call,
+			GetRequest request,
+			AtomicBoolean cancelled) {
+		FastGetResponse response = null;
+		try {
+			if (cancelled.get() || call.isCancelled()) {
+				return;
+			}
+			response = grpc.createFastGetResponse(request, grpcGetStrategy, embeddedDatabase);
+			if (cancelled.get() || call.isCancelled()) {
+				return;
+			}
+			call.sendHeaders(new Metadata());
+			if (cancelled.get() || call.isCancelled()) {
+				return;
+			}
+			call.sendMessage(response);
+			response.close();
+			response = null;
+			if (!cancelled.get() && !call.isCancelled()) {
+				call.close(Status.OK, new Metadata());
+			}
+		} catch (Throwable error) {
+			closeFastGetFailure(call, request, error, cancelled);
+		} finally {
+			if (response != null) {
+				try {
+					response.close();
+				} catch (Throwable closeError) {
+					if (!cancelled.get() && !call.isCancelled()) {
+						LOG.error("Failed to close a unary Get response after framing", closeError);
+					}
+				}
+			}
+		}
+	}
+
+	private void closeFastGetFailure(ServerCall<GetRequest, FastGetResponse> call,
+			GetRequest request,
+			Throwable error,
+			AtomicBoolean cancelled) {
+		if (cancelled.get() || call.isCancelled()) {
+			return;
+		}
+		cancelled.set(true);
+		Throwable mapped = grpc.mapRequestError("get", request, error);
+		Status status = Status.fromThrowable(mapped);
+		Metadata trailers = Status.trailersFromThrowable(mapped);
+		call.close(status, trailers != null ? trailers : new Metadata());
+	}
+
+	private static final class FastGetResponse implements AutoCloseable {
+
+		private final boolean present;
+		private final @Nullable Buf value;
+		private final boolean pinned;
+		private final @Nullable EmbeddedDB.GrpcGetResult owner;
+		private final AtomicBoolean closed = new AtomicBoolean();
+
+		private FastGetResponse(boolean present,
+				@Nullable Buf value,
+				boolean pinned,
+				@Nullable EmbeddedDB.GrpcGetResult owner) {
+			if (present != (value != null)) {
+				throw new IllegalArgumentException("present Get responses must have a value, including empty values");
+			}
+			this.present = present;
+			this.value = value;
+			this.pinned = pinned;
+			this.owner = owner;
+		}
+
+		private InputStream openStream() {
+			if (closed.get()) {
+				throw new IllegalStateException("Get response has already been closed");
+			}
+			return new FastGetInputStream(present, value, pinned);
+		}
+
+		@Override
+		public void close() {
+			if (closed.compareAndSet(false, true) && owner != null) {
+				owner.close();
+			}
+		}
+	}
+
+	private enum FastGetResponseMarshaller implements MethodDescriptor.Marshaller<FastGetResponse> {
+		INSTANCE;
+
+		@Override
+		public InputStream stream(FastGetResponse value) {
+			return value.openStream();
+		}
+
+		@Override
+		public FastGetResponse parse(InputStream stream) {
+			try {
+				GetResponse parsed = GetResponse.parseFrom(stream);
+				return parsed.hasValue()
+						? new FastGetResponse(true, Buf.wrap(parsed.getValue().toByteArray()), false, null)
+						: new FastGetResponse(false, null, false, null);
+			} catch (IOException exception) {
+				throw Status.INTERNAL.withDescription("Invalid Get response").withCause(exception).asRuntimeException();
+			}
+		}
+	}
+
+	private static final class FastGetInputStream extends InputStream implements Drainable, KnownLength {
+
+		private static final int COPY_CHUNK_BYTES = 16 * 1024;
+		private static final ThreadLocal<byte[]> COPY_CHUNK = ThreadLocal.withInitial(
+				() -> new byte[COPY_CHUNK_BYTES]);
+
+		private final byte[] prefix;
+		private final @Nullable Buf value;
+		private final boolean pinned;
+		private int prefixOffset;
+		private int valueOffset;
+
+		private FastGetInputStream(boolean present, @Nullable Buf value, boolean pinned) {
+			this.value = value;
+			this.pinned = pinned;
+			this.prefix = present ? protobufBytesPrefix(Objects.requireNonNull(value).size()) : new byte[0];
+			long totalLength = (long) prefix.length + (value != null ? value.size() : 0L);
+			if (totalLength > Integer.MAX_VALUE) {
+				throw new IllegalArgumentException("Get response exceeds the gRPC message length limit: " + totalLength);
+			}
+		}
+
+		@Override
+		public int read() {
+			if (prefixOffset < prefix.length) {
+				return prefix[prefixOffset++] & 0xff;
+			}
+			if (value == null || valueOffset >= value.size()) {
+				return -1;
+			}
+			return value.getByte(valueOffset++) & 0xff;
+		}
+
+		@Override
+		public int read(byte[] target, int offset, int length) {
+			Objects.checkFromIndexSize(offset, length, target.length);
+			if (length == 0) {
+				return 0;
+			}
+			int copied = 0;
+			if (prefixOffset < prefix.length) {
+				int count = Math.min(length, prefix.length - prefixOffset);
+				System.arraycopy(prefix, prefixOffset, target, offset, count);
+				prefixOffset += count;
+				offset += count;
+				length -= count;
+				copied += count;
+			}
+			if (length > 0 && value != null && valueOffset < value.size()) {
+				int count = Math.min(length, value.size() - valueOffset);
+				if (pinned) {
+					MemorySegment.copy(value.asMemorySegmentStrict(),
+							ValueLayout.JAVA_BYTE,
+							valueOffset,
+							target,
+							offset,
+							count);
+				} else {
+					System.arraycopy(value.getBackingByteArray(),
+							value.getBackingByteArrayOffset() + valueOffset,
+							target,
+							offset,
+							count);
+				}
+				valueOffset += count;
+				copied += count;
+			}
+			return copied == 0 ? -1 : copied;
+		}
+
+		@Override
+		public int drainTo(OutputStream target) throws IOException {
+			int written = 0;
+			if (prefixOffset < prefix.length) {
+				int count = prefix.length - prefixOffset;
+				target.write(prefix, prefixOffset, count);
+				prefixOffset = prefix.length;
+				written += count;
+			}
+			if (value == null || valueOffset >= value.size()) {
+				return written;
+			}
+			int remaining = value.size() - valueOffset;
+			if (!pinned) {
+				target.write(value.getBackingByteArray(),
+						value.getBackingByteArrayOffset() + valueOffset,
+						remaining);
+				valueOffset += remaining;
+				return written + remaining;
+			}
+
+			MemorySegment segment = value.asMemorySegmentStrict();
+			byte[] chunk = COPY_CHUNK.get();
+			while (remaining > 0) {
+				int count = Math.min(remaining, chunk.length);
+				MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, valueOffset, chunk, 0, count);
+				target.write(chunk, 0, count);
+				valueOffset += count;
+				remaining -= count;
+				written += count;
+			}
+			return written;
+		}
+
+		@Override
+		public int available() {
+			return prefix.length - prefixOffset + (value != null ? value.size() - valueOffset : 0);
+		}
+
+		private static byte[] protobufBytesPrefix(int valueLength) {
+			byte[] result = new byte[1 + varintSize(valueLength)];
+			result[0] = 0x0a;
+			int value = valueLength;
+			int index = 1;
+			while ((value & ~0x7f) != 0) {
+				result[index++] = (byte) ((value & 0x7f) | 0x80);
+				value >>>= 7;
+			}
+			result[index] = (byte) value;
+			return result;
+		}
+
+		private static int varintSize(int value) {
+			int size = 1;
+			while ((value & ~0x7f) != 0) {
+				size++;
+				value >>>= 7;
+			}
+			return size;
 		}
 	}
 
@@ -932,6 +1320,41 @@ public class GrpcServer extends Server {
 				}
 				return responseBuilder.build();
 			}, true).transform(this.onErrorMapMonoWithRequestInfo("get", request));
+		}
+
+		private FastGetResponse createFastGetResponse(GetRequest request,
+				GrpcGetStrategy strategy,
+				@Nullable EmbeddedDB embeddedDatabase) {
+			Keys keys = mapKeys(request.getKeysCount(), request::getKeys);
+			if (request.getTransactionOrUpdateId() == 0 && embeddedDatabase != null) {
+				EmbeddedDB.GrpcGetOutput output = switch (strategy) {
+					case EXACT_HEAP -> EmbeddedDB.GrpcGetOutput.EXACT_HEAP;
+					case PINNED_STREAMING -> EmbeddedDB.GrpcGetOutput.PINNED;
+					case AUTOMATIC -> EmbeddedDB.GrpcGetOutput.AUTOMATIC;
+					case LEGACY -> throw new IllegalStateException("legacy Get cannot use the custom binding");
+				};
+				EmbeddedDB.GrpcGetResult result = embeddedDatabase.tryGetForGrpc(
+						request.getColumnId(), keys, output);
+				if (result != null) {
+					try {
+						return new FastGetResponse(result.isPresent(),
+								result.value(),
+								result.isPinned(),
+								result);
+					} catch (Throwable error) {
+						result.close();
+						throw error;
+					}
+				}
+			}
+
+			Buf current = api.get(request.getTransactionOrUpdateId(),
+					request.getColumnId(),
+					keys,
+					new RequestCurrent<>());
+			return current != null
+					? new FastGetResponse(true, current, false, null)
+					: new FastGetResponse(false, null, false, null);
 		}
 
 		@Override

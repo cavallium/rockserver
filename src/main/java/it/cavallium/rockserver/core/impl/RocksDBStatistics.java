@@ -64,6 +64,7 @@ public class RocksDBStatistics {
 		this.metrics = metrics;
 		this.tickerMap = new EnumMap<>(Arrays
 				.stream(TickerType.values())
+				.filter(tickerType -> tickerType != TickerType.TICKER_ENUM_MAX)
 				.collect(Collectors.toMap(Function.identity(),
 						tickerType -> io.micrometer.core.instrument.Counter
 								.builder("rocksdb.statistics")
@@ -73,6 +74,7 @@ public class RocksDBStatistics {
 				)));
 		this.histogramMap = new EnumMap<>(Arrays
 				.stream(HistogramType.values())
+				.filter(histogramType -> histogramType != HistogramType.HISTOGRAM_ENUM_MAX)
 				.collect(Collectors.toMap(Function.identity(),
 						histogramType -> MultiGauge
 								.builder("rocksdb.statistics")
