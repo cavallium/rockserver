@@ -25,6 +25,12 @@ class RocksDBLoaderWalConfigTest {
     }
 
     @Test
+    void boundsLiveWalDebtByDefault() throws Exception {
+        assertEquals(4L * 1024 * 1024 * 1024,
+                ConfigParser.parseDefault().global().maxTotalWalSize().longValue());
+    }
+
+    @Test
     void systemPropertyOverridesConfiguredDefault() throws Exception {
         System.setProperty(WAL_TTL_SECONDS_PROPERTY, "172800");
         assertEquals(172_800L,

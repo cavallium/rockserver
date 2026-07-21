@@ -40,6 +40,8 @@ public interface GlobalDatabaseConfig {
 
 	@Nullable DataSize databaseWriteBufferSize() throws GestaltException;
 
+	@Nullable DataSize maxTotalWalSize() throws GestaltException;
+
 	@Nullable Path logPath() throws GestaltException;
 
 	@Nullable Path walPath() throws GestaltException;

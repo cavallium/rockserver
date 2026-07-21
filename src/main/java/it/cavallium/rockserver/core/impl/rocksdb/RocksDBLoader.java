@@ -683,6 +683,9 @@ public class RocksDBLoader {
             long dbWriteBufferSize = Optional.ofNullable(databaseOptions.global().databaseWriteBufferSize())
                     .map(DataSize::longValue)
                     .orElse(0L);
+            long maxTotalWalSize = Optional.ofNullable(databaseOptions.global().maxTotalWalSize())
+                    .map(DataSize::longValue)
+                    .orElse(0L);
             long walTtlSeconds = resolveWalTtlSeconds(databaseOptions.global());
 
             options
@@ -692,7 +695,7 @@ public class RocksDBLoader {
 
                     .setWalTtlSeconds(walTtlSeconds)
                     .setWalSizeLimitMB(0) // Auto
-                    .setMaxTotalWalSize(0) // AUto
+                    .setMaxTotalWalSize(maxTotalWalSize)
             ;
             long blockCacheSize;
             if (path != null) {
