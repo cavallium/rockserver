@@ -4,7 +4,6 @@ import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import com.google.protobuf.UnsafeByteOperations;
@@ -72,7 +71,8 @@ import java.util.Map;
 import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
@@ -93,7 +93,8 @@ import static it.cavallium.rockserver.core.common.Utils.toBuf;
 public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcConnection.class);
-	private static final Executor DIRECT_EXECUTOR = MoreExecutors.directExecutor();
+	private static final int EVENT_LOOP_THREADS_PER_CONNECTION = 1;
+	private static final long CALLBACK_EXECUTOR_SHUTDOWN_SECONDS = 5;
 	private static final String MAX_RETRY_ATTEMPTS_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.max-retry-attempts";
 	private static final String INITIAL_RETRY_BACKOFF_PROPERTY
@@ -107,6 +108,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	public static final int DEFAULT_MAX_INBOUND_MESSAGE_SIZE = 64 * 1024 * 1024;
 	public static final int MIN_MAX_INBOUND_MESSAGE_SIZE = 4 * 1024 * 1024;
 	private final ManagedChannel channel;
+	private final ExecutorService callbackExecutor;
 	private final EventLoopGroup eventLoopGroup;
 	private final RocksDBServiceStub asyncStub;
 	private final RocksDBServiceFutureStub futureStub;
@@ -128,27 +130,44 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}
 
 		channelBuilder
-				.directExecutor()
-					.usePlaintext()
-					.maxInboundMessageSize(maxInboundMessageSize)
-					.keepAliveTime(30, TimeUnit.SECONDS)
-					.keepAliveTimeout(5, TimeUnit.SECONDS)
-					.keepAliveWithoutCalls(true);
+				.usePlaintext()
+				.maxInboundMessageSize(maxInboundMessageSize)
+				.keepAliveTime(30, TimeUnit.SECONDS)
+				.keepAliveTimeout(5, TimeUnit.SECONDS)
+				.keepAliveWithoutCalls(true);
 		configureRetry(channelBuilder);
-		EventLoopGroup eventLoopGroup;
-		if (socketAddress instanceof DomainSocketAddress _) {
-			eventLoopGroup = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
-			channelBuilder
-					.eventLoopGroup(eventLoopGroup)
-					.channelType(EpollDomainSocketChannel.class);
-		} else {
-			eventLoopGroup = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
-			channelBuilder
-					.eventLoopGroup(eventLoopGroup)
-					.channelType(NioSocketChannel.class);
+
+		// Keep reactive-gRPC's bounded adapters off the transport loop: a backpressured
+		// application callback must not prevent the same channel from making progress.
+		var callbackExecutor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
+				.name("rockserver-grpc-" + name + "-callback-", 0)
+				.factory());
+		EventLoopGroup eventLoopGroup = null;
+		ManagedChannel channel;
+		try {
+			channelBuilder.executor(callbackExecutor);
+			if (socketAddress instanceof DomainSocketAddress _) {
+				eventLoopGroup = new EpollEventLoopGroup(EVENT_LOOP_THREADS_PER_CONNECTION);
+				channelBuilder
+						.eventLoopGroup(eventLoopGroup)
+						.channelType(EpollDomainSocketChannel.class);
+			} else {
+				eventLoopGroup = new NioEventLoopGroup(EVENT_LOOP_THREADS_PER_CONNECTION);
+				channelBuilder
+						.eventLoopGroup(eventLoopGroup)
+						.channelType(NioSocketChannel.class);
+			}
+			channelBuilder.intercept(new RetryLoggingInterceptor());
+			channel = channelBuilder.build();
+		} catch (RuntimeException | Error ex) {
+			callbackExecutor.shutdownNow();
+			if (eventLoopGroup != null) {
+				eventLoopGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
+			}
+			throw ex;
 		}
-		channelBuilder.intercept(new RetryLoggingInterceptor());
-		this.channel = channelBuilder.build();
+		this.channel = channel;
+		this.callbackExecutor = callbackExecutor;
 		this.eventLoopGroup = eventLoopGroup;
 		this.asyncStub = RocksDBServiceGrpc.newStub(channel);
 		this.futureStub = RocksDBServiceGrpc.newFutureStub(channel);
@@ -1172,11 +1191,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return flux.onErrorMap(GrpcConnection::mapReadDeadlineError);
 	}
 
-	private static <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture, Function<T, U> mapper) {
+	private <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture, Function<T, U> mapper) {
 		return toResponse(listenableFuture, mapper, GrpcConnection::mapGrpcStatusError);
 	}
 
-	private static <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture,
+	private <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture,
 			Function<T, U> mapper,
 			Function<Throwable, Throwable> errorMapper) {
 		var cf = new CompletableFuture<U>() {
@@ -1198,7 +1217,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			public void onFailure(@NotNull Throwable t) {
 				cf.completeExceptionally(errorMapper.apply(t));
 			}
-		}, DIRECT_EXECUTOR);
+		}, callbackExecutor);
 
 		return cf;
 	}
@@ -1273,7 +1292,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				: error;
 	}
 
-	private static <T> CompletableFuture<T> toResponse(ListenableFuture<T> listenableFuture) {
+	private <T> CompletableFuture<T> toResponse(ListenableFuture<T> listenableFuture) {
 		var cf = new CompletableFuture<T>() {
 			@Override
 			public boolean cancel(boolean mayInterruptIfRunning) {
@@ -1293,7 +1312,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			public void onFailure(@NotNull Throwable t) {
 				cf.completeExceptionally(t);
 			}
-		}, DIRECT_EXECUTOR);
+		}, callbackExecutor);
 
 		return cf;
 	}
@@ -1301,18 +1320,14 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public void close() {
 		try {
-			if (this.channel != null) {
-				this.channel.shutdown();
-			}
+			this.channel.shutdown();
 		} catch (Exception ex) {
 			LOG.error("Failed to close channel", ex);
 		}
 		try {
-			if (this.channel != null) {
-				if (!this.channel.awaitTermination(1, TimeUnit.MINUTES)) {
-					this.channel.shutdownNow();
-					this.channel.awaitTermination(1, TimeUnit.MINUTES);
-				}
+			if (!this.channel.awaitTermination(1, TimeUnit.MINUTES)) {
+				this.channel.shutdownNow();
+				this.channel.awaitTermination(1, TimeUnit.MINUTES);
 			}
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
@@ -1323,10 +1338,21 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				LOG.error("Failed to close channel", ex);
 			}
 		}
+		this.callbackExecutor.shutdown();
 		try {
-			if (this.eventLoopGroup != null) {
-				this.eventLoopGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync();
+			if (!this.callbackExecutor.awaitTermination(CALLBACK_EXECUTOR_SHUTDOWN_SECONDS, TimeUnit.SECONDS)) {
+				this.callbackExecutor.shutdownNow();
+				if (!this.callbackExecutor.awaitTermination(CALLBACK_EXECUTOR_SHUTDOWN_SECONDS, TimeUnit.SECONDS)) {
+					LOG.warn("gRPC callback executor did not terminate");
+				}
 			}
+		} catch (InterruptedException e) {
+			this.callbackExecutor.shutdownNow();
+			Thread.currentThread().interrupt();
+			LOG.error("Failed to wait gRPC callback executor termination", e);
+		}
+		try {
+			this.eventLoopGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync();
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
 			LOG.error("Failed to wait channel event loop termination", e);
