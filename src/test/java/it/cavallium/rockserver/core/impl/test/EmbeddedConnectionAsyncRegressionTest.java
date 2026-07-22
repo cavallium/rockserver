@@ -55,6 +55,29 @@ class EmbeddedConnectionAsyncRegressionTest {
 	Path tempDir;
 
 	@Test
+	void completedAsyncSeekReleasesAdmissionBeforeCompletionIsVisible() throws Exception {
+		try (var connection = singleThreadedConnection("seek-completion-order")) {
+			var syncApi = connection.getSyncApi();
+			var asyncApi = connection.getAsyncApi();
+			long columnId = syncApi.createColumn("entries",
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			syncApi.put(0, columnId, key(1), value(1), RequestType.none());
+
+			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, 10_000);
+			try {
+				for (int attempt = 0; attempt < 1_000; attempt++) {
+					asyncApi.seekToAsync(iteratorId, key(1)).join();
+					asyncApi.subsequentAsync(iteratorId, 0, 0, RequestType.multi()).join();
+				}
+			} finally {
+				syncApi.closeIterator(iteratorId);
+			}
+			assertEquals(0, connection.getInternalDB().getOpenIteratorsCount());
+			assertEquals(0, connection.getInternalDB().getPendingOpsCount());
+		}
+	}
+
+	@Test
 	void asyncIteratorAdmissionRemainsClaimedBetweenContinuationChunksAndThroughClose() throws Exception {
 		try (var connection = singleThreadedConnection("iterator-admission")) {
 			var syncApi = connection.getSyncApi();

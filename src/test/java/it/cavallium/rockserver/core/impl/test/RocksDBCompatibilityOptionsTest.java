@@ -2,14 +2,18 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
+import it.cavallium.rockserver.core.impl.rocksdb.RocksDBObjects;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.BlockBasedTableConfig;
 
 class RocksDBCompatibilityOptionsTest {
 
@@ -23,6 +27,8 @@ class RocksDBCompatibilityOptionsTest {
 	@Test
 	void persistsRocksDb10CompatibleTableFormatForEveryStartupColumnFamily(@TempDir Path dbPath)
 			throws Exception {
+		assertInternalColumnFamilyCompatibilityOptions();
+
 		var db = new EmbeddedDB(dbPath, "compatibility-options", null);
 		db.closeTesting();
 		assertCompatibleStartupColumnFamilies(latestOptions(dbPath), "initial creation");
@@ -50,13 +56,20 @@ class RocksDBCompatibilityOptionsTest {
 					"[TableOptions/BlockBasedTable \"" + columnFamily + "\"]");
 			assertTrue(tableOptions.contains("format_version=6"),
 					() -> "RocksDB 10.10-compatible format is missing after " + phase + " for " + columnFamily);
-			assertTrue(tableOptions.contains("uniform_cv_threshold=-1.000000"),
-					() -> "RocksDB 10.10-compatible index footer setting is missing after " + phase
-							+ " for " + columnFamily);
 			assertFalse(tableOptions.contains("format_version=7"),
 					() -> "RocksDB 11 table format leaked after " + phase + " into " + columnFamily);
 			assertFalse(tableOptions.contains("uniform_cv_threshold=0.200000"),
 					() -> "RocksDB 11 index footer default leaked after " + phase + " into " + columnFamily);
+		}
+	}
+
+	private static void assertInternalColumnFamilyCompatibilityOptions() {
+		try (var refs = new RocksDBObjects()) {
+			var options = RocksDBLoader.getCompatibilityColumnOptions(refs);
+			var tableOptions = assertInstanceOf(BlockBasedTableConfig.class, options.tableFormatConfig());
+			assertEquals(6, tableOptions.formatVersion());
+			assertEquals(-1.0d, tableOptions.uniformCvThreshold(),
+					"internal column families must not emit the RocksDB 11 index-footer flag");
 		}
 	}
 

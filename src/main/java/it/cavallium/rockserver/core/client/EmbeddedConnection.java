@@ -453,13 +453,22 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 		CompletableFuture<Void> result;
 		try {
 			result = supplyAsyncPreservingRunningCompletion(() -> {
-				db.seekTo(iterationId, keys);
-				return null;
+				try {
+					db.seekTo(iterationId, keys);
+					return null;
+				} finally {
+					// Release before the future becomes observable as complete. Completing the
+					// worker future first lets a joining caller race its next iterator request
+					// against a dependent whenComplete callback.
+					releaseAsyncIteratorOperation(iterationId, iteratorOperation);
+				}
 			}, db.getScheduler().readExecutor());
 		} catch (Throwable error) {
 			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
 			return CompletableFuture.failedFuture(error);
 		}
+		// Also covers cancellation while queued and executor rejection. Release is
+		// idempotent, so running success/failure may safely arrive here after finally.
 		result.whenComplete((_, _) -> releaseAsyncIteratorOperation(iterationId, iteratorOperation));
 		return result;
 	}

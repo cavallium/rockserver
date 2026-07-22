@@ -158,8 +158,10 @@ class RocksDBLoaderComplexConfigTest {
                         "the RocksDB 11 upgrade must retain the 10.10 WAL-recovery memory and flush policy");
                 assertTrue(persistedOptions.contains("format_version=6"),
                         "the compatibility table format must reach the native options");
-                assertTrue(persistedOptions.contains("uniform_cv_threshold=-1.000000"),
-                        "the RocksJava 11 uniformity default must remain disabled in native options");
+                // RocksDB omits the negative sentinel when serializing OPTIONS. The live table
+                // configuration below is the authoritative compatibility assertion.
+                assertFalse(persistedOptions.contains("uniform_cv_threshold=0.200000"),
+                        "the RocksJava 11 uniformity default must remain disabled in persisted options");
             }
 
             var columnOptions = loaded.definitiveColumnFamilyOptionsMap().get("default");
