@@ -42,7 +42,8 @@ public class RocksDBException extends RuntimeException {
 		CDC_RESPONSE_TOO_LARGE,
 		CDC_SUBSCRIPTION_CHANGED,
 		CDC_SUBSCRIPTION_NOT_FOUND,
-		READ_DEADLINE_EXCEEDED
+		READ_DEADLINE_EXCEEDED,
+		SERVER_OVERLOADED
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {

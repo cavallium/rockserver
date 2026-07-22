@@ -3,6 +3,8 @@ package it.cavallium.rockserver.core.impl;
 import static reactor.core.scheduler.Schedulers.DEFAULT_BOUNDED_ELASTIC_QUEUESIZE;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import io.micrometer.core.instrument.MeterRegistry;
+import it.cavallium.rockserver.core.common.WriteClass;
 import java.util.AbstractQueue;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -21,7 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import org.jetbrains.annotations.NotNull;
-import it.cavallium.rockserver.core.common.WriteClass;
+import org.jetbrains.annotations.Nullable;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
@@ -35,6 +37,10 @@ import reactor.core.scheduler.Schedulers;
  * but a weighted handoff guarantees composite progress under a continuous interactive load.
  * The configured read cap is therefore still the hard limit on running read tasks.</p>
  *
+ * <p>The write side exposes foreground and maintenance views over one bounded executor.
+ * Foreground work can use the full write limit, maintenance work has a smaller sub-limit, and
+ * both lanes retain FIFO order with bounded foreground preference.</p>
+ *
  * <p>Long flush/compact work is serialized on {@link #maintenance()}. Iterator cleanup uses
  * {@link #control()}, while CDC validation/WAL publication has the independent {@link #cdc()}
  * lane. Blocking iterator closes therefore cannot stall WAL visibility or consume a
@@ -43,6 +49,9 @@ import reactor.core.scheduler.Schedulers;
 public final class RWScheduler {
 
 	private static final int MAX_CONSECUTIVE_INTERACTIVE_READS = 8;
+	public static final int DEFAULT_MAINTENANCE_WRITE_PARALLELISM = 1;
+	public static final int DEFAULT_FOREGROUND_WRITE_QUEUE_CAPACITY = 4_096;
+	public static final int DEFAULT_MAINTENANCE_WRITE_QUEUE_CAPACITY = 512;
 	/**
 	 * Cleanup can wait for an in-flight iterator operation. Two lazy workers let an
 	 * unrelated cleanup still progress; CDC has its own independent lane below.
@@ -52,15 +61,18 @@ public final class RWScheduler {
 	private final Scheduler read;
 	private final Scheduler interactiveRead;
 	private final Scheduler write;
+	private final Scheduler maintenanceWrite;
 	private final Scheduler maintenance;
 	private final Scheduler control;
 	private final Scheduler cdc;
 	private final Executor readExecutor;
 	private final Executor interactiveReadExecutor;
 	private final Executor writeExecutor;
+	private final Executor maintenanceWriteExecutor;
 	private final Executor maintenanceExecutor;
 	private final Executor controlExecutor;
 	private final Executor cdcExecutor;
+	private final @Nullable ClassifiedWriteExecutor classifiedWriteExecutor;
 
 	public RWScheduler(Scheduler read, Scheduler write) {
 		this(read,
@@ -69,12 +81,15 @@ public final class RWScheduler {
 				write,
 				write,
 				write,
+				write,
 				read::schedule,
 				read::schedule,
 				write::schedule,
 				write::schedule,
 				write::schedule,
-				write::schedule);
+				write::schedule,
+				write::schedule,
+				null);
 	}
 
 	/** Preserves the original public constructor used by custom/in-process schedulers. */
@@ -85,82 +100,152 @@ public final class RWScheduler {
 				write,
 				write,
 				write,
+				write,
 				readExecutor,
 				readExecutor,
 				writeExecutor,
 				writeExecutor,
 				writeExecutor,
-				writeExecutor);
+				writeExecutor,
+				writeExecutor,
+				null);
 	}
 
 	public RWScheduler(int readCap, int writeCap, String name) {
-		this(createResources(readCap, writeCap, name));
+		this(readCap,
+				writeCap,
+				DEFAULT_MAINTENANCE_WRITE_PARALLELISM,
+				DEFAULT_FOREGROUND_WRITE_QUEUE_CAPACITY,
+				DEFAULT_MAINTENANCE_WRITE_QUEUE_CAPACITY,
+				name);
+	}
+
+	public RWScheduler(int readCap,
+			int writeCap,
+			int maintenanceWriteCap,
+			int foregroundWriteQueueCapacity,
+			int maintenanceWriteQueueCapacity,
+			String name) {
+		this(readCap,
+				writeCap,
+				maintenanceWriteCap,
+				foregroundWriteQueueCapacity,
+				maintenanceWriteQueueCapacity,
+				name,
+				null,
+				name);
+	}
+
+	public RWScheduler(int readCap,
+			int writeCap,
+			int maintenanceWriteCap,
+			int foregroundWriteQueueCapacity,
+			int maintenanceWriteQueueCapacity,
+			String name,
+			@Nullable MeterRegistry meterRegistry,
+			String databaseName) {
+		this(createResources(readCap,
+				writeCap,
+				maintenanceWriteCap,
+				foregroundWriteQueueCapacity,
+				maintenanceWriteQueueCapacity,
+				name,
+				meterRegistry,
+				databaseName));
 	}
 
 	private RWScheduler(Resources resources) {
 		this(resources.read(),
 				resources.interactiveRead(),
 				resources.write(),
+				resources.maintenanceWrite(),
 				resources.maintenance(),
 				resources.control(),
 				resources.cdc(),
 				resources.readExecutor(),
 				resources.interactiveReadExecutor(),
 				resources.writeExecutor(),
+				resources.maintenanceWriteExecutor(),
 				resources.maintenanceExecutor(),
 				resources.controlExecutor(),
-				resources.cdcExecutor());
+				resources.cdcExecutor(),
+				resources.classifiedWriteExecutor());
 	}
 
 	private RWScheduler(Scheduler read,
 			Scheduler interactiveRead,
 			Scheduler write,
+			Scheduler maintenanceWrite,
 			Scheduler maintenance,
 			Scheduler control,
 			Scheduler cdc,
 			Executor readExecutor,
 			Executor interactiveReadExecutor,
 			Executor writeExecutor,
+			Executor maintenanceWriteExecutor,
 			Executor maintenanceExecutor,
 			Executor controlExecutor,
-			Executor cdcExecutor) {
+			Executor cdcExecutor,
+			@Nullable ClassifiedWriteExecutor classifiedWriteExecutor) {
 		this.read = Objects.requireNonNull(read, "read");
 		this.interactiveRead = Objects.requireNonNull(interactiveRead, "interactiveRead");
 		this.write = Objects.requireNonNull(write, "write");
+		this.maintenanceWrite = Objects.requireNonNull(maintenanceWrite, "maintenanceWrite");
 		this.maintenance = Objects.requireNonNull(maintenance, "maintenance");
 		this.control = Objects.requireNonNull(control, "control");
 		this.cdc = Objects.requireNonNull(cdc, "cdc");
 		this.readExecutor = Objects.requireNonNull(readExecutor, "readExecutor");
 		this.interactiveReadExecutor = Objects.requireNonNull(interactiveReadExecutor, "interactiveReadExecutor");
 		this.writeExecutor = Objects.requireNonNull(writeExecutor, "writeExecutor");
+		this.maintenanceWriteExecutor = Objects.requireNonNull(maintenanceWriteExecutor, "maintenanceWriteExecutor");
 		this.maintenanceExecutor = Objects.requireNonNull(maintenanceExecutor, "maintenanceExecutor");
 		this.controlExecutor = Objects.requireNonNull(controlExecutor, "controlExecutor");
 		this.cdcExecutor = Objects.requireNonNull(cdcExecutor, "cdcExecutor");
+		this.classifiedWriteExecutor = classifiedWriteExecutor;
 	}
 
-	private static Resources createResources(int readCap, int writeCap, String name) {
-		if (readCap < 1 || writeCap < 1) {
-			throw new IllegalArgumentException("Read and write scheduler capacities must be positive");
+	private static Resources createResources(int readCap,
+			int writeCap,
+			int maintenanceWriteCap,
+			int foregroundWriteQueueCapacity,
+			int maintenanceWriteQueueCapacity,
+			String name,
+			@Nullable MeterRegistry meterRegistry,
+			String databaseName) {
+		if (readCap < 1) {
+			throw new IllegalArgumentException("Read scheduler capacity must be positive");
 		}
 		var readExecutor = createReadExecutor(readCap, name + "-read");
 		var interactiveReadExecutor = new InteractiveExecutor(readExecutor);
-		var writeExecutor = createExecutor(writeCap, name + "-write");
+		var classifiedWriteExecutor = new ClassifiedWriteExecutor(
+				writeCap,
+				maintenanceWriteCap,
+				foregroundWriteQueueCapacity,
+				maintenanceWriteQueueCapacity,
+				databaseName,
+				threadFactory(name + "-write"),
+				meterRegistry);
+		var writeExecutor = classifiedWriteExecutor.executor(WriteClass.FOREGROUND);
+		var maintenanceWriteExecutor = classifiedWriteExecutor.executor(WriteClass.MAINTENANCE);
 		var maintenanceExecutor = createExecutor(1, name + "-maintenance");
 		var controlExecutor = createExecutor(CONTROL_THREAD_CAPACITY, name + "-control");
 		var cdcExecutor = createExecutor(1, name + "-cdc");
 		return new Resources(
 				Schedulers.fromExecutorService(readExecutor, name + "-read"),
 				Schedulers.fromExecutor(interactiveReadExecutor),
-				Schedulers.fromExecutorService(writeExecutor, name + "-write"),
+				Schedulers.fromExecutorService(writeExecutor, name + "-write-foreground"),
+				Schedulers.fromExecutorService(maintenanceWriteExecutor, name + "-write-maintenance"),
 				Schedulers.fromExecutorService(maintenanceExecutor, name + "-maintenance"),
 				Schedulers.fromExecutorService(controlExecutor, name + "-control"),
 				Schedulers.fromExecutorService(cdcExecutor, name + "-cdc"),
 				readExecutor,
 				interactiveReadExecutor,
 				writeExecutor,
+				maintenanceWriteExecutor,
 				maintenanceExecutor,
 				controlExecutor,
-				cdcExecutor);
+				cdcExecutor,
+				classifiedWriteExecutor);
 	}
 
 	private static ExecutorService createReadExecutor(int cap, String name) {
@@ -207,10 +292,12 @@ public final class RWScheduler {
 		return write;
 	}
 
-	/** Classified write view. Plan 1 deliberately keeps both classes on the existing scheduler. */
+	/** Return the scheduling view for the requested write class. */
 	public Scheduler write(WriteClass writeClass) {
-		Objects.requireNonNull(writeClass, "writeClass");
-		return write;
+		return switch (Objects.requireNonNull(writeClass, "writeClass")) {
+			case FOREGROUND -> write;
+			case MAINTENANCE -> maintenanceWrite;
+		};
 	}
 
 	public Scheduler maintenance() {
@@ -237,10 +324,41 @@ public final class RWScheduler {
 		return writeExecutor;
 	}
 
-	/** Classified write executor. Plan 1 deliberately keeps both classes on the existing executor. */
+	/** Return the executor view for the requested write class. */
 	public Executor writeExecutor(WriteClass writeClass) {
+		return switch (Objects.requireNonNull(writeClass, "writeClass")) {
+			case FOREGROUND -> writeExecutor;
+			case MAINTENANCE -> maintenanceWriteExecutor;
+		};
+	}
+
+	public int queuedWriteTasks(WriteClass writeClass) {
 		Objects.requireNonNull(writeClass, "writeClass");
-		return writeExecutor;
+		return classifiedWriteExecutor != null ? classifiedWriteExecutor.queuedTasks(writeClass) : 0;
+	}
+
+	public int activeWriteTasks(WriteClass writeClass) {
+		Objects.requireNonNull(writeClass, "writeClass");
+		return classifiedWriteExecutor != null ? classifiedWriteExecutor.activeTasks(writeClass) : 0;
+	}
+
+	public int writeWorkerCount() {
+		return classifiedWriteExecutor != null ? classifiedWriteExecutor.workerCount() : 0;
+	}
+
+	public int writeWorkerLimit(WriteClass writeClass) {
+		Objects.requireNonNull(writeClass, "writeClass");
+		return classifiedWriteExecutor != null ? classifiedWriteExecutor.workerLimit(writeClass) : 0;
+	}
+
+	public int writeQueueCapacity(WriteClass writeClass) {
+		Objects.requireNonNull(writeClass, "writeClass");
+		return classifiedWriteExecutor != null ? classifiedWriteExecutor.queueCapacity(writeClass) : 0;
+	}
+
+	/** Whether the calling thread is already running inside this scheduler's write admission. */
+	public boolean isExecutingWriteTask() {
+		return classifiedWriteExecutor != null && classifiedWriteExecutor.isExecutingTask();
 	}
 
 	public Executor maintenanceExecutor() {
@@ -265,6 +383,12 @@ public final class RWScheduler {
 		Objects.requireNonNull(task, "task");
 		if (schedulingView instanceof InteractiveExecutor interactiveExecutor) {
 			return interactiveExecutor.remove(task);
+		}
+		if (classifiedWriteExecutor != null
+				&& (schedulingView == writeExecutor || schedulingView == maintenanceWriteExecutor)) {
+			return classifiedWriteExecutor.remove(
+					schedulingView == writeExecutor ? WriteClass.FOREGROUND : WriteClass.MAINTENANCE,
+					task);
 		}
 		return schedulingView instanceof ThreadPoolExecutor threadPool && threadPool.remove(task);
 	}
@@ -314,8 +438,8 @@ public final class RWScheduler {
 
 	private List<Scheduler> distinctSchedulers() {
 		Set<Scheduler> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-		var result = new ArrayList<Scheduler>(6);
-		for (var scheduler : List.of(interactiveRead, read, write, maintenance, control, cdc)) {
+		var result = new ArrayList<Scheduler>(7);
+		for (var scheduler : List.of(interactiveRead, read, write, maintenanceWrite, maintenance, control, cdc)) {
 			if (seen.add(scheduler)) {
 				result.add(scheduler);
 			}
@@ -325,9 +449,15 @@ public final class RWScheduler {
 
 	private List<Executor> distinctExecutors() {
 		Set<Executor> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-		var result = new ArrayList<Executor>(6);
+		var result = new ArrayList<Executor>(7);
 		for (var executor : List.of(
-				interactiveReadExecutor, readExecutor, writeExecutor, maintenanceExecutor, controlExecutor, cdcExecutor)) {
+				interactiveReadExecutor,
+				readExecutor,
+				writeExecutor,
+				maintenanceWriteExecutor,
+				maintenanceExecutor,
+				controlExecutor,
+				cdcExecutor)) {
 			if (seen.add(executor)) {
 				result.add(executor);
 			}
@@ -352,15 +482,18 @@ public final class RWScheduler {
 	private record Resources(Scheduler read,
 			Scheduler interactiveRead,
 			Scheduler write,
+			Scheduler maintenanceWrite,
 			Scheduler maintenance,
 			Scheduler control,
 			Scheduler cdc,
 			Executor readExecutor,
 			Executor interactiveReadExecutor,
 			Executor writeExecutor,
+			Executor maintenanceWriteExecutor,
 			Executor maintenanceExecutor,
 			Executor controlExecutor,
-			Executor cdcExecutor) {
+			Executor cdcExecutor,
+			ClassifiedWriteExecutor classifiedWriteExecutor) {
 	}
 
 	private record InteractiveTask(Runnable delegate) implements Runnable {

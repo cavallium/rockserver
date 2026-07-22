@@ -19,6 +19,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.server.ThriftServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -61,12 +62,20 @@ class ThriftAsyncDispatchRegressionTest {
 		assertEquals(3, connection.syncRequests.size());
 		assertEquals(0, connection.asyncRequests.size());
 
+		api.put(0, 1, key(2), expected, RequestType.none(), WriteClass.MAINTENANCE);
+		assertEquals(42L, api.createColumn("classified", ColumnSchema.of(
+				IntList.of(Integer.BYTES), ObjectList.of(), true),
+				WriteClass.MAINTENANCE));
+		api.deleteRange(1, key(1), key(2));
 		assertEquals(List.of(false), api.existsMulti(0, 1, List.of(key(1)), 10_000));
 		api.mergeBatch(1, Flux.empty(), MergeBatchMode.MERGE_WRITE_BATCH);
 
 		assertEquals(3, connection.syncRequests.size(),
 				"bounded and lane-specific work must not fall back to the direct sync path");
 		assertEquals(List.of(
+				RocksDBAPICommand.RocksDBAPICommandSingle.Put.class,
+				RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn.class,
+				RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange.class,
 				RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti.class,
 				RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch.class),
 				connection.asyncRequests);
@@ -340,6 +349,12 @@ class ThriftAsyncDispatchRegressionTest {
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
 				asyncRequests.add(request.getClass());
 				Object result = switch (request) {
+					case RocksDBAPICommand.RocksDBAPICommandSingle.Put<?> _ ->
+							CompletableFuture.completedFuture(null);
+					case RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn _ ->
+							CompletableFuture.completedFuture(42L);
+					case RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange _ ->
+							CompletableFuture.completedFuture(null);
 					case RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti _ ->
 							CompletableFuture.completedFuture(List.of(false));
 					case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch _ ->

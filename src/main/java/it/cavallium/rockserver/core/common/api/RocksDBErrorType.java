@@ -50,7 +50,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
   CDC_GAP_DETECTED(39),
   CDC_RESPONSE_TOO_LARGE(40),
   CDC_SUBSCRIPTION_CHANGED(41),
-  CDC_SUBSCRIPTION_NOT_FOUND(42);
+  CDC_SUBSCRIPTION_NOT_FOUND(42),
+  SERVER_OVERLOADED(43);
 
   private final int value;
 
@@ -159,6 +160,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
         return CDC_SUBSCRIPTION_CHANGED;
       case 42:
         return CDC_SUBSCRIPTION_NOT_FOUND;
+      case 43:
+        return SERVER_OVERLOADED;
       default:
         return null;
     }

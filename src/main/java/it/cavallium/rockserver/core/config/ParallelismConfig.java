@@ -10,4 +10,13 @@ public interface ParallelismConfig {
 
 	@Nullable
 	Integer write() throws GestaltException;
+
+	@Nullable
+	Integer maintenanceWrite() throws GestaltException;
+
+	@Nullable
+	Integer foregroundWriteQueueCapacity() throws GestaltException;
+
+	@Nullable
+	Integer maintenanceWriteQueueCapacity() throws GestaltException;
 }

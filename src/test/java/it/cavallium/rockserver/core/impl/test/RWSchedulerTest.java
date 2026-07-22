@@ -1,9 +1,14 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.time.Duration;
@@ -15,6 +20,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import reactor.core.scheduler.Schedulers;
@@ -23,13 +29,30 @@ import reactor.core.scheduler.Schedulers;
 class RWSchedulerTest {
 
 	@Test
-	void classifiedWritesRemainAliasesOfTheExistingWriteLane() {
+	void configuredClassifiedWritesUseDistinctViewsOfOnePool() {
 		var scheduler = new RWScheduler(1, 1, "write-class-alias-test");
 		try {
 			assertSame(scheduler.write(), scheduler.write(WriteClass.FOREGROUND));
-			assertSame(scheduler.write(), scheduler.write(WriteClass.MAINTENANCE));
+			assertNotSame(scheduler.write(), scheduler.write(WriteClass.MAINTENANCE));
 			assertSame(scheduler.writeExecutor(), scheduler.writeExecutor(WriteClass.FOREGROUND));
-			assertSame(scheduler.writeExecutor(), scheduler.writeExecutor(WriteClass.MAINTENANCE));
+			assertNotSame(scheduler.writeExecutor(), scheduler.writeExecutor(WriteClass.MAINTENANCE));
+			assertEquals(1, scheduler.writeWorkerLimit(WriteClass.FOREGROUND));
+			assertEquals(1, scheduler.writeWorkerLimit(WriteClass.MAINTENANCE));
+		} finally {
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void compatibilityConstructorRetainsWriteLaneAliases() {
+		var read = Schedulers.newSingle("compat-read");
+		var write = Schedulers.newSingle("compat-write");
+		var scheduler = new RWScheduler(read, write);
+		try {
+			assertSame(scheduler.write(), scheduler.write(WriteClass.FOREGROUND));
+			assertSame(scheduler.write(), scheduler.write(WriteClass.MAINTENANCE));
+			assertEquals(0, scheduler.writeWorkerLimit(WriteClass.FOREGROUND));
+			assertEquals(0, scheduler.writeWorkerLimit(WriteClass.MAINTENANCE));
 		} finally {
 			scheduler.dispose();
 		}
@@ -59,6 +82,33 @@ class RWSchedulerTest {
 	}
 
 	@Test
+	void gracefulDisposalDrainsBothClassifiedQueues() throws Exception {
+		var scheduler = new RWScheduler(1, 1, 1, 4, 4, "graceful-write-drain-test");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var queuedCompleted = new CountDownLatch(2);
+		try {
+			scheduler.write().schedule(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+			scheduler.write().schedule(queuedCompleted::countDown);
+			scheduler.write(WriteClass.MAINTENANCE).schedule(queuedCompleted::countDown);
+
+			var disposal = scheduler.disposeGracefully().toFuture();
+			releaseBlocker.countDown();
+			disposal.get(10, TimeUnit.SECONDS);
+
+			assertEquals(0, queuedCompleted.getCount());
+			assertTrue(((ExecutorService) scheduler.writeExecutor()).isTerminated());
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
 	void gracefulDisposalHandlesCompatibilityLaneAliasesOnce() {
 		var read = Schedulers.newSingle("aliased-read");
 		var write = Schedulers.newSingle("aliased-write");
@@ -75,12 +125,242 @@ class RWSchedulerTest {
 		var scheduler = new RWScheduler(16, 8, "lazy-worker-test");
 		try {
 			assertEquals(0, ((ThreadPoolExecutor) scheduler.readExecutor()).getPoolSize());
-			assertEquals(0, ((ThreadPoolExecutor) scheduler.writeExecutor()).getPoolSize());
+			assertEquals(0, scheduler.writeWorkerCount());
 			assertEquals(0, ((ThreadPoolExecutor) scheduler.maintenanceExecutor()).getPoolSize());
 			assertEquals(0, ((ThreadPoolExecutor) scheduler.controlExecutor()).getPoolSize());
 			assertEquals(0, ((ThreadPoolExecutor) scheduler.cdcExecutor()).getPoolSize());
 		} finally {
 			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void combinedAndMaintenanceRunningCapsAreHardLimits() throws Exception {
+		var scheduler = new RWScheduler(1, 4, 1, 64, 64, "write-cap-test");
+		var firstWaveStarted = new CountDownLatch(4);
+		var release = new CountDownLatch(1);
+		var completed = new CountDownLatch(10);
+		var active = new AtomicInteger();
+		var activeMaintenance = new AtomicInteger();
+		var maxActive = new AtomicInteger();
+		var maxActiveMaintenance = new AtomicInteger();
+		try {
+			for (int i = 0; i < 4; i++) {
+				scheduler.write(WriteClass.MAINTENANCE).schedule(() -> trackedWrite(
+						true, firstWaveStarted, release, completed, active, activeMaintenance,
+						maxActive, maxActiveMaintenance));
+			}
+			for (int i = 0; i < 6; i++) {
+				scheduler.write(WriteClass.FOREGROUND).schedule(() -> trackedWrite(
+						false, firstWaveStarted, release, completed, active, activeMaintenance,
+						maxActive, maxActiveMaintenance));
+			}
+
+			assertTrue(firstWaveStarted.await(5, TimeUnit.SECONDS));
+			assertEquals(4, maxActive.get());
+			assertEquals(1, maxActiveMaintenance.get());
+			release.countDown();
+			assertTrue(completed.await(5, TimeUnit.SECONDS));
+			assertEquals(4, maxActive.get());
+			assertEquals(1, maxActiveMaintenance.get());
+		} finally {
+			release.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void foregroundOvertakesQueuedMaintenance() throws Exception {
+		var scheduler = new RWScheduler(1, 1, 1, 8, 8, "write-overtake-test");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var completed = new CountDownLatch(2);
+		var order = Collections.synchronizedList(new ArrayList<String>());
+		try {
+			scheduler.write().schedule(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+			scheduler.write(WriteClass.MAINTENANCE).schedule(() -> {
+				order.add("maintenance");
+				completed.countDown();
+			});
+			scheduler.write(WriteClass.FOREGROUND).schedule(() -> {
+				order.add("foreground");
+				completed.countDown();
+			});
+
+			releaseBlocker.countDown();
+			assertTrue(completed.await(5, TimeUnit.SECONDS));
+			assertEquals(List.of("foreground", "maintenance"), order);
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void eachWriteClassRetainsFifoOrder() throws Exception {
+		var scheduler = new RWScheduler(1, 1, 1, 8, 8, "write-fifo-test");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var completed = new CountDownLatch(4);
+		var order = Collections.synchronizedList(new ArrayList<String>());
+		try {
+			scheduler.write().schedule(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+			scheduleRecorded(scheduler, WriteClass.MAINTENANCE, "maintenance-1", order, completed);
+			scheduleRecorded(scheduler, WriteClass.MAINTENANCE, "maintenance-2", order, completed);
+			scheduleRecorded(scheduler, WriteClass.FOREGROUND, "foreground-1", order, completed);
+			scheduleRecorded(scheduler, WriteClass.FOREGROUND, "foreground-2", order, completed);
+
+			releaseBlocker.countDown();
+			assertTrue(completed.await(5, TimeUnit.SECONDS));
+			assertEquals(List.of("foreground-1", "foreground-2", "maintenance-1", "maintenance-2"), order);
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void maintenanceProgressIsBoundedDuringForegroundFlood() throws Exception {
+		var scheduler = new RWScheduler(1, 1, 1, 64, 8, "write-progress-test");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var completed = new CountDownLatch(34);
+		var order = Collections.synchronizedList(new ArrayList<String>());
+		try {
+			scheduler.write().schedule(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+			scheduler.write(WriteClass.MAINTENANCE).schedule(() -> {
+				order.add("maintenance");
+				completed.countDown();
+			});
+			for (int i = 0; i < 33; i++) {
+				int task = i;
+				scheduler.write().schedule(() -> {
+					order.add("foreground-" + task);
+					completed.countDown();
+				});
+			}
+
+			releaseBlocker.countDown();
+			assertTrue(completed.await(5, TimeUnit.SECONDS));
+			assertEquals(32, order.indexOf("maintenance"));
+			assertEquals("foreground-0", order.getFirst());
+			assertEquals("foreground-31", order.get(31));
+			assertEquals("foreground-32", order.getLast());
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void queuesRejectIndependentlyWithServerOverloaded() throws Exception {
+		var scheduler = new RWScheduler(1, 1, 1, 1, 1, "write-rejection-test");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		try {
+			scheduler.writeExecutor().execute(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+			scheduler.writeExecutor().execute(() -> {});
+			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(() -> {});
+
+			var foregroundFailure = assertThrows(RocksDBException.class,
+					() -> scheduler.writeExecutor().execute(() -> {}));
+			var maintenanceFailure = assertThrows(RocksDBException.class,
+					() -> scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(() -> {}));
+			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, foregroundFailure.getErrorUniqueId());
+			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, maintenanceFailure.getErrorUniqueId());
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void cancellingScheduledWorkRemovesItsClassifiedWrapper() throws Exception {
+		var scheduler = new RWScheduler(1, 1, 1, 4, 4, "write-cancellation-test");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var cancelledTaskRan = new AtomicInteger();
+		try {
+			scheduler.write().schedule(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+			var disposable = scheduler.write(WriteClass.MAINTENANCE).schedule(cancelledTaskRan::incrementAndGet);
+			assertEquals(1, scheduler.queuedWriteTasks(WriteClass.MAINTENANCE));
+
+			disposable.dispose();
+			assertTrue(awaitCondition(
+					() -> scheduler.queuedWriteTasks(WriteClass.MAINTENANCE) == 0, Duration.ofSeconds(5)));
+			releaseBlocker.countDown();
+			assertTrue(awaitCondition(() -> scheduler.activeWriteTasks(WriteClass.FOREGROUND) == 0,
+					Duration.ofSeconds(5)));
+			assertEquals(0, cancelledTaskRan.get());
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void admissionMetricsReflectBothLanesAndConfiguredLimits() throws Exception {
+		var registry = new SimpleMeterRegistry();
+		try {
+			var scheduler = new RWScheduler(1, 1, 1, 1, 2,
+					"write-metrics-test", registry, "metrics-db");
+			var blockerStarted = new CountDownLatch(1);
+			var releaseBlocker = new CountDownLatch(1);
+			try {
+				scheduler.write().schedule(() -> {
+					blockerStarted.countDown();
+					await(releaseBlocker);
+				});
+				assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+				var cancelled = scheduler.write(WriteClass.FOREGROUND).schedule(() -> {});
+				assertThrows(RocksDBException.class, () -> scheduler.writeExecutor().execute(() -> {}));
+				cancelled.dispose();
+				releaseBlocker.countDown();
+				assertTrue(awaitCondition(() -> scheduler.activeWriteTasks(WriteClass.FOREGROUND) == 0,
+						Duration.ofSeconds(5)));
+
+				var maintenanceDone = new CountDownLatch(1);
+				scheduler.write(WriteClass.MAINTENANCE).schedule(maintenanceDone::countDown);
+				assertTrue(maintenanceDone.await(5, TimeUnit.SECONDS));
+
+				assertEquals(0d, gauge(registry, "rockserver.write.admission.queued", "foreground"));
+				assertEquals(0d, gauge(registry, "rockserver.write.admission.active", "foreground"));
+				assertEquals(1d, gauge(registry, "rockserver.write.admission.worker.limit", "foreground"));
+				assertEquals(1d, gauge(registry, "rockserver.write.admission.worker.limit", "maintenance"));
+				assertEquals(1d, gauge(registry, "rockserver.write.admission.queue.limit", "foreground"));
+				assertEquals(2d, gauge(registry, "rockserver.write.admission.queue.limit", "maintenance"));
+				assertEquals(1d, counter(registry, "rockserver.write.admission.cancelled", "foreground"));
+				assertEquals(1d, counter(registry, "rockserver.write.admission.rejected", "foreground"));
+				assertTrue(counter(registry, "rockserver.write.admission.completed", "foreground") >= 1d);
+				assertTrue(counter(registry, "rockserver.write.admission.completed", "maintenance") >= 1d);
+				assertTrue(timerCount(registry, "rockserver.write.admission.queue.wait", "foreground") >= 1L);
+				assertTrue(timerCount(registry, "rockserver.write.admission.execution", "maintenance") >= 1L);
+			} finally {
+				releaseBlocker.countDown();
+				scheduler.dispose();
+			}
+		} finally {
+			registry.close();
 		}
 	}
 
@@ -299,5 +579,59 @@ class RWSchedulerTest {
 		if (interrupted) {
 			Thread.currentThread().interrupt();
 		}
+	}
+
+	private static void trackedWrite(boolean maintenance,
+			CountDownLatch started,
+			CountDownLatch release,
+			CountDownLatch completed,
+			AtomicInteger active,
+			AtomicInteger activeMaintenance,
+			AtomicInteger maxActive,
+			AtomicInteger maxActiveMaintenance) {
+		int current = active.incrementAndGet();
+		maxActive.accumulateAndGet(current, Math::max);
+		if (maintenance) {
+			int currentMaintenance = activeMaintenance.incrementAndGet();
+			maxActiveMaintenance.accumulateAndGet(currentMaintenance, Math::max);
+		}
+		started.countDown();
+		await(release);
+		if (maintenance) {
+			activeMaintenance.decrementAndGet();
+		}
+		active.decrementAndGet();
+		completed.countDown();
+	}
+
+	private static void scheduleRecorded(RWScheduler scheduler,
+			WriteClass writeClass,
+			String value,
+			List<String> order,
+			CountDownLatch completed) {
+		scheduler.write(writeClass).schedule(() -> {
+			order.add(value);
+			completed.countDown();
+		});
+	}
+
+	private static boolean awaitCondition(BooleanSupplier condition, Duration timeout) throws InterruptedException {
+		long deadline = System.nanoTime() + timeout.toNanos();
+		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+			Thread.sleep(1L);
+		}
+		return condition.getAsBoolean();
+	}
+
+	private static double gauge(SimpleMeterRegistry registry, String name, String lane) {
+		return registry.get(name).tag("database", "metrics-db").tag("lane", lane).gauge().value();
+	}
+
+	private static double counter(SimpleMeterRegistry registry, String name, String lane) {
+		return registry.get(name).tag("database", "metrics-db").tag("lane", lane).counter().count();
+	}
+
+	private static long timerCount(SimpleMeterRegistry registry, String name, String lane) {
+		return registry.get(name).tag("database", "metrics-db").tag("lane", lane).timer().count();
 	}
 }

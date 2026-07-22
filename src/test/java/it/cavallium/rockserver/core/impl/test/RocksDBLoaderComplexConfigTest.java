@@ -322,10 +322,14 @@ class RocksDBLoaderComplexConfigTest {
 
     @Test
     void rejectsNonPositiveSchedulerParallelismBeforeOpeningDatabase(@TempDir Path tempDir) throws Exception {
-        var invalidSettings = List.of(
-                "database.parallelism.read = 0",
-                "database.parallelism.write = -3"
-        );
+		var invalidSettings = List.of(
+				"database.parallelism.read = 0",
+				"database.parallelism.write = -3",
+				"database.parallelism.maintenance-write = 0",
+				"database.parallelism.maintenance-write = 37",
+				"database.parallelism.foreground-write-queue-capacity = 0",
+				"database.parallelism.maintenance-write-queue-capacity = -1"
+		);
         for (int i = 0; i < invalidSettings.size(); i++) {
             Path configPath = tempDir.resolve("invalid-scheduler-parallelism-" + i + ".conf");
             Files.writeString(configPath, invalidSettings.get(i));

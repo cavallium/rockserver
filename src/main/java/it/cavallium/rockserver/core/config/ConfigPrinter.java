@@ -129,10 +129,16 @@ public class ConfigPrinter {
 		return """
 				{
 				    "read": %d,
-				    "write": %d
+				    "write": %d,
+				    "maintenance-write": %d,
+				    "foreground-write-queue-capacity": %d,
+				    "maintenance-write-queue-capacity": %d
 				  }\
 				""".formatted(o.read(),
-				o.write()
+				o.write(),
+				o.maintenanceWrite(),
+				o.foregroundWriteQueueCapacity(),
+				o.maintenanceWriteQueueCapacity()
 		);
 	}
 

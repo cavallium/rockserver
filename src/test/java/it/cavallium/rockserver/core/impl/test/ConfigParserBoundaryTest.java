@@ -29,8 +29,11 @@ class ConfigParserBoundaryTest {
 		var config = ConfigParser.parse(null);
 
 		assertAll(
-				() -> assertEquals(30, config.parallelism().read()),
-				() -> assertEquals(10, config.parallelism().write()),
+				() -> assertEquals(20, config.parallelism().read()),
+				() -> assertEquals(36, config.parallelism().write()),
+				() -> assertEquals(1, config.parallelism().maintenanceWrite()),
+				() -> assertEquals(4_096, config.parallelism().foregroundWriteQueueCapacity()),
+				() -> assertEquals(512, config.parallelism().maintenanceWriteQueueCapacity()),
 				() -> assertEquals("default", config.metrics().databaseName()),
 				() -> assertFalse(config.metrics().influx().enabled()),
 				() -> assertTrue(config.metrics().influx().allowInsecureCertificates()),
@@ -81,7 +84,10 @@ class ConfigParserBoundaryTest {
 
 		assertAll(
 				() -> assertEquals(9, config.parallelism().read()),
-				() -> assertEquals(10, config.parallelism().write()),
+				() -> assertEquals(36, config.parallelism().write()),
+				() -> assertEquals(1, config.parallelism().maintenanceWrite()),
+				() -> assertEquals(4_096, config.parallelism().foregroundWriteQueueCapacity()),
+				() -> assertEquals(512, config.parallelism().maintenanceWriteQueueCapacity()),
 				() -> assertEquals(new DataSize("1GiB"), config.global().blockCache()),
 				() -> assertEquals(3, config.global().maxBackgroundJobs()),
 				() -> assertTrue(config.global().unorderedWrite()),
@@ -126,6 +132,12 @@ class ConfigParserBoundaryTest {
 		assertAll(
 				() -> assertEquals(original.parallelism().read(), reparsed.parallelism().read()),
 				() -> assertEquals(original.parallelism().write(), reparsed.parallelism().write()),
+				() -> assertEquals(original.parallelism().maintenanceWrite(),
+						reparsed.parallelism().maintenanceWrite()),
+				() -> assertEquals(original.parallelism().foregroundWriteQueueCapacity(),
+						reparsed.parallelism().foregroundWriteQueueCapacity()),
+				() -> assertEquals(original.parallelism().maintenanceWriteQueueCapacity(),
+						reparsed.parallelism().maintenanceWriteQueueCapacity()),
 				() -> assertEquals(original.metrics().databaseName(), reparsed.metrics().databaseName()),
 				() -> assertEquals(original.global().followRocksdbOptimizations(),
 						reparsed.global().followRocksdbOptimizations()),
@@ -169,6 +181,11 @@ class ConfigParserBoundaryTest {
 	@Test
 	void printedConfigurationPreservesNonDefaultGlobalValues() throws IOException {
 		Path custom = write("custom.conf", """
+				database.parallelism.read = 7
+				database.parallelism.write = 12
+				database.parallelism.maintenance-write = 2
+				database.parallelism.foreground-write-queue-capacity = 123
+				database.parallelism.maintenance-write-queue-capacity = 45
 				database.global.follow-rocksdb-optimizations = false
 				database.global.paranoid-checks = false
 				database.global.use-clock-cache = true
@@ -193,6 +210,11 @@ class ConfigParserBoundaryTest {
 		var reparsed = ConfigParser.parse(printed);
 
 		assertAll(
+				() -> assertEquals(7, reparsed.parallelism().read()),
+				() -> assertEquals(12, reparsed.parallelism().write()),
+				() -> assertEquals(2, reparsed.parallelism().maintenanceWrite()),
+				() -> assertEquals(123, reparsed.parallelism().foregroundWriteQueueCapacity()),
+				() -> assertEquals(45, reparsed.parallelism().maintenanceWriteQueueCapacity()),
 				() -> assertFalse(reparsed.global().followRocksdbOptimizations()),
 				() -> assertFalse(reparsed.global().paranoidChecks()),
 				() -> assertTrue(reparsed.global().useClockCache()),

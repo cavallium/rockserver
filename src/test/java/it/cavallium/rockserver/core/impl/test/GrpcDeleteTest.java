@@ -16,6 +16,7 @@ import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.common.api.proto.PutRequest;
@@ -32,6 +33,8 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -50,7 +53,18 @@ class GrpcDeleteTest {
 	void setUp() throws IOException {
 		dbDir = Files.createTempDirectory("rockserver-grpc-delete-test");
 		configFile = Files.createTempFile("rockserver-config", ".conf");
-		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
+		Files.writeString(configFile, """
+				database: {
+				  parallelism: {
+				    read: 2
+				    write: 1
+				    maintenance-write: 1
+				    foreground-write-queue-capacity: 1
+				    maintenance-write-queue-capacity: 1
+				  }
+				  global: { ingest-behind: false, optimistic: false }
+				}
+				""");
 		embeddedConnection = new EmbeddedConnection(dbDir, "grpc-delete-test", configFile);
 		grpcServer = new GrpcServer(embeddedConnection, new InetSocketAddress("127.0.0.1", 0));
 		grpcServer.start();
@@ -100,7 +114,7 @@ class GrpcDeleteTest {
 	}
 
 	@Test
-	void explicitMaintenanceUsesDirectEmbeddedPointPath() {
+	void explicitMaintenanceUsesEmbeddedAdmissionWithoutRecursiveDispatch() {
 		var key = key(103);
 		embeddedConnection.getSyncApi().put(
 				0, colId, key, value(103), RequestType.none(), WriteClass.MAINTENANCE);
@@ -109,6 +123,57 @@ class GrpcDeleteTest {
 		embeddedConnection.getSyncApi().delete(
 				0, colId, key, RequestType.none(), WriteClass.MAINTENANCE);
 		assertFalse(embeddedConnection.getSyncApi().get(0, colId, key, RequestType.exists()));
+	}
+
+	@Test
+	void explicitEmbeddedMaintenancePointRejectsWhenQueueIsFull() throws Exception {
+		var scheduler = embeddedConnection.getScheduler();
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var queuedCompleted = new CountDownLatch(1);
+		try {
+			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(queuedCompleted::countDown);
+
+			var failure = assertThrows(RocksDBException.class,
+					() -> embeddedConnection.getSyncApi().put(
+							0, colId, key(105), value(105), RequestType.none(), WriteClass.MAINTENANCE));
+			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
+					failure.getErrorUniqueId());
+		} finally {
+			releaseBlocker.countDown();
+			assertTrue(queuedCompleted.await(5, TimeUnit.SECONDS));
+		}
+	}
+
+	@Test
+	void cancellingQueuedEmbeddedMaintenanceRemovesTheClassifiedTask() throws Exception {
+		var scheduler = embeddedConnection.getScheduler();
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var key = key(106);
+		try {
+			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+
+			var queued = embeddedConnection.getAsyncApi().putAsync(
+					0, colId, key, value(106), RequestType.none(), WriteClass.MAINTENANCE);
+			assertEquals(1, scheduler.queuedWriteTasks(WriteClass.MAINTENANCE));
+			assertTrue(queued.cancel(false));
+			assertEquals(0, scheduler.queuedWriteTasks(WriteClass.MAINTENANCE));
+
+			releaseBlocker.countDown();
+			assertFalse(embeddedConnection.getSyncApi().get(0, colId, key, RequestType.exists()));
+		} finally {
+			releaseBlocker.countDown();
+		}
 	}
 
 	@Test
@@ -147,6 +212,43 @@ class GrpcDeleteTest {
 					() -> ReactorRocksDBServiceGrpc.newReactorStub(channel).putBatch(Flux.just(initial)).block());
 			assertEquals(Status.Code.INVALID_ARGUMENT, error.getStatus().getCode());
 		} finally {
+			channel.shutdownNow();
+		}
+	}
+
+	@Test
+	void maintenanceQueueOverflowMapsToResourceExhausted() throws Exception {
+		var scheduler = embeddedConnection.getScheduler();
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var queuedCompleted = new CountDownLatch(1);
+		var channel = ManagedChannelBuilder.forAddress("127.0.0.1", grpcServer.getPort())
+				.usePlaintext()
+				.build();
+		try {
+			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(queuedCompleted::countDown);
+
+			var request = PutRequest.newBuilder()
+					.setColumnId(colId)
+					.setData(it.cavallium.rockserver.core.common.api.proto.KV.newBuilder()
+							.addKeys(ByteString.copyFrom(ByteBuffer.allocate(Long.BYTES).putLong(104).array()))
+							.setValue(ByteString.copyFrom(new byte[] {1})))
+					.setWriteClass(it.cavallium.rockserver.core.common.api.proto.WriteClass.MAINTENANCE)
+					.build();
+			var error = assertThrows(StatusRuntimeException.class,
+					() -> RocksDBServiceGrpc.newBlockingStub(channel)
+							.withDeadlineAfter(2, TimeUnit.SECONDS)
+							.put(request));
+			assertEquals(Status.Code.RESOURCE_EXHAUSTED, error.getStatus().getCode());
+			assertTrue(error.getStatus().getDescription().contains("SERVER_OVERLOADED"));
+		} finally {
+			releaseBlocker.countDown();
+			assertTrue(queuedCompleted.await(5, TimeUnit.SECONDS));
 			channel.shutdownNow();
 		}
 	}
@@ -217,5 +319,20 @@ class GrpcDeleteTest {
 
 	private static Buf value(int value) {
 		return Utils.toBufSimple(value);
+	}
+
+	private static void await(CountDownLatch latch) {
+		boolean interrupted = false;
+		while (true) {
+			try {
+				latch.await();
+				break;
+			} catch (InterruptedException _) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
 	}
 }

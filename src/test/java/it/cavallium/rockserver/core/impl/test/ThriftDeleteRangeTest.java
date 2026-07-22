@@ -10,8 +10,11 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.ThriftConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
+import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.common.api.RocksDB;
@@ -27,6 +30,8 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
@@ -35,6 +40,7 @@ import org.apache.thrift.transport.layered.TFramedTransport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import reactor.core.publisher.Flux;
 
 class ThriftDeleteRangeTest {
 
@@ -50,7 +56,18 @@ class ThriftDeleteRangeTest {
 	void setUp() throws IOException, TException {
 		dbDir = Files.createTempDirectory("rockserver-thrift-delete-range-test");
 		configFile = Files.createTempFile("rockserver-config", ".conf");
-		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
+		Files.writeString(configFile, """
+				database: {
+				  parallelism: {
+				    read: 2
+				    write: 1
+				    maintenance-write: 1
+				    foreground-write-queue-capacity: 1
+				    maintenance-write-queue-capacity: 1
+				  }
+				  global: { ingest-behind: false, optimistic: false }
+				}
+				""");
 		embeddedConnection = new EmbeddedConnection(dbDir, "thrift-delete-range-test", configFile);
 		port = findFreePort();
 		thriftServer = new ThriftServer(embeddedConnection, "127.0.0.1", port);
@@ -107,6 +124,46 @@ class ThriftDeleteRangeTest {
 
 		client.getSyncApi().delete(0, colId, key, RequestType.none(), WriteClass.MAINTENANCE);
 		assertFalse(client.getSyncApi().get(0, colId, key, RequestType.exists()));
+	}
+
+	@Test
+	void maintenanceQueueOverflowMapsToRetryableThriftError() throws Exception {
+		var scheduler = embeddedConnection.getScheduler();
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var queuedCompleted = new CountDownLatch(1);
+		try {
+			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(() -> {
+				blockerStarted.countDown();
+				await(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(queuedCompleted::countDown);
+
+			var failure = assertThrows(RocksDBException.class, () -> client.getSyncApi().put(
+					0, colId, key(103), value(103), RequestType.none(), WriteClass.MAINTENANCE));
+			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, failure.getErrorUniqueId());
+
+			failure = assertThrows(RocksDBException.class, () -> client.getSyncApi().deleteRange(
+					colId, key(103), key(104), WriteClass.MAINTENANCE));
+			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, failure.getErrorUniqueId());
+
+			failure = assertThrows(RocksDBException.class, () -> client.getSyncApi().putBatch(
+					colId,
+					Flux.just(new KVBatchRef(List.of(key(103)), List.of(value(103)))),
+					PutBatchMode.WRITE_BATCH,
+					WriteClass.MAINTENANCE));
+			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, failure.getErrorUniqueId());
+
+			failure = assertThrows(RocksDBException.class, () -> client.getSyncApi().createColumn(
+					"rejected-column",
+					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true),
+					WriteClass.MAINTENANCE));
+			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, failure.getErrorUniqueId());
+		} finally {
+			releaseBlocker.countDown();
+			assertTrue(queuedCompleted.await(5, TimeUnit.SECONDS));
+		}
 	}
 
 	@Test
@@ -177,5 +234,20 @@ class ThriftDeleteRangeTest {
 
 	private static Buf value(int value) {
 		return Utils.toBufSimple(value);
+	}
+
+	private static void await(CountDownLatch latch) {
+		boolean interrupted = false;
+		while (true) {
+			try {
+				latch.await();
+				break;
+			} catch (InterruptedException _) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
 	}
 }

@@ -2452,26 +2452,29 @@ public class GrpcServer extends Server {
 				return e.getStatus();
 			}
 
-			if (ex instanceof CompletionException exx) {
-				return handleError(exx.getCause());
-			} else {
-				return switch (ex) {
-					case RocksDBException e -> switch (e.getErrorUniqueId()) {
+			var rocksError = findRocksDBException(ex);
+			if (rocksError != null) {
+				return switch (rocksError.getErrorUniqueId()) {
 						case PUT_INVALID_REQUEST -> Status.INVALID_ARGUMENT
-								.withDescription(e.getLocalizedMessage()).withCause(e);
+								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case CDC_SUBSCRIPTION_NOT_FOUND -> Status.NOT_FOUND
-								.withDescription(e.getLocalizedMessage()).withCause(e);
+								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case CDC_RESPONSE_TOO_LARGE -> Status.FAILED_PRECONDITION
-								.withDescription(e.getLocalizedMessage()).withCause(e);
+								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case READ_DEADLINE_EXCEEDED -> Status.DEADLINE_EXCEEDED
-								.withDescription(e.getLocalizedMessage()).withCause(e);
-						default -> Status.INTERNAL.withDescription(e.getLocalizedMessage()).withCause(e);
-					};
-					case StatusException ex2 -> ex2.getStatus();
-					case StatusRuntimeException ex3 -> ex3.getStatus();
-					case null, default -> Status.INTERNAL.withCause(ex);
+								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
+						case SERVER_OVERLOADED -> Status.RESOURCE_EXHAUSTED
+								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
+						default -> Status.INTERNAL
+								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 				};
 			}
+			return switch (ex) {
+				case CompletionException exx -> handleError(exx.getCause());
+				case StatusException ex2 -> ex2.getStatus();
+				case StatusRuntimeException ex3 -> ex3.getStatus();
+				case null, default -> Status.INTERNAL.withCause(ex);
+			};
 		}
 	}
 

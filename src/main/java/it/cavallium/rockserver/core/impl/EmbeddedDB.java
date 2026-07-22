@@ -293,21 +293,40 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.config = config;
 		int readCap;
 		int writeCap;
+		int maintenanceWriteCap;
+		int foregroundWriteQueueCapacity;
+		int maintenanceWriteQueueCapacity;
 		try {
 			readCap = Objects.requireNonNullElse(
 					config.parallelism().read(), Runtime.getRuntime().availableProcessors());
 			writeCap = Objects.requireNonNullElse(
 					config.parallelism().write(), Runtime.getRuntime().availableProcessors());
+			maintenanceWriteCap = Objects.requireNonNullElse(
+					config.parallelism().maintenanceWrite(), RWScheduler.DEFAULT_MAINTENANCE_WRITE_PARALLELISM);
+			foregroundWriteQueueCapacity = Objects.requireNonNullElse(
+					config.parallelism().foregroundWriteQueueCapacity(),
+					RWScheduler.DEFAULT_FOREGROUND_WRITE_QUEUE_CAPACITY);
+			maintenanceWriteQueueCapacity = Objects.requireNonNullElse(
+					config.parallelism().maintenanceWriteQueueCapacity(),
+					RWScheduler.DEFAULT_MAINTENANCE_WRITE_QUEUE_CAPACITY);
 			this.fastGet = config.global().enableFastGet();
 		} catch (GestaltException e) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-					"Can't get scheduler parallelism or fast-get configuration",
+					"Can't get scheduler parallelism, write admission, or fast-get configuration",
 					e);
 		}
-		if (readCap < 1 || writeCap < 1) {
+		if (readCap < 1 || writeCap < 1
+				|| maintenanceWriteCap < 1
+				|| maintenanceWriteCap > writeCap
+				|| foregroundWriteQueueCapacity < 1
+				|| maintenanceWriteQueueCapacity < 1) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-					"Database read and write parallelism must be positive, but was read="
-							+ readCap + ", write=" + writeCap);
+					"Invalid database.parallelism configuration: read=" + readCap
+							+ ", write=" + writeCap
+							+ ", maintenance-write=" + maintenanceWriteCap
+							+ ", foreground-write-queue-capacity=" + foregroundWriteQueueCapacity
+							+ ", maintenance-write-queue-capacity=" + maintenanceWriteQueueCapacity
+							+ "; values must be positive and maintenance-write must not exceed write");
 		}
 
 		this.metrics = new MetricsManager(config);
@@ -451,7 +470,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				db.get(), walDirectory, dbOptions.maxTotalWalSize());
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache,
 				this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig, walMetricsConfig);
-		this.scheduler = new RWScheduler(readCap, writeCap, "db[" + name + "]");
+		this.scheduler = new RWScheduler(
+				readCap,
+				writeCap,
+				maintenanceWriteCap,
+				foregroundWriteQueueCapacity,
+				maintenanceWriteQueueCapacity,
+				"db[" + name + "]",
+				metrics.getRegistry(),
+				name);
 		this.fastGetReader = fastGet ? new NativeRocksDBGet(db.get(), (long) readCap + writeCap) : null;
 		this.leakScheduler = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("db-leak-scheduler"));
 
@@ -2607,6 +2634,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public CompletableFuture<Void> putBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode) throws RocksDBException {
+		return putBatchInternal(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+	}
+
+	public CompletableFuture<Void> putBatchInternal(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull PutBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		Objects.requireNonNull(writeClass, "writeClass");
 		var start = System.nanoTime();
 		actionLogger.logAction("PutBatch (begin)",
 				start,
@@ -2622,15 +2657,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		Mono<Void> operation = Mono.using(
 				() -> new PutBatchState(columnId, mode, start),
 				state -> Flux.from(batchPublisher)
-						.publishOn(scheduler.write())
+						.publishOn(scheduler.write(writeClass))
 						.doOnNext(state::write)
 						.then(Mono.fromRunnable(state::writePending)),
 				BatchWriteState::close,
 				true
 			);
-		return operation.subscribeOn(scheduler.write())
-				.onErrorMap(error -> !(error instanceof RocksDBException),
-						error -> RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, error))
+		return operation.subscribeOn(scheduler.write(writeClass))
+				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
 				.doFinally(ignored -> putBatchTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS))
 				.toFuture();
 	}
@@ -2638,6 +2672,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public CompletableFuture<Void> mergeBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode) throws RocksDBException {
+		return mergeBatchInternal(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+	}
+
+	public CompletableFuture<Void> mergeBatchInternal(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull MergeBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		Objects.requireNonNull(writeClass, "writeClass");
 		final boolean ingestBehindEnabled;
 		try {
 			ingestBehindEnabled = config.global().ingestBehind();
@@ -2659,7 +2701,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		Mono<Void> operation = Mono.using(
 				() -> new MergeBatchState(columnId, mode, ingestBehindEnabled, start),
 				state -> AdaptiveBatcher.buffer(
-							Flux.from(batchPublisher).publishOn(scheduler.write()),
+							Flux.from(batchPublisher).publishOn(scheduler.write(writeClass)),
 							128,
 							4096,
 							Duration.ofMillis(10)
@@ -2669,10 +2711,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				BatchWriteState::close,
 				true
 			);
-		return operation.subscribeOn(scheduler.write())
-				.onErrorMap(error -> !(error instanceof RocksDBException),
-						error -> RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, error))
+		return operation.subscribeOn(scheduler.write(writeClass))
+				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
 				.toFuture();
+	}
+
+	private static Throwable mapBatchWriteFailure(Throwable failure) {
+		var current = failure;
+		for (int depth = 0; current != null && depth < 32; depth++) {
+			if (current instanceof RocksDBException rocksError) {
+				return rocksError;
+			}
+			if (current.getCause() == current) {
+				break;
+			}
+			current = current.getCause();
+		}
+		return RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, failure);
 	}
 
 	private abstract class BatchWriteState implements AutoCloseable {
@@ -3122,12 +3177,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public void putBatch(long columnId, @NotNull Publisher<@NotNull KVBatch> batchPublisher, @NotNull PutBatchMode mode)
 			throws RocksDBException {
+		putBatch(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public void putBatch(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull PutBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		try {
-			putBatchInternal(columnId, batchPublisher, mode).get();
+			putBatchInternal(columnId, batchPublisher, mode, writeClass).get();
 		} catch (RocksDBException ex) {
 			throw ex;
-		} catch (Exception ex) {
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
 			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+		} catch (Exception ex) {
+			throw (RocksDBException) mapBatchWriteFailure(ex);
 		}
 	}
 
@@ -3135,12 +3201,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public void mergeBatch(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode) throws RocksDBException {
+		mergeBatch(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public void mergeBatch(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull MergeBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		try {
-			mergeBatchInternal(columnId, batchPublisher, mode).get();
+			mergeBatchInternal(columnId, batchPublisher, mode, writeClass).get();
 		} catch (RocksDBException ex) {
 			throw ex;
-		} catch (Exception ex) {
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
 			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+		} catch (Exception ex) {
+			throw (RocksDBException) mapBatchWriteFailure(ex);
 		}
 	}
 

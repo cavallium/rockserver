@@ -276,8 +276,19 @@ public class ThriftServer extends Server {
 		}
 
 		private static boolean shouldDispatchAsync(RocksDBAPICommand<?, ?, ?> request) {
+			if (!request.isReadOnly() && request.writeClass() == WriteClass.MAINTENANCE) {
+				return true;
+			}
 			if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti<?>
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteMulti<?>
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeMulti<?>
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumnIfExists
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.UploadMergeOperator
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction

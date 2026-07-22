@@ -1,5 +1,37 @@
 # Rockserver
 
+## Write admission
+
+Mutating APIs default to the `FOREGROUND` write class. Rebuildable/background
+callers may select `MAINTENANCE`; both classes share the hard `write` worker
+limit, while maintenance also obeys its smaller sub-limit. Foreground work can
+use every worker when maintenance is absent. With both queues populated, one
+maintenance task is selected after at most 32 foreground dequeues.
+
+```hocon
+database.parallelism {
+  read = 20
+  write = 36
+  maintenance-write = 1
+  foreground-write-queue-capacity = 4096
+  maintenance-write-queue-capacity = 512
+}
+```
+
+Each queue rejects overflow immediately as `SERVER_OVERLOADED`; gRPC exposes it
+as `RESOURCE_EXHAUSTED`. Admission publishes the following metrics with
+`database` and `lane` (`foreground` or `maintenance`) tags:
+
+- `rockserver.write.admission.queued`
+- `rockserver.write.admission.active`
+- `rockserver.write.admission.queue.wait`
+- `rockserver.write.admission.execution`
+- `rockserver.write.admission.completed`
+- `rockserver.write.admission.cancelled`
+- `rockserver.write.admission.rejected`
+- `rockserver.write.admission.worker.limit`
+- `rockserver.write.admission.queue.limit`
+
 ## Fast unary GET
 
 Embedded databases with `database.global.enable-fast-get=true` use the owned
