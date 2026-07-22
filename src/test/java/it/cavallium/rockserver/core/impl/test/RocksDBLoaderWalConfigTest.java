@@ -2,12 +2,17 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
+import java.nio.file.Path;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.Logger;
 
 class RocksDBLoaderWalConfigTest {
 
@@ -28,6 +33,22 @@ class RocksDBLoaderWalConfigTest {
     void boundsLiveWalDebtByDefault() throws Exception {
         assertEquals(4L * 1024 * 1024 * 1024,
                 ConfigParser.parseDefault().global().maxTotalWalSize().longValue());
+    }
+
+    @Test
+    void typedWalConfigurationReachesNativeOptionsAndStartupDiagnostics(@TempDir Path tempDir)
+            throws Exception {
+        var logger = mock(Logger.class);
+        var loaded = RocksDBLoader.load(tempDir.resolve("wal-config-db"), ConfigParser.parseDefault(), logger);
+        try {
+            assertEquals(4L * 1024 * 1024 * 1024, loaded.dbOptions().maxTotalWalSize());
+            assertEquals(86_400L, loaded.dbOptions().walTtlSeconds());
+            verify(logger).info("Opened RocksDB with effective WAL configuration: "
+                    + "max-total-wal-size=4GiB (4294967296 bytes), wal-ttl-seconds=86400");
+        } finally {
+            loaded.db().close();
+            loaded.refs().close();
+        }
     }
 
     @Test

@@ -6,6 +6,7 @@ import io.micrometer.core.instrument.MultiGauge;
 import io.micrometer.core.instrument.MultiGauge.Row;
 import io.micrometer.core.instrument.Tags;
 import java.math.BigInteger;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -23,6 +24,7 @@ import org.jetbrains.annotations.Nullable;
 import org.rocksdb.Cache;
 import org.rocksdb.HistogramData;
 import org.rocksdb.HistogramType;
+import org.rocksdb.RocksDB;
 import org.rocksdb.Statistics;
 import org.rocksdb.TickerType;
 import org.slf4j.Logger;
@@ -40,6 +42,7 @@ public class RocksDBStatistics {
 	private final EnumMap<RocksDBLongProperty, MultiGauge> perCfLongPropertyMap;
 	private final Thread executor;
 	private final MultiGauge cacheStats;
+	private final @Nullable RocksDBWalMetrics walMetrics;
 
 	private volatile boolean stopRequested = false;
 
@@ -52,6 +55,7 @@ public class RocksDBStatistics {
 	 * @param writableFileMaxBufferBytes writable file buffer size per compaction output file
 	 */
 	public record MemoryUpperBoundConfig(int maxBackgroundJobs, long compactionReadaheadBytes, long writableFileMaxBufferBytes) {}
+	record WalMetricsConfig(RocksDB rocksDB, Path walDirectory, long configuredLiveWalLimitBytes) {}
 
 	public RocksDBStatistics(String name,
 			Statistics statistics,
@@ -60,8 +64,26 @@ public class RocksDBStatistics {
 			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter,
 			Function<String, Map<String, Long>> perCfLongPropertyGetter,
 			MemoryUpperBoundConfig memoryUpperBoundConfig) {
+		this(name, statistics, metrics, cache, longPropertyGetter, perCfLongPropertyGetter,
+				memoryUpperBoundConfig, null);
+	}
+
+	RocksDBStatistics(String name,
+			Statistics statistics,
+			MetricsManager metrics,
+			@Nullable Cache cache,
+			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter,
+			Function<String, Map<String, Long>> perCfLongPropertyGetter,
+			MemoryUpperBoundConfig memoryUpperBoundConfig,
+			@Nullable WalMetricsConfig walMetricsConfig) {
 		this.statistics = statistics;
 		this.metrics = metrics;
+		this.walMetrics = walMetricsConfig == null ? null : new RocksDBWalMetrics(
+				name,
+				metrics.getRegistry(),
+				walMetricsConfig.rocksDB(),
+				walMetricsConfig.walDirectory(),
+				walMetricsConfig.configuredLiveWalLimitBytes());
 		this.tickerMap = new EnumMap<>(Arrays
 				.stream(TickerType.values())
 				.filter(tickerType -> tickerType != TickerType.TICKER_ENUM_MAX)
@@ -213,6 +235,10 @@ public class RocksDBStatistics {
 						cacheStatsRef.set(getCacheStats(cache));
 					}
 
+					if (walMetrics != null) {
+						walMetrics.refresh();
+					}
+
 					// Update per-CF property snapshots and re-register MultiGauge rows
 					for (var entry : perCfLongPropertyMap.entrySet()) {
 						RocksDBLongProperty prop = entry.getKey();
@@ -262,6 +288,9 @@ public class RocksDBStatistics {
 			executor.join();
 		} catch (InterruptedException e) {
 			LOG.error("Failed to close executor", e);
+		}
+		if (walMetrics != null) {
+			walMetrics.close();
 		}
 	}
 }

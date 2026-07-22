@@ -443,7 +443,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			memoryUpperBoundConfig = new RocksDBStatistics.MemoryUpperBoundConfig(
 					Runtime.getRuntime().availableProcessors(), 0, 0);
 		}
-		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache, this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig);
+		var configuredWalDirectory = dbOptions.walDir();
+		var walDirectory = configuredWalDirectory == null || configuredWalDirectory.isBlank()
+				? definitiveDbPath
+				: Path.of(configuredWalDirectory);
+		var walMetricsConfig = new RocksDBStatistics.WalMetricsConfig(
+				db.get(), walDirectory, dbOptions.maxTotalWalSize());
+		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache,
+				this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig, walMetricsConfig);
 		this.scheduler = new RWScheduler(readCap, writeCap, "db[" + name + "]");
 		this.fastGetReader = fastGet ? new NativeRocksDBGet(db.get(), (long) readCap + writeCap) : null;
 		this.leakScheduler = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("db-leak-scheduler"));

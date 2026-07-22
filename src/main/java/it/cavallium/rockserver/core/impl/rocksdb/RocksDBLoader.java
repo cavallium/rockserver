@@ -981,6 +981,12 @@ public class RocksDBLoader {
             try (var openedDbGuard = new OpenedDbGuard(db, handles)) {
                 handles.forEach(refs::add);
 
+                logger.info("Opened RocksDB with effective WAL configuration: "
+                        + "max-total-wal-size=%s (%d bytes), wal-ttl-seconds=%d".formatted(
+                        new DataSize(rocksdbOptions.maxTotalWalSize()),
+                        rocksdbOptions.maxTotalWalSize(),
+                        rocksdbOptions.walTtlSeconds()));
+
                 if (logger.isTraceEnabled()) {
                     try {
                         for (ColumnFamilyHandle cfh : handles) {
