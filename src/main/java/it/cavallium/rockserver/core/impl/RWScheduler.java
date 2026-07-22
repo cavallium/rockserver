@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import org.jetbrains.annotations.NotNull;
+import it.cavallium.rockserver.core.common.WriteClass;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
@@ -206,6 +207,12 @@ public final class RWScheduler {
 		return write;
 	}
 
+	/** Classified write view. Plan 1 deliberately keeps both classes on the existing scheduler. */
+	public Scheduler write(WriteClass writeClass) {
+		Objects.requireNonNull(writeClass, "writeClass");
+		return write;
+	}
+
 	public Scheduler maintenance() {
 		return maintenance;
 	}
@@ -227,6 +234,12 @@ public final class RWScheduler {
 	}
 
 	public Executor writeExecutor() {
+		return writeExecutor;
+	}
+
+	/** Classified write executor. Plan 1 deliberately keeps both classes on the existing executor. */
+	public Executor writeExecutor(WriteClass writeClass) {
+		Objects.requireNonNull(writeClass, "writeClass");
 		return writeExecutor;
 	}
 

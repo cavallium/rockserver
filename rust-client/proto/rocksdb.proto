@@ -67,6 +67,13 @@ enum Operation {
   MERGED = 9;
 }
 
+// Caller-selected admission class for durable mutations. The zero value is the
+// compatibility default, so requests serialized before this field existed are foreground.
+enum WriteClass {
+  FOREGROUND = 0;
+  MAINTENANCE = 1;
+}
+
 enum PutBatchMode {
   WRITE_BATCH = 0;
   WRITE_BATCH_NO_WAL = 1;
@@ -107,16 +114,16 @@ message KVBatch {
 message OpenTransactionRequest {int64 timeoutMs = 1;}
 message OpenTransactionResponse {int64 transactionId = 1;}
 
-message CloseTransactionRequest {int64 transactionId = 1; int64 timeoutMs = 2; bool commit = 3;}
+message CloseTransactionRequest {int64 transactionId = 1; int64 timeoutMs = 2; bool commit = 3; WriteClass writeClass = 4;}
 message CloseTransactionResponse {bool successful = 1;}
 
 message CloseFailedUpdateRequest {int64 updateId = 1;}
 
-message CreateColumnRequest {string name = 1; ColumnSchema schema = 2;}
+message CreateColumnRequest {string name = 1; ColumnSchema schema = 2; WriteClass writeClass = 3;}
 message CreateColumnResponse {int64 columnId = 1;}
 
-message DeleteColumnRequest {int64 columnId = 1;}
-message DeleteColumnIfExistsRequest {string name = 1;}
+message DeleteColumnRequest {int64 columnId = 1; WriteClass writeClass = 2;}
+message DeleteColumnIfExistsRequest {string name = 1; WriteClass writeClass = 2;}
 message DeleteColumnIfExistsResponse {bool deleted = 1;}
 
 message GetColumnIdRequest {string name = 1;}
@@ -124,21 +131,28 @@ message GetColumnIdResponse {int64 columnId = 1;}
 
 message EstimateNumKeysRequest {int64 columnId = 1;}
 
-message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
+message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3; WriteClass writeClass = 4;}
 
-message MergeRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
+message DeleteRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3; WriteClass writeClass = 4;}
 
-message PutBatchInitialRequest {int64 columnId = 1; PutBatchMode mode = 2;}
+message DeleteRangeRequest {int64 columnId = 1; repeated bytes startKeysInclusive = 2; repeated bytes endKeysExclusive = 3; WriteClass writeClass = 4;}
+
+message MergeRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3; WriteClass writeClass = 4;}
+
+message PutBatchInitialRequest {int64 columnId = 1; PutBatchMode mode = 2; WriteClass writeClass = 3;}
 message PutBatchRequest {oneof putBatchRequestType {PutBatchInitialRequest initialRequest = 1;KVBatch data = 2;}}
 
-message MergeBatchInitialRequest {int64 columnId = 1; MergeBatchMode mode = 2;}
+message MergeBatchInitialRequest {int64 columnId = 1; MergeBatchMode mode = 2; WriteClass writeClass = 3;}
 message MergeBatchRequest {oneof mergeBatchRequestType {MergeBatchInitialRequest initialRequest = 1;KVBatch data = 2;}}
 
-message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
+message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; WriteClass writeClass = 3;}
 message PutMultiRequest {oneof putMultiRequestType {PutMultiInitialRequest initialRequest = 1;KV data = 2;}}
 message PutMultiListRequest {PutMultiInitialRequest initialRequest = 1; repeated KV data = 2;}
 
-message MergeMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
+message DeleteMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; WriteClass writeClass = 3;}
+message DeleteMultiRequest {oneof deleteMultiRequestType {DeleteMultiInitialRequest initialRequest = 1; DeleteRequest data = 2;}}
+
+message MergeMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; WriteClass writeClass = 3;}
 message MergeMultiRequest {oneof mergeMultiRequestType {MergeMultiInitialRequest initialRequest = 1;KV data = 2;}}
 
 message GetRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3;}
@@ -224,6 +238,13 @@ service RocksDBService {
   rpc putMultiGetChanged(stream PutMultiRequest) returns (stream Changed);
   rpc putGetPreviousPresence(PutRequest) returns (PreviousPresence);
   rpc putMultiGetPreviousPresence(stream PutMultiRequest) returns (stream PreviousPresence);
+  rpc delete(DeleteRequest) returns (google.protobuf.Empty);
+  rpc deleteMulti(stream DeleteMultiRequest) returns (google.protobuf.Empty);
+  rpc deleteRange(DeleteRangeRequest) returns (google.protobuf.Empty);
+  rpc deleteGetPrevious(DeleteRequest) returns (Previous);
+  rpc deleteMultiGetPrevious(stream DeleteMultiRequest) returns (stream Previous);
+  rpc deleteGetPreviousPresence(DeleteRequest) returns (PreviousPresence);
+  rpc deleteMultiGetPreviousPresence(stream DeleteMultiRequest) returns (stream PreviousPresence);
   rpc merge(MergeRequest) returns (google.protobuf.Empty);
   rpc mergeBatch(stream MergeBatchRequest) returns (google.protobuf.Empty);
   rpc mergeMulti(stream MergeMultiRequest) returns (google.protobuf.Empty);

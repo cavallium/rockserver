@@ -37,6 +37,7 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KVBatch;
@@ -676,11 +677,14 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<CloseTransactionResponse> closeTransaction(CloseTransactionRequest request) {
-			var executionScheduler = request.getCommit() ? scheduler.write() : scheduler.control();
-			return executeScheduled(() -> {
-				var committed = api.closeTransaction(request.getTransactionId(), request.getCommit());
-                return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
-			}, executionScheduler).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
+			return Mono.defer(() -> {
+				var writeClass = mapWriteClass(request.getWriteClassValue());
+				var executionScheduler = request.getCommit() ? scheduler.write(writeClass) : scheduler.control();
+				return executeScheduled(() -> {
+					var committed = api.closeTransaction(request.getTransactionId(), request.getCommit(), writeClass);
+					return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
+				}, executionScheduler);
+			}).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
 		}
 
 		@Override
@@ -693,25 +697,25 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<CreateColumnResponse> createColumn(CreateColumnRequest request) {
-			return executeSync(() -> {
-				var colId = api.createColumn(request.getName(), mapColumnSchema(request.getSchema()));
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
+				var colId = api.createColumn(request.getName(), mapColumnSchema(request.getSchema()), writeClass);
 				return CreateColumnResponse.newBuilder().setColumnId(colId).build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("createColumn", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("createColumn", request));
 		}
 
 		@Override
 		public Mono<Empty> deleteColumn(DeleteColumnRequest request) {
-			return executeSync(() -> {
-				api.deleteColumn(request.getColumnId());
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
+				api.deleteColumn(request.getColumnId(), writeClass);
 				return Empty.getDefaultInstance();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteColumn", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("deleteColumn", request));
 		}
 
 		@Override
 		public Mono<DeleteColumnIfExistsResponse> deleteColumnIfExists(DeleteColumnIfExistsRequest request) {
-			return executeSync(() -> DeleteColumnIfExistsResponse.newBuilder()
-					.setDeleted(api.deleteColumnIfExists(request.getName()))
-					.build(), false)
+			return executeWrite(request.getWriteClassValue(), writeClass -> DeleteColumnIfExistsResponse.newBuilder()
+					.setDeleted(api.deleteColumnIfExists(request.getName(), writeClass))
+					.build())
 					.transform(this.onErrorMapMonoWithRequestInfo("deleteColumnIfExists", request));
 		}
 
@@ -733,38 +737,41 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> put(PutRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				api.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestNothing<>()
+						new RequestNothing<>(),
+						writeClass
 				);
 				return Empty.getDefaultInstance();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("put", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("put", request));
 		}
 
 		@Override
 		public Mono<Empty> delete(DeleteRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				api.delete(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestNothing<>()
+						new RequestNothing<>(),
+						writeClass
 				);
 				return Empty.getDefaultInstance();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("delete", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("delete", request));
 		}
 
 		@Override
 		public Mono<Empty> deleteRange(DeleteRangeRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				api.deleteRange(request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive)
+						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+						writeClass
 				);
 				return Empty.getDefaultInstance();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteRange", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("deleteRange", request));
 		}
 
 		@Override
@@ -786,15 +793,16 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> merge(MergeRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				api.merge(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestNothing<>()
+						new RequestNothing<>(),
+						writeClass
 				);
 				return Empty.getDefaultInstance();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("merge", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("merge", request));
 		}
 
 		@Override
@@ -808,6 +816,7 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
+					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var mode = switch (initialRequest.getMode()) {
 						case WRITE_BATCH -> PutBatchMode.WRITE_BATCH;
 						case WRITE_BATCH_NO_WAL -> PutBatchMode.WRITE_BATCH_NO_WAL;
@@ -833,7 +842,8 @@ public class GrpcServer extends Server {
 							});
 
 					return Mono
-							.fromFuture(() -> asyncApi.putBatchAsync(initialRequest.getColumnId(), batches, mode))
+							.fromFuture(() -> asyncApi.putBatchAsync(
+									initialRequest.getColumnId(), batches, mode, writeClass))
 							.transform(this.onErrorMapMonoWithRequestInfo("putBatch", initialRequest));
 				} else if (firstSignal.isOnComplete()) {
 					return Mono.error(RocksDBException.of(
@@ -855,6 +865,7 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
+					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var mode = switch (initialRequest.getMode()) {
 						case MERGE_WRITE_BATCH -> MergeBatchMode.MERGE_WRITE_BATCH;
 						case MERGE_WRITE_BATCH_NO_WAL -> MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL;
@@ -879,15 +890,16 @@ public class GrpcServer extends Server {
 								}
 							});
 
-  			return Mono
-  					.fromFuture(() -> asyncApi.mergeBatchAsync(initialRequest.getColumnId(), batches, mode))
-  					.transform(this.onErrorMapMonoWithRequestInfo("mergeBatch", initialRequest));
-			} else if (firstSignal.isOnComplete()) {
-				return Mono.error(RocksDBException.of(
-						RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
-  			} else {
-  				return requestFlux;
-  			}
+					return Mono
+							.fromFuture(() -> asyncApi.mergeBatchAsync(
+									initialRequest.getColumnId(), batches, mode, writeClass))
+							.transform(this.onErrorMapMonoWithRequestInfo("mergeBatch", initialRequest));
+				} else if (firstSignal.isOnComplete()) {
+					return Mono.error(RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+				} else {
+					return requestFlux;
+				}
 			}).then(Mono.just(Empty.getDefaultInstance()));
 		}
 
@@ -902,6 +914,7 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
+					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var dataFlux = requestsFlux
 							.skip(1)
 							.map(deleteRequest -> {
@@ -942,12 +955,14 @@ public class GrpcServer extends Server {
 		private Mono<Empty> deleteMultiDataFlux(DeleteMultiInitialRequest initialRequest,
 				Flux<DeleteRequest> dataFlux,
 				String requestName) {
+			var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 			return dataFlux
-					.publishOn(scheduler.write())
+					.publishOn(scheduler.write(writeClass))
 					.doOnNext(data -> api.delete(initialRequest.getTransactionOrUpdateId(),
 							initialRequest.getColumnId(),
 							mapKeys(data.getKeysCount(), data::getKeys),
-							new RequestNothing<>()))
+								new RequestNothing<>(),
+								writeClass))
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
 		}
@@ -965,6 +980,7 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
+					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var dataFlux = requestsFlux
 							.skip(1)
 							.map(deleteRequest -> {
@@ -975,11 +991,12 @@ public class GrpcServer extends Server {
 							});
 
 					return dataFlux
-							.publishOn(scheduler.write())
+							.publishOn(scheduler.write(writeClass))
 							.map(data -> mapper.apply(api.delete(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysCount(), data::getKeys),
-									requestType)))
+									requestType,
+									writeClass)))
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 				} else {
 					return Flux.error(RocksDBException.of(
@@ -988,19 +1005,20 @@ public class GrpcServer extends Server {
 			});
 		}
 
-  		@Override
-  		public Mono<Merged> mergeGetMerged(MergeRequest request) {
-  			return executeSync(() -> {
-  				var merged = api.merge(request.getTransactionOrUpdateId(),
-  						request.getColumnId(),
-  						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
-  						toBuf(request.getData().getValue()),
-  						RequestType.merged());
-  				return Merged.newBuilder()
-  						.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
-  						.build();
-  			}, false).transform(this.onErrorMapMonoWithRequestInfo("mergeGetMerged", request));
-  		}
+		@Override
+		public Mono<Merged> mergeGetMerged(MergeRequest request) {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
+				var merged = api.merge(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						toBuf(request.getData().getValue()),
+						RequestType.merged(),
+						writeClass);
+				return Merged.newBuilder()
+						.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
+						.build();
+			}).transform(this.onErrorMapMonoWithRequestInfo("mergeGetMerged", request));
+		}
 
 		@Override
 		public Mono<Empty> putMultiList(PutMultiListRequest request) {
@@ -1020,6 +1038,7 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
+					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var dataFlux = requestsFlux
 							.skip(1) // skip the initial request
 							.map(mergeRequest -> {
@@ -1049,6 +1068,7 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
+					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var dataFlux = requestsFlux
 							.skip(1) // skip the initial request
 							.map(mergeRequest -> {
@@ -1059,13 +1079,14 @@ public class GrpcServer extends Server {
 							});
 
 					return dataFlux
-							.publishOn(scheduler.write())
+							.publishOn(scheduler.write(writeClass))
 							.map(data -> {
 								var merged = api.merge(initialRequest.getTransactionOrUpdateId(),
 										initialRequest.getColumnId(),
 										mapKeys(data.getKeysCount(), data::getKeys),
 										toBuf(data.getValue()),
-										RequestType.merged());
+										RequestType.merged(),
+										writeClass);
 								return Merged.newBuilder()
 										.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
 										.build();
@@ -1080,14 +1101,16 @@ public class GrpcServer extends Server {
 
 		private Mono<Empty> mergeMultiDataFlux(MergeMultiInitialRequest initialRequest,
 				Flux<KV> dataFlux, String requestName) {
+			var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 			return dataFlux
-					.publishOn(scheduler.write())
+					.publishOn(scheduler.write(writeClass))
 					.doOnNext(data -> {
 						api.merge(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
 								mapKeys(data.getKeysCount(), data::getKeys),
 								toBuf(data.getValue()),
-								new RequestNothing<>());
+								new RequestNothing<>(),
+								writeClass);
 					})
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
@@ -1104,6 +1127,7 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
+					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var dataFlux = requestsFlux
 							.skip(1) // skip the initial request
 							.map(putRequest -> {
@@ -1176,6 +1200,7 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
+					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var dataFlux = requestsFlux
 							.skip(1)
 							.map(putRequest -> {
@@ -1186,12 +1211,13 @@ public class GrpcServer extends Server {
 							});
 
 					return dataFlux
-							.publishOn(scheduler.write())
+							.publishOn(scheduler.write(writeClass))
 							.map(data -> mapper.apply(api.put(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysCount(), data::getKeys),
 									toBuf(data.getValue()),
-									requestType)))
+									requestType,
+									writeClass)))
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 				} else {
 					return Flux.error(RocksDBException.of(
@@ -1202,14 +1228,16 @@ public class GrpcServer extends Server {
 
 		private Mono<Empty> putMultiDataFlux(PutMultiInitialRequest initialRequest,
 				Flux<KV> dataFlux, String requestName) {
+			var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 			return dataFlux
-					.publishOn(scheduler.write())
+					.publishOn(scheduler.write(writeClass))
 					.doOnNext(data -> {
 						api.put(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
 								mapKeys(data.getKeysCount(), data::getKeys),
 								toBuf(data.getValue()),
-								new RequestNothing<>());
+								new RequestNothing<>(),
+								writeClass);
 					})
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
@@ -1217,29 +1245,31 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Previous> putGetPrevious(PutRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				var prev = api.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestPrevious<>()
+						new RequestPrevious<>(),
+						writeClass
 				);
 				var prevBuilder = Previous.newBuilder();
 				if (prev != null) {
 					prevBuilder.setPrevious(Utils.toByteString(prev));
 				}
 				return prevBuilder.build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetPrevious", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("putGetPrevious", request));
 		}
 
 		@Override
 		public Mono<Delta> putGetDelta(PutRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				var delta = api.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestDelta<>()
+						new RequestDelta<>(),
+						writeClass
 				);
 				var deltaBuilder = Delta.newBuilder();
 				if (delta.previous() != null) {
@@ -1249,61 +1279,65 @@ public class GrpcServer extends Server {
 					deltaBuilder.setCurrent(Utils.toByteString(delta.current()));
 				}
 				return deltaBuilder.build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetDelta", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("putGetDelta", request));
 		}
 
 		@Override
 		public Mono<Changed> putGetChanged(PutRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				var changed = api.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestChanged<>()
+						new RequestChanged<>(),
+						writeClass
 				);
 				return Changed.newBuilder().setChanged(changed).build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetChanged", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("putGetChanged", request));
 		}
 
 		@Override
 		public Mono<PreviousPresence> putGetPreviousPresence(PutRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				var present = api.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestPreviousPresence<>()
+						new RequestPreviousPresence<>(),
+						writeClass
 				);
 				return PreviousPresence.newBuilder().setPresent(present).build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("putGetPreviousPresence", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("putGetPreviousPresence", request));
 		}
 
 		@Override
 		public Mono<Previous> deleteGetPrevious(DeleteRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				var prev = api.delete(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestPrevious<>()
+						new RequestPrevious<>(),
+						writeClass
 				);
 				var prevBuilder = Previous.newBuilder();
 				if (prev != null) {
 					prevBuilder.setPrevious(Utils.toByteString(prev));
 				}
 				return prevBuilder.build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteGetPrevious", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("deleteGetPrevious", request));
 		}
 
 		@Override
 		public Mono<PreviousPresence> deleteGetPreviousPresence(DeleteRequest request) {
-			return executeSync(() -> {
+			return executeWrite(request.getWriteClassValue(), writeClass -> {
 				var present = api.delete(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestPreviousPresence<>()
+						new RequestPreviousPresence<>(),
+						writeClass
 				);
 				return PreviousPresence.newBuilder().setPresent(present).build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("deleteGetPreviousPresence", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("deleteGetPreviousPresence", request));
 		}
 
 		@Override
@@ -1699,6 +1733,22 @@ public class GrpcServer extends Server {
 
 		private <T> Mono<T> executeSync(Callable<T> callable, boolean isReadOnly) {
 			return executeScheduled(callable, isReadOnly ? scheduler.interactiveRead() : scheduler.write());
+		}
+
+		private <T> Mono<T> executeWrite(int wireWriteClass, Function<WriteClass, T> operation) {
+			return Mono.defer(() -> {
+				var writeClass = mapWriteClass(wireWriteClass);
+				return executeScheduled(() -> operation.apply(writeClass), scheduler.write(writeClass));
+			});
+		}
+
+		private WriteClass mapWriteClass(int wireWriteClass) {
+			return switch (wireWriteClass) {
+				case 0 -> WriteClass.FOREGROUND;
+				case 1 -> WriteClass.MAINTENANCE;
+				default -> throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Unknown write class: " + wireWriteClass);
+			};
 		}
 
 		private <T> Mono<T> executeCompositeRead(Callable<T> callable) {
@@ -2407,6 +2457,8 @@ public class GrpcServer extends Server {
 			} else {
 				return switch (ex) {
 					case RocksDBException e -> switch (e.getErrorUniqueId()) {
+						case PUT_INVALID_REQUEST -> Status.INVALID_ARGUMENT
+								.withDescription(e.getLocalizedMessage()).withCause(e);
 						case CDC_SUBSCRIPTION_NOT_FOUND -> Status.NOT_FOUND
 								.withDescription(e.getLocalizedMessage()).withCause(e);
 						case CDC_RESPONSE_TOO_LARGE -> Status.FAILED_PRECONDITION

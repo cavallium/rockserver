@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -12,6 +13,11 @@ import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.WriteClass;
+import it.cavallium.rockserver.core.common.api.RocksDB;
+import it.cavallium.rockserver.core.common.api.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
+import it.cavallium.rockserver.core.common.api.RocksDBWriteClass;
 import it.cavallium.rockserver.core.server.ThriftServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -21,7 +27,11 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TException;
+import org.apache.thrift.protocol.TBinaryProtocol;
+import org.apache.thrift.transport.TSocket;
+import org.apache.thrift.transport.layered.TFramedTransport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -34,6 +44,7 @@ class ThriftDeleteRangeTest {
 	private ThriftServer thriftServer;
 	private ThriftConnection client;
 	private long colId;
+	private int port;
 
 	@BeforeEach
 	void setUp() throws IOException, TException {
@@ -41,7 +52,7 @@ class ThriftDeleteRangeTest {
 		configFile = Files.createTempFile("rockserver-config", ".conf");
 		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
 		embeddedConnection = new EmbeddedConnection(dbDir, "thrift-delete-range-test", configFile);
-		var port = findFreePort();
+		port = findFreePort();
 		thriftServer = new ThriftServer(embeddedConnection, "127.0.0.1", port);
 		thriftServer.start();
 		client = new ThriftConnection("thrift-client", "127.0.0.1", port);
@@ -88,6 +99,38 @@ class ThriftDeleteRangeTest {
 	}
 
 	@Test
+	void explicitMaintenancePropagatesOverThrift() {
+		var key = key(101);
+		client.getSyncApi().put(0, colId, key, value(101), RequestType.none(), WriteClass.MAINTENANCE);
+
+		assertTrue(client.getSyncApi().get(0, colId, key, RequestType.exists()));
+
+		client.getSyncApi().delete(0, colId, key, RequestType.none(), WriteClass.MAINTENANCE);
+		assertFalse(client.getSyncApi().get(0, colId, key, RequestType.exists()));
+	}
+
+	@Test
+	void legacyGeneratedThriftClientDefaultsToForeground() throws Exception {
+		try (var transport = openRawTransport()) {
+			var rawClient = new RocksDB.Client(new TBinaryProtocol(transport));
+			var key = key(102);
+			rawClient.put(0, colId, mapKeys(key), ByteBuffer.wrap(new byte[] {7}));
+
+			assertTrue(client.getSyncApi().get(0, colId, key, RequestType.exists()));
+		}
+	}
+
+	@Test
+	void unknownThriftWriteClassIsInvalidRequest() throws Exception {
+		try (var transport = openRawTransport()) {
+			var rawClient = new RocksDBWriteClass.Client(new TBinaryProtocol(transport));
+			var error = assertThrows(RocksDBThriftException.class,
+					() -> rawClient.deleteRangeWithWriteClass(colId, List.of(), List.of(), 99));
+			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, error.getErrorType());
+		}
+	}
+
+	@Test
 	void noCacheRangeReadOverThriftMatchesNormalRangeRead() {
 		var key1 = key(11);
 		var key2 = key(12);
@@ -115,6 +158,17 @@ class ThriftDeleteRangeTest {
 			socket.setReuseAddress(true);
 			return socket.getLocalPort();
 		}
+	}
+
+	private TFramedTransport openRawTransport() throws TException {
+		var configuration = TConfiguration.custom().build();
+		var transport = new TFramedTransport(new TSocket(configuration, "127.0.0.1", port));
+		transport.open();
+		return transport;
+	}
+
+	private static List<ByteBuffer> mapKeys(Keys keys) {
+		return java.util.Arrays.stream(keys.keys()).map(Utils::asByteBuffer).toList();
 	}
 
 	private static Keys key(long id) {

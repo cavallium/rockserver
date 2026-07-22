@@ -18,6 +18,7 @@ pub type Result<T> = std::result::Result<T, Status>;
 #[derive(Clone, Debug)]
 pub struct RockserverClient {
     client: RocksDbServiceClient<Channel>,
+    write_class: WriteClass,
 }
 
 impl RockserverClient {
@@ -34,13 +35,23 @@ impl RockserverClient {
         D::Error: Into<tonic::codegen::StdError>,
     {
         let client = RocksDbServiceClient::connect(dst).await?;
-        Ok(Self { client })
+        Ok(Self { client, write_class: WriteClass::Foreground })
     }
 
     /// Create a new client from an existing Tonic `Channel`.
     pub fn new(channel: Channel) -> Self {
         Self {
             client: RocksDbServiceClient::new(channel),
+            write_class: WriteClass::Foreground,
+        }
+    }
+
+    /// Returns a client view that applies the selected class to every caller-classified mutation.
+    /// The underlying channel is shared and cloning this view is cheap.
+    pub fn with_write_class(&self, write_class: WriteClass) -> Self {
+        Self {
+            client: self.client.clone(),
+            write_class,
         }
     }
 
@@ -75,6 +86,7 @@ impl RockserverClient {
             transaction_id,
             timeout_ms,
             commit,
+            write_class: self.write_class as i32,
         };
         let resp = self.client.clone().close_transaction(req).await?;
         Ok(resp.into_inner().successful)
@@ -93,14 +105,18 @@ impl RockserverClient {
 
     /// Creates a new column with the given name and schema.
     pub async fn create_column(&self, name: String, schema: ColumnSchema) -> Result<i64> {
-        let req = CreateColumnRequest { name, schema: Some(schema.into()) };
+        let req = CreateColumnRequest {
+            name,
+            schema: Some(schema.into()),
+            write_class: self.write_class as i32,
+        };
         let resp = self.client.clone().create_column(req).await?;
         Ok(resp.into_inner().column_id)
     }
 
     /// Deletes a column by its ID.
     pub async fn delete_column(&self, column_id: i64) -> Result<()> {
-        let req = DeleteColumnRequest { column_id };
+        let req = DeleteColumnRequest { column_id, write_class: self.write_class as i32 };
         self.client.clone().delete_column(req).await?;
         Ok(())
     }
@@ -109,7 +125,7 @@ impl RockserverClient {
     ///
     /// Returns `true` when a physical column was deleted and `false` when it was already absent.
     pub async fn delete_column_if_exists(&self, name: String) -> Result<bool> {
-        let req = DeleteColumnIfExistsRequest { name };
+        let req = DeleteColumnIfExistsRequest { name, write_class: self.write_class as i32 };
         let resp = self.client.clone().delete_column_if_exists(req).await?;
         Ok(resp.into_inner().deleted)
     }
@@ -145,6 +161,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
+            write_class: self.write_class as i32,
         };
         self.client.clone().put(req).await?;
         Ok(())
@@ -156,6 +173,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
+            write_class: self.write_class as i32,
         };
         let resp = self.client.clone().put_get_previous(req).await?;
         Ok(resp.into_inner().previous)
@@ -167,6 +185,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
+            write_class: self.write_class as i32,
         };
         let resp = self.client.clone().put_get_delta(req).await?;
         Ok(resp.into_inner())
@@ -178,6 +197,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
+            write_class: self.write_class as i32,
         };
         let resp = self.client.clone().put_get_changed(req).await?;
         Ok(resp.into_inner().changed)
@@ -189,6 +209,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
+            write_class: self.write_class as i32,
         };
         let resp = self.client.clone().put_get_previous_presence(req).await?;
         Ok(resp.into_inner().present)
@@ -206,6 +227,7 @@ impl RockserverClient {
                 PutBatchInitialRequest {
                     column_id,
                     mode: mode.into(),
+                    write_class: self.write_class as i32,
                 },
             )),
         };
@@ -235,6 +257,7 @@ impl RockserverClient {
                 MergeBatchInitialRequest {
                     column_id,
                     mode: mode.into(),
+                    write_class: self.write_class as i32,
                 },
             )),
         };
@@ -263,6 +286,7 @@ impl RockserverClient {
             initial_request: Some(PutMultiInitialRequest {
                 transaction_or_update_id,
                 column_id,
+                write_class: self.write_class as i32,
             }),
             data,
         };
@@ -282,6 +306,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
+                    write_class: self.write_class as i32,
                 },
             )),
         };
@@ -311,6 +336,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
+                    write_class: self.write_class as i32,
                 },
             )),
         };
@@ -340,6 +366,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
+                    write_class: self.write_class as i32,
                 },
             )),
         };
@@ -369,6 +396,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
+                    write_class: self.write_class as i32,
                 },
             )),
         };
@@ -398,6 +426,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
+                    write_class: self.write_class as i32,
                 },
             )),
         };
@@ -413,6 +442,137 @@ impl RockserverClient {
 
         let resp = self.client.clone().put_multi_get_previous_presence(request_stream).await?;
         Ok(resp.into_inner())
+    }
+
+    // ============================================================================================
+    // Data Operations - Delete
+    // ============================================================================================
+
+    /// Deletes a value for a specific key.
+    pub async fn delete(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>) -> Result<()> {
+        let req = DeleteRequest {
+            transaction_or_update_id,
+            column_id,
+            keys,
+            write_class: self.write_class as i32,
+        };
+        self.client.clone().delete(req).await?;
+        Ok(())
+    }
+
+    /// Deletes a value and returns the previous value when present.
+    pub async fn delete_get_previous(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>> {
+        let req = DeleteRequest {
+            transaction_or_update_id,
+            column_id,
+            keys,
+            write_class: self.write_class as i32,
+        };
+        let response = self.client.clone().delete_get_previous(req).await?;
+        Ok(response.into_inner().previous)
+    }
+
+    /// Deletes a value and reports whether it existed.
+    pub async fn delete_get_previous_presence(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<bool> {
+        let req = DeleteRequest {
+            transaction_or_update_id,
+            column_id,
+            keys,
+            write_class: self.write_class as i32,
+        };
+        let response = self.client.clone().delete_get_previous_presence(req).await?;
+        Ok(response.into_inner().present)
+    }
+
+    /// Deletes the encoded half-open range `[start_keys_inclusive, end_keys_exclusive)`.
+    pub async fn delete_range(
+        &self,
+        column_id: i64,
+        start_keys_inclusive: Vec<Vec<u8>>,
+        end_keys_exclusive: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        let req = DeleteRangeRequest {
+            column_id,
+            start_keys_inclusive,
+            end_keys_exclusive,
+            write_class: self.write_class as i32,
+        };
+        self.client.clone().delete_range(req).await?;
+        Ok(())
+    }
+
+    /// Streams keys to delete.
+    pub async fn delete_multi(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
+    ) -> Result<()> {
+        let requests = self.delete_multi_requests(transaction_or_update_id, column_id, keys);
+        self.client.clone().delete_multi(requests).await?;
+        Ok(())
+    }
+
+    /// Streams keys to delete and returns their previous values.
+    pub async fn delete_multi_get_previous(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
+    ) -> Result<impl Stream<Item = Result<Previous>>> {
+        let requests = self.delete_multi_requests(transaction_or_update_id, column_id, keys);
+        let response = self.client.clone().delete_multi_get_previous(requests).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Streams keys to delete and reports whether each value existed.
+    pub async fn delete_multi_get_previous_presence(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
+    ) -> Result<impl Stream<Item = Result<PreviousPresence>>> {
+        let requests = self.delete_multi_requests(transaction_or_update_id, column_id, keys);
+        let response = self.client.clone().delete_multi_get_previous_presence(requests).await?;
+        Ok(response.into_inner())
+    }
+
+    fn delete_multi_requests(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
+    ) -> impl Stream<Item = DeleteMultiRequest> + Send + 'static {
+        let write_class = self.write_class as i32;
+        async_stream::stream! {
+            yield DeleteMultiRequest {
+                delete_multi_request_type: Some(delete_multi_request::DeleteMultiRequestType::InitialRequest(
+                    DeleteMultiInitialRequest { transaction_or_update_id, column_id, write_class },
+                )),
+            };
+            for await item_keys in keys {
+                yield DeleteMultiRequest {
+                    delete_multi_request_type: Some(delete_multi_request::DeleteMultiRequestType::Data(
+                        DeleteRequest {
+                            transaction_or_update_id: 0,
+                            column_id: 0,
+                            keys: item_keys,
+                            write_class: WriteClass::Foreground as i32,
+                        },
+                    )),
+                };
+            }
+        }
     }
     
     // ============================================================================================
@@ -431,6 +591,7 @@ impl RockserverClient {
                 MergeMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
+                    write_class: self.write_class as i32,
                 },
             )),
         };
@@ -460,6 +621,7 @@ impl RockserverClient {
                 MergeMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
+                    write_class: self.write_class as i32,
                 },
             )),
         };
@@ -483,6 +645,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
+            write_class: self.write_class as i32,
         };
         self.client.clone().merge(req).await?;
         Ok(())
@@ -494,6 +657,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
+            write_class: self.write_class as i32,
         };
         let resp = self.client.clone().merge_get_merged(req).await?;
         Ok(resp.into_inner().merged)
@@ -1035,4 +1199,21 @@ fn decode_kv_batch(mut buf: &[u8]) -> Result<KvBatch> {
     }
 
     Ok(KvBatch { entries })
+}
+
+#[cfg(test)]
+mod write_class_tests {
+    use super::*;
+    use tonic::transport::Endpoint;
+
+    #[tokio::test]
+    async fn client_views_default_to_foreground_and_retain_maintenance() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let foreground = RockserverClient::new(channel);
+        assert_eq!(foreground.write_class, WriteClass::Foreground);
+
+        let maintenance = foreground.with_write_class(WriteClass::Maintenance);
+        assert_eq!(maintenance.write_class, WriteClass::Maintenance);
+        assert_eq!(foreground.write_class, WriteClass::Foreground);
+    }
 }

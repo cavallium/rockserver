@@ -3,7 +3,7 @@ use crate::proto;
 
 // Re-export proto types that are part of the public API
 pub use crate::proto::{
-    ColumnHashType, Operation, PutBatchMode, MergeBatchMode,
+    ColumnHashType, Operation, PutBatchMode, MergeBatchMode, WriteClass,
     Kv, KvBatch, Delta, Previous, Changed, PreviousPresence, Merged, UpdateBegin,
     FirstAndLast, CdcEvent,
 };

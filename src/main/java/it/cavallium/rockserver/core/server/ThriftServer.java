@@ -12,6 +12,7 @@ import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.common.api.Column;
 import it.cavallium.rockserver.core.common.api.ColumnHashType;
 import it.cavallium.rockserver.core.common.api.ColumnSchema;
@@ -22,8 +23,8 @@ import it.cavallium.rockserver.core.common.api.MergeBatchMode;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
 import it.cavallium.rockserver.core.common.api.OptionalLongValue;
 import it.cavallium.rockserver.core.common.api.PutBatchMode;
-import it.cavallium.rockserver.core.common.api.RocksDB.Iface;
-import it.cavallium.rockserver.core.common.api.RocksDB.Processor;
+import it.cavallium.rockserver.core.common.api.RocksDBWriteClass.Iface;
+import it.cavallium.rockserver.core.common.api.RocksDBWriteClass.Processor;
 import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -429,6 +430,179 @@ public class ThriftServer extends Server {
 			);
 		}
 
+		private WriteClass mapWriteClass(int wireWriteClass) {
+			return switch (wireWriteClass) {
+				case 0 -> WriteClass.FOREGROUND;
+				case 1 -> WriteClass.MAINTENANCE;
+				default -> throw it.cavallium.rockserver.core.common.RocksDBException.of(
+						it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Unknown write class: " + wireWriteClass);
+			};
+		}
+
+		// The inherited RocksDB service is the legacy wire surface. Its missing
+		// write-class field is defined to mean foreground.
+		@Override
+		public boolean closeTransaction(long transactionId, boolean commit) throws RocksDBThriftException {
+			return closeTransactionWithWriteClass(transactionId, commit, 0);
+		}
+
+		@Override
+		public long createColumn(String name, ColumnSchema schema) throws RocksDBThriftException {
+			return createColumnWithWriteClass(name, schema, 0);
+		}
+
+		@Override
+		public void deleteColumn(long columnId) throws RocksDBThriftException {
+			deleteColumnWithWriteClass(columnId, 0);
+		}
+
+		@Override
+		public boolean deleteColumnIfExists(String name) throws RocksDBThriftException {
+			return deleteColumnIfExistsWithWriteClass(name, 0);
+		}
+
+		@Override
+		public void putFast(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys, ByteBuffer value) {
+			putFastWithWriteClass(transactionOrUpdateId, columnId, keys, value, 0);
+		}
+
+		@Override
+		public void put(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys, ByteBuffer value)
+				throws RocksDBThriftException {
+			putWithWriteClass(transactionOrUpdateId, columnId, keys, value, 0);
+		}
+
+		@Override
+		public void putMulti(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			putMultiWithWriteClass(transactionOrUpdateId, columnId, keysMulti, valueMulti, 0);
+		}
+
+		@Override
+		public OptionalBinary putGetPrevious(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys,
+				ByteBuffer value) throws RocksDBThriftException {
+			return putGetPreviousWithWriteClass(transactionOrUpdateId, columnId, keys, value, 0);
+		}
+
+		@Override
+		public Delta putGetDelta(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys,
+				ByteBuffer value) throws RocksDBThriftException {
+			return putGetDeltaWithWriteClass(transactionOrUpdateId, columnId, keys, value, 0);
+		}
+
+		@Override
+		public boolean putGetChanged(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys,
+				ByteBuffer value) throws RocksDBThriftException {
+			return putGetChangedWithWriteClass(transactionOrUpdateId, columnId, keys, value, 0);
+		}
+
+		@Override
+		public boolean putGetPreviousPresence(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys,
+				ByteBuffer value) throws RocksDBThriftException {
+			return putGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, keys, value, 0);
+		}
+
+		@Override
+		public void delete(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys)
+				throws RocksDBThriftException {
+			deleteWithWriteClass(transactionOrUpdateId, columnId, keys, 0);
+		}
+
+		@Override
+		public OptionalBinary deleteGetPrevious(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys)
+				throws RocksDBThriftException {
+			return deleteGetPreviousWithWriteClass(transactionOrUpdateId, columnId, keys, 0);
+		}
+
+		@Override
+		public boolean deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys)
+				throws RocksDBThriftException {
+			return deleteGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, keys, 0);
+		}
+
+		@Override
+		public void deleteMulti(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti)
+				throws RocksDBThriftException {
+			deleteMultiWithWriteClass(transactionOrUpdateId, columnId, keysMulti, 0);
+		}
+
+		@Override
+		public List<OptionalBinary> deleteMultiGetPrevious(long transactionOrUpdateId, long columnId,
+				List<List<ByteBuffer>> keysMulti) throws RocksDBThriftException {
+			return deleteMultiGetPreviousWithWriteClass(transactionOrUpdateId, columnId, keysMulti, 0);
+		}
+
+		@Override
+		public List<Boolean> deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId,
+				List<List<ByteBuffer>> keysMulti) throws RocksDBThriftException {
+			return deleteMultiGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, keysMulti, 0);
+		}
+
+		@Override
+		public void putBatch(long columnId, List<KV> data, PutBatchMode mode) throws RocksDBThriftException {
+			putBatchWithWriteClass(columnId, data, mode, 0);
+		}
+
+		@Override
+		public void merge(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys, ByteBuffer value)
+				throws RocksDBThriftException {
+			mergeWithWriteClass(transactionOrUpdateId, columnId, keys, value, 0);
+		}
+
+		@Override
+		public void mergeMulti(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			mergeMultiWithWriteClass(transactionOrUpdateId, columnId, keysMulti, valueMulti, 0);
+		}
+
+		@Override
+		public void mergeBatch(long columnId, List<KV> data, MergeBatchMode mode) throws RocksDBThriftException {
+			mergeBatchWithWriteClass(columnId, data, mode, 0);
+		}
+
+		@Override
+		public void deleteRange(long columnId, List<ByteBuffer> startKeysInclusive,
+				List<ByteBuffer> endKeysExclusive) throws RocksDBThriftException {
+			deleteRangeWithWriteClass(columnId, startKeysInclusive, endKeysExclusive, 0);
+		}
+
+		@Override
+		public OptionalBinary mergeGetMerged(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys,
+				ByteBuffer value) throws RocksDBThriftException {
+			return mergeGetMergedWithWriteClass(transactionOrUpdateId, columnId, keys, value, 0);
+		}
+
+		@Override
+		public List<OptionalBinary> mergeMultiGetMerged(long transactionOrUpdateId, long columnId,
+				List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			return mergeMultiGetMergedWithWriteClass(transactionOrUpdateId, columnId, keysMulti, valueMulti, 0);
+		}
+
+		@Override
+		public List<OptionalBinary> putMultiGetPrevious(long transactionOrUpdateId, long columnId,
+				List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			return putMultiGetPreviousWithWriteClass(transactionOrUpdateId, columnId, keysMulti, valueMulti, 0);
+		}
+
+		@Override
+		public List<Delta> putMultiGetDelta(long transactionOrUpdateId, long columnId,
+				List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			return putMultiGetDeltaWithWriteClass(transactionOrUpdateId, columnId, keysMulti, valueMulti, 0);
+		}
+
+		@Override
+		public List<Boolean> putMultiGetChanged(long transactionOrUpdateId, long columnId,
+				List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			return putMultiGetChangedWithWriteClass(transactionOrUpdateId, columnId, keysMulti, valueMulti, 0);
+		}
+
+		@Override
+		public List<Boolean> putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId,
+				List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+			return putMultiGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, keysMulti, valueMulti, 0);
+		}
+
 		@Override
 		public long openTransaction(long timeoutMs) throws RocksDBThriftException {
 			try {
@@ -439,9 +613,9 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public boolean closeTransaction(long transactionId, boolean commit) throws RocksDBThriftException {
+		public boolean closeTransactionWithWriteClass(long transactionId, boolean commit, int writeClass) throws RocksDBThriftException {
 			try {
-				return api.closeTransaction(transactionId, commit);
+				return api.closeTransaction(transactionId, commit, mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -457,39 +631,43 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public long createColumn(String name, ColumnSchema schema) throws RocksDBThriftException {
+		public long createColumnWithWriteClass(String name, ColumnSchema schema, int writeClass) throws RocksDBThriftException {
 			try {
-				return api.createColumn(name, columnSchemaToRecord(schema));
+				return api.createColumn(name, columnSchemaToRecord(schema), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public void deleteColumn(long columnId) throws RocksDBThriftException {
+		public void deleteColumnWithWriteClass(long columnId, int writeClass) throws RocksDBThriftException {
 			try {
-				api.deleteColumn(columnId);
+				api.deleteColumn(columnId, mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public boolean deleteColumnIfExists(String name) throws RocksDBThriftException {
+		public boolean deleteColumnIfExistsWithWriteClass(String name, int writeClass) throws RocksDBThriftException {
 			try {
-				return api.deleteColumnIfExists(name);
+				return api.deleteColumnIfExists(name, mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public void deleteRange(long columnId, List<ByteBuffer> startKeysInclusive, List<ByteBuffer> endKeysExclusive)
+		public void deleteRangeWithWriteClass(long columnId,
+				List<ByteBuffer> startKeysInclusive,
+				List<ByteBuffer> endKeysExclusive,
+				int writeClass)
 				throws RocksDBThriftException {
 			try {
 				api.deleteRange(columnId,
 						keysToRecord(startKeysInclusive),
-						keysToRecord(endKeysExclusive));
+						keysToRecord(endKeysExclusive),
+						mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -514,12 +692,13 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void putFast(long transactionOrUpdateId,
+		public void putFastWithWriteClass(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) {
+				ByteBuffer value,
+				int writeClass) {
 			try {
-				this.put(transactionOrUpdateId, columnId, keys, value);
+				this.putWithWriteClass(transactionOrUpdateId, columnId, keys, value, writeClass);
 			} catch (Exception e) {
 				// Oneway cannot throw exception
 				LOG.error("Error in putFast", e);
@@ -527,144 +706,174 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void put(long transactionOrUpdateId,
+		public void putWithWriteClass(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) throws RocksDBThriftException {
+				ByteBuffer value,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				api.put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.none());
+				api.put(transactionOrUpdateId,
+						columnId,
+						keysToRecord(keys),
+						keyToRecord(value),
+						RequestType.none(),
+						mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public void putMulti(long transactionOrUpdateId,
+		public void putMultiWithWriteClass(long transactionOrUpdateId,
 				long columnId,
 				List<List<ByteBuffer>> keysMulti,
-				List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+				List<ByteBuffer> valueMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				api.putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.none());
+				api.putMulti(transactionOrUpdateId,
+						columnId,
+						keysToRecords(keysMulti),
+						keyToRecords(valueMulti),
+						RequestType.none(),
+						mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public OptionalBinary putGetPrevious(long transactionOrUpdateId,
+		public OptionalBinary putGetPreviousWithWriteClass(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) throws RocksDBThriftException {
+				ByteBuffer value,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return ThriftServer.mapResult(api.put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.previous()));
+				return ThriftServer.mapResult(api.put(transactionOrUpdateId, columnId, keysToRecord(keys),
+						keyToRecord(value), RequestType.previous(), mapWriteClass(writeClass)));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public Delta putGetDelta(long transactionOrUpdateId,
+		public Delta putGetDeltaWithWriteClass(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) throws RocksDBThriftException {
+				ByteBuffer value,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return ThriftServer.mapResult(api.put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.delta()));
+				return ThriftServer.mapResult(api.put(transactionOrUpdateId, columnId, keysToRecord(keys),
+						keyToRecord(value), RequestType.delta(), mapWriteClass(writeClass)));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public boolean putGetChanged(long transactionOrUpdateId,
+		public boolean putGetChangedWithWriteClass(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) throws RocksDBThriftException {
+				ByteBuffer value,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return api.put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.changed());
+				return api.put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value),
+						RequestType.changed(), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public boolean putGetPreviousPresence(long transactionOrUpdateId,
+		public boolean putGetPreviousPresenceWithWriteClass(long transactionOrUpdateId,
 				long columnId,
 				List<ByteBuffer> keys,
-				ByteBuffer value) throws RocksDBThriftException {
+				ByteBuffer value,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return api.put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.previousPresence());
+				return api.put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value),
+						RequestType.previousPresence(), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public void delete(long transactionOrUpdateId,
+		public void deleteWithWriteClass(long transactionOrUpdateId,
 				long columnId,
-				List<ByteBuffer> keys) throws RocksDBThriftException {
+				List<ByteBuffer> keys,
+				int writeClass) throws RocksDBThriftException {
 			try {
 				api.delete(
-						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.none());
+						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.none(), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public OptionalBinary deleteGetPrevious(long transactionOrUpdateId,
+		public OptionalBinary deleteGetPreviousWithWriteClass(long transactionOrUpdateId,
 				long columnId,
-				List<ByteBuffer> keys) throws RocksDBThriftException {
+				List<ByteBuffer> keys,
+				int writeClass) throws RocksDBThriftException {
 			try {
 				return ThriftServer.mapResult(api.delete(
-						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.previous()));
+						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.previous(), mapWriteClass(writeClass)));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public boolean deleteGetPreviousPresence(long transactionOrUpdateId,
+		public boolean deleteGetPreviousPresenceWithWriteClass(long transactionOrUpdateId,
 				long columnId,
-				List<ByteBuffer> keys) throws RocksDBThriftException {
+				List<ByteBuffer> keys,
+				int writeClass) throws RocksDBThriftException {
 			try {
 				return api.delete(
-						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.previousPresence());
+						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.previousPresence(),
+						mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public void deleteMulti(long transactionOrUpdateId,
+		public void deleteMultiWithWriteClass(long transactionOrUpdateId,
 				long columnId,
-				List<List<ByteBuffer>> keysMulti) throws RocksDBThriftException {
+				List<List<ByteBuffer>> keysMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
 				api.deleteMulti(
-						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.none());
+						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.none(),
+						mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public List<OptionalBinary> deleteMultiGetPrevious(long transactionOrUpdateId,
+		public List<OptionalBinary> deleteMultiGetPreviousWithWriteClass(long transactionOrUpdateId,
 				long columnId,
-				List<List<ByteBuffer>> keysMulti) throws RocksDBThriftException {
+				List<List<ByteBuffer>> keysMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
 				return ThriftServer.mapResult(api.deleteMulti(
-						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.previous()));
+						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.previous(),
+						mapWriteClass(writeClass)));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public List<Boolean> deleteMultiGetPreviousPresence(long transactionOrUpdateId,
+		public List<Boolean> deleteMultiGetPreviousPresenceWithWriteClass(long transactionOrUpdateId,
 				long columnId,
-				List<List<ByteBuffer>> keysMulti) throws RocksDBThriftException {
+				List<List<ByteBuffer>> keysMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
 				return api.deleteMulti(
-						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.previousPresence());
+						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.previousPresence(),
+						mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -782,54 +991,77 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void putBatch(long columnId, List<KV> data, PutBatchMode mode) throws RocksDBThriftException {
+		public void putBatchWithWriteClass(long columnId, List<KV> data, PutBatchMode mode, int writeClass)
+				throws RocksDBThriftException {
 			try {
-				api.putBatch(columnId, kvToBatch(data), mapPutBatchMode(mode));
+				api.putBatch(columnId, kvToBatch(data), mapPutBatchMode(mode), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public void merge(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys, ByteBuffer value) throws RocksDBThriftException {
+		public void mergeWithWriteClass(long transactionOrUpdateId,
+				long columnId,
+				List<ByteBuffer> keys,
+				ByteBuffer value,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				api.merge(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.none());
+				api.merge(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value),
+						RequestType.none(), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public void mergeMulti(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+		public void mergeMultiWithWriteClass(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				api.mergeMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.none());
+				api.mergeMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti),
+						RequestType.none(), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public void mergeBatch(long columnId, List<KV> data, MergeBatchMode mode) throws RocksDBThriftException {
+		public void mergeBatchWithWriteClass(long columnId, List<KV> data, MergeBatchMode mode, int writeClass)
+				throws RocksDBThriftException {
 			try {
-				api.mergeBatch(columnId, kvToBatch(data), mapMergeBatchMode(mode));
+				api.mergeBatch(columnId, kvToBatch(data), mapMergeBatchMode(mode), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public OptionalBinary mergeGetMerged(long transactionOrUpdateId, long columnId, List<ByteBuffer> keys, ByteBuffer value) throws RocksDBThriftException {
+		public OptionalBinary mergeGetMergedWithWriteClass(long transactionOrUpdateId,
+				long columnId,
+				List<ByteBuffer> keys,
+				ByteBuffer value,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return ThriftServer.mapResult(api.merge(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value), RequestType.merged()));
+				return ThriftServer.mapResult(api.merge(transactionOrUpdateId, columnId, keysToRecord(keys),
+						keyToRecord(value), RequestType.merged(), mapWriteClass(writeClass)));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public List<OptionalBinary> mergeMultiGetMerged(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+		public List<OptionalBinary> mergeMultiGetMergedWithWriteClass(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return ThriftServer.mapResult(api.mergeMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.merged()));
+				return ThriftServer.mapResult(api.mergeMulti(transactionOrUpdateId, columnId,
+						keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.merged(),
+						mapWriteClass(writeClass)));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -885,18 +1117,28 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public List<OptionalBinary> putMultiGetPrevious(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+		public List<OptionalBinary> putMultiGetPreviousWithWriteClass(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return mapResult(api.putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.previous()));
+				return mapResult(api.putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti),
+						keyToRecords(valueMulti), RequestType.previous(), mapWriteClass(writeClass)));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public List<Delta> putMultiGetDelta(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+		public List<Delta> putMultiGetDeltaWithWriteClass(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return api.putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.delta())
+				return api.putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti),
+						keyToRecords(valueMulti), RequestType.delta(), mapWriteClass(writeClass))
 						.stream().map(ThriftServer::mapResult).collect(Collectors.toList());
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -904,18 +1146,28 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public List<Boolean> putMultiGetChanged(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+		public List<Boolean> putMultiGetChangedWithWriteClass(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return api.putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.changed());
+				return api.putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti),
+						keyToRecords(valueMulti), RequestType.changed(), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public List<Boolean> putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, List<List<ByteBuffer>> keysMulti, List<ByteBuffer> valueMulti) throws RocksDBThriftException {
+		public List<Boolean> putMultiGetPreviousPresenceWithWriteClass(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti,
+				int writeClass) throws RocksDBThriftException {
 			try {
-				return api.putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.previousPresence());
+				return api.putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti),
+						keyToRecords(valueMulti), RequestType.previousPresence(), mapWriteClass(writeClass));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}

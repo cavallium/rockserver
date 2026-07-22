@@ -103,12 +103,22 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public boolean closeTransaction(long transactionId, boolean commit, @NotNull WriteClass writeClass) {
+		return db.closeTransaction(transactionId, commit);
+	}
+
+	@Override
 	public void closeFailedUpdate(long updateId) throws RocksDBException {
 		db.closeFailedUpdate(updateId);
 	}
 
 	@Override
 	public long createColumn(String name, @NotNull ColumnSchema schema) {
+		return db.createColumn(name, schema);
+	}
+
+	@Override
+	public long createColumn(String name, @NotNull ColumnSchema schema, @NotNull WriteClass writeClass) {
 		return db.createColumn(name, schema);
 	}
 
@@ -129,7 +139,17 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public void deleteColumn(long columnId, @NotNull WriteClass writeClass) throws RocksDBException {
+		db.deleteColumn(columnId);
+	}
+
+	@Override
 	public boolean deleteColumnIfExists(@NotNull String name) throws RocksDBException {
+		return db.deleteColumnIfExists(name);
+	}
+
+	@Override
+	public boolean deleteColumnIfExists(@NotNull String name, @NotNull WriteClass writeClass) throws RocksDBException {
 		return db.deleteColumnIfExists(name);
 	}
 
@@ -152,9 +172,10 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
     @Override
     public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> req) {
         return (RA) switch (req) {
-            case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
+            case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(
+                    putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode(), putBatch.writeClass());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch mergeBatch -> this.mergeBatchAsync(
-					mergeBatch.columnId(), mergeBatch.batchPublisher(), mergeBatch.mode());
+					mergeBatch.columnId(), mergeBatch.batchPublisher(), mergeBatch.mode(), mergeBatch.writeClass());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti existsMulti -> this.existsMultiAsync(
 					existsMulti.transactionId(), existsMulti.columnId(), existsMulti.keys(), existsMulti.timeoutMs());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator closeIterator -> this.closeIteratorAsync(
@@ -201,7 +222,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			return db.getScheduler().cdcExecutor();
 		}
 		if (!command.isReadOnly()) {
-			return db.getScheduler().writeExecutor();
+			return db.getScheduler().writeExecutor(command.writeClass());
 		}
 		return command.readWorkClass() == RocksDBAPICommand.ReadWorkClass.INTERACTIVE
 				? db.getScheduler().interactiveReadExecutor()
@@ -228,10 +249,29 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public <T> T put(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return db.put(transactionOrUpdateId, columnId, keys, value, requestType);
+	}
+
+	@Override
 	public <T> T delete(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
 			@NotNull RequestType.RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		return db.delete(transactionOrUpdateId, columnId, keys, requestType);
+	}
+
+	@Override
+	public <T> T delete(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull RequestType.RequestDelete<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		return db.delete(transactionOrUpdateId, columnId, keys, requestType);
 	}
 
@@ -245,6 +285,16 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public <T> T merge(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestMerge<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return db.merge(transactionOrUpdateId, columnId, keys, value, requestType);
+	}
+
+	@Override
 	public <T> List<T> deleteMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
@@ -253,9 +303,26 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public <T> List<T> deleteMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType);
+	}
+
+	@Override
 	public void deleteRange(long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive) throws RocksDBException {
+		db.deleteRange(columnId, startKeysInclusive, endKeysExclusive);
+	}
+
+	@Override
+	public void deleteRange(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		db.deleteRange(columnId, startKeysInclusive, endKeysExclusive);
 	}
 
@@ -269,11 +336,31 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public <T> List<T> putMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			@NotNull List<@NotNull Buf> values,
+			RequestPut<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return db.putMulti(transactionOrUpdateId, columnId, keys, values, requestType);
+	}
+
+	@Override
 	public <T> List<T> mergeMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
 			@NotNull List<@NotNull Buf> values,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		return db.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType);
+	}
+
+	@Override
+	public <T> List<T> mergeMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			@NotNull List<@NotNull Buf> values,
+			RequestMerge<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		return db.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType);
 	}
 
@@ -299,9 +386,25 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public CompletableFuture<Void> putBatchAsync(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull PutBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return db.putBatchInternal(columnId, batchPublisher, mode);
+	}
+
+	@Override
 	public CompletableFuture<Void> mergeBatchAsync(long columnId,
 											@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 											@NotNull MergeBatchMode mode) throws RocksDBException {
+		return db.mergeBatchInternal(columnId, batchPublisher, mode);
+	}
+
+	@Override
+	public CompletableFuture<Void> mergeBatchAsync(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull MergeBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		return db.mergeBatchInternal(columnId, batchPublisher, mode);
 	}
 
@@ -313,9 +416,25 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	public void putBatch(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull PutBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		db.putBatch(columnId, batchPublisher, mode);
+	}
+
+	@Override
 	public void mergeBatch(long columnId,
 				   @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 				   @NotNull MergeBatchMode mode) throws RocksDBException {
+		db.mergeBatch(columnId, batchPublisher, mode);
+	}
+
+	@Override
+	public void mergeBatch(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull MergeBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		db.mergeBatch(columnId, batchPublisher, mode);
 	}
 

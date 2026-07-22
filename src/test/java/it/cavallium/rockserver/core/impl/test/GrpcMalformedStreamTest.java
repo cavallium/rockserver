@@ -150,7 +150,7 @@ class GrpcMalformedStreamTest {
 	private static void assertInvalidRequest(Mono<?> response) {
 		var error = assertThrows(StatusRuntimeException.class,
 				() -> response.block(Duration.ofSeconds(10)));
-		assertEquals(Status.Code.INTERNAL, error.getStatus().getCode());
+		assertEquals(Status.Code.INVALID_ARGUMENT, error.getStatus().getCode());
 		assertTrue(error.getStatus().getDescription().contains("PUT_INVALID_REQUEST"),
 				() -> "Unexpected error description: " + error.getStatus().getDescription());
 	}

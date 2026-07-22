@@ -1,8 +1,10 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -19,6 +21,19 @@ import reactor.core.scheduler.Schedulers;
 
 @Timeout(30)
 class RWSchedulerTest {
+
+	@Test
+	void classifiedWritesRemainAliasesOfTheExistingWriteLane() {
+		var scheduler = new RWScheduler(1, 1, "write-class-alias-test");
+		try {
+			assertSame(scheduler.write(), scheduler.write(WriteClass.FOREGROUND));
+			assertSame(scheduler.write(), scheduler.write(WriteClass.MAINTENANCE));
+			assertSame(scheduler.writeExecutor(), scheduler.writeExecutor(WriteClass.FOREGROUND));
+			assertSame(scheduler.writeExecutor(), scheduler.writeExecutor(WriteClass.MAINTENANCE));
+		} finally {
+			scheduler.dispose();
+		}
+	}
 
 	@Test
 	void gracefulDisposalTerminatesEveryDedicatedExecutor() {

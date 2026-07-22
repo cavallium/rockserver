@@ -38,11 +38,12 @@ import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
 import it.cavallium.rockserver.core.common.api.OptionalLongValue;
-import it.cavallium.rockserver.core.common.api.RocksDB;
+import it.cavallium.rockserver.core.common.api.RocksDBWriteClass;
 import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
 import java.io.IOException;
@@ -86,7 +87,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	private final int maxCdcResponseSize;
 	private final List<ClientSlot> allClientSlots;
 	private final ArrayBlockingQueue<ClientSlot> availableClientSlots;
-	private final RocksDB.Iface client;
+	private final RocksDBWriteClass.Iface client;
 	private final ExecutorService executor;
 	private final Scheduler executorScheduler;
 	private final AtomicBoolean closed = new AtomicBoolean();
@@ -125,9 +126,9 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 		// Retain the constructor's fail-fast connectivity check. The remaining
 		// transports are opened lazily as actual concurrency requires them.
 		allClientSlots.getFirst().client();
-		this.client = (RocksDB.Iface) Proxy.newProxyInstance(
-				RocksDB.Iface.class.getClassLoader(),
-				new Class<?>[] {RocksDB.Iface.class},
+		this.client = (RocksDBWriteClass.Iface) Proxy.newProxyInstance(
+				RocksDBWriteClass.Iface.class.getClassLoader(),
+				new Class<?>[] {RocksDBWriteClass.Iface.class},
 				this::invokeClient);
 		this.executor = Executors.newFixedThreadPool(poolSize,
 				Thread.ofPlatform().name("rockserver-thrift-client-", 0).factory());
@@ -185,8 +186,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public boolean closeTransaction(long transactionId, boolean commit) {
+		return closeTransaction(transactionId, commit, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public boolean closeTransaction(long transactionId, boolean commit, WriteClass writeClass) {
 		try {
-			return client.closeTransaction(transactionId, commit);
+			return writeClass == WriteClass.FOREGROUND
+					? client.closeTransaction(transactionId, commit)
+					: client.closeTransactionWithWriteClass(transactionId, commit, mapWriteClass(writeClass));
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -203,8 +211,16 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public long createColumn(String name, ColumnSchema schema) {
+		return createColumn(name, schema, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public long createColumn(String name, ColumnSchema schema, WriteClass writeClass) {
 		try {
-			return client.createColumn(name, mapSchema(schema));
+			var thriftSchema = mapSchema(schema);
+			return writeClass == WriteClass.FOREGROUND
+					? client.createColumn(name, thriftSchema)
+					: client.createColumnWithWriteClass(name, thriftSchema, mapWriteClass(writeClass));
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -226,8 +242,17 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public void deleteColumn(long columnId) {
+		deleteColumn(columnId, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public void deleteColumn(long columnId, WriteClass writeClass) {
 		try {
-			client.deleteColumn(columnId);
+			if (writeClass == WriteClass.FOREGROUND) {
+				client.deleteColumn(columnId);
+			} else {
+				client.deleteColumnWithWriteClass(columnId, mapWriteClass(writeClass));
+			}
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -235,8 +260,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public boolean deleteColumnIfExists(String name) {
+		return deleteColumnIfExists(name, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public boolean deleteColumnIfExists(String name, WriteClass writeClass) {
 		try {
-			return client.deleteColumnIfExists(name);
+			return writeClass == WriteClass.FOREGROUND
+					? client.deleteColumnIfExists(name)
+					: client.deleteColumnIfExistsWithWriteClass(name, mapWriteClass(writeClass));
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -244,8 +276,22 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public void deleteRange(long columnId, Keys startKeysInclusive, Keys endKeysExclusive) {
+		deleteRange(columnId, startKeysInclusive, endKeysExclusive, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public void deleteRange(long columnId,
+			Keys startKeysInclusive,
+			Keys endKeysExclusive,
+			WriteClass writeClass) {
 		try {
-			client.deleteRange(columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive));
+			var startKeys = mapKeys(startKeysInclusive);
+			var endKeys = mapKeys(endKeysExclusive);
+			if (writeClass == WriteClass.FOREGROUND) {
+				client.deleteRange(columnId, startKeys, endKeys);
+			} else {
+				client.deleteRangeWithWriteClass(columnId, startKeys, endKeys, mapWriteClass(writeClass));
+			}
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -272,19 +318,43 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> T put(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestPut<? super Buf, T> requestType) {
+		return put(transactionOrUpdateId, columnId, keys, value, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> T put(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			Buf value,
+			RequestPut<? super Buf, T> requestType,
+			WriteClass writeClass) {
 		try {
+			int wireWriteClass = mapWriteClass(writeClass);
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestNothing) {
-				client.put(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value));
+				if (writeClass == WriteClass.FOREGROUND) {
+					client.put(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value));
+				} else {
+					client.putWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass);
+				}
 				return null;
 			} else if (requestType instanceof RequestPrevious) {
-				return (T) mapOptionalBinary(client.putGetPrevious(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value)));
+				return (T) mapOptionalBinary(writeClass == WriteClass.FOREGROUND
+						? client.putGetPrevious(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
+						: client.putGetPreviousWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
 			} else if (requestType instanceof RequestDelta) {
-				return (T) mapDelta(client.putGetDelta(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value)));
+				return (T) mapDelta(writeClass == WriteClass.FOREGROUND
+						? client.putGetDelta(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
+						: client.putGetDeltaWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
 			} else if (requestType instanceof RequestChanged) {
-				return (T) (Boolean) client.putGetChanged(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value));
+				return (T) (Boolean) (writeClass == WriteClass.FOREGROUND
+						? client.putGetChanged(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
+						: client.putGetChangedWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
 			} else if (requestType instanceof RequestPreviousPresence) {
-				return (T) (Boolean) client.putGetPreviousPresence(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value));
+				return (T) (Boolean) (writeClass == WriteClass.FOREGROUND
+						? client.putGetPreviousPresence(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
+						: client.putGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -298,17 +368,36 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			Keys keys,
 			RequestDelete<? super Buf, T> requestType) {
+		return delete(transactionOrUpdateId, columnId, keys, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> T delete(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			RequestDelete<? super Buf, T> requestType,
+			WriteClass writeClass) {
 		try {
+			int wireWriteClass = mapWriteClass(writeClass);
 			if (requestType == null) {
 				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			}
 			if (requestType instanceof RequestNothing) {
-				client.delete(transactionOrUpdateId, columnId, mapKeys(keys));
+				if (writeClass == WriteClass.FOREGROUND) {
+					client.delete(transactionOrUpdateId, columnId, mapKeys(keys));
+				} else {
+					client.deleteWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), wireWriteClass);
+				}
 				return null;
 			} else if (requestType instanceof RequestPrevious) {
-				return (T) mapOptionalBinary(client.deleteGetPrevious(transactionOrUpdateId, columnId, mapKeys(keys)));
+				return (T) mapOptionalBinary(writeClass == WriteClass.FOREGROUND
+						? client.deleteGetPrevious(transactionOrUpdateId, columnId, mapKeys(keys))
+						: client.deleteGetPreviousWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), wireWriteClass));
 			} else if (requestType instanceof RequestPreviousPresence) {
-				return (T) (Boolean) client.deleteGetPreviousPresence(transactionOrUpdateId, columnId, mapKeys(keys));
+				return (T) (Boolean) (writeClass == WriteClass.FOREGROUND
+						? client.deleteGetPreviousPresence(transactionOrUpdateId, columnId, mapKeys(keys))
+						: client.deleteGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), wireWriteClass));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -319,13 +408,31 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> T merge(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestMerge<? super Buf, T> requestType) {
+		return merge(transactionOrUpdateId, columnId, keys, value, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> T merge(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			Buf value,
+			RequestMerge<? super Buf, T> requestType,
+			WriteClass writeClass) {
 		try {
+			int wireWriteClass = mapWriteClass(writeClass);
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestNothing) {
-				client.merge(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value));
+				if (writeClass == WriteClass.FOREGROUND) {
+					client.merge(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value));
+				} else {
+					client.mergeWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass);
+				}
 				return null;
 			} else if (requestType instanceof RequestType.RequestMerged) {
-				return (T) mapOptionalBinary(client.mergeGetMerged(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value)));
+				return (T) mapOptionalBinary(writeClass == WriteClass.FOREGROUND
+						? client.mergeGetMerged(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
+						: client.mergeGetMergedWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -336,20 +443,45 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> List<T> putMulti(long transactionOrUpdateId, long columnId, List<Keys> keys, List<Buf> values, RequestPut<? super Buf, T> requestType) {
+		return putMulti(transactionOrUpdateId, columnId, keys, values, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> List<T> putMulti(long transactionOrUpdateId,
+			long columnId,
+			List<Keys> keys,
+			List<Buf> values,
+			RequestPut<? super Buf, T> requestType,
+			WriteClass writeClass) {
 		try {
+			int wireWriteClass = mapWriteClass(writeClass);
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestNothing) {
-				client.putMulti(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
+				if (writeClass == WriteClass.FOREGROUND) {
+					client.putMulti(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
+				} else {
+					client.putMultiWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass);
+				}
 				return Collections.nCopies(keys.size(), null);
 			} else if (requestType instanceof RequestPrevious) {
-				return (List<T>) mapOptionalBinaryList(client.putMultiGetPrevious(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values)));
+				return (List<T>) mapOptionalBinaryList(writeClass == WriteClass.FOREGROUND
+						? client.putMultiGetPrevious(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
+						: client.putMultiGetPreviousWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass));
 			} else if (requestType instanceof RequestDelta) {
-				return (List<T>) client.putMultiGetDelta(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
+				var result = writeClass == WriteClass.FOREGROUND
+						? client.putMultiGetDelta(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
+						: client.putMultiGetDeltaWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass);
+				return (List<T>) result
 						.stream().map(this::mapDelta).collect(Collectors.toList());
 			} else if (requestType instanceof RequestChanged) {
-				return (List<T>) client.putMultiGetChanged(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
+				return (List<T>) (writeClass == WriteClass.FOREGROUND
+						? client.putMultiGetChanged(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
+						: client.putMultiGetChangedWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass));
 			} else if (requestType instanceof RequestPreviousPresence) {
-				return (List<T>) client.putMultiGetPreviousPresence(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
+				return (List<T>) (writeClass == WriteClass.FOREGROUND
+						? client.putMultiGetPreviousPresence(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
+						: client.putMultiGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -363,19 +495,37 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) {
+		return deleteMulti(transactionOrUpdateId, columnId, keys, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> List<T> deleteMulti(long transactionOrUpdateId,
+			long columnId,
+			List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType,
+			WriteClass writeClass) {
 		try {
+			int wireWriteClass = mapWriteClass(writeClass);
 			if (requestType == null) {
 				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			}
 			if (requestType instanceof RequestNothing) {
-				client.deleteMulti(transactionOrUpdateId, columnId, mapKeysList(keys));
+				if (writeClass == WriteClass.FOREGROUND) {
+					client.deleteMulti(transactionOrUpdateId, columnId, mapKeysList(keys));
+				} else {
+					client.deleteMultiWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), wireWriteClass);
+				}
 				return Collections.nCopies(keys.size(), null);
 			} else if (requestType instanceof RequestPrevious) {
-				return (List<T>) mapOptionalBinaryList(
-						client.deleteMultiGetPrevious(transactionOrUpdateId, columnId, mapKeysList(keys)));
+				return (List<T>) mapOptionalBinaryList(writeClass == WriteClass.FOREGROUND
+						? client.deleteMultiGetPrevious(transactionOrUpdateId, columnId, mapKeysList(keys))
+						: client.deleteMultiGetPreviousWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), wireWriteClass));
 			} else if (requestType instanceof RequestPreviousPresence) {
-				return (List<T>) client.deleteMultiGetPreviousPresence(
-						transactionOrUpdateId, columnId, mapKeysList(keys));
+				return (List<T>) (writeClass == WriteClass.FOREGROUND
+						? client.deleteMultiGetPreviousPresence(transactionOrUpdateId, columnId, mapKeysList(keys))
+						: client.deleteMultiGetPreviousPresenceWithWriteClass(
+								transactionOrUpdateId, columnId, mapKeysList(keys), wireWriteClass));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -386,13 +536,31 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> List<T> mergeMulti(long transactionOrUpdateId, long columnId, List<Keys> keys, List<Buf> values, RequestMerge<? super Buf, T> requestType) {
+		return mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> List<T> mergeMulti(long transactionOrUpdateId,
+			long columnId,
+			List<Keys> keys,
+			List<Buf> values,
+			RequestMerge<? super Buf, T> requestType,
+			WriteClass writeClass) {
 		try {
+			int wireWriteClass = mapWriteClass(writeClass);
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestNothing) {
-				client.mergeMulti(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
+				if (writeClass == WriteClass.FOREGROUND) {
+					client.mergeMulti(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
+				} else {
+					client.mergeMultiWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass);
+				}
 				return Collections.nCopies(keys.size(), null);
 			} else if (requestType instanceof RequestType.RequestMerged) {
-				return (List<T>) mapOptionalBinaryList(client.mergeMultiGetMerged(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values)));
+				return (List<T>) mapOptionalBinaryList(writeClass == WriteClass.FOREGROUND
+						? client.mergeMultiGetMerged(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
+						: client.mergeMultiGetMergedWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -402,6 +570,14 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public void putBatch(long columnId, Publisher<KVBatch> batchPublisher, PutBatchMode mode) {
+		putBatch(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public void putBatch(long columnId,
+			Publisher<KVBatch> batchPublisher,
+			PutBatchMode mode,
+			WriteClass writeClass) {
 		try {
 			List<it.cavallium.rockserver.core.common.api.KV> data = new ArrayList<>();
 			Flux.from(batchPublisher).toIterable().forEach(batch -> {
@@ -417,7 +593,11 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 				case SST_INGESTION -> it.cavallium.rockserver.core.common.api.PutBatchMode.SST_INGESTION;
 				case SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.PutBatchMode.SST_INGEST_BEHIND;
 			};
-			client.putBatch(columnId, data, thriftMode);
+			if (writeClass == WriteClass.FOREGROUND) {
+				client.putBatch(columnId, data, thriftMode);
+			} else {
+				client.putBatchWithWriteClass(columnId, data, thriftMode, mapWriteClass(writeClass));
+			}
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -425,6 +605,14 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public void mergeBatch(long columnId, Publisher<KVBatch> batchPublisher, MergeBatchMode mode) {
+		mergeBatch(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public void mergeBatch(long columnId,
+			Publisher<KVBatch> batchPublisher,
+			MergeBatchMode mode,
+			WriteClass writeClass) {
 		try {
 			List<it.cavallium.rockserver.core.common.api.KV> data = new ArrayList<>();
 			Flux.from(batchPublisher).toIterable().forEach(batch -> {
@@ -440,7 +628,11 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 				case MERGE_SST_INGESTION -> it.cavallium.rockserver.core.common.api.MergeBatchMode.MERGE_SST_INGESTION;
 				case MERGE_SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.MergeBatchMode.MERGE_SST_INGEST_BEHIND;
 			};
-			client.mergeBatch(columnId, data, thriftMode);
+			if (writeClass == WriteClass.FOREGROUND) {
+				client.mergeBatch(columnId, data, thriftMode);
+			} else {
+				client.mergeBatchWithWriteClass(columnId, data, thriftMode, mapWriteClass(writeClass));
+			}
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -684,6 +876,13 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public CompletableFuture<Boolean> closeTransactionAsync(long transactionId,
+			boolean commit,
+			WriteClass writeClass) {
+		return CompletableFuture.supplyAsync(() -> closeTransaction(transactionId, commit, writeClass), executor);
+	}
+
+	@Override
 	public CompletableFuture<Void> closeFailedUpdateAsync(long updateId) {
 		return CompletableFuture.runAsync(() -> closeFailedUpdate(updateId), executor);
 	}
@@ -691,6 +890,11 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public CompletableFuture<Long> createColumnAsync(String name, ColumnSchema schema) {
 		return CompletableFuture.supplyAsync(() -> createColumn(name, schema), executor);
+	}
+
+	@Override
+	public CompletableFuture<Long> createColumnAsync(String name, ColumnSchema schema, WriteClass writeClass) {
+		return CompletableFuture.supplyAsync(() -> createColumn(name, schema, writeClass), executor);
 	}
 
 	@Override
@@ -709,13 +913,32 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public CompletableFuture<Void> deleteColumnAsync(long columnId, WriteClass writeClass) {
+		return CompletableFuture.runAsync(() -> deleteColumn(columnId, writeClass), executor);
+	}
+
+	@Override
 	public CompletableFuture<Boolean> deleteColumnIfExistsAsync(String name) {
 		return CompletableFuture.supplyAsync(() -> deleteColumnIfExists(name), executor);
 	}
 
 	@Override
+	public CompletableFuture<Boolean> deleteColumnIfExistsAsync(String name, WriteClass writeClass) {
+		return CompletableFuture.supplyAsync(() -> deleteColumnIfExists(name, writeClass), executor);
+	}
+
+	@Override
 	public CompletableFuture<Void> deleteRangeAsync(long columnId, Keys startKeysInclusive, Keys endKeysExclusive) {
 		return CompletableFuture.runAsync(() -> deleteRange(columnId, startKeysInclusive, endKeysExclusive), executor);
+	}
+
+	@Override
+	public CompletableFuture<Void> deleteRangeAsync(long columnId,
+			Keys startKeysInclusive,
+			Keys endKeysExclusive,
+			WriteClass writeClass) {
+		return CompletableFuture.runAsync(
+				() -> deleteRange(columnId, startKeysInclusive, endKeysExclusive, writeClass), executor);
 	}
 
 	@Override
@@ -734,6 +957,17 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public <T> CompletableFuture<T> putAsync(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			Buf value,
+			RequestPut<? super Buf, T> requestType,
+			WriteClass writeClass) {
+		return CompletableFuture.supplyAsync(
+				() -> put(transactionOrUpdateId, columnId, keys, value, requestType, writeClass), executor);
+	}
+
+	@Override
 	public <T> CompletableFuture<T> deleteAsync(long transactionOrUpdateId,
 			long columnId,
 			Keys keys,
@@ -743,13 +977,45 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public <T> CompletableFuture<T> deleteAsync(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			RequestDelete<? super Buf, T> requestType,
+			WriteClass writeClass) {
+		return CompletableFuture.supplyAsync(
+				() -> delete(transactionOrUpdateId, columnId, keys, requestType, writeClass), executor);
+	}
+
+	@Override
 	public <T> CompletableFuture<T> mergeAsync(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestMerge<? super Buf, T> requestType) {
 		return CompletableFuture.supplyAsync(() -> merge(transactionOrUpdateId, columnId, keys, value, requestType), executor);
 	}
 
 	@Override
+	public <T> CompletableFuture<T> mergeAsync(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			Buf value,
+			RequestMerge<? super Buf, T> requestType,
+			WriteClass writeClass) {
+		return CompletableFuture.supplyAsync(
+				() -> merge(transactionOrUpdateId, columnId, keys, value, requestType, writeClass), executor);
+	}
+
+	@Override
 	public <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId, long columnId, List<Keys> keys, List<Buf> values, RequestPut<? super Buf, T> requestType) {
 		return CompletableFuture.supplyAsync(() -> putMulti(transactionOrUpdateId, columnId, keys, values, requestType), executor);
+	}
+
+	@Override
+	public <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			List<Keys> keys,
+			List<Buf> values,
+			RequestPut<? super Buf, T> requestType,
+			WriteClass writeClass) {
+		return CompletableFuture.supplyAsync(
+				() -> putMulti(transactionOrUpdateId, columnId, keys, values, requestType, writeClass), executor);
 	}
 
 	@Override
@@ -762,8 +1028,29 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType,
+			WriteClass writeClass) {
+		return CompletableFuture.supplyAsync(
+				() -> deleteMulti(transactionOrUpdateId, columnId, keys, requestType, writeClass), executor);
+	}
+
+	@Override
 	public <T> CompletableFuture<List<T>> mergeMultiAsync(long transactionOrUpdateId, long columnId, List<Keys> keys, List<Buf> values, RequestMerge<? super Buf, T> requestType) {
 		return CompletableFuture.supplyAsync(() -> mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType), executor);
+	}
+
+	@Override
+	public <T> CompletableFuture<List<T>> mergeMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			List<Keys> keys,
+			List<Buf> values,
+			RequestMerge<? super Buf, T> requestType,
+			WriteClass writeClass) {
+		return CompletableFuture.supplyAsync(
+				() -> mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType, writeClass), executor);
 	}
 
 	@Override
@@ -772,8 +1059,24 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public CompletableFuture<Void> putBatchAsync(long columnId,
+			Publisher<KVBatch> batchPublisher,
+			PutBatchMode mode,
+			WriteClass writeClass) {
+		return CompletableFuture.runAsync(() -> putBatch(columnId, batchPublisher, mode, writeClass), executor);
+	}
+
+	@Override
 	public CompletableFuture<Void> mergeBatchAsync(long columnId, Publisher<KVBatch> batchPublisher, MergeBatchMode mode) {
 		return CompletableFuture.runAsync(() -> mergeBatch(columnId, batchPublisher, mode), executor);
+	}
+
+	@Override
+	public CompletableFuture<Void> mergeBatchAsync(long columnId,
+			Publisher<KVBatch> batchPublisher,
+			MergeBatchMode mode,
+			WriteClass writeClass) {
+		return CompletableFuture.runAsync(() -> mergeBatch(columnId, batchPublisher, mode, writeClass), executor);
 	}
 
 	@Override
@@ -991,9 +1294,9 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	private final class ClientSlot {
 
 		private TTransport transport;
-		private RocksDB.Client physicalClient;
+		private RocksDBWriteClass.Client physicalClient;
 
-		private synchronized RocksDB.Client client() throws TException {
+		private synchronized RocksDBWriteClass.Client client() throws TException {
 			if (closed.get()) {
 				throw new TException("Thrift connection is closed");
 			}
@@ -1010,7 +1313,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			try {
 				newTransport.open();
 				transport = newTransport;
-				physicalClient = new RocksDB.Client(new TBinaryProtocol(newTransport));
+				physicalClient = new RocksDBWriteClass.Client(new TBinaryProtocol(newTransport));
 				return physicalClient;
 			} catch (TException failure) {
 				newTransport.close();
@@ -1049,6 +1352,13 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 					e);
 		}
 		return RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+	}
+
+	private static int mapWriteClass(WriteClass writeClass) {
+		return switch (writeClass) {
+			case FOREGROUND -> 0;
+			case MAINTENANCE -> 1;
+		};
 	}
 
 	private List<ByteBuffer> mapKeys(Keys keys) {

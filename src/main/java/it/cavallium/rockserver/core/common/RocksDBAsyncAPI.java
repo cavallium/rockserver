@@ -69,6 +69,13 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new CloseTransaction(transactionId, commit));
 	}
 
+	/** Close a transaction, classifying commit work when {@code commit} is true. */
+	default CompletableFuture<Boolean> closeTransactionAsync(long transactionId,
+			boolean commit,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new CloseTransaction(transactionId, commit, writeClass));
+	}
+
 	/** See: {@link CloseFailedUpdate}. */
 	default CompletableFuture<Void> closeFailedUpdateAsync(long updateId) throws RocksDBException {
 		return requestAsync(new CloseFailedUpdate(updateId));
@@ -77,6 +84,12 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	/** See: {@link CreateColumn}. */
 	default CompletableFuture<Long> createColumnAsync(String name, @NotNull ColumnSchema schema) throws RocksDBException {
 		return requestAsync(new CreateColumn(name, schema));
+	}
+
+	default CompletableFuture<Long> createColumnAsync(String name,
+			@NotNull ColumnSchema schema,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new CreateColumn(name, schema, writeClass));
 	}
 
 	/** See: {@link UploadMergeOperator}. */
@@ -110,9 +123,19 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new DeleteColumn(columnId));
 	}
 
+	default CompletableFuture<Void> deleteColumnAsync(long columnId, @NotNull WriteClass writeClass)
+			throws RocksDBException {
+		return requestAsync(new DeleteColumn(columnId, writeClass));
+	}
+
 	/** Atomically delete a column by name when it exists. */
 	default CompletableFuture<Boolean> deleteColumnIfExistsAsync(@NotNull String name) throws RocksDBException {
 		return requestAsync(new DeleteColumnIfExists(name));
+	}
+
+	default CompletableFuture<Boolean> deleteColumnIfExistsAsync(@NotNull String name,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new DeleteColumnIfExists(name, writeClass));
 	}
 
 	/** See: {@link GetColumnId}. */
@@ -137,12 +160,29 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new Put<>(transactionOrUpdateId, columnId, keys, value, requestType));
 	}
 
+	default <T> CompletableFuture<T> putAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new Put<>(transactionOrUpdateId, columnId, keys, value, requestType, writeClass));
+	}
+
 	/** See: {@link Delete}. */
 	default <T> CompletableFuture<T> deleteAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
 		return requestAsync(new Delete<>(transactionOrUpdateId, columnId, keys, requestType));
+	}
+
+	default <T> CompletableFuture<T> deleteAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			RequestDelete<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new Delete<>(transactionOrUpdateId, columnId, keys, requestType, writeClass));
 	}
 
 	/** See: {@link DeleteMulti}. */
@@ -153,11 +193,26 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new DeleteMulti<>(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
+	default <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new DeleteMulti<>(transactionOrUpdateId, columnId, keys, requestType, writeClass));
+	}
+
 	/** See: {@link DeleteRange}. */
 	default CompletableFuture<Void> deleteRangeAsync(long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive) throws RocksDBException {
 		return requestAsync(new DeleteRange(columnId, startKeysInclusive, endKeysExclusive));
+	}
+
+	default CompletableFuture<Void> deleteRangeAsync(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new DeleteRange(columnId, startKeysInclusive, endKeysExclusive, writeClass));
 	}
 
 	/** See: {@link Merge}. */
@@ -169,6 +224,15 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new Merge<>(transactionOrUpdateId, columnId, keys, value, requestType));
 	}
 
+	default <T> CompletableFuture<T> mergeAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestMerge<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new Merge<>(transactionOrUpdateId, columnId, keys, value, requestType, writeClass));
+	}
+
 	/** See: {@link PutMulti}. */
 	default <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId,
 			long columnId,
@@ -176,6 +240,15 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 			@NotNull List<@NotNull Buf> values,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		return requestAsync(new PutMulti<>(transactionOrUpdateId, columnId, keys, values, requestType));
+	}
+
+	default <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<@NotNull Keys> keys,
+			@NotNull List<@NotNull Buf> values,
+			RequestPut<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new PutMulti<>(transactionOrUpdateId, columnId, keys, values, requestType, writeClass));
 	}
 
 	/** See: {@link MergeMulti}. */
@@ -187,6 +260,15 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new MergeMulti<>(transactionOrUpdateId, columnId, keys, values, requestType));
 	}
 
+	default <T> CompletableFuture<List<T>> mergeMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<@NotNull Keys> keys,
+			@NotNull List<@NotNull Buf> values,
+			RequestMerge<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new MergeMulti<>(transactionOrUpdateId, columnId, keys, values, requestType, writeClass));
+	}
+
 	/** See: {@link PutBatch}. */
 	default CompletableFuture<Void> putBatchAsync(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
@@ -194,11 +276,25 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new PutBatch(columnId, batchPublisher, mode));
 	}
 
+	default CompletableFuture<Void> putBatchAsync(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull PutBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new PutBatch(columnId, batchPublisher, mode, writeClass));
+	}
+
 	/** See: {@link MergeBatch}. */
 	default CompletableFuture<Void> mergeBatchAsync(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode) throws RocksDBException {
 		return requestAsync(new MergeBatch(columnId, batchPublisher, mode));
+	}
+
+	default CompletableFuture<Void> mergeBatchAsync(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull MergeBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestAsync(new MergeBatch(columnId, batchPublisher, mode, writeClass));
 	}
 
 	/** See: {@link Get}. */

@@ -3,8 +3,13 @@ package it.cavallium.rockserver.core.impl.test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.protobuf.ByteString;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
@@ -12,6 +17,12 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.WriteClass;
+import it.cavallium.rockserver.core.common.api.proto.PutRequest;
+import it.cavallium.rockserver.core.common.api.proto.PutBatchInitialRequest;
+import it.cavallium.rockserver.core.common.api.proto.PutBatchRequest;
+import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
+import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -24,6 +35,7 @@ import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import reactor.core.publisher.Flux;
 
 class GrpcDeleteTest {
 
@@ -74,6 +86,69 @@ class GrpcDeleteTest {
 		client.getSyncApi().delete(0, colId, key, RequestType.none());
 
 		assertFalse(client.getSyncApi().get(0, colId, key, RequestType.exists()));
+	}
+
+	@Test
+	void explicitMaintenancePropagatesOverGrpc() {
+		var key = key(101);
+		client.getSyncApi().put(0, colId, key, value(101), RequestType.none(), WriteClass.MAINTENANCE);
+
+		assertTrue(client.getSyncApi().get(0, colId, key, RequestType.exists()));
+
+		client.getSyncApi().delete(0, colId, key, RequestType.none(), WriteClass.MAINTENANCE);
+		assertFalse(client.getSyncApi().get(0, colId, key, RequestType.exists()));
+	}
+
+	@Test
+	void explicitMaintenanceUsesDirectEmbeddedPointPath() {
+		var key = key(103);
+		embeddedConnection.getSyncApi().put(
+				0, colId, key, value(103), RequestType.none(), WriteClass.MAINTENANCE);
+		assertTrue(embeddedConnection.getSyncApi().get(0, colId, key, RequestType.exists()));
+
+		embeddedConnection.getSyncApi().delete(
+				0, colId, key, RequestType.none(), WriteClass.MAINTENANCE);
+		assertFalse(embeddedConnection.getSyncApi().get(0, colId, key, RequestType.exists()));
+	}
+
+	@Test
+	void unknownGrpcWriteClassIsInvalidArgument() {
+		var channel = ManagedChannelBuilder.forAddress("127.0.0.1", grpcServer.getPort())
+				.usePlaintext()
+				.build();
+		try {
+			var request = PutRequest.newBuilder()
+					.setColumnId(colId)
+					.setData(it.cavallium.rockserver.core.common.api.proto.KV.newBuilder()
+							.addKeys(ByteString.copyFrom(ByteBuffer.allocate(Long.BYTES).putLong(102).array()))
+							.setValue(ByteString.copyFrom(new byte[] {1})))
+					.setWriteClassValue(99)
+					.build();
+			var error = assertThrows(StatusRuntimeException.class,
+					() -> RocksDBServiceGrpc.newBlockingStub(channel).put(request));
+			assertEquals(Status.Code.INVALID_ARGUMENT, error.getStatus().getCode());
+		} finally {
+			channel.shutdownNow();
+		}
+	}
+
+	@Test
+	void unknownStreamingGrpcWriteClassIsInvalidArgument() {
+		var channel = ManagedChannelBuilder.forAddress("127.0.0.1", grpcServer.getPort())
+				.usePlaintext()
+				.build();
+		try {
+			var initial = PutBatchRequest.newBuilder()
+					.setInitialRequest(PutBatchInitialRequest.newBuilder()
+							.setColumnId(colId)
+							.setWriteClassValue(99))
+					.build();
+			var error = assertThrows(StatusRuntimeException.class,
+					() -> ReactorRocksDBServiceGrpc.newReactorStub(channel).putBatch(Flux.just(initial)).block());
+			assertEquals(Status.Code.INVALID_ARGUMENT, error.getStatus().getCode());
+		} finally {
+			channel.shutdownNow();
+		}
 	}
 
 	@Test

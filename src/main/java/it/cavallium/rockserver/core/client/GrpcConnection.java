@@ -46,6 +46,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.SerializedKVBatch.SerializedKVBatchRef;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.ColumnHashType;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
@@ -315,9 +316,17 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public CompletableFuture<Boolean> closeTransactionAsync(long transactionId, boolean commit) throws RocksDBException {
+		return closeTransactionAsync(transactionId, commit, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public CompletableFuture<Boolean> closeTransactionAsync(long transactionId,
+			boolean commit,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var request = CloseTransactionRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setCommit(commit)
+				.setWriteClassValue(mapWriteClass(writeClass))
 				.build();
 		return toResponse(this.futureStub.closeTransaction(request), CloseTransactionResponse::getSuccessful);
 	}
@@ -332,10 +341,18 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public CompletableFuture<Long> createColumnAsync(String name,
-													 @NotNull ColumnSchema schema) throws RocksDBException {
+											 @NotNull ColumnSchema schema) throws RocksDBException {
+		return createColumnAsync(name, schema, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public CompletableFuture<Long> createColumnAsync(String name,
+			@NotNull ColumnSchema schema,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var requestBuilder = CreateColumnRequest.newBuilder()
 				.setName(name)
-				.setSchema(mapColumnSchema(schema));
+				.setSchema(mapColumnSchema(schema))
+				.setWriteClassValue(mapWriteClass(writeClass));
 		var request = requestBuilder.build();
 		return toResponse(this.futureStub.createColumn(request), CreateColumnResponse::getColumnId);
 	}
@@ -359,16 +376,30 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public CompletableFuture<Void> deleteColumnAsync(long columnId) throws RocksDBException {
+		return deleteColumnAsync(columnId, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public CompletableFuture<Void> deleteColumnAsync(long columnId, @NotNull WriteClass writeClass)
+			throws RocksDBException {
 		var request = DeleteColumnRequest.newBuilder()
 				.setColumnId(columnId)
+				.setWriteClassValue(mapWriteClass(writeClass))
 				.build();
 		return toResponse(this.futureStub.deleteColumn(request), _ -> null);
 	}
 
 	@Override
 	public CompletableFuture<Boolean> deleteColumnIfExistsAsync(@NotNull String name) throws RocksDBException {
+		return deleteColumnIfExistsAsync(name, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public CompletableFuture<Boolean> deleteColumnIfExistsAsync(@NotNull String name,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var request = DeleteColumnIfExistsRequest.newBuilder()
 				.setName(name)
+				.setWriteClassValue(mapWriteClass(writeClass))
 				.build();
 		return toResponse(this.futureStub.deleteColumnIfExists(request), DeleteColumnIfExistsResponse::getDeleted);
 	}
@@ -396,10 +427,22 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		return putAsync(transactionOrUpdateId, columnId, keys, value, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> CompletableFuture<T> putAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var request = PutRequest.newBuilder()
 				.setTransactionOrUpdateId(transactionOrUpdateId)
 				.setColumnId(columnId)
 				.setData(mapKV(keys, value))
+				.setWriteClassValue(mapWriteClass(writeClass))
 				.build();
 		if (requestType == null) {
 			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Null request type");
@@ -423,6 +466,16 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			@NotNull Keys keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		return deleteAsync(transactionOrUpdateId, columnId, keys, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> CompletableFuture<T> deleteAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			RequestDelete<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		if (requestType == null) {
 			throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "requestType");
 		}
@@ -430,6 +483,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setTransactionOrUpdateId(transactionOrUpdateId)
 				.setColumnId(columnId)
 				.addAllKeys(mapKeys(keys))
+				.setWriteClassValue(mapWriteClass(writeClass))
 				.build();
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestNothing<?> _ -> toResponse(this.futureStub.delete(request), _ -> null);
@@ -447,10 +501,22 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		return mergeAsync(transactionOrUpdateId, columnId, keys, value, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> CompletableFuture<T> mergeAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestMerge<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var request = MergeRequest.newBuilder()
 				.setTransactionOrUpdateId(transactionOrUpdateId)
 				.setColumnId(columnId)
 				.setData(mapKV(keys, value))
+				.setWriteClassValue(mapWriteClass(writeClass))
 				.build();
 		if (requestType == null) {
 			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Null request type");
@@ -470,6 +536,22 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			@NotNull List<@NotNull Keys> allKeys,
 			@NotNull List<@NotNull Buf> allValues,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		return putMultiAsync(transactionOrUpdateId,
+				columnId,
+				allKeys,
+				allValues,
+				requestType,
+				WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<@NotNull Keys> allKeys,
+			@NotNull List<@NotNull Buf> allValues,
+			RequestPut<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var count = allKeys.size();
 		if (count != allValues.size()) {
 			throw new IllegalArgumentException("Keys length is different than values length! "
@@ -478,8 +560,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 		var initialRequest = PutMultiRequest.newBuilder()
 				.setInitialRequest(PutMultiInitialRequest.newBuilder()
-						.setTransactionOrUpdateId(transactionOrUpdateId)
-						.setColumnId(columnId)
+							.setTransactionOrUpdateId(transactionOrUpdateId)
+							.setColumnId(columnId)
+							.setWriteClassValue(mapWriteClass(writeClass))
 						.build())
 				.build();
 
@@ -525,14 +608,25 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			@NotNull List<Keys> allKeys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		return deleteMultiAsync(transactionOrUpdateId, columnId, allKeys, requestType, WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> allKeys,
+			RequestDelete<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		if (requestType == null) {
 			throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "requestType");
 		}
 
 		var initialRequest = DeleteMultiRequest.newBuilder()
 				.setInitialRequest(DeleteMultiInitialRequest.newBuilder()
-						.setTransactionOrUpdateId(transactionOrUpdateId)
-						.setColumnId(columnId)
+							.setTransactionOrUpdateId(transactionOrUpdateId)
+							.setColumnId(columnId)
+							.setWriteClassValue(mapWriteClass(writeClass))
 						.build())
 				.build();
 
@@ -568,10 +662,19 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	public CompletableFuture<Void> deleteRangeAsync(long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive) throws RocksDBException {
+		return deleteRangeAsync(columnId, startKeysInclusive, endKeysExclusive, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public CompletableFuture<Void> deleteRangeAsync(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var request = DeleteRangeRequest.newBuilder()
 				.setColumnId(columnId)
 				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
 				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
+				.setWriteClassValue(mapWriteClass(writeClass))
 				.build();
 		return toResponse(this.futureStub.deleteRange(request), _ -> null);
 	}
@@ -583,6 +686,22 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			@NotNull List<@NotNull Keys> allKeys,
 			@NotNull List<@NotNull Buf> allValues,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		return mergeMultiAsync(transactionOrUpdateId,
+				columnId,
+				allKeys,
+				allValues,
+				requestType,
+				WriteClass.FOREGROUND);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T> CompletableFuture<List<T>> mergeMultiAsync(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<@NotNull Keys> allKeys,
+			@NotNull List<@NotNull Buf> allValues,
+			RequestMerge<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var count = allKeys.size();
 		if (count != allValues.size()) {
 			throw new IllegalArgumentException("Keys length is different than values length! "
@@ -591,8 +710,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 		var initialRequest = MergeMultiRequest.newBuilder()
 				.setInitialRequest(MergeMultiInitialRequest.newBuilder()
-						.setTransactionOrUpdateId(transactionOrUpdateId)
-						.setColumnId(columnId)
+							.setTransactionOrUpdateId(transactionOrUpdateId)
+							.setColumnId(columnId)
+							.setWriteClassValue(mapWriteClass(writeClass))
 						.build())
 				.build();
 
@@ -631,15 +751,24 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	public CompletableFuture<Void> putBatchAsync(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode) throws RocksDBException {
+		return putBatchAsync(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public CompletableFuture<Void> putBatchAsync(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull PutBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var initialRequest = Mono.just(PutBatchRequest.newBuilder()
 				.setInitialRequest(PutBatchInitialRequest.newBuilder()
 						.setColumnId(columnId)
-						.setMode(switch (mode) {
+							.setMode(switch (mode) {
 							case WRITE_BATCH -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH;
 							case WRITE_BATCH_NO_WAL -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.WRITE_BATCH_NO_WAL;
 							case SST_INGESTION -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.SST_INGESTION;
 							case SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.proto.PutBatchMode.SST_INGEST_BEHIND;
-						})
+							})
+							.setWriteClassValue(mapWriteClass(writeClass))
 						.build())
 				.build());
 		var nextRequests = Flux.from(batchPublisher).map(batch -> {
@@ -655,15 +784,24 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	public CompletableFuture<Void> mergeBatchAsync(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull it.cavallium.rockserver.core.common.MergeBatchMode mode) throws RocksDBException {
+		return mergeBatchAsync(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+	}
+
+	@Override
+	public CompletableFuture<Void> mergeBatchAsync(long columnId,
+			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull it.cavallium.rockserver.core.common.MergeBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
 		var initialRequest = Mono.just(MergeBatchRequest.newBuilder()
 				.setInitialRequest(MergeBatchInitialRequest.newBuilder()
 						.setColumnId(columnId)
-						.setMode(switch (mode) {
+							.setMode(switch (mode) {
 							case MERGE_WRITE_BATCH -> it.cavallium.rockserver.core.common.api.proto.MergeBatchMode.MERGE_WRITE_BATCH;
 							case MERGE_WRITE_BATCH_NO_WAL -> it.cavallium.rockserver.core.common.api.proto.MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL;
 							case MERGE_SST_INGESTION -> it.cavallium.rockserver.core.common.api.proto.MergeBatchMode.MERGE_SST_INGESTION;
 							case MERGE_SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.proto.MergeBatchMode.MERGE_SST_INGEST_BEHIND;
-						})
+							})
+							.setWriteClassValue(mapWriteClass(writeClass))
 						.build())
 				.build());
 		var nextRequests = Flux.from(batchPublisher).map(batch -> {
@@ -1025,6 +1163,13 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return it.cavallium.rockserver.core.common.api.proto.KVBatch.newBuilder()
 				.addAllEntries(list)
 				.build();
+	}
+
+	private static int mapWriteClass(@NotNull WriteClass writeClass) {
+		return switch (writeClass) {
+			case FOREGROUND -> 0;
+			case MAINTENANCE -> 1;
+		};
 	}
 
 	private static Iterable<KV> mapKVList(@NotNull List<Keys> keys, @NotNull List<Buf> values) {

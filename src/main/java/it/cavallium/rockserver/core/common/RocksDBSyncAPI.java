@@ -57,6 +57,12 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new CloseTransaction(transactionId, commit));
 	}
 
+	/** Close a transaction, classifying commit work when {@code commit} is true. */
+	default boolean closeTransaction(long transactionId, boolean commit, @NotNull WriteClass writeClass)
+			throws RocksDBException {
+		return requestSync(new CloseTransaction(transactionId, commit, writeClass));
+	}
+
 	/** See: {@link CloseFailedUpdate}. */
 	default void closeFailedUpdate(long updateId) throws RocksDBException {
 		requestSync(new CloseFailedUpdate(updateId));
@@ -65,6 +71,11 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	/** See: {@link CreateColumn}. */
 	default long createColumn(String name, @NotNull ColumnSchema schema) throws RocksDBException {
 		return requestSync(new CreateColumn(name, schema));
+	}
+
+	default long createColumn(String name, @NotNull ColumnSchema schema, @NotNull WriteClass writeClass)
+			throws RocksDBException {
+		return requestSync(new CreateColumn(name, schema, writeClass));
 	}
 
 	/** See: {@link UploadMergeOperator}. */
@@ -96,9 +107,18 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		requestSync(new DeleteColumn(columnId));
 	}
 
+	default void deleteColumn(long columnId, @NotNull WriteClass writeClass) throws RocksDBException {
+		requestSync(new DeleteColumn(columnId, writeClass));
+	}
+
 	/** Atomically delete a column by name when it exists. */
 	default boolean deleteColumnIfExists(@NotNull String name) throws RocksDBException {
 		return requestSync(new DeleteColumnIfExists(name));
+	}
+
+	default boolean deleteColumnIfExists(@NotNull String name, @NotNull WriteClass writeClass)
+			throws RocksDBException {
+		return requestSync(new DeleteColumnIfExists(name, writeClass));
 	}
 
 	/** See: {@link GetColumnId}. */
@@ -127,12 +147,29 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new Put<>(transactionOrUpdateId, columnId, keys, value, requestType));
 	}
 
+	default <T> T put(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestSync(new Put<>(transactionOrUpdateId, columnId, keys, value, requestType, writeClass));
+	}
+
 	/** See: {@link Delete}. */
 	default <T> T delete(long transactionOrUpdateId,
 			long columnId,
 			Keys keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
 		return requestSync(new Delete<>(transactionOrUpdateId, columnId, keys, requestType));
+	}
+
+	default <T> T delete(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			RequestDelete<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestSync(new Delete<>(transactionOrUpdateId, columnId, keys, requestType, writeClass));
 	}
 
 	/** See: {@link DeleteMulti}. */
@@ -143,11 +180,26 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new DeleteMulti<>(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
+	default <T> List<T> deleteMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			RequestDelete<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestSync(new DeleteMulti<>(transactionOrUpdateId, columnId, keys, requestType, writeClass));
+	}
+
 	/** See: {@link DeleteRange}. */
 	default void deleteRange(long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive) throws RocksDBException {
 		requestSync(new DeleteRange(columnId, startKeysInclusive, endKeysExclusive));
+	}
+
+	default void deleteRange(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		requestSync(new DeleteRange(columnId, startKeysInclusive, endKeysExclusive, writeClass));
 	}
 
 	/** See: {@link Merge}. */
@@ -159,6 +211,15 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new Merge<>(transactionOrUpdateId, columnId, keys, value, requestType));
 	}
 
+	default <T> T merge(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			@NotNull Buf value,
+			RequestMerge<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestSync(new Merge<>(transactionOrUpdateId, columnId, keys, value, requestType, writeClass));
+	}
+
 	/** See: {@link PutMulti}. */
 	default <T> List<T> putMulti(long transactionOrUpdateId,
 			long columnId,
@@ -166,6 +227,15 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 			@NotNull List<@NotNull Buf> values,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		return requestSync(new PutMulti<>(transactionOrUpdateId, columnId, keys, values, requestType));
+	}
+
+	default <T> List<T> putMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			@NotNull List<@NotNull Buf> values,
+			RequestPut<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestSync(new PutMulti<>(transactionOrUpdateId, columnId, keys, values, requestType, writeClass));
 	}
 
 	/** See: {@link MergeMulti}. */
@@ -177,6 +247,15 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new MergeMulti<>(transactionOrUpdateId, columnId, keys, values, requestType));
 	}
 
+	default <T> List<T> mergeMulti(long transactionOrUpdateId,
+			long columnId,
+			@NotNull List<Keys> keys,
+			@NotNull List<@NotNull Buf> values,
+			RequestMerge<? super Buf, T> requestType,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		return requestSync(new MergeMulti<>(transactionOrUpdateId, columnId, keys, values, requestType, writeClass));
+	}
+
 	/** See: {@link PutBatch}. */
 	default void putBatch(long columnId,
 					  @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
@@ -184,11 +263,25 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		requestSync(new PutBatch(columnId, batchPublisher, mode));
 	}
 
+	default void putBatch(long columnId,
+			@NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull PutBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		requestSync(new PutBatch(columnId, batchPublisher, mode, writeClass));
+	}
+
 	/** See: {@link MergeBatch}. */
 	default void mergeBatch(long columnId,
 				   @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
 				   @NotNull MergeBatchMode mode) throws RocksDBException {
 		requestSync(new MergeBatch(columnId, batchPublisher, mode));
+	}
+
+	default void mergeBatch(long columnId,
+			@NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+			@NotNull MergeBatchMode mode,
+			@NotNull WriteClass writeClass) throws RocksDBException {
+		requestSync(new MergeBatch(columnId, batchPublisher, mode, writeClass));
 	}
 
 	/** See: {@link Get}. */
