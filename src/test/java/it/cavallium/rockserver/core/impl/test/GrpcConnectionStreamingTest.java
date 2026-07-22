@@ -132,7 +132,9 @@ class GrpcConnectionStreamingTest {
 		var cleanup = range
 				.doOnNext(_ -> {
 					callbackCount.incrementAndGet();
-					callbacksOnVirtualThreads.updateAndGet(allVirtual -> allVirtual && Thread.currentThread().isVirtual());
+					if (!Thread.currentThread().isVirtual()) {
+						callbacksOnVirtualThreads.set(false);
+					}
 				})
 				.buffer(CLEANUP_BATCH_SIZE)
 				.concatMap(batch -> Mono.fromFuture(client.getAsyncApi().putMultiAsync(
@@ -301,7 +303,7 @@ class GrpcConnectionStreamingTest {
 				return Flux.range(0, RANGE_SIZE).map(RecordingService::kv);
 			}
 			if (request.getColumnId() == CANCELLABLE_RANGE_COLUMN_ID) {
-				return Flux.generate(() -> 0, (index, sink) -> {
+				return Flux.<KV, Integer>generate(() -> 0, (index, sink) -> {
 					sink.next(kv(index));
 					return index + 1;
 				}).doOnCancel(cancellableRangeCancellation::countDown);
