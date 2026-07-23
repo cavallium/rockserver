@@ -342,6 +342,19 @@ public final class RWScheduler {
 		return classifiedWriteExecutor != null ? classifiedWriteExecutor.activeTasks(writeClass) : 0;
 	}
 
+	/** Return one internally consistent observation for overload benchmarks and diagnostics. */
+	public WriteAdmissionSnapshot writeAdmissionSnapshot() {
+		if (classifiedWriteExecutor == null) {
+			return new WriteAdmissionSnapshot(0, 0, 0, 0);
+		}
+		var snapshot = classifiedWriteExecutor.snapshot();
+		return new WriteAdmissionSnapshot(
+				snapshot.foregroundQueued(),
+				snapshot.maintenanceQueued(),
+				snapshot.foregroundActive(),
+				snapshot.maintenanceActive());
+	}
+
 	public int writeWorkerCount() {
 		return classifiedWriteExecutor != null ? classifiedWriteExecutor.workerCount() : 0;
 	}
@@ -354,6 +367,17 @@ public final class RWScheduler {
 	public int writeQueueCapacity(WriteClass writeClass) {
 		Objects.requireNonNull(writeClass, "writeClass");
 		return classifiedWriteExecutor != null ? classifiedWriteExecutor.queueCapacity(writeClass) : 0;
+	}
+
+	/** Atomic write-admission gauges captured under the classified executor lock. */
+	public record WriteAdmissionSnapshot(int foregroundQueued,
+			int maintenanceQueued,
+			int foregroundActive,
+			int maintenanceActive) {
+
+		public int totalActive() {
+			return foregroundActive + maintenanceActive;
+		}
 	}
 
 	/** Whether the calling thread is already running inside this scheduler's write admission. */

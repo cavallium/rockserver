@@ -32,6 +32,20 @@ as `RESOURCE_EXHAUSTED`. Admission publishes the following metrics with
 - `rockserver.write.admission.worker.limit`
 - `rockserver.write.admission.queue.limit`
 
+## gRPC overload regression benchmark
+
+`GrpcOverloadBenchmark` is an opt-in, disk-backed runner separate from ordinary
+CI and the embedded `FastGetBenchmark`. It compares foreground-only and
+maintenance-flood phases against one preloaded database while keeping every
+foreground and first/last request on the fixed five-second deadline. Each run
+emits `results.json` and `results.md` and enforces foreground latency,
+maintenance progress, admission limits, cancellation, drain, native-handle,
+and shutdown checks.
+
+Use the prepare/reopen workflow for a real cold page cache. The exact reference
+command, options, acceptance rules, and current local baseline are documented in
+[`benchmarks/grpc-overload-2026-07-23.md`](benchmarks/grpc-overload-2026-07-23.md).
+
 ## Fast unary GET
 
 Embedded databases with `database.global.enable-fast-get=true` use the owned

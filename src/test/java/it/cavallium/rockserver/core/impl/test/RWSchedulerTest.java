@@ -333,6 +333,12 @@ class RWSchedulerTest {
 				});
 				assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
 				var cancelled = scheduler.write(WriteClass.FOREGROUND).schedule(() -> {});
+				var busySnapshot = scheduler.writeAdmissionSnapshot();
+				assertEquals(1, busySnapshot.foregroundQueued());
+				assertEquals(0, busySnapshot.maintenanceQueued());
+				assertEquals(1, busySnapshot.foregroundActive());
+				assertEquals(0, busySnapshot.maintenanceActive());
+				assertEquals(1, busySnapshot.totalActive());
 				assertThrows(RocksDBException.class, () -> scheduler.writeExecutor().execute(() -> {}));
 				cancelled.dispose();
 				releaseBlocker.countDown();
@@ -342,6 +348,12 @@ class RWSchedulerTest {
 				var maintenanceDone = new CountDownLatch(1);
 				scheduler.write(WriteClass.MAINTENANCE).schedule(maintenanceDone::countDown);
 				assertTrue(maintenanceDone.await(5, TimeUnit.SECONDS));
+				assertTrue(awaitCondition(() -> scheduler.writeAdmissionSnapshot().totalActive() == 0,
+						Duration.ofSeconds(5)));
+				var drainedSnapshot = scheduler.writeAdmissionSnapshot();
+				assertEquals(0, drainedSnapshot.foregroundQueued());
+				assertEquals(0, drainedSnapshot.maintenanceQueued());
+				assertEquals(0, drainedSnapshot.totalActive());
 
 				assertEquals(0d, gauge(registry, "rockserver.write.admission.queued", "foreground"));
 				assertEquals(0d, gauge(registry, "rockserver.write.admission.active", "foreground"));

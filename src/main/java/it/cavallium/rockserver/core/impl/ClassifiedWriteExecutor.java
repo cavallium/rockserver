@@ -520,6 +520,19 @@ final class ClassifiedWriteExecutor {
 		return metrics(writeClass).active.get();
 	}
 
+	AdmissionSnapshot snapshot() {
+		lock.lock();
+		try {
+			return new AdmissionSnapshot(
+					foregroundMetrics.queued.get(),
+					maintenanceMetrics.queued.get(),
+					foregroundMetrics.active.get(),
+					maintenanceMetrics.active.get());
+		} finally {
+			lock.unlock();
+		}
+	}
+
 	int workerCount() {
 		lock.lock();
 		try {
@@ -547,6 +560,12 @@ final class ClassifiedWriteExecutor {
 
 	private LaneMetrics metrics(WriteClass writeClass) {
 		return writeClass == WriteClass.FOREGROUND ? foregroundMetrics : maintenanceMetrics;
+	}
+
+	record AdmissionSnapshot(int foregroundQueued,
+			int maintenanceQueued,
+			int foregroundActive,
+			int maintenanceActive) {
 	}
 
 	private static boolean isCancelled(Runnable task) {
