@@ -75,6 +75,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
@@ -227,6 +228,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final RawScanFileDeletionRecovery rawScanFileDeletionRecovery = new RawScanFileDeletionRecovery();
 	private final Object asyncExistsMultiAdmissionLock = new Object();
 	private final SafeShutdown ops;
+	private final AtomicLong resourceLeases = new AtomicLong();
 	private final Object columnEditLock = new Object();
 	private final DatabaseConfig config;
 	private final RocksDBObjects refs;
@@ -369,7 +371,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					.tag("db", name)
 					.register(registry));
 			meters.add(Gauge
-					.builder("rockserver.pending.ops", ops, m -> (double) m.getPendingOpsCount())
+					.builder("rockserver.pending.ops", this, db -> (double) db.getPendingOpsCount())
 					.tag("db", name)
 					.register(registry));
 		} catch (Throwable ex) {
@@ -831,16 +833,33 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private void closeInternal(boolean testing) throws IOException {
 		long pendingOpsTimeoutMs = shutdownPendingOpsTimeoutMs();
 		try {
-			logger.info("Closing... waiting for ops");
-			ops.closeAndWait(pendingOpsTimeoutMs);
+			// Statistics reads use the same operation gate as API calls. Stop their
+			// producer before closing admission, then make shutdown-aware logical
+			// reads release their leases before waiting for genuinely active work.
+			logger.info("Closing... stopping background statistics");
+			try {
+				rocksDBStatistics.close();
+			} catch (Throwable error) {
+				logger.error("Failed to stop RocksDB statistics during shutdown", error);
+			}
+			ops.closeAdmission();
+			cancelActiveExistsMultiRequests();
+			closeActiveCdcPollCursors();
+			closeActiveRangeResources();
+			logger.info("Waiting for active operations");
+			ops.waitForExit(pendingOpsTimeoutMs);
 			// Normal shutdown path
 			logger.info("Ops finished, closing resources");
 			closeResources(false);
+			if (testing && resourceLeases.get() > 0) {
+				throw new IllegalStateException("Shutdown left " + resourceLeases.get() + " resource leases open");
+			}
 		} catch (TimeoutException e) {
 			logger.error(
-					"Some operations lasted more than {} ms, forcing database shutdown... pendingOps={}, openTxs={}, openIterators={}",
+					"Some active operations lasted more than {} ms, forcing database shutdown... activeOps={}, resourceLeases={}, openTxs={}, openIterators={}",
 					pendingOpsTimeoutMs,
 					ops.getPendingOpsCount(),
+					resourceLeases.get(),
 					txs.size(),
 					its.size()
 			);
@@ -850,8 +869,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// After forcing close of leaked resources, proceed to close DB/native resources defensively
 			closeResources(true);
 
-			if (testing && ops.getPendingOpsCount() > 0) {
-				throw new IllegalStateException("Some operations lasted more than " + pendingOpsTimeoutMs + " ms! pendingOps=" + ops.getPendingOpsCount() + ", openTxs=" + txs.size() + ", openIterators=" + its.size());
+			if (testing && (ops.getPendingOpsCount() > 0 || resourceLeases.get() > 0)) {
+				throw new IllegalStateException("Some active operations lasted more than " + pendingOpsTimeoutMs
+						+ " ms! activeOps=" + ops.getPendingOpsCount() + ", resourceLeases="
+						+ resourceLeases.get() + ", openTxs=" + txs.size() + ", openIterators=" + its.size());
 			}
 		} finally {
 			// Ensure scheduler and leak-scheduler are always torn down
@@ -896,10 +917,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		cancelActiveExistsMultiRequests();
 		closeActiveCdcPollCursors();
 		closeActiveRangeResources();
+		if (forced && ops.getPendingOpsCount() > 0) {
+			logger.error("Leaving RocksDB native resources allocated because {} operations are still active; "
+					+ "freeing DB, column, or FFM memory here could crash the process",
+					ops.getPendingOpsCount());
+			return;
+		}
 
-		// Close any remaining transactions to avoid hanging on DB close
+		// Active operations have drained, so idle server-side resources can now be
+		// released without racing a native transaction or iterator call.
 		if (!txs.isEmpty()) {
-			logger.warn("Closing {} remaining transactions", txs.size());
+			logger.info("Closing {} open transactions", txs.size());
 			for (long transactionId : new ArrayList<>(txs.keySet())) {
 				try {
 					closeTransactionInternal(transactionId, false);
@@ -908,9 +936,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 		}
-		// Close any remaining iterators
 		if (!its.isEmpty()) {
-			logger.warn("Closing {} remaining iterators", its.size());
+			logger.info("Closing {} open iterators", its.size());
 			for (long iteratorId : new ArrayList<>(its.keySet())) {
 				try {
 					closeIteratorInternal(iteratorId);
@@ -919,10 +946,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 		}
-		if (forced && ops.getPendingOpsCount() > 0) {
-			logger.error("Leaving RocksDB native resources allocated because {} operations are still active; "
-					+ "freeing DB, column, or FFM memory here could crash the process",
-					ops.getPendingOpsCount());
+		if (resourceLeases.get() > 0) {
+			logger.error("Leaving RocksDB native resources allocated because {} transaction or iterator leases "
+					+ "could not be resolved safely", resourceLeases.get());
 			return;
 		}
 		rawScanFileDeletionRecovery.stop();
@@ -1104,6 +1130,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		int closedIts = 0;
 		try {
 			cancelActiveExistsMultiRequests();
+			closeActiveCdcPollCursors();
+			closeActiveRangeResources();
+
+			try {
+				ops.waitForExit(2_000);
+			} catch (TimeoutException te) {
+				logger.warn("Pending operations still not zero after forced shutdown: {}", ops.getPendingOpsCount());
+			}
+			if (ops.getPendingOpsCount() > 0) {
+				return;
+			}
 
 			// Transactions
 			for (long transactionId : new ArrayList<>(txs.keySet())) {
@@ -1124,12 +1161,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				} catch (Throwable t) {
 					logger.warn("Failed to close iterator during forced shutdown", t);
 				}
-			}
-
-			try {
-				ops.waitForExit(2_000);
-			} catch (TimeoutException te) {
-				logger.warn("Pending operations still not zero after forced shutdown: {}", ops.getPendingOpsCount());
 			}
 		} catch (Throwable t) {
 			logger.warn("forceCloseLeakedResources encountered an error", t);
@@ -1398,34 +1429,45 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public long openTransaction(long timeoutMs) {
 		var start = System.nanoTime();
 		actionLogger.logAction("OpenTransaction", start, null, null, null, null, null, timeoutMs, null);
+		ops.beginOp();
 		try {
 			return allocateTransactionInternal(openTransactionInternal(timeoutMs, false));
 		} finally {
+			ops.endOp();
 			var end = System.nanoTime();
 			openTransactionTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
 	}
 
 	private long allocateTransactionInternal(Tx tx) {
-		return FastRandomUtils.allocateNewValue(txs, tx, Long.MIN_VALUE, -2);
+		try {
+			return FastRandomUtils.allocateNewValue(txs, tx, Long.MIN_VALUE, -2);
+		} catch (Throwable error) {
+			try {
+				closeTransactionInternal(tx, false);
+			} catch (Throwable closeError) {
+				error.addSuppressed(closeError);
+			}
+			throw error;
+		}
 	}
 
 	private Tx openTransactionInternal(long timeoutMs, boolean isFromGetForUpdate) {
-		// Open the transaction operation, do not close until the transaction has been closed
-		ops.beginOp();
+		var expirationTimestamp = timeoutMs + System.currentTimeMillis();
+		TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
+		var writeOpts = new LeakSafeWriteOptions("open-transaction-internal-write-options");
+		var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
 		try {
-			var expirationTimestamp = timeoutMs + System.currentTimeMillis();
-			TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
-			var writeOpts = new LeakSafeWriteOptions("open-transaction-internal-write-options");
-			var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
+			var tx = new Tx(db.beginTransaction(writeOpts, txOpts), isFromGetForUpdate, expirationTimestamp, rocksObjects);
 			try {
-				return new Tx(db.beginTransaction(writeOpts, txOpts), isFromGetForUpdate, expirationTimestamp, rocksObjects);
-			} catch (Throwable ex) {
-				rocksObjects.close();
-				throw ex;
+				retainResourceLease();
+				return tx;
+			} catch (Throwable error) {
+				tx.close();
+				throw error;
 			}
 		} catch (Throwable ex) {
-			ops.endOp();
+			rocksObjects.close();
 			throw ex;
 		}
 	}
@@ -1494,14 +1536,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Contract("_, false -> true; _, true -> _")
 	private boolean closeTransactionExclusively(@NotNull Tx tx, boolean commit) {
 		// Owned transactions are deliberately closed again from several finally blocks.
-		// Once the native handle is gone, its lifetime operation has already been balanced.
+		// Once the native handle is gone, its resource lease has already been balanced.
 		if (!tx.val().isOwningHandle()) {
 			return true;
 		}
-		// The transaction's lifetime is already counted by openTransactionInternal().
-		// Starting a second operation here is both redundant and incorrect during shutdown:
-		// closing forbids new operations, but an already-open transaction must still be able
-		// to commit or roll back so its original operation can drain.
+		// Transaction lifetimes are tracked separately from active operations. This lets
+		// shutdown drain native calls first and then roll back idle client transactions.
 		try {
 			if (commit) {
 				boolean succeeded;
@@ -1517,7 +1557,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				}
  			if (!succeeded) {
-					// Do not call endOp here, since the transaction is still open
+					// Keep the resource lease while the transaction remains open.
 					return false;
 				}
 			} else {
@@ -1526,8 +1566,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 			tx.close();
-			// Close the transaction operation started on open
-			ops.endOp();
+			releaseResourceLease();
 			return true;
 		} catch (org.rocksdb.RocksDBException e) {
 			try {
@@ -1535,8 +1574,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			} catch (Throwable t) {
 				e.addSuppressed(t);
 			}
-			// Balance the open op
-			ops.endOp();
+			releaseResourceLease();
 			throw RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Transaction close failed");
 		} catch (Throwable ex) {
 			try {
@@ -1544,8 +1582,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			} catch (Throwable t) {
 				ex.addSuppressed(t);
 			}
-			// Balance the open op
-			ops.endOp();
+			releaseResourceLease();
 			throw ex;
 		}
 	}
@@ -3826,6 +3863,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			throws RocksDBException {
 		var start = System.nanoTime();
 		ColumnInstance col = null;
+		ops.beginOp();
 		try {
 			actionLogger.logAction("Get", start, columnId, keys, null, transactionOrUpdateId, null, null, requestType);
 			// Column id
@@ -3879,6 +3917,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (col != null) {
 				col.endUse();
 			}
+			ops.endOp();
 			var end = System.nanoTime();
 			getTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
@@ -4449,7 +4488,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private <T> T get(Tx tx, long updateId, ColumnInstance col, Keys keys, RequestGet<? super Buf, T> callback)
 			throws RocksDBException {
-		ops.beginOp();
 		try {
 			if (!col.schema().hasValue() && RequestType.requiresGettingCurrentValue(callback)) {
 				throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
@@ -4514,8 +4552,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			throw ex;
 		} catch (Exception ex) {
 			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			ops.endOp();
 		}
 	}
 
@@ -4527,9 +4563,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
 		var start = System.nanoTime();
-		// Open an operation that ends when the iterator is closed
+		// Protect iterator construction as active work; the installed iterator's
+		// longer lifetime is accounted separately from shutdown admission.
 		ops.beginOp();
-		boolean installed = false;
+		boolean resourceLeaseRetained = false;
 		try {
 			actionLogger.logAction("OpenIterator",
 					start,
@@ -4587,24 +4624,31 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				checkIteratorStatusIfInvalid(it);
 
 				itEntry = new REntry<>(it, expirationTimestamp, state);
+				retainResourceLease();
+				resourceLeaseRetained = true;
 				long iteratorId = FastRandomUtils.allocateNewValue(its, itEntry, 1, Long.MAX_VALUE);
-				installed = true;
 				return iteratorId;
 			} catch (Throwable ex) {
-				if (itEntry != null) {
-					itEntry.close();
-				} else {
-					if (it != null) {
-						it.close();
+				try {
+					if (itEntry != null) {
+						itEntry.close();
+					} else {
+						if (it != null) {
+							it.close();
+						}
+						state.close();
 					}
-					state.close();
+				} catch (Throwable closeError) {
+					ex.addSuppressed(closeError);
+				} finally {
+					if (resourceLeaseRetained) {
+						releaseResourceLease();
+					}
 				}
 				throw ex;
 			}
 		} finally {
-			if (!installed) {
-				ops.endOp();
-			}
+			ops.endOp();
 			var end = System.nanoTime();
 			openIteratorTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
@@ -4663,7 +4707,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	/**
 	 * Atomically claims an iterator before closing it. Removing the map entry is the ownership
-	 * transfer that guarantees both the native handle and its lifetime operation are completed
+	 * transfer that guarantees both the native handle and its resource lease are completed
 	 * exactly once when explicit close, leak cleanup, and forced shutdown race.
 	 */
 	private boolean closeIteratorInternal(long iteratorId) {
@@ -4683,8 +4727,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				entry.close();
 			}
 		} finally {
-			// Balance the pending operation started in openIterator.
-			ops.endOp();
+			releaseResourceLease();
 		}
 		return true;
 	}
@@ -4840,7 +4883,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					try {
 						entry.close();
 					} finally {
-						ops.endOp();
+						releaseResourceLease();
 					}
 				}
 				throw iteratorNotFound(iteratorId);
@@ -6138,6 +6181,30 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private void retainResourceLease() {
+		for (;;) {
+			long current = resourceLeases.get();
+			if (current == Long.MAX_VALUE) {
+				throw new IllegalStateException("Too many open resource leases");
+			}
+			if (resourceLeases.compareAndSet(current, current + 1)) {
+				return;
+			}
+		}
+	}
+
+	private void releaseResourceLease() {
+		for (;;) {
+			long current = resourceLeases.get();
+			if (current == 0) {
+				throw new IllegalStateException("No open resource lease to release");
+			}
+			if (resourceLeases.compareAndSet(current, current - 1)) {
+				return;
+			}
+		}
+	}
+
 	public @Nullable Path getPath() {
 		return path;
 	}
@@ -6149,7 +6216,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@VisibleForTesting
 	public long getPendingOpsCount() {
-		return ops.getPendingOpsCount();
+		long activeOperations = ops.getPendingOpsCount();
+		long resources = resourceLeases.get();
+		return activeOperations > Long.MAX_VALUE - resources
+				? Long.MAX_VALUE
+				: activeOperations + resources;
 	}
 
 	@VisibleForTesting

@@ -1,7 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import it.cavallium.buffer.Buf;
@@ -58,7 +58,7 @@ public class MainShutdownTest {
 				Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 				"--enable-native-access=ALL-UNNAMED",
 				"-Drockserver.core.print-config=false",
-				"-Dit.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms=2000",
+				"-Dit.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms=20000",
 				"-Dit.cavallium.rockserver.grpc.server.shutdown-graceful-timeout-ms=5000",
 				"-Dit.cavallium.rockserver.grpc.server.shutdown-forced-timeout-ms=5000",
 				"-Dit.cavallium.rockserver.grpc.server.scheduler-shutdown-timeout-ms=5000",
@@ -99,12 +99,18 @@ public class MainShutdownTest {
 			}
 
 			child.destroy();
-			if (!child.waitFor(30, TimeUnit.SECONDS)) {
+			if (!child.waitFor(15, TimeUnit.SECONDS)) {
 				fail("Rockserver did not finish SIGTERM shutdown:\n" + childDetails(child, childLog));
 			}
 			assertEquals(128 + 15, child.exitValue(), childDetails(child, childLog));
 			assertEquals("complete", Files.readString(shutdownComplete),
 					"the JVM exited before Main completed every resource scope\n" + childDetails(child, childLog));
+			String log = readLog(childLog);
+			assertFalse(log.contains("Fatal error during stats collection"), log);
+			assertFalse(log.contains("Failed to compute total RocksDB memory"), log);
+			assertFalse(log.contains("Failed to compute max-estimate RocksDB memory"), log);
+			assertFalse(log.contains("Some active operations lasted more than"), log);
+			assertFalse(log.contains("Client is closed"), log);
 		} finally {
 			stopChild(child);
 		}

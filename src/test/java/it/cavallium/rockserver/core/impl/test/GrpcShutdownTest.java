@@ -165,6 +165,9 @@ class GrpcShutdownTest {
 
 	@Test
 	void databaseShutdownWithOpenRemoteTransactionIsBounded() throws Exception {
+		// An idle transaction is a resource to roll back after active requests drain;
+		// it must not consume this operation timeout during shutdown.
+		System.setProperty(DB_PENDING_OPS_TIMEOUT, "5000");
 		var client = newClient();
 		var colId = client.getSyncApi().createColumn("tx-col",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
@@ -176,8 +179,10 @@ class GrpcShutdownTest {
 				RequestType.none());
 
 		closeGrpcServer();
+		assertEquals(1, embeddedConnection.getInternalDB().getOpenTransactionsCount());
+		assertEquals(1, embeddedConnection.getInternalDB().getPendingOpsCount());
 
-		assertTimeoutPreemptively(Duration.ofSeconds(10), () -> {
+		assertTimeoutPreemptively(Duration.ofSeconds(3), () -> {
 			embeddedConnection.closeTesting();
 			embeddedConnection = null;
 		});

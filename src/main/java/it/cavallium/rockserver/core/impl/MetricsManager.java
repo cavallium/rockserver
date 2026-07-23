@@ -37,6 +37,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -50,8 +51,9 @@ public class MetricsManager implements AutoCloseable {
 	private final JvmHeapPressureMetrics heapPressureMetrics;
 	private final CompositeMeterRegistry compositeRegistry;
 	private final long startTime;
- private HttpClient httpClient;
- private Vertx vertx;
+	private final AtomicBoolean closed = new AtomicBoolean();
+	private HttpClient httpClient;
+	private Vertx vertx;
 
 	public MetricsManager(DatabaseConfig config) {
 		try {
@@ -300,6 +302,26 @@ public class MetricsManager implements AutoCloseable {
 
 	@Override
 	public void close() {
+		if (!closed.compareAndSet(false, true)) {
+			return;
+		}
+		try {
+			gcMetrics.close();
+		} catch (Throwable t) {
+			LOG.warn("Failed to close GC metrics", t);
+		}
+		try {
+			heapPressureMetrics.close();
+		} catch (Throwable t) {
+			LOG.warn("Failed to close heap pressure metrics", t);
+		}
+		// Push registries publish one final snapshot from close(). Keep their HTTP
+		// transport and Vert.x owner alive until that publish has completed.
+		try {
+			compositeRegistry.close();
+		} catch (Throwable t) {
+			LOG.warn("Failed to close metrics registry", t);
+		}
 		if (httpClient != null) {
 			try {
 				httpClient.rxClose().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
@@ -314,9 +336,6 @@ public class MetricsManager implements AutoCloseable {
 				LOG.warn("Failed to close Vertx instance for metrics", t);
 			}
 		}
-		gcMetrics.close();
-		heapPressureMetrics.close();
-		compositeRegistry.close();
 	}
 
 	public MeterRegistry getRegistry() {

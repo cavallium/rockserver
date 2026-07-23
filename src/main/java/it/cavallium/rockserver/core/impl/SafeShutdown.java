@@ -56,8 +56,16 @@ public class SafeShutdown implements AutoCloseable {
 
 	public void closeAndWait(long timeoutMs) throws TimeoutException {
 		validateTimeout(timeoutMs);
-		startClosing();
+		closeAdmission();
 		waitForExit(timeoutMs);
+	}
+
+	/**
+	 * Prevent new operations from starting without waiting for already admitted operations.
+	 * This lets an owner cancel shutdown-aware work before waiting for the active set to drain.
+	 */
+	public void closeAdmission() {
+		startClosing();
 	}
 
 	public void waitForExit(long timeoutMs) throws TimeoutException {

@@ -5,11 +5,22 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.reactivex.rxjava3.core.Completable;
+import io.vertx.rxjava3.core.Vertx;
+import io.vertx.rxjava3.core.http.HttpClient;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.impl.MetricsManager;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
@@ -66,6 +77,41 @@ class MetricsManagerTest {
 
 		assertTrue(registry.isClosed());
 		assertTrue(registry.getRegistries().stream().allMatch(child -> child.isClosed()));
+	}
+
+	@Test
+	void registryClosesBeforeItsHttpTransportAndManagerCloseIsIdempotent() throws Exception {
+		var config = ConfigParser.parse(writeConfig("""
+				database.metrics.jmx.enabled = false
+				database.metrics.influx.enabled = false
+				"""));
+		var manager = new MetricsManager(config);
+		var registry = (CompositeMeterRegistry) manager.getRegistry();
+		var exporter = spy(new SimpleMeterRegistry());
+		var httpClient = mock(HttpClient.class);
+		var vertx = mock(Vertx.class);
+		when(httpClient.rxClose()).thenReturn(Completable.complete());
+		when(vertx.rxClose()).thenReturn(Completable.complete());
+		registry.add(exporter);
+		setField(manager, "httpClient", httpClient);
+		setField(manager, "vertx", vertx);
+
+		manager.close();
+
+		var closeOrder = inOrder(exporter, httpClient, vertx);
+		closeOrder.verify(exporter).close();
+		closeOrder.verify(httpClient).rxClose();
+		closeOrder.verify(vertx).rxClose();
+
+		manager.close();
+		verify(httpClient, times(1)).rxClose();
+		verify(vertx, times(1)).rxClose();
+	}
+
+	private static void setField(Object target, String name, Object value) throws Exception {
+		Field field = target.getClass().getDeclaredField(name);
+		field.setAccessible(true);
+		field.set(target, value);
 	}
 
 	private Path writeConfig(String content) throws IOException {

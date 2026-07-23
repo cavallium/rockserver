@@ -14,6 +14,7 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode;
 import java.util.function.BiFunction;
@@ -43,6 +44,7 @@ public class RocksDBStatistics {
 	private final Thread executor;
 	private final MultiGauge cacheStats;
 	private final @Nullable RocksDBWalMetrics walMetrics;
+	private final AtomicBoolean closed = new AtomicBoolean();
 
 	private volatile boolean stopRequested = false;
 
@@ -110,7 +112,8 @@ public class RocksDBStatistics {
 				.filter(p -> p.getAggregationMode() != AggregationMode.PER_CF)
 				.collect(Collectors.toMap(Function.identity(),
 						longProperty -> Gauge
-								.builder("rocksdb.property.long", () -> longPropertyGetter.apply(longProperty.getName(), longProperty.getAggregationMode()))
+								.builder("rocksdb.property.long",
+										() -> readLongPropertyForGauge(longPropertyGetter, longProperty))
 								.tag("database", name)
 								.tag("property_name", longProperty.getName())
 								.register(metrics.getRegistry())
@@ -134,6 +137,9 @@ public class RocksDBStatistics {
 		// Realistic total memory gauge: block cache + table readers (index/filter outside cache) + memtables
 		// Note: block-cache-pinned-usage is a subset of block-cache-usage, so it's not added separately
 		Gauge.builder("rocksdb.memory.total", () -> {
+			if (stopRequested) {
+				return Double.NaN;
+			}
 			try {
 				long blockCacheUsage = longPropertyGetter.apply(
 						RocksDBLongProperty.BLOCK_CACHE_USAGE.getName(),
@@ -149,8 +155,10 @@ public class RocksDBStatistics {
 				).longValue();
 				return blockCacheUsage + tableReadersMem + memtables;
 			} catch (Throwable ex) {
-				LOG.error("Failed to compute total RocksDB memory", ex);
-				return 0;
+				if (!stopRequested) {
+					LOG.error("Failed to compute total RocksDB memory", ex);
+				}
+				return stopRequested ? Double.NaN : 0.0d;
 			}
 		}).tag("database", name).register(metrics.getRegistry());
 
@@ -160,6 +168,9 @@ public class RocksDBStatistics {
 		// file (writable file buffer). This gives a realistic upper bound on native memory.
 		final int estimatedInputFilesPerCompaction = 10;
 		Gauge.builder("rocksdb.memory.max-estimate", () -> {
+			if (stopRequested) {
+				return Double.NaN;
+			}
 			try {
 				// Block cache capacity (configured max, not current usage)
 				long blockCacheCapacity = longPropertyGetter.apply(
@@ -183,8 +194,10 @@ public class RocksDBStatistics {
 						   + memoryUpperBoundConfig.writableFileMaxBufferBytes());
 				return blockCacheCapacity + allMemtables + tableReadersMem + compactionBuffers;
 			} catch (Throwable ex) {
-				LOG.error("Failed to compute max-estimate RocksDB memory", ex);
-				return 0;
+				if (!stopRequested) {
+					LOG.error("Failed to compute max-estimate RocksDB memory", ex);
+				}
+				return stopRequested ? Double.NaN : 0.0d;
 			}
 		}).tag("database", name).register(metrics.getRegistry());
 
@@ -253,7 +266,9 @@ public class RocksDBStatistics {
 						multiGauge.register(rows, true);
 					}
 				} catch (Throwable ex) {
-					LOG.error("Fatal error during stats collection", ex);
+					if (!stopRequested) {
+						LOG.error("Fatal error during stats collection", ex);
+					}
 				}
 
 				var taskEndTime = System.nanoTime();
@@ -279,15 +294,40 @@ public class RocksDBStatistics {
 		return new CacheStats(cache.getUsage(), cache.getPinnedUsage());
 	}
 
+	private Number readLongPropertyForGauge(
+			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter,
+			RocksDBLongProperty property) {
+		if (stopRequested) {
+			return Double.NaN;
+		}
+		try {
+			return longPropertyGetter.apply(property.getName(), property.getAggregationMode());
+		} catch (RuntimeException | Error error) {
+			if (stopRequested) {
+				return Double.NaN;
+			}
+			throw error;
+		}
+	}
+
 	private record CacheStats(long usage, long pinnedUsage) {}
 
 	public void close() {
 		stopRequested = true;
+		if (!closed.compareAndSet(false, true)) {
+			return;
+		}
 		executor.interrupt();
-		try {
-			executor.join();
-		} catch (InterruptedException e) {
-			LOG.error("Failed to close executor", e);
+		boolean interrupted = false;
+		while (executor.isAlive()) {
+			try {
+				executor.join();
+			} catch (InterruptedException ignored) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
 		}
 		if (walMetrics != null) {
 			walMetrics.close();

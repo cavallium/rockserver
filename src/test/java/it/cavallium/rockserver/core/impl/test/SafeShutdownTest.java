@@ -85,6 +85,21 @@ public class SafeShutdownTest {
 	}
 
 	@Test
+	@DisplayName("Admission can close before shutdown-aware work is cancelled and drained")
+	public void testCloseAdmissionBeforeWait() throws Exception {
+		var shutdown = new SafeShutdown();
+		shutdown.beginOp();
+
+		shutdown.closeAdmission();
+
+		Assertions.assertFalse(shutdown.isOpen());
+		Assertions.assertEquals(1, shutdown.getPendingOpsCount());
+		Assertions.assertThrows(IllegalStateException.class, shutdown::beginOp);
+		shutdown.endOp();
+		shutdown.waitForExit(0);
+	}
+
+	@Test
 	@DisplayName("Invalid timeout and unmatched end should fail without corrupting state")
 	public void testInvalidLifecycleCalls() {
 		var shutdown = new SafeShutdown();
