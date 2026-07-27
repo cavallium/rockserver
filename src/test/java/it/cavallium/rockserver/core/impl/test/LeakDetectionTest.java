@@ -45,7 +45,7 @@ database: {
 }
 """);
         db = new EmbeddedConnection(null, "leak-tests", configFile);
-        colId = db.getSyncApi().createColumn("leak-col", ColumnSchema.of(
+        colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("leak-col", ColumnSchema.of(
                 IntList.of(Integer.BYTES),
                 ObjectList.of(),
                 true
@@ -62,23 +62,23 @@ database: {
     void testNoPendingResourcesAfterMixedOperations() {
         // Basic put/get
         var k = new Keys(new Buf[]{Buf.wrap(new byte[]{1, 2, 3, 4})});
-        db.getSyncApi().put(0, colId, k, Buf.wrap("a".getBytes()), RequestType.none());
-        var v = db.getSyncApi().get(0, colId, k, RequestType.current());
+        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, k, Buf.wrap("a".getBytes()), RequestType.none());
+        var v = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, k, RequestType.current());
         assertNotNull(v);
 
         // Explicit transaction with commit
-        long txId = db.getSyncApi().openTransaction(5_000);
-        db.getSyncApi().put(txId, colId, k, Buf.wrap("b".getBytes()), RequestType.none());
-        assertTrue(db.getSyncApi().closeTransaction(txId, true));
+        long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(5_000);
+        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId, colId, k, Buf.wrap("b".getBytes()), RequestType.none());
+        assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(txId, true));
 
         // Explicit transaction with rollback
-        long txId2 = db.getSyncApi().openTransaction(5_000);
-        db.getSyncApi().put(txId2, colId, k, Buf.wrap("c".getBytes()), RequestType.none());
-        assertTrue(db.getSyncApi().closeTransaction(txId2, false));
+        long txId2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(5_000);
+        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId2, colId, k, Buf.wrap("c".getBytes()), RequestType.none());
+        assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(txId2, false));
 
         // Merge and read back
-        db.getSyncApi().merge(0, colId, k, Buf.wrap("+d".getBytes()), RequestType.none());
-        var merged = db.getSyncApi().get(0, colId, k, RequestType.current());
+        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, k, Buf.wrap("+d".getBytes()), RequestType.none());
+        var merged = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, k, RequestType.current());
         assertNotNull(merged);
 
         // Range scan with cancellation (iterator should be closed)
@@ -100,7 +100,7 @@ database: {
         // Populate some rows
         for (int i = 0; i < 100; i++) {
             var key = new Keys(new Buf[]{Buf.wrap(new byte[]{(byte) i, 0, 0, 0})});
-            db.getSyncApi().put(0, colId, key, Buf.wrap(new byte[]{(byte) i}), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, Buf.wrap(new byte[]{(byte) i}), RequestType.none());
         }
         // Start range and cancel after a few elements
         var pub = db.getRangeAsync(0, colId, null, null, false, RequestType.allInRange(), Duration.ofSeconds(10).toMillis());

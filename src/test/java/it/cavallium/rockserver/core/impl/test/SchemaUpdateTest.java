@@ -58,7 +58,7 @@ public class SchemaUpdateTest {
             colId = db.createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.MyStringAppendOperator"));
             
             // Create CDC subscription (Resolved=true)
-            db.getSyncApi().cdcCreate(subId, null, List.of(colId), true);
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), true);
 
             // Put "A", Merge "B" -> "A,B"
             db.put(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("A".getBytes()), RequestType.none());
@@ -86,7 +86,7 @@ public class SchemaUpdateTest {
             // --- CDC Verification ---
             // Poll all events. Resolved=true.
             // All events should resolve to LATEST state ("A,B;C" or "A;B;C")
-            List<CDCEvent> events = db.getSyncApi().cdcPoll(subId, null, 100).collect(Collectors.toList());
+            List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll(subId, null, 100).collect(Collectors.toList());
             assertEquals(3, events.size());
             
             String latestState = valStr;

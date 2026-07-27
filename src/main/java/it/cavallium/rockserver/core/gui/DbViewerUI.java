@@ -5,9 +5,12 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RequestContext;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Map;
@@ -349,10 +352,11 @@ public class DbViewerUI extends JFrame {
 		new SwingWorker<TableData, Void>() {
 			@Override
 			protected TableData doInBackground() throws Exception {
-				var colId = apiClient.getSyncApi().getColumnId(selectedTable.name());
+				var analyticalApi = apiClient.getSyncApi(RequestContext.analytical(Instant.now().plusSeconds(5)));
+				var colId = analyticalApi.getColumnId(selectedTable.name());
 				var column = new Column(selectedTable.name(), colId, selectedTable.schema());
 
-				try (Stream<KV> dataStream = apiClient.getSyncApi().getRange(0, column.colId, null, null, false, RequestType.allInRange(), 5_000)) {
+				try (Stream<KV> dataStream = analyticalApi.getRange(0, column.colId, null, null, false, RequestType.allInRange(), 5_000)) {
 					var rows = dataStream.toList();
 					int numCols = column.schema().keysCount() + (column.schema.hasValue() ? 1 : 0);
 					Object[][] rowData = new Object[rows.size()][numCols];
@@ -430,7 +434,8 @@ public class DbViewerUI extends JFrame {
 		new SwingWorker<Map<String, ColumnSchema>, Void>() {
 			@Override
 			protected Map<String, ColumnSchema> doInBackground() throws Exception {
-				return apiClient.getSyncApi().getAllColumnDefinitions();
+				return apiClient.getSyncApi(RequestContext.latency(Duration.ofSeconds(5)))
+						.getAllColumnDefinitions();
 			}
 
 			@Override

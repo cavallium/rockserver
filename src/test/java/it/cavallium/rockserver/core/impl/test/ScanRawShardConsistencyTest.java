@@ -35,7 +35,7 @@ class ScanRawShardConsistencyTest {
 				} }
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "scan-raw-shards", configFile)) {
-			RocksDBSyncAPI api = connection.getSyncApi();
+			RocksDBSyncAPI api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("events",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 

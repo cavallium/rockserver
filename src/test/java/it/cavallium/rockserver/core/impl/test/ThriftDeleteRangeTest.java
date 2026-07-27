@@ -2,7 +2,6 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -10,17 +9,9 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.ThriftConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
-import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.Keys;
-import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestType;
-import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.Utils;
-import it.cavallium.rockserver.core.common.WriteClass;
-import it.cavallium.rockserver.core.common.api.RocksDB;
-import it.cavallium.rockserver.core.common.api.RocksDBErrorType;
-import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
-import it.cavallium.rockserver.core.common.api.RocksDBWriteClass;
 import it.cavallium.rockserver.core.server.ThriftServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -30,17 +21,10 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TException;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TSocket;
-import org.apache.thrift.transport.layered.TFramedTransport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import reactor.core.publisher.Flux;
 
 class ThriftDeleteRangeTest {
 
@@ -73,7 +57,7 @@ class ThriftDeleteRangeTest {
 		thriftServer = new ThriftServer(embeddedConnection, "127.0.0.1", port);
 		thriftServer.start();
 		client = new ThriftConnection("thrift-client", "127.0.0.1", port);
-		colId = client.getSyncApi().createColumn("test-col", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+		colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test-col", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 	}
 
 	@AfterEach
@@ -102,90 +86,19 @@ class ThriftDeleteRangeTest {
 		var key3 = key(13);
 		var key4 = key(14);
 
-		client.getSyncApi().put(0, colId, key1, value(110), RequestType.none());
-		client.getSyncApi().put(0, colId, key2, value(120), RequestType.none());
-		client.getSyncApi().put(0, colId, key3, value(130), RequestType.none());
-		client.getSyncApi().put(0, colId, key4, value(140), RequestType.none());
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value(110), RequestType.none());
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value(120), RequestType.none());
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key3, value(130), RequestType.none());
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key4, value(140), RequestType.none());
 
-		client.getSyncApi().deleteRange(colId, key2, key4);
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteRange(colId, key2, key4);
 
-		assertTrue(client.getSyncApi().get(0, colId, key1, RequestType.exists()));
-		assertFalse(client.getSyncApi().get(0, colId, key2, RequestType.exists()));
-		assertFalse(client.getSyncApi().get(0, colId, key3, RequestType.exists()));
-		assertTrue(client.getSyncApi().get(0, colId, key4, RequestType.exists()));
+		assertTrue(client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, RequestType.exists()));
+		assertFalse(client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key2, RequestType.exists()));
+		assertFalse(client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key3, RequestType.exists()));
+		assertTrue(client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key4, RequestType.exists()));
 	}
 
-	@Test
-	void explicitMaintenancePropagatesOverThrift() {
-		var key = key(101);
-		client.getSyncApi().put(0, colId, key, value(101), RequestType.none(), WriteClass.MAINTENANCE);
-
-		assertTrue(client.getSyncApi().get(0, colId, key, RequestType.exists()));
-
-		client.getSyncApi().delete(0, colId, key, RequestType.none(), WriteClass.MAINTENANCE);
-		assertFalse(client.getSyncApi().get(0, colId, key, RequestType.exists()));
-	}
-
-	@Test
-	void maintenanceQueueOverflowMapsToRetryableThriftError() throws Exception {
-		var scheduler = embeddedConnection.getScheduler();
-		var blockerStarted = new CountDownLatch(1);
-		var releaseBlocker = new CountDownLatch(1);
-		var queuedCompleted = new CountDownLatch(1);
-		try {
-			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(() -> {
-				blockerStarted.countDown();
-				await(releaseBlocker);
-			});
-			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
-			scheduler.writeExecutor(WriteClass.MAINTENANCE).execute(queuedCompleted::countDown);
-
-			var failure = assertThrows(RocksDBException.class, () -> client.getSyncApi().put(
-					0, colId, key(103), value(103), RequestType.none(), WriteClass.MAINTENANCE));
-			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, failure.getErrorUniqueId());
-
-			failure = assertThrows(RocksDBException.class, () -> client.getSyncApi().deleteRange(
-					colId, key(103), key(104), WriteClass.MAINTENANCE));
-			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, failure.getErrorUniqueId());
-
-			failure = assertThrows(RocksDBException.class, () -> client.getSyncApi().putBatch(
-					colId,
-					Flux.just(new KVBatchRef(List.of(key(103)), List.of(value(103)))),
-					PutBatchMode.WRITE_BATCH,
-					WriteClass.MAINTENANCE));
-			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, failure.getErrorUniqueId());
-
-			failure = assertThrows(RocksDBException.class, () -> client.getSyncApi().createColumn(
-					"rejected-column",
-					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true),
-					WriteClass.MAINTENANCE));
-			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, failure.getErrorUniqueId());
-		} finally {
-			releaseBlocker.countDown();
-			assertTrue(queuedCompleted.await(5, TimeUnit.SECONDS));
-		}
-	}
-
-	@Test
-	void legacyGeneratedThriftClientDefaultsToForeground() throws Exception {
-		try (var transport = openRawTransport()) {
-			var rawClient = new RocksDB.Client(new TBinaryProtocol(transport));
-			var key = key(102);
-			rawClient.put(0, colId, mapKeys(key), ByteBuffer.wrap(new byte[] {7}));
-
-			assertTrue(client.getSyncApi().get(0, colId, key, RequestType.exists()));
-		}
-	}
-
-	@Test
-	void unknownThriftWriteClassIsInvalidRequest() throws Exception {
-		try (var transport = openRawTransport()) {
-			var rawClient = new RocksDBWriteClass.Client(new TBinaryProtocol(transport));
-			var error = assertThrows(RocksDBThriftException.class,
-					() -> rawClient.deleteRangeWithWriteClass(colId, List.of(), List.of(), 99));
-			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, error.getErrorType());
-		}
-	}
 
 	@Test
 	void noCacheRangeReadOverThriftMatchesNormalRangeRead() {
@@ -194,15 +107,15 @@ class ThriftDeleteRangeTest {
 		var key3 = key(13);
 		var key4 = key(14);
 
-		client.getSyncApi().put(0, colId, key1, value(110), RequestType.none());
-		client.getSyncApi().put(0, colId, key2, value(120), RequestType.none());
-		client.getSyncApi().put(0, colId, key3, value(130), RequestType.none());
-		client.getSyncApi().put(0, colId, key4, value(140), RequestType.none());
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value(110), RequestType.none());
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value(120), RequestType.none());
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key3, value(130), RequestType.none());
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key4, value(140), RequestType.none());
 
-		var normal = client.getSyncApi()
+		var normal = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 				.getRange(0, colId, key2, key4, false, RequestType.allInRange(), 1_000)
 				.toList();
-		var noCache = client.getSyncApi()
+		var noCache = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 				.getRange(0, colId, key2, key4, false, RequestType.allInRangeNoCache(), 1_000)
 				.toList();
 
@@ -217,17 +130,6 @@ class ThriftDeleteRangeTest {
 		}
 	}
 
-	private TFramedTransport openRawTransport() throws TException {
-		var configuration = TConfiguration.custom().build();
-		var transport = new TFramedTransport(new TSocket(configuration, "127.0.0.1", port));
-		transport.open();
-		return transport;
-	}
-
-	private static List<ByteBuffer> mapKeys(Keys keys) {
-		return java.util.Arrays.stream(keys.keys()).map(Utils::asByteBuffer).toList();
-	}
-
 	private static Keys key(long id) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(id).array()));
 	}
@@ -236,18 +138,4 @@ class ThriftDeleteRangeTest {
 		return Utils.toBufSimple(value);
 	}
 
-	private static void await(CountDownLatch latch) {
-		boolean interrupted = false;
-		while (true) {
-			try {
-				latch.await();
-				break;
-			} catch (InterruptedException _) {
-				interrupted = true;
-			}
-		}
-		if (interrupted) {
-			Thread.currentThread().interrupt();
-		}
-	}
 }

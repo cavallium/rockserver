@@ -60,7 +60,7 @@ class GrpcMalformedStreamTest {
 		configFile = Files.createTempFile("rockserver-grpc-malformed-stream", ".conf");
 		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
 		embeddedConnection = new EmbeddedConnection(dbDir, "grpc-malformed-stream", configFile);
-		columnId = embeddedConnection.getSyncApi().createColumn("stream-column",
+		columnId = embeddedConnection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("stream-column",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 		grpcServer = new GrpcServer(embeddedConnection, new InetSocketAddress("127.0.0.1", 0));
 		grpcServer.start();

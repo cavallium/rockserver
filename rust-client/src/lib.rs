@@ -20,7 +20,14 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let client = RockserverClient::connect("http://[::1]:50051").await?;
+//!     let client = RockserverClient::connect(
+//!         "http://[::1]:50051",
+//!         rockserver_client::RequestContext::latency(
+//!             std::time::SystemTime::now()
+//!                 .duration_since(std::time::UNIX_EPOCH)?
+//!                 .as_millis() as i64 + 5_000,
+//!         ),
+//!     ).await?;
 //!     
 //!     // Create a column
 //!     let schema = ColumnSchema {

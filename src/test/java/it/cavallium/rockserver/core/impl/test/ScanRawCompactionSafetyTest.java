@@ -53,7 +53,7 @@ class ScanRawCompactionSafetyTest {
 				} }
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "scan-raw-compaction", configFile)) {
-			RocksDBSyncAPI api = connection.getSyncApi();
+			RocksDBSyncAPI api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			EmbeddedDB internal = connection.getInternalDB();
 			long columnId = api.createColumn(COLUMN_NAME,
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
@@ -118,7 +118,7 @@ class ScanRawCompactionSafetyTest {
 				} }
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "scan-raw-cancel", configFile)) {
-			RocksDBSyncAPI api = connection.getSyncApi();
+			RocksDBSyncAPI api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			EmbeddedDB internal = connection.getInternalDB();
 			long columnId = api.createColumn(COLUMN_NAME,
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
@@ -155,7 +155,7 @@ class ScanRawCompactionSafetyTest {
 	@Test
 	void rejectedAdmissionDoesNotEndAnUnrelatedShutdownOperation(@TempDir Path tempDir) throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "scan-raw-shutdown", null)) {
-			long columnId = connection.getSyncApi().createColumn(COLUMN_NAME,
+			long columnId = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(COLUMN_NAME,
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			EmbeddedDB internal = connection.getInternalDB();
 			SafeShutdown shutdown = shutdownOf(internal);

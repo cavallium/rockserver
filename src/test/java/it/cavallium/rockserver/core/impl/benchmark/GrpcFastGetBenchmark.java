@@ -232,7 +232,7 @@ public final class GrpcFastGetBenchmark {
 				options.writerRate());
 		List<Result> results = new ArrayList<>();
 		try (var embedded = new EmbeddedConnection(root.resolve("db"), "grpc-fast-get-benchmark", config)) {
-			long columnId = populate(embedded.getSyncApi(), bandSpecs);
+			long columnId = populate(embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()), bandSpecs);
 			try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 				server.start();
 				try (Client client = Client.open(server.getPort())) {

@@ -49,7 +49,7 @@ class GrpcIteratorLeaseTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-iterator-leases",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var api = client.getSyncApi();
+				var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				long columnId = api.createColumn("entries",
 						ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 				List<Long> iteratorIds = new ArrayList<>(ITERATOR_COUNT);
@@ -94,8 +94,8 @@ class GrpcIteratorLeaseTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-running-iterator-lease",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var asyncApi = client.getAsyncApi();
-				var syncApi = client.getSyncApi();
+				var asyncApi = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+				var syncApi = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				long iteratorId = syncApi.openIterator(0, 0, new Keys(), null, false, 30_000);
 				var running = asyncApi.subsequentAsync(iteratorId, 0, 1, RequestType.exists());
 
@@ -132,7 +132,7 @@ class GrpcIteratorLeaseTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-rejected-open-cleanup",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var open = client.getAsyncApi().openIteratorAsync(0, 0, new Keys(), null, false, 30_000);
+				var open = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIteratorAsync(0, 0, new Keys(), null, false, 30_000);
 				try {
 					assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 					assertTrue(open.cancel(true));
@@ -203,12 +203,12 @@ class GrpcIteratorLeaseTest {
 		}
 
 		@Override
-		public RocksDBSyncAPI getSyncApi() {
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return syncApi;
 		}
 
 		@Override
-		public RocksDBAsyncAPI getAsyncApi() {
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return asyncApi;
 		}
 
@@ -260,12 +260,12 @@ class GrpcIteratorLeaseTest {
 		}
 
 		@Override
-		public RocksDBSyncAPI getSyncApi() {
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return syncApi;
 		}
 
 		@Override
-		public RocksDBAsyncAPI getAsyncApi() {
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return asyncApi;
 		}
 

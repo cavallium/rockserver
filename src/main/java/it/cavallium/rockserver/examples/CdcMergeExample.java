@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class CdcMergeExample {
 
     private static final Logger LOG = LoggerFactory.getLogger(CdcMergeExample.class);
+	private static final RequestContext INGEST_CONTEXT = RequestContext.ingest();
 
     // --- Example domain model and patch ---
     record Message(int id, String text, boolean pinned, long updatedAt) {}
@@ -70,14 +71,14 @@ public class CdcMergeExample {
         // 2) Open an embedded DB (in-memory for the demo).
         // The column is declared via config (column-options) so we only need to resolve its id.
         try (var db = new EmbeddedConnection(null, "cdc-merge-example", tempConfig)) {
-            var api = db.getAsyncApi();
+			var api = db.getAsyncApi(INGEST_CONTEXT);
             var schema = ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntList.of(4), new it.unimi.dsi.fastutil.objects.ObjectArrayList<>(), true, null, null, "it.cavallium.rockserver.examples.MessagePatchMergeOperator");
-            long columnId = db.getSyncApi().createColumn("messages", schema);
+			long columnId = db.getSyncApi(INGEST_CONTEXT).createColumn("messages", schema);
             LOG.info("Using column 'messages' with id={} (from config)", columnId);
 
             // 3) Create or resume a CDC subscription BEFORE seeding data so we also see initial PUTs
             String subId = "messages-sub";
-            long startSeq = db.getSyncApi().cdcCreate(subId, null, List.of(columnId), true); // start from last committed + 1, resolved values
+			long startSeq = db.getSyncApi(INGEST_CONTEXT).cdcCreate(subId, null, List.of(columnId), true); // start from last committed + 1, resolved values
             LOG.info("CDC subscription '{}' created. startSeq={}", subId, startSeq);
 
             // 4) Seed some initial records (real value serialization)
@@ -337,7 +338,7 @@ public class CdcMergeExample {
     }
 
     private static void putMessage(EmbeddedConnection db, long columnId, Message m) {
-        db.getSyncApi().put(0, columnId,
+		db.getSyncApi(INGEST_CONTEXT).put(0, columnId,
                 new Keys(new Buf[]{Buf.wrap(intToBytes(m.id()))}),
                 Buf.wrap(encodeMessage(m)),
                 RequestType.none());

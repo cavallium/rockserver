@@ -68,7 +68,7 @@ database: {
 	void mergeSingleReturnsMergedValue() {
 		var schema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
 		long colId = embedded.createColumn("c1", schema);
-		var api = embedded.getSyncApi();
+		var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 		var key = new Keys(toBufSimple(1));
 		Buf merged;
 
@@ -88,7 +88,7 @@ database: {
 	void mergeMultiReturnsMergedValues() {
 		var schema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
 		long colId = embedded.createColumn("c2", schema);
-		var api = embedded.getSyncApi();
+		var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 		var keys = List.of(new Keys(toBufSimple(2)), new Keys(toBufSimple(3)));
 		var values = List.of(s("X"), s("Y"));
 
@@ -104,7 +104,7 @@ database: {
 	void mergeBatchAppendsValues() throws RocksDBException {
 		var schema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
 		long colId = embedded.createColumn("c3", schema);
-		var api = embedded.getSyncApi();
+		var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 
 		var batchKeys = List.of(new Keys(toBufSimple(4)), new Keys(toBufSimple(5)));
 		var batchValues = List.of(s("M"), s("N"));
@@ -121,7 +121,7 @@ database: {
 	void bucketedMergeUsesOperatorAndReturnsMerged() {
 		var schema = ColumnSchema.of(IntList.of(1, 1), ObjectList.of(ColumnHashType.XXHASH32), true);
 		long colId = embedded.createColumn("c4", schema);
-		var api = embedded.getSyncApi();
+		var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 		var key = new Keys(toBufSimple(7), toBufSimple(8), toBufSimple(9));
 
 		Buf merged = api.merge(0, colId, key, s("a"), RequestType.merged());
@@ -138,7 +138,7 @@ database: {
 		var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 8129));
 		server.start();
 		try (var client = GrpcConnection.forHostAndPort("test-client", new it.cavallium.rockserver.core.common.Utils.HostAndPort("127.0.0.1", 8129))) {
-			var api = client.getSyncApi();
+			var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var key = new Keys(toBufSimple(11));
 			Buf merged = api.merge(0, colId, key, s("q"), RequestType.merged());
 			assertEquals(s("q"), merged);

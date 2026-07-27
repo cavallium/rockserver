@@ -29,19 +29,19 @@ public class RemoteMergeOperatorTest {
             byte[] jarData = createJar(MyStringAppendOperator.class);
             
             // Upload
-            long version = db.getSyncApi().uploadMergeOperator("remote-append", MyStringAppendOperator.class.getName(), jarData);
+            long version = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).uploadMergeOperator("remote-append", MyStringAppendOperator.class.getName(), jarData);
             
             // Create column using the operator
             ColumnSchema schema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true, "remote-append", version);
-            long colId = db.getSyncApi().createColumn("remote-col", schema);
+            long colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("remote-col", schema);
             
             // Put and Merge
             var key = new it.cavallium.rockserver.core.common.Keys(toBuf(new byte[]{1}));
-            db.getSyncApi().put(0, colId, key, toBuf("Hello".getBytes()), RequestType.none());
-            db.getSyncApi().merge(0, colId, key, toBuf("World".getBytes()), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, toBuf("Hello".getBytes()), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, key, toBuf("World".getBytes()), RequestType.none());
             
             // Get
-            var result = db.getSyncApi().get(0, colId, key, RequestType.current());
+            var result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.current());
             assertNotNull(result);
             assertEquals("Hello,World", new String(result.toByteArray()));
             System.out.println("Test passed!");

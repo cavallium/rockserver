@@ -37,7 +37,7 @@ public class ReproduceCdcMergeBugTest {
     public void testCdcReceiveFromMergeBatch() throws Exception {
         // Setup DB
         try (EmbeddedConnection db = new EmbeddedConnection(tempDir, "test-db", null)) {
-            var api = db.getAsyncApi();
+            var api = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
             
             // Create column
             var schema = ColumnSchema.of(IntList.of(4), new ObjectArrayList<>(), true, null, null, "it.cavallium.rockserver.examples.MessagePatchMergeOperator");

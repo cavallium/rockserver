@@ -40,7 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok());
 
-    let client = RockserverClient::connect("http://10.0.0.11:5333").await?;
+	let client = RockserverClient::connect(
+		"http://10.0.0.11:5333",
+		rockserver_client::RequestContext::batch(),
+	).await?;
 
     // Define the schema based on the Java snippet:
     // CHAT_ENTITY_ID_BYTES (8) + Integer.BYTES (4)

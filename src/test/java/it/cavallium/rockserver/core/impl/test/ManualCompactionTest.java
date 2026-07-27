@@ -25,7 +25,7 @@ class ManualCompactionTest {
 	void compactIsIndependentFromTheProcessLocale(@TempDir Path tempDir) throws Exception {
 		Locale previousLocale = Locale.getDefault();
 		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "compact-locale", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			api.createColumn("entries", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
 
 			Locale.setDefault(Locale.ITALY);
@@ -38,7 +38,7 @@ class ManualCompactionTest {
 	@Test
 	void deletingAColumnWaitsForCompactionToReleaseItsHandle(@TempDir Path tempDir) throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "compact-delete", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var internal = connection.getInternalDB();
 			long columnId = api.createColumn("entries", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
 			var compactionEntered = new CountDownLatch(1);

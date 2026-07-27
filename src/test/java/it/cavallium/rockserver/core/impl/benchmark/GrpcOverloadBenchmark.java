@@ -14,6 +14,7 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.api.proto.FirstAndLast;
 import it.cavallium.rockserver.core.common.api.proto.GetRangeRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetRequest;
@@ -107,8 +108,8 @@ public final class GrpcOverloadBenchmark {
 		try {
 			embedded = new EmbeddedConnection(root.resolve("db"), options.databaseName(), config);
 			long columnId = options.reusePreloaded()
-					? embedded.getSyncApi().getColumnId("overload-benchmark")
-					: preload(embedded.getSyncApi(), options);
+					? embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("overload-benchmark")
+					: preload(embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()), options);
 			if (!options.prepareOnly()) {
 				Requests requests = Requests.create(columnId, options);
 				server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0));
@@ -616,11 +617,11 @@ public final class GrpcOverloadBenchmark {
 			long drainNanos) {
 		var scheduler = embedded.getScheduler();
 		var db = embedded.getInternalDB();
-		var admission = scheduler.writeAdmissionSnapshot();
-		int foregroundQueued = admission.foregroundQueued();
-		int maintenanceQueued = admission.maintenanceQueued();
-		int foregroundActive = admission.foregroundActive();
-		int maintenanceActive = admission.maintenanceActive();
+		var admission = scheduler.admissionSnapshot();
+		int foregroundQueued = admission.queued().get(WorkloadProfile.INGEST);
+		int maintenanceQueued = admission.queued().get(WorkloadProfile.BATCH);
+		int foregroundActive = admission.active().get(WorkloadProfile.INGEST);
+		int maintenanceActive = admission.active().get(WorkloadProfile.BATCH);
 		long pending = db.getPendingOpsCount();
 		int transactions = db.getOpenTransactionsCount();
 		int iterators = db.getOpenIteratorsCount();
@@ -1208,6 +1209,10 @@ public final class GrpcOverloadBenchmark {
 			PutRequest[][] cancellationWrites) {
 
 		private static Requests create(long columnId, Options options) {
+			var latencyContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY)
+					.setDeadlineEpochMillis(Long.MAX_VALUE - 1L)
+					.build();
 			GetRequest[] points = new GetRequest[Math.min(options.pointRequestCount(), options.preloadKeys())];
 			for (int index = 0; index < points.length; index++) {
 				long key = (long) index * options.preloadKeys() / points.length;
@@ -1215,6 +1220,7 @@ public final class GrpcOverloadBenchmark {
 						.setTransactionOrUpdateId(0)
 						.setColumnId(columnId)
 						.addKeys(keyByteString(key))
+						.setContext(latencyContext)
 						.build();
 			}
 
@@ -1237,6 +1243,7 @@ public final class GrpcOverloadBenchmark {
 						.addStartKeysInclusive(first)
 						.addEndKeysExclusive(keyByteString(end))
 						.setTimeoutMs(DEADLINE_MILLIS)
+						.setContext(latencyContext)
 						.build();
 				ranges[index] = new RangeCase(request, first, last);
 			}
@@ -1245,20 +1252,20 @@ public final class GrpcOverloadBenchmark {
 					points,
 					ranges,
 					writerRequests(columnId, options.foregroundWriters(), 1L << 60,
-							it.cavallium.rockserver.core.common.api.proto.WriteClass.FOREGROUND,
+							it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.INGEST,
 							options.valueBytes()),
 					writerRequests(columnId, options.maintenanceWriters(), 1L << 61,
-							it.cavallium.rockserver.core.common.api.proto.WriteClass.MAINTENANCE,
+							it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH,
 							options.valueBytes()),
 					writerRequests(columnId, options.cancellationWorkers(), 3L << 60,
-							it.cavallium.rockserver.core.common.api.proto.WriteClass.MAINTENANCE,
+							it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH,
 							options.valueBytes()));
 		}
 
 		private static PutRequest[][] writerRequests(long columnId,
 				int workers,
 				long keyBase,
-				it.cavallium.rockserver.core.common.api.proto.WriteClass writeClass,
+				it.cavallium.rockserver.core.common.api.proto.WorkloadProfile profile,
 				int valueBytes) {
 			PutRequest[][] requests = new PutRequest[workers][WRITE_REQUEST_VARIANTS];
 			for (int worker = 0; worker < workers; worker++) {
@@ -1270,7 +1277,9 @@ public final class GrpcOverloadBenchmark {
 							.setData(KV.newBuilder()
 									.addKeys(keyByteString(key))
 									.setValue(ByteString.copyFrom(valueBytes(valueBytes, key))))
-							.setWriteClass(writeClass)
+							.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+									.setProfile(profile)
+									.setDeadlineEpochMillis(Long.MAX_VALUE))
 							.build();
 				}
 			}
@@ -1493,11 +1502,11 @@ public final class GrpcOverloadBenchmark {
 		private final AtomicInteger maxTotalActive = new AtomicInteger();
 
 		private void sample(EmbeddedConnection embedded) {
-			var snapshot = embedded.getScheduler().writeAdmissionSnapshot();
-			int foregroundQueue = snapshot.foregroundQueued();
-			int maintenanceQueue = snapshot.maintenanceQueued();
-			int foregroundActive = snapshot.foregroundActive();
-			int maintenanceActive = snapshot.maintenanceActive();
+			var snapshot = embedded.getScheduler().admissionSnapshot();
+			int foregroundQueue = snapshot.queued().get(WorkloadProfile.INGEST);
+			int maintenanceQueue = snapshot.queued().get(WorkloadProfile.BATCH);
+			int foregroundActive = snapshot.active().get(WorkloadProfile.INGEST);
+			int maintenanceActive = snapshot.active().get(WorkloadProfile.BATCH);
 			maxForegroundQueue.accumulateAndGet(foregroundQueue, Math::max);
 			maxMaintenanceQueue.accumulateAndGet(maintenanceQueue, Math::max);
 			maxForegroundActive.accumulateAndGet(foregroundActive, Math::max);
@@ -1507,12 +1516,12 @@ public final class GrpcOverloadBenchmark {
 
 		private AdmissionResult finish(EmbeddedConnection embedded, PhaseMetrics metrics) {
 			sample(embedded);
-			var snapshot = embedded.getScheduler().writeAdmissionSnapshot();
+			var snapshot = embedded.getScheduler().admissionSnapshot();
 			return new AdmissionResult(
 					maxForegroundQueue.get(),
 					maxMaintenanceQueue.get(),
-					snapshot.foregroundQueued(),
-					snapshot.maintenanceQueued(),
+					snapshot.queued().get(WorkloadProfile.INGEST),
+					snapshot.queued().get(WorkloadProfile.BATCH),
 					maxForegroundActive.get(),
 					maxMaintenanceActive.get(),
 					maxTotalActive.get(),

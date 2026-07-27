@@ -50,7 +50,7 @@ class BatchWriteLifecycleTest {
 					.doOnSubscribe(ignored -> subscribed.countDown())
 					.doOnCancel(cancelled::countDown);
 
-			var future = db.getAsyncApi().putBatchAsync(columnId, source, PutBatchMode.WRITE_BATCH);
+			var future = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putBatchAsync(columnId, source, PutBatchMode.WRITE_BATCH);
 			assertTrue(subscribed.await(2, SECONDS));
 
 			var failure = assertThrows(ExecutionException.class, () -> future.get(2, SECONDS));
@@ -71,7 +71,7 @@ class BatchWriteLifecycleTest {
 					.doOnSubscribe(ignored -> subscribed.countDown())
 					.doOnCancel(cancelled::countDown);
 
-			var future = db.getAsyncApi().mergeBatchAsync(columnId, source, MergeBatchMode.MERGE_WRITE_BATCH);
+			var future = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeBatchAsync(columnId, source, MergeBatchMode.MERGE_WRITE_BATCH);
 			assertTrue(subscribed.await(2, SECONDS));
 
 			var failure = assertThrows(ExecutionException.class, () -> future.get(2, SECONDS));
@@ -92,7 +92,7 @@ class BatchWriteLifecycleTest {
 					.doOnSubscribe(ignored -> subscribed.countDown())
 					.doOnCancel(cancelled::countDown);
 
-			var future = db.getAsyncApi().putBatchAsync(columnId, source, PutBatchMode.WRITE_BATCH);
+			var future = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putBatchAsync(columnId, source, PutBatchMode.WRITE_BATCH);
 			assertTrue(subscribed.await(2, SECONDS));
 			assertTrue(future.cancel(false));
 
@@ -116,7 +116,7 @@ class BatchWriteLifecycleTest {
 					.concatWith(Flux.never())
 					.doOnCancel(sourceCancelled::countDown);
 
-			var future = db.getAsyncApi().putBatchAsync(columnId, source, PutBatchMode.WRITE_BATCH);
+			var future = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putBatchAsync(columnId, source, PutBatchMode.WRITE_BATCH);
 			assertTrue(callbackEntered.await(2, SECONDS), "the write callback did not become active");
 			assertEquals(1, db.getInternalDB().getPendingOpsCount());
 
@@ -156,7 +156,7 @@ class BatchWriteLifecycleTest {
 					.concatWith(Flux.never())
 					.doOnCancel(sourceCancelled::countDown);
 
-			var future = db.getAsyncApi().mergeBatchAsync(
+			var future = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeBatchAsync(
 					columnId, source, MergeBatchMode.MERGE_WRITE_BATCH);
 			assertTrue(callbackEntered.await(2, SECONDS), "the merge callback did not become active");
 			assertEquals(2, db.getInternalDB().getPendingOpsCount(),
@@ -184,7 +184,7 @@ class BatchWriteLifecycleTest {
 	@Test
 	void asynchronousInitializationFailureCompletesTheFutureAndBalancesOperations() throws Exception {
 		try (var db = new EmbeddedConnection(tempDir.resolve("put-init-failure"), "put-init-failure", null)) {
-			var future = db.getAsyncApi().putBatchAsync(Long.MAX_VALUE, Flux.never(), PutBatchMode.WRITE_BATCH);
+			var future = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putBatchAsync(Long.MAX_VALUE, Flux.never(), PutBatchMode.WRITE_BATCH);
 
 			var failure = assertThrows(ExecutionException.class, () -> future.get(2, SECONDS));
 			var rocksError = assertInstanceOf(RocksDBException.class, failure.getCause());

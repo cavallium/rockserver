@@ -48,7 +48,7 @@ database: {
 }
 """);
         db = new EmbeddedConnection(null, "complex-leaks", configFile);
-        colId = db.getSyncApi().createColumn("col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+        colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
     }
 
     @AfterEach
@@ -64,16 +64,16 @@ database: {
         for (int i = 0; i < 200; i++) {
             var key = new Keys(new Buf[]{Buf.wrap(intKey(i))});
             // Start update flow
-            var ctx = db.getSyncApi().get(0, colId, key, RequestType.forUpdate());
+            var ctx = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.forUpdate());
             long updateId = ctx.updateId();
             assertTrue(updateId != 0, "Expected non-zero updateId");
             boolean change = rnd.nextBoolean();
             if (change) {
                 // Perform a real change
-                db.getSyncApi().put(updateId, colId, key, Buf.wrap(new byte[]{(byte) i}), RequestType.none());
+                db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(updateId, colId, key, Buf.wrap(new byte[]{(byte) i}), RequestType.none());
             } else {
                 // No change -> ensure we close the failed update
-                db.getSyncApi().closeFailedUpdate(updateId);
+                db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeFailedUpdate(updateId);
             }
         }
         // Give async bits a moment
@@ -105,10 +105,10 @@ database: {
     void expired_tx_and_iterators_are_cleaned_up_without_waiting_scheduler() {
         var internal = db.getInternalDB();
         // Open a tx with tiny timeout so it expires immediately
-        long txId = db.getSyncApi().openTransaction(1);
+        long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(1);
         // Open an iterator with tiny timeout
         var key = new Keys(new Buf[]{Buf.wrap(intKey(1))});
-        long itId = db.getSyncApi().openIterator(txId, colId, key, null, false, 1);
+        long itId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(txId, colId, key, null, false, 1);
         // Do not close them. Let them expire, then run immediate cleanup.
         sleep(5);
         invokeCleanup(internal);
@@ -132,7 +132,7 @@ database: {
                         .concatWith(Flux.error(new RuntimeException("boom")));
 
         try {
-            db.getSyncApi().putBatch(colId, failing, PutBatchMode.WRITE_BATCH);
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putBatch(colId, failing, PutBatchMode.WRITE_BATCH);
             fail("Expected exception from failing publisher");
         } catch (Exception expected) {
             // ok

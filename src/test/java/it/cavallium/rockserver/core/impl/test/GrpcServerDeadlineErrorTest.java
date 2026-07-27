@@ -45,7 +45,7 @@ class GrpcServerDeadlineErrorTest {
 			try (var client = GrpcConnection.forHostAndPort("grpc-deadline-error",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var error = assertThrows(RocksDBException.class, () -> {
-					try (var range = client.getSyncApi().getRange(0,
+					try (var range = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRange(0,
 							0,
 							null,
 							null,
@@ -76,7 +76,7 @@ class GrpcServerDeadlineErrorTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-cancelled-deadline-error",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var response = client.getAsyncApi().reduceRangeAsync(0,
+				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(0,
 						0,
 						null,
 						null,
@@ -119,7 +119,7 @@ class GrpcServerDeadlineErrorTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-visible-deadline-error",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var error = assertThrows(RocksDBException.class, () -> client.getSyncApi().reduceRange(0,
+				var error = assertThrows(RocksDBException.class, () -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0,
 						0,
 						null,
 						null,
@@ -199,7 +199,7 @@ class GrpcServerDeadlineErrorTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-call-deadline",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var response = client.getAsyncApi().reduceRangeAsync(0,
+				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(0,
 						0,
 						null,
 						null,
@@ -227,7 +227,7 @@ class GrpcServerDeadlineErrorTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-exists-multi-deadline",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var response = client.getAsyncApi().existsMultiAsync(
+				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
 						0, 0, List.of(new it.cavallium.rockserver.core.common.Keys()), 1_000);
 				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 
@@ -264,12 +264,12 @@ class GrpcServerDeadlineErrorTest {
 		}
 
 		@Override
-		public RocksDBSyncAPI getSyncApi() {
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return syncApi;
 		}
 
 		@Override
-		public RocksDBAsyncAPI getAsyncApi() {
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return asyncApi;
 		}
 
@@ -318,12 +318,12 @@ class GrpcServerDeadlineErrorTest {
 		}
 
 		@Override
-		public RocksDBSyncAPI getSyncApi() {
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return syncApi;
 		}
 
 		@Override
-		public RocksDBAsyncAPI getAsyncApi() {
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return asyncApi;
 		}
 
@@ -358,12 +358,12 @@ class GrpcServerDeadlineErrorTest {
 		}
 
 		@Override
-		public RocksDBSyncAPI getSyncApi() {
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return new RocksDBSyncAPI() {};
 		}
 
 		@Override
-		public RocksDBAsyncAPI getAsyncApi() {
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return asyncApi;
 		}
 
@@ -407,12 +407,12 @@ class GrpcServerDeadlineErrorTest {
 		}
 
 		@Override
-		public RocksDBSyncAPI getSyncApi() {
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return new RocksDBSyncAPI() {};
 		}
 
 		@Override
-		public RocksDBAsyncAPI getAsyncApi() {
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return asyncApi;
 		}
 

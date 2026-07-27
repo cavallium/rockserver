@@ -7,13 +7,18 @@
 package it.cavallium.rockserver.core.common.api;
 
 
-public enum WriteClass implements org.apache.thrift.TEnum {
-  FOREGROUND(0),
-  MAINTENANCE(1);
+public enum WorkloadProfile implements org.apache.thrift.TEnum {
+  CONTROL(1),
+  LATENCY(2),
+  ANALYTICAL(3),
+  INGEST(4),
+  CDC(5),
+  BATCH(6),
+  PHYSICAL_MAINTENANCE(7);
 
   private final int value;
 
-  private WriteClass(int value) {
+  private WorkloadProfile(int value) {
     this.value = value;
   }
 
@@ -30,12 +35,22 @@ public enum WriteClass implements org.apache.thrift.TEnum {
    * @return null if the value is not found.
    */
   @org.apache.thrift.annotation.Nullable
-  public static WriteClass findByValue(int value) {
+  public static WorkloadProfile findByValue(int value) {
     switch (value) {
-      case 0:
-        return FOREGROUND;
       case 1:
-        return MAINTENANCE;
+        return CONTROL;
+      case 2:
+        return LATENCY;
+      case 3:
+        return ANALYTICAL;
+      case 4:
+        return INGEST;
+      case 5:
+        return CDC;
+      case 6:
+        return BATCH;
+      case 7:
+        return PHYSICAL_MAINTENANCE;
       default:
         return null;
     }

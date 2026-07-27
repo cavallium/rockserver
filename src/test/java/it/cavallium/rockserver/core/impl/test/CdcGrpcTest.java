@@ -55,7 +55,7 @@ public class CdcGrpcTest {
         dbDir = Files.createTempDirectory("rockserver-cdc-grpc-test");
         configFile = Files.createTempFile("rockserver-config", ".conf");
         Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
-        
+
         startServer();
     }
 
@@ -97,45 +97,45 @@ public class CdcGrpcTest {
 
     @Test
     void testBasicCdcFlowOverGrpc() throws Exception {
-        var colId = client.getSyncApi().createColumn("test-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+        var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 
         // Create CDC subscription
-        var startSeq = client.getSyncApi().cdcCreate("sub1", null, null);
+        var startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null);
         assertTrue(startSeq >= 0);
 
         // Put some data
         var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
-        client.getSyncApi().put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-        
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+
         var key2 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 2})});
-        client.getSyncApi().put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
         // Verify events
-        List<CDCEvent> events = client.getSyncApi().cdcPoll("sub1", null, 100).collect(Collectors.toList());
+        List<CDCEvent> events = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub1", null, 100).collect(Collectors.toList());
         assertEquals(2, events.size());
         assertEquals(CDCEvent.Op.PUT, events.get(0).op());
         assertEquals(CDCEvent.Op.PUT, events.get(1).op());
         assertEquals("val1", new String(events.get(0).value().toByteArray(), StandardCharsets.UTF_8));
         assertEquals("val2", new String(events.get(1).value().toByteArray(), StandardCharsets.UTF_8));
-        
+
         // Commit
-        client.getSyncApi().cdcCommit("sub1", events.get(1).seq());
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("sub1", events.get(1).seq());
     }
 
 	@Test
 	void missingSubscriptionErrorsRemainTypedOverGrpc() {
 		var commitError = assertThrows(RocksDBException.class,
-				() -> client.getSyncApi().cdcCommit("missing", 1L));
+				() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("missing", 1L));
 		assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
 				commitError.getErrorUniqueId());
 
 		var batchError = assertThrows(RocksDBException.class,
-				() -> client.getAsyncApi().cdcPollBatchAsync("missing", null, 10).block());
+				() -> client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("missing", null, 10).block());
 		assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
 				batchError.getErrorUniqueId());
 
 		var streamError = assertThrows(RocksDBException.class,
-				() -> Flux.from(client.getAsyncApi().cdcPollAsync("missing", null, 10))
+				() -> Flux.from(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollAsync("missing", null, 10))
 						.collectList()
 						.block());
 		assertEquals(RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
@@ -143,7 +143,7 @@ public class CdcGrpcTest {
 
 		var highLevelStreamError = assertTimeoutPreemptively(Duration.ofSeconds(2),
 				() -> assertThrows(RocksDBException.class,
-						() -> client.getAsyncApi().cdcStream(
+						() -> client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcStream(
 								"missing",
 								new CdcStreamOptions(null, 10, Duration.ofMillis(10), CdcCommitMode.NONE),
 								null)
@@ -155,17 +155,17 @@ public class CdcGrpcTest {
 
     @Test
     void filteredEmptyBatchCarriesServerNextSequenceOverGrpc() throws Exception {
-        var selectedColumn = client.getSyncApi().createColumn(
+        var selectedColumn = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "selected-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        var ignoredColumn = client.getSyncApi().createColumn(
+        var ignoredColumn = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "ignored-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        long startSeq = client.getSyncApi().cdcCreate("filtered-sub", null, List.of(selectedColumn));
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("filtered-sub", null, List.of(selectedColumn));
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
 
-        client.getSyncApi().put(0, ignoredColumn, key,
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, ignoredColumn, key,
                 Buf.wrap("ignored".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
-        CdcBatch embeddedBatch = embeddedConnection.getAsyncApi()
+        CdcBatch embeddedBatch = embeddedConnection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                 .cdcPollBatchAsync("filtered-sub", startSeq, 100)
                 .block();
         assertNotNull(embeddedBatch);
@@ -174,7 +174,7 @@ public class CdcGrpcTest {
                 "The embedded server cursor must advance first: start=" + startSeq
                         + ", next=" + embeddedBatch.nextSeq());
 
-        CdcBatch emptyBatch = client.getAsyncApi()
+        CdcBatch emptyBatch = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                 .cdcPollBatchAsync("filtered-sub", startSeq, 100)
                 .block();
         assertNotNull(emptyBatch);
@@ -183,9 +183,9 @@ public class CdcGrpcTest {
                 "The server cursor must advance across WAL entries removed by the subscription filter: start="
                         + startSeq + ", next=" + emptyBatch.nextSeq());
 
-        client.getSyncApi().put(0, selectedColumn, key,
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, selectedColumn, key,
                 Buf.wrap("selected".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-        CdcBatch selectedBatch = client.getAsyncApi()
+        CdcBatch selectedBatch = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                 .cdcPollBatchAsync("filtered-sub", emptyBatch.nextSeq(), 100)
                 .block();
         assertNotNull(selectedBatch);
@@ -195,15 +195,15 @@ public class CdcGrpcTest {
 
     @Test
     void cdcUnaryBatchLargerThanFourMiBSucceedsWithExactCursor() throws Exception {
-        long columnId = client.getSyncApi().createColumn(
+        long columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "large-response-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        long startSeq = client.getSyncApi().cdcCreate("large-response-sub", null, List.of(columnId));
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("large-response-sub", null, List.of(columnId));
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 7})});
         byte[] value = new byte[5 * 1024 * 1024];
         Arrays.fill(value, (byte) 0x5a);
-        client.getSyncApi().put(0, columnId, key, Buf.wrap(value), RequestType.none());
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, columnId, key, Buf.wrap(value), RequestType.none());
 
-        CdcBatch embeddedBatch = embeddedConnection.getAsyncApi()
+        CdcBatch embeddedBatch = embeddedConnection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                 .cdcPollBatchAsync("large-response-sub", startSeq, 10)
                 .block();
         assertNotNull(embeddedBatch);
@@ -212,7 +212,7 @@ public class CdcGrpcTest {
         assertTrue(serializedSize > 4 * 1024 * 1024,
                 "Regression fixture must exceed gRPC's legacy 4 MiB default, actual=" + serializedSize);
 
-        CdcBatch grpcBatch = client.getAsyncApi()
+        CdcBatch grpcBatch = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                 .cdcPollBatchAsync("large-response-sub", startSeq, 10)
                 .block();
         assertNotNull(grpcBatch);
@@ -224,7 +224,7 @@ public class CdcGrpcTest {
         assertArrayEquals(new byte[]{0, 0, 0, 7}, event.key().toByteArray());
         assertArrayEquals(value, event.value().toByteArray());
 
-        List<CDCEvent> streamedEvents = Flux.from(client.getAsyncApi()
+        List<CDCEvent> streamedEvents = Flux.from(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                         .cdcPollAsync("large-response-sub", startSeq, 10))
                 .collectList()
                 .block();
@@ -232,7 +232,7 @@ public class CdcGrpcTest {
         assertEquals(1, streamedEvents.size());
         assertArrayEquals(value, streamedEvents.getFirst().value().toByteArray());
 
-        CdcBatch tail = client.getAsyncApi()
+        CdcBatch tail = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                 .cdcPollBatchAsync("large-response-sub", grpcBatch.nextSeq(), 10)
                 .block();
         assertNotNull(tail);
@@ -243,15 +243,15 @@ public class CdcGrpcTest {
     @Test
     @ResourceLock(Resources.SYSTEM_PROPERTIES)
     void negotiatedLimitIsExactAndOversizedGroupFailsWithoutRetryingOrAdvancing() throws Exception {
-        long columnId = client.getSyncApi().createColumn(
+        long columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "limit-boundary-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        long startSeq = client.getSyncApi().cdcCreate("limit-boundary-sub", null, List.of(columnId));
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("limit-boundary-sub", null, List.of(columnId));
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 8})});
         byte[] value = new byte[5 * 1024 * 1024];
         Arrays.fill(value, (byte) 0x33);
-        client.getSyncApi().put(0, columnId, key, Buf.wrap(value), RequestType.none());
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, columnId, key, Buf.wrap(value), RequestType.none());
 
-        CdcBatch expected = embeddedConnection.getAsyncApi()
+        CdcBatch expected = embeddedConnection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                 .cdcPollBatchAsync("limit-boundary-sub", startSeq, 10)
                 .block();
         assertNotNull(expected);
@@ -271,7 +271,7 @@ public class CdcGrpcTest {
 
             GrpcConnection directClient = undersizedClient;
             StatusRuntimeException directFailure = assertThrows(StatusRuntimeException.class,
-                    () -> directClient.getAsyncApi()
+                    () -> directClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                             .cdcPollBatchAsync("limit-boundary-sub", startSeq, 10)
                             .block());
             assertEquals(Status.Code.FAILED_PRECONDITION, directFailure.getStatus().getCode());
@@ -283,7 +283,7 @@ public class CdcGrpcTest {
             assertTrue(description.contains(GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY));
 
             StatusRuntimeException legacyStreamFailure = assertThrows(StatusRuntimeException.class,
-                    () -> Flux.from(directClient.getAsyncApi()
+                    () -> Flux.from(directClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                                     .cdcPollAsync("limit-boundary-sub", startSeq, 10))
                             .collectList()
                             .block());
@@ -294,7 +294,7 @@ public class CdcGrpcTest {
 
             GrpcConnection streamClient = undersizedClient;
             StatusRuntimeException streamFailure = assertThrows(StatusRuntimeException.class,
-                    () -> streamClient.getAsyncApi().cdcStream(
+                    () -> streamClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcStream(
                                     "limit-boundary-sub",
                                     new CdcStreamOptions(startSeq, 10, Duration.ofMillis(10), CdcCommitMode.NONE),
                                     null)
@@ -306,7 +306,7 @@ public class CdcGrpcTest {
                     Integer.toString(exactResponseSize));
             exactClient = GrpcConnection.forHostAndPort(
                     "exact-limit-grpc-client", new Utils.HostAndPort("127.0.0.1", grpcServer.getPort()));
-            CdcBatch recovered = exactClient.getAsyncApi()
+            CdcBatch recovered = exactClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                     .cdcPollBatchAsync("limit-boundary-sub", startSeq, 10)
                     .block();
             assertNotNull(recovered);
@@ -327,18 +327,18 @@ public class CdcGrpcTest {
     @Test
     @ResourceLock(Resources.SYSTEM_PROPERTIES)
     void negotiatedResponseBudgetPaginatesWithoutSkippingEvents() throws Exception {
-        long columnId = client.getSyncApi().createColumn(
+        long columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "response-pages-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        long startSeq = client.getSyncApi().cdcCreate("response-pages-sub", null, List.of(columnId));
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("response-pages-sub", null, List.of(columnId));
         int valueSize = 2 * 1024 * 1024;
         for (int i = 0; i < 3; i++) {
             byte[] value = new byte[valueSize];
             Arrays.fill(value, (byte) (i + 1));
             var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, (byte) (i + 1)})});
-            client.getSyncApi().put(0, columnId, key, Buf.wrap(value), RequestType.none());
+            client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, columnId, key, Buf.wrap(value), RequestType.none());
         }
 
-        CdcBatch expected = embeddedConnection.getAsyncApi()
+        CdcBatch expected = embeddedConnection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                 .cdcPollBatchAsync("response-pages-sub", startSeq, 10)
                 .block();
         assertNotNull(expected);
@@ -354,7 +354,7 @@ public class CdcGrpcTest {
 
             long cursor = startSeq;
             for (int i = 0; i < expected.events().size(); i++) {
-                CdcBatch page = pagedClient.getAsyncApi()
+                CdcBatch page = pagedClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                         .cdcPollBatchAsync("response-pages-sub", cursor, 10)
                         .block();
                 assertNotNull(page);
@@ -371,7 +371,7 @@ public class CdcGrpcTest {
                 cursor = page.nextSeq();
             }
 
-            CdcBatch tail = pagedClient.getAsyncApi()
+            CdcBatch tail = pagedClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
                     .cdcPollBatchAsync("response-pages-sub", cursor, 10)
                     .block();
             assertNotNull(tail);
@@ -389,9 +389,9 @@ public class CdcGrpcTest {
 
 	@Test
 	void cdcGapIsPropagatedOverGrpcInsteadOfReturningAnEmptyBatch() throws Exception {
-		var columnId = client.getSyncApi().createColumn(
+		var columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
 				"gap-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-		client.getSyncApi().cdcCreate("gap-sub", null, List.of(columnId));
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("gap-sub", null, List.of(columnId));
 
 		long missingWalSeq = embeddedConnection.getInternalDB()
 				.getDb()
@@ -400,7 +400,7 @@ public class CdcGrpcTest {
 		long pollFromMissingWalSeq = missingWalSeq << 20;
 
 		var missingKey = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
-		embeddedConnection.getSyncApi().putBatch(
+		embeddedConnection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putBatch(
 				columnId,
 				Flux.just(new KVBatch.KVBatchRef(
 						List.of(missingKey),
@@ -408,11 +408,11 @@ public class CdcGrpcTest {
 				PutBatchMode.WRITE_BATCH_NO_WAL);
 
 		var presentKey = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 2})});
-		client.getSyncApi().put(0, columnId, presentKey,
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, columnId, presentKey,
 				Buf.wrap("in-wal".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
 		RocksDBException error = assertThrows(RocksDBException.class,
-				() -> client.getAsyncApi()
+				() -> client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 						.cdcPollBatchAsync("gap-sub", pollFromMissingWalSeq, 100)
 						.block());
 		assertEquals(RocksDBErrorType.CDC_GAP_DETECTED, error.getErrorUniqueId());
@@ -424,54 +424,54 @@ public class CdcGrpcTest {
         var colName = "test-col-resume";
         long lastSeq;
         long colId;
-        
-        colId = client.getSyncApi().createColumn(colName, ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        client.getSyncApi().cdcCreate("sub1", null, null);
-        
+
+        colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null);
+
         var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
-        client.getSyncApi().put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-        
-        List<CDCEvent> events = client.getSyncApi().cdcPoll("sub1", null, 100).collect(Collectors.toList());
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+
+        List<CDCEvent> events = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub1", null, 100).collect(Collectors.toList());
         assertEquals(1, events.size());
         lastSeq = events.get(0).seq();
-        client.getSyncApi().cdcCommit("sub1", lastSeq);
-        
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("sub1", lastSeq);
+
         // Restart
         stopServer();
         startServer();
-        
+
         // Re-acquire column ID
-        colId = client.getSyncApi().getColumnId(colName);
-        
+        colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId(colName);
+
         // New event
         var key2 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 2})});
-        client.getSyncApi().put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-        
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+
         // Poll - should get only the new event
-        events = client.getSyncApi().cdcPoll("sub1", null, 100).collect(Collectors.toList());
+        events = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub1", null, 100).collect(Collectors.toList());
         assertEquals(1, events.size());
         assertTrue(events.get(0).seq() > lastSeq);
         assertEquals("val2", new String(events.get(0).value().toByteArray(), StandardCharsets.UTF_8));
     }
-    
+
     @Test
     void testBucketedColumn() throws Exception {
         // Bucketed column: 1 fixed key (int), 1 variable key (int)
-        var colId = client.getSyncApi().createColumn("bucket-col", ColumnSchema.of(
-                IntList.of(Integer.BYTES), 
+        var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("bucket-col", ColumnSchema.of(
+                IntList.of(Integer.BYTES),
                 ObjectList.of(ColumnHashType.XXHASH32),
                 true
         ));
-        
-        client.getSyncApi().cdcCreate("sub-bucket", null, null);
-        
+
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub-bucket", null, null);
+
         var key = new Keys(new Buf[]{
             Buf.wrap(new byte[]{0, 0, 0, 1}), // fixed
             Buf.wrap(new byte[]{0, 0, 0, 2})  // variable
         });
-        client.getSyncApi().put(0, colId, key, Buf.wrap("bucket-val".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-        
-        List<CDCEvent> events = client.getSyncApi().cdcPoll("sub-bucket", null, 100).collect(Collectors.toList());
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, Buf.wrap("bucket-val".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+
+        List<CDCEvent> events = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub-bucket", null, 100).collect(Collectors.toList());
         assertEquals(1, events.size());
         // The key in CDC event should be the fixed key (4 bytes)
         assertEquals(4, events.get(0).key().size());
@@ -483,42 +483,42 @@ public class CdcGrpcTest {
     void testStressAndBackpressure() throws Exception {
         int totalEvents = 10_000; // Reduce from 50k for speed in integration test, but enough to trigger chunks
         int batchSize = 1000;
-        
-        var colId = client.getSyncApi().createColumn("stress-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        var startSeq = client.getSyncApi().cdcCreate("stress-sub", null, null);
-        
+
+        var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("stress-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+        var startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("stress-sub", null, null);
+
         // 1. Generate load
         for (int i = 0; i < totalEvents; i++) {
             var key = new Keys(new Buf[]{Buf.wrap(new byte[]{
                     (byte) (i >> 24), (byte) (i >> 16), (byte) (i >> 8), (byte) i
             })});
-            client.getSyncApi().put(0, colId, key, Buf.wrap(("val-" + i).getBytes(StandardCharsets.UTF_8)), RequestType.none());
-            if (i % 2000 == 0) client.getSyncApi().flush(); 
+            client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, Buf.wrap(("val-" + i).getBytes(StandardCharsets.UTF_8)), RequestType.none());
+            if (i % 2000 == 0) client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).flush();
         }
-        
+
         // 2. Poll with backpressure
         long consumed = 0;
         long lastSeq = startSeq - 1;
-        
+
         while (consumed < totalEvents) {
             // Poll small batch
-            List<CDCEvent> events = client.getSyncApi().cdcPoll("stress-sub", null, batchSize).collect(Collectors.toList());
-            
+            List<CDCEvent> events = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("stress-sub", null, batchSize).collect(Collectors.toList());
+
             if (events.isEmpty()) {
                 break;
             }
-            
+
             // Verify order and sequence
             for (CDCEvent ev : events) {
                 assertTrue(ev.seq() > lastSeq, "Sequence must be strictly increasing");
                 lastSeq = ev.seq();
                 consumed++;
             }
-            
+
             // Commit periodically
-            client.getSyncApi().cdcCommit("stress-sub", lastSeq);
+            client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("stress-sub", lastSeq);
         }
-        
+
         assertEquals(totalEvents, consumed);
     }
 
@@ -531,29 +531,29 @@ public class CdcGrpcTest {
             try (java.util.jar.JarOutputStream jos = new java.util.jar.JarOutputStream(baos, new java.util.jar.Manifest())) {
                 // Create valid empty JAR
             }
-            opVersion = client.getSyncApi().uploadMergeOperator("append-op", "it.cavallium.rockserver.core.impl.MyStringAppendOperator", baos.toByteArray());
+            opVersion = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).uploadMergeOperator("append-op", "it.cavallium.rockserver.core.impl.MyStringAppendOperator", baos.toByteArray());
         } catch (Throwable t) {
             Assumptions.assumeTrue(false, "Merge operator upload not available on this transport/env; skipping resolved-values over gRPC test");
             return;
         }
-        var colId = client.getSyncApi().createColumn(
+        var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "resolved-col-grpc",
                 ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true, "append-op", opVersion)
         );
 
         // Create CDC subscription with resolved values enabled
         String subId = "resolved-sub-grpc";
-        long startSeq = client.getSyncApi().cdcCreate(subId, null, List.of(colId), true);
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), true);
 
         // Put initial value, then merge a delta (using sample String append operator semantics)
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0,0,0,1})});
         Buf initial = Buf.wrap("Initial".getBytes(StandardCharsets.UTF_8));
         Buf delta = Buf.wrap("-Patched".getBytes(StandardCharsets.UTF_8));
-        client.getSyncApi().put(0, colId, key, initial, RequestType.none());
-        client.getSyncApi().merge(0, colId, key, delta, RequestType.none());
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, initial, RequestType.none());
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, key, delta, RequestType.none());
 
         // Poll two events starting from startSeq
-        var events = client.getSyncApi().cdcPoll(subId, startSeq, 10).collect(Collectors.toList());
+        var events = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll(subId, startSeq, 10).collect(Collectors.toList());
         assertEquals(2, events.size());
         CDCEvent ev1 = events.get(0);
         CDCEvent ev2 = events.get(1);

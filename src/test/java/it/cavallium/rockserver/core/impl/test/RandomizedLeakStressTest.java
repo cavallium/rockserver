@@ -55,7 +55,7 @@ database: {
 }
 """);
         db = new EmbeddedConnection(null, "rnd-leaks", configFile);
-        colId = db.getSyncApi().createColumn("rnd-col", ColumnSchema.of(
+        colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("rnd-col", ColumnSchema.of(
                 IntList.of(Integer.BYTES), ObjectList.of(), true));
     }
 
@@ -111,7 +111,7 @@ database: {
             try { d.dispose(); } catch (Throwable ignored) {}
         }
         for (Long itId : openIterators) {
-            try { db.getSyncApi().closeIterator(itId); } catch (Throwable ignored) {}
+            try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(itId); } catch (Throwable ignored) {}
         }
         // Deterministic cleanup of any expiring items
         invokeCleanup(getInternal(db));
@@ -159,32 +159,32 @@ database: {
     private void doPut(Random rnd, int keySpace) {
         var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
         var val = Buf.wrap(new byte[]{(byte) rnd.nextInt(256)});
-        db.getSyncApi().put(0, colId, key, val, RequestType.none());
+        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, val, RequestType.none());
     }
 
     private void doMerge(Random rnd, int keySpace) {
         var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
         var val = Buf.wrap(("+" + (char) ('a' + rnd.nextInt(26))).getBytes());
-        db.getSyncApi().merge(0, colId, key, val, RequestType.none());
+        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, key, val, RequestType.none());
     }
 
     private void doGet(Random rnd, int keySpace) {
         var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        db.getSyncApi().get(0, colId, key, RequestType.current());
+        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.current());
     }
 
     private void doTxCommit(Random rnd, int keySpace) {
         var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        long tx = db.getSyncApi().openTransaction(5_000);
-        db.getSyncApi().put(tx, colId, key, Buf.wrap(new byte[]{(byte) rnd.nextInt(256)}), RequestType.none());
-        assertTrue(db.getSyncApi().closeTransaction(tx, true));
+        long tx = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(5_000);
+        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(tx, colId, key, Buf.wrap(new byte[]{(byte) rnd.nextInt(256)}), RequestType.none());
+        assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(tx, true));
     }
 
     private void doTxRollback(Random rnd, int keySpace) {
         var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        long tx = db.getSyncApi().openTransaction(5_000);
-        db.getSyncApi().put(tx, colId, key, Buf.wrap(new byte[]{(byte) rnd.nextInt(256)}), RequestType.none());
-        assertTrue(db.getSyncApi().closeTransaction(tx, false));
+        long tx = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(5_000);
+        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(tx, colId, key, Buf.wrap(new byte[]{(byte) rnd.nextInt(256)}), RequestType.none());
+        assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(tx, false));
     }
 
     private void doRangeCancel(Random rnd) {
@@ -195,14 +195,14 @@ database: {
 
     private void doForUpdateFlow(Random rnd, int keySpace) {
         var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        var ctx = db.getSyncApi().get(0, colId, key, RequestType.forUpdate());
+        var ctx = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.forUpdate());
         long updateId = ctx.updateId();
         if (rnd.nextBoolean()) {
             // change path
-            db.getSyncApi().put(updateId, colId, key, Buf.wrap(new byte[]{(byte) rnd.nextInt(256)}), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(updateId, colId, key, Buf.wrap(new byte[]{(byte) rnd.nextInt(256)}), RequestType.none());
         } else {
             // unchanged path
-            db.getSyncApi().closeFailedUpdate(updateId);
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeFailedUpdate(updateId);
         }
     }
 
@@ -229,12 +229,12 @@ database: {
     private void openIteratorShortLived(Random rnd, java.util.List<Long> openIterators) {
         try {
             var start = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(256))) });
-            long it = db.getSyncApi().openIterator(0, colId, start, null, rnd.nextBoolean(), 5); // 5ms timeout
+			long iteratorId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(0, colId, start, null, rnd.nextBoolean(), 5); // 5ms timeout
             // sometimes keep it open to expire
             if (rnd.nextBoolean()) {
-                openIterators.add(it);
-            } else {
-                db.getSyncApi().closeIterator(it);
+				openIterators.add(iteratorId);
+			} else {
+				db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(iteratorId);
             }
         } catch (Exception ignored) {
             // ignore expected errors if iterator expired immediately
@@ -245,34 +245,34 @@ database: {
         if (openIterators.isEmpty()) return;
         int idx = rnd.nextInt(openIterators.size());
         Long id = openIterators.remove(idx);
-        try { db.getSyncApi().closeIterator(id); } catch (Throwable ignored) {}
+        try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(id); } catch (Throwable ignored) {}
     }
 
     private void doReduceRange(Random rnd) {
         boolean reverse = rnd.nextBoolean();
         long timeout = Duration.ofSeconds(5).toMillis();
         if (rnd.nextBoolean()) {
-            db.getSyncApi().reduceRange(0, colId, null, null, reverse, RequestType.entriesCount(), timeout);
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0, colId, null, null, reverse, RequestType.entriesCount(), timeout);
         } else {
-            db.getSyncApi().reduceRange(0, colId, null, null, reverse, RequestType.firstAndLast(), timeout);
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0, colId, null, null, reverse, RequestType.firstAndLast(), timeout);
         }
     }
 
     private void maybeFlush() {
         // Best-effort flush; should not leak resources
-        try { db.getSyncApi().flush(); } catch (Throwable ignored) {}
+        try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).flush(); } catch (Throwable ignored) {}
     }
 
     private void maybeCompact() {
         // Best-effort compact; should not leak resources
-        try { db.getSyncApi().compact(); } catch (Throwable ignored) {}
+        try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).compact(); } catch (Throwable ignored) {}
     }
 
     private void openExpiringTxAndIteratorThenCleanup() {
         try {
-            long tx = db.getSyncApi().openTransaction(1);
+            long tx = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(1);
             var key = new Keys(new Buf[]{Buf.wrap(intKey(1))});
-            try { db.getSyncApi().openIterator(tx, colId, key, null, false, 1); } catch (Throwable ignored) {}
+            try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(tx, colId, key, null, false, 1); } catch (Throwable ignored) {}
         } catch (Throwable ignored) {}
         // Sleep a moment, then run deterministic cleanup
         sleep(5);

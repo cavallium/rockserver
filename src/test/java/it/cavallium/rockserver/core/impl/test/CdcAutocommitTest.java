@@ -31,15 +31,15 @@ public class CdcAutocommitTest {
         Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
 
         try (var db = new EmbeddedConnection(dbDir, "cdc-autocommit", configFile)) {
-            var colId = db.getSyncApi().createColumn("test", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+            var colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
             var subId = "sub1";
-            long startSeq = db.getSyncApi().cdcCreate(subId, null, null);
+            long startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, null);
 
             // Put 10 items
             for (int i = 0; i < 10; i++) {
-                db.getSyncApi().put(0, colId, 
-                    new Keys(new Buf[]{Buf.wrap(new byte[]{0,0,0,(byte)i})}), 
-                    Buf.wrap("val".getBytes()), 
+                db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId,
+                    new Keys(new Buf[]{Buf.wrap(new byte[]{0,0,0,(byte)i})}),
+                    Buf.wrap("val".getBytes()),
                     RequestType.none());
             }
 
@@ -49,7 +49,7 @@ public class CdcAutocommitTest {
             java.util.concurrent.atomic.AtomicReference<Long> firstEventSeq = new java.util.concurrent.atomic.AtomicReference<>();
             java.util.concurrent.atomic.AtomicReference<Long> lastProcessedSeq = new java.util.concurrent.atomic.AtomicReference<>();
 
-            db.getAsyncApi().cdcStream(subId,
+            db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcStream(subId,
                     new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
                             startSeq,
                             10,
@@ -74,7 +74,7 @@ public class CdcAutocommitTest {
             Thread.sleep(100); // Wait for potential async commits
 
             // Resume
-            List<CDCEvent> resumed = db.getAsyncApi().cdcStream(subId,
+            List<CDCEvent> resumed = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcStream(subId,
                             new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
                                     null,
                                     10,
@@ -89,9 +89,9 @@ public class CdcAutocommitTest {
             Assertions.assertNotNull(resumed);
             Assertions.assertFalse(resumed.isEmpty());
             long resumedSeq = resumed.get(0).seq();
-            
+
             System.out.println("[DEBUG_LOG] StartSeq: " + startSeq + " FirstEvent: " + firstEventSeq.get() + " LastProcessed: " + lastProcessedSeq.get() + " ResumedSeq: " + resumedSeq);
-            
+
             // To ensure "perfect" autocommit with no duplicates after crash,
             // we should have committed at least the ones we processed successfully?
             // If we processed 1..4 successfully, and 5 crashed.
@@ -100,10 +100,10 @@ public class CdcAutocommitTest {
             // But we DEFINITELY don't want to retry 1..4.
             // So resumedSeq should be > firstEventSeq.get().
             // Ideally resumedSeq should be close to lastProcessedSeq.
-            
+
             // With current batch implementation, resumedSeq == firstEventSeq.get().
             // This test asserts the DESIRED behavior (No Duplicates).
-            Assertions.assertTrue(resumedSeq > firstEventSeq.get(), 
+            Assertions.assertTrue(resumedSeq > firstEventSeq.get(),
                 "Received duplicate events! Resumed at " + resumedSeq + " but already processed starting from " + firstEventSeq.get());
         } finally {
             // cleanup
@@ -117,17 +117,17 @@ public class CdcAutocommitTest {
 		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
 
 		try (var db = new EmbeddedConnection(dbDir, "cdc-group-autocommit", configFile)) {
-			long columnId = db.getSyncApi().createColumn("bucket", ColumnSchema.of(
+			long columnId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("bucket", ColumnSchema.of(
 					IntList.of(Integer.BYTES),
 					ObjectList.of(ColumnHashType.ALLSAME8),
 					true));
 			String subscriptionId = "resolved-group";
-			long startSeq = db.getSyncApi().cdcCreate(subscriptionId, null, List.of(columnId), true);
+			long startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subscriptionId, null, List.of(columnId), true);
 			putBucketSiblings(db, columnId);
 
 			var firstSequence = new java.util.concurrent.atomic.AtomicReference<Long>();
 			var processed = new AtomicInteger();
-			Assertions.assertThrows(RuntimeException.class, () -> db.getAsyncApi().cdcStream(
+			Assertions.assertThrows(RuntimeException.class, () -> db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcStream(
 						subscriptionId,
 						new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
 								startSeq, 1, Duration.ofMillis(10), CdcCommitMode.PER_EVENT),
@@ -140,7 +140,7 @@ public class CdcAutocommitTest {
 						.collectList()
 						.block(Duration.ofSeconds(5)));
 
-			var replay = db.getAsyncApi().cdcPollBatchAsync(subscriptionId, null, 1)
+			var replay = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync(subscriptionId, null, 1)
 					.block(Duration.ofSeconds(5));
 			Assertions.assertNotNull(replay);
 			Assertions.assertFalse(replay.events().isEmpty());
@@ -156,15 +156,15 @@ public class CdcAutocommitTest {
 		Files.writeString(configFile, "database: { global: { ingest-behind: false, optimistic: false } }");
 
 		try (var db = new EmbeddedConnection(dbDir, "cdc-group-ack", configFile)) {
-			long columnId = db.getSyncApi().createColumn("bucket", ColumnSchema.of(
+			long columnId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("bucket", ColumnSchema.of(
 					IntList.of(Integer.BYTES),
 					ObjectList.of(ColumnHashType.ALLSAME8),
 					true));
 			String subscriptionId = "resolved-group-ack";
-			long startSeq = db.getSyncApi().cdcCreate(subscriptionId, null, List.of(columnId), true);
+			long startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subscriptionId, null, List.of(columnId), true);
 			putBucketSiblings(db, columnId);
 
-			var acknowledgments = db.getAsyncApi().cdcStreamAck(
+			var acknowledgments = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcStreamAck(
 						subscriptionId,
 						new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
 								startSeq, 1, Duration.ofMillis(10), CdcCommitMode.NONE))
@@ -177,13 +177,13 @@ public class CdcAutocommitTest {
 			Assertions.assertEquals(groupSequence, acknowledgments.getLast().event().seq());
 
 			acknowledgments.getFirst().ack().block(Duration.ofSeconds(5));
-			var replay = db.getAsyncApi().cdcPollBatchAsync(subscriptionId, null, 1)
+			var replay = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync(subscriptionId, null, 1)
 					.block(Duration.ofSeconds(5));
 			Assertions.assertNotNull(replay);
 			Assertions.assertEquals(groupSequence, replay.events().getFirst().seq());
 
 			acknowledgments.getLast().ack().block(Duration.ofSeconds(5));
-			var afterGroup = db.getAsyncApi().cdcPollBatchAsync(subscriptionId, null, 1)
+			var afterGroup = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync(subscriptionId, null, 1)
 					.block(Duration.ofSeconds(5));
 			Assertions.assertNotNull(afterGroup);
 			Assertions.assertFalse(afterGroup.events().isEmpty());
@@ -193,7 +193,7 @@ public class CdcAutocommitTest {
 
 	private static void putBucketSiblings(EmbeddedConnection db, long columnId) {
 		for (String suffix : List.of("A", "B")) {
-			db.getSyncApi().put(0,
+			db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0,
 					columnId,
 					new Keys(new Buf[]{
 							Buf.wrap(new byte[]{0, 0, 0, 1}),

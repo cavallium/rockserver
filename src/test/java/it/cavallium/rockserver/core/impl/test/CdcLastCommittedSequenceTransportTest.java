@@ -140,7 +140,7 @@ class CdcLastCommittedSequenceTransportTest {
 				var server = new ThriftServer(embedded, "127.0.0.1", port)) {
 			server.start();
 			try (var client = new ThriftConnection("cdc-thrift-poll-client", "127.0.0.1", port)) {
-				var api = client.getSyncApi();
+				var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				var schema = ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true);
 				long selectedColumn = api.createColumn("selected", schema);
 				long ignoredColumn = api.createColumn("ignored", schema);
@@ -186,17 +186,17 @@ class CdcLastCommittedSequenceTransportTest {
 			server.start();
 			try (var client = new ThriftConnection("cdc-thrift-missing-client", "127.0.0.1", port)) {
 				var commitError = assertThrows(RocksDBException.class,
-						() -> client.getSyncApi().cdcCommit("missing", 1L));
+						() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("missing", 1L));
 				assertEquals(RocksDBException.RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
 						commitError.getErrorUniqueId());
 
 				var batchError = assertThrows(RocksDBException.class,
-						() -> client.getAsyncApi().cdcPollBatchAsync("missing", null, 10).block());
+						() -> client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("missing", null, 10).block());
 				assertEquals(RocksDBException.RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,
 						batchError.getErrorUniqueId());
 
 				var streamError = assertThrows(RocksDBException.class,
-						() -> Flux.from(client.getAsyncApi().cdcPollAsync("missing", null, 10))
+						() -> Flux.from(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollAsync("missing", null, 10))
 								.collectList()
 								.block());
 				assertEquals(RocksDBException.RocksDBErrorType.CDC_SUBSCRIPTION_NOT_FOUND,

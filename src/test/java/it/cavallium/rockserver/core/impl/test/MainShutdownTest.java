@@ -90,7 +90,7 @@ public class MainShutdownTest {
 
 			try (var client = GrpcConnection.forHostAndPort("main-shutdown-client",
 					new Utils.HostAndPort("127.0.0.1", grpcPort))) {
-				var api = client.getSyncApi();
+				var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				long columnId = api.createColumn("shutdown-column",
 						ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 				api.put(0, columnId, key(1), value(1), RequestType.none());
@@ -116,7 +116,7 @@ public class MainShutdownTest {
 		}
 
 		try (var reopened = new EmbeddedConnection(databasePath, "main-shutdown-reopen", configPath)) {
-			var api = reopened.getSyncApi();
+			var api = reopened.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.getColumnId("shutdown-column");
 			assertEquals(value(1), api.get(0, columnId, key(1), RequestType.current()));
 			api.put(0, columnId, key(2), value(2), RequestType.none());

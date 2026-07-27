@@ -39,7 +39,7 @@ class GrpcExactRangeCountTest {
 	@Test
 	void remoteRangesReuseOneNativeIteratorWithoutOpeningProtocolIterators() throws Exception {
 		try (var embedded = new EmbeddedConnection(tempDir.resolve("db"), "grpc-exact-range-count", null)) {
-			var backend = embedded.getSyncApi();
+			var backend = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long valueColumn = backend.createColumn("values",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			long bucketedColumn = backend.createColumn("bucketed-values",
@@ -68,7 +68,7 @@ class GrpcExactRangeCountTest {
 							"exact value count must not create a protocol iterator registration");
 
 					iteratorOpens.set(0);
-					long bucketedCount = client.getAsyncApi().reduceRangeAsync(0,
+					long bucketedCount = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(0,
 							bucketedColumn,
 							null,
 							null,
@@ -82,7 +82,7 @@ class GrpcExactRangeCountTest {
 							"exact bucketed count must not create a protocol iterator registration");
 
 					iteratorOpens.set(0);
-					var endpoints = client.getAsyncApi().reduceRangeAsync(0,
+					var endpoints = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(0,
 							valueColumn,
 							null,
 							null,
@@ -98,7 +98,7 @@ class GrpcExactRangeCountTest {
 							.mapToObj(GrpcExactRangeCountTest::intValue)
 							.toList();
 					iteratorOpens.set(0);
-					var valueColumnValues = Flux.from(client.getAsyncApi().getRangeAsync(0,
+					var valueColumnValues = Flux.from(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
 							valueColumn,
 							null,
 							null,
@@ -116,7 +116,7 @@ class GrpcExactRangeCountTest {
 							.mapToObj(GrpcExactRangeCountTest::intValue)
 							.toList();
 					iteratorOpens.set(0);
-					var forwardValues = Flux.from(client.getAsyncApi().getRangeAsync(0,
+					var forwardValues = Flux.from(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
 							bucketedColumn,
 							null,
 							null,
@@ -132,7 +132,7 @@ class GrpcExactRangeCountTest {
 					var expectedReverse = new ArrayList<>(expectedValues);
 					java.util.Collections.reverse(expectedReverse);
 					iteratorOpens.set(0);
-					var reverseValues = Flux.from(client.getAsyncApi().getRangeAsync(0,
+					var reverseValues = Flux.from(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
 							bucketedColumn,
 							null,
 							null,
@@ -151,7 +151,7 @@ class GrpcExactRangeCountTest {
 	}
 
 	private static long exactCount(GrpcConnection connection, long columnId, boolean reverse) {
-		return connection.getSyncApi().reduceRange(0,
+		return connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0,
 				columnId,
 				null,
 				null,

@@ -30,7 +30,7 @@ class GrpcIteratorSchedulingTest {
 	void nonMaterializingRemoteAdvanceUsesLargeBoundedSteps() throws Exception {
 		final int entries = 4_200;
 		try (var embedded = new EmbeddedConnection(tempDir.resolve("db"), "grpc-iterator-scheduling", null)) {
-			var backend = embedded.getSyncApi();
+			var backend = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = backend.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			for (int i = 0; i < entries; i++) {
@@ -41,7 +41,7 @@ class GrpcIteratorSchedulingTest {
 				server.start();
 				try (var client = GrpcConnection.forHostAndPort("grpc-iterator-scheduling",
 						new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-					var api = client.getSyncApi();
+					var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 					long iteratorId = api.openIterator(0, columnId, null, null, false, 10_000);
 					try {
 						var readExecutor = (ThreadPoolExecutor) embedded.getInternalDB()

@@ -76,6 +76,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
@@ -121,6 +122,7 @@ import org.slf4j.MarkerFactory;
 import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import org.rocksdb.TransactionLogIterator;
@@ -187,6 +189,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final int RANGE_READ_CHUNK_SIZE = 1_024;
 	private static final int RANGE_READ_MAX_PHYSICAL_KEYS_PER_CHUNK = 4_096;
 	private static final long RANGE_READ_MAX_DECODED_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
+	private static final String MAX_RETAINED_SNAPSHOT_AGE_PROPERTY =
+			"it.cavallium.rockserver.workload.max-retained-snapshot-age-ms";
+	private static final long STORAGE_PRESSURE_PENDING_COMPACTION_BYTES = Math.max(1L, Long.getLong(
+			"it.cavallium.rockserver.workload.storage-pressure-pending-compaction-bytes",
+			64L * SizeUnit.GB));
 	private static final int EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL = 4_096;
 	private static final long EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
 	private static final int RAW_SCAN_MAX_ENTRIES_PER_CHUNK = 65_536;
@@ -222,6 +229,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final NonBlockingHashMapLong<Tx> txs;
 	private final NonBlockingHashMapLong<REntry<RocksIterator>> its;
 	private final Set<ActiveRangeResource> activeRangeResources = ConcurrentHashMap.newKeySet();
+	private final AtomicInteger retainedRangeSnapshots = new AtomicInteger();
+	private final AtomicLong cdcLagSequences = new AtomicLong();
+	private final long maxRetainedSnapshotAgeMs = Math.max(1L,
+			Long.getLong(MAX_RETAINED_SNAPSHOT_AGE_PROPERTY, 60_000L));
 	private final Set<CdcPollCursor> activeCdcPollCursors = ConcurrentHashMap.newKeySet();
 	private final Set<AsyncExistsMultiRequest> activeExistsMultiRequests = ConcurrentHashMap.newKeySet();
 	private final ConcurrentMap<String, CdcMetadataLock> cdcMetadataLocks = new ConcurrentHashMap<>();
@@ -481,14 +492,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				"db[" + name + "]",
 				metrics.getRegistry(),
 				name);
+		Gauge.builder("rockserver.workload.retained.snapshots", retainedRangeSnapshots, AtomicInteger::get)
+				.tag("database", name)
+				.register(metrics.getRegistry());
+		Gauge.builder("rockserver.workload.cdc.lag", cdcLagSequences, AtomicLong::get)
+				.tag("database", name)
+				.register(metrics.getRegistry());
 		this.fastGetReader = fastGet ? new NativeRocksDBGet(db.get(), (long) readCap + writeCap) : null;
 		this.leakScheduler = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("db-leak-scheduler"));
 
 		leakScheduler.scheduleWithFixedDelay(this::cleanupExpiredTransactionsNow, 1, 1, TimeUnit.MINUTES);
 
 		leakScheduler.scheduleWithFixedDelay(this::cleanupExpiredIteratorsNow, 1, 1, TimeUnit.MINUTES);
+		leakScheduler.scheduleWithFixedDelay(this::refreshStoragePressure, 1, 1, TimeUnit.SECONDS);
+		long retainedSnapshotSweepMillis = Math.max(1L,
+				Math.min(100L, maxRetainedSnapshotAgeMs / 4L));
 		this.expiredRangeCleanupTask = leakScheduler.scheduleWithFixedDelay(
-				this::cleanupExpiredRangesNow, 1, 1, TimeUnit.MINUTES);
+				this::cleanupExpiredRangesNow,
+				retainedSnapshotSweepMillis,
+				retainedSnapshotSweepMillis,
+				TimeUnit.MILLISECONDS);
 
 		this.columnsConifg = loadedDb.definitiveColumnFamilyOptionsMap();
 		try {
@@ -1971,6 +1994,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private void refreshStoragePressure() {
+		try {
+			boolean writeStopped = getLongProperty(
+					RocksDBLongProperty.IS_WRITE_STOPPED.getName(),
+					RocksDBLongProperty.IS_WRITE_STOPPED.getAggregationMode()).signum() > 0;
+			var pendingCompactionBytes = getLongProperty(
+					RocksDBLongProperty.ESTIMATE_PENDING_COMPACTION_BYTES.getName(),
+					RocksDBLongProperty.ESTIMATE_PENDING_COMPACTION_BYTES.getAggregationMode());
+			scheduler.setStoragePressure(writeStopped || pendingCompactionBytes.compareTo(
+					BigInteger.valueOf(STORAGE_PRESSURE_PENDING_COMPACTION_BYTES)) >= 0);
+		} catch (Throwable error) {
+			logger.debug("Unable to refresh workload storage-pressure state", error);
+		}
+	}
+
 	/**
 	 * Return per-column-family long property values as a map from column name to value.
 	 * Only meaningful for PER_CF properties.
@@ -2671,14 +2709,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public CompletableFuture<Void> putBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode) throws RocksDBException {
-		return putBatchInternal(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+		return putBatchInternal(columnId, batchPublisher, mode, scheduler.write());
 	}
 
 	public CompletableFuture<Void> putBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		Objects.requireNonNull(writeClass, "writeClass");
+			@NotNull Scheduler workloadScheduler) throws RocksDBException {
 		var start = System.nanoTime();
 		actionLogger.logAction("PutBatch (begin)",
 				start,
@@ -2694,13 +2731,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		Mono<Void> operation = Mono.using(
 				() -> new PutBatchState(columnId, mode, start),
 				state -> Flux.from(batchPublisher)
-						.publishOn(scheduler.write(writeClass))
+						.publishOn(workloadScheduler)
 						.doOnNext(state::write)
 						.then(Mono.fromRunnable(state::writePending)),
 				BatchWriteState::close,
 				true
 			);
-		return operation.subscribeOn(scheduler.write(writeClass))
+		return operation.subscribeOn(workloadScheduler)
 				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
 				.doFinally(ignored -> putBatchTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS))
 				.toFuture();
@@ -2709,14 +2746,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public CompletableFuture<Void> mergeBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode) throws RocksDBException {
-		return mergeBatchInternal(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
+		return mergeBatchInternal(columnId, batchPublisher, mode, scheduler.write());
 	}
 
 	public CompletableFuture<Void> mergeBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		Objects.requireNonNull(writeClass, "writeClass");
+			@NotNull Scheduler workloadScheduler) throws RocksDBException {
 		final boolean ingestBehindEnabled;
 		try {
 			ingestBehindEnabled = config.global().ingestBehind();
@@ -2738,7 +2774,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		Mono<Void> operation = Mono.using(
 				() -> new MergeBatchState(columnId, mode, ingestBehindEnabled, start),
 				state -> AdaptiveBatcher.buffer(
-							Flux.from(batchPublisher).publishOn(scheduler.write(writeClass)),
+							Flux.from(batchPublisher).publishOn(workloadScheduler),
 							128,
 							4096,
 							Duration.ofMillis(10)
@@ -2748,7 +2784,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				BatchWriteState::close,
 				true
 			);
-		return operation.subscribeOn(scheduler.write(writeClass))
+		return operation.subscribeOn(workloadScheduler)
 				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
 				.toFuture();
 	}
@@ -3214,16 +3250,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public void putBatch(long columnId, @NotNull Publisher<@NotNull KVBatch> batchPublisher, @NotNull PutBatchMode mode)
 			throws RocksDBException {
-		putBatch(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public void putBatch(long columnId,
-			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
-			@NotNull PutBatchMode mode,
-			@NotNull WriteClass writeClass) throws RocksDBException {
 		try {
-			putBatchInternal(columnId, batchPublisher, mode, writeClass).get();
+			putBatchInternal(columnId, batchPublisher, mode).get();
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (InterruptedException ex) {
@@ -3238,16 +3266,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public void mergeBatch(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode) throws RocksDBException {
-		mergeBatch(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public void mergeBatch(long columnId,
-			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
-			@NotNull MergeBatchMode mode,
-			@NotNull WriteClass writeClass) throws RocksDBException {
 		try {
-			mergeBatchInternal(columnId, batchPublisher, mode, writeClass).get();
+			mergeBatchInternal(columnId, batchPublisher, mode).get();
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (InterruptedException ex) {
@@ -5153,6 +5173,24 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean reverse,
 			RequestGetRange<? super KV, T> requestType,
 			long timeoutMs) throws RocksDBException {
+		return getRangeAsyncInternal(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs,
+				scheduler.read());
+	}
+
+	public <T> Publisher<T> getRangeAsyncInternal(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			RequestGetRange<? super KV, T> requestType,
+			long timeoutMs,
+			@NotNull Scheduler workloadScheduler) throws RocksDBException {
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
 		long deadlineMicros = readDeadlineMicros(timeoutMs);
@@ -5176,6 +5214,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						reverse,
 						deadlineMicros,
 						fillCache,
+						false,
 						totalTime),
 				(cursor, sink) -> {
 					@SuppressWarnings("unchecked")
@@ -5200,7 +5239,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						getRangeTimer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
 					}
 				})
-				.subscribeOn(scheduler.read())
+				.subscribeOn(workloadScheduler)
 				// Cross the delivery boundary once per decoded page, not once per row.
 				// concatMap prefetch zero requests the next native page only after the
 				// current page is exhausted, so slow consumers neither park a RocksDB worker
@@ -5216,9 +5255,29 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) {
+		return countRangeAsyncInternal(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				timeoutMs,
+				scheduler.read());
+	}
+
+	public Mono<Long> countRangeAsyncInternal(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			long timeoutMs,
+			@NotNull Scheduler workloadScheduler) {
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
-		long deadlineMicros = readDeadlineMicros(timeoutMs);
+		long effectiveTimeoutMs = timeoutMs <= 0L || timeoutMs == Long.MAX_VALUE
+				? maxRetainedSnapshotAgeMs
+				: Math.min(timeoutMs, maxRetainedSnapshotAgeMs);
+		long deadlineMicros = readDeadlineMicros(effectiveTimeoutMs);
+		var retainedCursor = new AtomicReference<RangeCursor>();
 		actionLogger.logAction("ReduceRange (begin)",
 				start,
 				columnId,
@@ -5231,14 +5290,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		); // todo: log if reversed or not
 
 		return Flux.<Long, RangeCursor>generate(
-				() -> openRangeCursor(transactionId,
+				() -> {
+					var cursor = openRangeCursor(transactionId,
 						columnId,
 						startKeysInclusive,
 						endKeysExclusive,
 						reverse,
 						deadlineMicros,
 						false,
-						totalTime),
+						true,
+						totalTime);
+					retainedCursor.set(cursor);
+					return cursor;
+				},
 				(cursor, sink) -> {
 					var chunk = cursor.countChunk(totalTime);
 					var chunkObserver = rangeCountChunkObserver;
@@ -5253,6 +5317,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					return cursor;
 				},
 				cursor -> {
+					retainedCursor.compareAndSet(cursor, null);
 					var closeStart = System.nanoTime();
 					try {
 						cursor.close();
@@ -5261,7 +5326,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						reduceRangeTimer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
 					}
 				})
-				.subscribeOn(scheduler.read())
+				.doOnCancel(() -> {
+					var cursor = retainedCursor.getAndSet(null);
+					if (cursor != null) {
+						cursor.close();
+					}
+				})
+				.subscribeOn(workloadScheduler)
 				.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
 				.reduce(0L, Long::sum);
 	}
@@ -5273,6 +5344,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean reverse,
 			long deadlineMicros,
 			boolean fillCache,
+			boolean retainSnapshot,
 			LongAdder totalTime) {
 		ops.beginOp();
 		var initializationStart = System.nanoTime();
@@ -5292,7 +5364,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					calculatedEndKey,
 					reverse,
 					deadlineMicros,
-					fillCache);
+					fillCache,
+					retainSnapshot);
 			try {
 				activeRangeResources.add(cursor);
 				return cursor;
@@ -5331,6 +5404,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final boolean fillCache;
 		private final AbstractSlice<?> startKeySlice;
 		private final AbstractSlice<?> endKeySlice;
+		private final @Nullable Snapshot snapshot;
 		private final ReadOptions readOptions;
 		private final RocksIterator iterator;
 		private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
@@ -5344,7 +5418,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				@Nullable Buf endKey,
 				boolean reverse,
 				long deadlineMicros,
-				boolean fillCache) {
+				boolean fillCache,
+				boolean retainSnapshot) {
 			this.transactionId = transactionId;
 			this.columnUse = columnUse;
 			this.col = columnUse.column();
@@ -5355,12 +5430,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			AbstractSlice<?> createdStartKeySlice = null;
 			AbstractSlice<?> createdEndKeySlice = null;
 			ReadOptions createdReadOptions = null;
+			Snapshot createdSnapshot = null;
 			RocksIterator createdIterator = null;
 			try {
 				createdStartKeySlice = startKey != null ? toSlice(startKey) : null;
 				createdEndKeySlice = endKey != null ? toSlice(endKey) : null;
 				createdReadOptions = createReadOptions(createdStartKeySlice,
 						createdEndKeySlice);
+				if (retainSnapshot && transactionId == 0L) {
+					createdSnapshot = db.get().getSnapshot();
+					retainedRangeSnapshots.incrementAndGet();
+					createdReadOptions.setSnapshot(createdSnapshot);
+				}
 				createdIterator = createIterator(createdReadOptions);
 				if (reverse) {
 					createdIterator.seekToLast();
@@ -5374,6 +5455,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (createdReadOptions != null) {
 					createdReadOptions.close();
 				}
+				if (createdSnapshot != null) {
+					try {
+						db.get().releaseSnapshot(createdSnapshot);
+					} finally {
+						retainedRangeSnapshots.decrementAndGet();
+					}
+				}
 				if (createdEndKeySlice != null) {
 					createdEndKeySlice.close();
 				}
@@ -5384,6 +5472,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			this.startKeySlice = createdStartKeySlice;
 			this.endKeySlice = createdEndKeySlice;
+			this.snapshot = createdSnapshot;
 			this.readOptions = createdReadOptions;
 			this.iterator = createdIterator;
 		}
@@ -5559,9 +5648,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							readOptions.close();
 						} finally {
 							try {
-								if (endKeySlice != null) {
-									endKeySlice.close();
+								if (snapshot != null) {
+									try {
+										db.get().releaseSnapshot(snapshot);
+									} finally {
+										retainedRangeSnapshots.decrementAndGet();
+									}
 								}
+							} finally {
+								try {
+									if (endKeySlice != null) {
+										endKeySlice.close();
+									}
 								} finally {
 									try {
 										if (startKeySlice != null) {
@@ -5574,6 +5672,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							}
 						}
 					}
+				}
 			} finally {
 				activeRangeResources.remove(this);
 			}
@@ -5876,6 +5975,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId, int shardIndex, int shardCount) {
+		return scanRawAsyncInternal(columnId, shardIndex, shardCount, scheduler.read());
+	}
+
+	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId,
+			int shardIndex,
+			int shardCount,
+			@NotNull Scheduler workloadScheduler) {
 		return Flux.using(
 				() -> {
 					ops.beginOp();
@@ -5911,7 +6017,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 											return state;
 										},
 										ScanState::close)
-										.subscribeOn(scheduler.read())
+										.subscribeOn(workloadScheduler)
 										.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
 
 						var ssts = Flux.fromIterable(lease.files())
@@ -5938,7 +6044,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				},
 				true)
-				.subscribeOn(scheduler.read());
+				.subscribeOn(workloadScheduler);
 	}
 
 	public Stream<SerializedKVBatch> scanRaw(long columnId, int shardIndex, int shardCount) {
@@ -6239,6 +6345,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@VisibleForTesting
+	public int getRetainedRangeSnapshotCount() {
+		return retainedRangeSnapshots.get();
+	}
+
+	@VisibleForTesting
 	public boolean isExpiredRangeCleanupScheduledForTesting() {
 		return !expiredRangeCleanupTask.isCancelled() && !expiredRangeCleanupTask.isDone();
 	}
@@ -6392,6 +6503,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private static long extractCdcRocksSequence(long cdcSeq) {
 		return Math.addExact(extractCdcWalSeq(cdcSeq), extractCdcOpIndex(cdcSeq));
+	}
+
+	private void updateCdcLag(long nextExternalSequence, long tailWalSequenceInclusive) {
+		long nextRocksSequence;
+		try {
+			nextRocksSequence = extractCdcRocksSequence(nextExternalSequence);
+		} catch (ArithmeticException invalidCursor) {
+			cdcLagSequences.set(Long.MAX_VALUE);
+			return;
+		}
+		if (nextRocksSequence > tailWalSequenceInclusive) {
+			cdcLagSequences.set(0L);
+			return;
+		}
+		long remaining = tailWalSequenceInclusive - nextRocksSequence;
+		cdcLagSequences.set(remaining == Long.MAX_VALUE ? Long.MAX_VALUE : remaining + 1L);
 	}
 
 	private record CdcSubscriptionMeta(long lastCommittedSeq, @Nullable long[] columnFilter, boolean emitLatestValues) {}
@@ -7171,6 +7298,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.initialRocksSequence = extractCdcRocksSequence(startSeq);
 			this.maxWalSequenceInclusive = maxWalSequenceInclusive;
 			this.nextSeq = startSeq;
+			updateCdcLag(nextSeq, maxWalSequenceInclusive);
 
 			if (initialRocksSequence > maxWalSequenceInclusive) {
 				exhausted = true;
@@ -7313,12 +7441,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				nextSeq = resolvedPage.continuationSeq();
 				exhausted = true;
 			}
+			updateCdcLag(nextSeq, maxWalSequenceInclusive);
 			return new CdcPollPage(new CdcBatch(resolvedPage.events(), nextSeq),
 					resolvedPage.events().size(),
 					resolvedPage.emittedBytes());
 		}
 
 		private CdcPollPage emptyPage() {
+			updateCdcLag(nextSeq, maxWalSequenceInclusive);
 			return new CdcPollPage(new CdcBatch(Collections.emptyList(), nextSeq), 0L, 0L);
 		}
 
@@ -7526,7 +7656,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long maxEvents,
 			long maxBytes,
 			boolean allowOversizedFirstEvent) {
-		return scheduleTracked(this.scheduler.read(), () -> {
+		return scheduleTracked(this.scheduler.cdc(), () -> {
 			var cursor = openCdcPollCursor(window.subscription(),
 					window.startSeq(),
 					window.maxWalSequenceInclusive());
@@ -7547,7 +7677,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long maxEvents,
 			long maxBytes,
 			boolean allowOversizedFirstEvent) {
-		return scheduleTracked(this.scheduler.read(),
+		return scheduleTracked(this.scheduler.cdc(),
 				() -> cursor.readPage(maxEvents,
 						maxBytes,
 						allowOversizedFirstEvent,

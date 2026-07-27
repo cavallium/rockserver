@@ -39,7 +39,7 @@ class FastGetTest {
 		Buf emptyValue = Buf.wrap(new byte[0]);
 
 		try (var connection = new EmbeddedConnection(databasePath, "fast-get-load", configFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("fast-get",
 					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 			api.put(0, columnId, nonEmptyKey, nonEmptyValue, RequestType.none());
@@ -54,7 +54,7 @@ class FastGetTest {
 		}
 
 		try (var connection = new EmbeddedConnection(databasePath, "fast-get-reopen", configFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.getColumnId("fast-get");
 			assertEquals(nonEmptyValue, api.get(0, columnId, nonEmptyKey, RequestType.current()));
 			assertEquals(emptyValue, api.get(0, columnId, emptyKey, RequestType.current()),
@@ -64,7 +64,7 @@ class FastGetTest {
 
 		Path ordinaryConfigFile = writeConfig("rockserver-ordinary.conf", false);
 		try (var connection = new EmbeddedConnection(databasePath, "ordinary-get-reopen", ordinaryConfigFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.getColumnId("fast-get");
 			assertEquals(nonEmptyValue, api.get(0, columnId, nonEmptyKey, RequestType.current()));
 			assertEquals(emptyValue, api.get(0, columnId, emptyKey, RequestType.current()));
@@ -80,7 +80,7 @@ class FastGetTest {
 		Keys key = key(11);
 		Buf expected = value(99);
 		try (var connection = new EmbeddedConnection(databasePath, "fast-get-concurrent", configFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("fast-get-concurrent",
 					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 			api.put(0, columnId, key, expected, RequestType.none());

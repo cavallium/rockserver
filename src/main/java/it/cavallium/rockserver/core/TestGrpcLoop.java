@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -24,12 +25,13 @@ public class TestGrpcLoop {
         clientB.setName("local");
         clientB.setUseThrift(false);
         var client = clientB.build();
-        var col = client.getSyncApi().createColumn("test", ColumnSchema.of(IntList.of(15), ObjectList.of(), true));
+		var ingestApi = client.getSyncApi(RequestContext.ingest());
+		var col = ingestApi.createColumn("test", ColumnSchema.of(IntList.of(15), ObjectList.of(), true));
         var parallelism = 4;
         for (int i = 0; i < parallelism; i++) {
             var t = Thread.ofPlatform().daemon().name("test-requests-thread-" + i).start(() -> {
                 while (true) {
-                    var delta = client.getSyncApi().put(0, col,
+					var delta = ingestApi.put(0, col,
                         new Keys(new Buf[]{Buf.wrap(new byte[15])}),
                         Buf.wrap(new byte[15]),
                         RequestType.delta());

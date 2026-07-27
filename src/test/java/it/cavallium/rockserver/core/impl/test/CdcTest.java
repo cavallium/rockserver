@@ -41,21 +41,21 @@ public class CdcTest {
     @Test
     void testBasicCdcFlow() throws Exception {
         try (var db = new EmbeddedConnection(dbDir, "cdc-test", configFile)) {
-            var colId = db.getSyncApi().createColumn("test-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+            var colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 
             // Create CDC subscription
-            var startSeq = db.getSyncApi().cdcCreate("sub1", null, null);
+            var startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null);
             assertTrue(startSeq >= 0);
 
             // Put some data
             var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
-            db.getSyncApi().put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
             
             var key2 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 2})});
-            db.getSyncApi().put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
             // Verify events
-            List<CDCEvent> events = db.getSyncApi().cdcPoll("sub1", null, 100).collect(Collectors.toList());
+            List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub1", null, 100).collect(Collectors.toList());
             assertEquals(2, events.size());
             assertEquals(CDCEvent.Op.PUT, events.get(0).op());
             assertEquals(CDCEvent.Op.PUT, events.get(1).op());
@@ -63,7 +63,7 @@ public class CdcTest {
             assertEquals("val2", new String(events.get(1).value().toByteArray(), StandardCharsets.UTF_8));
             
             // Commit
-            db.getSyncApi().cdcCommit("sub1", events.get(1).seq());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("sub1", events.get(1).seq());
         }
     }
     
@@ -74,28 +74,28 @@ public class CdcTest {
         long colId;
         
         try (var db = new EmbeddedConnection(dbDir, "cdc-resume", configFile)) {
-            colId = db.getSyncApi().createColumn(colName, ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-            db.getSyncApi().cdcCreate("sub1", null, null);
+            colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null);
             
             var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
-            db.getSyncApi().put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
             
-            List<CDCEvent> events = db.getSyncApi().cdcPoll("sub1", null, 100).collect(Collectors.toList());
+            List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub1", null, 100).collect(Collectors.toList());
             assertEquals(1, events.size());
             lastSeq = events.get(0).seq();
-            db.getSyncApi().cdcCommit("sub1", lastSeq);
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("sub1", lastSeq);
         }
         
         // Reopen
         try (var db = new EmbeddedConnection(dbDir, "cdc-resume", configFile)) {
-            colId = db.getSyncApi().getColumnId(colName);
+            colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId(colName);
             
             // New event
             var key2 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 2})});
-            db.getSyncApi().put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
             
             // Poll - should get only the new event
-            List<CDCEvent> events = db.getSyncApi().cdcPoll("sub1", null, 100).collect(Collectors.toList());
+            List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub1", null, 100).collect(Collectors.toList());
             assertEquals(1, events.size());
             assertTrue(events.get(0).seq() > lastSeq);
             assertEquals("val2", new String(events.get(0).value().toByteArray(), StandardCharsets.UTF_8));
@@ -106,20 +106,20 @@ public class CdcTest {
     void testBucketedColumn() throws Exception {
         try (var db = new EmbeddedConnection(dbDir, "cdc-bucket", configFile)) {
             // Bucketed column: 1 fixed key (int), 1 variable key (int)
-            var colId = db.getSyncApi().createColumn("bucket-col", ColumnSchema.of(
+            var colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("bucket-col", ColumnSchema.of(
                     IntList.of(Integer.BYTES), 
                     ObjectList.of(ColumnHashType.XXHASH32),
                     true
             ));
-            db.getSyncApi().cdcCreate("sub-bucket", null, null);
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub-bucket", null, null);
             
             var key = new Keys(new Buf[]{
                 Buf.wrap(new byte[]{0, 0, 0, 1}), // fixed
                 Buf.wrap(new byte[]{0, 0, 0, 2})  // variable
             });
-            db.getSyncApi().put(0, colId, key, Buf.wrap("bucket-val".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, Buf.wrap("bucket-val".getBytes(StandardCharsets.UTF_8)), RequestType.none());
             
-            List<CDCEvent> events = db.getSyncApi().cdcPoll("sub-bucket", null, 100).collect(Collectors.toList());
+            List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub-bucket", null, 100).collect(Collectors.toList());
             assertEquals(1, events.size());
             // The key in CDC event should be the fixed key (4 bytes)
             assertEquals(4, events.get(0).key().size());
@@ -134,16 +134,16 @@ public class CdcTest {
         int batchSize = 1000;
         
         try (var db = new EmbeddedConnection(dbDir, "cdc-stress", configFile)) {
-            var colId = db.getSyncApi().createColumn("stress-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-            var startSeq = db.getSyncApi().cdcCreate("stress-sub", null, null);
+            var colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("stress-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+            var startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("stress-sub", null, null);
             
             // 1. Generate load
             for (int i = 0; i < totalEvents; i++) {
                 var key = new Keys(new Buf[]{Buf.wrap(new byte[]{
                         (byte) (i >> 24), (byte) (i >> 16), (byte) (i >> 8), (byte) i
                 })});
-                db.getSyncApi().put(0, colId, key, Buf.wrap(("val-" + i).getBytes(StandardCharsets.UTF_8)), RequestType.none());
-                if (i % 10000 == 0) db.getSyncApi().flush(); // Force some WAL flushes/rotations
+                db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, Buf.wrap(("val-" + i).getBytes(StandardCharsets.UTF_8)), RequestType.none());
+                if (i % 10000 == 0) db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).flush(); // Force some WAL flushes/rotations
             }
             
             // 2. Poll with backpressure
@@ -152,7 +152,7 @@ public class CdcTest {
             
             while (consumed < totalEvents) {
                 // Poll small batch
-                List<CDCEvent> events = db.getSyncApi().cdcPoll("stress-sub", null, batchSize).collect(Collectors.toList());
+                List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("stress-sub", null, batchSize).collect(Collectors.toList());
                 
                 if (events.isEmpty()) {
                     // Should not happen if we expect events, but maybe wait a bit? 
@@ -168,7 +168,7 @@ public class CdcTest {
                 }
                 
                 // Commit periodically
-                db.getSyncApi().cdcCommit("stress-sub", lastSeq);
+                db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("stress-sub", lastSeq);
             }
             
             assertEquals(totalEvents, consumed);

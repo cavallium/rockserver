@@ -37,9 +37,10 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
-import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.OperationFamily;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.PutBatchMode;
@@ -385,7 +386,8 @@ public class GrpcServer extends Server {
 
 					Disposable scheduled;
 					try {
-						scheduled = scheduler.interactiveRead().schedule(callContext.wrap(
+						var context = grpc.mapRequestContext(currentRequest.getContext());
+						scheduled = scheduler.scheduler(context, OperationFamily.POINT_LOOKUP).schedule(callContext.wrap(
 								() -> runFastGetCall(call, currentRequest, cancelled)));
 					} catch (Throwable schedulingError) {
 						closeFastGetFailure(call, currentRequest, schedulingError, cancelled);
@@ -655,13 +657,66 @@ public class GrpcServer extends Server {
 		private static final long ITERATOR_VALUE_PAGE_SIZE = 64L;
 		private static final long ITERATOR_ADVANCE_STEP_SIZE = 4_096L;
 
-		private final RocksDBAsyncAPI asyncApi;
-        private final RocksDBSyncAPI api;
+		private final RocksDBConnection client;
 		private final ConcurrentMap<Long, Object> iteratorOperations = new ConcurrentHashMap<>();
 
 		public GrpcServerImpl(RocksDBConnection client) {
-			this.asyncApi = client.getAsyncApi();
-            this.api = client.getSyncApi();
+			this.client = Objects.requireNonNull(client, "client");
+		}
+
+		private it.cavallium.rockserver.core.common.RequestContext mapRequestContext(
+				it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext) {
+			if (wireContext == null
+					|| wireContext.getProfile() == it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.WORKLOAD_PROFILE_UNSPECIFIED
+					|| wireContext.getProfile() == it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.UNRECOGNIZED) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Request context and workload profile are required");
+			}
+			int profileIndex = wireContext.getProfileValue() - 1;
+			if (profileIndex < 0 || profileIndex >= WorkloadProfile.values().length) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Unknown workload profile: " + wireContext.getProfileValue());
+			}
+			long deadlineEpochMillis = wireContext.getDeadlineEpochMillis();
+			var transportDeadline = Context.current().getDeadline();
+			if (transportDeadline != null) {
+				long remainingMillis = Math.max(0L,
+						transportDeadline.timeRemaining(TimeUnit.MILLISECONDS));
+				long now = System.currentTimeMillis();
+				long transportEpochMillis = remainingMillis >= Long.MAX_VALUE - now
+						? Long.MAX_VALUE
+						: now + remainingMillis;
+				deadlineEpochMillis = Math.min(deadlineEpochMillis, transportEpochMillis);
+			}
+			var profile = WorkloadProfile.values()[profileIndex];
+			if (!profile.isClientSelectable()) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Workload profile " + profile + " is owned by Rockserver");
+			}
+			try {
+				return new it.cavallium.rockserver.core.common.RequestContext(profile, deadlineEpochMillis);
+			} catch (IllegalArgumentException invalid) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Invalid request context: " + invalid.getMessage(), invalid);
+			}
+		}
+
+		private RocksDBSyncAPI api(
+				it.cavallium.rockserver.core.common.api.proto.RequestContext context) {
+			return client.getSyncApi(mapRequestContext(context));
+		}
+
+		private RocksDBAsyncAPI asyncApi(
+				it.cavallium.rockserver.core.common.api.proto.RequestContext context) {
+			return client.getAsyncApi(mapRequestContext(context));
+		}
+
+		private RocksDBSyncAPI protectedApi() {
+			return client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+		}
+
+		private RocksDBAsyncAPI protectedAsyncApi() {
+			return client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 		}
 
 		// functions
@@ -669,19 +724,23 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<OpenTransactionResponse> openTransaction(OpenTransactionRequest request) {
-			return executeSync(() -> {
-				var txId = api.openTransaction(request.getTimeoutMs());
+			return executeSync(request.getContext(), OperationFamily.METADATA, contextualApi -> {
+				var txId = contextualApi.openTransaction(request.getTimeoutMs());
 				return OpenTransactionResponse.newBuilder().setTransactionId(txId).build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("openTransaction", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("openTransaction", request));
 		}
 
 		@Override
 		public Mono<CloseTransactionResponse> closeTransaction(CloseTransactionRequest request) {
 			return Mono.defer(() -> {
-				var writeClass = mapWriteClass(request.getWriteClassValue());
-				var executionScheduler = request.getCommit() ? scheduler.write(writeClass) : scheduler.control();
+				var context = mapRequestContext(request.getContext());
+				var executionScheduler = request.getCommit()
+						? scheduler.scheduler(context, OperationFamily.MUTATION)
+						: scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL,
+								it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE);
 				return executeScheduled(() -> {
-					var committed = api.closeTransaction(request.getTransactionId(), request.getCommit(), writeClass);
+					var committed = client.getSyncApi(context)
+							.closeTransaction(request.getTransactionId(), request.getCommit());
 					return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
 				}, executionScheduler);
 			}).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
@@ -690,60 +749,59 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Empty> closeFailedUpdate(CloseFailedUpdateRequest request) {
 			return executeScheduled(() -> {
-				api.closeFailedUpdate(request.getUpdateId());
+				protectedApi().closeFailedUpdate(request.getUpdateId());
 				return Empty.getDefaultInstance();
 			}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
 		}
 
 		@Override
 		public Mono<CreateColumnResponse> createColumn(CreateColumnRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				var colId = api.createColumn(request.getName(), mapColumnSchema(request.getSchema()), writeClass);
+			return executeWrite(request.getContext(), contextualApi -> {
+				var colId = contextualApi.createColumn(request.getName(), mapColumnSchema(request.getSchema()));
 				return CreateColumnResponse.newBuilder().setColumnId(colId).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("createColumn", request));
 		}
 
 		@Override
 		public Mono<Empty> deleteColumn(DeleteColumnRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				api.deleteColumn(request.getColumnId(), writeClass);
+			return executeWrite(request.getContext(), contextualApi -> {
+				contextualApi.deleteColumn(request.getColumnId());
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("deleteColumn", request));
 		}
 
 		@Override
 		public Mono<DeleteColumnIfExistsResponse> deleteColumnIfExists(DeleteColumnIfExistsRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> DeleteColumnIfExistsResponse.newBuilder()
-					.setDeleted(api.deleteColumnIfExists(request.getName(), writeClass))
+			return executeWrite(request.getContext(), contextualApi -> DeleteColumnIfExistsResponse.newBuilder()
+					.setDeleted(contextualApi.deleteColumnIfExists(request.getName()))
 					.build())
 					.transform(this.onErrorMapMonoWithRequestInfo("deleteColumnIfExists", request));
 		}
 
 		@Override
 		public Mono<GetColumnIdResponse> getColumnId(GetColumnIdRequest request) {
-			return executeSync(() -> {
-				var colId = api.getColumnId(request.getName());
+			return executeSync(request.getContext(), OperationFamily.METADATA, contextualApi -> {
+				var colId = contextualApi.getColumnId(request.getName());
 				return GetColumnIdResponse.newBuilder().setColumnId(colId).build();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("getColumnId", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("getColumnId", request));
 		}
 
 		@Override
 		public Mono<EntriesCount> estimateNumKeys(EstimateNumKeysRequest request) {
-			return executeSync(() -> EntriesCount.newBuilder()
-					.setCount(api.estimateNumKeys(request.getColumnId()))
-					.build(), true)
+			return executeSync(request.getContext(), OperationFamily.METADATA, contextualApi -> EntriesCount.newBuilder()
+					.setCount(contextualApi.estimateNumKeys(request.getColumnId()))
+					.build())
 					.transform(this.onErrorMapMonoWithRequestInfo("estimateNumKeys", request));
 		}
 
 		@Override
 		public Mono<Empty> put(PutRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				api.put(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestNothing<>(),
-						writeClass
+						new RequestNothing<>()
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("put", request));
@@ -751,12 +809,11 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> delete(DeleteRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				api.delete(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				contextualApi.delete(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestNothing<>(),
-						writeClass
+						new RequestNothing<>()
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("delete", request));
@@ -764,11 +821,10 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> deleteRange(DeleteRangeRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				api.deleteRange(request.getColumnId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				contextualApi.deleteRange(request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
-						writeClass
+						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive)
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("deleteRange", request));
@@ -781,7 +837,7 @@ public class GrpcServer extends Server {
 					var keys = request.getKeysMultiList().stream()
 							.map(keyTuple -> mapKeys(keyTuple.getKeysCount(), keyTuple::getKeys))
 							.toList();
-					return fromCancellableFuture(asyncApi.existsMultiAsync(
+					return fromCancellableFuture(asyncApi(request.getContext()).existsMultiAsync(
 							request.getTransactionId(),
 							request.getColumnId(),
 							keys,
@@ -793,13 +849,12 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> merge(MergeRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				api.merge(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				contextualApi.merge(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestNothing<>(),
-						writeClass
+						new RequestNothing<>()
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("merge", request));
@@ -816,7 +871,6 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
-					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var mode = switch (initialRequest.getMode()) {
 						case WRITE_BATCH -> PutBatchMode.WRITE_BATCH;
 						case WRITE_BATCH_NO_WAL -> PutBatchMode.WRITE_BATCH_NO_WAL;
@@ -842,8 +896,8 @@ public class GrpcServer extends Server {
 							});
 
 					return Mono
-							.fromFuture(() -> asyncApi.putBatchAsync(
-									initialRequest.getColumnId(), batches, mode, writeClass))
+							.fromFuture(() -> asyncApi(initialRequest.getContext()).putBatchAsync(
+									initialRequest.getColumnId(), batches, mode))
 							.transform(this.onErrorMapMonoWithRequestInfo("putBatch", initialRequest));
 				} else if (firstSignal.isOnComplete()) {
 					return Mono.error(RocksDBException.of(
@@ -865,7 +919,6 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
-					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var mode = switch (initialRequest.getMode()) {
 						case MERGE_WRITE_BATCH -> MergeBatchMode.MERGE_WRITE_BATCH;
 						case MERGE_WRITE_BATCH_NO_WAL -> MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL;
@@ -891,8 +944,8 @@ public class GrpcServer extends Server {
 							});
 
 					return Mono
-							.fromFuture(() -> asyncApi.mergeBatchAsync(
-									initialRequest.getColumnId(), batches, mode, writeClass))
+							.fromFuture(() -> asyncApi(initialRequest.getContext()).mergeBatchAsync(
+									initialRequest.getColumnId(), batches, mode))
 							.transform(this.onErrorMapMonoWithRequestInfo("mergeBatch", initialRequest));
 				} else if (firstSignal.isOnComplete()) {
 					return Mono.error(RocksDBException.of(
@@ -914,7 +967,6 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
-					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var dataFlux = requestsFlux
 							.skip(1)
 							.map(deleteRequest -> {
@@ -955,14 +1007,14 @@ public class GrpcServer extends Server {
 		private Mono<Empty> deleteMultiDataFlux(DeleteMultiInitialRequest initialRequest,
 				Flux<DeleteRequest> dataFlux,
 				String requestName) {
-			var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
+			var context = mapRequestContext(initialRequest.getContext());
+			var contextualApi = client.getSyncApi(context);
 			return dataFlux
-					.publishOn(scheduler.write(writeClass))
-					.doOnNext(data -> api.delete(initialRequest.getTransactionOrUpdateId(),
+					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+					.doOnNext(data -> contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 							initialRequest.getColumnId(),
 							mapKeys(data.getKeysCount(), data::getKeys),
-								new RequestNothing<>(),
-								writeClass))
+								new RequestNothing<>()))
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
 		}
@@ -980,7 +1032,8 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
-					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
+					var context = mapRequestContext(initialRequest.getContext());
+					var contextualApi = client.getSyncApi(context);
 					var dataFlux = requestsFlux
 							.skip(1)
 							.map(deleteRequest -> {
@@ -991,12 +1044,11 @@ public class GrpcServer extends Server {
 							});
 
 					return dataFlux
-							.publishOn(scheduler.write(writeClass))
-							.map(data -> mapper.apply(api.delete(initialRequest.getTransactionOrUpdateId(),
+							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+							.map(data -> mapper.apply(contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysCount(), data::getKeys),
-									requestType,
-									writeClass)))
+									requestType)))
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 				} else {
 					return Flux.error(RocksDBException.of(
@@ -1007,13 +1059,12 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Merged> mergeGetMerged(MergeRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				var merged = api.merge(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				var merged = contextualApi.merge(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						RequestType.merged(),
-						writeClass);
+						RequestType.merged());
 				return Merged.newBuilder()
 						.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
 						.build();
@@ -1038,7 +1089,6 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
-					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var dataFlux = requestsFlux
 							.skip(1) // skip the initial request
 							.map(mergeRequest -> {
@@ -1068,7 +1118,8 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
-					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
+					var context = mapRequestContext(initialRequest.getContext());
+					var contextualApi = client.getSyncApi(context);
 					var dataFlux = requestsFlux
 							.skip(1) // skip the initial request
 							.map(mergeRequest -> {
@@ -1079,14 +1130,13 @@ public class GrpcServer extends Server {
 							});
 
 					return dataFlux
-							.publishOn(scheduler.write(writeClass))
+							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 							.map(data -> {
-								var merged = api.merge(initialRequest.getTransactionOrUpdateId(),
+								var merged = contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 										initialRequest.getColumnId(),
 										mapKeys(data.getKeysCount(), data::getKeys),
 										toBuf(data.getValue()),
-										RequestType.merged(),
-										writeClass);
+										RequestType.merged());
 								return Merged.newBuilder()
 										.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
 										.build();
@@ -1101,16 +1151,16 @@ public class GrpcServer extends Server {
 
 		private Mono<Empty> mergeMultiDataFlux(MergeMultiInitialRequest initialRequest,
 				Flux<KV> dataFlux, String requestName) {
-			var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
+			var context = mapRequestContext(initialRequest.getContext());
+			var contextualApi = client.getSyncApi(context);
 			return dataFlux
-					.publishOn(scheduler.write(writeClass))
+					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 					.doOnNext(data -> {
-						api.merge(initialRequest.getTransactionOrUpdateId(),
+						contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
 								mapKeys(data.getKeysCount(), data::getKeys),
 								toBuf(data.getValue()),
-								new RequestNothing<>(),
-								writeClass);
+								new RequestNothing<>());
 					})
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
@@ -1127,7 +1177,6 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
-					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
 					var dataFlux = requestsFlux
 							.skip(1) // skip the initial request
 							.map(putRequest -> {
@@ -1200,7 +1249,8 @@ public class GrpcServer extends Server {
 								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
 					}
 					var initialRequest = firstValue.getInitialRequest();
-					var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
+					var context = mapRequestContext(initialRequest.getContext());
+					var contextualApi = client.getSyncApi(context);
 					var dataFlux = requestsFlux
 							.skip(1)
 							.map(putRequest -> {
@@ -1211,13 +1261,12 @@ public class GrpcServer extends Server {
 							});
 
 					return dataFlux
-							.publishOn(scheduler.write(writeClass))
-							.map(data -> mapper.apply(api.put(initialRequest.getTransactionOrUpdateId(),
+							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+							.map(data -> mapper.apply(contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysCount(), data::getKeys),
 									toBuf(data.getValue()),
-									requestType,
-									writeClass)))
+									requestType)))
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 				} else {
 					return Flux.error(RocksDBException.of(
@@ -1228,16 +1277,16 @@ public class GrpcServer extends Server {
 
 		private Mono<Empty> putMultiDataFlux(PutMultiInitialRequest initialRequest,
 				Flux<KV> dataFlux, String requestName) {
-			var writeClass = mapWriteClass(initialRequest.getWriteClassValue());
+			var context = mapRequestContext(initialRequest.getContext());
+			var contextualApi = client.getSyncApi(context);
 			return dataFlux
-					.publishOn(scheduler.write(writeClass))
+					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 					.doOnNext(data -> {
-						api.put(initialRequest.getTransactionOrUpdateId(),
+						contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
 								mapKeys(data.getKeysCount(), data::getKeys),
 								toBuf(data.getValue()),
-								new RequestNothing<>(),
-								writeClass);
+								new RequestNothing<>());
 					})
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
@@ -1245,13 +1294,12 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Previous> putGetPrevious(PutRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				var prev = api.put(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				var prev = contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestPrevious<>(),
-						writeClass
+						new RequestPrevious<>()
 				);
 				var prevBuilder = Previous.newBuilder();
 				if (prev != null) {
@@ -1263,13 +1311,12 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Delta> putGetDelta(PutRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				var delta = api.put(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				var delta = contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestDelta<>(),
-						writeClass
+						new RequestDelta<>()
 				);
 				var deltaBuilder = Delta.newBuilder();
 				if (delta.previous() != null) {
@@ -1284,13 +1331,12 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Changed> putGetChanged(PutRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				var changed = api.put(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				var changed = contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestChanged<>(),
-						writeClass
+						new RequestChanged<>()
 				);
 				return Changed.newBuilder().setChanged(changed).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("putGetChanged", request));
@@ -1298,13 +1344,12 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<PreviousPresence> putGetPreviousPresence(PutRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				var present = api.put(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				var present = contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
 						toBuf(request.getData().getValue()),
-						new RequestPreviousPresence<>(),
-						writeClass
+						new RequestPreviousPresence<>()
 				);
 				return PreviousPresence.newBuilder().setPresent(present).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("putGetPreviousPresence", request));
@@ -1312,12 +1357,11 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Previous> deleteGetPrevious(DeleteRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				var prev = api.delete(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				var prev = contextualApi.delete(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestPrevious<>(),
-						writeClass
+						new RequestPrevious<>()
 				);
 				var prevBuilder = Previous.newBuilder();
 				if (prev != null) {
@@ -1329,12 +1373,11 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<PreviousPresence> deleteGetPreviousPresence(DeleteRequest request) {
-			return executeWrite(request.getWriteClassValue(), writeClass -> {
-				var present = api.delete(request.getTransactionOrUpdateId(),
+			return executeWrite(request.getContext(), contextualApi -> {
+				var present = contextualApi.delete(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestPreviousPresence<>(),
-						writeClass
+						new RequestPreviousPresence<>()
 				);
 				return PreviousPresence.newBuilder().setPresent(present).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("deleteGetPreviousPresence", request));
@@ -1342,8 +1385,8 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<GetResponse> get(GetRequest request) {
-			return executeSync(() -> {
-				var current = api.get(request.getTransactionOrUpdateId(),
+			return executeSync(request.getContext(), OperationFamily.POINT_LOOKUP, contextualApi -> {
+				var current = contextualApi.get(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysCount(), request::getKeys),
 						new RequestCurrent<>()
@@ -1353,7 +1396,7 @@ public class GrpcServer extends Server {
 					responseBuilder.setValue(Utils.toByteString(current));
 				}
 				return responseBuilder.build();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("get", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("get", request));
 		}
 
 		private FastGetResponse createFastGetResponse(GetRequest request,
@@ -1382,7 +1425,7 @@ public class GrpcServer extends Server {
 				}
 			}
 
-			Buf current = api.get(request.getTransactionOrUpdateId(),
+			Buf current = api(request.getContext()).get(request.getTransactionOrUpdateId(),
 					request.getColumnId(),
 					keys,
 					new RequestCurrent<>());
@@ -1393,8 +1436,8 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<UpdateBegin> getForUpdate(GetRequest request) {
-			return executeSync(() -> {
-				var forUpdate = api.get(request.getTransactionOrUpdateId(),
+			return executeSync(request.getContext(), OperationFamily.POINT_LOOKUP, contextualApi -> {
+				var forUpdate = contextualApi.get(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysCount(), request::getKeys),
 						new RequestForUpdate<>()
@@ -1405,25 +1448,27 @@ public class GrpcServer extends Server {
 					responseBuilder.setPrevious(Utils.toByteString(forUpdate.previous()));
 				}
 				return responseBuilder.build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("getForUpdate", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("getForUpdate", request));
 		}
 
 		@Override
 		public Mono<PreviousPresence> exists(GetRequest request) {
-			return executeSync(() -> {
-				var exists = api.get(request.getTransactionOrUpdateId(),
+			return executeSync(request.getContext(), OperationFamily.POINT_LOOKUP, contextualApi -> {
+				var exists = contextualApi.get(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysCount(), request::getKeys),
 						new RequestExists<>()
 				);
 				return PreviousPresence.newBuilder().setPresent(exists).build();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("exists", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("exists", request));
 		}
 
 		@Override
 		public Mono<OpenIteratorResponse> openIterator(OpenIteratorRequest request) {
+			var context = mapRequestContext(request.getContext());
+			var contextualApi = client.getSyncApi(context);
 			return executeScheduled(() -> {
-				var iteratorId = api.openIterator(request.getTransactionId(),
+				var iteratorId = contextualApi.openIterator(request.getTransactionId(),
 						request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
 						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
@@ -1431,16 +1476,16 @@ public class GrpcServer extends Server {
 						request.getTimeoutMs()
 				);
 				return OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build();
-			}, scheduler.read(), response -> {
+			}, scheduler.scheduler(context, OperationFamily.BOUNDARY_SEEK), response -> {
 				long iteratorId = response.getIteratorId();
-				api.closeIterator(iteratorId);
+				protectedApi().closeIterator(iteratorId);
 			}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
 		}
 
 		@Override
 		public Mono<Empty> closeIterator(CloseIteratorRequest request) {
 			return executeScheduled(() -> {
-					api.closeIterator(request.getIteratorId());
+					protectedApi().closeIterator(request.getIteratorId());
 					return Empty.getDefaultInstance();
 				}, scheduler.control())
 					.transform(this.onErrorMapMonoWithRequestInfo("closeIterator", request));
@@ -1448,8 +1493,9 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> seekTo(SeekToRequest request) {
-			return withIteratorLease(request.getIterationId(), () -> executeCompositeRead(() -> {
-				api.seekTo(request.getIterationId(), mapKeys(request.getKeysCount(), request::getKeys));
+			return withIteratorLease(request.getIterationId(), () -> executeCompositeRead(
+					request.getContext(), OperationFamily.BOUNDARY_SEEK, contextualApi -> {
+				contextualApi.seekTo(request.getIterationId(), mapKeys(request.getKeysCount(), request::getKeys));
 				return Empty.getDefaultInstance();
 			})).transform(this.onErrorMapMonoWithRequestInfo("seekTo", request));
 		}
@@ -1458,7 +1504,7 @@ public class GrpcServer extends Server {
 		public Mono<Empty> subsequent(SubsequentRequest request) {
 			return validateIteratorCounts(request)
 					.then(withIteratorLease(request.getIterationId(), () ->
-							advanceIterator(request.getIterationId(), request.getSkipCount(), request.getTakeCount())
+							advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), request.getTakeCount())
 									.thenReturn(Empty.getDefaultInstance())))
 					.transform(this.onErrorMapMonoWithRequestInfo("subsequent", request));
 		}
@@ -1467,9 +1513,9 @@ public class GrpcServer extends Server {
 		public Mono<PreviousPresence> subsequentExists(SubsequentRequest request) {
 			return validateIteratorCounts(request)
 					.then(withIteratorLease(request.getIterationId(), () ->
-							advanceIterator(request.getIterationId(), request.getSkipCount(), 0)
+							advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), 0)
 									.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_ADVANCE_STEP_SIZE))
-									.concatMap(take -> executeCompositeRead(() -> api.subsequent(
+									.concatMap(take -> executeCompositeRead(request.getContext(), OperationFamily.RANGE_PAGE, contextualApi -> contextualApi.subsequent(
 											request.getIterationId(), 0, take, new RequestExists<>())), 1)
 									.takeUntil(found -> !found)
 									.reduce(false, (found, pageFound) -> found || pageFound)
@@ -1481,9 +1527,9 @@ public class GrpcServer extends Server {
 		public Flux<KV> subsequentMultiGet(SubsequentRequest request) {
 			return validateIteratorCounts(request)
 					.thenMany(withIteratorFluxLease(request.getIterationId(), () ->
-							advanceIterator(request.getIterationId(), request.getSkipCount(), 0)
+							advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), 0)
 									.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_VALUE_PAGE_SIZE)
-											.concatMap(take -> executeCompositeRead(() -> api.subsequent(
+											.concatMap(take -> executeCompositeRead(request.getContext(), OperationFamily.RANGE_PAGE, contextualApi -> contextualApi.subsequent(
 													request.getIterationId(), 0, take, new RequestMulti<>())), 1)
 											.takeUntil(values -> values.size() < ITERATOR_VALUE_PAGE_SIZE)
 											.concatMapIterable(Function.identity(), 1)
@@ -1496,7 +1542,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
 			var transportDeadline = Context.current().getDeadline();
-			return Mono.defer(() -> fromCancellableFuture(asyncApi.reduceRangeAsync(
+			return Mono.defer(() -> fromCancellableFuture(asyncApi(request.getContext()).reduceRangeAsync(
 						request.getTransactionId(),
 						request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
@@ -1519,7 +1565,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<EntriesCount> reduceRangeEntriesCount(GetRangeRequest request) {
 			var transportDeadline = Context.current().getDeadline();
-			return Mono.defer(() -> fromCancellableFuture(asyncApi.reduceRangeAsync(
+			return Mono.defer(() -> fromCancellableFuture(asyncApi(request.getContext()).reduceRangeAsync(
 						request.getTransactionId(),
 						request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
@@ -1556,7 +1602,7 @@ public class GrpcServer extends Server {
 				String requestName) {
 			var transportDeadline = Context.current().getDeadline();
 			return Flux.defer(() -> Flux
-					.from(asyncApi.getRangeAsync(request.getTransactionId(),
+					.from(asyncApi(request.getContext()).getRangeAsync(request.getTransactionId(),
 							request.getColumnId(),
 							mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
 							mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
@@ -1570,7 +1616,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Flux<it.cavallium.rockserver.core.common.api.proto.ScanRawResponse> scanRaw(ScanRawRequest request) {
 			return Flux.defer(() -> Flux
-					.from(asyncApi.scanRawAsync(request.getColumnId(), request.getShardIndex(), request.getShardCount())))
+					.from(asyncApi(request.getContext()).scanRawAsync(request.getColumnId(), request.getShardIndex(), request.getShardCount())))
 					.map(batch -> {
 						var builder = it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder();
 						var serializedBatchValue = UnsafeByteOperations.unsafeWrap(
@@ -1588,7 +1634,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Empty> flush(FlushRequest request) {
 			return executeScheduled(() -> {
-				api.flush();
+				protectedApi().flush();
 				return Empty.getDefaultInstance();
 			}, scheduler.maintenance()).transform(this.onErrorMapMonoWithRequestInfo("flush", request));
 		}
@@ -1596,41 +1642,41 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Empty> compact(CompactRequest request) {
 			return executeScheduled(() -> {
-				api.compact();
+				protectedApi().compact();
 				return Empty.getDefaultInstance();
 			}, scheduler.maintenance()).transform(this.onErrorMapMonoWithRequestInfo("compact", request));
 		}
 
 		@Override
 		public Mono<GetAllColumnDefinitionsResponse> getAllColumnDefinitions(GetAllColumnDefinitionsRequest request) {
-			return executeSync(() -> {
-				var definitions = api.getAllColumnDefinitions();
+			return executeSync(request.getContext(), OperationFamily.METADATA, contextualApi -> {
+				var definitions = contextualApi.getAllColumnDefinitions();
 				var builder = GetAllColumnDefinitionsResponse.newBuilder();
 				for (Entry<String, ColumnSchema> e : definitions.entrySet()) {
 					builder.addColumns(Column.newBuilder().setName(e.getKey()).setSchema(unmapColumnSchema(e.getValue())));
 				}
  			return builder.build();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("getAllColumnDefinitions", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("getAllColumnDefinitions", request));
 		}
 
 		@Override
 		public Mono<UploadMergeOperatorResponse> uploadMergeOperator(UploadMergeOperatorRequest request) {
-			return executeSync(() -> {
-				var version = api.uploadMergeOperator(request.getOperatorName(), request.getClassName(), request.getJarPayload().toByteArray());
+			return executeSync(request.getContext(), OperationFamily.MUTATION, contextualApi -> {
+				var version = contextualApi.uploadMergeOperator(request.getOperatorName(), request.getClassName(), request.getJarPayload().toByteArray());
 				return UploadMergeOperatorResponse.newBuilder().setVersion(version).build();
-			}, false).transform(this.onErrorMapMonoWithRequestInfo("uploadMergeOperator", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("uploadMergeOperator", request));
 		}
 
 		@Override
 		public Mono<CheckMergeOperatorResponse> checkMergeOperator(CheckMergeOperatorRequest request) {
-			return executeSync(() -> {
-				var version = api.checkMergeOperator(request.getOperatorName(), request.getHash().toByteArray());
+			return executeSync(request.getContext(), OperationFamily.METADATA, contextualApi -> {
+				var version = contextualApi.checkMergeOperator(request.getOperatorName(), request.getHash().toByteArray());
 				var builder = CheckMergeOperatorResponse.newBuilder();
 				if (version != null) {
 					builder.setVersion(version);
 				}
 				return builder.build();
-			}, true).transform(this.onErrorMapMonoWithRequestInfo("checkMergeOperator", request));
+			}).transform(this.onErrorMapMonoWithRequestInfo("checkMergeOperator", request));
 		}
 
             // ============ CDC RPCs ============
@@ -1643,44 +1689,45 @@ public class GrpcServer extends Server {
 					case EXPECTEDLASTCOMMITTEDSEQ -> OptionalLong.of(request.getExpectedLastCommittedSeq());
 					case EXPECTEDLASTCOMMITTED_NOT_SET -> null;
 				};
-				var executionScheduler = fromSeq != null && fromSeq == 0L
-						? scheduler.cdc()
-						: scheduler.write();
 				return executeScheduled(() -> {
 					var cols = request.getColumnIdsCount() > 0 ? request.getColumnIdsList().stream().map(Long::valueOf).toList() : null;
 					Boolean resolvedValues = request.hasResolvedValues() ? request.getResolvedValues() : null;
-					long startSeq = api.cdcCreate(
+					long startSeq = protectedApi().cdcCreate(
 							request.getId(), fromSeq, cols, resolvedValues, expectedLastCommitted);
 					return CdcCreateResponse.newBuilder().setStartSeq(startSeq).build();
-				}, executionScheduler).transform(this.onErrorMapMonoWithRequestInfo("cdcCreate", request));
+				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
+						it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE))
+						.transform(this.onErrorMapMonoWithRequestInfo("cdcCreate", request));
 			}
 
             @Override
-            public Mono<Empty> cdcDelete(CdcDeleteRequest request) {
-                return executeSync(() -> {
-                    api.cdcDelete(request.getId());
-                    return Empty.getDefaultInstance();
-                }, false).transform(this.onErrorMapMonoWithRequestInfo("cdcDelete", request));
+			public Mono<Empty> cdcDelete(CdcDeleteRequest request) {
+				return executeScheduled(() -> {
+					protectedApi().cdcDelete(request.getId());
+					return Empty.getDefaultInstance();
+				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
+						it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE))
+						.transform(this.onErrorMapMonoWithRequestInfo("cdcDelete", request));
             }
 
 			@Override
 			public Mono<CdcGetEarliestAvailableSequenceResponse> cdcGetEarliestAvailableSequence(Empty request) {
 				return executeScheduled(() -> CdcGetEarliestAvailableSequenceResponse.newBuilder()
-						.setSequence(api.cdcGetEarliestAvailableSequence())
+						.setSequence(protectedApi().cdcGetEarliestAvailableSequence())
 						.build(), scheduler.cdc())
 						.transform(this.onErrorMapMonoWithRequestInfo(
 								"cdcGetEarliestAvailableSequence", request));
 			}
 
             @Override
-            public Mono<CdcGetLastCommittedSequenceResponse> cdcGetLastCommittedSequence(
-                    CdcGetLastCommittedSequenceRequest request) {
-                return executeSync(() -> {
-                    var sequence = api.cdcGetLastCommittedSequence(request.getId());
+			public Mono<CdcGetLastCommittedSequenceResponse> cdcGetLastCommittedSequence(
+					CdcGetLastCommittedSequenceRequest request) {
+				return executeScheduled(() -> {
+					var sequence = protectedApi().cdcGetLastCommittedSequence(request.getId());
                     var response = CdcGetLastCommittedSequenceResponse.newBuilder();
                     sequence.ifPresent(response::setLastCommittedSeq);
                     return response.build();
-                }, true).transform(this.onErrorMapMonoWithRequestInfo(
+				}, scheduler.cdc()).transform(this.onErrorMapMonoWithRequestInfo(
                         "cdcGetLastCommittedSequence", request));
             }
 
@@ -1690,7 +1737,7 @@ public class GrpcServer extends Server {
                             long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
                             Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
                             int maxResponseBytes = requestedMaxResponseBytes(request);
-                            return Flux.from(asyncApi.cdcPollAsync(request.getId(), fromSeq, maxEvents))
+							return Flux.from(protectedAsyncApi().cdcPollAsync(request.getId(), fromSeq, maxEvents))
                                     .map(event -> CdcResponseBudget.buildEvent(event, maxResponseBytes));
                         })
                         .transform(this.onErrorMapFluxWithRequestInfo("cdcPoll", request));
@@ -1702,7 +1749,7 @@ public class GrpcServer extends Server {
                             long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
                             Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
                             int maxResponseBytes = requestedMaxResponseBytes(request);
-                            return asyncApi.cdcPollBatchAsync(request.getId(), fromSeq, maxEvents)
+							return protectedAsyncApi().cdcPollBatchAsync(request.getId(), fromSeq, maxEvents)
                                     .map(batch -> CdcResponseBudget.build(batch, maxResponseBytes));
                         })
                         .transform(this.onErrorMapMonoWithRequestInfo("cdcPollBatch", request));
@@ -1722,37 +1769,43 @@ public class GrpcServer extends Server {
             }
 
             @Override
-            public Mono<Empty> cdcCommit(CdcCommitRequest request) {
+			public Mono<Empty> cdcCommit(CdcCommitRequest request) {
 				return executeScheduled(() -> {
-                    api.cdcCommit(request.getId(), request.getSeq());
-                    return Empty.getDefaultInstance();
-				}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("cdcCommit", request));
+					protectedApi().cdcCommit(request.getId(), request.getSeq());
+					return Empty.getDefaultInstance();
+				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
+						it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE))
+						.transform(this.onErrorMapMonoWithRequestInfo("cdcCommit", request));
             }
 
 		// utils
 
-		private <T> Mono<T> executeSync(Callable<T> callable, boolean isReadOnly) {
-			return executeScheduled(callable, isReadOnly ? scheduler.interactiveRead() : scheduler.write());
-		}
-
-		private <T> Mono<T> executeWrite(int wireWriteClass, Function<WriteClass, T> operation) {
+		private <T> Mono<T> executeSync(
+				it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext,
+				OperationFamily family,
+				Function<RocksDBSyncAPI, T> operation) {
 			return Mono.defer(() -> {
-				var writeClass = mapWriteClass(wireWriteClass);
-				return executeScheduled(() -> operation.apply(writeClass), scheduler.write(writeClass));
+				var context = mapRequestContext(wireContext);
+				return executeScheduled(() -> operation.apply(client.getSyncApi(context)),
+						scheduler.scheduler(context, family));
 			});
 		}
 
-		private WriteClass mapWriteClass(int wireWriteClass) {
-			return switch (wireWriteClass) {
-				case 0 -> WriteClass.FOREGROUND;
-				case 1 -> WriteClass.MAINTENANCE;
-				default -> throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Unknown write class: " + wireWriteClass);
-			};
+		private <T> Mono<T> executeWrite(
+				it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext,
+				Function<RocksDBSyncAPI, T> operation) {
+			return Mono.defer(() -> {
+				var context = mapRequestContext(wireContext);
+				return executeScheduled(() -> operation.apply(client.getSyncApi(context)),
+						scheduler.scheduler(context, OperationFamily.MUTATION));
+			});
 		}
 
-		private <T> Mono<T> executeCompositeRead(Callable<T> callable) {
-			return executeScheduled(callable, scheduler.read());
+		private <T> Mono<T> executeCompositeRead(
+				it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext,
+				OperationFamily family,
+				Function<RocksDBSyncAPI, T> operation) {
+			return executeSync(wireContext, family, operation);
 		}
 
 		private Mono<Void> validateIteratorCounts(SubsequentRequest request) {
@@ -1775,14 +1828,22 @@ public class GrpcServer extends Server {
 			});
 		}
 
-		private Mono<Void> advanceIterator(long iteratorId, long skipCount, long takeCount) {
-			return advanceIteratorPart(iteratorId, skipCount)
-					.then(advanceIteratorPart(iteratorId, takeCount));
+		private Mono<Void> advanceIterator(
+				it.cavallium.rockserver.core.common.api.proto.RequestContext context,
+				long iteratorId,
+				long skipCount,
+				long takeCount) {
+			return advanceIteratorPart(context, iteratorId, skipCount)
+					.then(advanceIteratorPart(context, iteratorId, takeCount));
 		}
 
-		private Mono<Void> advanceIteratorPart(long iteratorId, long count) {
+		private Mono<Void> advanceIteratorPart(
+				it.cavallium.rockserver.core.common.api.proto.RequestContext context,
+				long iteratorId,
+				long count) {
 			return iteratorChunks(count, ITERATOR_ADVANCE_STEP_SIZE)
-					.concatMap(step -> executeCompositeRead(() -> api.subsequent(
+					.concatMap(step -> executeCompositeRead(context, OperationFamily.RANGE_PAGE,
+							contextualApi -> contextualApi.subsequent(
 							iteratorId, 0, step, new RequestExists<>())), 1)
 					.takeUntil(found -> !found)
 					.then();

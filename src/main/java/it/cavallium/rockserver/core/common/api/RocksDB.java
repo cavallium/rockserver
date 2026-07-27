@@ -11,105 +11,105 @@ public class RocksDB {
 
   public interface Iface {
 
-    public long openTransaction(long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException;
+    public long openTransaction(long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public boolean closeTransaction(long transactionId, boolean commit) throws RocksDBThriftException, org.apache.thrift.TException;
+    public boolean closeTransaction(long transactionId, boolean commit, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public void closeFailedUpdate(long updateId) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public long createColumn(java.lang.String name, ColumnSchema schema) throws RocksDBThriftException, org.apache.thrift.TException;
+    public long createColumn(java.lang.String name, ColumnSchema schema, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void deleteColumn(long columnId) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void deleteColumn(long columnId, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public boolean deleteColumnIfExists(java.lang.String name) throws RocksDBThriftException, org.apache.thrift.TException;
+    public boolean deleteColumnIfExists(java.lang.String name, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public long getColumnId(java.lang.String name) throws RocksDBThriftException, org.apache.thrift.TException;
+    public long getColumnId(java.lang.String name, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public long estimateNumKeys(long columnId) throws RocksDBThriftException, org.apache.thrift.TException;
+    public long estimateNumKeys(long columnId, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException;
+    public void putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public OptionalBinary putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException;
+    public OptionalBinary putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public Delta putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException;
+    public Delta putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public boolean putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException;
+    public boolean putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public boolean putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException;
+    public boolean putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public OptionalBinary deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException;
+    public OptionalBinary deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public boolean deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException;
+    public boolean deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<OptionalBinary> deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<OptionalBinary> deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<java.lang.Boolean> deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<java.lang.Boolean> deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public OptionalBinary get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException;
+    public OptionalBinary get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public UpdateBegin getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException;
+    public UpdateBegin getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public boolean exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException;
+    public boolean exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<java.lang.Boolean> existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<java.lang.Boolean> existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public long openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException;
+    public long openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public void closeIterator(long iteratorId) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void subsequent(long iterationId, long skipCount, long takeCount) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void subsequent(long iterationId, long skipCount, long takeCount, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public boolean subsequentExists(long iterationId, long skipCount, long takeCount) throws RocksDBThriftException, org.apache.thrift.TException;
+    public boolean subsequentExists(long iterationId, long skipCount, long takeCount, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<OptionalBinary> subsequentMultiGet(long iterationId, long skipCount, long takeCount) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<OptionalBinary> subsequentMultiGet(long iterationId, long skipCount, long takeCount, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public OptionalBinary mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException;
+    public OptionalBinary mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<OptionalBinary> mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<OptionalBinary> mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public FirstAndLast reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException;
+    public FirstAndLast reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public long reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException;
+    public long reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<KV> getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<KV> getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<KV> getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<KV> getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public long uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload) throws RocksDBThriftException, org.apache.thrift.TException;
+    public long uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<OptionalBinary> putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<OptionalBinary> putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<Delta> putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<Delta> putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<java.lang.Boolean> putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<java.lang.Boolean> putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<java.lang.Boolean> putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<java.lang.Boolean> putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public void flush() throws RocksDBThriftException, org.apache.thrift.TException;
 
     public void compact() throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public java.util.List<Column> getAllColumnDefinitions() throws RocksDBThriftException, org.apache.thrift.TException;
+    public java.util.List<Column> getAllColumnDefinitions(RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public long cdcCreate(CdcCreateRequest request) throws RocksDBThriftException, org.apache.thrift.TException;
 
@@ -127,105 +127,105 @@ public class RocksDB {
 
   public interface AsyncIface {
 
-    public void openTransaction(long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+    public void openTransaction(long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
-    public void closeTransaction(long transactionId, boolean commit, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
+    public void closeTransaction(long transactionId, boolean commit, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
 
     public void closeFailedUpdate(long updateId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void createColumn(java.lang.String name, ColumnSchema schema, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+    public void createColumn(java.lang.String name, ColumnSchema schema, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
-    public void deleteColumn(long columnId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void deleteColumn(long columnId, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void deleteColumnIfExists(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
+    public void deleteColumnIfExists(java.lang.String name, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
 
-    public void getColumnId(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+    public void getColumnId(java.lang.String name, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
-    public void estimateNumKeys(long columnId, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+    public void estimateNumKeys(long columnId, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
-    public void putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException;
+    public void putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException;
 
-    public void putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Delta> resultHandler) throws org.apache.thrift.TException;
+    public void putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Delta> resultHandler) throws org.apache.thrift.TException;
 
-    public void putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
+    public void putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
 
-    public void putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
+    public void putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
 
-    public void delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException;
+    public void deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException;
 
-    public void deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
+    public void deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
 
-    public void deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException;
+    public void deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException;
 
-    public void deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException;
+    public void deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException;
 
-    public void get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException;
+    public void get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException;
 
-    public void getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<UpdateBegin> resultHandler) throws org.apache.thrift.TException;
+    public void getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<UpdateBegin> resultHandler) throws org.apache.thrift.TException;
 
-    public void exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
+    public void exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
 
-    public void existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException;
+    public void existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException;
 
-    public void openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+    public void openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
     public void closeIterator(long iteratorId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void subsequent(long iterationId, long skipCount, long takeCount, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void subsequent(long iterationId, long skipCount, long takeCount, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void subsequentExists(long iterationId, long skipCount, long takeCount, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
+    public void subsequentExists(long iterationId, long skipCount, long takeCount, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
 
-    public void subsequentMultiGet(long iterationId, long skipCount, long takeCount, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException;
+    public void subsequentMultiGet(long iterationId, long skipCount, long takeCount, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException;
 
-    public void putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException;
+    public void mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException;
 
-    public void mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException;
+    public void mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException;
 
-    public void reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<FirstAndLast> resultHandler) throws org.apache.thrift.TException;
+    public void reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<FirstAndLast> resultHandler) throws org.apache.thrift.TException;
 
-    public void reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+    public void reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
-    public void getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException;
+    public void getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException;
 
-    public void getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException;
+    public void getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException;
 
-    public void uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+    public void uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
-    public void putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException;
+    public void putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException;
 
-    public void putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Delta>> resultHandler) throws org.apache.thrift.TException;
+    public void putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Delta>> resultHandler) throws org.apache.thrift.TException;
 
-    public void putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException;
+    public void putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException;
 
-    public void putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException;
+    public void putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException;
 
     public void flush(org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
     public void compact(org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void getAllColumnDefinitions(org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler) throws org.apache.thrift.TException;
+    public void getAllColumnDefinitions(RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler) throws org.apache.thrift.TException;
 
     public void cdcCreate(CdcCreateRequest request, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
@@ -264,16 +264,17 @@ public class RocksDB {
     }
 
     @Override
-    public long openTransaction(long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException
+    public long openTransaction(long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_openTransaction(timeoutMs);
+      send_openTransaction(timeoutMs, context);
       return recv_openTransaction();
     }
 
-    public void send_openTransaction(long timeoutMs) throws org.apache.thrift.TException
+    public void send_openTransaction(long timeoutMs, RequestContext context) throws org.apache.thrift.TException
     {
       openTransaction_args args = new openTransaction_args();
       args.setTimeoutMs(timeoutMs);
+      args.setContext(context);
       sendBase("openTransaction", args);
     }
 
@@ -291,17 +292,18 @@ public class RocksDB {
     }
 
     @Override
-    public boolean closeTransaction(long transactionId, boolean commit) throws RocksDBThriftException, org.apache.thrift.TException
+    public boolean closeTransaction(long transactionId, boolean commit, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_closeTransaction(transactionId, commit);
+      send_closeTransaction(transactionId, commit, context);
       return recv_closeTransaction();
     }
 
-    public void send_closeTransaction(long transactionId, boolean commit) throws org.apache.thrift.TException
+    public void send_closeTransaction(long transactionId, boolean commit, RequestContext context) throws org.apache.thrift.TException
     {
       closeTransaction_args args = new closeTransaction_args();
       args.setTransactionId(transactionId);
       args.setCommit(commit);
+      args.setContext(context);
       sendBase("closeTransaction", args);
     }
 
@@ -343,17 +345,18 @@ public class RocksDB {
     }
 
     @Override
-    public long createColumn(java.lang.String name, ColumnSchema schema) throws RocksDBThriftException, org.apache.thrift.TException
+    public long createColumn(java.lang.String name, ColumnSchema schema, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_createColumn(name, schema);
+      send_createColumn(name, schema, context);
       return recv_createColumn();
     }
 
-    public void send_createColumn(java.lang.String name, ColumnSchema schema) throws org.apache.thrift.TException
+    public void send_createColumn(java.lang.String name, ColumnSchema schema, RequestContext context) throws org.apache.thrift.TException
     {
       createColumn_args args = new createColumn_args();
       args.setName(name);
       args.setSchema(schema);
+      args.setContext(context);
       sendBase("createColumn", args);
     }
 
@@ -371,16 +374,17 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteColumn(long columnId) throws RocksDBThriftException, org.apache.thrift.TException
+    public void deleteColumn(long columnId, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_deleteColumn(columnId);
+      send_deleteColumn(columnId, context);
       recv_deleteColumn();
     }
 
-    public void send_deleteColumn(long columnId) throws org.apache.thrift.TException
+    public void send_deleteColumn(long columnId, RequestContext context) throws org.apache.thrift.TException
     {
       deleteColumn_args args = new deleteColumn_args();
       args.setColumnId(columnId);
+      args.setContext(context);
       sendBase("deleteColumn", args);
     }
 
@@ -395,16 +399,17 @@ public class RocksDB {
     }
 
     @Override
-    public boolean deleteColumnIfExists(java.lang.String name) throws RocksDBThriftException, org.apache.thrift.TException
+    public boolean deleteColumnIfExists(java.lang.String name, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_deleteColumnIfExists(name);
+      send_deleteColumnIfExists(name, context);
       return recv_deleteColumnIfExists();
     }
 
-    public void send_deleteColumnIfExists(java.lang.String name) throws org.apache.thrift.TException
+    public void send_deleteColumnIfExists(java.lang.String name, RequestContext context) throws org.apache.thrift.TException
     {
       deleteColumnIfExists_args args = new deleteColumnIfExists_args();
       args.setName(name);
+      args.setContext(context);
       sendBase("deleteColumnIfExists", args);
     }
 
@@ -422,16 +427,17 @@ public class RocksDB {
     }
 
     @Override
-    public long getColumnId(java.lang.String name) throws RocksDBThriftException, org.apache.thrift.TException
+    public long getColumnId(java.lang.String name, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_getColumnId(name);
+      send_getColumnId(name, context);
       return recv_getColumnId();
     }
 
-    public void send_getColumnId(java.lang.String name) throws org.apache.thrift.TException
+    public void send_getColumnId(java.lang.String name, RequestContext context) throws org.apache.thrift.TException
     {
       getColumnId_args args = new getColumnId_args();
       args.setName(name);
+      args.setContext(context);
       sendBase("getColumnId", args);
     }
 
@@ -449,16 +455,17 @@ public class RocksDB {
     }
 
     @Override
-    public long estimateNumKeys(long columnId) throws RocksDBThriftException, org.apache.thrift.TException
+    public long estimateNumKeys(long columnId, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_estimateNumKeys(columnId);
+      send_estimateNumKeys(columnId, context);
       return recv_estimateNumKeys();
     }
 
-    public void send_estimateNumKeys(long columnId) throws org.apache.thrift.TException
+    public void send_estimateNumKeys(long columnId, RequestContext context) throws org.apache.thrift.TException
     {
       estimateNumKeys_args args = new estimateNumKeys_args();
       args.setColumnId(columnId);
+      args.setContext(context);
       sendBase("estimateNumKeys", args);
     }
 
@@ -476,35 +483,48 @@ public class RocksDB {
     }
 
     @Override
-    public void putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException
+    public void putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putFast(transactionOrUpdateId, columnId, keys, value);
+      send_putFast(transactionOrUpdateId, columnId, keys, value, context);
+      recv_putFast();
     }
 
-    public void send_putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException
+    public void send_putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws org.apache.thrift.TException
     {
       putFast_args args = new putFast_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
       args.setValue(value);
-      sendBaseOneway("putFast", args);
+      args.setContext(context);
+      sendBase("putFast", args);
+    }
+
+    public void recv_putFast() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      putFast_result result = new putFast_result();
+      receiveBase(result, "putFast");
+      if (result.e != null) {
+        throw result.e;
+      }
+      return;
     }
 
     @Override
-    public void put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException
+    public void put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_put(transactionOrUpdateId, columnId, keys, value);
+      send_put(transactionOrUpdateId, columnId, keys, value, context);
       recv_put();
     }
 
-    public void send_put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException
+    public void send_put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws org.apache.thrift.TException
     {
       put_args args = new put_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
       args.setValue(value);
+      args.setContext(context);
       sendBase("put", args);
     }
 
@@ -519,19 +539,20 @@ public class RocksDB {
     }
 
     @Override
-    public void putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public void putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putMulti(transactionOrUpdateId, columnId, keysMulti, valueMulti);
+      send_putMulti(transactionOrUpdateId, columnId, keysMulti, valueMulti, context);
       recv_putMulti();
     }
 
-    public void send_putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws org.apache.thrift.TException
+    public void send_putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws org.apache.thrift.TException
     {
       putMulti_args args = new putMulti_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
       args.setValueMulti(valueMulti);
+      args.setContext(context);
       sendBase("putMulti", args);
     }
 
@@ -546,19 +567,20 @@ public class RocksDB {
     }
 
     @Override
-    public OptionalBinary putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException
+    public OptionalBinary putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putGetPrevious(transactionOrUpdateId, columnId, keys, value);
+      send_putGetPrevious(transactionOrUpdateId, columnId, keys, value, context);
       return recv_putGetPrevious();
     }
 
-    public void send_putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException
+    public void send_putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws org.apache.thrift.TException
     {
       putGetPrevious_args args = new putGetPrevious_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
       args.setValue(value);
+      args.setContext(context);
       sendBase("putGetPrevious", args);
     }
 
@@ -576,19 +598,20 @@ public class RocksDB {
     }
 
     @Override
-    public Delta putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException
+    public Delta putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putGetDelta(transactionOrUpdateId, columnId, keys, value);
+      send_putGetDelta(transactionOrUpdateId, columnId, keys, value, context);
       return recv_putGetDelta();
     }
 
-    public void send_putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException
+    public void send_putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws org.apache.thrift.TException
     {
       putGetDelta_args args = new putGetDelta_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
       args.setValue(value);
+      args.setContext(context);
       sendBase("putGetDelta", args);
     }
 
@@ -606,19 +629,20 @@ public class RocksDB {
     }
 
     @Override
-    public boolean putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException
+    public boolean putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putGetChanged(transactionOrUpdateId, columnId, keys, value);
+      send_putGetChanged(transactionOrUpdateId, columnId, keys, value, context);
       return recv_putGetChanged();
     }
 
-    public void send_putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException
+    public void send_putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws org.apache.thrift.TException
     {
       putGetChanged_args args = new putGetChanged_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
       args.setValue(value);
+      args.setContext(context);
       sendBase("putGetChanged", args);
     }
 
@@ -636,19 +660,20 @@ public class RocksDB {
     }
 
     @Override
-    public boolean putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException
+    public boolean putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putGetPreviousPresence(transactionOrUpdateId, columnId, keys, value);
+      send_putGetPreviousPresence(transactionOrUpdateId, columnId, keys, value, context);
       return recv_putGetPreviousPresence();
     }
 
-    public void send_putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException
+    public void send_putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws org.apache.thrift.TException
     {
       putGetPreviousPresence_args args = new putGetPreviousPresence_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
       args.setValue(value);
+      args.setContext(context);
       sendBase("putGetPreviousPresence", args);
     }
 
@@ -666,18 +691,19 @@ public class RocksDB {
     }
 
     @Override
-    public void delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException
+    public void delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_delete(transactionOrUpdateId, columnId, keys);
+      send_delete(transactionOrUpdateId, columnId, keys, context);
       recv_delete();
     }
 
-    public void send_delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws org.apache.thrift.TException
+    public void send_delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws org.apache.thrift.TException
     {
       delete_args args = new delete_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
+      args.setContext(context);
       sendBase("delete", args);
     }
 
@@ -692,18 +718,19 @@ public class RocksDB {
     }
 
     @Override
-    public OptionalBinary deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException
+    public OptionalBinary deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_deleteGetPrevious(transactionOrUpdateId, columnId, keys);
+      send_deleteGetPrevious(transactionOrUpdateId, columnId, keys, context);
       return recv_deleteGetPrevious();
     }
 
-    public void send_deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws org.apache.thrift.TException
+    public void send_deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws org.apache.thrift.TException
     {
       deleteGetPrevious_args args = new deleteGetPrevious_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
+      args.setContext(context);
       sendBase("deleteGetPrevious", args);
     }
 
@@ -721,18 +748,19 @@ public class RocksDB {
     }
 
     @Override
-    public boolean deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException
+    public boolean deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_deleteGetPreviousPresence(transactionOrUpdateId, columnId, keys);
+      send_deleteGetPreviousPresence(transactionOrUpdateId, columnId, keys, context);
       return recv_deleteGetPreviousPresence();
     }
 
-    public void send_deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws org.apache.thrift.TException
+    public void send_deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws org.apache.thrift.TException
     {
       deleteGetPreviousPresence_args args = new deleteGetPreviousPresence_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
+      args.setContext(context);
       sendBase("deleteGetPreviousPresence", args);
     }
 
@@ -750,18 +778,19 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public void deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_deleteMulti(transactionOrUpdateId, columnId, keysMulti);
+      send_deleteMulti(transactionOrUpdateId, columnId, keysMulti, context);
       recv_deleteMulti();
     }
 
-    public void send_deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti) throws org.apache.thrift.TException
+    public void send_deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context) throws org.apache.thrift.TException
     {
       deleteMulti_args args = new deleteMulti_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
+      args.setContext(context);
       sendBase("deleteMulti", args);
     }
 
@@ -776,18 +805,19 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<OptionalBinary> deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<OptionalBinary> deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_deleteMultiGetPrevious(transactionOrUpdateId, columnId, keysMulti);
+      send_deleteMultiGetPrevious(transactionOrUpdateId, columnId, keysMulti, context);
       return recv_deleteMultiGetPrevious();
     }
 
-    public void send_deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti) throws org.apache.thrift.TException
+    public void send_deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context) throws org.apache.thrift.TException
     {
       deleteMultiGetPrevious_args args = new deleteMultiGetPrevious_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
+      args.setContext(context);
       sendBase("deleteMultiGetPrevious", args);
     }
 
@@ -805,18 +835,19 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<java.lang.Boolean> deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<java.lang.Boolean> deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_deleteMultiGetPreviousPresence(transactionOrUpdateId, columnId, keysMulti);
+      send_deleteMultiGetPreviousPresence(transactionOrUpdateId, columnId, keysMulti, context);
       return recv_deleteMultiGetPreviousPresence();
     }
 
-    public void send_deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti) throws org.apache.thrift.TException
+    public void send_deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context) throws org.apache.thrift.TException
     {
       deleteMultiGetPreviousPresence_args args = new deleteMultiGetPreviousPresence_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
+      args.setContext(context);
       sendBase("deleteMultiGetPreviousPresence", args);
     }
 
@@ -834,18 +865,19 @@ public class RocksDB {
     }
 
     @Override
-    public OptionalBinary get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException
+    public OptionalBinary get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_get(transactionOrUpdateId, columnId, keys);
+      send_get(transactionOrUpdateId, columnId, keys, context);
       return recv_get();
     }
 
-    public void send_get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws org.apache.thrift.TException
+    public void send_get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws org.apache.thrift.TException
     {
       get_args args = new get_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
+      args.setContext(context);
       sendBase("get", args);
     }
 
@@ -863,18 +895,19 @@ public class RocksDB {
     }
 
     @Override
-    public UpdateBegin getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException
+    public UpdateBegin getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_getForUpdate(transactionOrUpdateId, columnId, keys);
+      send_getForUpdate(transactionOrUpdateId, columnId, keys, context);
       return recv_getForUpdate();
     }
 
-    public void send_getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws org.apache.thrift.TException
+    public void send_getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws org.apache.thrift.TException
     {
       getForUpdate_args args = new getForUpdate_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
+      args.setContext(context);
       sendBase("getForUpdate", args);
     }
 
@@ -892,18 +925,19 @@ public class RocksDB {
     }
 
     @Override
-    public boolean exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException
+    public boolean exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_exists(transactionOrUpdateId, columnId, keys);
+      send_exists(transactionOrUpdateId, columnId, keys, context);
       return recv_exists();
     }
 
-    public void send_exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys) throws org.apache.thrift.TException
+    public void send_exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws org.apache.thrift.TException
     {
       exists_args args = new exists_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
+      args.setContext(context);
       sendBase("exists", args);
     }
 
@@ -921,19 +955,20 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<java.lang.Boolean> existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<java.lang.Boolean> existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_existsMulti(transactionId, columnId, keysMulti, timeoutMs);
+      send_existsMulti(transactionId, columnId, keysMulti, timeoutMs, context);
       return recv_existsMulti();
     }
 
-    public void send_existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs) throws org.apache.thrift.TException
+    public void send_existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs, RequestContext context) throws org.apache.thrift.TException
     {
       existsMulti_args args = new existsMulti_args();
       args.setTransactionId(transactionId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
       args.setTimeoutMs(timeoutMs);
+      args.setContext(context);
       sendBase("existsMulti", args);
     }
 
@@ -951,13 +986,13 @@ public class RocksDB {
     }
 
     @Override
-    public long openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException
+    public long openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+      send_openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context);
       return recv_openIterator();
     }
 
-    public void send_openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws org.apache.thrift.TException
+    public void send_openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws org.apache.thrift.TException
     {
       openIterator_args args = new openIterator_args();
       args.setTransactionId(transactionId);
@@ -966,6 +1001,7 @@ public class RocksDB {
       args.setEndKeysExclusive(endKeysExclusive);
       args.setReverse(reverse);
       args.setTimeoutMs(timeoutMs);
+      args.setContext(context);
       sendBase("openIterator", args);
     }
 
@@ -1007,17 +1043,18 @@ public class RocksDB {
     }
 
     @Override
-    public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys) throws RocksDBThriftException, org.apache.thrift.TException
+    public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_seekTo(iterationId, keys);
+      send_seekTo(iterationId, keys, context);
       recv_seekTo();
     }
 
-    public void send_seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys) throws org.apache.thrift.TException
+    public void send_seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws org.apache.thrift.TException
     {
       seekTo_args args = new seekTo_args();
       args.setIterationId(iterationId);
       args.setKeys(keys);
+      args.setContext(context);
       sendBase("seekTo", args);
     }
 
@@ -1032,18 +1069,19 @@ public class RocksDB {
     }
 
     @Override
-    public void subsequent(long iterationId, long skipCount, long takeCount) throws RocksDBThriftException, org.apache.thrift.TException
+    public void subsequent(long iterationId, long skipCount, long takeCount, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_subsequent(iterationId, skipCount, takeCount);
+      send_subsequent(iterationId, skipCount, takeCount, context);
       recv_subsequent();
     }
 
-    public void send_subsequent(long iterationId, long skipCount, long takeCount) throws org.apache.thrift.TException
+    public void send_subsequent(long iterationId, long skipCount, long takeCount, RequestContext context) throws org.apache.thrift.TException
     {
       subsequent_args args = new subsequent_args();
       args.setIterationId(iterationId);
       args.setSkipCount(skipCount);
       args.setTakeCount(takeCount);
+      args.setContext(context);
       sendBase("subsequent", args);
     }
 
@@ -1058,18 +1096,19 @@ public class RocksDB {
     }
 
     @Override
-    public boolean subsequentExists(long iterationId, long skipCount, long takeCount) throws RocksDBThriftException, org.apache.thrift.TException
+    public boolean subsequentExists(long iterationId, long skipCount, long takeCount, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_subsequentExists(iterationId, skipCount, takeCount);
+      send_subsequentExists(iterationId, skipCount, takeCount, context);
       return recv_subsequentExists();
     }
 
-    public void send_subsequentExists(long iterationId, long skipCount, long takeCount) throws org.apache.thrift.TException
+    public void send_subsequentExists(long iterationId, long skipCount, long takeCount, RequestContext context) throws org.apache.thrift.TException
     {
       subsequentExists_args args = new subsequentExists_args();
       args.setIterationId(iterationId);
       args.setSkipCount(skipCount);
       args.setTakeCount(takeCount);
+      args.setContext(context);
       sendBase("subsequentExists", args);
     }
 
@@ -1087,18 +1126,19 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<OptionalBinary> subsequentMultiGet(long iterationId, long skipCount, long takeCount) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<OptionalBinary> subsequentMultiGet(long iterationId, long skipCount, long takeCount, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_subsequentMultiGet(iterationId, skipCount, takeCount);
+      send_subsequentMultiGet(iterationId, skipCount, takeCount, context);
       return recv_subsequentMultiGet();
     }
 
-    public void send_subsequentMultiGet(long iterationId, long skipCount, long takeCount) throws org.apache.thrift.TException
+    public void send_subsequentMultiGet(long iterationId, long skipCount, long takeCount, RequestContext context) throws org.apache.thrift.TException
     {
       subsequentMultiGet_args args = new subsequentMultiGet_args();
       args.setIterationId(iterationId);
       args.setSkipCount(skipCount);
       args.setTakeCount(takeCount);
+      args.setContext(context);
       sendBase("subsequentMultiGet", args);
     }
 
@@ -1116,18 +1156,19 @@ public class RocksDB {
     }
 
     @Override
-    public void putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode) throws RocksDBThriftException, org.apache.thrift.TException
+    public void putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putBatch(columnId, data, mode);
+      send_putBatch(columnId, data, mode, context);
       recv_putBatch();
     }
 
-    public void send_putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode) throws org.apache.thrift.TException
+    public void send_putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode, RequestContext context) throws org.apache.thrift.TException
     {
       putBatch_args args = new putBatch_args();
       args.setColumnId(columnId);
       args.setData(data);
       args.setMode(mode);
+      args.setContext(context);
       sendBase("putBatch", args);
     }
 
@@ -1142,19 +1183,20 @@ public class RocksDB {
     }
 
     @Override
-    public void merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException
+    public void merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_merge(transactionOrUpdateId, columnId, keys, value);
+      send_merge(transactionOrUpdateId, columnId, keys, value, context);
       recv_merge();
     }
 
-    public void send_merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException
+    public void send_merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws org.apache.thrift.TException
     {
       merge_args args = new merge_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
       args.setValue(value);
+      args.setContext(context);
       sendBase("merge", args);
     }
 
@@ -1169,19 +1211,20 @@ public class RocksDB {
     }
 
     @Override
-    public void mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public void mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_mergeMulti(transactionOrUpdateId, columnId, keysMulti, valueMulti);
+      send_mergeMulti(transactionOrUpdateId, columnId, keysMulti, valueMulti, context);
       recv_mergeMulti();
     }
 
-    public void send_mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws org.apache.thrift.TException
+    public void send_mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws org.apache.thrift.TException
     {
       mergeMulti_args args = new mergeMulti_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
       args.setValueMulti(valueMulti);
+      args.setContext(context);
       sendBase("mergeMulti", args);
     }
 
@@ -1196,18 +1239,19 @@ public class RocksDB {
     }
 
     @Override
-    public void mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode) throws RocksDBThriftException, org.apache.thrift.TException
+    public void mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_mergeBatch(columnId, data, mode);
+      send_mergeBatch(columnId, data, mode, context);
       recv_mergeBatch();
     }
 
-    public void send_mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode) throws org.apache.thrift.TException
+    public void send_mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode, RequestContext context) throws org.apache.thrift.TException
     {
       mergeBatch_args args = new mergeBatch_args();
       args.setColumnId(columnId);
       args.setData(data);
       args.setMode(mode);
+      args.setContext(context);
       sendBase("mergeBatch", args);
     }
 
@@ -1222,18 +1266,19 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive) throws RocksDBThriftException, org.apache.thrift.TException
+    public void deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_deleteRange(columnId, startKeysInclusive, endKeysExclusive);
+      send_deleteRange(columnId, startKeysInclusive, endKeysExclusive, context);
       recv_deleteRange();
     }
 
-    public void send_deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive) throws org.apache.thrift.TException
+    public void send_deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, RequestContext context) throws org.apache.thrift.TException
     {
       deleteRange_args args = new deleteRange_args();
       args.setColumnId(columnId);
       args.setStartKeysInclusive(startKeysInclusive);
       args.setEndKeysExclusive(endKeysExclusive);
+      args.setContext(context);
       sendBase("deleteRange", args);
     }
 
@@ -1248,19 +1293,20 @@ public class RocksDB {
     }
 
     @Override
-    public OptionalBinary mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws RocksDBThriftException, org.apache.thrift.TException
+    public OptionalBinary mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_mergeGetMerged(transactionOrUpdateId, columnId, keys, value);
+      send_mergeGetMerged(transactionOrUpdateId, columnId, keys, value, context);
       return recv_mergeGetMerged();
     }
 
-    public void send_mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value) throws org.apache.thrift.TException
+    public void send_mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context) throws org.apache.thrift.TException
     {
       mergeGetMerged_args args = new mergeGetMerged_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeys(keys);
       args.setValue(value);
+      args.setContext(context);
       sendBase("mergeGetMerged", args);
     }
 
@@ -1278,19 +1324,20 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<OptionalBinary> mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<OptionalBinary> mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_mergeMultiGetMerged(transactionOrUpdateId, columnId, keysMulti, valueMulti);
+      send_mergeMultiGetMerged(transactionOrUpdateId, columnId, keysMulti, valueMulti, context);
       return recv_mergeMultiGetMerged();
     }
 
-    public void send_mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws org.apache.thrift.TException
+    public void send_mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws org.apache.thrift.TException
     {
       mergeMultiGetMerged_args args = new mergeMultiGetMerged_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
       args.setValueMulti(valueMulti);
+      args.setContext(context);
       sendBase("mergeMultiGetMerged", args);
     }
 
@@ -1308,13 +1355,13 @@ public class RocksDB {
     }
 
     @Override
-    public FirstAndLast reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException
+    public FirstAndLast reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_reduceRangeFirstAndLast(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+      send_reduceRangeFirstAndLast(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context);
       return recv_reduceRangeFirstAndLast();
     }
 
-    public void send_reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws org.apache.thrift.TException
+    public void send_reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws org.apache.thrift.TException
     {
       reduceRangeFirstAndLast_args args = new reduceRangeFirstAndLast_args();
       args.setTransactionId(transactionId);
@@ -1323,6 +1370,7 @@ public class RocksDB {
       args.setEndKeysExclusive(endKeysExclusive);
       args.setReverse(reverse);
       args.setTimeoutMs(timeoutMs);
+      args.setContext(context);
       sendBase("reduceRangeFirstAndLast", args);
     }
 
@@ -1340,13 +1388,13 @@ public class RocksDB {
     }
 
     @Override
-    public long reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException
+    public long reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_reduceRangeEntriesCount(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+      send_reduceRangeEntriesCount(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context);
       return recv_reduceRangeEntriesCount();
     }
 
-    public void send_reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws org.apache.thrift.TException
+    public void send_reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws org.apache.thrift.TException
     {
       reduceRangeEntriesCount_args args = new reduceRangeEntriesCount_args();
       args.setTransactionId(transactionId);
@@ -1355,6 +1403,7 @@ public class RocksDB {
       args.setEndKeysExclusive(endKeysExclusive);
       args.setReverse(reverse);
       args.setTimeoutMs(timeoutMs);
+      args.setContext(context);
       sendBase("reduceRangeEntriesCount", args);
     }
 
@@ -1372,13 +1421,13 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<KV> getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<KV> getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_getAllInRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+      send_getAllInRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context);
       return recv_getAllInRange();
     }
 
-    public void send_getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws org.apache.thrift.TException
+    public void send_getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws org.apache.thrift.TException
     {
       getAllInRange_args args = new getAllInRange_args();
       args.setTransactionId(transactionId);
@@ -1387,6 +1436,7 @@ public class RocksDB {
       args.setEndKeysExclusive(endKeysExclusive);
       args.setReverse(reverse);
       args.setTimeoutMs(timeoutMs);
+      args.setContext(context);
       sendBase("getAllInRange", args);
     }
 
@@ -1404,13 +1454,13 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<KV> getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<KV> getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_getAllInRangeNoCache(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+      send_getAllInRangeNoCache(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context);
       return recv_getAllInRangeNoCache();
     }
 
-    public void send_getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs) throws org.apache.thrift.TException
+    public void send_getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context) throws org.apache.thrift.TException
     {
       getAllInRangeNoCache_args args = new getAllInRangeNoCache_args();
       args.setTransactionId(transactionId);
@@ -1419,6 +1469,7 @@ public class RocksDB {
       args.setEndKeysExclusive(endKeysExclusive);
       args.setReverse(reverse);
       args.setTimeoutMs(timeoutMs);
+      args.setContext(context);
       sendBase("getAllInRangeNoCache", args);
     }
 
@@ -1436,18 +1487,19 @@ public class RocksDB {
     }
 
     @Override
-    public long uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload) throws RocksDBThriftException, org.apache.thrift.TException
+    public long uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_uploadMergeOperator(operatorName, className, jarPayload);
+      send_uploadMergeOperator(operatorName, className, jarPayload, context);
       return recv_uploadMergeOperator();
     }
 
-    public void send_uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload) throws org.apache.thrift.TException
+    public void send_uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, RequestContext context) throws org.apache.thrift.TException
     {
       uploadMergeOperator_args args = new uploadMergeOperator_args();
       args.setOperatorName(operatorName);
       args.setClassName(className);
       args.setJarPayload(jarPayload);
+      args.setContext(context);
       sendBase("uploadMergeOperator", args);
     }
 
@@ -1465,19 +1517,20 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<OptionalBinary> putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<OptionalBinary> putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putMultiGetPrevious(transactionOrUpdateId, columnId, keysMulti, valueMulti);
+      send_putMultiGetPrevious(transactionOrUpdateId, columnId, keysMulti, valueMulti, context);
       return recv_putMultiGetPrevious();
     }
 
-    public void send_putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws org.apache.thrift.TException
+    public void send_putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws org.apache.thrift.TException
     {
       putMultiGetPrevious_args args = new putMultiGetPrevious_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
       args.setValueMulti(valueMulti);
+      args.setContext(context);
       sendBase("putMultiGetPrevious", args);
     }
 
@@ -1495,19 +1548,20 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<Delta> putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<Delta> putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putMultiGetDelta(transactionOrUpdateId, columnId, keysMulti, valueMulti);
+      send_putMultiGetDelta(transactionOrUpdateId, columnId, keysMulti, valueMulti, context);
       return recv_putMultiGetDelta();
     }
 
-    public void send_putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws org.apache.thrift.TException
+    public void send_putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws org.apache.thrift.TException
     {
       putMultiGetDelta_args args = new putMultiGetDelta_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
       args.setValueMulti(valueMulti);
+      args.setContext(context);
       sendBase("putMultiGetDelta", args);
     }
 
@@ -1525,19 +1579,20 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<java.lang.Boolean> putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<java.lang.Boolean> putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putMultiGetChanged(transactionOrUpdateId, columnId, keysMulti, valueMulti);
+      send_putMultiGetChanged(transactionOrUpdateId, columnId, keysMulti, valueMulti, context);
       return recv_putMultiGetChanged();
     }
 
-    public void send_putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws org.apache.thrift.TException
+    public void send_putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws org.apache.thrift.TException
     {
       putMultiGetChanged_args args = new putMultiGetChanged_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
       args.setValueMulti(valueMulti);
+      args.setContext(context);
       sendBase("putMultiGetChanged", args);
     }
 
@@ -1555,19 +1610,20 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<java.lang.Boolean> putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<java.lang.Boolean> putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_putMultiGetPreviousPresence(transactionOrUpdateId, columnId, keysMulti, valueMulti);
+      send_putMultiGetPreviousPresence(transactionOrUpdateId, columnId, keysMulti, valueMulti, context);
       return recv_putMultiGetPreviousPresence();
     }
 
-    public void send_putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti) throws org.apache.thrift.TException
+    public void send_putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws org.apache.thrift.TException
     {
       putMultiGetPreviousPresence_args args = new putMultiGetPreviousPresence_args();
       args.setTransactionOrUpdateId(transactionOrUpdateId);
       args.setColumnId(columnId);
       args.setKeysMulti(keysMulti);
       args.setValueMulti(valueMulti);
+      args.setContext(context);
       sendBase("putMultiGetPreviousPresence", args);
     }
 
@@ -1631,15 +1687,16 @@ public class RocksDB {
     }
 
     @Override
-    public java.util.List<Column> getAllColumnDefinitions() throws RocksDBThriftException, org.apache.thrift.TException
+    public java.util.List<Column> getAllColumnDefinitions(RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_getAllColumnDefinitions();
+      send_getAllColumnDefinitions(context);
       return recv_getAllColumnDefinitions();
     }
 
-    public void send_getAllColumnDefinitions() throws org.apache.thrift.TException
+    public void send_getAllColumnDefinitions(RequestContext context) throws org.apache.thrift.TException
     {
       getAllColumnDefinitions_args args = new getAllColumnDefinitions_args();
+      args.setContext(context);
       sendBase("getAllColumnDefinitions", args);
     }
 
@@ -1832,18 +1889,20 @@ public class RocksDB {
     }
 
     @Override
-    public void openTransaction(long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+    public void openTransaction(long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      openTransaction_call method_call = new openTransaction_call(timeoutMs, resultHandler, this, ___protocolFactory, ___transport);
+      openTransaction_call method_call = new openTransaction_call(timeoutMs, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class openTransaction_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Long> {
       private long timeoutMs;
-      public openTransaction_call(long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public openTransaction_call(long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.timeoutMs = timeoutMs;
+        this.context = context;
       }
 
       @Override
@@ -1851,6 +1910,7 @@ public class RocksDB {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("openTransaction", org.apache.thrift.protocol.TMessageType.CALL, 0));
         openTransaction_args args = new openTransaction_args();
         args.setTimeoutMs(timeoutMs);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -1867,9 +1927,9 @@ public class RocksDB {
     }
 
     @Override
-    public void closeTransaction(long transactionId, boolean commit, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
+    public void closeTransaction(long transactionId, boolean commit, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      closeTransaction_call method_call = new closeTransaction_call(transactionId, commit, resultHandler, this, ___protocolFactory, ___transport);
+      closeTransaction_call method_call = new closeTransaction_call(transactionId, commit, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -1877,10 +1937,12 @@ public class RocksDB {
     public static class closeTransaction_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Boolean> {
       private long transactionId;
       private boolean commit;
-      public closeTransaction_call(long transactionId, boolean commit, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public closeTransaction_call(long transactionId, boolean commit, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionId = transactionId;
         this.commit = commit;
+        this.context = context;
       }
 
       @Override
@@ -1889,6 +1951,7 @@ public class RocksDB {
         closeTransaction_args args = new closeTransaction_args();
         args.setTransactionId(transactionId);
         args.setCommit(commit);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -1941,9 +2004,9 @@ public class RocksDB {
     }
 
     @Override
-    public void createColumn(java.lang.String name, ColumnSchema schema, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+    public void createColumn(java.lang.String name, ColumnSchema schema, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      createColumn_call method_call = new createColumn_call(name, schema, resultHandler, this, ___protocolFactory, ___transport);
+      createColumn_call method_call = new createColumn_call(name, schema, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -1951,10 +2014,12 @@ public class RocksDB {
     public static class createColumn_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Long> {
       private java.lang.String name;
       private ColumnSchema schema;
-      public createColumn_call(java.lang.String name, ColumnSchema schema, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public createColumn_call(java.lang.String name, ColumnSchema schema, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.name = name;
         this.schema = schema;
+        this.context = context;
       }
 
       @Override
@@ -1963,6 +2028,7 @@ public class RocksDB {
         createColumn_args args = new createColumn_args();
         args.setName(name);
         args.setSchema(schema);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -1979,18 +2045,20 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteColumn(long columnId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void deleteColumn(long columnId, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      deleteColumn_call method_call = new deleteColumn_call(columnId, resultHandler, this, ___protocolFactory, ___transport);
+      deleteColumn_call method_call = new deleteColumn_call(columnId, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class deleteColumn_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
       private long columnId;
-      public deleteColumn_call(long columnId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public deleteColumn_call(long columnId, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.columnId = columnId;
+        this.context = context;
       }
 
       @Override
@@ -1998,6 +2066,7 @@ public class RocksDB {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("deleteColumn", org.apache.thrift.protocol.TMessageType.CALL, 0));
         deleteColumn_args args = new deleteColumn_args();
         args.setColumnId(columnId);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2015,18 +2084,20 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteColumnIfExists(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
+    public void deleteColumnIfExists(java.lang.String name, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      deleteColumnIfExists_call method_call = new deleteColumnIfExists_call(name, resultHandler, this, ___protocolFactory, ___transport);
+      deleteColumnIfExists_call method_call = new deleteColumnIfExists_call(name, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class deleteColumnIfExists_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Boolean> {
       private java.lang.String name;
-      public deleteColumnIfExists_call(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public deleteColumnIfExists_call(java.lang.String name, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.name = name;
+        this.context = context;
       }
 
       @Override
@@ -2034,6 +2105,7 @@ public class RocksDB {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("deleteColumnIfExists", org.apache.thrift.protocol.TMessageType.CALL, 0));
         deleteColumnIfExists_args args = new deleteColumnIfExists_args();
         args.setName(name);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2050,18 +2122,20 @@ public class RocksDB {
     }
 
     @Override
-    public void getColumnId(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+    public void getColumnId(java.lang.String name, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      getColumnId_call method_call = new getColumnId_call(name, resultHandler, this, ___protocolFactory, ___transport);
+      getColumnId_call method_call = new getColumnId_call(name, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class getColumnId_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Long> {
       private java.lang.String name;
-      public getColumnId_call(java.lang.String name, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public getColumnId_call(java.lang.String name, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.name = name;
+        this.context = context;
       }
 
       @Override
@@ -2069,6 +2143,7 @@ public class RocksDB {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("getColumnId", org.apache.thrift.protocol.TMessageType.CALL, 0));
         getColumnId_args args = new getColumnId_args();
         args.setName(name);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2085,18 +2160,20 @@ public class RocksDB {
     }
 
     @Override
-    public void estimateNumKeys(long columnId, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+    public void estimateNumKeys(long columnId, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      estimateNumKeys_call method_call = new estimateNumKeys_call(columnId, resultHandler, this, ___protocolFactory, ___transport);
+      estimateNumKeys_call method_call = new estimateNumKeys_call(columnId, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class estimateNumKeys_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Long> {
       private long columnId;
-      public estimateNumKeys_call(long columnId, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public estimateNumKeys_call(long columnId, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.columnId = columnId;
+        this.context = context;
       }
 
       @Override
@@ -2104,6 +2181,7 @@ public class RocksDB {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("estimateNumKeys", org.apache.thrift.protocol.TMessageType.CALL, 0));
         estimateNumKeys_args args = new estimateNumKeys_args();
         args.setColumnId(columnId);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2120,9 +2198,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void putFast(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putFast_call method_call = new putFast_call(transactionOrUpdateId, columnId, keys, value, resultHandler, this, ___protocolFactory, ___transport);
+      putFast_call method_call = new putFast_call(transactionOrUpdateId, columnId, keys, value, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2132,41 +2210,45 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
       private java.nio.ByteBuffer value;
-      public putFast_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
-        super(client, protocolFactory, transport, resultHandler, true);
+      private RequestContext context;
+      public putFast_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
         this.value = value;
+        this.context = context;
       }
 
       @Override
       public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
-        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("putFast", org.apache.thrift.protocol.TMessageType.ONEWAY, 0));
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("putFast", org.apache.thrift.protocol.TMessageType.CALL, 0));
         putFast_args args = new putFast_args();
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeys(keys);
         args.setValue(value);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
 
       @Override
-      public Void getResult() throws org.apache.thrift.TException {
+      public Void getResult() throws RocksDBThriftException, org.apache.thrift.TException {
         if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
           throw new java.lang.IllegalStateException("Method call not finished!");
         }
         org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
         org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        (new Client(prot)).recv_putFast();
         return null;
       }
     }
 
     @Override
-    public void put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void put(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      put_call method_call = new put_call(transactionOrUpdateId, columnId, keys, value, resultHandler, this, ___protocolFactory, ___transport);
+      put_call method_call = new put_call(transactionOrUpdateId, columnId, keys, value, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2176,12 +2258,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
       private java.nio.ByteBuffer value;
-      public put_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public put_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
         this.value = value;
+        this.context = context;
       }
 
       @Override
@@ -2192,6 +2276,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeys(keys);
         args.setValue(value);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2209,9 +2294,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void putMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putMulti_call method_call = new putMulti_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, resultHandler, this, ___protocolFactory, ___transport);
+      putMulti_call method_call = new putMulti_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2221,12 +2306,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
       private java.util.List<java.nio.ByteBuffer> valueMulti;
-      public putMulti_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putMulti_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
         this.valueMulti = valueMulti;
+        this.context = context;
       }
 
       @Override
@@ -2237,6 +2324,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
         args.setValueMulti(valueMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2254,9 +2342,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
+    public void putGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putGetPrevious_call method_call = new putGetPrevious_call(transactionOrUpdateId, columnId, keys, value, resultHandler, this, ___protocolFactory, ___transport);
+      putGetPrevious_call method_call = new putGetPrevious_call(transactionOrUpdateId, columnId, keys, value, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2266,12 +2354,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
       private java.nio.ByteBuffer value;
-      public putGetPrevious_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putGetPrevious_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
         this.value = value;
+        this.context = context;
       }
 
       @Override
@@ -2282,6 +2372,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeys(keys);
         args.setValue(value);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2298,9 +2389,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Delta> resultHandler) throws org.apache.thrift.TException {
+    public void putGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Delta> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putGetDelta_call method_call = new putGetDelta_call(transactionOrUpdateId, columnId, keys, value, resultHandler, this, ___protocolFactory, ___transport);
+      putGetDelta_call method_call = new putGetDelta_call(transactionOrUpdateId, columnId, keys, value, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2310,12 +2401,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
       private java.nio.ByteBuffer value;
-      public putGetDelta_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Delta> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putGetDelta_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Delta> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
         this.value = value;
+        this.context = context;
       }
 
       @Override
@@ -2326,6 +2419,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeys(keys);
         args.setValue(value);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2342,9 +2436,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
+    public void putGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putGetChanged_call method_call = new putGetChanged_call(transactionOrUpdateId, columnId, keys, value, resultHandler, this, ___protocolFactory, ___transport);
+      putGetChanged_call method_call = new putGetChanged_call(transactionOrUpdateId, columnId, keys, value, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2354,12 +2448,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
       private java.nio.ByteBuffer value;
-      public putGetChanged_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putGetChanged_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
         this.value = value;
+        this.context = context;
       }
 
       @Override
@@ -2370,6 +2466,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeys(keys);
         args.setValue(value);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2386,9 +2483,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
+    public void putGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putGetPreviousPresence_call method_call = new putGetPreviousPresence_call(transactionOrUpdateId, columnId, keys, value, resultHandler, this, ___protocolFactory, ___transport);
+      putGetPreviousPresence_call method_call = new putGetPreviousPresence_call(transactionOrUpdateId, columnId, keys, value, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2398,12 +2495,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
       private java.nio.ByteBuffer value;
-      public putGetPreviousPresence_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putGetPreviousPresence_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
         this.value = value;
+        this.context = context;
       }
 
       @Override
@@ -2414,6 +2513,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeys(keys);
         args.setValue(value);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2430,9 +2530,9 @@ public class RocksDB {
     }
 
     @Override
-    public void delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void delete(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      delete_call method_call = new delete_call(transactionOrUpdateId, columnId, keys, resultHandler, this, ___protocolFactory, ___transport);
+      delete_call method_call = new delete_call(transactionOrUpdateId, columnId, keys, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2441,11 +2541,13 @@ public class RocksDB {
       private long transactionOrUpdateId;
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
-      public delete_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public delete_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
+        this.context = context;
       }
 
       @Override
@@ -2455,6 +2557,7 @@ public class RocksDB {
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeys(keys);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2472,9 +2575,9 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
+    public void deleteGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      deleteGetPrevious_call method_call = new deleteGetPrevious_call(transactionOrUpdateId, columnId, keys, resultHandler, this, ___protocolFactory, ___transport);
+      deleteGetPrevious_call method_call = new deleteGetPrevious_call(transactionOrUpdateId, columnId, keys, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2483,11 +2586,13 @@ public class RocksDB {
       private long transactionOrUpdateId;
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
-      public deleteGetPrevious_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public deleteGetPrevious_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
+        this.context = context;
       }
 
       @Override
@@ -2497,6 +2602,7 @@ public class RocksDB {
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeys(keys);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2513,9 +2619,9 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
+    public void deleteGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      deleteGetPreviousPresence_call method_call = new deleteGetPreviousPresence_call(transactionOrUpdateId, columnId, keys, resultHandler, this, ___protocolFactory, ___transport);
+      deleteGetPreviousPresence_call method_call = new deleteGetPreviousPresence_call(transactionOrUpdateId, columnId, keys, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2524,11 +2630,13 @@ public class RocksDB {
       private long transactionOrUpdateId;
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
-      public deleteGetPreviousPresence_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public deleteGetPreviousPresence_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
+        this.context = context;
       }
 
       @Override
@@ -2538,6 +2646,7 @@ public class RocksDB {
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeys(keys);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2554,9 +2663,9 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void deleteMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      deleteMulti_call method_call = new deleteMulti_call(transactionOrUpdateId, columnId, keysMulti, resultHandler, this, ___protocolFactory, ___transport);
+      deleteMulti_call method_call = new deleteMulti_call(transactionOrUpdateId, columnId, keysMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2565,11 +2674,13 @@ public class RocksDB {
       private long transactionOrUpdateId;
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
-      public deleteMulti_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public deleteMulti_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
+        this.context = context;
       }
 
       @Override
@@ -2579,6 +2690,7 @@ public class RocksDB {
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2596,9 +2708,9 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
+    public void deleteMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      deleteMultiGetPrevious_call method_call = new deleteMultiGetPrevious_call(transactionOrUpdateId, columnId, keysMulti, resultHandler, this, ___protocolFactory, ___transport);
+      deleteMultiGetPrevious_call method_call = new deleteMultiGetPrevious_call(transactionOrUpdateId, columnId, keysMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2607,11 +2719,13 @@ public class RocksDB {
       private long transactionOrUpdateId;
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
-      public deleteMultiGetPrevious_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public deleteMultiGetPrevious_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
+        this.context = context;
       }
 
       @Override
@@ -2621,6 +2735,7 @@ public class RocksDB {
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2637,9 +2752,9 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
+    public void deleteMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      deleteMultiGetPreviousPresence_call method_call = new deleteMultiGetPreviousPresence_call(transactionOrUpdateId, columnId, keysMulti, resultHandler, this, ___protocolFactory, ___transport);
+      deleteMultiGetPreviousPresence_call method_call = new deleteMultiGetPreviousPresence_call(transactionOrUpdateId, columnId, keysMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2648,11 +2763,13 @@ public class RocksDB {
       private long transactionOrUpdateId;
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
-      public deleteMultiGetPreviousPresence_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public deleteMultiGetPreviousPresence_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
+        this.context = context;
       }
 
       @Override
@@ -2662,6 +2779,7 @@ public class RocksDB {
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2678,9 +2796,9 @@ public class RocksDB {
     }
 
     @Override
-    public void get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
+    public void get(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      get_call method_call = new get_call(transactionOrUpdateId, columnId, keys, resultHandler, this, ___protocolFactory, ___transport);
+      get_call method_call = new get_call(transactionOrUpdateId, columnId, keys, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2689,11 +2807,13 @@ public class RocksDB {
       private long transactionOrUpdateId;
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
-      public get_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public get_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
+        this.context = context;
       }
 
       @Override
@@ -2703,6 +2823,7 @@ public class RocksDB {
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeys(keys);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2719,9 +2840,9 @@ public class RocksDB {
     }
 
     @Override
-    public void getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<UpdateBegin> resultHandler) throws org.apache.thrift.TException {
+    public void getForUpdate(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<UpdateBegin> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      getForUpdate_call method_call = new getForUpdate_call(transactionOrUpdateId, columnId, keys, resultHandler, this, ___protocolFactory, ___transport);
+      getForUpdate_call method_call = new getForUpdate_call(transactionOrUpdateId, columnId, keys, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2730,11 +2851,13 @@ public class RocksDB {
       private long transactionOrUpdateId;
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
-      public getForUpdate_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<UpdateBegin> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public getForUpdate_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<UpdateBegin> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
+        this.context = context;
       }
 
       @Override
@@ -2744,6 +2867,7 @@ public class RocksDB {
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeys(keys);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2760,9 +2884,9 @@ public class RocksDB {
     }
 
     @Override
-    public void exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
+    public void exists(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      exists_call method_call = new exists_call(transactionOrUpdateId, columnId, keys, resultHandler, this, ___protocolFactory, ___transport);
+      exists_call method_call = new exists_call(transactionOrUpdateId, columnId, keys, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2771,11 +2895,13 @@ public class RocksDB {
       private long transactionOrUpdateId;
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
-      public exists_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public exists_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
+        this.context = context;
       }
 
       @Override
@@ -2785,6 +2911,7 @@ public class RocksDB {
         args.setTransactionOrUpdateId(transactionOrUpdateId);
         args.setColumnId(columnId);
         args.setKeys(keys);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2801,9 +2928,9 @@ public class RocksDB {
     }
 
     @Override
-    public void existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
+    public void existsMulti(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      existsMulti_call method_call = new existsMulti_call(transactionId, columnId, keysMulti, timeoutMs, resultHandler, this, ___protocolFactory, ___transport);
+      existsMulti_call method_call = new existsMulti_call(transactionId, columnId, keysMulti, timeoutMs, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2813,12 +2940,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
       private long timeoutMs;
-      public existsMulti_call(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public existsMulti_call(long transactionId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionId = transactionId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
         this.timeoutMs = timeoutMs;
+        this.context = context;
       }
 
       @Override
@@ -2829,6 +2958,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
         args.setTimeoutMs(timeoutMs);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2845,9 +2975,9 @@ public class RocksDB {
     }
 
     @Override
-    public void openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+    public void openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      openIterator_call method_call = new openIterator_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, resultHandler, this, ___protocolFactory, ___transport);
+      openIterator_call method_call = new openIterator_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2859,7 +2989,8 @@ public class RocksDB {
       private java.util.List<java.nio.ByteBuffer> endKeysExclusive;
       private boolean reverse;
       private long timeoutMs;
-      public openIterator_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public openIterator_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionId = transactionId;
         this.columnId = columnId;
@@ -2867,6 +2998,7 @@ public class RocksDB {
         this.endKeysExclusive = endKeysExclusive;
         this.reverse = reverse;
         this.timeoutMs = timeoutMs;
+        this.context = context;
       }
 
       @Override
@@ -2879,6 +3011,7 @@ public class RocksDB {
         args.setEndKeysExclusive(endKeysExclusive);
         args.setReverse(reverse);
         args.setTimeoutMs(timeoutMs);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2931,9 +3064,9 @@ public class RocksDB {
     }
 
     @Override
-    public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      seekTo_call method_call = new seekTo_call(iterationId, keys, resultHandler, this, ___protocolFactory, ___transport);
+      seekTo_call method_call = new seekTo_call(iterationId, keys, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2941,10 +3074,12 @@ public class RocksDB {
     public static class seekTo_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
       private long iterationId;
       private java.util.List<java.nio.ByteBuffer> keys;
-      public seekTo_call(long iterationId, java.util.List<java.nio.ByteBuffer> keys, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public seekTo_call(long iterationId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.iterationId = iterationId;
         this.keys = keys;
+        this.context = context;
       }
 
       @Override
@@ -2953,6 +3088,7 @@ public class RocksDB {
         seekTo_args args = new seekTo_args();
         args.setIterationId(iterationId);
         args.setKeys(keys);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -2970,9 +3106,9 @@ public class RocksDB {
     }
 
     @Override
-    public void subsequent(long iterationId, long skipCount, long takeCount, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void subsequent(long iterationId, long skipCount, long takeCount, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      subsequent_call method_call = new subsequent_call(iterationId, skipCount, takeCount, resultHandler, this, ___protocolFactory, ___transport);
+      subsequent_call method_call = new subsequent_call(iterationId, skipCount, takeCount, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -2981,11 +3117,13 @@ public class RocksDB {
       private long iterationId;
       private long skipCount;
       private long takeCount;
-      public subsequent_call(long iterationId, long skipCount, long takeCount, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public subsequent_call(long iterationId, long skipCount, long takeCount, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.iterationId = iterationId;
         this.skipCount = skipCount;
         this.takeCount = takeCount;
+        this.context = context;
       }
 
       @Override
@@ -2995,6 +3133,7 @@ public class RocksDB {
         args.setIterationId(iterationId);
         args.setSkipCount(skipCount);
         args.setTakeCount(takeCount);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3012,9 +3151,9 @@ public class RocksDB {
     }
 
     @Override
-    public void subsequentExists(long iterationId, long skipCount, long takeCount, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
+    public void subsequentExists(long iterationId, long skipCount, long takeCount, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      subsequentExists_call method_call = new subsequentExists_call(iterationId, skipCount, takeCount, resultHandler, this, ___protocolFactory, ___transport);
+      subsequentExists_call method_call = new subsequentExists_call(iterationId, skipCount, takeCount, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3023,11 +3162,13 @@ public class RocksDB {
       private long iterationId;
       private long skipCount;
       private long takeCount;
-      public subsequentExists_call(long iterationId, long skipCount, long takeCount, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public subsequentExists_call(long iterationId, long skipCount, long takeCount, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.iterationId = iterationId;
         this.skipCount = skipCount;
         this.takeCount = takeCount;
+        this.context = context;
       }
 
       @Override
@@ -3037,6 +3178,7 @@ public class RocksDB {
         args.setIterationId(iterationId);
         args.setSkipCount(skipCount);
         args.setTakeCount(takeCount);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3053,9 +3195,9 @@ public class RocksDB {
     }
 
     @Override
-    public void subsequentMultiGet(long iterationId, long skipCount, long takeCount, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
+    public void subsequentMultiGet(long iterationId, long skipCount, long takeCount, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      subsequentMultiGet_call method_call = new subsequentMultiGet_call(iterationId, skipCount, takeCount, resultHandler, this, ___protocolFactory, ___transport);
+      subsequentMultiGet_call method_call = new subsequentMultiGet_call(iterationId, skipCount, takeCount, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3064,11 +3206,13 @@ public class RocksDB {
       private long iterationId;
       private long skipCount;
       private long takeCount;
-      public subsequentMultiGet_call(long iterationId, long skipCount, long takeCount, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public subsequentMultiGet_call(long iterationId, long skipCount, long takeCount, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.iterationId = iterationId;
         this.skipCount = skipCount;
         this.takeCount = takeCount;
+        this.context = context;
       }
 
       @Override
@@ -3078,6 +3222,7 @@ public class RocksDB {
         args.setIterationId(iterationId);
         args.setSkipCount(skipCount);
         args.setTakeCount(takeCount);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3094,9 +3239,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void putBatch(long columnId, java.util.List<KV> data, PutBatchMode mode, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putBatch_call method_call = new putBatch_call(columnId, data, mode, resultHandler, this, ___protocolFactory, ___transport);
+      putBatch_call method_call = new putBatch_call(columnId, data, mode, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3105,11 +3250,13 @@ public class RocksDB {
       private long columnId;
       private java.util.List<KV> data;
       private PutBatchMode mode;
-      public putBatch_call(long columnId, java.util.List<KV> data, PutBatchMode mode, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putBatch_call(long columnId, java.util.List<KV> data, PutBatchMode mode, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.columnId = columnId;
         this.data = data;
         this.mode = mode;
+        this.context = context;
       }
 
       @Override
@@ -3119,6 +3266,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setData(data);
         args.setMode(mode);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3136,9 +3284,9 @@ public class RocksDB {
     }
 
     @Override
-    public void merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void merge(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      merge_call method_call = new merge_call(transactionOrUpdateId, columnId, keys, value, resultHandler, this, ___protocolFactory, ___transport);
+      merge_call method_call = new merge_call(transactionOrUpdateId, columnId, keys, value, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3148,12 +3296,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
       private java.nio.ByteBuffer value;
-      public merge_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public merge_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
         this.value = value;
+        this.context = context;
       }
 
       @Override
@@ -3164,6 +3314,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeys(keys);
         args.setValue(value);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3181,9 +3332,9 @@ public class RocksDB {
     }
 
     @Override
-    public void mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void mergeMulti(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      mergeMulti_call method_call = new mergeMulti_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, resultHandler, this, ___protocolFactory, ___transport);
+      mergeMulti_call method_call = new mergeMulti_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3193,12 +3344,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
       private java.util.List<java.nio.ByteBuffer> valueMulti;
-      public mergeMulti_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public mergeMulti_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
         this.valueMulti = valueMulti;
+        this.context = context;
       }
 
       @Override
@@ -3209,6 +3362,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
         args.setValueMulti(valueMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3226,9 +3380,9 @@ public class RocksDB {
     }
 
     @Override
-    public void mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void mergeBatch(long columnId, java.util.List<KV> data, MergeBatchMode mode, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      mergeBatch_call method_call = new mergeBatch_call(columnId, data, mode, resultHandler, this, ___protocolFactory, ___transport);
+      mergeBatch_call method_call = new mergeBatch_call(columnId, data, mode, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3237,11 +3391,13 @@ public class RocksDB {
       private long columnId;
       private java.util.List<KV> data;
       private MergeBatchMode mode;
-      public mergeBatch_call(long columnId, java.util.List<KV> data, MergeBatchMode mode, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public mergeBatch_call(long columnId, java.util.List<KV> data, MergeBatchMode mode, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.columnId = columnId;
         this.data = data;
         this.mode = mode;
+        this.context = context;
       }
 
       @Override
@@ -3251,6 +3407,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setData(data);
         args.setMode(mode);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3268,9 +3425,9 @@ public class RocksDB {
     }
 
     @Override
-    public void deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void deleteRange(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      deleteRange_call method_call = new deleteRange_call(columnId, startKeysInclusive, endKeysExclusive, resultHandler, this, ___protocolFactory, ___transport);
+      deleteRange_call method_call = new deleteRange_call(columnId, startKeysInclusive, endKeysExclusive, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3279,11 +3436,13 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> startKeysInclusive;
       private java.util.List<java.nio.ByteBuffer> endKeysExclusive;
-      public deleteRange_call(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public deleteRange_call(long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.columnId = columnId;
         this.startKeysInclusive = startKeysInclusive;
         this.endKeysExclusive = endKeysExclusive;
+        this.context = context;
       }
 
       @Override
@@ -3293,6 +3452,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setStartKeysInclusive(startKeysInclusive);
         args.setEndKeysExclusive(endKeysExclusive);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3310,9 +3470,9 @@ public class RocksDB {
     }
 
     @Override
-    public void mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
+    public void mergeGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      mergeGetMerged_call method_call = new mergeGetMerged_call(transactionOrUpdateId, columnId, keys, value, resultHandler, this, ___protocolFactory, ___transport);
+      mergeGetMerged_call method_call = new mergeGetMerged_call(transactionOrUpdateId, columnId, keys, value, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3322,12 +3482,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.nio.ByteBuffer> keys;
       private java.nio.ByteBuffer value;
-      public mergeGetMerged_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public mergeGetMerged_call(long transactionOrUpdateId, long columnId, java.util.List<java.nio.ByteBuffer> keys, java.nio.ByteBuffer value, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keys = keys;
         this.value = value;
+        this.context = context;
       }
 
       @Override
@@ -3338,6 +3500,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeys(keys);
         args.setValue(value);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3354,9 +3517,9 @@ public class RocksDB {
     }
 
     @Override
-    public void mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
+    public void mergeMultiGetMerged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      mergeMultiGetMerged_call method_call = new mergeMultiGetMerged_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, resultHandler, this, ___protocolFactory, ___transport);
+      mergeMultiGetMerged_call method_call = new mergeMultiGetMerged_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3366,12 +3529,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
       private java.util.List<java.nio.ByteBuffer> valueMulti;
-      public mergeMultiGetMerged_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public mergeMultiGetMerged_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
         this.valueMulti = valueMulti;
+        this.context = context;
       }
 
       @Override
@@ -3382,6 +3547,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
         args.setValueMulti(valueMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3398,9 +3564,9 @@ public class RocksDB {
     }
 
     @Override
-    public void reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<FirstAndLast> resultHandler) throws org.apache.thrift.TException {
+    public void reduceRangeFirstAndLast(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<FirstAndLast> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      reduceRangeFirstAndLast_call method_call = new reduceRangeFirstAndLast_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, resultHandler, this, ___protocolFactory, ___transport);
+      reduceRangeFirstAndLast_call method_call = new reduceRangeFirstAndLast_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3412,7 +3578,8 @@ public class RocksDB {
       private java.util.List<java.nio.ByteBuffer> endKeysExclusive;
       private boolean reverse;
       private long timeoutMs;
-      public reduceRangeFirstAndLast_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<FirstAndLast> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public reduceRangeFirstAndLast_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<FirstAndLast> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionId = transactionId;
         this.columnId = columnId;
@@ -3420,6 +3587,7 @@ public class RocksDB {
         this.endKeysExclusive = endKeysExclusive;
         this.reverse = reverse;
         this.timeoutMs = timeoutMs;
+        this.context = context;
       }
 
       @Override
@@ -3432,6 +3600,7 @@ public class RocksDB {
         args.setEndKeysExclusive(endKeysExclusive);
         args.setReverse(reverse);
         args.setTimeoutMs(timeoutMs);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3448,9 +3617,9 @@ public class RocksDB {
     }
 
     @Override
-    public void reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+    public void reduceRangeEntriesCount(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      reduceRangeEntriesCount_call method_call = new reduceRangeEntriesCount_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, resultHandler, this, ___protocolFactory, ___transport);
+      reduceRangeEntriesCount_call method_call = new reduceRangeEntriesCount_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3462,7 +3631,8 @@ public class RocksDB {
       private java.util.List<java.nio.ByteBuffer> endKeysExclusive;
       private boolean reverse;
       private long timeoutMs;
-      public reduceRangeEntriesCount_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public reduceRangeEntriesCount_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionId = transactionId;
         this.columnId = columnId;
@@ -3470,6 +3640,7 @@ public class RocksDB {
         this.endKeysExclusive = endKeysExclusive;
         this.reverse = reverse;
         this.timeoutMs = timeoutMs;
+        this.context = context;
       }
 
       @Override
@@ -3482,6 +3653,7 @@ public class RocksDB {
         args.setEndKeysExclusive(endKeysExclusive);
         args.setReverse(reverse);
         args.setTimeoutMs(timeoutMs);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3498,9 +3670,9 @@ public class RocksDB {
     }
 
     @Override
-    public void getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException {
+    public void getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      getAllInRange_call method_call = new getAllInRange_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, resultHandler, this, ___protocolFactory, ___transport);
+      getAllInRange_call method_call = new getAllInRange_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3512,7 +3684,8 @@ public class RocksDB {
       private java.util.List<java.nio.ByteBuffer> endKeysExclusive;
       private boolean reverse;
       private long timeoutMs;
-      public getAllInRange_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public getAllInRange_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionId = transactionId;
         this.columnId = columnId;
@@ -3520,6 +3693,7 @@ public class RocksDB {
         this.endKeysExclusive = endKeysExclusive;
         this.reverse = reverse;
         this.timeoutMs = timeoutMs;
+        this.context = context;
       }
 
       @Override
@@ -3532,6 +3706,7 @@ public class RocksDB {
         args.setEndKeysExclusive(endKeysExclusive);
         args.setReverse(reverse);
         args.setTimeoutMs(timeoutMs);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3548,9 +3723,9 @@ public class RocksDB {
     }
 
     @Override
-    public void getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException {
+    public void getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      getAllInRangeNoCache_call method_call = new getAllInRangeNoCache_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, resultHandler, this, ___protocolFactory, ___transport);
+      getAllInRangeNoCache_call method_call = new getAllInRangeNoCache_call(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3562,7 +3737,8 @@ public class RocksDB {
       private java.util.List<java.nio.ByteBuffer> endKeysExclusive;
       private boolean reverse;
       private long timeoutMs;
-      public getAllInRangeNoCache_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public getAllInRangeNoCache_call(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long timeoutMs, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionId = transactionId;
         this.columnId = columnId;
@@ -3570,6 +3746,7 @@ public class RocksDB {
         this.endKeysExclusive = endKeysExclusive;
         this.reverse = reverse;
         this.timeoutMs = timeoutMs;
+        this.context = context;
       }
 
       @Override
@@ -3582,6 +3759,7 @@ public class RocksDB {
         args.setEndKeysExclusive(endKeysExclusive);
         args.setReverse(reverse);
         args.setTimeoutMs(timeoutMs);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3598,9 +3776,9 @@ public class RocksDB {
     }
 
     @Override
-    public void uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+    public void uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      uploadMergeOperator_call method_call = new uploadMergeOperator_call(operatorName, className, jarPayload, resultHandler, this, ___protocolFactory, ___transport);
+      uploadMergeOperator_call method_call = new uploadMergeOperator_call(operatorName, className, jarPayload, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3609,11 +3787,13 @@ public class RocksDB {
       private java.lang.String operatorName;
       private java.lang.String className;
       private java.nio.ByteBuffer jarPayload;
-      public uploadMergeOperator_call(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public uploadMergeOperator_call(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.operatorName = operatorName;
         this.className = className;
         this.jarPayload = jarPayload;
+        this.context = context;
       }
 
       @Override
@@ -3623,6 +3803,7 @@ public class RocksDB {
         args.setOperatorName(operatorName);
         args.setClassName(className);
         args.setJarPayload(jarPayload);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3639,9 +3820,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
+    public void putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putMultiGetPrevious_call method_call = new putMultiGetPrevious_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, resultHandler, this, ___protocolFactory, ___transport);
+      putMultiGetPrevious_call method_call = new putMultiGetPrevious_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3651,12 +3832,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
       private java.util.List<java.nio.ByteBuffer> valueMulti;
-      public putMultiGetPrevious_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putMultiGetPrevious_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
         this.valueMulti = valueMulti;
+        this.context = context;
       }
 
       @Override
@@ -3667,6 +3850,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
         args.setValueMulti(valueMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3683,9 +3867,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Delta>> resultHandler) throws org.apache.thrift.TException {
+    public void putMultiGetDelta(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Delta>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putMultiGetDelta_call method_call = new putMultiGetDelta_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, resultHandler, this, ___protocolFactory, ___transport);
+      putMultiGetDelta_call method_call = new putMultiGetDelta_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3695,12 +3879,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
       private java.util.List<java.nio.ByteBuffer> valueMulti;
-      public putMultiGetDelta_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Delta>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putMultiGetDelta_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Delta>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
         this.valueMulti = valueMulti;
+        this.context = context;
       }
 
       @Override
@@ -3711,6 +3897,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
         args.setValueMulti(valueMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3727,9 +3914,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
+    public void putMultiGetChanged(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putMultiGetChanged_call method_call = new putMultiGetChanged_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, resultHandler, this, ___protocolFactory, ___transport);
+      putMultiGetChanged_call method_call = new putMultiGetChanged_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3739,12 +3926,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
       private java.util.List<java.nio.ByteBuffer> valueMulti;
-      public putMultiGetChanged_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putMultiGetChanged_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
         this.valueMulti = valueMulti;
+        this.context = context;
       }
 
       @Override
@@ -3755,6 +3944,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
         args.setValueMulti(valueMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3771,9 +3961,9 @@ public class RocksDB {
     }
 
     @Override
-    public void putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
+    public void putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      putMultiGetPreviousPresence_call method_call = new putMultiGetPreviousPresence_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, resultHandler, this, ___protocolFactory, ___transport);
+      putMultiGetPreviousPresence_call method_call = new putMultiGetPreviousPresence_call(transactionOrUpdateId, columnId, keysMulti, valueMulti, context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -3783,12 +3973,14 @@ public class RocksDB {
       private long columnId;
       private java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti;
       private java.util.List<java.nio.ByteBuffer> valueMulti;
-      public putMultiGetPreviousPresence_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public putMultiGetPreviousPresence_call(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.transactionOrUpdateId = transactionOrUpdateId;
         this.columnId = columnId;
         this.keysMulti = keysMulti;
         this.valueMulti = valueMulti;
+        this.context = context;
       }
 
       @Override
@@ -3799,6 +3991,7 @@ public class RocksDB {
         args.setColumnId(columnId);
         args.setKeysMulti(keysMulti);
         args.setValueMulti(valueMulti);
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3881,22 +4074,25 @@ public class RocksDB {
     }
 
     @Override
-    public void getAllColumnDefinitions(org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler) throws org.apache.thrift.TException {
+    public void getAllColumnDefinitions(RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      getAllColumnDefinitions_call method_call = new getAllColumnDefinitions_call(resultHandler, this, ___protocolFactory, ___transport);
+      getAllColumnDefinitions_call method_call = new getAllColumnDefinitions_call(context, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class getAllColumnDefinitions_call extends org.apache.thrift.async.TAsyncMethodCall<java.util.List<Column>> {
-      public getAllColumnDefinitions_call(org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private RequestContext context;
+      public getAllColumnDefinitions_call(RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
+        this.context = context;
       }
 
       @Override
       public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("getAllColumnDefinitions", org.apache.thrift.protocol.TMessageType.CALL, 0));
         getAllColumnDefinitions_args args = new getAllColumnDefinitions_args();
+        args.setContext(context);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -4225,7 +4421,7 @@ public class RocksDB {
       public openTransaction_result getResult(I iface, openTransaction_args args) throws org.apache.thrift.TException {
         openTransaction_result result = getEmptyResultInstance();
         try {
-          result.success = iface.openTransaction(args.timeoutMs);
+          result.success = iface.openTransaction(args.timeoutMs, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -4263,7 +4459,7 @@ public class RocksDB {
       public closeTransaction_result getResult(I iface, closeTransaction_args args) throws org.apache.thrift.TException {
         closeTransaction_result result = getEmptyResultInstance();
         try {
-          result.success = iface.closeTransaction(args.transactionId, args.commit);
+          result.success = iface.closeTransaction(args.transactionId, args.commit, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -4338,7 +4534,7 @@ public class RocksDB {
       public createColumn_result getResult(I iface, createColumn_args args) throws org.apache.thrift.TException {
         createColumn_result result = getEmptyResultInstance();
         try {
-          result.success = iface.createColumn(args.name, args.schema);
+          result.success = iface.createColumn(args.name, args.schema, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -4376,7 +4572,7 @@ public class RocksDB {
       public deleteColumn_result getResult(I iface, deleteColumn_args args) throws org.apache.thrift.TException {
         deleteColumn_result result = getEmptyResultInstance();
         try {
-          iface.deleteColumn(args.columnId);
+          iface.deleteColumn(args.columnId, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -4413,7 +4609,7 @@ public class RocksDB {
       public deleteColumnIfExists_result getResult(I iface, deleteColumnIfExists_args args) throws org.apache.thrift.TException {
         deleteColumnIfExists_result result = getEmptyResultInstance();
         try {
-          result.success = iface.deleteColumnIfExists(args.name);
+          result.success = iface.deleteColumnIfExists(args.name, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -4451,7 +4647,7 @@ public class RocksDB {
       public getColumnId_result getResult(I iface, getColumnId_args args) throws org.apache.thrift.TException {
         getColumnId_result result = getEmptyResultInstance();
         try {
-          result.success = iface.getColumnId(args.name);
+          result.success = iface.getColumnId(args.name, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -4489,7 +4685,7 @@ public class RocksDB {
       public estimateNumKeys_result getResult(I iface, estimateNumKeys_args args) throws org.apache.thrift.TException {
         estimateNumKeys_result result = getEmptyResultInstance();
         try {
-          result.success = iface.estimateNumKeys(args.columnId);
+          result.success = iface.estimateNumKeys(args.columnId, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -4498,7 +4694,7 @@ public class RocksDB {
       }
     }
 
-    public static class putFast<I extends Iface> extends org.apache.thrift.ProcessFunction<I, putFast_args, org.apache.thrift.TBase> {
+    public static class putFast<I extends Iface> extends org.apache.thrift.ProcessFunction<I, putFast_args, putFast_result> {
       public putFast() {
         super("putFast");
       }
@@ -4510,7 +4706,7 @@ public class RocksDB {
 
       @Override
       public boolean isOneway() {
-        return true;
+        return false;
       }
 
       @Override
@@ -4519,14 +4715,19 @@ public class RocksDB {
       }
 
       @Override
-      public org.apache.thrift.TBase getEmptyResultInstance() {
-        return null;
+      public putFast_result getEmptyResultInstance() {
+        return new putFast_result();
       }
 
       @Override
-      public org.apache.thrift.TBase getResult(I iface, putFast_args args) throws org.apache.thrift.TException {
-        iface.putFast(args.transactionOrUpdateId, args.columnId, args.keys, args.value);
-        return null;
+      public putFast_result getResult(I iface, putFast_args args) throws org.apache.thrift.TException {
+        putFast_result result = getEmptyResultInstance();
+        try {
+          iface.putFast(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context);
+        } catch (RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
       }
     }
 
@@ -4559,7 +4760,7 @@ public class RocksDB {
       public put_result getResult(I iface, put_args args) throws org.apache.thrift.TException {
         put_result result = getEmptyResultInstance();
         try {
-          iface.put(args.transactionOrUpdateId, args.columnId, args.keys, args.value);
+          iface.put(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -4596,7 +4797,7 @@ public class RocksDB {
       public putMulti_result getResult(I iface, putMulti_args args) throws org.apache.thrift.TException {
         putMulti_result result = getEmptyResultInstance();
         try {
-          iface.putMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti);
+          iface.putMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -4633,7 +4834,7 @@ public class RocksDB {
       public putGetPrevious_result getResult(I iface, putGetPrevious_args args) throws org.apache.thrift.TException {
         putGetPrevious_result result = getEmptyResultInstance();
         try {
-          result.success = iface.putGetPrevious(args.transactionOrUpdateId, args.columnId, args.keys, args.value);
+          result.success = iface.putGetPrevious(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -4670,7 +4871,7 @@ public class RocksDB {
       public putGetDelta_result getResult(I iface, putGetDelta_args args) throws org.apache.thrift.TException {
         putGetDelta_result result = getEmptyResultInstance();
         try {
-          result.success = iface.putGetDelta(args.transactionOrUpdateId, args.columnId, args.keys, args.value);
+          result.success = iface.putGetDelta(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -4707,7 +4908,7 @@ public class RocksDB {
       public putGetChanged_result getResult(I iface, putGetChanged_args args) throws org.apache.thrift.TException {
         putGetChanged_result result = getEmptyResultInstance();
         try {
-          result.success = iface.putGetChanged(args.transactionOrUpdateId, args.columnId, args.keys, args.value);
+          result.success = iface.putGetChanged(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -4745,7 +4946,7 @@ public class RocksDB {
       public putGetPreviousPresence_result getResult(I iface, putGetPreviousPresence_args args) throws org.apache.thrift.TException {
         putGetPreviousPresence_result result = getEmptyResultInstance();
         try {
-          result.success = iface.putGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keys, args.value);
+          result.success = iface.putGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -4783,7 +4984,7 @@ public class RocksDB {
       public delete_result getResult(I iface, delete_args args) throws org.apache.thrift.TException {
         delete_result result = getEmptyResultInstance();
         try {
-          iface.delete(args.transactionOrUpdateId, args.columnId, args.keys);
+          iface.delete(args.transactionOrUpdateId, args.columnId, args.keys, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -4820,7 +5021,7 @@ public class RocksDB {
       public deleteGetPrevious_result getResult(I iface, deleteGetPrevious_args args) throws org.apache.thrift.TException {
         deleteGetPrevious_result result = getEmptyResultInstance();
         try {
-          result.success = iface.deleteGetPrevious(args.transactionOrUpdateId, args.columnId, args.keys);
+          result.success = iface.deleteGetPrevious(args.transactionOrUpdateId, args.columnId, args.keys, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -4857,7 +5058,7 @@ public class RocksDB {
       public deleteGetPreviousPresence_result getResult(I iface, deleteGetPreviousPresence_args args) throws org.apache.thrift.TException {
         deleteGetPreviousPresence_result result = getEmptyResultInstance();
         try {
-          result.success = iface.deleteGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keys);
+          result.success = iface.deleteGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keys, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -4895,7 +5096,7 @@ public class RocksDB {
       public deleteMulti_result getResult(I iface, deleteMulti_args args) throws org.apache.thrift.TException {
         deleteMulti_result result = getEmptyResultInstance();
         try {
-          iface.deleteMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti);
+          iface.deleteMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -4932,7 +5133,7 @@ public class RocksDB {
       public deleteMultiGetPrevious_result getResult(I iface, deleteMultiGetPrevious_args args) throws org.apache.thrift.TException {
         deleteMultiGetPrevious_result result = getEmptyResultInstance();
         try {
-          result.success = iface.deleteMultiGetPrevious(args.transactionOrUpdateId, args.columnId, args.keysMulti);
+          result.success = iface.deleteMultiGetPrevious(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -4969,7 +5170,7 @@ public class RocksDB {
       public deleteMultiGetPreviousPresence_result getResult(I iface, deleteMultiGetPreviousPresence_args args) throws org.apache.thrift.TException {
         deleteMultiGetPreviousPresence_result result = getEmptyResultInstance();
         try {
-          result.success = iface.deleteMultiGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keysMulti);
+          result.success = iface.deleteMultiGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5006,7 +5207,7 @@ public class RocksDB {
       public get_result getResult(I iface, get_args args) throws org.apache.thrift.TException {
         get_result result = getEmptyResultInstance();
         try {
-          result.success = iface.get(args.transactionOrUpdateId, args.columnId, args.keys);
+          result.success = iface.get(args.transactionOrUpdateId, args.columnId, args.keys, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5043,7 +5244,7 @@ public class RocksDB {
       public getForUpdate_result getResult(I iface, getForUpdate_args args) throws org.apache.thrift.TException {
         getForUpdate_result result = getEmptyResultInstance();
         try {
-          result.success = iface.getForUpdate(args.transactionOrUpdateId, args.columnId, args.keys);
+          result.success = iface.getForUpdate(args.transactionOrUpdateId, args.columnId, args.keys, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5080,7 +5281,7 @@ public class RocksDB {
       public exists_result getResult(I iface, exists_args args) throws org.apache.thrift.TException {
         exists_result result = getEmptyResultInstance();
         try {
-          result.success = iface.exists(args.transactionOrUpdateId, args.columnId, args.keys);
+          result.success = iface.exists(args.transactionOrUpdateId, args.columnId, args.keys, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -5118,7 +5319,7 @@ public class RocksDB {
       public existsMulti_result getResult(I iface, existsMulti_args args) throws org.apache.thrift.TException {
         existsMulti_result result = getEmptyResultInstance();
         try {
-          result.success = iface.existsMulti(args.transactionId, args.columnId, args.keysMulti, args.timeoutMs);
+          result.success = iface.existsMulti(args.transactionId, args.columnId, args.keysMulti, args.timeoutMs, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5155,7 +5356,7 @@ public class RocksDB {
       public openIterator_result getResult(I iface, openIterator_args args) throws org.apache.thrift.TException {
         openIterator_result result = getEmptyResultInstance();
         try {
-          result.success = iface.openIterator(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs);
+          result.success = iface.openIterator(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -5230,7 +5431,7 @@ public class RocksDB {
       public seekTo_result getResult(I iface, seekTo_args args) throws org.apache.thrift.TException {
         seekTo_result result = getEmptyResultInstance();
         try {
-          iface.seekTo(args.iterationId, args.keys);
+          iface.seekTo(args.iterationId, args.keys, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5267,7 +5468,7 @@ public class RocksDB {
       public subsequent_result getResult(I iface, subsequent_args args) throws org.apache.thrift.TException {
         subsequent_result result = getEmptyResultInstance();
         try {
-          iface.subsequent(args.iterationId, args.skipCount, args.takeCount);
+          iface.subsequent(args.iterationId, args.skipCount, args.takeCount, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5304,7 +5505,7 @@ public class RocksDB {
       public subsequentExists_result getResult(I iface, subsequentExists_args args) throws org.apache.thrift.TException {
         subsequentExists_result result = getEmptyResultInstance();
         try {
-          result.success = iface.subsequentExists(args.iterationId, args.skipCount, args.takeCount);
+          result.success = iface.subsequentExists(args.iterationId, args.skipCount, args.takeCount, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -5342,7 +5543,7 @@ public class RocksDB {
       public subsequentMultiGet_result getResult(I iface, subsequentMultiGet_args args) throws org.apache.thrift.TException {
         subsequentMultiGet_result result = getEmptyResultInstance();
         try {
-          result.success = iface.subsequentMultiGet(args.iterationId, args.skipCount, args.takeCount);
+          result.success = iface.subsequentMultiGet(args.iterationId, args.skipCount, args.takeCount, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5379,7 +5580,7 @@ public class RocksDB {
       public putBatch_result getResult(I iface, putBatch_args args) throws org.apache.thrift.TException {
         putBatch_result result = getEmptyResultInstance();
         try {
-          iface.putBatch(args.columnId, args.data, args.mode);
+          iface.putBatch(args.columnId, args.data, args.mode, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5416,7 +5617,7 @@ public class RocksDB {
       public merge_result getResult(I iface, merge_args args) throws org.apache.thrift.TException {
         merge_result result = getEmptyResultInstance();
         try {
-          iface.merge(args.transactionOrUpdateId, args.columnId, args.keys, args.value);
+          iface.merge(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5453,7 +5654,7 @@ public class RocksDB {
       public mergeMulti_result getResult(I iface, mergeMulti_args args) throws org.apache.thrift.TException {
         mergeMulti_result result = getEmptyResultInstance();
         try {
-          iface.mergeMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti);
+          iface.mergeMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5490,7 +5691,7 @@ public class RocksDB {
       public mergeBatch_result getResult(I iface, mergeBatch_args args) throws org.apache.thrift.TException {
         mergeBatch_result result = getEmptyResultInstance();
         try {
-          iface.mergeBatch(args.columnId, args.data, args.mode);
+          iface.mergeBatch(args.columnId, args.data, args.mode, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5527,7 +5728,7 @@ public class RocksDB {
       public deleteRange_result getResult(I iface, deleteRange_args args) throws org.apache.thrift.TException {
         deleteRange_result result = getEmptyResultInstance();
         try {
-          iface.deleteRange(args.columnId, args.startKeysInclusive, args.endKeysExclusive);
+          iface.deleteRange(args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5564,7 +5765,7 @@ public class RocksDB {
       public mergeGetMerged_result getResult(I iface, mergeGetMerged_args args) throws org.apache.thrift.TException {
         mergeGetMerged_result result = getEmptyResultInstance();
         try {
-          result.success = iface.mergeGetMerged(args.transactionOrUpdateId, args.columnId, args.keys, args.value);
+          result.success = iface.mergeGetMerged(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5601,7 +5802,7 @@ public class RocksDB {
       public mergeMultiGetMerged_result getResult(I iface, mergeMultiGetMerged_args args) throws org.apache.thrift.TException {
         mergeMultiGetMerged_result result = getEmptyResultInstance();
         try {
-          result.success = iface.mergeMultiGetMerged(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti);
+          result.success = iface.mergeMultiGetMerged(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5638,7 +5839,7 @@ public class RocksDB {
       public reduceRangeFirstAndLast_result getResult(I iface, reduceRangeFirstAndLast_args args) throws org.apache.thrift.TException {
         reduceRangeFirstAndLast_result result = getEmptyResultInstance();
         try {
-          result.success = iface.reduceRangeFirstAndLast(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs);
+          result.success = iface.reduceRangeFirstAndLast(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5675,7 +5876,7 @@ public class RocksDB {
       public reduceRangeEntriesCount_result getResult(I iface, reduceRangeEntriesCount_args args) throws org.apache.thrift.TException {
         reduceRangeEntriesCount_result result = getEmptyResultInstance();
         try {
-          result.success = iface.reduceRangeEntriesCount(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs);
+          result.success = iface.reduceRangeEntriesCount(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -5713,7 +5914,7 @@ public class RocksDB {
       public getAllInRange_result getResult(I iface, getAllInRange_args args) throws org.apache.thrift.TException {
         getAllInRange_result result = getEmptyResultInstance();
         try {
-          result.success = iface.getAllInRange(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs);
+          result.success = iface.getAllInRange(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5750,7 +5951,7 @@ public class RocksDB {
       public getAllInRangeNoCache_result getResult(I iface, getAllInRangeNoCache_args args) throws org.apache.thrift.TException {
         getAllInRangeNoCache_result result = getEmptyResultInstance();
         try {
-          result.success = iface.getAllInRangeNoCache(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs);
+          result.success = iface.getAllInRangeNoCache(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5787,7 +5988,7 @@ public class RocksDB {
       public uploadMergeOperator_result getResult(I iface, uploadMergeOperator_args args) throws org.apache.thrift.TException {
         uploadMergeOperator_result result = getEmptyResultInstance();
         try {
-          result.success = iface.uploadMergeOperator(args.operatorName, args.className, args.jarPayload);
+          result.success = iface.uploadMergeOperator(args.operatorName, args.className, args.jarPayload, args.context);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -5825,7 +6026,7 @@ public class RocksDB {
       public putMultiGetPrevious_result getResult(I iface, putMultiGetPrevious_args args) throws org.apache.thrift.TException {
         putMultiGetPrevious_result result = getEmptyResultInstance();
         try {
-          result.success = iface.putMultiGetPrevious(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti);
+          result.success = iface.putMultiGetPrevious(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5862,7 +6063,7 @@ public class RocksDB {
       public putMultiGetDelta_result getResult(I iface, putMultiGetDelta_args args) throws org.apache.thrift.TException {
         putMultiGetDelta_result result = getEmptyResultInstance();
         try {
-          result.success = iface.putMultiGetDelta(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti);
+          result.success = iface.putMultiGetDelta(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5899,7 +6100,7 @@ public class RocksDB {
       public putMultiGetChanged_result getResult(I iface, putMultiGetChanged_args args) throws org.apache.thrift.TException {
         putMultiGetChanged_result result = getEmptyResultInstance();
         try {
-          result.success = iface.putMultiGetChanged(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti);
+          result.success = iface.putMultiGetChanged(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5936,7 +6137,7 @@ public class RocksDB {
       public putMultiGetPreviousPresence_result getResult(I iface, putMultiGetPreviousPresence_args args) throws org.apache.thrift.TException {
         putMultiGetPreviousPresence_result result = getEmptyResultInstance();
         try {
-          result.success = iface.putMultiGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti);
+          result.success = iface.putMultiGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -6047,7 +6248,7 @@ public class RocksDB {
       public getAllColumnDefinitions_result getResult(I iface, getAllColumnDefinitions_args args) throws org.apache.thrift.TException {
         getAllColumnDefinitions_result result = getEmptyResultInstance();
         try {
-          result.success = iface.getAllColumnDefinitions();
+          result.success = iface.getAllColumnDefinitions(args.context);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -6424,7 +6625,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, openTransaction_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
-        iface.openTransaction(args.timeoutMs,resultHandler);
+        iface.openTransaction(args.timeoutMs, args.context,resultHandler);
       }
     }
 
@@ -6501,7 +6702,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, closeTransaction_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
-        iface.closeTransaction(args.transactionId, args.commit,resultHandler);
+        iface.closeTransaction(args.transactionId, args.commit, args.context,resultHandler);
       }
     }
 
@@ -6653,7 +6854,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, createColumn_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
-        iface.createColumn(args.name, args.schema,resultHandler);
+        iface.createColumn(args.name, args.schema, args.context,resultHandler);
       }
     }
 
@@ -6728,7 +6929,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, deleteColumn_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.deleteColumn(args.columnId,resultHandler);
+        iface.deleteColumn(args.columnId, args.context,resultHandler);
       }
     }
 
@@ -6805,7 +7006,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, deleteColumnIfExists_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
-        iface.deleteColumnIfExists(args.name,resultHandler);
+        iface.deleteColumnIfExists(args.name, args.context,resultHandler);
       }
     }
 
@@ -6882,7 +7083,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, getColumnId_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
-        iface.getColumnId(args.name,resultHandler);
+        iface.getColumnId(args.name, args.context,resultHandler);
       }
     }
 
@@ -6959,18 +7160,18 @@ public class RocksDB {
 
       @Override
       public void start(I iface, estimateNumKeys_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
-        iface.estimateNumKeys(args.columnId,resultHandler);
+        iface.estimateNumKeys(args.columnId, args.context,resultHandler);
       }
     }
 
-    public static class putFast<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, putFast_args, Void, org.apache.thrift.TBase> {
+    public static class putFast<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, putFast_args, Void, putFast_result> {
       public putFast() {
         super("putFast");
       }
 
       @Override
-      public org.apache.thrift.TBase getEmptyResultInstance() {
-        return null;
+      public putFast_result getEmptyResultInstance() {
+        return new putFast_result();
       }
 
       @Override
@@ -6984,14 +7185,44 @@ public class RocksDB {
         return new org.apache.thrift.async.AsyncMethodCallback<Void>() {
           @Override
           public void onComplete(Void o) {
+            putFast_result result = new putFast_result();
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
           }
           @Override
           public void onError(java.lang.Exception e) {
-            if (e instanceof org.apache.thrift.transport.TTransportException) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            putFast_result result = new putFast_result();
+            if (e instanceof RocksDBThriftException) {
+              result.e = (RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
               _LOGGER.error("TTransportException inside handler", e);
               fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
             } else {
-              _LOGGER.error("Exception inside oneway handler", e);
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
             }
           }
         };
@@ -6999,12 +7230,12 @@ public class RocksDB {
 
       @Override
       public boolean isOneway() {
-        return true;
+        return false;
       }
 
       @Override
       public void start(I iface, putFast_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.putFast(args.transactionOrUpdateId, args.columnId, args.keys, args.value,resultHandler);
+        iface.putFast(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context,resultHandler);
       }
     }
 
@@ -7079,7 +7310,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, put_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.put(args.transactionOrUpdateId, args.columnId, args.keys, args.value,resultHandler);
+        iface.put(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context,resultHandler);
       }
     }
 
@@ -7154,7 +7385,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putMulti_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.putMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti,resultHandler);
+        iface.putMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context,resultHandler);
       }
     }
 
@@ -7230,7 +7461,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putGetPrevious_args args, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
-        iface.putGetPrevious(args.transactionOrUpdateId, args.columnId, args.keys, args.value,resultHandler);
+        iface.putGetPrevious(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context,resultHandler);
       }
     }
 
@@ -7306,7 +7537,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putGetDelta_args args, org.apache.thrift.async.AsyncMethodCallback<Delta> resultHandler) throws org.apache.thrift.TException {
-        iface.putGetDelta(args.transactionOrUpdateId, args.columnId, args.keys, args.value,resultHandler);
+        iface.putGetDelta(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context,resultHandler);
       }
     }
 
@@ -7383,7 +7614,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putGetChanged_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
-        iface.putGetChanged(args.transactionOrUpdateId, args.columnId, args.keys, args.value,resultHandler);
+        iface.putGetChanged(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context,resultHandler);
       }
     }
 
@@ -7460,7 +7691,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putGetPreviousPresence_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
-        iface.putGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keys, args.value,resultHandler);
+        iface.putGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context,resultHandler);
       }
     }
 
@@ -7535,7 +7766,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, delete_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.delete(args.transactionOrUpdateId, args.columnId, args.keys,resultHandler);
+        iface.delete(args.transactionOrUpdateId, args.columnId, args.keys, args.context,resultHandler);
       }
     }
 
@@ -7611,7 +7842,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, deleteGetPrevious_args args, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
-        iface.deleteGetPrevious(args.transactionOrUpdateId, args.columnId, args.keys,resultHandler);
+        iface.deleteGetPrevious(args.transactionOrUpdateId, args.columnId, args.keys, args.context,resultHandler);
       }
     }
 
@@ -7688,7 +7919,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, deleteGetPreviousPresence_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
-        iface.deleteGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keys,resultHandler);
+        iface.deleteGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keys, args.context,resultHandler);
       }
     }
 
@@ -7763,7 +7994,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, deleteMulti_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.deleteMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti,resultHandler);
+        iface.deleteMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.context,resultHandler);
       }
     }
 
@@ -7839,7 +8070,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, deleteMultiGetPrevious_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
-        iface.deleteMultiGetPrevious(args.transactionOrUpdateId, args.columnId, args.keysMulti,resultHandler);
+        iface.deleteMultiGetPrevious(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.context,resultHandler);
       }
     }
 
@@ -7915,7 +8146,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, deleteMultiGetPreviousPresence_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
-        iface.deleteMultiGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keysMulti,resultHandler);
+        iface.deleteMultiGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.context,resultHandler);
       }
     }
 
@@ -7991,7 +8222,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, get_args args, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
-        iface.get(args.transactionOrUpdateId, args.columnId, args.keys,resultHandler);
+        iface.get(args.transactionOrUpdateId, args.columnId, args.keys, args.context,resultHandler);
       }
     }
 
@@ -8067,7 +8298,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, getForUpdate_args args, org.apache.thrift.async.AsyncMethodCallback<UpdateBegin> resultHandler) throws org.apache.thrift.TException {
-        iface.getForUpdate(args.transactionOrUpdateId, args.columnId, args.keys,resultHandler);
+        iface.getForUpdate(args.transactionOrUpdateId, args.columnId, args.keys, args.context,resultHandler);
       }
     }
 
@@ -8144,7 +8375,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, exists_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
-        iface.exists(args.transactionOrUpdateId, args.columnId, args.keys,resultHandler);
+        iface.exists(args.transactionOrUpdateId, args.columnId, args.keys, args.context,resultHandler);
       }
     }
 
@@ -8220,7 +8451,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, existsMulti_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
-        iface.existsMulti(args.transactionId, args.columnId, args.keysMulti, args.timeoutMs,resultHandler);
+        iface.existsMulti(args.transactionId, args.columnId, args.keysMulti, args.timeoutMs, args.context,resultHandler);
       }
     }
 
@@ -8297,7 +8528,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, openIterator_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
-        iface.openIterator(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs,resultHandler);
+        iface.openIterator(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context,resultHandler);
       }
     }
 
@@ -8447,7 +8678,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, seekTo_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.seekTo(args.iterationId, args.keys,resultHandler);
+        iface.seekTo(args.iterationId, args.keys, args.context,resultHandler);
       }
     }
 
@@ -8522,7 +8753,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, subsequent_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.subsequent(args.iterationId, args.skipCount, args.takeCount,resultHandler);
+        iface.subsequent(args.iterationId, args.skipCount, args.takeCount, args.context,resultHandler);
       }
     }
 
@@ -8599,7 +8830,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, subsequentExists_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException {
-        iface.subsequentExists(args.iterationId, args.skipCount, args.takeCount,resultHandler);
+        iface.subsequentExists(args.iterationId, args.skipCount, args.takeCount, args.context,resultHandler);
       }
     }
 
@@ -8675,7 +8906,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, subsequentMultiGet_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
-        iface.subsequentMultiGet(args.iterationId, args.skipCount, args.takeCount,resultHandler);
+        iface.subsequentMultiGet(args.iterationId, args.skipCount, args.takeCount, args.context,resultHandler);
       }
     }
 
@@ -8750,7 +8981,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putBatch_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.putBatch(args.columnId, args.data, args.mode,resultHandler);
+        iface.putBatch(args.columnId, args.data, args.mode, args.context,resultHandler);
       }
     }
 
@@ -8825,7 +9056,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, merge_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.merge(args.transactionOrUpdateId, args.columnId, args.keys, args.value,resultHandler);
+        iface.merge(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context,resultHandler);
       }
     }
 
@@ -8900,7 +9131,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, mergeMulti_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.mergeMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti,resultHandler);
+        iface.mergeMulti(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context,resultHandler);
       }
     }
 
@@ -8975,7 +9206,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, mergeBatch_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.mergeBatch(args.columnId, args.data, args.mode,resultHandler);
+        iface.mergeBatch(args.columnId, args.data, args.mode, args.context,resultHandler);
       }
     }
 
@@ -9050,7 +9281,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, deleteRange_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.deleteRange(args.columnId, args.startKeysInclusive, args.endKeysExclusive,resultHandler);
+        iface.deleteRange(args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.context,resultHandler);
       }
     }
 
@@ -9126,7 +9357,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, mergeGetMerged_args args, org.apache.thrift.async.AsyncMethodCallback<OptionalBinary> resultHandler) throws org.apache.thrift.TException {
-        iface.mergeGetMerged(args.transactionOrUpdateId, args.columnId, args.keys, args.value,resultHandler);
+        iface.mergeGetMerged(args.transactionOrUpdateId, args.columnId, args.keys, args.value, args.context,resultHandler);
       }
     }
 
@@ -9202,7 +9433,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, mergeMultiGetMerged_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
-        iface.mergeMultiGetMerged(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti,resultHandler);
+        iface.mergeMultiGetMerged(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context,resultHandler);
       }
     }
 
@@ -9278,7 +9509,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, reduceRangeFirstAndLast_args args, org.apache.thrift.async.AsyncMethodCallback<FirstAndLast> resultHandler) throws org.apache.thrift.TException {
-        iface.reduceRangeFirstAndLast(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs,resultHandler);
+        iface.reduceRangeFirstAndLast(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context,resultHandler);
       }
     }
 
@@ -9355,7 +9586,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, reduceRangeEntriesCount_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
-        iface.reduceRangeEntriesCount(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs,resultHandler);
+        iface.reduceRangeEntriesCount(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context,resultHandler);
       }
     }
 
@@ -9431,7 +9662,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, getAllInRange_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException {
-        iface.getAllInRange(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs,resultHandler);
+        iface.getAllInRange(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context,resultHandler);
       }
     }
 
@@ -9507,7 +9738,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, getAllInRangeNoCache_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException {
-        iface.getAllInRangeNoCache(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs,resultHandler);
+        iface.getAllInRangeNoCache(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.timeoutMs, args.context,resultHandler);
       }
     }
 
@@ -9584,7 +9815,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, uploadMergeOperator_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
-        iface.uploadMergeOperator(args.operatorName, args.className, args.jarPayload,resultHandler);
+        iface.uploadMergeOperator(args.operatorName, args.className, args.jarPayload, args.context,resultHandler);
       }
     }
 
@@ -9660,7 +9891,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putMultiGetPrevious_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<OptionalBinary>> resultHandler) throws org.apache.thrift.TException {
-        iface.putMultiGetPrevious(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti,resultHandler);
+        iface.putMultiGetPrevious(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context,resultHandler);
       }
     }
 
@@ -9736,7 +9967,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putMultiGetDelta_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Delta>> resultHandler) throws org.apache.thrift.TException {
-        iface.putMultiGetDelta(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti,resultHandler);
+        iface.putMultiGetDelta(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context,resultHandler);
       }
     }
 
@@ -9812,7 +10043,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putMultiGetChanged_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
-        iface.putMultiGetChanged(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti,resultHandler);
+        iface.putMultiGetChanged(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context,resultHandler);
       }
     }
 
@@ -9888,7 +10119,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, putMultiGetPreviousPresence_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException {
-        iface.putMultiGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti,resultHandler);
+        iface.putMultiGetPreviousPresence(args.transactionOrUpdateId, args.columnId, args.keysMulti, args.valueMulti, args.context,resultHandler);
       }
     }
 
@@ -10114,7 +10345,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, getAllColumnDefinitions_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler) throws org.apache.thrift.TException {
-        iface.getAllColumnDefinitions(resultHandler);
+        iface.getAllColumnDefinitions(args.context,resultHandler);
       }
     }
 
@@ -10581,15 +10812,18 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("openTransaction_args");
 
     private static final org.apache.thrift.protocol.TField TIMEOUT_MS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutMs", org.apache.thrift.protocol.TType.I64, (short)1);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)2);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new openTransaction_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new openTransaction_argsTupleSchemeFactory();
 
     public long timeoutMs; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-      TIMEOUT_MS((short)1, "timeoutMs");
+      TIMEOUT_MS((short)1, "timeoutMs"),
+      CONTEXT((short)2, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -10607,6 +10841,8 @@ public class RocksDB {
         switch(fieldId) {
           case 1: // TIMEOUT_MS
             return TIMEOUT_MS;
+          case 2: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -10657,6 +10893,8 @@ public class RocksDB {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
       tmpMap.put(_Fields.TIMEOUT_MS, new org.apache.thrift.meta_data.FieldMetaData("timeoutMs", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(openTransaction_args.class, metaDataMap);
     }
@@ -10665,11 +10903,13 @@ public class RocksDB {
     }
 
     public openTransaction_args(
-      long timeoutMs)
+      long timeoutMs,
+      RequestContext context)
     {
       this();
       this.timeoutMs = timeoutMs;
       setTimeoutMsIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -10678,6 +10918,9 @@ public class RocksDB {
     public openTransaction_args(openTransaction_args other) {
       __isset_bitfield = other.__isset_bitfield;
       this.timeoutMs = other.timeoutMs;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -10689,6 +10932,7 @@ public class RocksDB {
     public void clear() {
       setTimeoutMsIsSet(false);
       this.timeoutMs = 0;
+      this.context = null;
     }
 
     public long getTimeoutMs() {
@@ -10714,6 +10958,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TIMEOUTMS_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public openTransaction_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -10722,6 +10991,14 @@ public class RocksDB {
           unsetTimeoutMs();
         } else {
           setTimeoutMs((java.lang.Long)value);
+        }
+        break;
+
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
         }
         break;
 
@@ -10734,6 +11011,9 @@ public class RocksDB {
       switch (field) {
       case TIMEOUT_MS:
         return getTimeoutMs();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -10749,6 +11029,8 @@ public class RocksDB {
       switch (field) {
       case TIMEOUT_MS:
         return isSetTimeoutMs();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -10775,6 +11057,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -10783,6 +11074,10 @@ public class RocksDB {
       int hashCode = 1;
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(timeoutMs);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -10801,6 +11096,16 @@ public class RocksDB {
       }
       if (isSetTimeoutMs()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.timeoutMs, other.timeoutMs);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -10832,6 +11137,14 @@ public class RocksDB {
       sb.append("timeoutMs:");
       sb.append(this.timeoutMs);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -10839,7 +11152,13 @@ public class RocksDB {
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
       // alas, we cannot check 'timeoutMs' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -10888,6 +11207,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 2: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -10910,6 +11238,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TIMEOUT_MS_FIELD_DESC);
         oprot.writeI64(struct.timeoutMs);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -10929,6 +11262,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, openTransaction_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeI64(struct.timeoutMs);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -10936,6 +11270,9 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.timeoutMs = iprot.readI64();
         struct.setTimeoutMsIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -11432,17 +11769,20 @@ public class RocksDB {
 
     private static final org.apache.thrift.protocol.TField TRANSACTION_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COMMIT_FIELD_DESC = new org.apache.thrift.protocol.TField("commit", org.apache.thrift.protocol.TType.BOOL, (short)2);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)3);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new closeTransaction_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new closeTransaction_argsTupleSchemeFactory();
 
     public long transactionId; // required
     public boolean commit; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_ID((short)1, "transactionId"),
-      COMMIT((short)2, "commit");
+      COMMIT((short)2, "commit"),
+      CONTEXT((short)3, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -11462,6 +11802,8 @@ public class RocksDB {
             return TRANSACTION_ID;
           case 2: // COMMIT
             return COMMIT;
+          case 3: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -11515,6 +11857,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
       tmpMap.put(_Fields.COMMIT, new org.apache.thrift.meta_data.FieldMetaData("commit", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(closeTransaction_args.class, metaDataMap);
     }
@@ -11524,13 +11868,15 @@ public class RocksDB {
 
     public closeTransaction_args(
       long transactionId,
-      boolean commit)
+      boolean commit,
+      RequestContext context)
     {
       this();
       this.transactionId = transactionId;
       setTransactionIdIsSet(true);
       this.commit = commit;
       setCommitIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -11540,6 +11886,9 @@ public class RocksDB {
       __isset_bitfield = other.__isset_bitfield;
       this.transactionId = other.transactionId;
       this.commit = other.commit;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -11553,6 +11902,7 @@ public class RocksDB {
       this.transactionId = 0;
       setCommitIsSet(false);
       this.commit = false;
+      this.context = null;
     }
 
     public long getTransactionId() {
@@ -11601,6 +11951,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __COMMIT_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public closeTransaction_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -11620,6 +11995,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -11632,6 +12015,9 @@ public class RocksDB {
 
       case COMMIT:
         return isCommit();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -11649,6 +12035,8 @@ public class RocksDB {
         return isSetTransactionId();
       case COMMIT:
         return isSetCommit();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -11684,6 +12072,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -11694,6 +12091,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(transactionId);
 
       hashCode = hashCode * 8191 + ((commit) ? 131071 : 524287);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -11722,6 +12123,16 @@ public class RocksDB {
       }
       if (isSetCommit()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.commit, other.commit);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -11757,6 +12168,14 @@ public class RocksDB {
       sb.append("commit:");
       sb.append(this.commit);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -11765,7 +12184,13 @@ public class RocksDB {
       // check for required fields
       // alas, we cannot check 'transactionId' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'commit' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -11822,6 +12247,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 3: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -11850,6 +12284,11 @@ public class RocksDB {
         oprot.writeFieldBegin(COMMIT_FIELD_DESC);
         oprot.writeBool(struct.commit);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -11870,6 +12309,7 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeI64(struct.transactionId);
         oprot.writeBool(struct.commit);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -11879,6 +12319,9 @@ public class RocksDB {
         struct.setTransactionIdIsSet(true);
         struct.commit = iprot.readBool();
         struct.setCommitIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -13123,17 +13566,20 @@ public class RocksDB {
 
     private static final org.apache.thrift.protocol.TField NAME_FIELD_DESC = new org.apache.thrift.protocol.TField("name", org.apache.thrift.protocol.TType.STRING, (short)1);
     private static final org.apache.thrift.protocol.TField SCHEMA_FIELD_DESC = new org.apache.thrift.protocol.TField("schema", org.apache.thrift.protocol.TType.STRUCT, (short)2);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)3);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new createColumn_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new createColumn_argsTupleSchemeFactory();
 
     public @org.apache.thrift.annotation.Nullable java.lang.String name; // required
     public @org.apache.thrift.annotation.Nullable ColumnSchema schema; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       NAME((short)1, "name"),
-      SCHEMA((short)2, "schema");
+      SCHEMA((short)2, "schema"),
+      CONTEXT((short)3, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -13153,6 +13599,8 @@ public class RocksDB {
             return NAME;
           case 2: // SCHEMA
             return SCHEMA;
+          case 3: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -13203,6 +13651,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
       tmpMap.put(_Fields.SCHEMA, new org.apache.thrift.meta_data.FieldMetaData("schema", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, ColumnSchema.class)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(createColumn_args.class, metaDataMap);
     }
@@ -13212,11 +13662,13 @@ public class RocksDB {
 
     public createColumn_args(
       java.lang.String name,
-      ColumnSchema schema)
+      ColumnSchema schema,
+      RequestContext context)
     {
       this();
       this.name = name;
       this.schema = schema;
+      this.context = context;
     }
 
     /**
@@ -13229,6 +13681,9 @@ public class RocksDB {
       if (other.isSetSchema()) {
         this.schema = new ColumnSchema(other.schema);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -13240,6 +13695,7 @@ public class RocksDB {
     public void clear() {
       this.name = null;
       this.schema = null;
+      this.context = null;
     }
 
     @org.apache.thrift.annotation.Nullable
@@ -13292,6 +13748,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public createColumn_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -13311,6 +13792,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -13323,6 +13812,9 @@ public class RocksDB {
 
       case SCHEMA:
         return getSchema();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -13340,6 +13832,8 @@ public class RocksDB {
         return isSetName();
       case SCHEMA:
         return isSetSchema();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -13375,6 +13869,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -13389,6 +13892,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetSchema()) ? 131071 : 524287);
       if (isSetSchema())
         hashCode = hashCode * 8191 + schema.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -13417,6 +13924,16 @@ public class RocksDB {
       }
       if (isSetSchema()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.schema, other.schema);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -13460,6 +13977,14 @@ public class RocksDB {
         sb.append(this.schema);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -13472,9 +13997,15 @@ public class RocksDB {
       if (schema == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'schema' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
       if (schema != null) {
         schema.validate();
+      }
+      if (context != null) {
+        context.validate();
       }
     }
 
@@ -13531,6 +14062,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 3: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -13557,6 +14097,11 @@ public class RocksDB {
           struct.schema.write(oprot);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -13577,6 +14122,7 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeString(struct.name);
         struct.schema.write(oprot);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -13587,6 +14133,9 @@ public class RocksDB {
         struct.schema = new ColumnSchema();
         struct.schema.read(iprot);
         struct.setSchemaIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -14082,15 +14631,18 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("deleteColumn_args");
 
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)1);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)2);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteColumn_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteColumn_argsTupleSchemeFactory();
 
     public long columnId; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-      COLUMN_ID((short)1, "columnId");
+      COLUMN_ID((short)1, "columnId"),
+      CONTEXT((short)2, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -14108,6 +14660,8 @@ public class RocksDB {
         switch(fieldId) {
           case 1: // COLUMN_ID
             return COLUMN_ID;
+          case 2: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -14158,6 +14712,8 @@ public class RocksDB {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
       tmpMap.put(_Fields.COLUMN_ID, new org.apache.thrift.meta_data.FieldMetaData("columnId", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteColumn_args.class, metaDataMap);
     }
@@ -14166,11 +14722,13 @@ public class RocksDB {
     }
 
     public deleteColumn_args(
-      long columnId)
+      long columnId,
+      RequestContext context)
     {
       this();
       this.columnId = columnId;
       setColumnIdIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -14179,6 +14737,9 @@ public class RocksDB {
     public deleteColumn_args(deleteColumn_args other) {
       __isset_bitfield = other.__isset_bitfield;
       this.columnId = other.columnId;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -14190,6 +14751,7 @@ public class RocksDB {
     public void clear() {
       setColumnIdIsSet(false);
       this.columnId = 0;
+      this.context = null;
     }
 
     public long getColumnId() {
@@ -14215,6 +14777,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __COLUMNID_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public deleteColumn_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -14223,6 +14810,14 @@ public class RocksDB {
           unsetColumnId();
         } else {
           setColumnId((java.lang.Long)value);
+        }
+        break;
+
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
         }
         break;
 
@@ -14235,6 +14830,9 @@ public class RocksDB {
       switch (field) {
       case COLUMN_ID:
         return getColumnId();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -14250,6 +14848,8 @@ public class RocksDB {
       switch (field) {
       case COLUMN_ID:
         return isSetColumnId();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -14276,6 +14876,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -14284,6 +14893,10 @@ public class RocksDB {
       int hashCode = 1;
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(columnId);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -14302,6 +14915,16 @@ public class RocksDB {
       }
       if (isSetColumnId()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.columnId, other.columnId);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -14333,6 +14956,14 @@ public class RocksDB {
       sb.append("columnId:");
       sb.append(this.columnId);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -14340,7 +14971,13 @@ public class RocksDB {
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
       // alas, we cannot check 'columnId' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -14389,6 +15026,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 2: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -14411,6 +15057,11 @@ public class RocksDB {
         oprot.writeFieldBegin(COLUMN_ID_FIELD_DESC);
         oprot.writeI64(struct.columnId);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -14430,6 +15081,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, deleteColumn_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeI64(struct.columnId);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -14437,6 +15089,9 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -14830,15 +15485,18 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("deleteColumnIfExists_args");
 
     private static final org.apache.thrift.protocol.TField NAME_FIELD_DESC = new org.apache.thrift.protocol.TField("name", org.apache.thrift.protocol.TType.STRING, (short)1);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)2);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteColumnIfExists_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteColumnIfExists_argsTupleSchemeFactory();
 
     public @org.apache.thrift.annotation.Nullable java.lang.String name; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-      NAME((short)1, "name");
+      NAME((short)1, "name"),
+      CONTEXT((short)2, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -14856,6 +15514,8 @@ public class RocksDB {
         switch(fieldId) {
           case 1: // NAME
             return NAME;
+          case 2: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -14904,6 +15564,8 @@ public class RocksDB {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
       tmpMap.put(_Fields.NAME, new org.apache.thrift.meta_data.FieldMetaData("name", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteColumnIfExists_args.class, metaDataMap);
     }
@@ -14912,10 +15574,12 @@ public class RocksDB {
     }
 
     public deleteColumnIfExists_args(
-      java.lang.String name)
+      java.lang.String name,
+      RequestContext context)
     {
       this();
       this.name = name;
+      this.context = context;
     }
 
     /**
@@ -14924,6 +15588,9 @@ public class RocksDB {
     public deleteColumnIfExists_args(deleteColumnIfExists_args other) {
       if (other.isSetName()) {
         this.name = other.name;
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
       }
     }
 
@@ -14935,6 +15602,7 @@ public class RocksDB {
     @Override
     public void clear() {
       this.name = null;
+      this.context = null;
     }
 
     @org.apache.thrift.annotation.Nullable
@@ -14962,6 +15630,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public deleteColumnIfExists_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -14970,6 +15663,14 @@ public class RocksDB {
           unsetName();
         } else {
           setName((java.lang.String)value);
+        }
+        break;
+
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
         }
         break;
 
@@ -14982,6 +15683,9 @@ public class RocksDB {
       switch (field) {
       case NAME:
         return getName();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -14997,6 +15701,8 @@ public class RocksDB {
       switch (field) {
       case NAME:
         return isSetName();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -15023,6 +15729,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -15033,6 +15748,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetName()) ? 131071 : 524287);
       if (isSetName())
         hashCode = hashCode * 8191 + name.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -15051,6 +15770,16 @@ public class RocksDB {
       }
       if (isSetName()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.name, other.name);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -15086,6 +15815,14 @@ public class RocksDB {
         sb.append(this.name);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -15095,7 +15832,13 @@ public class RocksDB {
       if (name == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'name' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -15142,6 +15885,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 2: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -15163,6 +15915,11 @@ public class RocksDB {
           oprot.writeString(struct.name);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -15182,6 +15939,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, deleteColumnIfExists_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeString(struct.name);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -15189,6 +15947,9 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.name = iprot.readString();
         struct.setNameIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -15684,15 +16445,18 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("getColumnId_args");
 
     private static final org.apache.thrift.protocol.TField NAME_FIELD_DESC = new org.apache.thrift.protocol.TField("name", org.apache.thrift.protocol.TType.STRING, (short)1);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)2);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new getColumnId_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new getColumnId_argsTupleSchemeFactory();
 
     public @org.apache.thrift.annotation.Nullable java.lang.String name; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-      NAME((short)1, "name");
+      NAME((short)1, "name"),
+      CONTEXT((short)2, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -15710,6 +16474,8 @@ public class RocksDB {
         switch(fieldId) {
           case 1: // NAME
             return NAME;
+          case 2: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -15758,6 +16524,8 @@ public class RocksDB {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
       tmpMap.put(_Fields.NAME, new org.apache.thrift.meta_data.FieldMetaData("name", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(getColumnId_args.class, metaDataMap);
     }
@@ -15766,10 +16534,12 @@ public class RocksDB {
     }
 
     public getColumnId_args(
-      java.lang.String name)
+      java.lang.String name,
+      RequestContext context)
     {
       this();
       this.name = name;
+      this.context = context;
     }
 
     /**
@@ -15778,6 +16548,9 @@ public class RocksDB {
     public getColumnId_args(getColumnId_args other) {
       if (other.isSetName()) {
         this.name = other.name;
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
       }
     }
 
@@ -15789,6 +16562,7 @@ public class RocksDB {
     @Override
     public void clear() {
       this.name = null;
+      this.context = null;
     }
 
     @org.apache.thrift.annotation.Nullable
@@ -15816,6 +16590,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public getColumnId_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -15824,6 +16623,14 @@ public class RocksDB {
           unsetName();
         } else {
           setName((java.lang.String)value);
+        }
+        break;
+
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
         }
         break;
 
@@ -15836,6 +16643,9 @@ public class RocksDB {
       switch (field) {
       case NAME:
         return getName();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -15851,6 +16661,8 @@ public class RocksDB {
       switch (field) {
       case NAME:
         return isSetName();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -15877,6 +16689,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -15887,6 +16708,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetName()) ? 131071 : 524287);
       if (isSetName())
         hashCode = hashCode * 8191 + name.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -15905,6 +16730,16 @@ public class RocksDB {
       }
       if (isSetName()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.name, other.name);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -15940,6 +16775,14 @@ public class RocksDB {
         sb.append(this.name);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -15949,7 +16792,13 @@ public class RocksDB {
       if (name == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'name' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -15996,6 +16845,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 2: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -16017,6 +16875,11 @@ public class RocksDB {
           oprot.writeString(struct.name);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -16036,6 +16899,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, getColumnId_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeString(struct.name);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -16043,6 +16907,9 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.name = iprot.readString();
         struct.setNameIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -16538,15 +17405,18 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("estimateNumKeys_args");
 
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)1);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)2);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new estimateNumKeys_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new estimateNumKeys_argsTupleSchemeFactory();
 
     public long columnId; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-      COLUMN_ID((short)1, "columnId");
+      COLUMN_ID((short)1, "columnId"),
+      CONTEXT((short)2, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -16564,6 +17434,8 @@ public class RocksDB {
         switch(fieldId) {
           case 1: // COLUMN_ID
             return COLUMN_ID;
+          case 2: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -16614,6 +17486,8 @@ public class RocksDB {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
       tmpMap.put(_Fields.COLUMN_ID, new org.apache.thrift.meta_data.FieldMetaData("columnId", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(estimateNumKeys_args.class, metaDataMap);
     }
@@ -16622,11 +17496,13 @@ public class RocksDB {
     }
 
     public estimateNumKeys_args(
-      long columnId)
+      long columnId,
+      RequestContext context)
     {
       this();
       this.columnId = columnId;
       setColumnIdIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -16635,6 +17511,9 @@ public class RocksDB {
     public estimateNumKeys_args(estimateNumKeys_args other) {
       __isset_bitfield = other.__isset_bitfield;
       this.columnId = other.columnId;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -16646,6 +17525,7 @@ public class RocksDB {
     public void clear() {
       setColumnIdIsSet(false);
       this.columnId = 0;
+      this.context = null;
     }
 
     public long getColumnId() {
@@ -16671,6 +17551,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __COLUMNID_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public estimateNumKeys_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -16679,6 +17584,14 @@ public class RocksDB {
           unsetColumnId();
         } else {
           setColumnId((java.lang.Long)value);
+        }
+        break;
+
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
         }
         break;
 
@@ -16691,6 +17604,9 @@ public class RocksDB {
       switch (field) {
       case COLUMN_ID:
         return getColumnId();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -16706,6 +17622,8 @@ public class RocksDB {
       switch (field) {
       case COLUMN_ID:
         return isSetColumnId();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -16732,6 +17650,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -16740,6 +17667,10 @@ public class RocksDB {
       int hashCode = 1;
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(columnId);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -16758,6 +17689,16 @@ public class RocksDB {
       }
       if (isSetColumnId()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.columnId, other.columnId);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -16789,6 +17730,14 @@ public class RocksDB {
       sb.append("columnId:");
       sb.append(this.columnId);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -16796,7 +17745,13 @@ public class RocksDB {
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
       // alas, we cannot check 'columnId' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -16845,6 +17800,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 2: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -16867,6 +17831,11 @@ public class RocksDB {
         oprot.writeFieldBegin(COLUMN_ID_FIELD_DESC);
         oprot.writeI64(struct.columnId);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -16886,6 +17855,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, estimateNumKeys_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeI64(struct.columnId);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -16893,6 +17863,9 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -17391,6 +18364,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putFast_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putFast_argsTupleSchemeFactory();
@@ -17399,13 +18373,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
     public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS((short)3, "keys"),
-      VALUE((short)4, "value");
+      VALUE((short)4, "value"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -17429,6 +18405,8 @@ public class RocksDB {
             return KEYS;
           case 4: // VALUE
             return VALUE;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -17487,6 +18465,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
       tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putFast_args.class, metaDataMap);
     }
@@ -17498,7 +18478,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.nio.ByteBuffer> keys,
-      java.nio.ByteBuffer value)
+      java.nio.ByteBuffer value,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -17507,6 +18488,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keys = keys;
       this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
+      this.context = context;
     }
 
     /**
@@ -17523,6 +18505,9 @@ public class RocksDB {
       if (other.isSetValue()) {
         this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -17538,6 +18523,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keys = null;
       this.value = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -17661,6 +18647,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putFast_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -17700,6 +18711,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -17718,6 +18737,9 @@ public class RocksDB {
 
       case VALUE:
         return getValue();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -17739,6 +18761,8 @@ public class RocksDB {
         return isSetKeys();
       case VALUE:
         return isSetValue();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -17792,6 +18816,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -17810,6 +18843,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
       if (isSetValue())
         hashCode = hashCode * 8191 + value.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -17862,6 +18899,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -17909,6 +18956,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.value, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -17923,7 +18978,13 @@ public class RocksDB {
       if (value == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'value' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -18006,6 +19067,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -18051,6 +19121,11 @@ public class RocksDB {
           oprot.writeBinary(struct.value);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -18079,6 +19154,7 @@ public class RocksDB {
           }
         }
         oprot.writeBinary(struct.value);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -18101,6 +19177,389 @@ public class RocksDB {
         struct.setKeysIsSet(true);
         struct.value = iprot.readBinary();
         struct.setValueIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class putFast_result implements org.apache.thrift.TBase<putFast_result, putFast_result._Fields>, java.io.Serializable, Cloneable, Comparable<putFast_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("putFast_result");
+
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putFast_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putFast_resultTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putFast_result.class, metaDataMap);
+    }
+
+    public putFast_result() {
+    }
+
+    public putFast_result(
+      RocksDBThriftException e)
+    {
+      this();
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public putFast_result(putFast_result other) {
+      if (other.isSetE()) {
+        this.e = new RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public putFast_result deepCopy() {
+      return new putFast_result(this);
+    }
+
+    @Override
+    public void clear() {
+      this.e = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public putFast_result setE(@org.apache.thrift.annotation.Nullable RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof putFast_result)
+        return this.equals((putFast_result)that);
+      return false;
+    }
+
+    public boolean equals(putFast_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(putFast_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("putFast_result(");
+      boolean first = true;
+
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class putFast_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public putFast_resultStandardScheme getScheme() {
+        return new putFast_resultStandardScheme();
+      }
+    }
+
+    private static class putFast_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<putFast_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, putFast_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, putFast_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class putFast_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public putFast_resultTupleScheme getScheme() {
+        return new putFast_resultTupleScheme();
+      }
+    }
+
+    private static class putFast_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<putFast_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, putFast_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetE()) {
+          optionals.set(0);
+        }
+        oprot.writeBitSet(optionals, 1);
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, putFast_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(1);
+        if (incoming.get(0)) {
+          struct.e = new RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
       }
     }
 
@@ -18117,6 +19576,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new put_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new put_argsTupleSchemeFactory();
@@ -18125,13 +19585,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
     public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS((short)3, "keys"),
-      VALUE((short)4, "value");
+      VALUE((short)4, "value"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -18155,6 +19617,8 @@ public class RocksDB {
             return KEYS;
           case 4: // VALUE
             return VALUE;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -18213,6 +19677,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
       tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(put_args.class, metaDataMap);
     }
@@ -18224,7 +19690,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.nio.ByteBuffer> keys,
-      java.nio.ByteBuffer value)
+      java.nio.ByteBuffer value,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -18233,6 +19700,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keys = keys;
       this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
+      this.context = context;
     }
 
     /**
@@ -18249,6 +19717,9 @@ public class RocksDB {
       if (other.isSetValue()) {
         this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -18264,6 +19735,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keys = null;
       this.value = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -18387,6 +19859,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public put_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -18426,6 +19923,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -18444,6 +19949,9 @@ public class RocksDB {
 
       case VALUE:
         return getValue();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -18465,6 +19973,8 @@ public class RocksDB {
         return isSetKeys();
       case VALUE:
         return isSetValue();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -18518,6 +20028,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -18536,6 +20055,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
       if (isSetValue())
         hashCode = hashCode * 8191 + value.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -18588,6 +20111,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -18635,6 +20168,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.value, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -18649,7 +20190,13 @@ public class RocksDB {
       if (value == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'value' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -18732,6 +20279,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -18777,6 +20333,11 @@ public class RocksDB {
           oprot.writeBinary(struct.value);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -18805,6 +20366,7 @@ public class RocksDB {
           }
         }
         oprot.writeBinary(struct.value);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -18827,6 +20389,9 @@ public class RocksDB {
         struct.setKeysIsSet(true);
         struct.value = iprot.readBinary();
         struct.setValueIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -19223,6 +20788,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("valueMulti", org.apache.thrift.protocol.TType.LIST, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putMulti_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putMulti_argsTupleSchemeFactory();
@@ -19231,13 +20797,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> valueMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS_MULTI((short)3, "keysMulti"),
-      VALUE_MULTI((short)4, "valueMulti");
+      VALUE_MULTI((short)4, "valueMulti"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -19261,6 +20829,8 @@ public class RocksDB {
             return KEYS_MULTI;
           case 4: // VALUE_MULTI
             return VALUE_MULTI;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -19321,6 +20891,8 @@ public class RocksDB {
       tmpMap.put(_Fields.VALUE_MULTI, new org.apache.thrift.meta_data.FieldMetaData("valueMulti", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putMulti_args.class, metaDataMap);
     }
@@ -19332,7 +20904,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
-      java.util.List<java.nio.ByteBuffer> valueMulti)
+      java.util.List<java.nio.ByteBuffer> valueMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -19341,6 +20914,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
       this.valueMulti = valueMulti;
+      this.context = context;
     }
 
     /**
@@ -19362,6 +20936,9 @@ public class RocksDB {
         java.util.List<java.nio.ByteBuffer> __this__valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(other.valueMulti);
         this.valueMulti = __this__valueMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -19377,6 +20954,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keysMulti = null;
       this.valueMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -19507,6 +21085,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putMulti_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -19542,6 +21145,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -19560,6 +21171,9 @@ public class RocksDB {
 
       case VALUE_MULTI:
         return getValueMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -19581,6 +21195,8 @@ public class RocksDB {
         return isSetKeysMulti();
       case VALUE_MULTI:
         return isSetValueMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -19634,6 +21250,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -19652,6 +21277,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValueMulti()) ? 131071 : 524287);
       if (isSetValueMulti())
         hashCode = hashCode * 8191 + valueMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -19704,6 +21333,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -19751,6 +21390,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.valueMulti, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -19765,7 +21412,13 @@ public class RocksDB {
       if (valueMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'valueMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -19868,6 +21521,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -19927,6 +21589,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -19967,6 +21634,7 @@ public class RocksDB {
             oprot.writeBinary(_iter70);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -20007,6 +21675,9 @@ public class RocksDB {
           }
         }
         struct.setValueMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -20403,6 +22074,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putGetPrevious_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putGetPrevious_argsTupleSchemeFactory();
@@ -20411,13 +22083,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
     public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS((short)3, "keys"),
-      VALUE((short)4, "value");
+      VALUE((short)4, "value"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -20441,6 +22115,8 @@ public class RocksDB {
             return KEYS;
           case 4: // VALUE
             return VALUE;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -20499,6 +22175,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
       tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putGetPrevious_args.class, metaDataMap);
     }
@@ -20510,7 +22188,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.nio.ByteBuffer> keys,
-      java.nio.ByteBuffer value)
+      java.nio.ByteBuffer value,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -20519,6 +22198,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keys = keys;
       this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
+      this.context = context;
     }
 
     /**
@@ -20535,6 +22215,9 @@ public class RocksDB {
       if (other.isSetValue()) {
         this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -20550,6 +22233,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keys = null;
       this.value = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -20673,6 +22357,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putGetPrevious_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -20712,6 +22421,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -20730,6 +22447,9 @@ public class RocksDB {
 
       case VALUE:
         return getValue();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -20751,6 +22471,8 @@ public class RocksDB {
         return isSetKeys();
       case VALUE:
         return isSetValue();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -20804,6 +22526,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -20822,6 +22553,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
       if (isSetValue())
         hashCode = hashCode * 8191 + value.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -20874,6 +22609,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -20921,6 +22666,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.value, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -20935,7 +22688,13 @@ public class RocksDB {
       if (value == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'value' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -21018,6 +22777,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -21063,6 +22831,11 @@ public class RocksDB {
           oprot.writeBinary(struct.value);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -21091,6 +22864,7 @@ public class RocksDB {
           }
         }
         oprot.writeBinary(struct.value);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -21113,6 +22887,9 @@ public class RocksDB {
         struct.setKeysIsSet(true);
         struct.value = iprot.readBinary();
         struct.setValueIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -21619,6 +23396,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putGetDelta_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putGetDelta_argsTupleSchemeFactory();
@@ -21627,13 +23405,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
     public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS((short)3, "keys"),
-      VALUE((short)4, "value");
+      VALUE((short)4, "value"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -21657,6 +23437,8 @@ public class RocksDB {
             return KEYS;
           case 4: // VALUE
             return VALUE;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -21715,6 +23497,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
       tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putGetDelta_args.class, metaDataMap);
     }
@@ -21726,7 +23510,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.nio.ByteBuffer> keys,
-      java.nio.ByteBuffer value)
+      java.nio.ByteBuffer value,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -21735,6 +23520,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keys = keys;
       this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
+      this.context = context;
     }
 
     /**
@@ -21751,6 +23537,9 @@ public class RocksDB {
       if (other.isSetValue()) {
         this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -21766,6 +23555,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keys = null;
       this.value = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -21889,6 +23679,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putGetDelta_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -21928,6 +23743,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -21946,6 +23769,9 @@ public class RocksDB {
 
       case VALUE:
         return getValue();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -21967,6 +23793,8 @@ public class RocksDB {
         return isSetKeys();
       case VALUE:
         return isSetValue();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -22020,6 +23848,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -22038,6 +23875,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
       if (isSetValue())
         hashCode = hashCode * 8191 + value.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -22090,6 +23931,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -22137,6 +23988,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.value, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -22151,7 +24010,13 @@ public class RocksDB {
       if (value == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'value' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -22234,6 +24099,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -22279,6 +24153,11 @@ public class RocksDB {
           oprot.writeBinary(struct.value);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -22307,6 +24186,7 @@ public class RocksDB {
           }
         }
         oprot.writeBinary(struct.value);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -22329,6 +24209,9 @@ public class RocksDB {
         struct.setKeysIsSet(true);
         struct.value = iprot.readBinary();
         struct.setValueIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -22835,6 +24718,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putGetChanged_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putGetChanged_argsTupleSchemeFactory();
@@ -22843,13 +24727,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
     public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS((short)3, "keys"),
-      VALUE((short)4, "value");
+      VALUE((short)4, "value"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -22873,6 +24759,8 @@ public class RocksDB {
             return KEYS;
           case 4: // VALUE
             return VALUE;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -22931,6 +24819,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
       tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putGetChanged_args.class, metaDataMap);
     }
@@ -22942,7 +24832,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.nio.ByteBuffer> keys,
-      java.nio.ByteBuffer value)
+      java.nio.ByteBuffer value,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -22951,6 +24842,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keys = keys;
       this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
+      this.context = context;
     }
 
     /**
@@ -22967,6 +24859,9 @@ public class RocksDB {
       if (other.isSetValue()) {
         this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -22982,6 +24877,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keys = null;
       this.value = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -23105,6 +25001,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putGetChanged_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -23144,6 +25065,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -23162,6 +25091,9 @@ public class RocksDB {
 
       case VALUE:
         return getValue();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -23183,6 +25115,8 @@ public class RocksDB {
         return isSetKeys();
       case VALUE:
         return isSetValue();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -23236,6 +25170,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -23254,6 +25197,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
       if (isSetValue())
         hashCode = hashCode * 8191 + value.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -23306,6 +25253,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -23353,6 +25310,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.value, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -23367,7 +25332,13 @@ public class RocksDB {
       if (value == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'value' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -23450,6 +25421,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -23495,6 +25475,11 @@ public class RocksDB {
           oprot.writeBinary(struct.value);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -23523,6 +25508,7 @@ public class RocksDB {
           }
         }
         oprot.writeBinary(struct.value);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -23545,6 +25531,9 @@ public class RocksDB {
         struct.setKeysIsSet(true);
         struct.value = iprot.readBinary();
         struct.setValueIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -24043,6 +26032,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putGetPreviousPresence_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putGetPreviousPresence_argsTupleSchemeFactory();
@@ -24051,13 +26041,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
     public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS((short)3, "keys"),
-      VALUE((short)4, "value");
+      VALUE((short)4, "value"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -24081,6 +26073,8 @@ public class RocksDB {
             return KEYS;
           case 4: // VALUE
             return VALUE;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -24139,6 +26133,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
       tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putGetPreviousPresence_args.class, metaDataMap);
     }
@@ -24150,7 +26146,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.nio.ByteBuffer> keys,
-      java.nio.ByteBuffer value)
+      java.nio.ByteBuffer value,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -24159,6 +26156,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keys = keys;
       this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
+      this.context = context;
     }
 
     /**
@@ -24175,6 +26173,9 @@ public class RocksDB {
       if (other.isSetValue()) {
         this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -24190,6 +26191,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keys = null;
       this.value = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -24313,6 +26315,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putGetPreviousPresence_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -24352,6 +26379,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -24370,6 +26405,9 @@ public class RocksDB {
 
       case VALUE:
         return getValue();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -24391,6 +26429,8 @@ public class RocksDB {
         return isSetKeys();
       case VALUE:
         return isSetValue();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -24444,6 +26484,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -24462,6 +26511,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
       if (isSetValue())
         hashCode = hashCode * 8191 + value.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -24514,6 +26567,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -24561,6 +26624,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.value, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -24575,7 +26646,13 @@ public class RocksDB {
       if (value == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'value' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -24658,6 +26735,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -24703,6 +26789,11 @@ public class RocksDB {
           oprot.writeBinary(struct.value);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -24731,6 +26822,7 @@ public class RocksDB {
           }
         }
         oprot.writeBinary(struct.value);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -24753,6 +26845,9 @@ public class RocksDB {
         struct.setKeysIsSet(true);
         struct.value = iprot.readBinary();
         struct.setValueIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -25250,6 +27345,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField TRANSACTION_OR_UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionOrUpdateId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new delete_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new delete_argsTupleSchemeFactory();
@@ -25257,12 +27353,14 @@ public class RocksDB {
     public long transactionOrUpdateId; // required
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
-      KEYS((short)3, "keys");
+      KEYS((short)3, "keys"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -25284,6 +27382,8 @@ public class RocksDB {
             return COLUMN_ID;
           case 3: // KEYS
             return KEYS;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -25340,6 +27440,8 @@ public class RocksDB {
       tmpMap.put(_Fields.KEYS, new org.apache.thrift.meta_data.FieldMetaData("keys", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(delete_args.class, metaDataMap);
     }
@@ -25350,7 +27452,8 @@ public class RocksDB {
     public delete_args(
       long transactionOrUpdateId,
       long columnId,
-      java.util.List<java.nio.ByteBuffer> keys)
+      java.util.List<java.nio.ByteBuffer> keys,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -25358,6 +27461,7 @@ public class RocksDB {
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.keys = keys;
+      this.context = context;
     }
 
     /**
@@ -25370,6 +27474,9 @@ public class RocksDB {
       if (other.isSetKeys()) {
         java.util.List<java.nio.ByteBuffer> __this__keys = new java.util.ArrayList<java.nio.ByteBuffer>(other.keys);
         this.keys = __this__keys;
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
       }
     }
 
@@ -25385,6 +27492,7 @@ public class RocksDB {
       setColumnIdIsSet(false);
       this.columnId = 0;
       this.keys = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -25474,6 +27582,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public delete_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -25501,6 +27634,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -25516,6 +27657,9 @@ public class RocksDB {
 
       case KEYS:
         return getKeys();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -25535,6 +27679,8 @@ public class RocksDB {
         return isSetColumnId();
       case KEYS:
         return isSetKeys();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -25579,6 +27725,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -25593,6 +27748,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeys()) ? 131071 : 524287);
       if (isSetKeys())
         hashCode = hashCode * 8191 + keys.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -25631,6 +27790,16 @@ public class RocksDB {
       }
       if (isSetKeys()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keys, other.keys);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -25674,6 +27843,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.keys, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -25685,7 +27862,13 @@ public class RocksDB {
       if (keys == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keys' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -25760,6 +27943,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -25800,6 +27992,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -25827,6 +28024,7 @@ public class RocksDB {
             oprot.writeBinary(_iter116);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -25847,6 +28045,9 @@ public class RocksDB {
           }
         }
         struct.setKeysIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -26242,6 +28443,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField TRANSACTION_OR_UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionOrUpdateId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteGetPrevious_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteGetPrevious_argsTupleSchemeFactory();
@@ -26249,12 +28451,14 @@ public class RocksDB {
     public long transactionOrUpdateId; // required
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
-      KEYS((short)3, "keys");
+      KEYS((short)3, "keys"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -26276,6 +28480,8 @@ public class RocksDB {
             return COLUMN_ID;
           case 3: // KEYS
             return KEYS;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -26332,6 +28538,8 @@ public class RocksDB {
       tmpMap.put(_Fields.KEYS, new org.apache.thrift.meta_data.FieldMetaData("keys", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteGetPrevious_args.class, metaDataMap);
     }
@@ -26342,7 +28550,8 @@ public class RocksDB {
     public deleteGetPrevious_args(
       long transactionOrUpdateId,
       long columnId,
-      java.util.List<java.nio.ByteBuffer> keys)
+      java.util.List<java.nio.ByteBuffer> keys,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -26350,6 +28559,7 @@ public class RocksDB {
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.keys = keys;
+      this.context = context;
     }
 
     /**
@@ -26362,6 +28572,9 @@ public class RocksDB {
       if (other.isSetKeys()) {
         java.util.List<java.nio.ByteBuffer> __this__keys = new java.util.ArrayList<java.nio.ByteBuffer>(other.keys);
         this.keys = __this__keys;
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
       }
     }
 
@@ -26377,6 +28590,7 @@ public class RocksDB {
       setColumnIdIsSet(false);
       this.columnId = 0;
       this.keys = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -26466,6 +28680,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public deleteGetPrevious_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -26493,6 +28732,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -26508,6 +28755,9 @@ public class RocksDB {
 
       case KEYS:
         return getKeys();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -26527,6 +28777,8 @@ public class RocksDB {
         return isSetColumnId();
       case KEYS:
         return isSetKeys();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -26571,6 +28823,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -26585,6 +28846,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeys()) ? 131071 : 524287);
       if (isSetKeys())
         hashCode = hashCode * 8191 + keys.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -26623,6 +28888,16 @@ public class RocksDB {
       }
       if (isSetKeys()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keys, other.keys);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -26666,6 +28941,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.keys, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -26677,7 +28960,13 @@ public class RocksDB {
       if (keys == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keys' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -26752,6 +29041,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -26792,6 +29090,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -26819,6 +29122,7 @@ public class RocksDB {
             oprot.writeBinary(_iter124);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -26839,6 +29143,9 @@ public class RocksDB {
           }
         }
         struct.setKeysIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -27344,6 +29651,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField TRANSACTION_OR_UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionOrUpdateId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteGetPreviousPresence_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteGetPreviousPresence_argsTupleSchemeFactory();
@@ -27351,12 +29659,14 @@ public class RocksDB {
     public long transactionOrUpdateId; // required
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
-      KEYS((short)3, "keys");
+      KEYS((short)3, "keys"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -27378,6 +29688,8 @@ public class RocksDB {
             return COLUMN_ID;
           case 3: // KEYS
             return KEYS;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -27434,6 +29746,8 @@ public class RocksDB {
       tmpMap.put(_Fields.KEYS, new org.apache.thrift.meta_data.FieldMetaData("keys", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteGetPreviousPresence_args.class, metaDataMap);
     }
@@ -27444,7 +29758,8 @@ public class RocksDB {
     public deleteGetPreviousPresence_args(
       long transactionOrUpdateId,
       long columnId,
-      java.util.List<java.nio.ByteBuffer> keys)
+      java.util.List<java.nio.ByteBuffer> keys,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -27452,6 +29767,7 @@ public class RocksDB {
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.keys = keys;
+      this.context = context;
     }
 
     /**
@@ -27464,6 +29780,9 @@ public class RocksDB {
       if (other.isSetKeys()) {
         java.util.List<java.nio.ByteBuffer> __this__keys = new java.util.ArrayList<java.nio.ByteBuffer>(other.keys);
         this.keys = __this__keys;
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
       }
     }
 
@@ -27479,6 +29798,7 @@ public class RocksDB {
       setColumnIdIsSet(false);
       this.columnId = 0;
       this.keys = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -27568,6 +29888,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public deleteGetPreviousPresence_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -27595,6 +29940,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -27610,6 +29963,9 @@ public class RocksDB {
 
       case KEYS:
         return getKeys();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -27629,6 +29985,8 @@ public class RocksDB {
         return isSetColumnId();
       case KEYS:
         return isSetKeys();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -27673,6 +30031,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -27687,6 +30054,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeys()) ? 131071 : 524287);
       if (isSetKeys())
         hashCode = hashCode * 8191 + keys.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -27725,6 +30096,16 @@ public class RocksDB {
       }
       if (isSetKeys()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keys, other.keys);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -27768,6 +30149,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.keys, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -27779,7 +30168,13 @@ public class RocksDB {
       if (keys == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keys' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -27854,6 +30249,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -27894,6 +30298,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -27921,6 +30330,7 @@ public class RocksDB {
             oprot.writeBinary(_iter132);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -27941,6 +30351,9 @@ public class RocksDB {
           }
         }
         struct.setKeysIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -28438,6 +30851,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField TRANSACTION_OR_UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionOrUpdateId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteMulti_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteMulti_argsTupleSchemeFactory();
@@ -28445,12 +30859,14 @@ public class RocksDB {
     public long transactionOrUpdateId; // required
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
-      KEYS_MULTI((short)3, "keysMulti");
+      KEYS_MULTI((short)3, "keysMulti"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -28472,6 +30888,8 @@ public class RocksDB {
             return COLUMN_ID;
           case 3: // KEYS_MULTI
             return KEYS_MULTI;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -28529,6 +30947,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
                   new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING                  , true)))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteMulti_args.class, metaDataMap);
     }
@@ -28539,7 +30959,8 @@ public class RocksDB {
     public deleteMulti_args(
       long transactionOrUpdateId,
       long columnId,
-      java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti)
+      java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -28547,6 +30968,7 @@ public class RocksDB {
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
+      this.context = context;
     }
 
     /**
@@ -28564,6 +30986,9 @@ public class RocksDB {
         }
         this.keysMulti = __this__keysMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -28578,6 +31003,7 @@ public class RocksDB {
       setColumnIdIsSet(false);
       this.columnId = 0;
       this.keysMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -28667,6 +31093,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public deleteMulti_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -28694,6 +31145,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -28709,6 +31168,9 @@ public class RocksDB {
 
       case KEYS_MULTI:
         return getKeysMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -28728,6 +31190,8 @@ public class RocksDB {
         return isSetColumnId();
       case KEYS_MULTI:
         return isSetKeysMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -28772,6 +31236,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -28786,6 +31259,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeysMulti()) ? 131071 : 524287);
       if (isSetKeysMulti())
         hashCode = hashCode * 8191 + keysMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -28824,6 +31301,16 @@ public class RocksDB {
       }
       if (isSetKeysMulti()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keysMulti, other.keysMulti);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -28867,6 +31354,14 @@ public class RocksDB {
         sb.append(this.keysMulti);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -28878,7 +31373,13 @@ public class RocksDB {
       if (keysMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keysMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -28963,6 +31464,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -29010,6 +31520,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -29043,6 +31558,7 @@ public class RocksDB {
             }
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -29072,6 +31588,9 @@ public class RocksDB {
           }
         }
         struct.setKeysMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -29467,6 +31986,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField TRANSACTION_OR_UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionOrUpdateId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteMultiGetPrevious_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteMultiGetPrevious_argsTupleSchemeFactory();
@@ -29474,12 +31994,14 @@ public class RocksDB {
     public long transactionOrUpdateId; // required
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
-      KEYS_MULTI((short)3, "keysMulti");
+      KEYS_MULTI((short)3, "keysMulti"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -29501,6 +32023,8 @@ public class RocksDB {
             return COLUMN_ID;
           case 3: // KEYS_MULTI
             return KEYS_MULTI;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -29558,6 +32082,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
                   new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING                  , true)))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteMultiGetPrevious_args.class, metaDataMap);
     }
@@ -29568,7 +32094,8 @@ public class RocksDB {
     public deleteMultiGetPrevious_args(
       long transactionOrUpdateId,
       long columnId,
-      java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti)
+      java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -29576,6 +32103,7 @@ public class RocksDB {
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
+      this.context = context;
     }
 
     /**
@@ -29593,6 +32121,9 @@ public class RocksDB {
         }
         this.keysMulti = __this__keysMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -29607,6 +32138,7 @@ public class RocksDB {
       setColumnIdIsSet(false);
       this.columnId = 0;
       this.keysMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -29696,6 +32228,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public deleteMultiGetPrevious_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -29723,6 +32280,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -29738,6 +32303,9 @@ public class RocksDB {
 
       case KEYS_MULTI:
         return getKeysMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -29757,6 +32325,8 @@ public class RocksDB {
         return isSetColumnId();
       case KEYS_MULTI:
         return isSetKeysMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -29801,6 +32371,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -29815,6 +32394,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeysMulti()) ? 131071 : 524287);
       if (isSetKeysMulti())
         hashCode = hashCode * 8191 + keysMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -29853,6 +32436,16 @@ public class RocksDB {
       }
       if (isSetKeysMulti()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keysMulti, other.keysMulti);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -29896,6 +32489,14 @@ public class RocksDB {
         sb.append(this.keysMulti);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -29907,7 +32508,13 @@ public class RocksDB {
       if (keysMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keysMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -29992,6 +32599,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -30039,6 +32655,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -30072,6 +32693,7 @@ public class RocksDB {
             }
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -30101,6 +32723,9 @@ public class RocksDB {
           }
         }
         struct.setKeysMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -30656,6 +33281,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField TRANSACTION_OR_UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionOrUpdateId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteMultiGetPreviousPresence_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteMultiGetPreviousPresence_argsTupleSchemeFactory();
@@ -30663,12 +33289,14 @@ public class RocksDB {
     public long transactionOrUpdateId; // required
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
-      KEYS_MULTI((short)3, "keysMulti");
+      KEYS_MULTI((short)3, "keysMulti"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -30690,6 +33318,8 @@ public class RocksDB {
             return COLUMN_ID;
           case 3: // KEYS_MULTI
             return KEYS_MULTI;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -30747,6 +33377,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
                   new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING                  , true)))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteMultiGetPreviousPresence_args.class, metaDataMap);
     }
@@ -30757,7 +33389,8 @@ public class RocksDB {
     public deleteMultiGetPreviousPresence_args(
       long transactionOrUpdateId,
       long columnId,
-      java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti)
+      java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -30765,6 +33398,7 @@ public class RocksDB {
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
+      this.context = context;
     }
 
     /**
@@ -30782,6 +33416,9 @@ public class RocksDB {
         }
         this.keysMulti = __this__keysMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -30796,6 +33433,7 @@ public class RocksDB {
       setColumnIdIsSet(false);
       this.columnId = 0;
       this.keysMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -30885,6 +33523,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public deleteMultiGetPreviousPresence_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -30912,6 +33575,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -30927,6 +33598,9 @@ public class RocksDB {
 
       case KEYS_MULTI:
         return getKeysMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -30946,6 +33620,8 @@ public class RocksDB {
         return isSetColumnId();
       case KEYS_MULTI:
         return isSetKeysMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -30990,6 +33666,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -31004,6 +33689,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeysMulti()) ? 131071 : 524287);
       if (isSetKeysMulti())
         hashCode = hashCode * 8191 + keysMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -31042,6 +33731,16 @@ public class RocksDB {
       }
       if (isSetKeysMulti()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keysMulti, other.keysMulti);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -31085,6 +33784,14 @@ public class RocksDB {
         sb.append(this.keysMulti);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -31096,7 +33803,13 @@ public class RocksDB {
       if (keysMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keysMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -31181,6 +33894,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -31228,6 +33950,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -31261,6 +33988,7 @@ public class RocksDB {
             }
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -31290,6 +34018,9 @@ public class RocksDB {
           }
         }
         struct.setKeysMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -31840,6 +34571,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField TRANSACTION_OR_UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionOrUpdateId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new get_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new get_argsTupleSchemeFactory();
@@ -31847,12 +34579,14 @@ public class RocksDB {
     public long transactionOrUpdateId; // required
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
-      KEYS((short)3, "keys");
+      KEYS((short)3, "keys"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -31874,6 +34608,8 @@ public class RocksDB {
             return COLUMN_ID;
           case 3: // KEYS
             return KEYS;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -31930,6 +34666,8 @@ public class RocksDB {
       tmpMap.put(_Fields.KEYS, new org.apache.thrift.meta_data.FieldMetaData("keys", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(get_args.class, metaDataMap);
     }
@@ -31940,7 +34678,8 @@ public class RocksDB {
     public get_args(
       long transactionOrUpdateId,
       long columnId,
-      java.util.List<java.nio.ByteBuffer> keys)
+      java.util.List<java.nio.ByteBuffer> keys,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -31948,6 +34687,7 @@ public class RocksDB {
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.keys = keys;
+      this.context = context;
     }
 
     /**
@@ -31960,6 +34700,9 @@ public class RocksDB {
       if (other.isSetKeys()) {
         java.util.List<java.nio.ByteBuffer> __this__keys = new java.util.ArrayList<java.nio.ByteBuffer>(other.keys);
         this.keys = __this__keys;
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
       }
     }
 
@@ -31975,6 +34718,7 @@ public class RocksDB {
       setColumnIdIsSet(false);
       this.columnId = 0;
       this.keys = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -32064,6 +34808,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public get_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -32091,6 +34860,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -32106,6 +34883,9 @@ public class RocksDB {
 
       case KEYS:
         return getKeys();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -32125,6 +34905,8 @@ public class RocksDB {
         return isSetColumnId();
       case KEYS:
         return isSetKeys();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -32169,6 +34951,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -32183,6 +34974,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeys()) ? 131071 : 524287);
       if (isSetKeys())
         hashCode = hashCode * 8191 + keys.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -32221,6 +35016,16 @@ public class RocksDB {
       }
       if (isSetKeys()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keys, other.keys);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -32264,6 +35069,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.keys, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -32275,7 +35088,13 @@ public class RocksDB {
       if (keys == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keys' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -32350,6 +35169,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -32390,6 +35218,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -32417,6 +35250,7 @@ public class RocksDB {
             oprot.writeBinary(_iter204);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -32437,6 +35271,9 @@ public class RocksDB {
           }
         }
         struct.setKeysIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -32942,6 +35779,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField TRANSACTION_OR_UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionOrUpdateId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new getForUpdate_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new getForUpdate_argsTupleSchemeFactory();
@@ -32949,12 +35787,14 @@ public class RocksDB {
     public long transactionOrUpdateId; // required
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
-      KEYS((short)3, "keys");
+      KEYS((short)3, "keys"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -32976,6 +35816,8 @@ public class RocksDB {
             return COLUMN_ID;
           case 3: // KEYS
             return KEYS;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -33032,6 +35874,8 @@ public class RocksDB {
       tmpMap.put(_Fields.KEYS, new org.apache.thrift.meta_data.FieldMetaData("keys", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(getForUpdate_args.class, metaDataMap);
     }
@@ -33042,7 +35886,8 @@ public class RocksDB {
     public getForUpdate_args(
       long transactionOrUpdateId,
       long columnId,
-      java.util.List<java.nio.ByteBuffer> keys)
+      java.util.List<java.nio.ByteBuffer> keys,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -33050,6 +35895,7 @@ public class RocksDB {
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.keys = keys;
+      this.context = context;
     }
 
     /**
@@ -33062,6 +35908,9 @@ public class RocksDB {
       if (other.isSetKeys()) {
         java.util.List<java.nio.ByteBuffer> __this__keys = new java.util.ArrayList<java.nio.ByteBuffer>(other.keys);
         this.keys = __this__keys;
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
       }
     }
 
@@ -33077,6 +35926,7 @@ public class RocksDB {
       setColumnIdIsSet(false);
       this.columnId = 0;
       this.keys = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -33166,6 +36016,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public getForUpdate_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -33193,6 +36068,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -33208,6 +36091,9 @@ public class RocksDB {
 
       case KEYS:
         return getKeys();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -33227,6 +36113,8 @@ public class RocksDB {
         return isSetColumnId();
       case KEYS:
         return isSetKeys();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -33271,6 +36159,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -33285,6 +36182,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeys()) ? 131071 : 524287);
       if (isSetKeys())
         hashCode = hashCode * 8191 + keys.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -33323,6 +36224,16 @@ public class RocksDB {
       }
       if (isSetKeys()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keys, other.keys);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -33366,6 +36277,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.keys, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -33377,7 +36296,13 @@ public class RocksDB {
       if (keys == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keys' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -33452,6 +36377,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -33492,6 +36426,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -33519,6 +36458,7 @@ public class RocksDB {
             oprot.writeBinary(_iter212);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -33539,6 +36479,9 @@ public class RocksDB {
           }
         }
         struct.setKeysIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -34044,6 +36987,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField TRANSACTION_OR_UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("transactionOrUpdateId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)3);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new exists_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new exists_argsTupleSchemeFactory();
@@ -34051,12 +36995,14 @@ public class RocksDB {
     public long transactionOrUpdateId; // required
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)3, "columnId"),
-      KEYS((short)4, "keys");
+      KEYS((short)4, "keys"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -34078,6 +37024,8 @@ public class RocksDB {
             return COLUMN_ID;
           case 4: // KEYS
             return KEYS;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -34134,6 +37082,8 @@ public class RocksDB {
       tmpMap.put(_Fields.KEYS, new org.apache.thrift.meta_data.FieldMetaData("keys", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(exists_args.class, metaDataMap);
     }
@@ -34144,7 +37094,8 @@ public class RocksDB {
     public exists_args(
       long transactionOrUpdateId,
       long columnId,
-      java.util.List<java.nio.ByteBuffer> keys)
+      java.util.List<java.nio.ByteBuffer> keys,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -34152,6 +37103,7 @@ public class RocksDB {
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.keys = keys;
+      this.context = context;
     }
 
     /**
@@ -34164,6 +37116,9 @@ public class RocksDB {
       if (other.isSetKeys()) {
         java.util.List<java.nio.ByteBuffer> __this__keys = new java.util.ArrayList<java.nio.ByteBuffer>(other.keys);
         this.keys = __this__keys;
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
       }
     }
 
@@ -34179,6 +37134,7 @@ public class RocksDB {
       setColumnIdIsSet(false);
       this.columnId = 0;
       this.keys = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -34268,6 +37224,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public exists_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -34295,6 +37276,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -34310,6 +37299,9 @@ public class RocksDB {
 
       case KEYS:
         return getKeys();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -34329,6 +37321,8 @@ public class RocksDB {
         return isSetColumnId();
       case KEYS:
         return isSetKeys();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -34373,6 +37367,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -34387,6 +37390,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeys()) ? 131071 : 524287);
       if (isSetKeys())
         hashCode = hashCode * 8191 + keys.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -34425,6 +37432,16 @@ public class RocksDB {
       }
       if (isSetKeys()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keys, other.keys);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -34468,6 +37485,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.keys, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -34479,7 +37504,13 @@ public class RocksDB {
       if (keys == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keys' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -34554,6 +37585,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -34594,6 +37634,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -34621,6 +37666,7 @@ public class RocksDB {
             oprot.writeBinary(_iter220);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -34641,6 +37687,9 @@ public class RocksDB {
           }
         }
         struct.setKeysIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -35139,6 +38188,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField TIMEOUT_MS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutMs", org.apache.thrift.protocol.TType.I64, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new existsMulti_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new existsMulti_argsTupleSchemeFactory();
@@ -35147,13 +38197,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
     public long timeoutMs; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_ID((short)1, "transactionId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS_MULTI((short)3, "keysMulti"),
-      TIMEOUT_MS((short)4, "timeoutMs");
+      TIMEOUT_MS((short)4, "timeoutMs"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -35177,6 +38229,8 @@ public class RocksDB {
             return KEYS_MULTI;
           case 4: // TIMEOUT_MS
             return TIMEOUT_MS;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -35237,6 +38291,8 @@ public class RocksDB {
                   new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING                  , true)))));
       tmpMap.put(_Fields.TIMEOUT_MS, new org.apache.thrift.meta_data.FieldMetaData("timeoutMs", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(existsMulti_args.class, metaDataMap);
     }
@@ -35248,7 +38304,8 @@ public class RocksDB {
       long transactionId,
       long columnId,
       java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
-      long timeoutMs)
+      long timeoutMs,
+      RequestContext context)
     {
       this();
       this.transactionId = transactionId;
@@ -35258,6 +38315,7 @@ public class RocksDB {
       this.keysMulti = keysMulti;
       this.timeoutMs = timeoutMs;
       setTimeoutMsIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -35276,6 +38334,9 @@ public class RocksDB {
         this.keysMulti = __this__keysMulti;
       }
       this.timeoutMs = other.timeoutMs;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -35292,6 +38353,7 @@ public class RocksDB {
       this.keysMulti = null;
       setTimeoutMsIsSet(false);
       this.timeoutMs = 0;
+      this.context = null;
     }
 
     public long getTransactionId() {
@@ -35404,6 +38466,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TIMEOUTMS_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public existsMulti_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -35439,6 +38526,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -35457,6 +38552,9 @@ public class RocksDB {
 
       case TIMEOUT_MS:
         return getTimeoutMs();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -35478,6 +38576,8 @@ public class RocksDB {
         return isSetKeysMulti();
       case TIMEOUT_MS:
         return isSetTimeoutMs();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -35531,6 +38631,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -35547,6 +38656,10 @@ public class RocksDB {
         hashCode = hashCode * 8191 + keysMulti.hashCode();
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(timeoutMs);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -35599,6 +38712,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -35642,6 +38765,14 @@ public class RocksDB {
       sb.append("timeoutMs:");
       sb.append(this.timeoutMs);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -35654,7 +38785,13 @@ public class RocksDB {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keysMulti' was not present! Struct: " + toString());
       }
       // alas, we cannot check 'timeoutMs' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -35747,6 +38884,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -35800,6 +38946,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TIMEOUT_MS_FIELD_DESC);
         oprot.writeI64(struct.timeoutMs);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -35834,6 +38985,7 @@ public class RocksDB {
           }
         }
         oprot.writeI64(struct.timeoutMs);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -35865,6 +39017,9 @@ public class RocksDB {
         struct.setKeysMultiIsSet(true);
         struct.timeoutMs = iprot.readI64();
         struct.setTimeoutMsIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -36418,6 +39573,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField END_KEYS_EXCLUSIVE_FIELD_DESC = new org.apache.thrift.protocol.TField("endKeysExclusive", org.apache.thrift.protocol.TType.LIST, (short)4);
     private static final org.apache.thrift.protocol.TField REVERSE_FIELD_DESC = new org.apache.thrift.protocol.TField("reverse", org.apache.thrift.protocol.TType.BOOL, (short)5);
     private static final org.apache.thrift.protocol.TField TIMEOUT_MS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutMs", org.apache.thrift.protocol.TType.I64, (short)6);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)7);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new openIterator_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new openIterator_argsTupleSchemeFactory();
@@ -36428,6 +39584,7 @@ public class RocksDB {
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> endKeysExclusive; // required
     public boolean reverse; // required
     public long timeoutMs; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -36436,7 +39593,8 @@ public class RocksDB {
       START_KEYS_INCLUSIVE((short)3, "startKeysInclusive"),
       END_KEYS_EXCLUSIVE((short)4, "endKeysExclusive"),
       REVERSE((short)5, "reverse"),
-      TIMEOUT_MS((short)6, "timeoutMs");
+      TIMEOUT_MS((short)6, "timeoutMs"),
+      CONTEXT((short)7, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -36464,6 +39622,8 @@ public class RocksDB {
             return REVERSE;
           case 6: // TIMEOUT_MS
             return TIMEOUT_MS;
+          case 7: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -36529,6 +39689,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
       tmpMap.put(_Fields.TIMEOUT_MS, new org.apache.thrift.meta_data.FieldMetaData("timeoutMs", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(openIterator_args.class, metaDataMap);
     }
@@ -36542,7 +39704,8 @@ public class RocksDB {
       java.util.List<java.nio.ByteBuffer> startKeysInclusive,
       java.util.List<java.nio.ByteBuffer> endKeysExclusive,
       boolean reverse,
-      long timeoutMs)
+      long timeoutMs,
+      RequestContext context)
     {
       this();
       this.transactionId = transactionId;
@@ -36555,6 +39718,7 @@ public class RocksDB {
       setReverseIsSet(true);
       this.timeoutMs = timeoutMs;
       setTimeoutMsIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -36574,6 +39738,9 @@ public class RocksDB {
       }
       this.reverse = other.reverse;
       this.timeoutMs = other.timeoutMs;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -36593,6 +39760,7 @@ public class RocksDB {
       this.reverse = false;
       setTimeoutMsIsSet(false);
       this.timeoutMs = 0;
+      this.context = null;
     }
 
     public long getTransactionId() {
@@ -36769,6 +39937,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TIMEOUTMS_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public openIterator_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -36820,6 +40013,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -36845,6 +40046,9 @@ public class RocksDB {
       case TIMEOUT_MS:
         return getTimeoutMs();
 
+      case CONTEXT:
+        return getContext();
+
       }
       throw new java.lang.IllegalStateException();
     }
@@ -36869,6 +40073,8 @@ public class RocksDB {
         return isSetReverse();
       case TIMEOUT_MS:
         return isSetTimeoutMs();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -36940,6 +40146,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -36962,6 +40177,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((reverse) ? 131071 : 524287);
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(timeoutMs);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -37034,6 +40253,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -37089,6 +40318,14 @@ public class RocksDB {
       sb.append("timeoutMs:");
       sb.append(this.timeoutMs);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -37099,7 +40336,13 @@ public class RocksDB {
       // alas, we cannot check 'columnId' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'reverse' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'timeoutMs' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -37208,6 +40451,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 7: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -37272,6 +40524,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TIMEOUT_MS_FIELD_DESC);
         oprot.writeI64(struct.timeoutMs);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -37294,6 +40551,7 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         oprot.writeBool(struct.reverse);
         oprot.writeI64(struct.timeoutMs);
+        struct.context.write(oprot);
         java.util.BitSet optionals = new java.util.BitSet();
         if (struct.isSetStartKeysInclusive()) {
           optionals.set(0);
@@ -37333,6 +40591,9 @@ public class RocksDB {
         struct.setReverseIsSet(true);
         struct.timeoutMs = iprot.readI64();
         struct.setTimeoutMsIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
@@ -38604,17 +41865,20 @@ public class RocksDB {
 
     private static final org.apache.thrift.protocol.TField ITERATION_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("iterationId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)2);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)3);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new seekTo_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new seekTo_argsTupleSchemeFactory();
 
     public long iterationId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       ITERATION_ID((short)1, "iterationId"),
-      KEYS((short)2, "keys");
+      KEYS((short)2, "keys"),
+      CONTEXT((short)3, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -38634,6 +41898,8 @@ public class RocksDB {
             return ITERATION_ID;
           case 2: // KEYS
             return KEYS;
+          case 3: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -38687,6 +41953,8 @@ public class RocksDB {
       tmpMap.put(_Fields.KEYS, new org.apache.thrift.meta_data.FieldMetaData("keys", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(seekTo_args.class, metaDataMap);
     }
@@ -38696,12 +41964,14 @@ public class RocksDB {
 
     public seekTo_args(
       long iterationId,
-      java.util.List<java.nio.ByteBuffer> keys)
+      java.util.List<java.nio.ByteBuffer> keys,
+      RequestContext context)
     {
       this();
       this.iterationId = iterationId;
       setIterationIdIsSet(true);
       this.keys = keys;
+      this.context = context;
     }
 
     /**
@@ -38713,6 +41983,9 @@ public class RocksDB {
       if (other.isSetKeys()) {
         java.util.List<java.nio.ByteBuffer> __this__keys = new java.util.ArrayList<java.nio.ByteBuffer>(other.keys);
         this.keys = __this__keys;
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
       }
     }
 
@@ -38726,6 +41999,7 @@ public class RocksDB {
       setIterationIdIsSet(false);
       this.iterationId = 0;
       this.keys = null;
+      this.context = null;
     }
 
     public long getIterationId() {
@@ -38792,6 +42066,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public seekTo_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -38811,6 +42110,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -38823,6 +42130,9 @@ public class RocksDB {
 
       case KEYS:
         return getKeys();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -38840,6 +42150,8 @@ public class RocksDB {
         return isSetIterationId();
       case KEYS:
         return isSetKeys();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -38875,6 +42187,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -38887,6 +42208,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetKeys()) ? 131071 : 524287);
       if (isSetKeys())
         hashCode = hashCode * 8191 + keys.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -38915,6 +42240,16 @@ public class RocksDB {
       }
       if (isSetKeys()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.keys, other.keys);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -38954,6 +42289,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.keys, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -38964,7 +42307,13 @@ public class RocksDB {
       if (keys == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'keys' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -39031,6 +42380,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 3: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -39065,6 +42423,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -39091,6 +42454,7 @@ public class RocksDB {
             oprot.writeBinary(_iter268);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -39109,6 +42473,9 @@ public class RocksDB {
           }
         }
         struct.setKeysIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -39504,6 +42871,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField ITERATION_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("iterationId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField SKIP_COUNT_FIELD_DESC = new org.apache.thrift.protocol.TField("skipCount", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField TAKE_COUNT_FIELD_DESC = new org.apache.thrift.protocol.TField("takeCount", org.apache.thrift.protocol.TType.I64, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new subsequent_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new subsequent_argsTupleSchemeFactory();
@@ -39511,12 +42879,14 @@ public class RocksDB {
     public long iterationId; // required
     public long skipCount; // required
     public long takeCount; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       ITERATION_ID((short)1, "iterationId"),
       SKIP_COUNT((short)2, "skipCount"),
-      TAKE_COUNT((short)3, "takeCount");
+      TAKE_COUNT((short)3, "takeCount"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -39538,6 +42908,8 @@ public class RocksDB {
             return SKIP_COUNT;
           case 3: // TAKE_COUNT
             return TAKE_COUNT;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -39594,6 +42966,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
       tmpMap.put(_Fields.TAKE_COUNT, new org.apache.thrift.meta_data.FieldMetaData("takeCount", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(subsequent_args.class, metaDataMap);
     }
@@ -39604,7 +42978,8 @@ public class RocksDB {
     public subsequent_args(
       long iterationId,
       long skipCount,
-      long takeCount)
+      long takeCount,
+      RequestContext context)
     {
       this();
       this.iterationId = iterationId;
@@ -39613,6 +42988,7 @@ public class RocksDB {
       setSkipCountIsSet(true);
       this.takeCount = takeCount;
       setTakeCountIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -39623,6 +42999,9 @@ public class RocksDB {
       this.iterationId = other.iterationId;
       this.skipCount = other.skipCount;
       this.takeCount = other.takeCount;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -39638,6 +43017,7 @@ public class RocksDB {
       this.skipCount = 0;
       setTakeCountIsSet(false);
       this.takeCount = 0;
+      this.context = null;
     }
 
     public long getIterationId() {
@@ -39709,6 +43089,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TAKECOUNT_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public subsequent_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -39736,6 +43141,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -39751,6 +43164,9 @@ public class RocksDB {
 
       case TAKE_COUNT:
         return getTakeCount();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -39770,6 +43186,8 @@ public class RocksDB {
         return isSetSkipCount();
       case TAKE_COUNT:
         return isSetTakeCount();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -39814,6 +43232,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -39826,6 +43253,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(skipCount);
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(takeCount);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -39868,6 +43299,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -39903,6 +43344,14 @@ public class RocksDB {
       sb.append("takeCount:");
       sb.append(this.takeCount);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -39912,7 +43361,13 @@ public class RocksDB {
       // alas, we cannot check 'iterationId' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'skipCount' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'takeCount' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -39977,6 +43432,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -40011,6 +43475,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TAKE_COUNT_FIELD_DESC);
         oprot.writeI64(struct.takeCount);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -40032,6 +43501,7 @@ public class RocksDB {
         oprot.writeI64(struct.iterationId);
         oprot.writeI64(struct.skipCount);
         oprot.writeI64(struct.takeCount);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -40043,6 +43513,9 @@ public class RocksDB {
         struct.setSkipCountIsSet(true);
         struct.takeCount = iprot.readI64();
         struct.setTakeCountIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -40438,6 +43911,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField ITERATION_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("iterationId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField SKIP_COUNT_FIELD_DESC = new org.apache.thrift.protocol.TField("skipCount", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField TAKE_COUNT_FIELD_DESC = new org.apache.thrift.protocol.TField("takeCount", org.apache.thrift.protocol.TType.I64, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new subsequentExists_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new subsequentExists_argsTupleSchemeFactory();
@@ -40445,12 +43919,14 @@ public class RocksDB {
     public long iterationId; // required
     public long skipCount; // required
     public long takeCount; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       ITERATION_ID((short)1, "iterationId"),
       SKIP_COUNT((short)2, "skipCount"),
-      TAKE_COUNT((short)3, "takeCount");
+      TAKE_COUNT((short)3, "takeCount"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -40472,6 +43948,8 @@ public class RocksDB {
             return SKIP_COUNT;
           case 3: // TAKE_COUNT
             return TAKE_COUNT;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -40528,6 +44006,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
       tmpMap.put(_Fields.TAKE_COUNT, new org.apache.thrift.meta_data.FieldMetaData("takeCount", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(subsequentExists_args.class, metaDataMap);
     }
@@ -40538,7 +44018,8 @@ public class RocksDB {
     public subsequentExists_args(
       long iterationId,
       long skipCount,
-      long takeCount)
+      long takeCount,
+      RequestContext context)
     {
       this();
       this.iterationId = iterationId;
@@ -40547,6 +44028,7 @@ public class RocksDB {
       setSkipCountIsSet(true);
       this.takeCount = takeCount;
       setTakeCountIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -40557,6 +44039,9 @@ public class RocksDB {
       this.iterationId = other.iterationId;
       this.skipCount = other.skipCount;
       this.takeCount = other.takeCount;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -40572,6 +44057,7 @@ public class RocksDB {
       this.skipCount = 0;
       setTakeCountIsSet(false);
       this.takeCount = 0;
+      this.context = null;
     }
 
     public long getIterationId() {
@@ -40643,6 +44129,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TAKECOUNT_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public subsequentExists_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -40670,6 +44181,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -40685,6 +44204,9 @@ public class RocksDB {
 
       case TAKE_COUNT:
         return getTakeCount();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -40704,6 +44226,8 @@ public class RocksDB {
         return isSetSkipCount();
       case TAKE_COUNT:
         return isSetTakeCount();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -40748,6 +44272,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -40760,6 +44293,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(skipCount);
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(takeCount);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -40802,6 +44339,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -40837,6 +44384,14 @@ public class RocksDB {
       sb.append("takeCount:");
       sb.append(this.takeCount);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -40846,7 +44401,13 @@ public class RocksDB {
       // alas, we cannot check 'iterationId' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'skipCount' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'takeCount' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -40911,6 +44472,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -40945,6 +44515,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TAKE_COUNT_FIELD_DESC);
         oprot.writeI64(struct.takeCount);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -40966,6 +44541,7 @@ public class RocksDB {
         oprot.writeI64(struct.iterationId);
         oprot.writeI64(struct.skipCount);
         oprot.writeI64(struct.takeCount);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -40977,6 +44553,9 @@ public class RocksDB {
         struct.setSkipCountIsSet(true);
         struct.takeCount = iprot.readI64();
         struct.setTakeCountIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -41474,6 +45053,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField ITERATION_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("iterationId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField SKIP_COUNT_FIELD_DESC = new org.apache.thrift.protocol.TField("skipCount", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField TAKE_COUNT_FIELD_DESC = new org.apache.thrift.protocol.TField("takeCount", org.apache.thrift.protocol.TType.I64, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new subsequentMultiGet_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new subsequentMultiGet_argsTupleSchemeFactory();
@@ -41481,12 +45061,14 @@ public class RocksDB {
     public long iterationId; // required
     public long skipCount; // required
     public long takeCount; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       ITERATION_ID((short)1, "iterationId"),
       SKIP_COUNT((short)2, "skipCount"),
-      TAKE_COUNT((short)3, "takeCount");
+      TAKE_COUNT((short)3, "takeCount"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -41508,6 +45090,8 @@ public class RocksDB {
             return SKIP_COUNT;
           case 3: // TAKE_COUNT
             return TAKE_COUNT;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -41564,6 +45148,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
       tmpMap.put(_Fields.TAKE_COUNT, new org.apache.thrift.meta_data.FieldMetaData("takeCount", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(subsequentMultiGet_args.class, metaDataMap);
     }
@@ -41574,7 +45160,8 @@ public class RocksDB {
     public subsequentMultiGet_args(
       long iterationId,
       long skipCount,
-      long takeCount)
+      long takeCount,
+      RequestContext context)
     {
       this();
       this.iterationId = iterationId;
@@ -41583,6 +45170,7 @@ public class RocksDB {
       setSkipCountIsSet(true);
       this.takeCount = takeCount;
       setTakeCountIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -41593,6 +45181,9 @@ public class RocksDB {
       this.iterationId = other.iterationId;
       this.skipCount = other.skipCount;
       this.takeCount = other.takeCount;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -41608,6 +45199,7 @@ public class RocksDB {
       this.skipCount = 0;
       setTakeCountIsSet(false);
       this.takeCount = 0;
+      this.context = null;
     }
 
     public long getIterationId() {
@@ -41679,6 +45271,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TAKECOUNT_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public subsequentMultiGet_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -41706,6 +45323,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -41721,6 +45346,9 @@ public class RocksDB {
 
       case TAKE_COUNT:
         return getTakeCount();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -41740,6 +45368,8 @@ public class RocksDB {
         return isSetSkipCount();
       case TAKE_COUNT:
         return isSetTakeCount();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -41784,6 +45414,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -41796,6 +45435,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(skipCount);
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(takeCount);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -41838,6 +45481,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -41873,6 +45526,14 @@ public class RocksDB {
       sb.append("takeCount:");
       sb.append(this.takeCount);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -41882,7 +45543,13 @@ public class RocksDB {
       // alas, we cannot check 'iterationId' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'skipCount' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'takeCount' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -41947,6 +45614,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -41981,6 +45657,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TAKE_COUNT_FIELD_DESC);
         oprot.writeI64(struct.takeCount);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -42002,6 +45683,7 @@ public class RocksDB {
         oprot.writeI64(struct.iterationId);
         oprot.writeI64(struct.skipCount);
         oprot.writeI64(struct.takeCount);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -42013,6 +45695,9 @@ public class RocksDB {
         struct.setSkipCountIsSet(true);
         struct.takeCount = iprot.readI64();
         struct.setTakeCountIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -42568,6 +46253,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField DATA_FIELD_DESC = new org.apache.thrift.protocol.TField("data", org.apache.thrift.protocol.TType.LIST, (short)2);
     private static final org.apache.thrift.protocol.TField MODE_FIELD_DESC = new org.apache.thrift.protocol.TField("mode", org.apache.thrift.protocol.TType.I32, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putBatch_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putBatch_argsTupleSchemeFactory();
@@ -42579,6 +46265,7 @@ public class RocksDB {
      * @see PutBatchMode
      */
     public @org.apache.thrift.annotation.Nullable PutBatchMode mode; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -42588,7 +46275,8 @@ public class RocksDB {
        *
        * @see PutBatchMode
        */
-      MODE((short)3, "mode");
+      MODE((short)3, "mode"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -42610,6 +46298,8 @@ public class RocksDB {
             return DATA;
           case 3: // MODE
             return MODE;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -42665,6 +46355,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, KV.class))));
       tmpMap.put(_Fields.MODE, new org.apache.thrift.meta_data.FieldMetaData("mode", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, PutBatchMode.class)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putBatch_args.class, metaDataMap);
     }
@@ -42675,13 +46367,15 @@ public class RocksDB {
     public putBatch_args(
       long columnId,
       java.util.List<KV> data,
-      PutBatchMode mode)
+      PutBatchMode mode,
+      RequestContext context)
     {
       this();
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.data = data;
       this.mode = mode;
+      this.context = context;
     }
 
     /**
@@ -42700,6 +46394,9 @@ public class RocksDB {
       if (other.isSetMode()) {
         this.mode = other.mode;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -42713,6 +46410,7 @@ public class RocksDB {
       this.columnId = 0;
       this.data = null;
       this.mode = null;
+      this.context = null;
     }
 
     public long getColumnId() {
@@ -42812,6 +46510,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putBatch_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -42839,6 +46562,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -42854,6 +46585,9 @@ public class RocksDB {
 
       case MODE:
         return getMode();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -42873,6 +46607,8 @@ public class RocksDB {
         return isSetData();
       case MODE:
         return isSetMode();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -42917,6 +46653,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -42933,6 +46678,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetMode()) ? 131071 : 524287);
       if (isSetMode())
         hashCode = hashCode * 8191 + mode.getValue();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -42971,6 +46720,16 @@ public class RocksDB {
       }
       if (isSetMode()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.mode, other.mode);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -43018,6 +46777,14 @@ public class RocksDB {
         sb.append(this.mode);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -43031,7 +46798,13 @@ public class RocksDB {
       if (mode == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'mode' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -43107,6 +46880,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -43146,6 +46928,11 @@ public class RocksDB {
           oprot.writeI32(struct.mode.getValue());
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -43173,6 +46960,7 @@ public class RocksDB {
           }
         }
         oprot.writeI32(struct.mode.getValue());
+        struct.context.write(oprot);
       }
 
       @Override
@@ -43194,6 +46982,9 @@ public class RocksDB {
         struct.setDataIsSet(true);
         struct.mode = it.cavallium.rockserver.core.common.api.PutBatchMode.findByValue(iprot.readI32());
         struct.setModeIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -43590,6 +47381,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new merge_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new merge_argsTupleSchemeFactory();
@@ -43598,13 +47390,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
     public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS((short)3, "keys"),
-      VALUE((short)4, "value");
+      VALUE((short)4, "value"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -43628,6 +47422,8 @@ public class RocksDB {
             return KEYS;
           case 4: // VALUE
             return VALUE;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -43686,6 +47482,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
       tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(merge_args.class, metaDataMap);
     }
@@ -43697,7 +47495,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.nio.ByteBuffer> keys,
-      java.nio.ByteBuffer value)
+      java.nio.ByteBuffer value,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -43706,6 +47505,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keys = keys;
       this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
+      this.context = context;
     }
 
     /**
@@ -43722,6 +47522,9 @@ public class RocksDB {
       if (other.isSetValue()) {
         this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -43737,6 +47540,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keys = null;
       this.value = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -43860,6 +47664,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public merge_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -43899,6 +47728,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -43917,6 +47754,9 @@ public class RocksDB {
 
       case VALUE:
         return getValue();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -43938,6 +47778,8 @@ public class RocksDB {
         return isSetKeys();
       case VALUE:
         return isSetValue();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -43991,6 +47833,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -44009,6 +47860,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
       if (isSetValue())
         hashCode = hashCode * 8191 + value.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -44061,6 +47916,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -44108,6 +47973,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.value, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -44122,7 +47995,13 @@ public class RocksDB {
       if (value == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'value' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -44205,6 +48084,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -44250,6 +48138,11 @@ public class RocksDB {
           oprot.writeBinary(struct.value);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -44278,6 +48171,7 @@ public class RocksDB {
           }
         }
         oprot.writeBinary(struct.value);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -44300,6 +48194,9 @@ public class RocksDB {
         struct.setKeysIsSet(true);
         struct.value = iprot.readBinary();
         struct.setValueIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -44696,6 +48593,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("valueMulti", org.apache.thrift.protocol.TType.LIST, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new mergeMulti_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new mergeMulti_argsTupleSchemeFactory();
@@ -44704,13 +48602,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> valueMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS_MULTI((short)3, "keysMulti"),
-      VALUE_MULTI((short)4, "valueMulti");
+      VALUE_MULTI((short)4, "valueMulti"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -44734,6 +48634,8 @@ public class RocksDB {
             return KEYS_MULTI;
           case 4: // VALUE_MULTI
             return VALUE_MULTI;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -44794,6 +48696,8 @@ public class RocksDB {
       tmpMap.put(_Fields.VALUE_MULTI, new org.apache.thrift.meta_data.FieldMetaData("valueMulti", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(mergeMulti_args.class, metaDataMap);
     }
@@ -44805,7 +48709,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
-      java.util.List<java.nio.ByteBuffer> valueMulti)
+      java.util.List<java.nio.ByteBuffer> valueMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -44814,6 +48719,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
       this.valueMulti = valueMulti;
+      this.context = context;
     }
 
     /**
@@ -44835,6 +48741,9 @@ public class RocksDB {
         java.util.List<java.nio.ByteBuffer> __this__valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(other.valueMulti);
         this.valueMulti = __this__valueMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -44850,6 +48759,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keysMulti = null;
       this.valueMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -44980,6 +48890,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public mergeMulti_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -45015,6 +48950,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -45033,6 +48976,9 @@ public class RocksDB {
 
       case VALUE_MULTI:
         return getValueMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -45054,6 +49000,8 @@ public class RocksDB {
         return isSetKeysMulti();
       case VALUE_MULTI:
         return isSetValueMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -45107,6 +49055,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -45125,6 +49082,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValueMulti()) ? 131071 : 524287);
       if (isSetValueMulti())
         hashCode = hashCode * 8191 + valueMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -45177,6 +49138,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -45224,6 +49195,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.valueMulti, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -45238,7 +49217,13 @@ public class RocksDB {
       if (valueMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'valueMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -45341,6 +49326,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -45400,6 +49394,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -45440,6 +49439,7 @@ public class RocksDB {
             oprot.writeBinary(_iter310);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -45480,6 +49480,9 @@ public class RocksDB {
           }
         }
         struct.setValueMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -45875,6 +49878,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField DATA_FIELD_DESC = new org.apache.thrift.protocol.TField("data", org.apache.thrift.protocol.TType.LIST, (short)2);
     private static final org.apache.thrift.protocol.TField MODE_FIELD_DESC = new org.apache.thrift.protocol.TField("mode", org.apache.thrift.protocol.TType.I32, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new mergeBatch_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new mergeBatch_argsTupleSchemeFactory();
@@ -45886,6 +49890,7 @@ public class RocksDB {
      * @see MergeBatchMode
      */
     public @org.apache.thrift.annotation.Nullable MergeBatchMode mode; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -45895,7 +49900,8 @@ public class RocksDB {
        *
        * @see MergeBatchMode
        */
-      MODE((short)3, "mode");
+      MODE((short)3, "mode"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -45917,6 +49923,8 @@ public class RocksDB {
             return DATA;
           case 3: // MODE
             return MODE;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -45972,6 +49980,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, KV.class))));
       tmpMap.put(_Fields.MODE, new org.apache.thrift.meta_data.FieldMetaData("mode", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, MergeBatchMode.class)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(mergeBatch_args.class, metaDataMap);
     }
@@ -45982,13 +49992,15 @@ public class RocksDB {
     public mergeBatch_args(
       long columnId,
       java.util.List<KV> data,
-      MergeBatchMode mode)
+      MergeBatchMode mode,
+      RequestContext context)
     {
       this();
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.data = data;
       this.mode = mode;
+      this.context = context;
     }
 
     /**
@@ -46007,6 +50019,9 @@ public class RocksDB {
       if (other.isSetMode()) {
         this.mode = other.mode;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -46020,6 +50035,7 @@ public class RocksDB {
       this.columnId = 0;
       this.data = null;
       this.mode = null;
+      this.context = null;
     }
 
     public long getColumnId() {
@@ -46119,6 +50135,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public mergeBatch_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -46146,6 +50187,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -46161,6 +50210,9 @@ public class RocksDB {
 
       case MODE:
         return getMode();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -46180,6 +50232,8 @@ public class RocksDB {
         return isSetData();
       case MODE:
         return isSetMode();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -46224,6 +50278,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -46240,6 +50303,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetMode()) ? 131071 : 524287);
       if (isSetMode())
         hashCode = hashCode * 8191 + mode.getValue();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -46278,6 +50345,16 @@ public class RocksDB {
       }
       if (isSetMode()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.mode, other.mode);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -46325,6 +50402,14 @@ public class RocksDB {
         sb.append(this.mode);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -46338,7 +50423,13 @@ public class RocksDB {
       if (mode == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'mode' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -46414,6 +50505,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -46453,6 +50553,11 @@ public class RocksDB {
           oprot.writeI32(struct.mode.getValue());
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -46480,6 +50585,7 @@ public class RocksDB {
           }
         }
         oprot.writeI32(struct.mode.getValue());
+        struct.context.write(oprot);
       }
 
       @Override
@@ -46501,6 +50607,9 @@ public class RocksDB {
         struct.setDataIsSet(true);
         struct.mode = it.cavallium.rockserver.core.common.api.MergeBatchMode.findByValue(iprot.readI32());
         struct.setModeIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -46896,6 +51005,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)1);
     private static final org.apache.thrift.protocol.TField START_KEYS_INCLUSIVE_FIELD_DESC = new org.apache.thrift.protocol.TField("startKeysInclusive", org.apache.thrift.protocol.TType.LIST, (short)2);
     private static final org.apache.thrift.protocol.TField END_KEYS_EXCLUSIVE_FIELD_DESC = new org.apache.thrift.protocol.TField("endKeysExclusive", org.apache.thrift.protocol.TType.LIST, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new deleteRange_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new deleteRange_argsTupleSchemeFactory();
@@ -46903,12 +51013,14 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> startKeysInclusive; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> endKeysExclusive; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       COLUMN_ID((short)1, "columnId"),
       START_KEYS_INCLUSIVE((short)2, "startKeysInclusive"),
-      END_KEYS_EXCLUSIVE((short)3, "endKeysExclusive");
+      END_KEYS_EXCLUSIVE((short)3, "endKeysExclusive"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -46930,6 +51042,8 @@ public class RocksDB {
             return START_KEYS_INCLUSIVE;
           case 3: // END_KEYS_EXCLUSIVE
             return END_KEYS_EXCLUSIVE;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -46986,6 +51100,8 @@ public class RocksDB {
       tmpMap.put(_Fields.END_KEYS_EXCLUSIVE, new org.apache.thrift.meta_data.FieldMetaData("endKeysExclusive", org.apache.thrift.TFieldRequirementType.DEFAULT,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(deleteRange_args.class, metaDataMap);
     }
@@ -46996,13 +51112,15 @@ public class RocksDB {
     public deleteRange_args(
       long columnId,
       java.util.List<java.nio.ByteBuffer> startKeysInclusive,
-      java.util.List<java.nio.ByteBuffer> endKeysExclusive)
+      java.util.List<java.nio.ByteBuffer> endKeysExclusive,
+      RequestContext context)
     {
       this();
       this.columnId = columnId;
       setColumnIdIsSet(true);
       this.startKeysInclusive = startKeysInclusive;
       this.endKeysExclusive = endKeysExclusive;
+      this.context = context;
     }
 
     /**
@@ -47019,6 +51137,9 @@ public class RocksDB {
         java.util.List<java.nio.ByteBuffer> __this__endKeysExclusive = new java.util.ArrayList<java.nio.ByteBuffer>(other.endKeysExclusive);
         this.endKeysExclusive = __this__endKeysExclusive;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -47032,6 +51153,7 @@ public class RocksDB {
       this.columnId = 0;
       this.startKeysInclusive = null;
       this.endKeysExclusive = null;
+      this.context = null;
     }
 
     public long getColumnId() {
@@ -47139,6 +51261,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public deleteRange_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -47166,6 +51313,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -47181,6 +51336,9 @@ public class RocksDB {
 
       case END_KEYS_EXCLUSIVE:
         return getEndKeysExclusive();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -47200,6 +51358,8 @@ public class RocksDB {
         return isSetStartKeysInclusive();
       case END_KEYS_EXCLUSIVE:
         return isSetEndKeysExclusive();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -47244,6 +51404,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -47260,6 +51429,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetEndKeysExclusive()) ? 131071 : 524287);
       if (isSetEndKeysExclusive())
         hashCode = hashCode * 8191 + endKeysExclusive.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -47298,6 +51471,16 @@ public class RocksDB {
       }
       if (isSetEndKeysExclusive()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.endKeysExclusive, other.endKeysExclusive);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -47345,6 +51528,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.endKeysExclusive, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -47352,7 +51543,13 @@ public class RocksDB {
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
       // alas, we cannot check 'columnId' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -47437,6 +51634,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -47483,6 +51689,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -47502,6 +51713,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, deleteRange_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeI64(struct.columnId);
+        struct.context.write(oprot);
         java.util.BitSet optionals = new java.util.BitSet();
         if (struct.isSetStartKeysInclusive()) {
           optionals.set(0);
@@ -47535,6 +51747,9 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.columnId = iprot.readI64();
         struct.setColumnIdIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
@@ -47958,6 +52173,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("keys", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_FIELD_DESC = new org.apache.thrift.protocol.TField("value", org.apache.thrift.protocol.TType.STRING, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new mergeGetMerged_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new mergeGetMerged_argsTupleSchemeFactory();
@@ -47966,13 +52182,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> keys; // required
     public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer value; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS((short)3, "keys"),
-      VALUE((short)4, "value");
+      VALUE((short)4, "value"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -47996,6 +52214,8 @@ public class RocksDB {
             return KEYS;
           case 4: // VALUE
             return VALUE;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -48054,6 +52274,8 @@ public class RocksDB {
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
       tmpMap.put(_Fields.VALUE, new org.apache.thrift.meta_data.FieldMetaData("value", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(mergeGetMerged_args.class, metaDataMap);
     }
@@ -48065,7 +52287,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.nio.ByteBuffer> keys,
-      java.nio.ByteBuffer value)
+      java.nio.ByteBuffer value,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -48074,6 +52297,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keys = keys;
       this.value = org.apache.thrift.TBaseHelper.copyBinary(value);
+      this.context = context;
     }
 
     /**
@@ -48090,6 +52314,9 @@ public class RocksDB {
       if (other.isSetValue()) {
         this.value = org.apache.thrift.TBaseHelper.copyBinary(other.value);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -48105,6 +52332,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keys = null;
       this.value = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -48228,6 +52456,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public mergeGetMerged_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -48267,6 +52520,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -48285,6 +52546,9 @@ public class RocksDB {
 
       case VALUE:
         return getValue();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -48306,6 +52570,8 @@ public class RocksDB {
         return isSetKeys();
       case VALUE:
         return isSetValue();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -48359,6 +52625,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -48377,6 +52652,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValue()) ? 131071 : 524287);
       if (isSetValue())
         hashCode = hashCode * 8191 + value.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -48429,6 +52708,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -48476,6 +52765,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.value, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -48490,7 +52787,13 @@ public class RocksDB {
       if (value == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'value' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -48573,6 +52876,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -48618,6 +52930,11 @@ public class RocksDB {
           oprot.writeBinary(struct.value);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -48646,6 +52963,7 @@ public class RocksDB {
           }
         }
         oprot.writeBinary(struct.value);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -48668,6 +52986,9 @@ public class RocksDB {
         struct.setKeysIsSet(true);
         struct.value = iprot.readBinary();
         struct.setValueIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -49174,6 +53495,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("valueMulti", org.apache.thrift.protocol.TType.LIST, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new mergeMultiGetMerged_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new mergeMultiGetMerged_argsTupleSchemeFactory();
@@ -49182,13 +53504,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> valueMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS_MULTI((short)3, "keysMulti"),
-      VALUE_MULTI((short)4, "valueMulti");
+      VALUE_MULTI((short)4, "valueMulti"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -49212,6 +53536,8 @@ public class RocksDB {
             return KEYS_MULTI;
           case 4: // VALUE_MULTI
             return VALUE_MULTI;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -49272,6 +53598,8 @@ public class RocksDB {
       tmpMap.put(_Fields.VALUE_MULTI, new org.apache.thrift.meta_data.FieldMetaData("valueMulti", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(mergeMultiGetMerged_args.class, metaDataMap);
     }
@@ -49283,7 +53611,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
-      java.util.List<java.nio.ByteBuffer> valueMulti)
+      java.util.List<java.nio.ByteBuffer> valueMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -49292,6 +53621,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
       this.valueMulti = valueMulti;
+      this.context = context;
     }
 
     /**
@@ -49313,6 +53643,9 @@ public class RocksDB {
         java.util.List<java.nio.ByteBuffer> __this__valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(other.valueMulti);
         this.valueMulti = __this__valueMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -49328,6 +53661,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keysMulti = null;
       this.valueMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -49458,6 +53792,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public mergeMultiGetMerged_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -49493,6 +53852,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -49511,6 +53878,9 @@ public class RocksDB {
 
       case VALUE_MULTI:
         return getValueMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -49532,6 +53902,8 @@ public class RocksDB {
         return isSetKeysMulti();
       case VALUE_MULTI:
         return isSetValueMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -49585,6 +53957,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -49603,6 +53984,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValueMulti()) ? 131071 : 524287);
       if (isSetValueMulti())
         hashCode = hashCode * 8191 + valueMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -49655,6 +54040,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -49702,6 +54097,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.valueMulti, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -49716,7 +54119,13 @@ public class RocksDB {
       if (valueMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'valueMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -49819,6 +54228,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -49878,6 +54296,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -49918,6 +54341,7 @@ public class RocksDB {
             oprot.writeBinary(_iter366);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -49958,6 +54382,9 @@ public class RocksDB {
           }
         }
         struct.setValueMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -50516,6 +54943,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField END_KEYS_EXCLUSIVE_FIELD_DESC = new org.apache.thrift.protocol.TField("endKeysExclusive", org.apache.thrift.protocol.TType.LIST, (short)4);
     private static final org.apache.thrift.protocol.TField REVERSE_FIELD_DESC = new org.apache.thrift.protocol.TField("reverse", org.apache.thrift.protocol.TType.BOOL, (short)5);
     private static final org.apache.thrift.protocol.TField TIMEOUT_MS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutMs", org.apache.thrift.protocol.TType.I64, (short)6);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)7);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new reduceRangeFirstAndLast_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new reduceRangeFirstAndLast_argsTupleSchemeFactory();
@@ -50526,6 +54954,7 @@ public class RocksDB {
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> endKeysExclusive; // required
     public boolean reverse; // required
     public long timeoutMs; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -50534,7 +54963,8 @@ public class RocksDB {
       START_KEYS_INCLUSIVE((short)3, "startKeysInclusive"),
       END_KEYS_EXCLUSIVE((short)4, "endKeysExclusive"),
       REVERSE((short)5, "reverse"),
-      TIMEOUT_MS((short)6, "timeoutMs");
+      TIMEOUT_MS((short)6, "timeoutMs"),
+      CONTEXT((short)7, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -50562,6 +54992,8 @@ public class RocksDB {
             return REVERSE;
           case 6: // TIMEOUT_MS
             return TIMEOUT_MS;
+          case 7: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -50627,6 +55059,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
       tmpMap.put(_Fields.TIMEOUT_MS, new org.apache.thrift.meta_data.FieldMetaData("timeoutMs", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(reduceRangeFirstAndLast_args.class, metaDataMap);
     }
@@ -50640,7 +55074,8 @@ public class RocksDB {
       java.util.List<java.nio.ByteBuffer> startKeysInclusive,
       java.util.List<java.nio.ByteBuffer> endKeysExclusive,
       boolean reverse,
-      long timeoutMs)
+      long timeoutMs,
+      RequestContext context)
     {
       this();
       this.transactionId = transactionId;
@@ -50653,6 +55088,7 @@ public class RocksDB {
       setReverseIsSet(true);
       this.timeoutMs = timeoutMs;
       setTimeoutMsIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -50672,6 +55108,9 @@ public class RocksDB {
       }
       this.reverse = other.reverse;
       this.timeoutMs = other.timeoutMs;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -50691,6 +55130,7 @@ public class RocksDB {
       this.reverse = false;
       setTimeoutMsIsSet(false);
       this.timeoutMs = 0;
+      this.context = null;
     }
 
     public long getTransactionId() {
@@ -50867,6 +55307,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TIMEOUTMS_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public reduceRangeFirstAndLast_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -50918,6 +55383,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -50943,6 +55416,9 @@ public class RocksDB {
       case TIMEOUT_MS:
         return getTimeoutMs();
 
+      case CONTEXT:
+        return getContext();
+
       }
       throw new java.lang.IllegalStateException();
     }
@@ -50967,6 +55443,8 @@ public class RocksDB {
         return isSetReverse();
       case TIMEOUT_MS:
         return isSetTimeoutMs();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -51038,6 +55516,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -51060,6 +55547,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((reverse) ? 131071 : 524287);
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(timeoutMs);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -51132,6 +55623,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -51187,6 +55688,14 @@ public class RocksDB {
       sb.append("timeoutMs:");
       sb.append(this.timeoutMs);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -51197,7 +55706,13 @@ public class RocksDB {
       // alas, we cannot check 'columnId' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'reverse' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'timeoutMs' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -51306,6 +55821,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 7: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -51370,6 +55894,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TIMEOUT_MS_FIELD_DESC);
         oprot.writeI64(struct.timeoutMs);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -51392,6 +55921,7 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         oprot.writeBool(struct.reverse);
         oprot.writeI64(struct.timeoutMs);
+        struct.context.write(oprot);
         java.util.BitSet optionals = new java.util.BitSet();
         if (struct.isSetStartKeysInclusive()) {
           optionals.set(0);
@@ -51431,6 +55961,9 @@ public class RocksDB {
         struct.setReverseIsSet(true);
         struct.timeoutMs = iprot.readI64();
         struct.setTimeoutMsIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
@@ -51966,6 +56499,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField END_KEYS_EXCLUSIVE_FIELD_DESC = new org.apache.thrift.protocol.TField("endKeysExclusive", org.apache.thrift.protocol.TType.LIST, (short)4);
     private static final org.apache.thrift.protocol.TField REVERSE_FIELD_DESC = new org.apache.thrift.protocol.TField("reverse", org.apache.thrift.protocol.TType.BOOL, (short)5);
     private static final org.apache.thrift.protocol.TField TIMEOUT_MS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutMs", org.apache.thrift.protocol.TType.I64, (short)6);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)7);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new reduceRangeEntriesCount_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new reduceRangeEntriesCount_argsTupleSchemeFactory();
@@ -51976,6 +56510,7 @@ public class RocksDB {
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> endKeysExclusive; // required
     public boolean reverse; // required
     public long timeoutMs; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -51984,7 +56519,8 @@ public class RocksDB {
       START_KEYS_INCLUSIVE((short)3, "startKeysInclusive"),
       END_KEYS_EXCLUSIVE((short)4, "endKeysExclusive"),
       REVERSE((short)5, "reverse"),
-      TIMEOUT_MS((short)6, "timeoutMs");
+      TIMEOUT_MS((short)6, "timeoutMs"),
+      CONTEXT((short)7, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -52012,6 +56548,8 @@ public class RocksDB {
             return REVERSE;
           case 6: // TIMEOUT_MS
             return TIMEOUT_MS;
+          case 7: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -52077,6 +56615,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
       tmpMap.put(_Fields.TIMEOUT_MS, new org.apache.thrift.meta_data.FieldMetaData("timeoutMs", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(reduceRangeEntriesCount_args.class, metaDataMap);
     }
@@ -52090,7 +56630,8 @@ public class RocksDB {
       java.util.List<java.nio.ByteBuffer> startKeysInclusive,
       java.util.List<java.nio.ByteBuffer> endKeysExclusive,
       boolean reverse,
-      long timeoutMs)
+      long timeoutMs,
+      RequestContext context)
     {
       this();
       this.transactionId = transactionId;
@@ -52103,6 +56644,7 @@ public class RocksDB {
       setReverseIsSet(true);
       this.timeoutMs = timeoutMs;
       setTimeoutMsIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -52122,6 +56664,9 @@ public class RocksDB {
       }
       this.reverse = other.reverse;
       this.timeoutMs = other.timeoutMs;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -52141,6 +56686,7 @@ public class RocksDB {
       this.reverse = false;
       setTimeoutMsIsSet(false);
       this.timeoutMs = 0;
+      this.context = null;
     }
 
     public long getTransactionId() {
@@ -52317,6 +56863,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TIMEOUTMS_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public reduceRangeEntriesCount_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -52368,6 +56939,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -52393,6 +56972,9 @@ public class RocksDB {
       case TIMEOUT_MS:
         return getTimeoutMs();
 
+      case CONTEXT:
+        return getContext();
+
       }
       throw new java.lang.IllegalStateException();
     }
@@ -52417,6 +56999,8 @@ public class RocksDB {
         return isSetReverse();
       case TIMEOUT_MS:
         return isSetTimeoutMs();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -52488,6 +57072,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -52510,6 +57103,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((reverse) ? 131071 : 524287);
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(timeoutMs);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -52582,6 +57179,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -52637,6 +57244,14 @@ public class RocksDB {
       sb.append("timeoutMs:");
       sb.append(this.timeoutMs);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -52647,7 +57262,13 @@ public class RocksDB {
       // alas, we cannot check 'columnId' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'reverse' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'timeoutMs' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -52756,6 +57377,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 7: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -52820,6 +57450,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TIMEOUT_MS_FIELD_DESC);
         oprot.writeI64(struct.timeoutMs);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -52842,6 +57477,7 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         oprot.writeBool(struct.reverse);
         oprot.writeI64(struct.timeoutMs);
+        struct.context.write(oprot);
         java.util.BitSet optionals = new java.util.BitSet();
         if (struct.isSetStartKeysInclusive()) {
           optionals.set(0);
@@ -52881,6 +57517,9 @@ public class RocksDB {
         struct.setReverseIsSet(true);
         struct.timeoutMs = iprot.readI64();
         struct.setTimeoutMsIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
@@ -53408,6 +58047,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField END_KEYS_EXCLUSIVE_FIELD_DESC = new org.apache.thrift.protocol.TField("endKeysExclusive", org.apache.thrift.protocol.TType.LIST, (short)4);
     private static final org.apache.thrift.protocol.TField REVERSE_FIELD_DESC = new org.apache.thrift.protocol.TField("reverse", org.apache.thrift.protocol.TType.BOOL, (short)5);
     private static final org.apache.thrift.protocol.TField TIMEOUT_MS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutMs", org.apache.thrift.protocol.TType.I64, (short)6);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)7);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new getAllInRange_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new getAllInRange_argsTupleSchemeFactory();
@@ -53418,6 +58058,7 @@ public class RocksDB {
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> endKeysExclusive; // required
     public boolean reverse; // required
     public long timeoutMs; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -53426,7 +58067,8 @@ public class RocksDB {
       START_KEYS_INCLUSIVE((short)3, "startKeysInclusive"),
       END_KEYS_EXCLUSIVE((short)4, "endKeysExclusive"),
       REVERSE((short)5, "reverse"),
-      TIMEOUT_MS((short)6, "timeoutMs");
+      TIMEOUT_MS((short)6, "timeoutMs"),
+      CONTEXT((short)7, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -53454,6 +58096,8 @@ public class RocksDB {
             return REVERSE;
           case 6: // TIMEOUT_MS
             return TIMEOUT_MS;
+          case 7: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -53519,6 +58163,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
       tmpMap.put(_Fields.TIMEOUT_MS, new org.apache.thrift.meta_data.FieldMetaData("timeoutMs", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(getAllInRange_args.class, metaDataMap);
     }
@@ -53532,7 +58178,8 @@ public class RocksDB {
       java.util.List<java.nio.ByteBuffer> startKeysInclusive,
       java.util.List<java.nio.ByteBuffer> endKeysExclusive,
       boolean reverse,
-      long timeoutMs)
+      long timeoutMs,
+      RequestContext context)
     {
       this();
       this.transactionId = transactionId;
@@ -53545,6 +58192,7 @@ public class RocksDB {
       setReverseIsSet(true);
       this.timeoutMs = timeoutMs;
       setTimeoutMsIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -53564,6 +58212,9 @@ public class RocksDB {
       }
       this.reverse = other.reverse;
       this.timeoutMs = other.timeoutMs;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -53583,6 +58234,7 @@ public class RocksDB {
       this.reverse = false;
       setTimeoutMsIsSet(false);
       this.timeoutMs = 0;
+      this.context = null;
     }
 
     public long getTransactionId() {
@@ -53759,6 +58411,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TIMEOUTMS_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public getAllInRange_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -53810,6 +58487,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -53835,6 +58520,9 @@ public class RocksDB {
       case TIMEOUT_MS:
         return getTimeoutMs();
 
+      case CONTEXT:
+        return getContext();
+
       }
       throw new java.lang.IllegalStateException();
     }
@@ -53859,6 +58547,8 @@ public class RocksDB {
         return isSetReverse();
       case TIMEOUT_MS:
         return isSetTimeoutMs();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -53930,6 +58620,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -53952,6 +58651,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((reverse) ? 131071 : 524287);
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(timeoutMs);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -54024,6 +58727,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -54079,6 +58792,14 @@ public class RocksDB {
       sb.append("timeoutMs:");
       sb.append(this.timeoutMs);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -54089,7 +58810,13 @@ public class RocksDB {
       // alas, we cannot check 'columnId' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'reverse' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'timeoutMs' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -54198,6 +58925,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 7: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -54262,6 +58998,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TIMEOUT_MS_FIELD_DESC);
         oprot.writeI64(struct.timeoutMs);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -54284,6 +59025,7 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         oprot.writeBool(struct.reverse);
         oprot.writeI64(struct.timeoutMs);
+        struct.context.write(oprot);
         java.util.BitSet optionals = new java.util.BitSet();
         if (struct.isSetStartKeysInclusive()) {
           optionals.set(0);
@@ -54323,6 +59065,9 @@ public class RocksDB {
         struct.setReverseIsSet(true);
         struct.timeoutMs = iprot.readI64();
         struct.setTimeoutMsIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
@@ -54908,6 +59653,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField END_KEYS_EXCLUSIVE_FIELD_DESC = new org.apache.thrift.protocol.TField("endKeysExclusive", org.apache.thrift.protocol.TType.LIST, (short)4);
     private static final org.apache.thrift.protocol.TField REVERSE_FIELD_DESC = new org.apache.thrift.protocol.TField("reverse", org.apache.thrift.protocol.TType.BOOL, (short)5);
     private static final org.apache.thrift.protocol.TField TIMEOUT_MS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutMs", org.apache.thrift.protocol.TType.I64, (short)6);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)7);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new getAllInRangeNoCache_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new getAllInRangeNoCache_argsTupleSchemeFactory();
@@ -54918,6 +59664,7 @@ public class RocksDB {
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> endKeysExclusive; // required
     public boolean reverse; // required
     public long timeoutMs; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -54926,7 +59673,8 @@ public class RocksDB {
       START_KEYS_INCLUSIVE((short)3, "startKeysInclusive"),
       END_KEYS_EXCLUSIVE((short)4, "endKeysExclusive"),
       REVERSE((short)5, "reverse"),
-      TIMEOUT_MS((short)6, "timeoutMs");
+      TIMEOUT_MS((short)6, "timeoutMs"),
+      CONTEXT((short)7, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -54954,6 +59702,8 @@ public class RocksDB {
             return REVERSE;
           case 6: // TIMEOUT_MS
             return TIMEOUT_MS;
+          case 7: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -55019,6 +59769,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
       tmpMap.put(_Fields.TIMEOUT_MS, new org.apache.thrift.meta_data.FieldMetaData("timeoutMs", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(getAllInRangeNoCache_args.class, metaDataMap);
     }
@@ -55032,7 +59784,8 @@ public class RocksDB {
       java.util.List<java.nio.ByteBuffer> startKeysInclusive,
       java.util.List<java.nio.ByteBuffer> endKeysExclusive,
       boolean reverse,
-      long timeoutMs)
+      long timeoutMs,
+      RequestContext context)
     {
       this();
       this.transactionId = transactionId;
@@ -55045,6 +59798,7 @@ public class RocksDB {
       setReverseIsSet(true);
       this.timeoutMs = timeoutMs;
       setTimeoutMsIsSet(true);
+      this.context = context;
     }
 
     /**
@@ -55064,6 +59818,9 @@ public class RocksDB {
       }
       this.reverse = other.reverse;
       this.timeoutMs = other.timeoutMs;
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -55083,6 +59840,7 @@ public class RocksDB {
       this.reverse = false;
       setTimeoutMsIsSet(false);
       this.timeoutMs = 0;
+      this.context = null;
     }
 
     public long getTransactionId() {
@@ -55259,6 +60017,31 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TIMEOUTMS_ISSET_ID, value);
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public getAllInRangeNoCache_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -55310,6 +60093,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -55335,6 +60126,9 @@ public class RocksDB {
       case TIMEOUT_MS:
         return getTimeoutMs();
 
+      case CONTEXT:
+        return getContext();
+
       }
       throw new java.lang.IllegalStateException();
     }
@@ -55359,6 +60153,8 @@ public class RocksDB {
         return isSetReverse();
       case TIMEOUT_MS:
         return isSetTimeoutMs();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -55430,6 +60226,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -55452,6 +60257,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((reverse) ? 131071 : 524287);
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(timeoutMs);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -55524,6 +60333,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -55579,6 +60398,14 @@ public class RocksDB {
       sb.append("timeoutMs:");
       sb.append(this.timeoutMs);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -55589,7 +60416,13 @@ public class RocksDB {
       // alas, we cannot check 'columnId' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'reverse' because it's a primitive and you chose the non-beans generator.
       // alas, we cannot check 'timeoutMs' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -55698,6 +60531,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 7: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -55762,6 +60604,11 @@ public class RocksDB {
         oprot.writeFieldBegin(TIMEOUT_MS_FIELD_DESC);
         oprot.writeI64(struct.timeoutMs);
         oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -55784,6 +60631,7 @@ public class RocksDB {
         oprot.writeI64(struct.columnId);
         oprot.writeBool(struct.reverse);
         oprot.writeI64(struct.timeoutMs);
+        struct.context.write(oprot);
         java.util.BitSet optionals = new java.util.BitSet();
         if (struct.isSetStartKeysInclusive()) {
           optionals.set(0);
@@ -55823,6 +60671,9 @@ public class RocksDB {
         struct.setReverseIsSet(true);
         struct.timeoutMs = iprot.readI64();
         struct.setTimeoutMsIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
@@ -56405,6 +61256,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField OPERATOR_NAME_FIELD_DESC = new org.apache.thrift.protocol.TField("operatorName", org.apache.thrift.protocol.TType.STRING, (short)1);
     private static final org.apache.thrift.protocol.TField CLASS_NAME_FIELD_DESC = new org.apache.thrift.protocol.TField("className", org.apache.thrift.protocol.TType.STRING, (short)2);
     private static final org.apache.thrift.protocol.TField JAR_PAYLOAD_FIELD_DESC = new org.apache.thrift.protocol.TField("jarPayload", org.apache.thrift.protocol.TType.STRING, (short)3);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)4);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new uploadMergeOperator_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new uploadMergeOperator_argsTupleSchemeFactory();
@@ -56412,12 +61264,14 @@ public class RocksDB {
     public @org.apache.thrift.annotation.Nullable java.lang.String operatorName; // required
     public @org.apache.thrift.annotation.Nullable java.lang.String className; // required
     public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer jarPayload; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       OPERATOR_NAME((short)1, "operatorName"),
       CLASS_NAME((short)2, "className"),
-      JAR_PAYLOAD((short)3, "jarPayload");
+      JAR_PAYLOAD((short)3, "jarPayload"),
+      CONTEXT((short)4, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -56439,6 +61293,8 @@ public class RocksDB {
             return CLASS_NAME;
           case 3: // JAR_PAYLOAD
             return JAR_PAYLOAD;
+          case 4: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -56491,6 +61347,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
       tmpMap.put(_Fields.JAR_PAYLOAD, new org.apache.thrift.meta_data.FieldMetaData("jarPayload", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(uploadMergeOperator_args.class, metaDataMap);
     }
@@ -56501,12 +61359,14 @@ public class RocksDB {
     public uploadMergeOperator_args(
       java.lang.String operatorName,
       java.lang.String className,
-      java.nio.ByteBuffer jarPayload)
+      java.nio.ByteBuffer jarPayload,
+      RequestContext context)
     {
       this();
       this.operatorName = operatorName;
       this.className = className;
       this.jarPayload = org.apache.thrift.TBaseHelper.copyBinary(jarPayload);
+      this.context = context;
     }
 
     /**
@@ -56522,6 +61382,9 @@ public class RocksDB {
       if (other.isSetJarPayload()) {
         this.jarPayload = org.apache.thrift.TBaseHelper.copyBinary(other.jarPayload);
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -56534,6 +61397,7 @@ public class RocksDB {
       this.operatorName = null;
       this.className = null;
       this.jarPayload = null;
+      this.context = null;
     }
 
     @org.apache.thrift.annotation.Nullable
@@ -56620,6 +61484,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public uploadMergeOperator_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -56651,6 +61540,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -56666,6 +61563,9 @@ public class RocksDB {
 
       case JAR_PAYLOAD:
         return getJarPayload();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -56685,6 +61585,8 @@ public class RocksDB {
         return isSetClassName();
       case JAR_PAYLOAD:
         return isSetJarPayload();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -56729,6 +61631,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -56747,6 +61658,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetJarPayload()) ? 131071 : 524287);
       if (isSetJarPayload())
         hashCode = hashCode * 8191 + jarPayload.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -56785,6 +61700,16 @@ public class RocksDB {
       }
       if (isSetJarPayload()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.jarPayload, other.jarPayload);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -56836,6 +61761,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.jarPayload, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -56851,7 +61784,13 @@ public class RocksDB {
       if (jarPayload == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'jarPayload' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -56914,6 +61853,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 4: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -56945,6 +61893,11 @@ public class RocksDB {
           oprot.writeBinary(struct.jarPayload);
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -56966,6 +61919,7 @@ public class RocksDB {
         oprot.writeString(struct.operatorName);
         oprot.writeString(struct.className);
         oprot.writeBinary(struct.jarPayload);
+        struct.context.write(oprot);
       }
 
       @Override
@@ -56977,6 +61931,9 @@ public class RocksDB {
         struct.setClassNameIsSet(true);
         struct.jarPayload = iprot.readBinary();
         struct.setJarPayloadIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -57475,6 +62432,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("valueMulti", org.apache.thrift.protocol.TType.LIST, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putMultiGetPrevious_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putMultiGetPrevious_argsTupleSchemeFactory();
@@ -57483,13 +62441,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> valueMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS_MULTI((short)3, "keysMulti"),
-      VALUE_MULTI((short)4, "valueMulti");
+      VALUE_MULTI((short)4, "valueMulti"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -57513,6 +62473,8 @@ public class RocksDB {
             return KEYS_MULTI;
           case 4: // VALUE_MULTI
             return VALUE_MULTI;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -57573,6 +62535,8 @@ public class RocksDB {
       tmpMap.put(_Fields.VALUE_MULTI, new org.apache.thrift.meta_data.FieldMetaData("valueMulti", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putMultiGetPrevious_args.class, metaDataMap);
     }
@@ -57584,7 +62548,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
-      java.util.List<java.nio.ByteBuffer> valueMulti)
+      java.util.List<java.nio.ByteBuffer> valueMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -57593,6 +62558,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
       this.valueMulti = valueMulti;
+      this.context = context;
     }
 
     /**
@@ -57614,6 +62580,9 @@ public class RocksDB {
         java.util.List<java.nio.ByteBuffer> __this__valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(other.valueMulti);
         this.valueMulti = __this__valueMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -57629,6 +62598,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keysMulti = null;
       this.valueMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -57759,6 +62729,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putMultiGetPrevious_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -57794,6 +62789,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -57812,6 +62815,9 @@ public class RocksDB {
 
       case VALUE_MULTI:
         return getValueMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -57833,6 +62839,8 @@ public class RocksDB {
         return isSetKeysMulti();
       case VALUE_MULTI:
         return isSetValueMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -57886,6 +62894,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -57904,6 +62921,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValueMulti()) ? 131071 : 524287);
       if (isSetValueMulti())
         hashCode = hashCode * 8191 + valueMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -57956,6 +62977,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -58003,6 +63034,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.valueMulti, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -58017,7 +63056,13 @@ public class RocksDB {
       if (valueMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'valueMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -58120,6 +63165,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -58179,6 +63233,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -58219,6 +63278,7 @@ public class RocksDB {
             oprot.writeBinary(_iter478);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -58259,6 +63319,9 @@ public class RocksDB {
           }
         }
         struct.setValueMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -58815,6 +63878,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("valueMulti", org.apache.thrift.protocol.TType.LIST, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putMultiGetDelta_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putMultiGetDelta_argsTupleSchemeFactory();
@@ -58823,13 +63887,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> valueMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS_MULTI((short)3, "keysMulti"),
-      VALUE_MULTI((short)4, "valueMulti");
+      VALUE_MULTI((short)4, "valueMulti"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -58853,6 +63919,8 @@ public class RocksDB {
             return KEYS_MULTI;
           case 4: // VALUE_MULTI
             return VALUE_MULTI;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -58913,6 +63981,8 @@ public class RocksDB {
       tmpMap.put(_Fields.VALUE_MULTI, new org.apache.thrift.meta_data.FieldMetaData("valueMulti", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putMultiGetDelta_args.class, metaDataMap);
     }
@@ -58924,7 +63994,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
-      java.util.List<java.nio.ByteBuffer> valueMulti)
+      java.util.List<java.nio.ByteBuffer> valueMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -58933,6 +64004,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
       this.valueMulti = valueMulti;
+      this.context = context;
     }
 
     /**
@@ -58954,6 +64026,9 @@ public class RocksDB {
         java.util.List<java.nio.ByteBuffer> __this__valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(other.valueMulti);
         this.valueMulti = __this__valueMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -58969,6 +64044,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keysMulti = null;
       this.valueMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -59099,6 +64175,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putMultiGetDelta_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -59134,6 +64235,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -59152,6 +64261,9 @@ public class RocksDB {
 
       case VALUE_MULTI:
         return getValueMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -59173,6 +64285,8 @@ public class RocksDB {
         return isSetKeysMulti();
       case VALUE_MULTI:
         return isSetValueMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -59226,6 +64340,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -59244,6 +64367,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValueMulti()) ? 131071 : 524287);
       if (isSetValueMulti())
         hashCode = hashCode * 8191 + valueMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -59296,6 +64423,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -59343,6 +64480,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.valueMulti, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -59357,7 +64502,13 @@ public class RocksDB {
       if (valueMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'valueMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -59460,6 +64611,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -59519,6 +64679,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -59559,6 +64724,7 @@ public class RocksDB {
             oprot.writeBinary(_iter510);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -59599,6 +64765,9 @@ public class RocksDB {
           }
         }
         struct.setValueMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -60155,6 +65324,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("valueMulti", org.apache.thrift.protocol.TType.LIST, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putMultiGetChanged_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putMultiGetChanged_argsTupleSchemeFactory();
@@ -60163,13 +65333,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> valueMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS_MULTI((short)3, "keysMulti"),
-      VALUE_MULTI((short)4, "valueMulti");
+      VALUE_MULTI((short)4, "valueMulti"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -60193,6 +65365,8 @@ public class RocksDB {
             return KEYS_MULTI;
           case 4: // VALUE_MULTI
             return VALUE_MULTI;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -60253,6 +65427,8 @@ public class RocksDB {
       tmpMap.put(_Fields.VALUE_MULTI, new org.apache.thrift.meta_data.FieldMetaData("valueMulti", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putMultiGetChanged_args.class, metaDataMap);
     }
@@ -60264,7 +65440,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
-      java.util.List<java.nio.ByteBuffer> valueMulti)
+      java.util.List<java.nio.ByteBuffer> valueMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -60273,6 +65450,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
       this.valueMulti = valueMulti;
+      this.context = context;
     }
 
     /**
@@ -60294,6 +65472,9 @@ public class RocksDB {
         java.util.List<java.nio.ByteBuffer> __this__valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(other.valueMulti);
         this.valueMulti = __this__valueMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -60309,6 +65490,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keysMulti = null;
       this.valueMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -60439,6 +65621,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putMultiGetChanged_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -60474,6 +65681,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -60492,6 +65707,9 @@ public class RocksDB {
 
       case VALUE_MULTI:
         return getValueMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -60513,6 +65731,8 @@ public class RocksDB {
         return isSetKeysMulti();
       case VALUE_MULTI:
         return isSetValueMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -60566,6 +65786,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -60584,6 +65813,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValueMulti()) ? 131071 : 524287);
       if (isSetValueMulti())
         hashCode = hashCode * 8191 + valueMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -60636,6 +65869,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -60683,6 +65926,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.valueMulti, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -60697,7 +65948,13 @@ public class RocksDB {
       if (valueMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'valueMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -60800,6 +66057,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -60859,6 +66125,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -60899,6 +66170,7 @@ public class RocksDB {
             oprot.writeBinary(_iter542);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -60939,6 +66211,9 @@ public class RocksDB {
           }
         }
         struct.setValueMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -61490,6 +66765,7 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TField COLUMN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("columnId", org.apache.thrift.protocol.TType.I64, (short)2);
     private static final org.apache.thrift.protocol.TField KEYS_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("keysMulti", org.apache.thrift.protocol.TType.LIST, (short)3);
     private static final org.apache.thrift.protocol.TField VALUE_MULTI_FIELD_DESC = new org.apache.thrift.protocol.TField("valueMulti", org.apache.thrift.protocol.TType.LIST, (short)4);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)5);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new putMultiGetPreviousPresence_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new putMultiGetPreviousPresence_argsTupleSchemeFactory();
@@ -61498,13 +66774,15 @@ public class RocksDB {
     public long columnId; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti; // required
     public @org.apache.thrift.annotation.Nullable java.util.List<java.nio.ByteBuffer> valueMulti; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       TRANSACTION_OR_UPDATE_ID((short)1, "transactionOrUpdateId"),
       COLUMN_ID((short)2, "columnId"),
       KEYS_MULTI((short)3, "keysMulti"),
-      VALUE_MULTI((short)4, "valueMulti");
+      VALUE_MULTI((short)4, "valueMulti"),
+      CONTEXT((short)5, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -61528,6 +66806,8 @@ public class RocksDB {
             return KEYS_MULTI;
           case 4: // VALUE_MULTI
             return VALUE_MULTI;
+          case 5: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -61588,6 +66868,8 @@ public class RocksDB {
       tmpMap.put(_Fields.VALUE_MULTI, new org.apache.thrift.meta_data.FieldMetaData("valueMulti", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
               new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING              , true))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(putMultiGetPreviousPresence_args.class, metaDataMap);
     }
@@ -61599,7 +66881,8 @@ public class RocksDB {
       long transactionOrUpdateId,
       long columnId,
       java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti,
-      java.util.List<java.nio.ByteBuffer> valueMulti)
+      java.util.List<java.nio.ByteBuffer> valueMulti,
+      RequestContext context)
     {
       this();
       this.transactionOrUpdateId = transactionOrUpdateId;
@@ -61608,6 +66891,7 @@ public class RocksDB {
       setColumnIdIsSet(true);
       this.keysMulti = keysMulti;
       this.valueMulti = valueMulti;
+      this.context = context;
     }
 
     /**
@@ -61629,6 +66913,9 @@ public class RocksDB {
         java.util.List<java.nio.ByteBuffer> __this__valueMulti = new java.util.ArrayList<java.nio.ByteBuffer>(other.valueMulti);
         this.valueMulti = __this__valueMulti;
       }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -61644,6 +66931,7 @@ public class RocksDB {
       this.columnId = 0;
       this.keysMulti = null;
       this.valueMulti = null;
+      this.context = null;
     }
 
     public long getTransactionOrUpdateId() {
@@ -61774,6 +67062,31 @@ public class RocksDB {
       }
     }
 
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public putMultiGetPreviousPresence_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -61809,6 +67122,14 @@ public class RocksDB {
         }
         break;
 
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -61827,6 +67148,9 @@ public class RocksDB {
 
       case VALUE_MULTI:
         return getValueMulti();
+
+      case CONTEXT:
+        return getContext();
 
       }
       throw new java.lang.IllegalStateException();
@@ -61848,6 +67172,8 @@ public class RocksDB {
         return isSetKeysMulti();
       case VALUE_MULTI:
         return isSetValueMulti();
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -61901,6 +67227,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
@@ -61919,6 +67254,10 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetValueMulti()) ? 131071 : 524287);
       if (isSetValueMulti())
         hashCode = hashCode * 8191 + valueMulti.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -61971,6 +67310,16 @@ public class RocksDB {
           return lastComparison;
         }
       }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -62018,6 +67367,14 @@ public class RocksDB {
         org.apache.thrift.TBaseHelper.toString(this.valueMulti, sb);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -62032,7 +67389,13 @@ public class RocksDB {
       if (valueMulti == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'valueMulti' was not present! Struct: " + toString());
       }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -62135,6 +67498,15 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 5: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -62194,6 +67566,11 @@ public class RocksDB {
           }
           oprot.writeFieldEnd();
         }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -62234,6 +67611,7 @@ public class RocksDB {
             oprot.writeBinary(_iter574);
           }
         }
+        struct.context.write(oprot);
       }
 
       @Override
@@ -62274,6 +67652,9 @@ public class RocksDB {
           }
         }
         struct.setValueMultiIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 
@@ -64113,14 +69494,16 @@ public class RocksDB {
   public static class getAllColumnDefinitions_args implements org.apache.thrift.TBase<getAllColumnDefinitions_args, getAllColumnDefinitions_args._Fields>, java.io.Serializable, Cloneable, Comparable<getAllColumnDefinitions_args>   {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("getAllColumnDefinitions_args");
 
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)1);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new getAllColumnDefinitions_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new getAllColumnDefinitions_argsTupleSchemeFactory();
 
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-;
+      CONTEXT((short)1, "context");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -64136,6 +69519,8 @@ public class RocksDB {
       @org.apache.thrift.annotation.Nullable
       public static _Fields findByThriftId(int fieldId) {
         switch(fieldId) {
+          case 1: // CONTEXT
+            return CONTEXT;
           default:
             return null;
         }
@@ -64177,9 +69562,13 @@ public class RocksDB {
         return _fieldName;
       }
     }
+
+    // isset id assignments
     public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
     static {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(getAllColumnDefinitions_args.class, metaDataMap);
     }
@@ -64187,10 +69576,20 @@ public class RocksDB {
     public getAllColumnDefinitions_args() {
     }
 
+    public getAllColumnDefinitions_args(
+      RequestContext context)
+    {
+      this();
+      this.context = context;
+    }
+
     /**
      * Performs a deep copy on <i>other</i>.
      */
     public getAllColumnDefinitions_args(getAllColumnDefinitions_args other) {
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
     }
 
     @Override
@@ -64200,11 +69599,45 @@ public class RocksDB {
 
     @Override
     public void clear() {
+      this.context = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public getAllColumnDefinitions_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
     }
 
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
       }
     }
 
@@ -64212,6 +69645,9 @@ public class RocksDB {
     @Override
     public java.lang.Object getFieldValue(_Fields field) {
       switch (field) {
+      case CONTEXT:
+        return getContext();
+
       }
       throw new java.lang.IllegalStateException();
     }
@@ -64224,6 +69660,8 @@ public class RocksDB {
       }
 
       switch (field) {
+      case CONTEXT:
+        return isSetContext();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -64241,12 +69679,25 @@ public class RocksDB {
       if (this == that)
         return true;
 
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
       return true;
     }
 
     @Override
     public int hashCode() {
       int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
 
       return hashCode;
     }
@@ -64259,6 +69710,16 @@ public class RocksDB {
 
       int lastComparison = 0;
 
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -64283,13 +69744,26 @@ public class RocksDB {
       java.lang.StringBuilder sb = new java.lang.StringBuilder("getAllColumnDefinitions_args(");
       boolean first = true;
 
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
       sb.append(")");
       return sb.toString();
     }
 
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
       // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
     }
 
     private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
@@ -64328,6 +69802,15 @@ public class RocksDB {
             break;
           }
           switch (schemeField.id) {
+            case 1: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -64344,6 +69827,11 @@ public class RocksDB {
         struct.validate();
 
         oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -64362,11 +69850,15 @@ public class RocksDB {
       @Override
       public void write(org.apache.thrift.protocol.TProtocol prot, getAllColumnDefinitions_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.context.write(oprot);
       }
 
       @Override
       public void read(org.apache.thrift.protocol.TProtocol prot, getAllColumnDefinitions_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
       }
     }
 

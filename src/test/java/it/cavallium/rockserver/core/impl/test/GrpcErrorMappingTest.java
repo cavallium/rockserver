@@ -56,7 +56,7 @@ class GrpcErrorMappingTest {
 	@Test
 	void validRockserverErrorsRetainTheirTypedContract() {
 		var error = assertThrows(RocksDBException.class,
-				() -> client.getSyncApi().getColumnId("valid"));
+				() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("valid"));
 
 		assertEquals(RocksDBErrorType.COLUMN_NOT_FOUND, error.getErrorUniqueId());
 		assertEquals("missing column", error.getMessage());
@@ -65,7 +65,7 @@ class GrpcErrorMappingTest {
 	@Test
 	void readDeadlineExceededRetainsItsTypedContract() {
 		var error = assertThrows(RocksDBException.class,
-				() -> client.getSyncApi().getColumnId("read-deadline"));
+				() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("read-deadline"));
 
 		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
 		assertEquals("Deadline exceeded", error.getMessage());
@@ -74,7 +74,7 @@ class GrpcErrorMappingTest {
 	@Test
 	void getErrorWithDeadlineTextIsNotReclassifiedAsReadDeadlineExceeded() {
 		var error = assertThrows(RocksDBException.class,
-				() -> client.getSyncApi().getColumnId("get-deadline-text"));
+				() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("get-deadline-text"));
 
 		assertEquals(RocksDBErrorType.GET_1, error.getErrorUniqueId());
 		assertEquals("Deadline exceeded", error.getMessage());
@@ -83,13 +83,13 @@ class GrpcErrorMappingTest {
 	@Test
 	void updateRetryRetainsItsSpecializedExceptionType() {
 		assertThrows(RocksDBRetryException.class,
-				() -> client.getSyncApi().getColumnId("retry"));
+				() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("retry"));
 	}
 
 	@Test
 	void truncatedRockserverErrorDescriptionDoesNotCrashTheMapper() {
 		var error = assertThrows(StatusRuntimeException.class,
-				() -> client.getSyncApi().getColumnId("truncated"));
+				() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("truncated"));
 
 		assertEquals(Status.Code.INTERNAL, error.getStatus().getCode());
 		assertEquals(ERROR_PREFIX, error.getStatus().getDescription());
@@ -99,7 +99,7 @@ class GrpcErrorMappingTest {
 	void unknownRockserverErrorCodeDoesNotCrashTheMapper() {
 		String description = ERROR_PREFIX + "FUTURE_SERVER_ERROR] unknown";
 		var error = assertThrows(StatusRuntimeException.class,
-				() -> client.getSyncApi().getColumnId("unknown"));
+				() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("unknown"));
 
 		assertEquals(Status.Code.INTERNAL, error.getStatus().getCode());
 		assertEquals(description, error.getStatus().getDescription());
@@ -108,7 +108,7 @@ class GrpcErrorMappingTest {
 	@Test
 	void unrelatedGrpcStatusIsNotReclassified() {
 		var error = assertThrows(StatusRuntimeException.class,
-				() -> client.getSyncApi().getColumnId("unrelated"));
+				() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("unrelated"));
 
 		assertEquals(Status.Code.INVALID_ARGUMENT, error.getStatus().getCode());
 		assertEquals("plain grpc error", error.getStatus().getDescription());
@@ -117,7 +117,7 @@ class GrpcErrorMappingTest {
 	@Test
 	void noCacheRangeFailsClearlyAgainstAnIncompatiblePeer() {
 		var error = assertThrows(RocksDBException.class, () -> {
-			try (var range = client.getSyncApi().getRange(0,
+			try (var range = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRange(0,
 					0,
 					null,
 					null,

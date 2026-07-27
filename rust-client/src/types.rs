@@ -3,10 +3,34 @@ use crate::proto;
 
 // Re-export proto types that are part of the public API
 pub use crate::proto::{
-    ColumnHashType, Operation, PutBatchMode, MergeBatchMode, WriteClass,
+	ColumnHashType, Operation, PutBatchMode, MergeBatchMode, RequestContext, WorkloadProfile,
     Kv, KvBatch, Delta, Previous, Changed, PreviousPresence, Merged, UpdateBegin,
     FirstAndLast, CdcEvent,
 };
+
+impl RequestContext {
+	/// Create a mandatory caller context. Protected profiles are rejected by Rockserver.
+	pub fn for_profile(profile: WorkloadProfile, deadline_epoch_millis: i64) -> Self {
+		Self { profile: profile as i32, deadline_epoch_millis }
+	}
+
+	/// Context for request-bound work with an absolute Unix-epoch deadline.
+	pub fn latency(deadline_epoch_millis: i64) -> Self {
+		Self::for_profile(WorkloadProfile::Latency, deadline_epoch_millis)
+	}
+
+	pub fn analytical() -> Self {
+		Self::for_profile(WorkloadProfile::Analytical, i64::MAX)
+	}
+
+	pub fn ingest() -> Self {
+		Self::for_profile(WorkloadProfile::Ingest, i64::MAX)
+	}
+
+	pub fn batch() -> Self {
+		Self::for_profile(WorkloadProfile::Batch, i64::MAX)
+	}
+}
 
 /// Schema definition for a column in RockServer.
 ///

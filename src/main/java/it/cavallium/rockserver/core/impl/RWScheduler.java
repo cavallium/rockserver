@@ -1,136 +1,98 @@
 package it.cavallium.rockserver.core.impl;
 
-import static reactor.core.scheduler.Schedulers.DEFAULT_BOUNDED_ELASTIC_QUEUESIZE;
-
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
-import it.cavallium.rockserver.core.common.WriteClass;
-import java.util.AbstractQueue;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
+import it.cavallium.rockserver.core.common.OperationFamily;
+import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
+import java.time.Duration;
+import java.util.EnumMap;
 import java.util.IdentityHashMap;
-import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
-import org.jetbrains.annotations.NotNull;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.jetbrains.annotations.Nullable;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
 /**
- * Shared read/write schedulers for a database.
+ * Workload-aware shared read/write admission for one database.
  *
- * <p>The read side has two scheduling views backed by the same fixed-size executor:
- * {@link #read()} for composite/background steps and {@link #interactiveRead()} for
- * latency-sensitive bounded calls. Interactive work may overtake queued composite work,
- * but a weighted handoff guarantees composite progress under a continuous interactive load.
- * The configured read cap is therefore still the hard limit on running read tasks.</p>
- *
- * <p>The write side exposes foreground and maintenance views over one bounded executor.
- * Foreground work can use the full write limit, maintenance work has a smaller sub-limit, and
- * both lanes retain FIFO order with bounded foreground preference.</p>
- *
- * <p>Long flush/compact work is serialized on {@link #maintenance()}. Iterator cleanup uses
- * {@link #control()}, while CDC validation/WAL publication has the independent {@link #cdc()}
- * lane. Blocking iterator closes therefore cannot stall WAL visibility or consume a
- * read/write worker.</p>
+ * <p>LATENCY requests are ordered by absolute deadline. INGEST, CDC, ANALYTICAL,
+ * and BATCH use weighted deficit round-robin, so no profile depends on a strict
+ * global-priority chain. Read and write resources are shared but have independent
+ * bounded queues. CONTROL owns a small isolated executor; physical maintenance is
+ * serialized.</p>
  */
 public final class RWScheduler {
 
-	private static final int MAX_CONSECUTIVE_INTERACTIVE_READS = 8;
+	public static final int DEFAULT_ANALYTICAL_QUEUE_CAPACITY = 512;
+	public static final int DEFAULT_BATCH_QUEUE_CAPACITY = 512;
+	public static final int DEFAULT_LATENCY_QUEUE_CAPACITY = 4_096;
+	public static final int DEFAULT_INGEST_QUEUE_CAPACITY = 4_096;
+	public static final int DEFAULT_CDC_QUEUE_CAPACITY = 1_024;
+	// Configuration compatibility: these keys predate workload profiles but now
+	// size the analytical cap and the shared foreground/batch queues.
 	public static final int DEFAULT_MAINTENANCE_WRITE_PARALLELISM = 1;
-	public static final int DEFAULT_FOREGROUND_WRITE_QUEUE_CAPACITY = 4_096;
-	public static final int DEFAULT_MAINTENANCE_WRITE_QUEUE_CAPACITY = 512;
-	/**
-	 * Cleanup can wait for an in-flight iterator operation. Two lazy workers let an
-	 * unrelated cleanup still progress; CDC has its own independent lane below.
-	 */
-	private static final int CONTROL_THREAD_CAPACITY = 2;
+	public static final int DEFAULT_FOREGROUND_WRITE_QUEUE_CAPACITY = DEFAULT_INGEST_QUEUE_CAPACITY;
+	public static final int DEFAULT_MAINTENANCE_WRITE_QUEUE_CAPACITY = DEFAULT_BATCH_QUEUE_CAPACITY;
+	private static final int CONTROL_THREADS = 2;
+	private static final int CONTROL_QUEUE_CAPACITY = 256;
+	private static final int PHYSICAL_QUEUE_CAPACITY = 16;
 
-	private final Scheduler read;
-	private final Scheduler interactiveRead;
-	private final Scheduler write;
-	private final Scheduler maintenanceWrite;
-	private final Scheduler maintenance;
-	private final Scheduler control;
-	private final Scheduler cdc;
-	private final Executor readExecutor;
-	private final Executor interactiveReadExecutor;
-	private final Executor writeExecutor;
-	private final Executor maintenanceWriteExecutor;
-	private final Executor maintenanceExecutor;
-	private final Executor controlExecutor;
-	private final Executor cdcExecutor;
-	private final @Nullable ClassifiedWriteExecutor classifiedWriteExecutor;
+	private final @Nullable ProfiledWorkloadExecutor readPool;
+	private final @Nullable ProfiledWorkloadExecutor writePool;
+	private final @Nullable ProfiledWorkloadExecutor controlPool;
+	private final @Nullable ProfiledWorkloadExecutor physicalPool;
+	private final @Nullable Scheduler externalRead;
+	private final @Nullable Scheduler externalWrite;
+	private final @Nullable Executor externalReadExecutor;
+	private final @Nullable Executor externalWriteExecutor;
+	private final AtomicBoolean storagePressure = new AtomicBoolean();
 
+	/** Preserve custom in-process scheduling while requiring contexts at API boundaries. */
 	public RWScheduler(Scheduler read, Scheduler write) {
-		this(read,
-				read,
-				write,
-				write,
-				write,
-				write,
-				write,
-				read::schedule,
-				read::schedule,
-				write::schedule,
-				write::schedule,
-				write::schedule,
-				write::schedule,
-				write::schedule,
-				null);
+		this(read, write, read::schedule, write::schedule);
 	}
 
-	/** Preserves the original public constructor used by custom/in-process schedulers. */
+	/** Preserve the original custom executor constructor. */
 	public RWScheduler(Scheduler read, Scheduler write, Executor readExecutor, Executor writeExecutor) {
-		this(read,
-				read,
-				write,
-				write,
-				write,
-				write,
-				write,
-				readExecutor,
-				readExecutor,
-				writeExecutor,
-				writeExecutor,
-				writeExecutor,
-				writeExecutor,
-				writeExecutor,
-				null);
+		this.readPool = null;
+		this.writePool = null;
+		this.controlPool = null;
+		this.physicalPool = null;
+		this.externalRead = Objects.requireNonNull(read, "read");
+		this.externalWrite = Objects.requireNonNull(write, "write");
+		this.externalReadExecutor = Objects.requireNonNull(readExecutor, "readExecutor");
+		this.externalWriteExecutor = Objects.requireNonNull(writeExecutor, "writeExecutor");
 	}
 
 	public RWScheduler(int readCap, int writeCap, String name) {
 		this(readCap,
 				writeCap,
-				DEFAULT_MAINTENANCE_WRITE_PARALLELISM,
-				DEFAULT_FOREGROUND_WRITE_QUEUE_CAPACITY,
-				DEFAULT_MAINTENANCE_WRITE_QUEUE_CAPACITY,
+				1,
+				DEFAULT_INGEST_QUEUE_CAPACITY,
+				DEFAULT_BATCH_QUEUE_CAPACITY,
 				name);
 	}
 
 	public RWScheduler(int readCap,
 			int writeCap,
-			int maintenanceWriteCap,
-			int foregroundWriteQueueCapacity,
-			int maintenanceWriteQueueCapacity,
+			int analyticalCap,
+			int foregroundQueueCapacity,
+			int batchQueueCapacity,
 			String name) {
 		this(readCap,
 				writeCap,
-				maintenanceWriteCap,
-				foregroundWriteQueueCapacity,
-				maintenanceWriteQueueCapacity,
+				analyticalCap,
+				foregroundQueueCapacity,
+				batchQueueCapacity,
 				name,
 				null,
 				name);
@@ -138,332 +100,260 @@ public final class RWScheduler {
 
 	public RWScheduler(int readCap,
 			int writeCap,
-			int maintenanceWriteCap,
-			int foregroundWriteQueueCapacity,
-			int maintenanceWriteQueueCapacity,
+			int analyticalCap,
+			int foregroundQueueCapacity,
+			int batchQueueCapacity,
 			String name,
-			@Nullable MeterRegistry meterRegistry,
+			@Nullable MeterRegistry registry,
 			String databaseName) {
-		this(createResources(readCap,
-				writeCap,
-				maintenanceWriteCap,
-				foregroundWriteQueueCapacity,
-				maintenanceWriteQueueCapacity,
-				name,
-				meterRegistry,
-				databaseName));
-	}
-
-	private RWScheduler(Resources resources) {
-		this(resources.read(),
-				resources.interactiveRead(),
-				resources.write(),
-				resources.maintenanceWrite(),
-				resources.maintenance(),
-				resources.control(),
-				resources.cdc(),
-				resources.readExecutor(),
-				resources.interactiveReadExecutor(),
-				resources.writeExecutor(),
-				resources.maintenanceWriteExecutor(),
-				resources.maintenanceExecutor(),
-				resources.controlExecutor(),
-				resources.cdcExecutor(),
-				resources.classifiedWriteExecutor());
-	}
-
-	private RWScheduler(Scheduler read,
-			Scheduler interactiveRead,
-			Scheduler write,
-			Scheduler maintenanceWrite,
-			Scheduler maintenance,
-			Scheduler control,
-			Scheduler cdc,
-			Executor readExecutor,
-			Executor interactiveReadExecutor,
-			Executor writeExecutor,
-			Executor maintenanceWriteExecutor,
-			Executor maintenanceExecutor,
-			Executor controlExecutor,
-			Executor cdcExecutor,
-			@Nullable ClassifiedWriteExecutor classifiedWriteExecutor) {
-		this.read = Objects.requireNonNull(read, "read");
-		this.interactiveRead = Objects.requireNonNull(interactiveRead, "interactiveRead");
-		this.write = Objects.requireNonNull(write, "write");
-		this.maintenanceWrite = Objects.requireNonNull(maintenanceWrite, "maintenanceWrite");
-		this.maintenance = Objects.requireNonNull(maintenance, "maintenance");
-		this.control = Objects.requireNonNull(control, "control");
-		this.cdc = Objects.requireNonNull(cdc, "cdc");
-		this.readExecutor = Objects.requireNonNull(readExecutor, "readExecutor");
-		this.interactiveReadExecutor = Objects.requireNonNull(interactiveReadExecutor, "interactiveReadExecutor");
-		this.writeExecutor = Objects.requireNonNull(writeExecutor, "writeExecutor");
-		this.maintenanceWriteExecutor = Objects.requireNonNull(maintenanceWriteExecutor, "maintenanceWriteExecutor");
-		this.maintenanceExecutor = Objects.requireNonNull(maintenanceExecutor, "maintenanceExecutor");
-		this.controlExecutor = Objects.requireNonNull(controlExecutor, "controlExecutor");
-		this.cdcExecutor = Objects.requireNonNull(cdcExecutor, "cdcExecutor");
-		this.classifiedWriteExecutor = classifiedWriteExecutor;
-	}
-
-	private static Resources createResources(int readCap,
-			int writeCap,
-			int maintenanceWriteCap,
-			int foregroundWriteQueueCapacity,
-			int maintenanceWriteQueueCapacity,
-			String name,
-			@Nullable MeterRegistry meterRegistry,
-			String databaseName) {
-		if (readCap < 1) {
-			throw new IllegalArgumentException("Read scheduler capacity must be positive");
+		if (readCap < 1 || writeCap < 1 || analyticalCap < 1) {
+			throw new IllegalArgumentException("Scheduler capacities must be positive");
 		}
-		var readExecutor = createReadExecutor(readCap, name + "-read");
-		var interactiveReadExecutor = new InteractiveExecutor(readExecutor);
-		var classifiedWriteExecutor = new ClassifiedWriteExecutor(
-				writeCap,
-				maintenanceWriteCap,
-				foregroundWriteQueueCapacity,
-				maintenanceWriteQueueCapacity,
-				databaseName,
-				threadFactory(name + "-write"),
-				meterRegistry);
-		var writeExecutor = classifiedWriteExecutor.executor(WriteClass.FOREGROUND);
-		var maintenanceWriteExecutor = classifiedWriteExecutor.executor(WriteClass.MAINTENANCE);
-		var maintenanceExecutor = createExecutor(1, name + "-maintenance");
-		var controlExecutor = createExecutor(CONTROL_THREAD_CAPACITY, name + "-control");
-		var cdcExecutor = createExecutor(1, name + "-cdc");
-		return new Resources(
-				Schedulers.fromExecutorService(readExecutor, name + "-read"),
-				Schedulers.fromExecutor(interactiveReadExecutor),
-				Schedulers.fromExecutorService(writeExecutor, name + "-write-foreground"),
-				Schedulers.fromExecutorService(maintenanceWriteExecutor, name + "-write-maintenance"),
-				Schedulers.fromExecutorService(maintenanceExecutor, name + "-maintenance"),
-				Schedulers.fromExecutorService(controlExecutor, name + "-control"),
-				Schedulers.fromExecutorService(cdcExecutor, name + "-cdc"),
-				readExecutor,
-				interactiveReadExecutor,
-				writeExecutor,
-				maintenanceWriteExecutor,
-				maintenanceExecutor,
-				controlExecutor,
-				cdcExecutor,
-				classifiedWriteExecutor);
+		if (foregroundQueueCapacity < 1 || batchQueueCapacity < 1) {
+			throw new IllegalArgumentException("Queue capacities must be positive");
+		}
+		this.externalRead = null;
+		this.externalWrite = null;
+		this.externalReadExecutor = null;
+		this.externalWriteExecutor = null;
+		var dataCapacities = dataCapacities(foregroundQueueCapacity, batchQueueCapacity);
+		this.readPool = new ProfiledWorkloadExecutor(readCap,
+				analyticalCap,
+				dataCapacities,
+				name + "-read",
+				"read",
+				storagePressure,
+				registry,
+				databaseName);
+		this.writePool = new ProfiledWorkloadExecutor(writeCap,
+				analyticalCap,
+				dataCapacities,
+				name + "-write",
+				"write",
+				storagePressure,
+				registry,
+				databaseName);
+		this.controlPool = new ProfiledWorkloadExecutor(CONTROL_THREADS,
+				CONTROL_THREADS,
+				Map.of(WorkloadProfile.CONTROL, CONTROL_QUEUE_CAPACITY),
+				name + "-control",
+				"control",
+				storagePressure,
+				registry,
+				databaseName);
+		this.physicalPool = new ProfiledWorkloadExecutor(1,
+				1,
+				Map.of(WorkloadProfile.PHYSICAL_MAINTENANCE, PHYSICAL_QUEUE_CAPACITY),
+				name + "-physical",
+				"physical",
+				storagePressure,
+				registry,
+				databaseName);
+		if (registry != null) {
+			Gauge.builder("rockserver.workload.storage.pressure", storagePressure, value -> value.get() ? 1 : 0)
+					.tag("database", databaseName)
+					.register(registry);
+		}
 	}
 
-	private static ExecutorService createReadExecutor(int cap, String name) {
-		var executor = new ThreadPoolExecutor(cap,
-				cap,
-				0L,
-				TimeUnit.MILLISECONDS,
-				new WeightedReadQueue(DEFAULT_BOUNDED_ELASTIC_QUEUESIZE,
-						MAX_CONSECUTIVE_INTERACTIVE_READS),
-				threadFactory(name),
-				new ThreadPoolExecutor.AbortPolicy());
-		executor.allowCoreThreadTimeOut(false);
-		return executor;
+	private static Map<WorkloadProfile, Integer> dataCapacities(int foreground, int batch) {
+		var capacities = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
+		capacities.put(WorkloadProfile.LATENCY, foreground);
+		capacities.put(WorkloadProfile.INGEST, foreground);
+		capacities.put(WorkloadProfile.CDC, Math.max(64, Math.min(foreground, DEFAULT_CDC_QUEUE_CAPACITY)));
+		capacities.put(WorkloadProfile.ANALYTICAL, Math.max(1, Math.min(batch, DEFAULT_ANALYTICAL_QUEUE_CAPACITY)));
+		capacities.put(WorkloadProfile.BATCH, batch);
+		return capacities;
 	}
 
-	private static ExecutorService createExecutor(int cap, String name) {
-		var executor = new ThreadPoolExecutor(cap,
-				cap,
-				0L,
-				TimeUnit.MILLISECONDS,
-				new java.util.concurrent.LinkedBlockingQueue<>(DEFAULT_BOUNDED_ELASTIC_QUEUESIZE),
-				threadFactory(name),
-				new ThreadPoolExecutor.AbortPolicy());
-		executor.allowCoreThreadTimeOut(false);
-		return executor;
+	/** Resolve and validate the caller context, then return its resource-specific view. */
+	public Scheduler scheduler(RequestContext context, OperationFamily family) {
+		var profile = WorkloadAdmission.resolve(context, family);
+		return scheduler(profile, family, context.deadlineEpochMillis());
 	}
 
-	private static java.util.concurrent.ThreadFactory threadFactory(String name) {
-		return new ThreadFactoryBuilder()
-				.setDaemon(false)
-				.setNameFormat(name + "-%d")
-				.build();
+	public Executor executor(RequestContext context, OperationFamily family) {
+		var profile = WorkloadAdmission.resolve(context, family);
+		return executor(profile, family, context.deadlineEpochMillis());
 	}
 
+	/** Server-only scheduling entry for protected CDC/control/physical work. */
+	public Scheduler scheduler(WorkloadProfile profile,
+			OperationFamily family,
+			long deadlineEpochMillis) {
+		return Schedulers.fromExecutor(executor(profile, family, deadlineEpochMillis));
+	}
+
+	/** Server-only executor entry for protected CDC/control/physical work. */
+	public Executor executor(WorkloadProfile profile,
+			OperationFamily family,
+			long deadlineEpochMillis) {
+		WorkloadAdmission.validate(profile, family);
+		if (readPool == null) {
+			return resourceKind(profile, family) == ResourceKind.READ
+					? Objects.requireNonNull(externalReadExecutor)
+					: Objects.requireNonNull(externalWriteExecutor);
+		}
+		return pool(profile, family).view(profile, family, deadlineEpochMillis);
+	}
+
+	private ProfiledWorkloadExecutor pool(WorkloadProfile profile, OperationFamily family) {
+		return switch (resourceKind(profile, family)) {
+			case READ -> Objects.requireNonNull(readPool);
+			case WRITE -> Objects.requireNonNull(writePool);
+			case CONTROL -> Objects.requireNonNull(controlPool);
+			case PHYSICAL -> Objects.requireNonNull(physicalPool);
+		};
+	}
+
+	private static ResourceKind resourceKind(WorkloadProfile profile, OperationFamily family) {
+		if (profile == WorkloadProfile.CONTROL) {
+			return ResourceKind.CONTROL;
+		}
+		if (profile == WorkloadProfile.PHYSICAL_MAINTENANCE) {
+			return ResourceKind.PHYSICAL;
+		}
+		return switch (family) {
+			case MUTATION, FLUSH -> ResourceKind.WRITE;
+			case CONTROL -> ResourceKind.CONTROL;
+			case COMPACTION -> ResourceKind.PHYSICAL;
+			case METADATA, POINT_LOOKUP, BOUNDARY_SEEK, BOUNDED_FAN_OUT,
+					RANGE_PAGE, FULL_SCAN_AGGREGATE, WAL_PAGE -> ResourceKind.READ;
+		};
+	}
+
+	/** Legacy internal aliases. Generic public requests must use {@link #scheduler(RequestContext, OperationFamily)}. */
 	public Scheduler read() {
-		return read;
+		return scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
 	}
 
 	public Scheduler interactiveRead() {
-		return interactiveRead;
+		return scheduler(WorkloadProfile.LATENCY,
+				OperationFamily.POINT_LOOKUP,
+				System.currentTimeMillis() + Duration.ofMinutes(1).toMillis());
 	}
 
 	public Scheduler write() {
-		return write;
-	}
-
-	/** Return the scheduling view for the requested write class. */
-	public Scheduler write(WriteClass writeClass) {
-		return switch (Objects.requireNonNull(writeClass, "writeClass")) {
-			case FOREGROUND -> write;
-			case MAINTENANCE -> maintenanceWrite;
-		};
+		return scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
 	}
 
 	public Scheduler maintenance() {
-		return maintenance;
+		return scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE,
+				OperationFamily.COMPACTION,
+				RequestContext.NO_DEADLINE);
 	}
 
 	public Scheduler control() {
-		return control;
+		return scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, RequestContext.NO_DEADLINE);
 	}
 
 	public Scheduler cdc() {
-		return cdc;
+		return scheduler(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, RequestContext.NO_DEADLINE);
 	}
 
 	public Executor readExecutor() {
-		return readExecutor;
+		return executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
 	}
 
 	public Executor interactiveReadExecutor() {
-		return interactiveReadExecutor;
+		return executor(WorkloadProfile.LATENCY,
+				OperationFamily.POINT_LOOKUP,
+				System.currentTimeMillis() + Duration.ofMinutes(1).toMillis());
 	}
 
 	public Executor writeExecutor() {
-		return writeExecutor;
-	}
-
-	/** Return the executor view for the requested write class. */
-	public Executor writeExecutor(WriteClass writeClass) {
-		return switch (Objects.requireNonNull(writeClass, "writeClass")) {
-			case FOREGROUND -> writeExecutor;
-			case MAINTENANCE -> maintenanceWriteExecutor;
-		};
-	}
-
-	public int queuedWriteTasks(WriteClass writeClass) {
-		Objects.requireNonNull(writeClass, "writeClass");
-		return classifiedWriteExecutor != null ? classifiedWriteExecutor.queuedTasks(writeClass) : 0;
-	}
-
-	public int activeWriteTasks(WriteClass writeClass) {
-		Objects.requireNonNull(writeClass, "writeClass");
-		return classifiedWriteExecutor != null ? classifiedWriteExecutor.activeTasks(writeClass) : 0;
-	}
-
-	/** Return one internally consistent observation for overload benchmarks and diagnostics. */
-	public WriteAdmissionSnapshot writeAdmissionSnapshot() {
-		if (classifiedWriteExecutor == null) {
-			return new WriteAdmissionSnapshot(0, 0, 0, 0);
-		}
-		var snapshot = classifiedWriteExecutor.snapshot();
-		return new WriteAdmissionSnapshot(
-				snapshot.foregroundQueued(),
-				snapshot.maintenanceQueued(),
-				snapshot.foregroundActive(),
-				snapshot.maintenanceActive());
-	}
-
-	public int writeWorkerCount() {
-		return classifiedWriteExecutor != null ? classifiedWriteExecutor.workerCount() : 0;
-	}
-
-	public int writeWorkerLimit(WriteClass writeClass) {
-		Objects.requireNonNull(writeClass, "writeClass");
-		return classifiedWriteExecutor != null ? classifiedWriteExecutor.workerLimit(writeClass) : 0;
-	}
-
-	public int writeQueueCapacity(WriteClass writeClass) {
-		Objects.requireNonNull(writeClass, "writeClass");
-		return classifiedWriteExecutor != null ? classifiedWriteExecutor.queueCapacity(writeClass) : 0;
-	}
-
-	/** Atomic write-admission gauges captured under the classified executor lock. */
-	public record WriteAdmissionSnapshot(int foregroundQueued,
-			int maintenanceQueued,
-			int foregroundActive,
-			int maintenanceActive) {
-
-		public int totalActive() {
-			return foregroundActive + maintenanceActive;
-		}
-	}
-
-	/** Whether the calling thread is already running inside this scheduler's write admission. */
-	public boolean isExecutingWriteTask() {
-		return classifiedWriteExecutor != null && classifiedWriteExecutor.isExecutingTask();
+		return executor(WorkloadProfile.INGEST, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
 	}
 
 	public Executor maintenanceExecutor() {
-		return maintenanceExecutor;
+		return executor(WorkloadProfile.PHYSICAL_MAINTENANCE,
+				OperationFamily.COMPACTION,
+				RequestContext.NO_DEADLINE);
 	}
 
 	public Executor controlExecutor() {
-		return controlExecutor;
+		return executor(WorkloadProfile.CONTROL, OperationFamily.CONTROL, RequestContext.NO_DEADLINE);
 	}
 
 	public Executor cdcExecutor() {
-		return cdcExecutor;
+		return executor(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, RequestContext.NO_DEADLINE);
 	}
 
-	/**
-	 * Remove work that has not started from either scheduling view. Interactive reads are
-	 * wrapped only to classify them in the shared weighted queue, so cancellation must remove
-	 * that wrapper rather than the original runnable.
-	 */
+	public int queuedTasks(WorkloadProfile profile) {
+		return readPool == null ? 0 : readPool.queued(profile) + writePool.queued(profile)
+				+ controlPool.queued(profile) + physicalPool.queued(profile);
+	}
+
+	public int activeTasks(WorkloadProfile profile) {
+		return readPool == null ? 0 : readPool.active(profile) + writePool.active(profile)
+				+ controlPool.active(profile) + physicalPool.active(profile);
+	}
+
+	public int queueCapacity(WorkloadProfile profile) {
+		return readPool == null ? 0 : readPool.capacity(profile) + writePool.capacity(profile)
+				+ controlPool.capacity(profile) + physicalPool.capacity(profile);
+	}
+
+	public ProfileAdmissionSnapshot admissionSnapshot() {
+		var queued = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
+		var active = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
+		for (var profile : WorkloadProfile.values()) {
+			queued.put(profile, queuedTasks(profile));
+			active.put(profile, activeTasks(profile));
+		}
+		return new ProfileAdmissionSnapshot(Map.copyOf(queued), Map.copyOf(active), storagePressure.get());
+	}
+
 	public boolean removeQueuedTask(Executor schedulingView, Runnable task) {
 		Objects.requireNonNull(schedulingView, "schedulingView");
 		Objects.requireNonNull(task, "task");
-		if (schedulingView instanceof InteractiveExecutor interactiveExecutor) {
-			return interactiveExecutor.remove(task);
+		if (readPool != null) {
+			for (var pool : List.of(readPool, writePool, controlPool, physicalPool)) {
+				if (pool.remove(schedulingView, task)) {
+					return true;
+				}
+			}
 		}
-		if (classifiedWriteExecutor != null
-				&& (schedulingView == writeExecutor || schedulingView == maintenanceWriteExecutor)) {
-			return classifiedWriteExecutor.remove(
-					schedulingView == writeExecutor ? WriteClass.FOREGROUND : WriteClass.MAINTENANCE,
-					task);
-		}
-		return schedulingView instanceof ThreadPoolExecutor threadPool && threadPool.remove(task);
+		return schedulingView instanceof java.util.concurrent.ThreadPoolExecutor threadPool
+				&& threadPool.remove(task);
 	}
 
-	/** Preserve the value semantics of the original four-component public record. */
-	@Override
-	public boolean equals(Object object) {
-		if (this == object) {
-			return true;
-		}
-		if (!(object instanceof RWScheduler other)) {
-			return false;
-		}
-		return read.equals(other.read)
-				&& write.equals(other.write)
-				&& readExecutor.equals(other.readExecutor)
-				&& writeExecutor.equals(other.writeExecutor);
+	/** True while the current thread owns any database workload worker. */
+	public boolean isExecutingWorkloadTask() {
+		return ProfiledWorkloadExecutor.isExecutingTask();
 	}
 
-	@Override
-	public int hashCode() {
-		return Objects.hash(read, write, readExecutor, writeExecutor);
+	public void setStoragePressure(boolean pressured) {
+		storagePressure.set(pressured);
 	}
 
-	@Override
-	public String toString() {
-		return "RWScheduler[read=" + read
-				+ ", write=" + write
-				+ ", readExecutor=" + readExecutor
-				+ ", writeExecutor=" + writeExecutor + "]";
+	public boolean isStoragePressure() {
+		return storagePressure.get();
 	}
 
 	public Mono<Void> disposeGracefully() {
-		return Mono.whenDelayError(distinctSchedulers().stream()
-				.map(Scheduler::disposeGracefully)
-				.toList());
+		return Mono.fromRunnable(this::dispose);
 	}
 
 	public void dispose() {
-		for (var scheduler : distinctSchedulers()) {
-			scheduler.dispose();
+		if (readPool == null) {
+			for (var scheduler : distinctExternalSchedulers()) {
+				scheduler.dispose();
+			}
+			for (var executor : distinctExternalExecutors()) {
+				shutdownExecutor(executor);
+			}
+			return;
 		}
-		for (var executor : distinctExecutors()) {
-			shutdownExecutor(executor);
+		for (var pool : List.of(readPool, writePool, controlPool, physicalPool)) {
+			shutdownExecutor(pool);
 		}
 	}
 
-	private List<Scheduler> distinctSchedulers() {
-		Set<Scheduler> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-		var result = new ArrayList<Scheduler>(7);
-		for (var scheduler : List.of(interactiveRead, read, write, maintenanceWrite, maintenance, control, cdc)) {
+	private List<Scheduler> distinctExternalSchedulers() {
+		Set<Scheduler> seen = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+		var result = new java.util.ArrayList<Scheduler>(2);
+		for (var scheduler : List.of(Objects.requireNonNull(externalRead), Objects.requireNonNull(externalWrite))) {
 			if (seen.add(scheduler)) {
 				result.add(scheduler);
 			}
@@ -471,17 +361,10 @@ public final class RWScheduler {
 		return result;
 	}
 
-	private List<Executor> distinctExecutors() {
-		Set<Executor> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-		var result = new ArrayList<Executor>(7);
-		for (var executor : List.of(
-				interactiveReadExecutor,
-				readExecutor,
-				writeExecutor,
-				maintenanceWriteExecutor,
-				maintenanceExecutor,
-				controlExecutor,
-				cdcExecutor)) {
+	private List<Executor> distinctExternalExecutors() {
+		Set<Executor> seen = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+		var result = new java.util.ArrayList<Executor>(2);
+		for (var executor : List.of(Objects.requireNonNull(externalReadExecutor), Objects.requireNonNull(externalWriteExecutor))) {
 			if (seen.add(executor)) {
 				result.add(executor);
 			}
@@ -490,325 +373,36 @@ public final class RWScheduler {
 	}
 
 	private static void shutdownExecutor(Executor executor) {
-		if (executor instanceof ExecutorService es) {
-			es.shutdown();
+		if (executor instanceof ExecutorService service) {
+			service.shutdown();
 			try {
-				if (!es.awaitTermination(10, TimeUnit.SECONDS)) {
-					es.shutdownNow();
+				if (!service.awaitTermination(10, TimeUnit.SECONDS)) {
+					service.shutdownNow();
 				}
-			} catch (InterruptedException e) {
-				es.shutdownNow();
+			} catch (InterruptedException interrupted) {
+				service.shutdownNow();
 				Thread.currentThread().interrupt();
 			}
 		}
 	}
 
-	private record Resources(Scheduler read,
-			Scheduler interactiveRead,
-			Scheduler write,
-			Scheduler maintenanceWrite,
-			Scheduler maintenance,
-			Scheduler control,
-			Scheduler cdc,
-			Executor readExecutor,
-			Executor interactiveReadExecutor,
-			Executor writeExecutor,
-			Executor maintenanceWriteExecutor,
-			Executor maintenanceExecutor,
-			Executor controlExecutor,
-			Executor cdcExecutor,
-			ClassifiedWriteExecutor classifiedWriteExecutor) {
-	}
+	public record ProfileAdmissionSnapshot(Map<WorkloadProfile, Integer> queued,
+			Map<WorkloadProfile, Integer> active,
+			boolean storagePressure) {
 
-	private record InteractiveTask(Runnable delegate) implements Runnable {
-
-		private InteractiveTask {
-			Objects.requireNonNull(delegate, "delegate");
+		public int totalActive() {
+			return active.values().stream().mapToInt(Integer::intValue).sum();
 		}
 
-		@Override
-		public void run() {
-			delegate.run();
+		public int totalQueued() {
+			return queued.values().stream().mapToInt(Integer::intValue).sum();
 		}
 	}
 
-	private record InteractiveExecutor(Executor delegate) implements Executor {
-
-		private InteractiveExecutor {
-			Objects.requireNonNull(delegate, "delegate");
-		}
-
-		@Override
-		public void execute(@NotNull Runnable command) {
-			delegate.execute(command instanceof InteractiveTask ? command : new InteractiveTask(command));
-		}
-
-		private boolean remove(Runnable command) {
-			if (!(delegate instanceof ThreadPoolExecutor threadPool)) {
-				return false;
-			}
-			return threadPool.remove(command instanceof InteractiveTask
-					? command
-					: new InteractiveTask(command));
-		}
-	}
-
-	/** A bounded two-class queue with FIFO order inside each class. */
-	private static final class WeightedReadQueue extends AbstractQueue<Runnable>
-			implements BlockingQueue<Runnable> {
-
-		private final int capacity;
-		private final int maxConsecutiveInteractive;
-		private final ArrayDeque<Runnable> interactive = new ArrayDeque<>();
-		private final ArrayDeque<Runnable> composite = new ArrayDeque<>();
-		private final ReentrantLock lock = new ReentrantLock();
-		private final Condition notEmpty = lock.newCondition();
-		private final Condition notFull = lock.newCondition();
-		private int consecutiveInteractive;
-
-		private WeightedReadQueue(int capacity, int maxConsecutiveInteractive) {
-			if (capacity < 1 || maxConsecutiveInteractive < 1) {
-				throw new IllegalArgumentException("Queue capacity and interactive weight must be positive");
-			}
-			this.capacity = capacity;
-			this.maxConsecutiveInteractive = maxConsecutiveInteractive;
-		}
-
-		@Override
-		public boolean add(@NotNull Runnable task) {
-			return super.add(task);
-		}
-
-		@Override
-		public boolean offer(@NotNull Runnable task) {
-			Objects.requireNonNull(task, "task");
-			lock.lock();
-			try {
-				if (sizeUnsafe() >= capacity) {
-					return false;
-				}
-				addUnsafe(task);
-				return true;
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public void put(@NotNull Runnable task) throws InterruptedException {
-			Objects.requireNonNull(task, "task");
-			lock.lockInterruptibly();
-			try {
-				while (sizeUnsafe() >= capacity) {
-					notFull.await();
-				}
-				addUnsafe(task);
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public boolean offer(@NotNull Runnable task, long timeout, @NotNull TimeUnit unit)
-				throws InterruptedException {
-			Objects.requireNonNull(task, "task");
-			long remaining = unit.toNanos(timeout);
-			lock.lockInterruptibly();
-			try {
-				while (sizeUnsafe() >= capacity) {
-					if (remaining <= 0L) {
-						return false;
-					}
-					remaining = notFull.awaitNanos(remaining);
-				}
-				addUnsafe(task);
-				return true;
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		private void addUnsafe(Runnable task) {
-			(task instanceof InteractiveTask ? interactive : composite).addLast(task);
-			notEmpty.signal();
-		}
-
-		@Override
-		public @NotNull Runnable take() throws InterruptedException {
-			lock.lockInterruptibly();
-			try {
-				while (sizeUnsafe() == 0) {
-					notEmpty.await();
-				}
-				return removeNextUnsafe();
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public Runnable poll(long timeout, @NotNull TimeUnit unit) throws InterruptedException {
-			long remaining = unit.toNanos(timeout);
-			lock.lockInterruptibly();
-			try {
-				while (sizeUnsafe() == 0) {
-					if (remaining <= 0L) {
-						return null;
-					}
-					remaining = notEmpty.awaitNanos(remaining);
-				}
-				return removeNextUnsafe();
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public Runnable poll() {
-			lock.lock();
-			try {
-				return sizeUnsafe() == 0 ? null : removeNextUnsafe();
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public Runnable peek() {
-			lock.lock();
-			try {
-				return nextQueueUnsafe().peekFirst();
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		private Runnable removeNextUnsafe() {
-			var nextQueue = nextQueueUnsafe();
-			var task = nextQueue.removeFirst();
-			if (nextQueue == interactive) {
-				// Priority debt only matters while composite work is actually waiting. Reset
-				// it during purely interactive traffic and saturate it so a long-running
-				// server can never wrap the counter and postpone the next composite task.
-				consecutiveInteractive = composite.isEmpty()
-						? 0
-						: Math.min(maxConsecutiveInteractive, consecutiveInteractive + 1);
-			} else {
-				consecutiveInteractive = 0;
-			}
-			notFull.signal();
-			return task;
-		}
-
-		private ArrayDeque<Runnable> nextQueueUnsafe() {
-			if (!interactive.isEmpty()
-					&& (composite.isEmpty() || consecutiveInteractive < maxConsecutiveInteractive)) {
-				return interactive;
-			}
-			return composite;
-		}
-
-		@Override
-		public int remainingCapacity() {
-			lock.lock();
-			try {
-				return capacity - sizeUnsafe();
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public int drainTo(@NotNull Collection<? super Runnable> target) {
-			return drainTo(target, Integer.MAX_VALUE);
-		}
-
-		@Override
-		public int drainTo(@NotNull Collection<? super Runnable> target, int maxElements) {
-			Objects.requireNonNull(target, "target");
-			if (target == this) {
-				throw new IllegalArgumentException("Cannot drain a queue into itself");
-			}
-			if (maxElements <= 0) {
-				return 0;
-			}
-			lock.lock();
-			try {
-				int count = 0;
-				while (count < maxElements && sizeUnsafe() > 0) {
-					target.add(removeNextUnsafe());
-					count++;
-				}
-				return count;
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public boolean remove(Object object) {
-			lock.lock();
-			try {
-				boolean removed = interactive.remove(object) || composite.remove(object);
-				if (removed) {
-					notFull.signal();
-				}
-				return removed;
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public boolean contains(Object object) {
-			lock.lock();
-			try {
-				return interactive.contains(object) || composite.contains(object);
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public void clear() {
-			lock.lock();
-			try {
-				if (sizeUnsafe() != 0) {
-					interactive.clear();
-					composite.clear();
-					consecutiveInteractive = 0;
-					notFull.signalAll();
-				}
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		@Override
-		public int size() {
-			lock.lock();
-			try {
-				return sizeUnsafe();
-			} finally {
-				lock.unlock();
-			}
-		}
-
-		private int sizeUnsafe() {
-			return interactive.size() + composite.size();
-		}
-
-		@Override
-		public @NotNull Iterator<Runnable> iterator() {
-			lock.lock();
-			try {
-				List<Runnable> snapshot = new ArrayList<>(sizeUnsafe());
-				snapshot.addAll(interactive);
-				snapshot.addAll(composite);
-				return List.copyOf(snapshot).iterator();
-			} finally {
-				lock.unlock();
-			}
-		}
+	private enum ResourceKind {
+		READ,
+		WRITE,
+		CONTROL,
+		PHYSICAL
 	}
 }

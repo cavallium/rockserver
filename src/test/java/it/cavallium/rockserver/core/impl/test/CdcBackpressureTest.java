@@ -45,7 +45,7 @@ public class CdcBackpressureTest {
         var schema = ColumnSchema.of(IntList.of(4), new ObjectArrayList<>(), true, null, null, "it.cavallium.rockserver.examples.MessagePatchMergeOperator");
         long colId = db.createColumn("messages", schema);
         try {
-            db.getSyncApi().cdcCreate(subId, null, List.of(colId));
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId));
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -58,7 +58,7 @@ public class CdcBackpressureTest {
         setupAndRun("testDbFastCdcSlow", db -> {
             String subId = "sub1";
             long colId = setupCdc(db, subId);
-            var api = db.getAsyncApi();
+            var api = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 
             int itemCount = 500;
             Flux<KVBatch> source = Flux.range(0, itemCount)
@@ -90,7 +90,7 @@ public class CdcBackpressureTest {
         setupAndRun("testDbSlowCdcFast", db -> {
             String subId = "sub2";
             long colId = setupCdc(db, subId);
-            var api = db.getAsyncApi();
+            var api = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 
             int itemCount = 10;
             // Slow producer
@@ -120,7 +120,7 @@ public class CdcBackpressureTest {
          setupAndRun("testDbFastCdcLagging", db -> {
             String subId = "sub3";
             long colId = setupCdc(db, subId);
-            var api = db.getAsyncApi();
+            var api = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 
             int itemCount = 1000;
             // Burst producer
@@ -145,7 +145,7 @@ public class CdcBackpressureTest {
          setupAndRun("testThroughput", db -> {
             String subId = "sub4";
             long colId = setupCdc(db, subId);
-            var api = db.getAsyncApi();
+            var api = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 
             int itemCount = 5000;
             Flux<KVBatch> source = Flux.range(0, itemCount).map(this::createBatch);

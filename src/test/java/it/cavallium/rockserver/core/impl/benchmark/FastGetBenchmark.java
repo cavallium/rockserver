@@ -128,7 +128,7 @@ public final class FastGetBenchmark {
 		System.out.printf("%n[%s] opening and loading database...%n", scenarioName);
 		ScenarioResult result;
 		try (var connection = new EmbeddedConnection(scenarioRoot.resolve("db"), scenarioName, config)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("benchmark",
 					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 			var keys = BenchmarkKeys.create(options.hotKeys(), options.writerKeys(), options.missKeyCount());

@@ -38,7 +38,7 @@ class RangePerformanceRegressionTest {
 	void schedulingSlicesReuseOneIteratorForRangeCountAndEndpoints() throws Exception {
 		final int entries = 4_200;
 		try (var connection = new EmbeddedConnection(tempDir.resolve("reuse-db"), "range-reuse", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var internal = connection.getInternalDB();
 			assertTrue(internal.isExpiredRangeCleanupScheduledForTesting(),
 					"stalled range cleanup must be registered on the production leak scheduler");
@@ -50,7 +50,7 @@ class RangePerformanceRegressionTest {
 			var iteratorOpens = new AtomicInteger();
 			internal.setRangeIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
 
-			var rows = Flux.from(connection.getAsyncApi().getRangeAsync(0,
+			var rows = Flux.from(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
 					columnId,
 					null,
 					null,
@@ -65,7 +65,7 @@ class RangePerformanceRegressionTest {
 					"scheduler slices must not recreate the native range iterator");
 
 			iteratorOpens.set(0);
-			long count = connection.getAsyncApi().reduceRangeAsync(0,
+			long count = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(0,
 					columnId,
 					null,
 					null,
@@ -77,7 +77,7 @@ class RangePerformanceRegressionTest {
 					"exact count must aggregate physical chunks with one iterator");
 
 			iteratorOpens.set(0);
-			var endpoints = connection.getAsyncApi().reduceRangeAsync(0,
+			var endpoints = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(0,
 					columnId,
 					null,
 					null,
@@ -96,7 +96,7 @@ class RangePerformanceRegressionTest {
 		final int entries = 5_000;
 		try (var connection = new EmbeddedConnection(tempDir.resolve("cancel-count-db"),
 				"range-cancel-count", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var internal = connection.getInternalDB();
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
@@ -119,7 +119,7 @@ class RangePerformanceRegressionTest {
 				}
 			});
 
-			var count = connection.getAsyncApi().reduceRangeAsync(0,
+			var count = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(0,
 					columnId,
 					null,
 					null,
@@ -143,7 +143,7 @@ class RangePerformanceRegressionTest {
 	void valueRangeChunksHaveABoundedDecodedByteFootprint() throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("byte-bounded-range-db"),
 				"range-byte-bound", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var internal = connection.getInternalDB();
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
@@ -154,7 +154,7 @@ class RangePerformanceRegressionTest {
 			var chunkSizes = new ArrayList<Integer>();
 			internal.setRangeReadChunkSizeObserverForTesting(chunkSizes::add);
 
-			var rows = Flux.from(connection.getAsyncApi().getRangeAsync(0,
+			var rows = Flux.from(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
 					columnId,
 					null,
 					null,
@@ -173,7 +173,7 @@ class RangePerformanceRegressionTest {
 	void laterDemandKeepsTheOriginalPointInTimeView() throws Exception {
 		final int entries = 1_100;
 		try (var connection = new EmbeddedConnection(tempDir.resolve("snapshot-db"), "range-snapshot", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			for (int i = 0; i < entries; i++) {
@@ -183,7 +183,7 @@ class RangePerformanceRegressionTest {
 			var decodedPages = new AtomicInteger();
 			internal.setRangeReadChunkSizeObserverForTesting(_ -> decodedPages.incrementAndGet());
 
-			var range = Flux.from(connection.getAsyncApi().getRangeAsync(0,
+			var range = Flux.from(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
 					columnId,
 					null,
 					null,
@@ -207,7 +207,7 @@ class RangePerformanceRegressionTest {
 		final int entries = 3_000;
 		try (var connection = new EmbeddedConnection(tempDir.resolve("refresh-snapshot-db"),
 				"range-refresh-snapshot", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var internal = connection.getInternalDB();
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
@@ -217,7 +217,7 @@ class RangePerformanceRegressionTest {
 			var iteratorOpens = new AtomicInteger();
 			internal.setRangeIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
 
-			var range = Flux.from(connection.getAsyncApi().getRangeAsync(0,
+			var range = Flux.from(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
 					columnId,
 					null,
 					null,
@@ -242,7 +242,7 @@ class RangePerformanceRegressionTest {
 		final int entries = 5_000;
 		try (var connection = new EmbeddedConnection(tempDir.resolve("expired-snapshot-db"),
 				"range-expired-snapshot", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var internal = connection.getInternalDB();
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
@@ -250,7 +250,7 @@ class RangePerformanceRegressionTest {
 				api.put(0, columnId, key(i), value(i), RequestType.none());
 			}
 
-			var range = Flux.from(connection.getAsyncApi().getRangeAsync(0,
+			var range = Flux.from(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
 					columnId,
 					null,
 					null,

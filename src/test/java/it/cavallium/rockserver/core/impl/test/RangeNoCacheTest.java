@@ -61,13 +61,13 @@ class RangeNoCacheTest {
 		embeddedConnection = new EmbeddedConnection(tempDir.resolve("db"), "range-no-cache", configFile);
 		embeddedDB = embeddedConnection.getInternalDB();
 
-		columnId = embeddedConnection.getSyncApi().createColumn("range-column",
+		columnId = embeddedConnection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("range-column",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 		rows = new ArrayList<>();
 		for (long index = 0; index < 10; index++) {
 			KV row = new KV(key(index), value(index));
 			rows.add(row);
-			embeddedConnection.getSyncApi().put(0,
+			embeddedConnection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0,
 					columnId,
 					row.keys(),
 					row.value(),
@@ -95,22 +95,22 @@ class RangeNoCacheTest {
 
 	@Test
 	void embeddedBoundedRangesKeepRowsAndReadOptionsMode() {
-		assertBoundedRangeModes(embeddedConnection.getSyncApi());
+		assertBoundedRangeModes(embeddedConnection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()));
 	}
 
 	@Test
 	void grpcBoundedRangesKeepRowsAndReadOptionsMode() {
-		assertBoundedRangeModes(grpcClient.getSyncApi());
+		assertBoundedRangeModes(grpcClient.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()));
 	}
 
 	@Test
 	void embeddedCancellationReleasesRangeResources() throws InterruptedException {
-		assertCancellationReleasesRangeResources(embeddedConnection.getAsyncApi());
+		assertCancellationReleasesRangeResources(embeddedConnection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()));
 	}
 
 	@Test
 	void grpcCancellationReleasesServerSideRangeResources() throws InterruptedException {
-		assertCancellationReleasesRangeResources(grpcClient.getAsyncApi());
+		assertCancellationReleasesRangeResources(grpcClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()));
 	}
 
 	private void assertBoundedRangeModes(RocksDBSyncAPI api) {

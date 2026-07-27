@@ -143,7 +143,7 @@ class GrpcFastGetTest {
 		String previousStrategy = System.getProperty("rockserver.grpc.fast-get.strategy");
 		try (var embedded = openEmbedded("fallbacks")) {
 			long columnId = populate(embedded);
-			var api = embedded.getSyncApi();
+			var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long transactionId = api.openTransaction(TimeUnit.MINUTES.toMillis(1));
 			byte[] transactionValue = value(42, 513);
 			api.put(transactionId, columnId, keys(42), Buf.wrap(transactionValue), RequestType.none());
@@ -196,7 +196,7 @@ class GrpcFastGetTest {
 	void cancellationDuringLargePinnedResponseReleasesDatabaseAndColumnLeases() throws Exception {
 		String previousStrategy = System.getProperty("rockserver.grpc.fast-get.strategy");
 		try (var embedded = openEmbedded("cancel")) {
-			var api = embedded.getSyncApi();
+			var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("cancel",
 					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 			int valueSize = 32 * 1024 * 1024;
@@ -257,7 +257,7 @@ class GrpcFastGetTest {
 	}
 
 	private static long populate(EmbeddedConnection embedded) {
-		var api = embedded.getSyncApi();
+		var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 		long columnId = api.createColumn("fast-get",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 		for (int index = 0; index < CORRECTNESS_SIZES.length; index++) {

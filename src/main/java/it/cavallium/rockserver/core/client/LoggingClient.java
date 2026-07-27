@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.client;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
@@ -19,14 +20,10 @@ import reactor.core.publisher.Mono;
 public class LoggingClient implements RocksDBConnection {
 
 	private final RocksDBConnection client;
-	private final LoggingSyncApi syncApi;
-	private final LoggingAsyncApi asyncApi;
 	private final Logger logger;
 
 	public LoggingClient(RocksDBConnection client) {
 		this.client = client;
-		this.syncApi = new LoggingSyncApi(client.getSyncApi());
-		this.asyncApi = new LoggingAsyncApi(client.getAsyncApi());
 		this.logger = LoggerFactory.getLogger("db.requests");
 	}
 
@@ -36,13 +33,13 @@ public class LoggingClient implements RocksDBConnection {
 	}
 
 	@Override
-	public RocksDBSyncAPI getSyncApi() {
-		return syncApi;
+	public RocksDBSyncAPI getSyncApi(RequestContext context) {
+		return new LoggingSyncApi(client.getSyncApi(context));
 	}
 
 	@Override
-	public RocksDBAsyncAPI getAsyncApi() {
-		return asyncApi;
+	public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
+		return new LoggingAsyncApi(client.getAsyncApi(context));
 	}
 
 	@Override

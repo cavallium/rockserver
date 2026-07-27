@@ -18,7 +18,7 @@ pub type Result<T> = std::result::Result<T, Status>;
 #[derive(Clone, Debug)]
 pub struct RockserverClient {
     client: RocksDbServiceClient<Channel>,
-    write_class: WriteClass,
+	context: RequestContext,
 }
 
 impl RockserverClient {
@@ -29,31 +29,31 @@ impl RockserverClient {
     ///
     /// # Returns
     /// A `Result` containing the connected client or a transport error.
-    pub async fn connect<D>(dst: D) -> std::result::Result<Self, tonic::transport::Error>
+	pub async fn connect<D>(dst: D, context: RequestContext) -> std::result::Result<Self, tonic::transport::Error>
     where
         D: std::convert::TryInto<tonic::transport::Endpoint>,
         D::Error: Into<tonic::codegen::StdError>,
     {
         let client = RocksDbServiceClient::connect(dst).await?;
-        Ok(Self { client, write_class: WriteClass::Foreground })
+		Ok(Self { client, context })
     }
 
     /// Create a new client from an existing Tonic `Channel`.
-    pub fn new(channel: Channel) -> Self {
-        Self {
-            client: RocksDbServiceClient::new(channel),
-            write_class: WriteClass::Foreground,
-        }
-    }
+	pub fn new(channel: Channel, context: RequestContext) -> Self {
+		Self {
+			client: RocksDbServiceClient::new(channel),
+			context,
+		}
+	}
 
-    /// Returns a client view that applies the selected class to every caller-classified mutation.
-    /// The underlying channel is shared and cloning this view is cheap.
-    pub fn with_write_class(&self, write_class: WriteClass) -> Self {
-        Self {
-            client: self.client.clone(),
-            write_class,
-        }
-    }
+	/// Returns a client view that applies one mandatory workload context to every generic request.
+	/// The underlying channel is shared and cloning this view is cheap.
+	pub fn with_context(&self, context: RequestContext) -> Self {
+		Self {
+			client: self.client.clone(),
+			context,
+		}
+	}
 
     // ============================================================================================
     // Transaction Management
@@ -67,7 +67,7 @@ impl RockserverClient {
     /// # Returns
     /// The transaction ID.
     pub async fn open_transaction(&self, timeout_ms: i64) -> Result<i64> {
-        let req = OpenTransactionRequest { timeout_ms };
+		let req = OpenTransactionRequest { timeout_ms, context: Some(self.context.clone()) };
         let resp = self.client.clone().open_transaction(req).await?;
         Ok(resp.into_inner().transaction_id)
     }
@@ -86,7 +86,7 @@ impl RockserverClient {
             transaction_id,
             timeout_ms,
             commit,
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         let resp = self.client.clone().close_transaction(req).await?;
         Ok(resp.into_inner().successful)
@@ -108,7 +108,7 @@ impl RockserverClient {
         let req = CreateColumnRequest {
             name,
             schema: Some(schema.into()),
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         let resp = self.client.clone().create_column(req).await?;
         Ok(resp.into_inner().column_id)
@@ -116,7 +116,7 @@ impl RockserverClient {
 
     /// Deletes a column by its ID.
     pub async fn delete_column(&self, column_id: i64) -> Result<()> {
-        let req = DeleteColumnRequest { column_id, write_class: self.write_class as i32 };
+        let req = DeleteColumnRequest { column_id, context: Some(self.context.clone()) };
         self.client.clone().delete_column(req).await?;
         Ok(())
     }
@@ -125,28 +125,28 @@ impl RockserverClient {
     ///
     /// Returns `true` when a physical column was deleted and `false` when it was already absent.
     pub async fn delete_column_if_exists(&self, name: String) -> Result<bool> {
-        let req = DeleteColumnIfExistsRequest { name, write_class: self.write_class as i32 };
+        let req = DeleteColumnIfExistsRequest { name, context: Some(self.context.clone()) };
         let resp = self.client.clone().delete_column_if_exists(req).await?;
         Ok(resp.into_inner().deleted)
     }
 
     /// Retrieves the ID of a column by its name.
     pub async fn get_column_id(&self, name: String) -> Result<i64> {
-        let req = GetColumnIdRequest { name };
+		let req = GetColumnIdRequest { name, context: Some(self.context.clone()) };
         let resp = self.client.clone().get_column_id(req).await?;
         Ok(resp.into_inner().column_id)
     }
 
     /// Returns RocksDB's unbounded estimate of physical keys in a column.
     pub async fn estimate_num_keys(&self, column_id: i64) -> Result<i64> {
-        let req = EstimateNumKeysRequest { column_id };
+		let req = EstimateNumKeysRequest { column_id, context: Some(self.context.clone()) };
         let resp = self.client.clone().estimate_num_keys(req).await?;
         Ok(resp.into_inner().count)
     }
 
     /// Retrieves definitions for all existing columns.
     pub async fn get_all_column_definitions(&self) -> Result<Vec<Column>> {
-        let req = GetAllColumnDefinitionsRequest {};
+		let req = GetAllColumnDefinitionsRequest { context: Some(self.context.clone()) };
         let resp = self.client.clone().get_all_column_definitions(req).await?;
         Ok(resp.into_inner().columns.into_iter().map(|c| c.into()).collect())
     }
@@ -161,7 +161,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         self.client.clone().put(req).await?;
         Ok(())
@@ -173,7 +173,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         let resp = self.client.clone().put_get_previous(req).await?;
         Ok(resp.into_inner().previous)
@@ -185,7 +185,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         let resp = self.client.clone().put_get_delta(req).await?;
         Ok(resp.into_inner())
@@ -197,7 +197,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         let resp = self.client.clone().put_get_changed(req).await?;
         Ok(resp.into_inner().changed)
@@ -209,7 +209,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         let resp = self.client.clone().put_get_previous_presence(req).await?;
         Ok(resp.into_inner().present)
@@ -227,7 +227,7 @@ impl RockserverClient {
                 PutBatchInitialRequest {
                     column_id,
                     mode: mode.into(),
-                    write_class: self.write_class as i32,
+                    context: Some(self.context.clone()),
                 },
             )),
         };
@@ -257,7 +257,7 @@ impl RockserverClient {
                 MergeBatchInitialRequest {
                     column_id,
                     mode: mode.into(),
-                    write_class: self.write_class as i32,
+                    context: Some(self.context.clone()),
                 },
             )),
         };
@@ -286,7 +286,7 @@ impl RockserverClient {
             initial_request: Some(PutMultiInitialRequest {
                 transaction_or_update_id,
                 column_id,
-                write_class: self.write_class as i32,
+                context: Some(self.context.clone()),
             }),
             data,
         };
@@ -306,7 +306,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
-                    write_class: self.write_class as i32,
+                    context: Some(self.context.clone()),
                 },
             )),
         };
@@ -336,7 +336,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
-                    write_class: self.write_class as i32,
+                    context: Some(self.context.clone()),
                 },
             )),
         };
@@ -366,7 +366,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
-                    write_class: self.write_class as i32,
+                    context: Some(self.context.clone()),
                 },
             )),
         };
@@ -396,7 +396,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
-                    write_class: self.write_class as i32,
+                    context: Some(self.context.clone()),
                 },
             )),
         };
@@ -426,7 +426,7 @@ impl RockserverClient {
                 PutMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
-                    write_class: self.write_class as i32,
+                    context: Some(self.context.clone()),
                 },
             )),
         };
@@ -454,7 +454,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             keys,
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         self.client.clone().delete(req).await?;
         Ok(())
@@ -471,7 +471,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             keys,
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         let response = self.client.clone().delete_get_previous(req).await?;
         Ok(response.into_inner().previous)
@@ -488,7 +488,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             keys,
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         let response = self.client.clone().delete_get_previous_presence(req).await?;
         Ok(response.into_inner().present)
@@ -505,7 +505,7 @@ impl RockserverClient {
             column_id,
             start_keys_inclusive,
             end_keys_exclusive,
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         self.client.clone().delete_range(req).await?;
         Ok(())
@@ -553,11 +553,11 @@ impl RockserverClient {
         column_id: i64,
         keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
     ) -> impl Stream<Item = DeleteMultiRequest> + Send + 'static {
-        let write_class = self.write_class as i32;
+        let context = Some(self.context.clone());
         async_stream::stream! {
             yield DeleteMultiRequest {
                 delete_multi_request_type: Some(delete_multi_request::DeleteMultiRequestType::InitialRequest(
-                    DeleteMultiInitialRequest { transaction_or_update_id, column_id, write_class },
+                    DeleteMultiInitialRequest { transaction_or_update_id, column_id, context },
                 )),
             };
             for await item_keys in keys {
@@ -567,7 +567,7 @@ impl RockserverClient {
                             transaction_or_update_id: 0,
                             column_id: 0,
                             keys: item_keys,
-                            write_class: WriteClass::Foreground as i32,
+                            context: None,
                         },
                     )),
                 };
@@ -591,7 +591,7 @@ impl RockserverClient {
                 MergeMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
-                    write_class: self.write_class as i32,
+                    context: Some(self.context.clone()),
                 },
             )),
         };
@@ -621,7 +621,7 @@ impl RockserverClient {
                 MergeMultiInitialRequest {
                     transaction_or_update_id,
                     column_id,
-                    write_class: self.write_class as i32,
+                    context: Some(self.context.clone()),
                 },
             )),
         };
@@ -645,7 +645,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         self.client.clone().merge(req).await?;
         Ok(())
@@ -657,7 +657,7 @@ impl RockserverClient {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
-            write_class: self.write_class as i32,
+            context: Some(self.context.clone()),
         };
         let resp = self.client.clone().merge_get_merged(req).await?;
         Ok(resp.into_inner().merged)
@@ -669,10 +669,11 @@ impl RockserverClient {
 
     /// Gets a value by key.
     pub async fn get(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>) -> Result<Option<Vec<u8>>> {
-        let req = GetRequest {
-            transaction_or_update_id,
-            column_id,
-            keys,
+		let req = GetRequest {
+			transaction_or_update_id,
+			column_id,
+			keys,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().get(req).await?;
         Ok(resp.into_inner().value)
@@ -680,10 +681,11 @@ impl RockserverClient {
 
     /// Gets a value for update (locking).
     pub async fn get_for_update(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>) -> Result<UpdateBegin> {
-        let req = GetRequest {
-            transaction_or_update_id,
-            column_id,
-            keys,
+		let req = GetRequest {
+			transaction_or_update_id,
+			column_id,
+			keys,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().get_for_update(req).await?;
         Ok(resp.into_inner())
@@ -691,10 +693,11 @@ impl RockserverClient {
 
     /// Checks if a key exists.
     pub async fn exists(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>) -> Result<bool> {
-        let req = GetRequest {
-            transaction_or_update_id,
-            column_id,
-            keys,
+		let req = GetRequest {
+			transaction_or_update_id,
+			column_id,
+			keys,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().exists(req).await?;
         Ok(resp.into_inner().present)
@@ -713,9 +716,10 @@ impl RockserverClient {
             column_id,
             keys_multi: keys_multi
                 .into_iter()
-                .map(|keys| KeyTuple { keys })
-                .collect(),
-            timeout_ms,
+				.map(|keys| KeyTuple { keys })
+				.collect(),
+			timeout_ms,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().exists_multi(req).await?;
         Ok(resp.into_inner().present)
@@ -740,8 +744,9 @@ impl RockserverClient {
             column_id,
             start_keys_inclusive,
             end_keys_exclusive,
-            reverse,
-            timeout_ms,
+			reverse,
+			timeout_ms,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().open_iterator(req).await?;
         Ok(resp.into_inner().iterator_id)
@@ -756,7 +761,7 @@ impl RockserverClient {
 
     /// Seeks the iterator to a specific key.
     pub async fn seek_to(&self, iteration_id: i64, keys: Vec<Vec<u8>>) -> Result<()> {
-        let req = SeekToRequest { iteration_id, keys };
+		let req = SeekToRequest { iteration_id, keys, context: Some(self.context.clone()) };
         self.client.clone().seek_to(req).await?;
         Ok(())
     }
@@ -764,9 +769,10 @@ impl RockserverClient {
     /// Advances the iterator.
     pub async fn subsequent(&self, iteration_id: i64, skip_count: i64, take_count: i64) -> Result<()> {
         let req = SubsequentRequest {
-            iteration_id,
-            skip_count,
-            take_count,
+			iteration_id,
+			skip_count,
+			take_count,
+			context: Some(self.context.clone()),
         };
         self.client.clone().subsequent(req).await?;
         Ok(())
@@ -775,9 +781,10 @@ impl RockserverClient {
     /// Advances the iterator and checks existence.
     pub async fn subsequent_exists(&self, iteration_id: i64, skip_count: i64, take_count: i64) -> Result<bool> {
         let req = SubsequentRequest {
-            iteration_id,
-            skip_count,
-            take_count,
+			iteration_id,
+			skip_count,
+			take_count,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().subsequent_exists(req).await?;
         Ok(resp.into_inner().present)
@@ -791,9 +798,10 @@ impl RockserverClient {
         take_count: i64,
     ) -> Result<impl Stream<Item = Result<Kv>>> {
         let req = SubsequentRequest {
-            iteration_id,
-            skip_count,
-            take_count,
+			iteration_id,
+			skip_count,
+			take_count,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().subsequent_multi_get(req).await?;
         Ok(resp.into_inner())
@@ -818,8 +826,9 @@ impl RockserverClient {
             column_id,
             start_keys_inclusive,
             end_keys_exclusive,
-            reverse,
-            timeout_ms,
+			reverse,
+			timeout_ms,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().reduce_range_first_and_last(req).await?;
         Ok(resp.into_inner())
@@ -840,8 +849,9 @@ impl RockserverClient {
             column_id,
             start_keys_inclusive,
             end_keys_exclusive,
-            reverse,
-            timeout_ms,
+			reverse,
+			timeout_ms,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().reduce_range_entries_count(req).await?;
         Ok(resp.into_inner().count)
@@ -862,8 +872,9 @@ impl RockserverClient {
             column_id,
             start_keys_inclusive,
             end_keys_exclusive,
-            reverse,
-            timeout_ms,
+			reverse,
+			timeout_ms,
+			context: Some(self.context.clone()),
         };
         let resp = self.client.clone().get_all_in_range(req).await?;
         Ok(resp.into_inner())
@@ -871,7 +882,12 @@ impl RockserverClient {
 
     /// Scans the column raw (ignoring transactions, usually).
     pub async fn scan_raw(&self, column_id: i64, shard_index: i32, shard_count: i32) -> Result<impl Stream<Item = Result<KvBatch>>> {
-        let req = ScanRawRequest { column_id, shard_index, shard_count };
+		let req = ScanRawRequest {
+			column_id,
+			shard_index,
+			shard_count,
+			context: Some(self.context.clone()),
+		};
         let resp = self.client.clone().scan_raw(req).await?;
         Ok(resp.into_inner().map(|res| {
             match res {
@@ -1202,18 +1218,18 @@ fn decode_kv_batch(mut buf: &[u8]) -> Result<KvBatch> {
 }
 
 #[cfg(test)]
-mod write_class_tests {
+mod workload_context_tests {
     use super::*;
     use tonic::transport::Endpoint;
 
     #[tokio::test]
-    async fn client_views_default_to_foreground_and_retain_maintenance() {
-        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let foreground = RockserverClient::new(channel);
-        assert_eq!(foreground.write_class, WriteClass::Foreground);
+	async fn client_views_retain_independent_workload_contexts() {
+		let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+		let ingest = RockserverClient::new(channel, RequestContext::ingest());
+		assert_eq!(ingest.context.profile, WorkloadProfile::Ingest as i32);
 
-        let maintenance = foreground.with_write_class(WriteClass::Maintenance);
-        assert_eq!(maintenance.write_class, WriteClass::Maintenance);
-        assert_eq!(foreground.write_class, WriteClass::Foreground);
-    }
+		let analytical = ingest.with_context(RequestContext::analytical());
+		assert_eq!(analytical.context.profile, WorkloadProfile::Analytical as i32);
+		assert_eq!(ingest.context.profile, WorkloadProfile::Ingest as i32);
+	}
 }

@@ -44,7 +44,7 @@ class EmbeddedRangeSchedulingTest {
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("cleanup-db"),
 				"cleanup-scheduling", configFile)) {
-			connection.getSyncApi().cdcCreate("progress", 1L, null, false);
+			connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("progress", 1L, null, false);
 			var writeStarted = new CountDownLatch(1);
 			var releaseWrite = new CountDownLatch(1);
 			connection.getScheduler().writeExecutor().execute(() -> {
@@ -53,16 +53,16 @@ class EmbeddedRangeSchedulingTest {
 			});
 			try {
 				assertTrue(writeStarted.await(5, TimeUnit.SECONDS));
-				connection.getAsyncApi().closeFailedUpdateAsync(Long.MAX_VALUE)
+				connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeFailedUpdateAsync(Long.MAX_VALUE)
 						.get(5, TimeUnit.SECONDS);
-				assertTrue(connection.getAsyncApi().closeTransactionAsync(Long.MAX_VALUE, false)
+				assertTrue(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransactionAsync(Long.MAX_VALUE, false)
 						.get(5, TimeUnit.SECONDS));
-				connection.getAsyncApi().cdcCommitAsync("progress", 42L)
+				connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommitAsync("progress", 42L)
 						.get(5, TimeUnit.SECONDS);
 				assertEquals(java.util.OptionalLong.of(42L),
-						connection.getSyncApi().cdcGetLastCommittedSequence("progress"));
+						connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcGetLastCommittedSequence("progress"));
 
-				var commit = connection.getAsyncApi().closeTransactionAsync(Long.MAX_VALUE, true);
+				var commit = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransactionAsync(Long.MAX_VALUE, true);
 				assertThrows(TimeoutException.class, () -> commit.get(200, TimeUnit.MILLISECONDS),
 						"commit=true must remain queued on the saturated write lane");
 				releaseWrite.countDown();
@@ -84,7 +84,7 @@ class EmbeddedRangeSchedulingTest {
 				}
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "range-scheduling", configFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			for (int i = 0; i < 128; i++) {
@@ -96,7 +96,7 @@ class EmbeddedRangeSchedulingTest {
 			var releaseRange = new CountDownLatch(1);
 			var interactiveRan = new CountDownLatch(1);
 			var items = new AtomicInteger();
-			var completion = Flux.from(connection.getAsyncApi().getRangeAsync(0,
+			var completion = Flux.from(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
 						columnId,
 						null,
 						null,
@@ -154,7 +154,7 @@ class EmbeddedRangeSchedulingTest {
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("iterator-db"),
 				"iterator-scheduling", configFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			final int entries = 4_097;
@@ -168,7 +168,7 @@ class EmbeddedRangeSchedulingTest {
 						.getScheduler()
 						.readExecutor();
 				long tasksBefore = readExecutor.getTaskCount();
-				var values = connection.getAsyncApi()
+				var values = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 						.subsequentAsync(iteratorId, 0, entries, RequestType.<Buf>multi())
 						.get(5, TimeUnit.SECONDS);
 
@@ -180,7 +180,7 @@ class EmbeddedRangeSchedulingTest {
 						"large iterator reads should use a few bounded tasks, got " + continuationTasks);
 
 				long exhaustedTasksBefore = readExecutor.getTaskCount();
-				connection.getAsyncApi()
+				connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 						.subsequentAsync(iteratorId, 0, Long.MAX_VALUE, RequestType.none())
 						.get(5, TimeUnit.SECONDS);
 				assertTrue(readExecutor.getTaskCount() - exhaustedTasksBefore <= 2,
@@ -195,7 +195,7 @@ class EmbeddedRangeSchedulingTest {
 	void singleNativeMultiPointReadDoesNotAcquireAnExplicitSnapshot() throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("single-multi-db"),
 				"single-multi-read", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var key = intKey(1);
@@ -207,7 +207,7 @@ class EmbeddedRangeSchedulingTest {
 			connection.getInternalDB()
 					.setExistsMultiSnapshotObserverForTesting(snapshotAcquisitions::incrementAndGet);
 
-			var existence = connection.getAsyncApi()
+			var existence = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 					.existsMultiAsync(0, columnId, List.of(key), 10_000)
 					.get(5, TimeUnit.SECONDS);
 
@@ -229,7 +229,7 @@ class EmbeddedRangeSchedulingTest {
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("multi-db"),
 				"multi-read-scheduling", configFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			final int existingKeys = 4_200;
@@ -265,7 +265,7 @@ class EmbeddedRangeSchedulingTest {
 				}
 			});
 
-			var existence = connection.getAsyncApi()
+			var existence = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 					.existsMultiAsync(0, columnId, keys, 10_000)
 					.get(5, TimeUnit.SECONDS);
 
@@ -291,7 +291,7 @@ class EmbeddedRangeSchedulingTest {
 	void multiPointReadBoundsNativeDirectKeyMemoryByBytes() throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("multi-byte-db"),
 				"multi-read-byte-bound", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			final int keyBytes = 1_024;
 			final int keyCount = 2_050;
 			long columnId = api.createColumn("entries",
@@ -315,7 +315,7 @@ class EmbeddedRangeSchedulingTest {
 			long transactionId = api.openTransaction(10_000);
 			java.util.List<Boolean> existence;
 			try {
-				existence = connection.getAsyncApi()
+				existence = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 						.existsMultiAsync(transactionId, columnId, keys, 10_000)
 						.get(10, TimeUnit.SECONDS);
 			} finally {

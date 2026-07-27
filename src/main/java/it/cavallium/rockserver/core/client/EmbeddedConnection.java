@@ -8,6 +8,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
@@ -41,6 +42,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
 
 public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, InternalConnection {
 
@@ -79,16 +81,6 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public RocksDBSyncAPI getSyncApi() {
-		return this;
-	}
-
-	@Override
-	public RocksDBAsyncAPI getAsyncApi() {
-		return this;
-	}
-
-	@Override
 	public EmbeddedDB getEmbeddedDB() {
 		return db;
 	}
@@ -104,14 +96,6 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public boolean closeTransaction(long transactionId, boolean commit, @NotNull WriteClass writeClass) {
-		if (!commit) {
-			return db.closeTransaction(transactionId, false);
-		}
-		return executeClassifiedWriteSync(writeClass, () -> db.closeTransaction(transactionId, true));
-	}
-
-	@Override
 	public void closeFailedUpdate(long updateId) throws RocksDBException {
 		db.closeFailedUpdate(updateId);
 	}
@@ -120,12 +104,6 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	public long createColumn(String name, @NotNull ColumnSchema schema) {
 		return db.createColumn(name, schema);
 	}
-
-	@Override
-	public long createColumn(String name, @NotNull ColumnSchema schema, @NotNull WriteClass writeClass) {
-		return executeClassifiedWriteSync(writeClass, () -> db.createColumn(name, schema));
-	}
-
 
 	@Override
 	public long uploadMergeOperator(String name, String className, byte[] jarData) throws RocksDBException {
@@ -143,21 +121,8 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public void deleteColumn(long columnId, @NotNull WriteClass writeClass) throws RocksDBException {
-		executeClassifiedWriteSync(writeClass, () -> {
-			db.deleteColumn(columnId);
-			return null;
-		});
-	}
-
-	@Override
 	public boolean deleteColumnIfExists(@NotNull String name) throws RocksDBException {
 		return db.deleteColumnIfExists(name);
-	}
-
-	@Override
-	public boolean deleteColumnIfExists(@NotNull String name, @NotNull WriteClass writeClass) throws RocksDBException {
-		return executeClassifiedWriteSync(writeClass, () -> db.deleteColumnIfExists(name));
 	}
 
 	@Override
@@ -171,18 +136,48 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> req) {
-		return req.handleSync(this);
+	public <R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		if (db.getScheduler().isExecutingWorkloadTask()) {
+			return withRequestContext(context, () -> req.handleSync(this));
+		}
+		return withRequestContext(context, () -> {
+			Object asyncResult = requestAsync(context, req);
+			if (asyncResult instanceof CompletableFuture<?> future) {
+				try {
+					@SuppressWarnings("unchecked")
+					var result = (RS) future.get();
+					return result;
+				} catch (InterruptedException interrupted) {
+					future.cancel(false);
+					Thread.currentThread().interrupt();
+					throw RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR,
+							"Interrupted while waiting for workload admission", interrupted);
+				} catch (ExecutionException failure) {
+					var rocksError = findRocksDBException(failure);
+					if (rocksError != null) {
+						throw rocksError;
+					}
+					throw RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR,
+							failure.getCause() != null ? failure.getCause() : failure);
+				}
+			}
+			if (asyncResult instanceof Publisher<?> publisher) {
+				@SuppressWarnings("unchecked")
+				var stream = (RS) Flux.from(publisher).toStream();
+				return stream;
+			}
+			throw new IllegalStateException("Unsupported async result for " + req.getClass().getName());
+		});
 	}
 
 	@SuppressWarnings("unchecked")
     @Override
-    public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> req) {
-        return (RA) switch (req) {
+	public <R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		return withRequestContext(context, () -> (RA) switch (req) {
             case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(
-                    putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode(), putBatch.writeClass());
+					putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch mergeBatch -> this.mergeBatchAsync(
-					mergeBatch.columnId(), mergeBatch.batchPublisher(), mergeBatch.mode(), mergeBatch.writeClass());
+					mergeBatch.columnId(), mergeBatch.batchPublisher(), mergeBatch.mode());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti existsMulti -> this.existsMultiAsync(
 					existsMulti.transactionId(), existsMulti.columnId(), existsMulti.keys(), existsMulti.timeoutMs());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator closeIterator -> this.closeIteratorAsync(
@@ -203,42 +198,33 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
             case RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw scanRaw -> this.scanRawAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount());
             case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
 			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> supplyAsyncPreservingRunningCompletion(
-					() -> req.handleSync(this), commandExecutor(req));
+					() -> withRequestContext(context, () -> req.handleSync(this)), commandExecutor(req));
             case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
-        };
+		});
     }
 
 	private java.util.concurrent.Executor commandExecutor(RocksDBAPICommand<?, ?, ?> command) {
-		if (command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator
-				|| command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate
-				|| (command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction closeTransaction
-				&& !closeTransaction.commit())
-				|| command instanceof RocksDBAPICommand.CdcCommit) {
-			return db.getScheduler().controlExecutor();
-		}
-		if (command instanceof RocksDBAPICommand.Flush
-					|| command instanceof RocksDBAPICommand.Compact) {
-			return db.getScheduler().maintenanceExecutor();
-		}
-		if (command instanceof RocksDBAPICommand.CdcGetEarliestAvailableSequence) {
-			return db.getScheduler().cdcExecutor();
-		}
-		if (command instanceof RocksDBAPICommand.CdcCreate create
-				&& create.fromSeq() != null
-				&& create.fromSeq() == 0L) {
-			return db.getScheduler().cdcExecutor();
-		}
-		if (!command.isReadOnly()) {
-			return db.getScheduler().writeExecutor(command.writeClass());
-		}
-		return command.readWorkClass() == RocksDBAPICommand.ReadWorkClass.INTERACTIVE
-				? db.getScheduler().interactiveReadExecutor()
-				: db.getScheduler().readExecutor();
+		var context = currentRequestContext();
+		var profile = WorkloadAdmission.resolve(context, command);
+		return db.getScheduler().executor(profile,
+				command.operationFamily(),
+				context.deadlineEpochMillis());
+	}
+
+	private Scheduler commandScheduler(RocksDBAPICommand<?, ?, ?> command) {
+		var context = currentRequestContext();
+		var profile = WorkloadAdmission.resolve(context, command);
+		return db.getScheduler().scheduler(profile,
+				command.operationFamily(),
+				context.deadlineEpochMillis());
 	}
 
 	@Override
 	public Flux<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
-		return db.scanRawAsyncInternal(columnId, shardIndex, shardCount);
+		var command = new RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw(
+				columnId, shardIndex, shardCount);
+		return db.scanRawAsyncInternal(
+				columnId, shardIndex, shardCount, commandScheduler(command));
 	}
 
 	@Override
@@ -256,32 +242,11 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public <T> T put(long transactionOrUpdateId,
-			long columnId,
-			@NotNull Keys keys,
-			@NotNull Buf value,
-			RequestPut<? super Buf, T> requestType,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		return executeClassifiedWriteSync(writeClass,
-				() -> db.put(transactionOrUpdateId, columnId, keys, value, requestType));
-	}
-
-	@Override
 	public <T> T delete(long transactionOrUpdateId,
 			long columnId,
 			@NotNull Keys keys,
 			@NotNull RequestType.RequestDelete<? super Buf, T> requestType) throws RocksDBException {
 		return db.delete(transactionOrUpdateId, columnId, keys, requestType);
-	}
-
-	@Override
-	public <T> T delete(long transactionOrUpdateId,
-			long columnId,
-			@NotNull Keys keys,
-			@NotNull RequestType.RequestDelete<? super Buf, T> requestType,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		return executeClassifiedWriteSync(writeClass,
-				() -> db.delete(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
 	@Override
@@ -294,17 +259,6 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public <T> T merge(long transactionOrUpdateId,
-			long columnId,
-			@NotNull Keys keys,
-			@NotNull Buf value,
-			RequestMerge<? super Buf, T> requestType,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		return executeClassifiedWriteSync(writeClass,
-				() -> db.merge(transactionOrUpdateId, columnId, keys, value, requestType));
-	}
-
-	@Override
 	public <T> List<T> deleteMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
@@ -313,31 +267,10 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public <T> List<T> deleteMulti(long transactionOrUpdateId,
-			long columnId,
-			@NotNull List<Keys> keys,
-			RequestDelete<? super Buf, T> requestType,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		return executeClassifiedWriteSync(writeClass,
-				() -> db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType));
-	}
-
-	@Override
 	public void deleteRange(long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive) throws RocksDBException {
 		db.deleteRange(columnId, startKeysInclusive, endKeysExclusive);
-	}
-
-	@Override
-	public void deleteRange(long columnId,
-			@Nullable Keys startKeysInclusive,
-			@Nullable Keys endKeysExclusive,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		executeClassifiedWriteSync(writeClass, () -> {
-			db.deleteRange(columnId, startKeysInclusive, endKeysExclusive);
-			return null;
-		});
 	}
 
 	@Override
@@ -350,17 +283,6 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public <T> List<T> putMulti(long transactionOrUpdateId,
-			long columnId,
-			@NotNull List<Keys> keys,
-			@NotNull List<@NotNull Buf> values,
-			RequestPut<? super Buf, T> requestType,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		return executeClassifiedWriteSync(writeClass,
-				() -> db.putMulti(transactionOrUpdateId, columnId, keys, values, requestType));
-	}
-
-	@Override
 	public <T> List<T> mergeMulti(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
@@ -370,32 +292,11 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public <T> List<T> mergeMulti(long transactionOrUpdateId,
-			long columnId,
-			@NotNull List<Keys> keys,
-			@NotNull List<@NotNull Buf> values,
-			RequestMerge<? super Buf, T> requestType,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		return executeClassifiedWriteSync(writeClass,
-				() -> db.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType));
-	}
-
-	@Override
 	public <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
 			long columnId,
 			@NotNull List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
-		return deleteMultiAsync(
-				transactionOrUpdateId, columnId, keys, requestType, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
-			long columnId,
-			@NotNull List<Keys> keys,
-			RequestDelete<? super Buf, T> requestType,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		var executor = db.getScheduler().writeExecutor(writeClass);
+		var executor = db.getScheduler().writeExecutor();
 		return supplyAsyncPreservingRunningCompletion(
 				() -> db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType), executor);
 	}
@@ -404,30 +305,22 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	public CompletableFuture<Void> putBatchAsync(long columnId,
 											 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 											 @NotNull PutBatchMode mode) throws RocksDBException {
-		return db.putBatchInternal(columnId, batchPublisher, mode);
-	}
-
-	@Override
-	public CompletableFuture<Void> putBatchAsync(long columnId,
-			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
-			@NotNull PutBatchMode mode,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		return db.putBatchInternal(columnId, batchPublisher, mode, writeClass);
+		var context = currentRequestContext();
+		return db.putBatchInternal(columnId,
+				batchPublisher,
+				mode,
+				db.getScheduler().scheduler(context, OperationFamily.MUTATION));
 	}
 
 	@Override
 	public CompletableFuture<Void> mergeBatchAsync(long columnId,
 											@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 											@NotNull MergeBatchMode mode) throws RocksDBException {
-		return db.mergeBatchInternal(columnId, batchPublisher, mode);
-	}
-
-	@Override
-	public CompletableFuture<Void> mergeBatchAsync(long columnId,
-			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
-			@NotNull MergeBatchMode mode,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		return db.mergeBatchInternal(columnId, batchPublisher, mode, writeClass);
+		var context = currentRequestContext();
+		return db.mergeBatchInternal(columnId,
+				batchPublisher,
+				mode,
+				db.getScheduler().scheduler(context, OperationFamily.MUTATION));
 	}
 
 	@Override
@@ -438,26 +331,10 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
-	public void putBatch(long columnId,
-			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
-			@NotNull PutBatchMode mode,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		db.putBatch(columnId, batchPublisher, mode, writeClass);
-	}
-
-	@Override
 	public void mergeBatch(long columnId,
 				   @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 				   @NotNull MergeBatchMode mode) throws RocksDBException {
 		db.mergeBatch(columnId, batchPublisher, mode);
-	}
-
-	@Override
-	public void mergeBatch(long columnId,
-			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
-			@NotNull MergeBatchMode mode,
-			@NotNull WriteClass writeClass) throws RocksDBException {
-		db.mergeBatch(columnId, batchPublisher, mode, writeClass);
 	}
 
 	@Override
@@ -536,6 +413,9 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 		}
 
 		var cancelled = new AtomicBoolean();
+		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<>(
+				iterationId, skipCount, takeCount, requestType);
+		var workloadExecutor = commandExecutor(command);
 		CompletableFuture<T> result = new CompletableFuture<>() {
 			@Override
 			public boolean cancel(boolean mayInterruptIfRunning) {
@@ -547,23 +427,31 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 		CompletableFuture<T> operation;
 		try {
 			if (skipCount == 0 && takeCount == 0) {
-				operation = scheduleIteratorStep(iterationId, 0, requestType, cancelled);
+				operation = scheduleIteratorStep(
+						iterationId, 0, requestType, cancelled, workloadExecutor);
 			} else {
-				var skipped = advanceIteratorAsync(iterationId, skipCount, cancelled);
+				var skipped = advanceIteratorAsync(
+						iterationId, skipCount, cancelled, workloadExecutor);
 				operation = switch (requestType) {
 					case RequestType.RequestNothing<?> _ -> (CompletableFuture<T>) (CompletableFuture<?>) skipped
 							.thenCompose(exhausted -> exhausted
 									? CompletableFuture.completedFuture(null)
-									: advanceIteratorAsync(iterationId, takeCount, cancelled).thenApply(_ -> null));
+									: advanceIteratorAsync(
+											iterationId, takeCount, cancelled, workloadExecutor).thenApply(_ -> null));
 					case RequestType.RequestExists<?> _ -> (CompletableFuture<T>) (CompletableFuture<?>) skipped
 							.thenCompose(exhausted -> exhausted
 									? CompletableFuture.completedFuture(false)
-									: subsequentExistsAsync(iterationId, takeCount, false, cancelled));
+									: subsequentExistsAsync(
+											iterationId, takeCount, false, cancelled, workloadExecutor));
 					case RequestType.RequestMulti<?> _ -> (CompletableFuture<T>) (CompletableFuture<?>) skipped
 							.thenCompose(exhausted -> exhausted
 									? CompletableFuture.completedFuture(List.of())
 									: subsequentMultiAsync(
-											iterationId, takeCount, new ArrayList<>(), cancelled));
+											iterationId,
+											takeCount,
+											new ArrayList<>(),
+											cancelled,
+											workloadExecutor));
 				};
 			}
 		} catch (Throwable error) {
@@ -593,6 +481,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 		}
 		CompletableFuture<Void> result;
 		try {
+			var command = new RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo(iterationId, keys);
 			result = supplyAsyncPreservingRunningCompletion(() -> {
 				try {
 					db.seekTo(iterationId, keys);
@@ -603,7 +492,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 					// against a dependent whenComplete callback.
 					releaseAsyncIteratorOperation(iterationId, iteratorOperation);
 				}
-			}, db.getScheduler().readExecutor());
+			}, commandExecutor(command));
 		} catch (Throwable error) {
 			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
 			return CompletableFuture.failedFuture(error);
@@ -684,59 +573,66 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	/** @return true when the iterator was exhausted before consuming the requested count. */
 	private CompletableFuture<Boolean> advanceIteratorAsync(long iterationId,
 			long remaining,
-			AtomicBoolean cancelled) {
+			AtomicBoolean cancelled,
+			Executor workloadExecutor) {
 		if (remaining <= 0) {
 			return CompletableFuture.completedFuture(false);
 		}
 		long step = Math.min(remaining, ITERATOR_READ_STEP_SIZE);
-		return scheduleIteratorAdvanceStep(iterationId, step, cancelled)
+		return scheduleIteratorAdvanceStep(iterationId, step, cancelled, workloadExecutor)
 				.thenCompose(advanced -> advanced < step
 						? CompletableFuture.completedFuture(true)
-						: advanceIteratorAsync(iterationId, remaining - step, cancelled));
+						: advanceIteratorAsync(iterationId, remaining - step, cancelled, workloadExecutor));
 	}
 
 	private CompletableFuture<Boolean> subsequentExistsAsync(long iterationId,
 			long remaining,
 			boolean found,
-			AtomicBoolean cancelled) {
+			AtomicBoolean cancelled,
+			Executor workloadExecutor) {
 		if (remaining <= 0 || cancelled.get()) {
 			return cancelled.get()
 					? CompletableFuture.failedFuture(new CancellationException())
 					: CompletableFuture.completedFuture(found);
 		}
 		long step = Math.min(remaining, ITERATOR_READ_STEP_SIZE);
-		return scheduleIteratorAdvanceStep(iterationId, step, cancelled)
+		return scheduleIteratorAdvanceStep(iterationId, step, cancelled, workloadExecutor)
 				.thenCompose(advanced -> {
 					boolean pageFound = found || advanced > 0L;
 					return advanced < step
 							? CompletableFuture.completedFuture(pageFound)
-							: subsequentExistsAsync(iterationId, remaining - step, pageFound, cancelled);
+							: subsequentExistsAsync(
+									iterationId, remaining - step, pageFound, cancelled, workloadExecutor);
 				});
 	}
 
 	private CompletableFuture<List<Buf>> subsequentMultiAsync(long iterationId,
 			long remaining,
 			ArrayList<Buf> values,
-			AtomicBoolean cancelled) {
+			AtomicBoolean cancelled,
+			Executor workloadExecutor) {
 		if (remaining <= 0 || cancelled.get()) {
 			return cancelled.get()
 					? CompletableFuture.failedFuture(new CancellationException())
 					: CompletableFuture.completedFuture(values);
 		}
 		long step = Math.min(remaining, ITERATOR_READ_STEP_SIZE);
-		return scheduleIteratorStep(iterationId, step, RequestType.multi(), cancelled)
+		return scheduleIteratorStep(
+				iterationId, step, RequestType.multi(), cancelled, workloadExecutor)
 				.thenCompose(page -> {
 					values.addAll(page);
 					return page.size() < step
 							? CompletableFuture.completedFuture(values)
-							: subsequentMultiAsync(iterationId, remaining - step, values, cancelled);
+							: subsequentMultiAsync(
+									iterationId, remaining - step, values, cancelled, workloadExecutor);
 				});
 	}
 
 	private <T> CompletableFuture<T> scheduleIteratorStep(long iterationId,
 			long takeCount,
 			RequestType.RequestIterate<? super Buf, T> requestType,
-			AtomicBoolean cancelled) {
+			AtomicBoolean cancelled,
+			Executor workloadExecutor) {
 		if (cancelled.get()) {
 			return CompletableFuture.failedFuture(new CancellationException());
 		}
@@ -745,12 +641,13 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 				throw new CancellationException();
 			}
 			return db.subsequent(iterationId, 0, takeCount, requestType);
-		}, db.getScheduler().readExecutor());
+		}, workloadExecutor);
 	}
 
 	private CompletableFuture<Long> scheduleIteratorAdvanceStep(long iterationId,
 			long takeCount,
-			AtomicBoolean cancelled) {
+			AtomicBoolean cancelled,
+			Executor workloadExecutor) {
 		if (cancelled.get()) {
 			return CompletableFuture.failedFuture(new CancellationException());
 		}
@@ -759,7 +656,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 				throw new CancellationException();
 			}
 			return db.advanceIteratorInternal(iterationId, takeCount);
-		}, db.getScheduler().readExecutor());
+		}, workloadExecutor);
 	}
 
 	@Override
@@ -776,6 +673,14 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			boolean reverse,
 			@NotNull RequestType.RequestReduceRange<? super KV, T> requestType,
 		long timeoutMs) throws RocksDBException {
+		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
+				transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs);
 		if (requestType instanceof RequestType.RequestEntriesCount<?>) {
 			Consumer<Throwable> lateFailureHandler = error -> logLateRangeCountFailure(
 					transactionId, columnId, reverse, timeoutMs, error);
@@ -785,20 +690,13 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 					startKeysInclusive,
 					endKeysExclusive,
 					reverse,
-					timeoutMs)
+					timeoutMs,
+					commandScheduler(command))
 					.contextWrite(context -> context.put(
 							REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY, lateFailureHandler))
 					.toFuture();
 		}
 		long queuedAtNanos = System.nanoTime();
-		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
-				transactionId,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				reverse,
-				requestType,
-				timeoutMs);
 		return supplyAsyncPreservingRunningCompletion(() -> db.reduceRange(
 				transactionId,
 				columnId,
@@ -844,38 +742,6 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			future.reject(error);
 		}
 		return future;
-	}
-
-	/**
-	 * Preserve the direct foreground sync path while admitting explicitly classified maintenance
-	 * calls. Transport async bridges are already executing inside admission, so their command
-	 * handlers must invoke the native operation directly instead of recursively queuing and waiting.
-	 */
-	private <T> T executeClassifiedWriteSync(@NotNull WriteClass writeClass, Supplier<T> operation) {
-		java.util.Objects.requireNonNull(writeClass, "writeClass");
-		java.util.Objects.requireNonNull(operation, "operation");
-		if (writeClass == WriteClass.FOREGROUND || db.getScheduler().isExecutingWriteTask()) {
-			return operation.get();
-		}
-		var future = supplyAsyncPreservingRunningCompletion(
-				operation, db.getScheduler().writeExecutor(writeClass));
-		try {
-			return future.get();
-		} catch (InterruptedException interrupted) {
-			future.cancel(false);
-			Thread.currentThread().interrupt();
-			throw RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR,
-					"Interrupted while waiting for classified write admission",
-					interrupted);
-		} catch (ExecutionException failure) {
-			var rocksError = findRocksDBException(failure);
-			if (rocksError != null) {
-				throw rocksError;
-			}
-			throw RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR,
-					"Classified write failed",
-					failure.getCause() != null ? failure.getCause() : failure);
-		}
 	}
 
 	private static void logLateRangeCountFailure(long transactionId,
@@ -984,7 +850,22 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		return db.getRangeAsyncInternal(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+		var command = new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<>(
+				transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs);
+		return db.getRangeAsyncInternal(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs,
+				commandScheduler(command));
 	}
 
 	@Override

@@ -35,15 +35,15 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.Utils;
-import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
 import it.cavallium.rockserver.core.common.api.OptionalLongValue;
-import it.cavallium.rockserver.core.common.api.RocksDBWriteClass;
+import it.cavallium.rockserver.core.common.api.RocksDB;
 import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
 import java.io.IOException;
@@ -87,7 +87,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	private final int maxCdcResponseSize;
 	private final List<ClientSlot> allClientSlots;
 	private final ArrayBlockingQueue<ClientSlot> availableClientSlots;
-	private final RocksDBWriteClass.Iface client;
+	private final RocksDB.Iface client;
 	private final ExecutorService executor;
 	private final Scheduler executorScheduler;
 	private final AtomicBoolean closed = new AtomicBoolean();
@@ -126,9 +126,9 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 		// Retain the constructor's fail-fast connectivity check. The remaining
 		// transports are opened lazily as actual concurrency requires them.
 		allClientSlots.getFirst().client();
-		this.client = (RocksDBWriteClass.Iface) Proxy.newProxyInstance(
-				RocksDBWriteClass.Iface.class.getClassLoader(),
-				new Class<?>[] {RocksDBWriteClass.Iface.class},
+		this.client = (RocksDB.Iface) Proxy.newProxyInstance(
+				RocksDB.Iface.class.getClassLoader(),
+				new Class<?>[] {RocksDB.Iface.class},
 				this::invokeClient);
 		this.executor = Executors.newFixedThreadPool(poolSize,
 				Thread.ofPlatform().name("rockserver-thrift-client-", 0).factory());
@@ -138,16 +138,6 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public URI getUrl() {
 		return uri;
-	}
-
-	@Override
-	public RocksDBSyncAPI getSyncApi() {
-		return this;
-	}
-
-	@Override
-	public RocksDBAsyncAPI getAsyncApi() {
-		return this;
 	}
 
 	@Override
@@ -178,7 +168,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public long openTransaction(long timeoutMs) {
 		try {
-			return client.openTransaction(timeoutMs);
+			return client.openTransaction(timeoutMs, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -186,15 +176,8 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public boolean closeTransaction(long transactionId, boolean commit) {
-		return closeTransaction(transactionId, commit, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public boolean closeTransaction(long transactionId, boolean commit, WriteClass writeClass) {
 		try {
-			return writeClass == WriteClass.FOREGROUND
-					? client.closeTransaction(transactionId, commit)
-					: client.closeTransactionWithWriteClass(transactionId, commit, mapWriteClass(writeClass));
+			return client.closeTransaction(transactionId, commit, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -211,16 +194,9 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public long createColumn(String name, ColumnSchema schema) {
-		return createColumn(name, schema, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public long createColumn(String name, ColumnSchema schema, WriteClass writeClass) {
 		try {
 			var thriftSchema = mapSchema(schema);
-			return writeClass == WriteClass.FOREGROUND
-					? client.createColumn(name, thriftSchema)
-					: client.createColumnWithWriteClass(name, thriftSchema, mapWriteClass(writeClass));
+			return client.createColumn(name, thriftSchema, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -229,7 +205,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public long uploadMergeOperator(String name, String className, byte[] jarData) {
 		try {
-			return client.uploadMergeOperator(name, className, ByteBuffer.wrap(jarData));
+			return client.uploadMergeOperator(name, className, ByteBuffer.wrap(jarData), currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -242,17 +218,8 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public void deleteColumn(long columnId) {
-		deleteColumn(columnId, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public void deleteColumn(long columnId, WriteClass writeClass) {
 		try {
-			if (writeClass == WriteClass.FOREGROUND) {
-				client.deleteColumn(columnId);
-			} else {
-				client.deleteColumnWithWriteClass(columnId, mapWriteClass(writeClass));
-			}
+			client.deleteColumn(columnId, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -260,15 +227,8 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public boolean deleteColumnIfExists(String name) {
-		return deleteColumnIfExists(name, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public boolean deleteColumnIfExists(String name, WriteClass writeClass) {
 		try {
-			return writeClass == WriteClass.FOREGROUND
-					? client.deleteColumnIfExists(name)
-					: client.deleteColumnIfExistsWithWriteClass(name, mapWriteClass(writeClass));
+			return client.deleteColumnIfExists(name, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -276,22 +236,10 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public void deleteRange(long columnId, Keys startKeysInclusive, Keys endKeysExclusive) {
-		deleteRange(columnId, startKeysInclusive, endKeysExclusive, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public void deleteRange(long columnId,
-			Keys startKeysInclusive,
-			Keys endKeysExclusive,
-			WriteClass writeClass) {
 		try {
 			var startKeys = mapKeys(startKeysInclusive);
 			var endKeys = mapKeys(endKeysExclusive);
-			if (writeClass == WriteClass.FOREGROUND) {
-				client.deleteRange(columnId, startKeys, endKeys);
-			} else {
-				client.deleteRangeWithWriteClass(columnId, startKeys, endKeys, mapWriteClass(writeClass));
-			}
+			client.deleteRange(columnId, startKeys, endKeys, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -300,7 +248,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public long getColumnId(String name) {
 		try {
-			return client.getColumnId(name);
+			return client.getColumnId(name, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -309,7 +257,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public long estimateNumKeys(long columnId) {
 		try {
-			return client.estimateNumKeys(columnId);
+			return client.estimateNumKeys(columnId, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -318,43 +266,24 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> T put(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestPut<? super Buf, T> requestType) {
-		return put(transactionOrUpdateId, columnId, keys, value, requestType, WriteClass.FOREGROUND);
-	}
-
-	@SuppressWarnings("unchecked")
-	@Override
-	public <T> T put(long transactionOrUpdateId,
-			long columnId,
-			Keys keys,
-			Buf value,
-			RequestPut<? super Buf, T> requestType,
-			WriteClass writeClass) {
 		try {
-			int wireWriteClass = mapWriteClass(writeClass);
+			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestNothing) {
-				if (writeClass == WriteClass.FOREGROUND) {
-					client.put(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value));
-				} else {
-					client.putWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass);
-				}
+				client.put(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context);
 				return null;
 			} else if (requestType instanceof RequestPrevious) {
-				return (T) mapOptionalBinary(writeClass == WriteClass.FOREGROUND
-						? client.putGetPrevious(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
-						: client.putGetPreviousWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
+				return (T) mapOptionalBinary(client.putGetPrevious(
+						transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context));
 			} else if (requestType instanceof RequestDelta) {
-				return (T) mapDelta(writeClass == WriteClass.FOREGROUND
-						? client.putGetDelta(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
-						: client.putGetDeltaWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
+				return (T) mapDelta(client.putGetDelta(
+						transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context));
 			} else if (requestType instanceof RequestChanged) {
-				return (T) (Boolean) (writeClass == WriteClass.FOREGROUND
-						? client.putGetChanged(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
-						: client.putGetChangedWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
+				return (T) (Boolean) client.putGetChanged(
+						transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context);
 			} else if (requestType instanceof RequestPreviousPresence) {
-				return (T) (Boolean) (writeClass == WriteClass.FOREGROUND
-						? client.putGetPreviousPresence(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
-						: client.putGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
+				return (T) (Boolean) client.putGetPreviousPresence(
+						transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context);
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -368,36 +297,20 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			Keys keys,
 			RequestDelete<? super Buf, T> requestType) {
-		return delete(transactionOrUpdateId, columnId, keys, requestType, WriteClass.FOREGROUND);
-	}
-
-	@SuppressWarnings("unchecked")
-	@Override
-	public <T> T delete(long transactionOrUpdateId,
-			long columnId,
-			Keys keys,
-			RequestDelete<? super Buf, T> requestType,
-			WriteClass writeClass) {
 		try {
-			int wireWriteClass = mapWriteClass(writeClass);
+			var context = currentWireRequestContext();
 			if (requestType == null) {
 				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			}
 			if (requestType instanceof RequestNothing) {
-				if (writeClass == WriteClass.FOREGROUND) {
-					client.delete(transactionOrUpdateId, columnId, mapKeys(keys));
-				} else {
-					client.deleteWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), wireWriteClass);
-				}
+				client.delete(transactionOrUpdateId, columnId, mapKeys(keys), context);
 				return null;
 			} else if (requestType instanceof RequestPrevious) {
-				return (T) mapOptionalBinary(writeClass == WriteClass.FOREGROUND
-						? client.deleteGetPrevious(transactionOrUpdateId, columnId, mapKeys(keys))
-						: client.deleteGetPreviousWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), wireWriteClass));
+				return (T) mapOptionalBinary(client.deleteGetPrevious(
+						transactionOrUpdateId, columnId, mapKeys(keys), context));
 			} else if (requestType instanceof RequestPreviousPresence) {
-				return (T) (Boolean) (writeClass == WriteClass.FOREGROUND
-						? client.deleteGetPreviousPresence(transactionOrUpdateId, columnId, mapKeys(keys))
-						: client.deleteGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), wireWriteClass));
+				return (T) (Boolean) client.deleteGetPreviousPresence(
+						transactionOrUpdateId, columnId, mapKeys(keys), context);
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -408,31 +321,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> T merge(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestMerge<? super Buf, T> requestType) {
-		return merge(transactionOrUpdateId, columnId, keys, value, requestType, WriteClass.FOREGROUND);
-	}
-
-	@SuppressWarnings("unchecked")
-	@Override
-	public <T> T merge(long transactionOrUpdateId,
-			long columnId,
-			Keys keys,
-			Buf value,
-			RequestMerge<? super Buf, T> requestType,
-			WriteClass writeClass) {
 		try {
-			int wireWriteClass = mapWriteClass(writeClass);
+			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestNothing) {
-				if (writeClass == WriteClass.FOREGROUND) {
-					client.merge(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value));
-				} else {
-					client.mergeWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass);
-				}
+				client.merge(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context);
 				return null;
 			} else if (requestType instanceof RequestType.RequestMerged) {
-				return (T) mapOptionalBinary(writeClass == WriteClass.FOREGROUND
-						? client.mergeGetMerged(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value))
-						: client.mergeGetMergedWithWriteClass(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), wireWriteClass));
+				return (T) mapOptionalBinary(client.mergeGetMerged(
+						transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -443,45 +340,26 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> List<T> putMulti(long transactionOrUpdateId, long columnId, List<Keys> keys, List<Buf> values, RequestPut<? super Buf, T> requestType) {
-		return putMulti(transactionOrUpdateId, columnId, keys, values, requestType, WriteClass.FOREGROUND);
-	}
-
-	@SuppressWarnings("unchecked")
-	@Override
-	public <T> List<T> putMulti(long transactionOrUpdateId,
-			long columnId,
-			List<Keys> keys,
-			List<Buf> values,
-			RequestPut<? super Buf, T> requestType,
-			WriteClass writeClass) {
 		try {
-			int wireWriteClass = mapWriteClass(writeClass);
+			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestNothing) {
-				if (writeClass == WriteClass.FOREGROUND) {
-					client.putMulti(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
-				} else {
-					client.putMultiWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass);
-				}
+				client.putMulti(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context);
 				return Collections.nCopies(keys.size(), null);
 			} else if (requestType instanceof RequestPrevious) {
-				return (List<T>) mapOptionalBinaryList(writeClass == WriteClass.FOREGROUND
-						? client.putMultiGetPrevious(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
-						: client.putMultiGetPreviousWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass));
+				return (List<T>) mapOptionalBinaryList(client.putMultiGetPrevious(
+						transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context));
 			} else if (requestType instanceof RequestDelta) {
-				var result = writeClass == WriteClass.FOREGROUND
-						? client.putMultiGetDelta(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
-						: client.putMultiGetDeltaWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass);
+				var result = client.putMultiGetDelta(
+						transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context);
 				return (List<T>) result
 						.stream().map(this::mapDelta).collect(Collectors.toList());
 			} else if (requestType instanceof RequestChanged) {
-				return (List<T>) (writeClass == WriteClass.FOREGROUND
-						? client.putMultiGetChanged(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
-						: client.putMultiGetChangedWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass));
+				return (List<T>) client.putMultiGetChanged(
+						transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context);
 			} else if (requestType instanceof RequestPreviousPresence) {
-				return (List<T>) (writeClass == WriteClass.FOREGROUND
-						? client.putMultiGetPreviousPresence(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
-						: client.putMultiGetPreviousPresenceWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass));
+				return (List<T>) client.putMultiGetPreviousPresence(
+						transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context);
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -495,37 +373,20 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) {
-		return deleteMulti(transactionOrUpdateId, columnId, keys, requestType, WriteClass.FOREGROUND);
-	}
-
-	@SuppressWarnings("unchecked")
-	@Override
-	public <T> List<T> deleteMulti(long transactionOrUpdateId,
-			long columnId,
-			List<Keys> keys,
-			RequestDelete<? super Buf, T> requestType,
-			WriteClass writeClass) {
 		try {
-			int wireWriteClass = mapWriteClass(writeClass);
+			var context = currentWireRequestContext();
 			if (requestType == null) {
 				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			}
 			if (requestType instanceof RequestNothing) {
-				if (writeClass == WriteClass.FOREGROUND) {
-					client.deleteMulti(transactionOrUpdateId, columnId, mapKeysList(keys));
-				} else {
-					client.deleteMultiWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), wireWriteClass);
-				}
+				client.deleteMulti(transactionOrUpdateId, columnId, mapKeysList(keys), context);
 				return Collections.nCopies(keys.size(), null);
 			} else if (requestType instanceof RequestPrevious) {
-				return (List<T>) mapOptionalBinaryList(writeClass == WriteClass.FOREGROUND
-						? client.deleteMultiGetPrevious(transactionOrUpdateId, columnId, mapKeysList(keys))
-						: client.deleteMultiGetPreviousWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), wireWriteClass));
+				return (List<T>) mapOptionalBinaryList(client.deleteMultiGetPrevious(
+						transactionOrUpdateId, columnId, mapKeysList(keys), context));
 			} else if (requestType instanceof RequestPreviousPresence) {
-				return (List<T>) (writeClass == WriteClass.FOREGROUND
-						? client.deleteMultiGetPreviousPresence(transactionOrUpdateId, columnId, mapKeysList(keys))
-						: client.deleteMultiGetPreviousPresenceWithWriteClass(
-								transactionOrUpdateId, columnId, mapKeysList(keys), wireWriteClass));
+				return (List<T>) client.deleteMultiGetPreviousPresence(
+						transactionOrUpdateId, columnId, mapKeysList(keys), context);
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -536,31 +397,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> List<T> mergeMulti(long transactionOrUpdateId, long columnId, List<Keys> keys, List<Buf> values, RequestMerge<? super Buf, T> requestType) {
-		return mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType, WriteClass.FOREGROUND);
-	}
-
-	@SuppressWarnings("unchecked")
-	@Override
-	public <T> List<T> mergeMulti(long transactionOrUpdateId,
-			long columnId,
-			List<Keys> keys,
-			List<Buf> values,
-			RequestMerge<? super Buf, T> requestType,
-			WriteClass writeClass) {
 		try {
-			int wireWriteClass = mapWriteClass(writeClass);
+			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestNothing) {
-				if (writeClass == WriteClass.FOREGROUND) {
-					client.mergeMulti(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values));
-				} else {
-					client.mergeMultiWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass);
-				}
+				client.mergeMulti(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context);
 				return Collections.nCopies(keys.size(), null);
 			} else if (requestType instanceof RequestType.RequestMerged) {
-				return (List<T>) mapOptionalBinaryList(writeClass == WriteClass.FOREGROUND
-						? client.mergeMultiGetMerged(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values))
-						: client.mergeMultiGetMergedWithWriteClass(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), wireWriteClass));
+				return (List<T>) mapOptionalBinaryList(client.mergeMultiGetMerged(
+						transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -570,14 +415,6 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public void putBatch(long columnId, Publisher<KVBatch> batchPublisher, PutBatchMode mode) {
-		putBatch(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public void putBatch(long columnId,
-			Publisher<KVBatch> batchPublisher,
-			PutBatchMode mode,
-			WriteClass writeClass) {
 		try {
 			List<it.cavallium.rockserver.core.common.api.KV> data = new ArrayList<>();
 			Flux.from(batchPublisher).toIterable().forEach(batch -> {
@@ -593,11 +430,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 				case SST_INGESTION -> it.cavallium.rockserver.core.common.api.PutBatchMode.SST_INGESTION;
 				case SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.PutBatchMode.SST_INGEST_BEHIND;
 			};
-			if (writeClass == WriteClass.FOREGROUND) {
-				client.putBatch(columnId, data, thriftMode);
-			} else {
-				client.putBatchWithWriteClass(columnId, data, thriftMode, mapWriteClass(writeClass));
-			}
+			client.putBatch(columnId, data, thriftMode, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -605,14 +438,6 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public void mergeBatch(long columnId, Publisher<KVBatch> batchPublisher, MergeBatchMode mode) {
-		mergeBatch(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
-	}
-
-	@Override
-	public void mergeBatch(long columnId,
-			Publisher<KVBatch> batchPublisher,
-			MergeBatchMode mode,
-			WriteClass writeClass) {
 		try {
 			List<it.cavallium.rockserver.core.common.api.KV> data = new ArrayList<>();
 			Flux.from(batchPublisher).toIterable().forEach(batch -> {
@@ -628,11 +453,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 				case MERGE_SST_INGESTION -> it.cavallium.rockserver.core.common.api.MergeBatchMode.MERGE_SST_INGESTION;
 				case MERGE_SST_INGEST_BEHIND -> it.cavallium.rockserver.core.common.api.MergeBatchMode.MERGE_SST_INGEST_BEHIND;
 			};
-			if (writeClass == WriteClass.FOREGROUND) {
-				client.mergeBatch(columnId, data, thriftMode);
-			} else {
-				client.mergeBatchWithWriteClass(columnId, data, thriftMode, mapWriteClass(writeClass));
-			}
+			client.mergeBatch(columnId, data, thriftMode, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -642,16 +463,17 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public <T> T get(long transactionOrUpdateId, long columnId, Keys keys, RequestGet<? super Buf, T> requestType) {
 		try {
+			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestCurrent) {
-				return (T) mapOptionalBinary(client.get(transactionOrUpdateId, columnId, mapKeys(keys)));
+				return (T) mapOptionalBinary(client.get(transactionOrUpdateId, columnId, mapKeys(keys), context));
 			} else if (requestType instanceof RequestForUpdate) {
-				UpdateBegin ub = client.getForUpdate(transactionOrUpdateId, columnId, mapKeys(keys));
+				UpdateBegin ub = client.getForUpdate(transactionOrUpdateId, columnId, mapKeys(keys), context);
 				return (T) new it.cavallium.rockserver.core.common.UpdateContext<>(
 						ub.isSetPrevious() ? Utils.fromByteBuffer(ub.previous) : null,
 						ub.getUpdateId());
 			} else if (requestType instanceof RequestExists) {
-				return (T) (Boolean) client.exists(transactionOrUpdateId, columnId, mapKeys(keys));
+				return (T) (Boolean) client.exists(transactionOrUpdateId, columnId, mapKeys(keys), context);
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -665,7 +487,8 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			List<Keys> keys,
 			long timeoutMs) {
 		try {
-			return client.existsMulti(transactionId, columnId, mapKeysList(keys), timeoutMs);
+			return client.existsMulti(transactionId, columnId, mapKeysList(keys), timeoutMs,
+					currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -674,7 +497,8 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public long openIterator(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, long timeoutMs) {
 		try {
-			return client.openIterator(transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs);
+			return client.openIterator(transactionId, columnId, mapKeys(startKeysInclusive),
+					mapKeys(endKeysExclusive), reverse, timeoutMs, currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -692,7 +516,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public void seekTo(long iterationId, Keys keys) {
 		try {
-			client.seekTo(iterationId, mapKeys(keys));
+			client.seekTo(iterationId, mapKeys(keys), currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -702,14 +526,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public <T> T subsequent(long iterationId, long skipCount, long takeCount, RequestIterate<? super Buf, T> requestType) {
 		try {
+			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestNothing) {
-				client.subsequent(iterationId, skipCount, takeCount);
+				client.subsequent(iterationId, skipCount, takeCount, context);
 				return null;
 			} else if (requestType instanceof RequestExists) {
-				return (T) (Boolean) client.subsequentExists(iterationId, skipCount, takeCount);
+				return (T) (Boolean) client.subsequentExists(iterationId, skipCount, takeCount, context);
 			} else if (requestType instanceof RequestMulti) {
-				return (T) mapOptionalBinaryList(client.subsequentMultiGet(iterationId, skipCount, takeCount));
+				return (T) mapOptionalBinaryList(client.subsequentMultiGet(iterationId, skipCount, takeCount, context));
 			}
 			throw new UnsupportedOperationException("Request type " + requestType + " not supported");
 		} catch (TException e) {
@@ -720,11 +545,15 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public <T> T reduceRange(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestReduceRange<? super KV, T> requestType, long timeoutMs) {
 		try {
+			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestEntriesCount) {
-				return (T) Long.valueOf(client.reduceRangeEntriesCount(transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs));
+				return (T) Long.valueOf(client.reduceRangeEntriesCount(transactionId, columnId,
+						mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs, context));
 			} else if (requestType instanceof RequestGetFirstAndLast) {
-				it.cavallium.rockserver.core.common.api.FirstAndLast fl = client.reduceRangeFirstAndLast(transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs);
+				it.cavallium.rockserver.core.common.api.FirstAndLast fl = client.reduceRangeFirstAndLast(
+						transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive),
+						reverse, timeoutMs, context);
 				return (T) new it.cavallium.rockserver.core.common.FirstAndLast<>(
 						fl.isSetFirst() ? mapKV(fl.getFirst()) : null,
 						fl.isSetLast() ? mapKV(fl.getLast()) : null
@@ -739,12 +568,17 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public <T> Stream<T> getRange(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestGetRange<? super KV, T> requestType, long timeoutMs) {
 		try {
+			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestGetAllInRange) {
-				List<it.cavallium.rockserver.core.common.api.KV> list = client.getAllInRange(transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs);
+				List<it.cavallium.rockserver.core.common.api.KV> list = client.getAllInRange(
+						transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive),
+						reverse, timeoutMs, context);
 				return list.stream().map(this::mapKV).map(k -> (T) k);
 			} else if (requestType instanceof RequestGetAllInRangeNoCache) {
-				List<it.cavallium.rockserver.core.common.api.KV> list = client.getAllInRangeNoCache(transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs);
+				List<it.cavallium.rockserver.core.common.api.KV> list = client.getAllInRangeNoCache(
+						transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive),
+						reverse, timeoutMs, context);
 				return list.stream().map(this::mapKV).map(k -> (T) k);
 			}
 			throw new UnsupportedOperationException("Get range type " + requestType + " not implemented");
@@ -774,7 +608,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public Map<String, ColumnSchema> getAllColumnDefinitions() {
 		try {
-			return client.getAllColumnDefinitions().stream()
+			return client.getAllColumnDefinitions(currentWireRequestContext()).stream()
 					.collect(Collectors.toMap(
 							it.cavallium.rockserver.core.common.api.Column::getName,
 							c -> mapSchemaFromThrift(c.getSchema())
@@ -867,39 +701,27 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public CompletableFuture<Long> openTransactionAsync(long timeoutMs) {
-		return CompletableFuture.supplyAsync(() -> openTransaction(timeoutMs), executor);
+		return supplyAsyncContextual(() -> openTransaction(timeoutMs), executor);
 	}
 
 	@Override
 	public CompletableFuture<Boolean> closeTransactionAsync(long transactionId, boolean commit) {
-		return CompletableFuture.supplyAsync(() -> closeTransaction(transactionId, commit), executor);
-	}
-
-	@Override
-	public CompletableFuture<Boolean> closeTransactionAsync(long transactionId,
-			boolean commit,
-			WriteClass writeClass) {
-		return CompletableFuture.supplyAsync(() -> closeTransaction(transactionId, commit, writeClass), executor);
+		return supplyAsyncContextual(() -> closeTransaction(transactionId, commit), executor);
 	}
 
 	@Override
 	public CompletableFuture<Void> closeFailedUpdateAsync(long updateId) {
-		return CompletableFuture.runAsync(() -> closeFailedUpdate(updateId), executor);
+		return runAsyncContextual(() -> closeFailedUpdate(updateId), executor);
 	}
 
 	@Override
 	public CompletableFuture<Long> createColumnAsync(String name, ColumnSchema schema) {
-		return CompletableFuture.supplyAsync(() -> createColumn(name, schema), executor);
-	}
-
-	@Override
-	public CompletableFuture<Long> createColumnAsync(String name, ColumnSchema schema, WriteClass writeClass) {
-		return CompletableFuture.supplyAsync(() -> createColumn(name, schema, writeClass), executor);
+		return supplyAsyncContextual(() -> createColumn(name, schema), executor);
 	}
 
 	@Override
 	public CompletableFuture<Long> uploadMergeOperatorAsync(String name, String className, byte[] jarData) {
-		return CompletableFuture.supplyAsync(() -> uploadMergeOperator(name, className, jarData), executor);
+		return supplyAsyncContextual(() -> uploadMergeOperator(name, className, jarData), executor);
 	}
 
 	@Override
@@ -909,62 +731,32 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public CompletableFuture<Void> deleteColumnAsync(long columnId) {
-		return CompletableFuture.runAsync(() -> deleteColumn(columnId), executor);
-	}
-
-	@Override
-	public CompletableFuture<Void> deleteColumnAsync(long columnId, WriteClass writeClass) {
-		return CompletableFuture.runAsync(() -> deleteColumn(columnId, writeClass), executor);
+		return runAsyncContextual(() -> deleteColumn(columnId), executor);
 	}
 
 	@Override
 	public CompletableFuture<Boolean> deleteColumnIfExistsAsync(String name) {
-		return CompletableFuture.supplyAsync(() -> deleteColumnIfExists(name), executor);
-	}
-
-	@Override
-	public CompletableFuture<Boolean> deleteColumnIfExistsAsync(String name, WriteClass writeClass) {
-		return CompletableFuture.supplyAsync(() -> deleteColumnIfExists(name, writeClass), executor);
+		return supplyAsyncContextual(() -> deleteColumnIfExists(name), executor);
 	}
 
 	@Override
 	public CompletableFuture<Void> deleteRangeAsync(long columnId, Keys startKeysInclusive, Keys endKeysExclusive) {
-		return CompletableFuture.runAsync(() -> deleteRange(columnId, startKeysInclusive, endKeysExclusive), executor);
-	}
-
-	@Override
-	public CompletableFuture<Void> deleteRangeAsync(long columnId,
-			Keys startKeysInclusive,
-			Keys endKeysExclusive,
-			WriteClass writeClass) {
-		return CompletableFuture.runAsync(
-				() -> deleteRange(columnId, startKeysInclusive, endKeysExclusive, writeClass), executor);
+		return runAsyncContextual(() -> deleteRange(columnId, startKeysInclusive, endKeysExclusive), executor);
 	}
 
 	@Override
 	public CompletableFuture<Long> getColumnIdAsync(String name) {
-		return CompletableFuture.supplyAsync(() -> getColumnId(name), executor);
+		return supplyAsyncContextual(() -> getColumnId(name), executor);
 	}
 
 	@Override
 	public CompletableFuture<Long> estimateNumKeysAsync(long columnId) {
-		return CompletableFuture.supplyAsync(() -> estimateNumKeys(columnId), executor);
+		return supplyAsyncContextual(() -> estimateNumKeys(columnId), executor);
 	}
 
 	@Override
 	public <T> CompletableFuture<T> putAsync(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestPut<? super Buf, T> requestType) {
-		return CompletableFuture.supplyAsync(() -> put(transactionOrUpdateId, columnId, keys, value, requestType), executor);
-	}
-
-	@Override
-	public <T> CompletableFuture<T> putAsync(long transactionOrUpdateId,
-			long columnId,
-			Keys keys,
-			Buf value,
-			RequestPut<? super Buf, T> requestType,
-			WriteClass writeClass) {
-		return CompletableFuture.supplyAsync(
-				() -> put(transactionOrUpdateId, columnId, keys, value, requestType, writeClass), executor);
+		return supplyAsyncContextual(() -> put(transactionOrUpdateId, columnId, keys, value, requestType), executor);
 	}
 
 	@Override
@@ -972,50 +764,18 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			Keys keys,
 			RequestDelete<? super Buf, T> requestType) {
-		return CompletableFuture.supplyAsync(
+		return supplyAsyncContextual(
 				() -> delete(transactionOrUpdateId, columnId, keys, requestType), executor);
 	}
 
 	@Override
-	public <T> CompletableFuture<T> deleteAsync(long transactionOrUpdateId,
-			long columnId,
-			Keys keys,
-			RequestDelete<? super Buf, T> requestType,
-			WriteClass writeClass) {
-		return CompletableFuture.supplyAsync(
-				() -> delete(transactionOrUpdateId, columnId, keys, requestType, writeClass), executor);
-	}
-
-	@Override
 	public <T> CompletableFuture<T> mergeAsync(long transactionOrUpdateId, long columnId, Keys keys, Buf value, RequestMerge<? super Buf, T> requestType) {
-		return CompletableFuture.supplyAsync(() -> merge(transactionOrUpdateId, columnId, keys, value, requestType), executor);
-	}
-
-	@Override
-	public <T> CompletableFuture<T> mergeAsync(long transactionOrUpdateId,
-			long columnId,
-			Keys keys,
-			Buf value,
-			RequestMerge<? super Buf, T> requestType,
-			WriteClass writeClass) {
-		return CompletableFuture.supplyAsync(
-				() -> merge(transactionOrUpdateId, columnId, keys, value, requestType, writeClass), executor);
+		return supplyAsyncContextual(() -> merge(transactionOrUpdateId, columnId, keys, value, requestType), executor);
 	}
 
 	@Override
 	public <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId, long columnId, List<Keys> keys, List<Buf> values, RequestPut<? super Buf, T> requestType) {
-		return CompletableFuture.supplyAsync(() -> putMulti(transactionOrUpdateId, columnId, keys, values, requestType), executor);
-	}
-
-	@Override
-	public <T> CompletableFuture<List<T>> putMultiAsync(long transactionOrUpdateId,
-			long columnId,
-			List<Keys> keys,
-			List<Buf> values,
-			RequestPut<? super Buf, T> requestType,
-			WriteClass writeClass) {
-		return CompletableFuture.supplyAsync(
-				() -> putMulti(transactionOrUpdateId, columnId, keys, values, requestType, writeClass), executor);
+		return supplyAsyncContextual(() -> putMulti(transactionOrUpdateId, columnId, keys, values, requestType), executor);
 	}
 
 	@Override
@@ -1023,65 +783,28 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) {
-		return CompletableFuture.supplyAsync(
+		return supplyAsyncContextual(
 				() -> deleteMulti(transactionOrUpdateId, columnId, keys, requestType), executor);
 	}
 
 	@Override
-	public <T> CompletableFuture<List<T>> deleteMultiAsync(long transactionOrUpdateId,
-			long columnId,
-			List<Keys> keys,
-			RequestDelete<? super Buf, T> requestType,
-			WriteClass writeClass) {
-		return CompletableFuture.supplyAsync(
-				() -> deleteMulti(transactionOrUpdateId, columnId, keys, requestType, writeClass), executor);
-	}
-
-	@Override
 	public <T> CompletableFuture<List<T>> mergeMultiAsync(long transactionOrUpdateId, long columnId, List<Keys> keys, List<Buf> values, RequestMerge<? super Buf, T> requestType) {
-		return CompletableFuture.supplyAsync(() -> mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType), executor);
-	}
-
-	@Override
-	public <T> CompletableFuture<List<T>> mergeMultiAsync(long transactionOrUpdateId,
-			long columnId,
-			List<Keys> keys,
-			List<Buf> values,
-			RequestMerge<? super Buf, T> requestType,
-			WriteClass writeClass) {
-		return CompletableFuture.supplyAsync(
-				() -> mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType, writeClass), executor);
+		return supplyAsyncContextual(() -> mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType), executor);
 	}
 
 	@Override
 	public CompletableFuture<Void> putBatchAsync(long columnId, Publisher<KVBatch> batchPublisher, PutBatchMode mode) {
-		return CompletableFuture.runAsync(() -> putBatch(columnId, batchPublisher, mode), executor);
-	}
-
-	@Override
-	public CompletableFuture<Void> putBatchAsync(long columnId,
-			Publisher<KVBatch> batchPublisher,
-			PutBatchMode mode,
-			WriteClass writeClass) {
-		return CompletableFuture.runAsync(() -> putBatch(columnId, batchPublisher, mode, writeClass), executor);
+		return runAsyncContextual(() -> putBatch(columnId, batchPublisher, mode), executor);
 	}
 
 	@Override
 	public CompletableFuture<Void> mergeBatchAsync(long columnId, Publisher<KVBatch> batchPublisher, MergeBatchMode mode) {
-		return CompletableFuture.runAsync(() -> mergeBatch(columnId, batchPublisher, mode), executor);
-	}
-
-	@Override
-	public CompletableFuture<Void> mergeBatchAsync(long columnId,
-			Publisher<KVBatch> batchPublisher,
-			MergeBatchMode mode,
-			WriteClass writeClass) {
-		return CompletableFuture.runAsync(() -> mergeBatch(columnId, batchPublisher, mode, writeClass), executor);
+		return runAsyncContextual(() -> mergeBatch(columnId, batchPublisher, mode), executor);
 	}
 
 	@Override
 	public <T> CompletableFuture<T> getAsync(long transactionOrUpdateId, long columnId, Keys keys, RequestGet<? super Buf, T> requestType) {
-		return CompletableFuture.supplyAsync(() -> get(transactionOrUpdateId, columnId, keys, requestType), executor);
+		return supplyAsyncContextual(() -> get(transactionOrUpdateId, columnId, keys, requestType), executor);
 	}
 
 	@Override
@@ -1089,32 +812,32 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			long columnId,
 			List<Keys> keys,
 			long timeoutMs) {
-		return CompletableFuture.supplyAsync(() -> existsMulti(transactionId, columnId, keys, timeoutMs), executor);
+		return supplyAsyncContextual(() -> existsMulti(transactionId, columnId, keys, timeoutMs), executor);
 	}
 
 	@Override
 	public CompletableFuture<Long> openIteratorAsync(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, long timeoutMs) {
-		return CompletableFuture.supplyAsync(() -> openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs), executor);
+		return supplyAsyncContextual(() -> openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs), executor);
 	}
 
 	@Override
 	public CompletableFuture<Void> closeIteratorAsync(long iteratorId) {
-		return CompletableFuture.runAsync(() -> closeIterator(iteratorId), executor);
+		return runAsyncContextual(() -> closeIterator(iteratorId), executor);
 	}
 
 	@Override
 	public CompletableFuture<Void> seekToAsync(long iterationId, Keys keys) {
-		return CompletableFuture.runAsync(() -> seekTo(iterationId, keys), executor);
+		return runAsyncContextual(() -> seekTo(iterationId, keys), executor);
 	}
 
 	@Override
 	public <T> CompletableFuture<T> subsequentAsync(long iterationId, long skipCount, long takeCount, RequestIterate<? super Buf, T> requestType) {
-		return CompletableFuture.supplyAsync(() -> subsequent(iterationId, skipCount, takeCount, requestType), executor);
+		return supplyAsyncContextual(() -> subsequent(iterationId, skipCount, takeCount, requestType), executor);
 	}
 
 	@Override
 	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestReduceRange<? super KV, T> requestType, long timeoutMs) {
-		return CompletableFuture.supplyAsync(() -> reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs), executor);
+		return supplyAsyncContextual(() -> reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs), executor);
 	}
 
 	@Override
@@ -1123,28 +846,29 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 		// downstream delivery can still obey demand and cancellation. Flux.fromStream
 		// also closes the stream on cancellation; the previous sink::next loop eagerly
 		// pushed every item and kept running after the subscriber went away.
-		return Flux.fromStream(() -> getRange(transactionId,
+		var context = currentRequestContext();
+		return Flux.fromStream(() -> withRequestContext(context, () -> getRange(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
 				requestType,
-				timeoutMs)).subscribeOn(executorScheduler);
+				timeoutMs))).subscribeOn(executorScheduler);
 	}
 
 	@Override
 	public CompletableFuture<Void> flushAsync() {
-		return CompletableFuture.runAsync(this::flush, executor);
+		return runAsyncContextual(this::flush, executor);
 	}
 
 	@Override
 	public CompletableFuture<Void> compactAsync() {
-		return CompletableFuture.runAsync(this::compact, executor);
+		return runAsyncContextual(this::compact, executor);
 	}
 
 	@Override
 	public CompletableFuture<Map<String, ColumnSchema>> getAllColumnDefinitionsAsync() {
-		return CompletableFuture.supplyAsync(this::getAllColumnDefinitions, executor);
+		return supplyAsyncContextual(this::getAllColumnDefinitions, executor);
 	}
 
 	@Override
@@ -1161,23 +885,23 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			List<Long> columnIds,
 			Boolean emitLatestValues,
 			OptionalLong expectedLastCommitted) {
-		return CompletableFuture.supplyAsync(
+		return supplyAsyncContextual(
 				() -> cdcCreate(id, fromSeq, columnIds, emitLatestValues, expectedLastCommitted), executor);
 	}
 
 	@Override
 	public CompletableFuture<Void> cdcDeleteAsync(String id) {
-		return CompletableFuture.runAsync(() -> cdcDelete(id), executor);
+		return runAsyncContextual(() -> cdcDelete(id), executor);
 	}
 
 	@Override
 	public CompletableFuture<Long> cdcGetEarliestAvailableSequenceAsync() {
-		return CompletableFuture.supplyAsync(this::cdcGetEarliestAvailableSequence, executor);
+		return supplyAsyncContextual(this::cdcGetEarliestAvailableSequence, executor);
 	}
 
 	@Override
 	public CompletableFuture<OptionalLong> cdcGetLastCommittedSequenceAsync(String id) {
-		return CompletableFuture.supplyAsync(() -> cdcGetLastCommittedSequence(id), executor);
+		return supplyAsyncContextual(() -> cdcGetLastCommittedSequence(id), executor);
 	}
 
 	@Override
@@ -1188,26 +912,27 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-		return Mono.fromCallable(() -> cdcPollBatch(id, fromSeq, maxEvents))
+		var context = currentRequestContext();
+		return Mono.fromCallable(() -> withRequestContext(context, () -> cdcPollBatch(id, fromSeq, maxEvents)))
 				.subscribeOn(executorScheduler);
 	}
 
 	@Override
 	public CompletableFuture<Void> cdcCommitAsync(String id, long seq) {
-		return CompletableFuture.runAsync(() -> cdcCommit(id, seq), executor);
+		return runAsyncContextual(() -> cdcCommit(id, seq), executor);
 	}
 
 	@Override
-	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> req) {
-		return req.handleSync(this);
+	public <R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		return withRequestContext(context, () -> req.handleSync(this));
 	}
 
 	@Override
-	public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> req) {
+	public <R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
         if (req instanceof RocksDBAPICommand.RocksDBAPICommandStream) {
              // Let handleAsync dispatch to getRangeAsync etc
         }
-		return req.handleAsync(this);
+		return withRequestContext(context, () -> req.handleAsync(this));
 	}
 
 	// --- Helpers ---
@@ -1294,9 +1019,9 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	private final class ClientSlot {
 
 		private TTransport transport;
-		private RocksDBWriteClass.Client physicalClient;
+		private RocksDB.Client physicalClient;
 
-		private synchronized RocksDBWriteClass.Client client() throws TException {
+		private synchronized RocksDB.Client client() throws TException {
 			if (closed.get()) {
 				throw new TException("Thrift connection is closed");
 			}
@@ -1313,7 +1038,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			try {
 				newTransport.open();
 				transport = newTransport;
-				physicalClient = new RocksDBWriteClass.Client(new TBinaryProtocol(newTransport));
+				physicalClient = new RocksDB.Client(new TBinaryProtocol(newTransport));
 				return physicalClient;
 			} catch (TException failure) {
 				newTransport.close();
@@ -1354,11 +1079,26 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 		return RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
 	}
 
-	private static int mapWriteClass(WriteClass writeClass) {
-		return switch (writeClass) {
-			case FOREGROUND -> 0;
-			case MAINTENANCE -> 1;
-		};
+	private it.cavallium.rockserver.core.common.api.RequestContext currentWireRequestContext() {
+		var context = currentRequestContext();
+		return new it.cavallium.rockserver.core.common.api.RequestContext(
+				it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(
+						context.profile().ordinal() + 1),
+				context.deadlineEpochMillis());
+	}
+
+	private <T> CompletableFuture<T> supplyAsyncContextual(java.util.function.Supplier<T> operation,
+			java.util.concurrent.Executor ignoredExecutor) {
+		var context = currentRequestContext();
+		return CompletableFuture.supplyAsync(() -> withRequestContext(context, operation), executor);
+	}
+
+	private CompletableFuture<Void> runAsyncContextual(Runnable operation,
+			java.util.concurrent.Executor ignoredExecutor) {
+		return supplyAsyncContextual(() -> {
+			operation.run();
+			return null;
+		}, ignoredExecutor);
 	}
 
 	private List<ByteBuffer> mapKeys(Keys keys) {

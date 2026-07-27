@@ -33,9 +33,19 @@ enum Operation {
   PREVIOUS_PRESENCE = 9
 }
 
-enum WriteClass {
-  FOREGROUND = 0,
-  MAINTENANCE = 1
+enum WorkloadProfile {
+  CONTROL = 1,
+  LATENCY = 2,
+  ANALYTICAL = 3,
+  INGEST = 4,
+  CDC = 5,
+  BATCH = 6,
+  PHYSICAL_MAINTENANCE = 7
+}
+
+struct RequestContext {
+  1: required WorkloadProfile profile,
+  2: required i64 deadlineEpochMillis
 }
 
 enum PutBatchMode {
@@ -171,105 +181,105 @@ exception RocksDBThriftException {
 
 service RocksDB {
 
-   i64 openTransaction(1: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   i64 openTransaction(1: required i64 timeoutMs, 2: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   bool closeTransaction(1: required i64 transactionId, 2: required bool commit) throws (1: RocksDBThriftException e),
+   bool closeTransaction(1: required i64 transactionId, 2: required bool commit, 3: required RequestContext context) throws (1: RocksDBThriftException e),
 
    void closeFailedUpdate(1: required i64 updateId) throws (1: RocksDBThriftException e),
 
-   i64 createColumn(1: required string name, 2: required ColumnSchema schema) throws (1: RocksDBThriftException e),
+   i64 createColumn(1: required string name, 2: required ColumnSchema schema, 3: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void deleteColumn(1: required i64 columnId) throws (1: RocksDBThriftException e),
+   void deleteColumn(1: required i64 columnId, 2: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   bool deleteColumnIfExists(1: required string name) throws (1: RocksDBThriftException e),
+   bool deleteColumnIfExists(1: required string name, 2: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   i64 getColumnId(1: required string name) throws (1: RocksDBThriftException e),
+   i64 getColumnId(1: required string name, 2: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   i64 estimateNumKeys(1: required i64 columnId) throws (1: RocksDBThriftException e),
+   i64 estimateNumKeys(1: required i64 columnId, 2: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   oneway void putFast(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value),
+   void putFast(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void put(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
+   void put(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void putMulti(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti) throws (1: RocksDBThriftException e),
+   void putMulti(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   OptionalBinary putGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
+   OptionalBinary putGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   Delta putGetDelta(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
+   Delta putGetDelta(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   bool putGetChanged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
+   bool putGetChanged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   bool putGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
+   bool putGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void delete(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
+   void delete(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   OptionalBinary deleteGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
+   OptionalBinary deleteGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   bool deleteGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
+   bool deleteGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void deleteMulti(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti) throws (1: RocksDBThriftException e),
+   void deleteMulti(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<OptionalBinary> deleteMultiGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti) throws (1: RocksDBThriftException e),
+   list<OptionalBinary> deleteMultiGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<bool> deleteMultiGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti) throws (1: RocksDBThriftException e),
+   list<bool> deleteMultiGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   OptionalBinary get(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
+   OptionalBinary get(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   UpdateBegin getForUpdate(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys) throws (1: RocksDBThriftException e),
+   UpdateBegin getForUpdate(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   bool exists(1: required i64 transactionOrUpdateId, 3: required i64 columnId, 4: required list<binary> keys) throws (1: RocksDBThriftException e),
+   bool exists(1: required i64 transactionOrUpdateId, 3: required i64 columnId, 4: required list<binary> keys, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<bool> existsMulti(1: required i64 transactionId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   list<bool> existsMulti(1: required i64 transactionId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required i64 timeoutMs, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   i64 openIterator(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   i64 openIterator(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
    void closeIterator(1: required i64 iteratorId) throws (1: RocksDBThriftException e),
 
-   void seekTo(1: required i64 iterationId, 2: required list<binary> keys) throws (1: RocksDBThriftException e),
+   void seekTo(1: required i64 iterationId, 2: required list<binary> keys, 3: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void subsequent(1: required i64 iterationId, 2: required i64 skipCount, 3: required i64 takeCount) throws (1: RocksDBThriftException e),
+   void subsequent(1: required i64 iterationId, 2: required i64 skipCount, 3: required i64 takeCount, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   bool subsequentExists(1: required i64 iterationId, 2: required i64 skipCount, 3: required i64 takeCount) throws (1: RocksDBThriftException e),
+   bool subsequentExists(1: required i64 iterationId, 2: required i64 skipCount, 3: required i64 takeCount, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<OptionalBinary> subsequentMultiGet(1: required i64 iterationId, 2: required i64 skipCount, 3: required i64 takeCount) throws (1: RocksDBThriftException e),
+   list<OptionalBinary> subsequentMultiGet(1: required i64 iterationId, 2: required i64 skipCount, 3: required i64 takeCount, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void putBatch(1: required i64 columnId, 2: required list<KV> data, 3: required PutBatchMode mode) throws (1: RocksDBThriftException e),
+   void putBatch(1: required i64 columnId, 2: required list<KV> data, 3: required PutBatchMode mode, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void merge(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
+   void merge(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void mergeMulti(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti) throws (1: RocksDBThriftException e),
+   void mergeMulti(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void mergeBatch(1: required i64 columnId, 2: required list<KV> data, 3: required MergeBatchMode mode) throws (1: RocksDBThriftException e),
+   void mergeBatch(1: required i64 columnId, 2: required list<KV> data, 3: required MergeBatchMode mode, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void deleteRange(1: required i64 columnId, 2: list<binary> startKeysInclusive, 3: list<binary> endKeysExclusive) throws (1: RocksDBThriftException e),
+   void deleteRange(1: required i64 columnId, 2: list<binary> startKeysInclusive, 3: list<binary> endKeysExclusive, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   OptionalBinary mergeGetMerged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value) throws (1: RocksDBThriftException e),
+   OptionalBinary mergeGetMerged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<OptionalBinary> mergeMultiGetMerged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti) throws (1: RocksDBThriftException e),
+   list<OptionalBinary> mergeMultiGetMerged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   FirstAndLast reduceRangeFirstAndLast(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   FirstAndLast reduceRangeFirstAndLast(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   i64 reduceRangeEntriesCount(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   i64 reduceRangeEntriesCount(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<KV> getAllInRange(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   list<KV> getAllInRange(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<KV> getAllInRangeNoCache(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs) throws (1: RocksDBThriftException e),
+   list<KV> getAllInRangeNoCache(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   i64 uploadMergeOperator(1: required string operatorName, 2: required string className, 3: required binary jarPayload) throws (1: RocksDBThriftException e),
+   i64 uploadMergeOperator(1: required string operatorName, 2: required string className, 3: required binary jarPayload, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<OptionalBinary> putMultiGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti) throws (1: RocksDBThriftException e),
+   list<OptionalBinary> putMultiGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<Delta> putMultiGetDelta(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti) throws (1: RocksDBThriftException e),
+   list<Delta> putMultiGetDelta(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<bool> putMultiGetChanged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti) throws (1: RocksDBThriftException e),
+   list<bool> putMultiGetChanged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<bool> putMultiGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti) throws (1: RocksDBThriftException e),
+   list<bool> putMultiGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
    void flush() throws (1: RocksDBThriftException e),
 
    void compact() throws (1: RocksDBThriftException e),
 
-   list<Column> getAllColumnDefinitions() throws (1: RocksDBThriftException e),
+   list<Column> getAllColumnDefinitions(1: required RequestContext context) throws (1: RocksDBThriftException e),
 
    i64 cdcCreate(1: required CdcCreateRequest request) throws (1: RocksDBThriftException e),
 
@@ -283,65 +293,4 @@ service RocksDB {
 
    void cdcCommit(1: required string id, 2: required i64 seq) throws (1: RocksDBThriftException e),
 
-}
-
-// Additive classified-write surface. RocksDB remains unchanged so generated legacy
-// clients retain source and wire compatibility; inherited methods mean foreground.
-service RocksDBWriteClass extends RocksDB {
-
-   bool closeTransactionWithWriteClass(1: required i64 transactionId, 2: required bool commit, 3: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   i64 createColumnWithWriteClass(1: required string name, 2: required ColumnSchema schema, 3: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   void deleteColumnWithWriteClass(1: required i64 columnId, 2: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   bool deleteColumnIfExistsWithWriteClass(1: required string name, 2: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   oneway void putFastWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required i32 writeClass),
-
-   void putWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   void putMultiWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   OptionalBinary putGetPreviousWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   Delta putGetDeltaWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   bool putGetChangedWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   bool putGetPreviousPresenceWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   void deleteWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   OptionalBinary deleteGetPreviousWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   bool deleteGetPreviousPresenceWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   void deleteMultiWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   list<OptionalBinary> deleteMultiGetPreviousWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   list<bool> deleteMultiGetPreviousPresenceWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   void putBatchWithWriteClass(1: required i64 columnId, 2: required list<KV> data, 3: required PutBatchMode mode, 4: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   void mergeWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   void mergeMultiWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   void mergeBatchWithWriteClass(1: required i64 columnId, 2: required list<KV> data, 3: required MergeBatchMode mode, 4: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   void deleteRangeWithWriteClass(1: required i64 columnId, 2: list<binary> startKeysInclusive, 3: list<binary> endKeysExclusive, 4: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   OptionalBinary mergeGetMergedWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   list<OptionalBinary> mergeMultiGetMergedWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   list<OptionalBinary> putMultiGetPreviousWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   list<Delta> putMultiGetDeltaWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   list<bool> putMultiGetChangedWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
-
-   list<bool> putMultiGetPreviousPresenceWithWriteClass(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required i32 writeClass) throws (1: RocksDBThriftException e),
 }

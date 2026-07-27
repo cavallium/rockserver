@@ -42,8 +42,10 @@ class EmbeddedReduceRangeSchedulingTest {
 		var entriesCount = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<Long>(
 				0, 1, null, null, false, RequestType.entriesCount(), 1_000);
 
-		assertEquals(RocksDBAPICommand.ReadWorkClass.INTERACTIVE, firstAndLast.readWorkClass());
-		assertEquals(RocksDBAPICommand.ReadWorkClass.COMPOSITE, entriesCount.readWorkClass());
+		assertEquals(it.cavallium.rockserver.core.common.OperationFamily.BOUNDARY_SEEK,
+				firstAndLast.operationFamily());
+		assertEquals(it.cavallium.rockserver.core.common.OperationFamily.FULL_SCAN_AGGREGATE,
+				entriesCount.operationFamily());
 	}
 
 	@Test
@@ -56,7 +58,7 @@ class EmbeddedReduceRangeSchedulingTest {
 				}
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("async-io-db"), "range-async-io", configFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var observedAsyncIo = new AtomicReference<Boolean>();
@@ -81,7 +83,7 @@ class EmbeddedReduceRangeSchedulingTest {
 				}
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "range-deadline", configFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			api.put(0, columnId, intKey(1), intValue(1), RequestType.none());
@@ -97,7 +99,7 @@ class EmbeddedReduceRangeSchedulingTest {
 			var iteratorOpens = new AtomicInteger();
 			connection.getInternalDB().setRangeIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
 			try {
-				var result = connection.getAsyncApi().reduceRangeAsync(
+				var result = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(
 						0, columnId, null, null, false, RequestType.firstAndLast(), 50);
 				Thread.sleep(150);
 				releaseBlocker.countDown();
@@ -126,7 +128,7 @@ class EmbeddedReduceRangeSchedulingTest {
 				}
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("cancel-db"), "range-cancellation", configFile)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var readExecutor = assertInstanceOf(ThreadPoolExecutor.class,
@@ -140,7 +142,7 @@ class EmbeddedReduceRangeSchedulingTest {
 			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
 
 			try {
-				var result = connection.getAsyncApi().reduceRangeAsync(
+				var result = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(
 						0, columnId, null, null, false, RequestType.firstAndLast(), 5_000);
 				awaitQueueSize(readExecutor, 1);
 

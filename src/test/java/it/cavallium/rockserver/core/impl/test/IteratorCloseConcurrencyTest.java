@@ -47,7 +47,7 @@ class IteratorCloseConcurrencyTest {
 	void activeAndQueuedPagingSerializeBeforeCloseClaimsTheNativeIterator() throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("iterator-active-close"),
 				"iterator-active-close", null)) {
-			var api = connection.getSyncApi();
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			EmbeddedDB internal = connection.getInternalDB();
 			long columnId = api.createColumn(
 					"column",
@@ -148,10 +148,10 @@ class IteratorCloseConcurrencyTest {
 	void forcedAndExplicitCloseClaimIteratorLifetimeExactlyOnce() throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("iterator-close"), "iterator-close", null)) {
 			EmbeddedDB internal = connection.getInternalDB();
-			long columnId = connection.getSyncApi().createColumn(
+			long columnId = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
 					"column",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			long iteratorId = connection.getSyncApi().openIterator(
+			long iteratorId = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(
 					0,
 					columnId,
 					new Keys(new Buf[] {Buf.wrap(new byte[Integer.BYTES])}),
@@ -182,7 +182,7 @@ class IteratorCloseConcurrencyTest {
 				var forcedCleanup = executor.submit(() -> invokeForcedCleanup(internal));
 				assertTrue(forcedCloseStarted.await(1, TimeUnit.SECONDS));
 				try {
-					connection.getSyncApi().closeIterator(iteratorId);
+					connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(iteratorId);
 				} finally {
 					releaseForcedClose.countDown();
 				}
@@ -200,10 +200,10 @@ class IteratorCloseConcurrencyTest {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("iterator-close-failure"),
 				"iterator-close-failure", null)) {
 			EmbeddedDB internal = connection.getInternalDB();
-			long columnId = connection.getSyncApi().createColumn(
+			long columnId = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
 					"column",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			long iteratorId = connection.getSyncApi().openIterator(
+			long iteratorId = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(
 					0,
 					columnId,
 					new Keys(new Buf[] {Buf.wrap(new byte[Integer.BYTES])}),
@@ -223,12 +223,12 @@ class IteratorCloseConcurrencyTest {
 			iterators.put(iteratorId, throwingEntry);
 
 			RuntimeException actual = assertThrows(RuntimeException.class,
-					() -> connection.getSyncApi().closeIterator(iteratorId));
+					() -> connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(iteratorId));
 			assertSame(failure, actual);
 			assertEquals(0, internal.getOpenIteratorsCount());
 			assertEquals(0, internal.getPendingOpsCount());
 
-			connection.getSyncApi().closeIterator(iteratorId);
+			connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(iteratorId);
 			invokeForcedCleanup(internal);
 			Mockito.verify(throwingEntry, Mockito.times(1)).close();
 			assertEquals(0, internal.getPendingOpsCount());

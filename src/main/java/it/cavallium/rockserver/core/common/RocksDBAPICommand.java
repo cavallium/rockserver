@@ -18,24 +18,77 @@ import org.reactivestreams.Publisher;
 
 public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> {
 
-	enum ReadWorkClass {
-		INTERACTIVE,
-		COMPOSITE
-	}
-
 	SYNC_RESULT handleSync(RocksDBSyncAPI api);
 	ASYNC_RESULT handleAsync(RocksDBAsyncAPI api);
 
 	boolean isReadOnly();
 
-	/** Scheduling class for asynchronous read commands. Ignored for write commands. */
-	default ReadWorkClass readWorkClass() {
-		return ReadWorkClass.INTERACTIVE;
+	/**
+	 * Derive the actual operation/resource-cost family from the concrete request.
+	 * This value is server-owned and deliberately independent from the caller's
+	 * workload profile.
+	 */
+	default OperationFamily operationFamily() {
+		return switch (this) {
+			case RocksDBAPICommandSingle.OpenTransaction _ -> OperationFamily.METADATA;
+			case RocksDBAPICommandSingle.CloseTransaction close -> close.commit()
+					? OperationFamily.MUTATION
+					: OperationFamily.CONTROL;
+			case RocksDBAPICommandSingle.CloseFailedUpdate _ -> OperationFamily.CONTROL;
+			case RocksDBAPICommandSingle.CreateColumn _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.UploadMergeOperator _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.CheckMergeOperator _ -> OperationFamily.METADATA;
+			case RocksDBAPICommandSingle.DeleteColumn _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.DeleteColumnIfExists _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.GetColumnId _ -> OperationFamily.METADATA;
+			case RocksDBAPICommandSingle.EstimateNumKeys _ -> OperationFamily.METADATA;
+			case RocksDBAPICommandSingle.Put<?> _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.Delete<?> _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.DeleteMulti<?> _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.DeleteRange _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.PutMulti<?> _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.PutBatch _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.Merge<?> _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.MergeMulti<?> _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.MergeBatch _ -> OperationFamily.MUTATION;
+			case RocksDBAPICommandSingle.Get<?> _ -> OperationFamily.POINT_LOOKUP;
+			case RocksDBAPICommandSingle.ExistsMulti _ -> OperationFamily.BOUNDED_FAN_OUT;
+			case RocksDBAPICommandSingle.OpenIterator _ -> OperationFamily.BOUNDARY_SEEK;
+			case RocksDBAPICommandSingle.CloseIterator _ -> OperationFamily.CONTROL;
+			case RocksDBAPICommandSingle.SeekTo _ -> OperationFamily.BOUNDARY_SEEK;
+			case RocksDBAPICommandSingle.Subsequent<?> _ -> OperationFamily.RANGE_PAGE;
+			case RocksDBAPICommandSingle.ReduceRange<?> reduce ->
+					reduce.requestType().getRequestTypeId() == RequestType.RequestTypeId.FIRST_AND_LAST
+							? OperationFamily.BOUNDARY_SEEK
+							: OperationFamily.FULL_SCAN_AGGREGATE;
+			case RocksDBAPICommandStream.GetRange<?> _ -> OperationFamily.RANGE_PAGE;
+			case RocksDBAPICommandStream.ScanRaw _ -> OperationFamily.RANGE_PAGE;
+			case RocksDBAPICommandStream.CdcPoll _ -> OperationFamily.WAL_PAGE;
+			case Flush _ -> OperationFamily.FLUSH;
+			case Compact _ -> OperationFamily.COMPACTION;
+			case GetAllColumnDefinitions _ -> OperationFamily.METADATA;
+			case CdcCreate _ -> OperationFamily.MUTATION;
+			case CdcDelete _ -> OperationFamily.MUTATION;
+			case CdcGetEarliestAvailableSequence _ -> OperationFamily.WAL_PAGE;
+			case CdcGetLastCommittedSequence _ -> OperationFamily.WAL_PAGE;
+			case CdcCommit _ -> OperationFamily.MUTATION;
+		};
 	}
 
-	/** Scheduling class for caller-selected writes. Ignored for reads and internal lanes. */
-	default WriteClass writeClass() {
-		return WriteClass.FOREGROUND;
+	/** Protected service profile selected by Rockserver, or {@code null} for client work. */
+	default @Nullable WorkloadProfile protectedProfile() {
+		return switch (this) {
+			case RocksDBAPICommandSingle.CloseTransaction close -> close.commit()
+					? null
+					: WorkloadProfile.CONTROL;
+			case RocksDBAPICommandSingle.CloseFailedUpdate _, RocksDBAPICommandSingle.CloseIterator _ ->
+					WorkloadProfile.CONTROL;
+			case CdcCreate _, CdcDelete _, CdcGetEarliestAvailableSequence _,
+					CdcGetLastCommittedSequence _, CdcCommit _, RocksDBAPICommandStream.CdcPoll _ ->
+					WorkloadProfile.CDC;
+			case Flush _, Compact _ -> WorkloadProfile.PHYSICAL_MAINTENANCE;
+			default -> null;
+		};
 	}
 
 	sealed interface RocksDBAPICommandSingle<R> extends RocksDBAPICommand<R, R, CompletableFuture<R>> {
@@ -74,20 +127,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param transactionId transaction id to close
 		 * @param commit true to commit the transaction, false to rollback it
 		 */
-		record CloseTransaction(long transactionId, boolean commit, WriteClass writeClass) implements RocksDBAPICommandSingle<Boolean> {
-
-			public CloseTransaction(long transactionId, boolean commit) {
-				this(transactionId, commit, WriteClass.FOREGROUND);
-			}
+		record CloseTransaction(long transactionId, boolean commit) implements RocksDBAPICommandSingle<Boolean> {
 
 			@Override
 			public Boolean handleSync(RocksDBSyncAPI api) {
-				return api.closeTransaction(transactionId, commit, writeClass);
+				return api.closeTransaction(transactionId, commit);
 			}
 
 			@Override
 			public CompletableFuture<Boolean> handleAsync(RocksDBAsyncAPI api) {
-				return api.closeTransactionAsync(transactionId, commit, writeClass);
+				return api.closeTransactionAsync(transactionId, commit);
 			}
 
 			@Override
@@ -129,21 +178,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param schema column key-value schema
 		 */
 		record CreateColumn(String name,
-							@NotNull ColumnSchema schema,
-							WriteClass writeClass) implements RocksDBAPICommandSingle<Long> {
-
-			public CreateColumn(String name, @NotNull ColumnSchema schema) {
-				this(name, schema, WriteClass.FOREGROUND);
-			}
+							@NotNull ColumnSchema schema) implements RocksDBAPICommandSingle<Long> {
 
 			@Override
 			public Long handleSync(RocksDBSyncAPI api) {
-				return api.createColumn(name, schema, writeClass);
+				return api.createColumn(name, schema);
 			}
 
 			@Override
 			public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
-				return api.createColumnAsync(name, schema, writeClass);
+				return api.createColumnAsync(name, schema);
 			}
 
 			@Override
@@ -207,21 +251,17 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * Delete a column
 		 * @param columnId column id
 		 */
-		record DeleteColumn(long columnId, WriteClass writeClass) implements RocksDBAPICommandSingle<Void> {
-
-			public DeleteColumn(long columnId) {
-				this(columnId, WriteClass.FOREGROUND);
-			}
+		record DeleteColumn(long columnId) implements RocksDBAPICommandSingle<Void> {
 
 			@Override
 			public Void handleSync(RocksDBSyncAPI api) {
-				api.deleteColumn(columnId, writeClass);
+				api.deleteColumn(columnId);
 				return null;
 			}
 
 			@Override
 			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
-				return api.deleteColumnAsync(columnId, writeClass);
+				return api.deleteColumnAsync(columnId);
 			}
 
 			@Override
@@ -236,20 +276,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 *
 		 * @param name column name
 		 */
-		record DeleteColumnIfExists(@NotNull String name, WriteClass writeClass) implements RocksDBAPICommandSingle<Boolean> {
-
-			public DeleteColumnIfExists(@NotNull String name) {
-				this(name, WriteClass.FOREGROUND);
-			}
+		record DeleteColumnIfExists(@NotNull String name) implements RocksDBAPICommandSingle<Boolean> {
 
 			@Override
 			public Boolean handleSync(RocksDBSyncAPI api) {
-				return api.deleteColumnIfExists(name, writeClass);
+				return api.deleteColumnIfExists(name);
 			}
 
 			@Override
 			public CompletableFuture<Boolean> handleAsync(RocksDBAsyncAPI api) {
-				return api.deleteColumnIfExistsAsync(name, writeClass);
+				return api.deleteColumnIfExistsAsync(name);
 			}
 
 			@Override
@@ -323,22 +359,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 					  long columnId,
 					  Keys keys,
 					  @NotNull Buf value,
-					  RequestPut<? super Buf, T> requestType,
-					  WriteClass writeClass) implements RocksDBAPICommandSingle<T> {
-
-			public Put(long transactionOrUpdateId, long columnId, Keys keys, @NotNull Buf value,
-					RequestPut<? super Buf, T> requestType) {
-				this(transactionOrUpdateId, columnId, keys, value, requestType, WriteClass.FOREGROUND);
-			}
+					  RequestPut<? super Buf, T> requestType) implements RocksDBAPICommandSingle<T> {
 
 			@Override
 			public T handleSync(RocksDBSyncAPI api) {
-				return api.put(transactionOrUpdateId, columnId, keys, value, requestType, writeClass);
+				return api.put(transactionOrUpdateId, columnId, keys, value, requestType);
 			}
 
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
-				return api.putAsync(transactionOrUpdateId, columnId, keys, value, requestType, writeClass);
+				return api.putAsync(transactionOrUpdateId, columnId, keys, value, requestType);
 			}
 
 			@Override
@@ -370,22 +400,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		record Delete<T>(long transactionOrUpdateId,
 					  long columnId,
 					  Keys keys,
-					  RequestDelete<? super Buf, T> requestType,
-					  WriteClass writeClass) implements RocksDBAPICommandSingle<T> {
-
-			public Delete(long transactionOrUpdateId, long columnId, Keys keys,
-					RequestDelete<? super Buf, T> requestType) {
-				this(transactionOrUpdateId, columnId, keys, requestType, WriteClass.FOREGROUND);
-			}
+					  RequestDelete<? super Buf, T> requestType) implements RocksDBAPICommandSingle<T> {
 
 			@Override
 			public T handleSync(RocksDBSyncAPI api) {
-				return api.delete(transactionOrUpdateId, columnId, keys, requestType, writeClass);
+				return api.delete(transactionOrUpdateId, columnId, keys, requestType);
 			}
 
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
-				return api.deleteAsync(transactionOrUpdateId, columnId, keys, requestType, writeClass);
+				return api.deleteAsync(transactionOrUpdateId, columnId, keys, requestType);
 			}
 
 			@Override
@@ -415,22 +439,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 */
 		record DeleteMulti<T>(long transactionOrUpdateId, long columnId,
 										 @NotNull List<Keys> keys,
-										 RequestDelete<? super Buf, T> requestType,
-										 WriteClass writeClass) implements RocksDBAPICommandSingle<List<T>> {
-
-			public DeleteMulti(long transactionOrUpdateId, long columnId, @NotNull List<Keys> keys,
-					RequestDelete<? super Buf, T> requestType) {
-				this(transactionOrUpdateId, columnId, keys, requestType, WriteClass.FOREGROUND);
-			}
+										 RequestDelete<? super Buf, T> requestType) implements RocksDBAPICommandSingle<List<T>> {
 
 			@Override
 			public List<T> handleSync(RocksDBSyncAPI api) {
-				return api.deleteMulti(transactionOrUpdateId, columnId, keys, requestType, writeClass);
+				return api.deleteMulti(transactionOrUpdateId, columnId, keys, requestType);
 			}
 
 			@Override
 			public CompletableFuture<List<T>> handleAsync(RocksDBAsyncAPI api) {
-				return api.deleteMultiAsync(transactionOrUpdateId, columnId, keys, requestType, writeClass);
+				return api.deleteMultiAsync(transactionOrUpdateId, columnId, keys, requestType);
 			}
 
 			@Override
@@ -465,22 +483,17 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 */
 		record DeleteRange(long columnId,
 						   @Nullable Keys startKeysInclusive,
-						   @Nullable Keys endKeysExclusive,
-						   WriteClass writeClass) implements RocksDBAPICommandSingle<Void> {
-
-			public DeleteRange(long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive) {
-				this(columnId, startKeysInclusive, endKeysExclusive, WriteClass.FOREGROUND);
-			}
+						   @Nullable Keys endKeysExclusive) implements RocksDBAPICommandSingle<Void> {
 
 			@Override
 			public Void handleSync(RocksDBSyncAPI api) {
-				api.deleteRange(columnId, startKeysInclusive, endKeysExclusive, writeClass);
+				api.deleteRange(columnId, startKeysInclusive, endKeysExclusive);
 				return null;
 			}
 
 			@Override
 			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
-				return api.deleteRangeAsync(columnId, startKeysInclusive, endKeysExclusive, writeClass);
+				return api.deleteRangeAsync(columnId, startKeysInclusive, endKeysExclusive);
 			}
 
 			@Override
@@ -507,22 +520,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		record PutMulti<T>(long transactionOrUpdateId, long columnId,
 										 @NotNull List<Keys> keys,
 										 @NotNull List<@NotNull Buf> values,
-										 RequestPut<? super Buf, T> requestType,
-										 WriteClass writeClass) implements RocksDBAPICommandSingle<List<T>> {
-
-			public PutMulti(long transactionOrUpdateId, long columnId, @NotNull List<Keys> keys,
-					@NotNull List<@NotNull Buf> values, RequestPut<? super Buf, T> requestType) {
-				this(transactionOrUpdateId, columnId, keys, values, requestType, WriteClass.FOREGROUND);
-			}
+										 RequestPut<? super Buf, T> requestType) implements RocksDBAPICommandSingle<List<T>> {
 
 			@Override
 			public List<T> handleSync(RocksDBSyncAPI api) {
-				return api.putMulti(transactionOrUpdateId, columnId, keys, values, requestType, writeClass);
+				return api.putMulti(transactionOrUpdateId, columnId, keys, values, requestType);
 			}
 
 			@Override
 			public CompletableFuture<List<T>> handleAsync(RocksDBAsyncAPI api) {
-				return api.putMultiAsync(transactionOrUpdateId, columnId, keys, values, requestType, writeClass);
+				return api.putMultiAsync(transactionOrUpdateId, columnId, keys, values, requestType);
 			}
 
 			@Override
@@ -556,23 +563,17 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 */
 		record PutBatch(long columnId,
 					@NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
-					@NotNull PutBatchMode mode,
-					WriteClass writeClass) implements RocksDBAPICommandSingle<Void> {
-
-			public PutBatch(long columnId, @NotNull Publisher<@NotNull KVBatch> batchPublisher,
-					@NotNull PutBatchMode mode) {
-				this(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
-			}
+					@NotNull PutBatchMode mode) implements RocksDBAPICommandSingle<Void> {
 
 			@Override
 			public Void handleSync(RocksDBSyncAPI api) {
-				api.putBatch(columnId, batchPublisher, mode, writeClass);
+				api.putBatch(columnId, batchPublisher, mode);
 				return null;
 			}
 
 			@Override
 			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
-				return api.putBatchAsync(columnId, batchPublisher, mode, writeClass);
+				return api.putBatchAsync(columnId, batchPublisher, mode);
 			}
 
 			@Override
@@ -602,22 +603,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 					  long columnId,
 					  Keys keys,
 					  @NotNull Buf value,
-					  RequestType.RequestMerge<? super Buf, T> requestType,
-					  WriteClass writeClass) implements RocksDBAPICommandSingle<T> {
-
-			public Merge(long transactionOrUpdateId, long columnId, Keys keys, @NotNull Buf value,
-					RequestType.RequestMerge<? super Buf, T> requestType) {
-				this(transactionOrUpdateId, columnId, keys, value, requestType, WriteClass.FOREGROUND);
-			}
+					  RequestType.RequestMerge<? super Buf, T> requestType) implements RocksDBAPICommandSingle<T> {
 
 			@Override
 			public T handleSync(RocksDBSyncAPI api) {
-				return api.merge(transactionOrUpdateId, columnId, keys, value, requestType, writeClass);
+				return api.merge(transactionOrUpdateId, columnId, keys, value, requestType);
 			}
 
 			@Override
 			public CompletableFuture<T> handleAsync(RocksDBAsyncAPI api) {
-				return api.mergeAsync(transactionOrUpdateId, columnId, keys, value, requestType, writeClass);
+				return api.mergeAsync(transactionOrUpdateId, columnId, keys, value, requestType);
 			}
 
 			@Override
@@ -650,22 +645,16 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		record MergeMulti<T>(long transactionOrUpdateId, long columnId,
 							 @NotNull List<Keys> keys,
 							 @NotNull List<@NotNull Buf> values,
-							 RequestType.RequestMerge<? super Buf, T> requestType,
-							 WriteClass writeClass) implements RocksDBAPICommandSingle<List<T>> {
-
-			public MergeMulti(long transactionOrUpdateId, long columnId, @NotNull List<Keys> keys,
-					@NotNull List<@NotNull Buf> values, RequestType.RequestMerge<? super Buf, T> requestType) {
-				this(transactionOrUpdateId, columnId, keys, values, requestType, WriteClass.FOREGROUND);
-			}
+							 RequestType.RequestMerge<? super Buf, T> requestType) implements RocksDBAPICommandSingle<List<T>> {
 
 			@Override
 			public List<T> handleSync(RocksDBSyncAPI api) {
-				return api.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType, writeClass);
+				return api.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType);
 			}
 
 			@Override
 			public CompletableFuture<List<T>> handleAsync(RocksDBAsyncAPI api) {
-				return api.mergeMultiAsync(transactionOrUpdateId, columnId, keys, values, requestType, writeClass);
+				return api.mergeMultiAsync(transactionOrUpdateId, columnId, keys, values, requestType);
 			}
 
 			@Override
@@ -699,23 +688,17 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 */
 		record MergeBatch(long columnId,
 						 @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
-						 @NotNull MergeBatchMode mode,
-						 WriteClass writeClass) implements RocksDBAPICommandSingle<Void> {
-
-			public MergeBatch(long columnId, @NotNull Publisher<@NotNull KVBatch> batchPublisher,
-					@NotNull MergeBatchMode mode) {
-				this(columnId, batchPublisher, mode, WriteClass.FOREGROUND);
-			}
+						 @NotNull MergeBatchMode mode) implements RocksDBAPICommandSingle<Void> {
 
 			@Override
 			public Void handleSync(RocksDBSyncAPI api) {
-				api.mergeBatch(columnId, batchPublisher, mode, writeClass);
+				api.mergeBatch(columnId, batchPublisher, mode);
 				return null;
 			}
 
 			@Override
 			public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
-				return api.mergeBatchAsync(columnId, batchPublisher, mode, writeClass);
+				return api.mergeBatchAsync(columnId, batchPublisher, mode);
 			}
 
 			@Override
@@ -798,11 +781,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			public boolean isReadOnly() {
 				return true;
 			}
-
-			@Override
-			public ReadWorkClass readWorkClass() {
-				return ReadWorkClass.COMPOSITE;
-			}
 		}
 		/**
 		 * Open an iterator
@@ -842,11 +820,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
-			}
-
-			@Override
-			public ReadWorkClass readWorkClass() {
-				return ReadWorkClass.COMPOSITE;
 			}
 
 		}
@@ -898,11 +871,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return true;
 			}
 
-			@Override
-			public ReadWorkClass readWorkClass() {
-				return ReadWorkClass.COMPOSITE;
-			}
-
 		}
 		/**
 		 * Get the subsequent element during an iteration
@@ -930,11 +898,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
-			}
-
-			@Override
-			public ReadWorkClass readWorkClass() {
-				return ReadWorkClass.COMPOSITE;
 			}
 
 		}
@@ -986,13 +949,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
-			}
-
-			@Override
-			public ReadWorkClass readWorkClass() {
-				return requestType.getRequestTypeId() == RequestType.RequestTypeId.FIRST_AND_LAST
-						? ReadWorkClass.INTERACTIVE
-						: ReadWorkClass.COMPOSITE;
 			}
 
 		}
@@ -1049,11 +1005,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return true;
 			}
 
-			@Override
-			public ReadWorkClass readWorkClass() {
-				return ReadWorkClass.COMPOSITE;
-			}
-
 		}
 
 		/**
@@ -1074,11 +1025,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
-			}
-
-			@Override
-			public ReadWorkClass readWorkClass() {
-				return ReadWorkClass.COMPOSITE;
 			}
 		}
 
@@ -1102,11 +1048,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
-			}
-
-			@Override
-			public ReadWorkClass readWorkClass() {
-				return ReadWorkClass.COMPOSITE;
 			}
 		}
 	}
@@ -1241,11 +1182,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		@Override
 		public boolean isReadOnly() {
 			return true;
-		}
-
-		@Override
-		public ReadWorkClass readWorkClass() {
-			return ReadWorkClass.COMPOSITE;
 		}
 	}
 

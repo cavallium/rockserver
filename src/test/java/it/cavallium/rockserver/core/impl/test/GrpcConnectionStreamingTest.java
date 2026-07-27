@@ -87,7 +87,7 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void putMultiAboveLegacyChunkSizeUsesOneStreamingRpc() throws Exception {
-		var response = client.getAsyncApi().putMultiAsync(
+		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
 				0, 17, keys(), values(), RequestType.none()).get(10, TimeUnit.SECONDS);
 
 		assertEquals(List.of(), response);
@@ -98,7 +98,7 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void mergeMultiAboveLegacyChunkSizeUsesOneStreamingRpc() throws Exception {
-		var response = client.getAsyncApi().mergeMultiAsync(
+		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeMultiAsync(
 				0, 23, keys(), values(), RequestType.none()).get(10, TimeUnit.SECONDS);
 
 		assertEquals(List.of(), response);
@@ -109,9 +109,9 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void rangeVariantsUseTransportDeadlineAndTypedErrorMapping() throws InterruptedException {
-		expectReadDeadline(client.getAsyncApi().getRangeAsync(
+		expectReadDeadline(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
 				0, 29, null, null, false, RequestType.allInRange(), RANGE_TIMEOUT_MS));
-		expectReadDeadline(client.getAsyncApi().getRangeAsync(
+		expectReadDeadline(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
 				0, 31, null, null, false, RequestType.allInRangeNoCache(), RANGE_TIMEOUT_MS));
 
 		assertEquals(1, service.rangeCalls.get());
@@ -126,7 +126,7 @@ class GrpcConnectionStreamingTest {
 	void rangeLargerThanReactiveGrpcQueueCanWriteBatchesThroughSameConnection() throws Exception {
 		var callbacksOnVirtualThreads = new AtomicBoolean(true);
 		var callbackCount = new AtomicInteger();
-		Flux<it.cavallium.rockserver.core.common.KV> range = Flux.from(client.getAsyncApi().getRangeAsync(
+		Flux<it.cavallium.rockserver.core.common.KV> range = Flux.from(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
 				0, STREAMING_RANGE_COLUMN_ID, null, null, false,
 				RequestType.allInRange(), Long.MAX_VALUE));
 		var cleanup = range
@@ -137,7 +137,7 @@ class GrpcConnectionStreamingTest {
 					}
 				})
 				.buffer(CLEANUP_BATCH_SIZE)
-				.concatMap(batch -> Mono.fromFuture(client.getAsyncApi().putMultiAsync(
+				.concatMap(batch -> Mono.fromFuture(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
 						0,
 						CLEANUP_WRITE_COLUMN_ID,
 						batch.stream().map(it.cavallium.rockserver.core.common.KV::keys).toList(),
@@ -149,9 +149,9 @@ class GrpcConnectionStreamingTest {
 		assertTrue(service.firstCleanupWriteStarted.await(5, TimeUnit.SECONDS),
 				"the range did not start its nested cleanup write");
 		try {
-			assertEquals(73, client.getAsyncApi().getColumnIdAsync("responsive-unary")
+			assertEquals(73, client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnIdAsync("responsive-unary")
 					.get(5, TimeUnit.SECONDS));
-			var cdcBatch = client.getAsyncApi().cdcPollBatchAsync("responsive-cdc", null, 10)
+			var cdcBatch = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("responsive-cdc", null, 10)
 					.toFuture()
 					.get(5, TimeUnit.SECONDS);
 			assertEquals(101, cdcBatch.nextSeq());
@@ -170,7 +170,7 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void backpressuredCancellationReachesServerAndLeavesConnectionHealthy() throws Exception {
-		var range = client.getAsyncApi().getRangeAsync(
+		var range = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
 				0, CANCELLABLE_RANGE_COLUMN_ID, null, null, false,
 				RequestType.allInRange(), Long.MAX_VALUE);
 
@@ -182,7 +182,7 @@ class GrpcConnectionStreamingTest {
 
 		assertTrue(service.cancellableRangeCancellation.await(5, TimeUnit.SECONDS),
 				"the server did not observe downstream cancellation");
-		assertEquals(73, client.getAsyncApi().getColumnIdAsync("healthy-after-cancellation")
+		assertEquals(73, client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnIdAsync("healthy-after-cancellation")
 				.get(5, TimeUnit.SECONDS));
 	}
 
@@ -193,7 +193,7 @@ class GrpcConnectionStreamingTest {
 		var channel = privateField(client, "channel", ManagedChannel.class);
 		assertEquals(1, StreamSupport.stream(eventLoopGroup.spliterator(), false).count());
 
-		assertEquals(73, client.getAsyncApi().getColumnIdAsync("executor-started")
+		assertEquals(73, client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnIdAsync("executor-started")
 				.get(5, TimeUnit.SECONDS));
 		client.close();
 		client = null;

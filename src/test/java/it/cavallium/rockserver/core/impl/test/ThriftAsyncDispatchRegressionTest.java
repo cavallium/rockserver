@@ -19,7 +19,6 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
-import it.cavallium.rockserver.core.common.WriteClass;
 import it.cavallium.rockserver.core.server.ThriftServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -62,18 +61,16 @@ class ThriftAsyncDispatchRegressionTest {
 		assertEquals(3, connection.syncRequests.size());
 		assertEquals(0, connection.asyncRequests.size());
 
-		api.put(0, 1, key(2), expected, RequestType.none(), WriteClass.MAINTENANCE);
+		api.put(0, 1, key(2), expected, RequestType.none());
 		assertEquals(42L, api.createColumn("classified", ColumnSchema.of(
-				IntList.of(Integer.BYTES), ObjectList.of(), true),
-				WriteClass.MAINTENANCE));
+				IntList.of(Integer.BYTES), ObjectList.of(), true)));
 		api.deleteRange(1, key(1), key(2));
 		assertEquals(List.of(false), api.existsMulti(0, 1, List.of(key(1)), 10_000));
 		api.mergeBatch(1, Flux.empty(), MergeBatchMode.MERGE_WRITE_BATCH);
 
-		assertEquals(3, connection.syncRequests.size(),
-				"bounded and lane-specific work must not fall back to the direct sync path");
+		assertEquals(4, connection.syncRequests.size(),
+				"ordinary point work must retain the direct sync path");
 		assertEquals(List.of(
-				RocksDBAPICommand.RocksDBAPICommandSingle.Put.class,
 				RocksDBAPICommand.RocksDBAPICommandSingle.CreateColumn.class,
 				RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange.class,
 				RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti.class,
@@ -86,8 +83,8 @@ class ThriftAsyncDispatchRegressionTest {
 		var connection = new TrackingConnection();
 		var api = ThriftServer.createDispatchingSyncApiForTesting(connection);
 
-		assertEquals(RocksDBAPICommand.ReadWorkClass.COMPOSITE,
-				new RocksDBAPICommand.CdcGetEarliestAvailableSequence().readWorkClass());
+		assertEquals(it.cavallium.rockserver.core.common.OperationFamily.WAL_PAGE,
+				new RocksDBAPICommand.CdcGetEarliestAvailableSequence().operationFamily());
 		assertEquals(37L, api.cdcGetEarliestAvailableSequence());
 		assertEquals(41L, api.cdcCreate("prefixless", 0L, null, false));
 
@@ -180,19 +177,19 @@ class ThriftAsyncDispatchRegressionTest {
 				var server = new ThriftServer(backend, "127.0.0.1", port)) {
 			server.start();
 			try (var client = new ThriftConnection("thrift-single-writer", "127.0.0.1", port)) {
-				long columnId = client.getSyncApi().createColumn("entries",
+				long columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("entries",
 						ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 				var key = key(1);
 				var value = Buf.wrap("first".getBytes(StandardCharsets.UTF_8));
 				try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-					var completion = CompletableFuture.runAsync(() -> client.getSyncApi().mergeBatch(
+					var completion = CompletableFuture.runAsync(() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeBatch(
 							columnId,
 							Flux.just(new KVBatchRef(List.of(key), List.of(value))),
 							MergeBatchMode.MERGE_WRITE_BATCH), executor);
 					completion.get(5, SECONDS);
 				}
 
-				assertEquals(value, client.getSyncApi().get(0, columnId, key, RequestType.current()));
+				assertEquals(value, client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, columnId, key, RequestType.current()));
 			}
 		}
 	}
@@ -211,7 +208,7 @@ class ThriftAsyncDispatchRegressionTest {
 				var server = new ThriftServer(backend, "127.0.0.1", port)) {
 			server.start();
 			try (var client = new ThriftConnection("concurrent-thrift", "127.0.0.1", port)) {
-				var sync = client.getSyncApi();
+				var sync = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				long columnId = sync.createColumn("entries",
 						ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 				for (int i = 0; i < 32; i++) {
@@ -221,7 +218,7 @@ class ThriftAsyncDispatchRegressionTest {
 				var reads = new ArrayList<CompletableFuture<Buf>>();
 				for (int i = 0; i < 256; i++) {
 					int value = i % 32;
-					reads.add(client.getAsyncApi().getAsync(0,
+					reads.add(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getAsync(0,
 							columnId,
 							key(value),
 							RequestType.current()));
@@ -392,12 +389,12 @@ class ThriftAsyncDispatchRegressionTest {
 		}
 
 		@Override
-		public RocksDBSyncAPI getSyncApi() {
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return syncApi;
 		}
 
 		@Override
-		public RocksDBAsyncAPI getAsyncApi() {
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return asyncApi;
 		}
 
