@@ -90,6 +90,10 @@ time bound it reaches; continuations reacquire workload admission. Configured
 LATENCY maxima may be lowered but cannot exceed the public 4096-item/8-MiB range
 or 256-item/2-MiB fan-out contract ceilings.
 
+The gRPC adapter validates and buffers a LATENCY fixed multi-operation within
+the configured fan-out bounds before executing its first mutation. INGEST and
+BATCH multi-operations remain streamed and are not constrained by LATENCY limits.
+
 Tune only with the seven-profile hardware harness. Keep the smallest candidate
 within the throughput/latency acceptance envelope, then verify it and its
 adjacent candidates on the target storage class. CI results alone are not

@@ -117,12 +117,31 @@ class WorkloadResourceBindingTest {
 			assertEquals(2, latency.existsMulti(0, fixedColumn, keysOfSizes(1, 1)).size());
 			assertEquals(3, latency.existsMulti(0, fixedColumn, keysOfSizes(1, 1, 1)).size());
 			assertRocksFailure(() -> latency.existsMulti(0, fixedColumn, keysOfSizes(1, 1, 1, 1)));
+			assertDoesNotThrow(() -> latency.putMulti(0, fixedColumn, keysOfSizes(1, 1), valuesOfSizes(0, 0)));
+			assertDoesNotThrow(() -> latency.putMulti(0, fixedColumn, keysOfSizes(1, 1, 1), valuesOfSizes(0, 0, 0)));
+			assertRocksFailure(() -> latency.putMulti(
+					0, fixedColumn, keysOfSizes(1, 1, 1, 1), valuesOfSizes(0, 0, 0, 0)));
+			assertDoesNotThrow(() -> latency.deleteMulti(0, fixedColumn, keysOfSizes(1, 1)));
+			assertDoesNotThrow(() -> latency.deleteMulti(0, fixedColumn, keysOfSizes(1, 1, 1)));
+			assertRocksFailure(() -> latency.deleteMulti(0, fixedColumn, keysOfSizes(1, 1, 1, 1)));
+			assertTrue(assertRocksFailure(() -> latency.mergeMulti(
+					0, fixedColumn, keysOfSizes(1, 1, 1, 1), valuesOfSizes(0, 0, 0, 0)))
+					.getMessage().contains("must not exceed"));
 
 			long variableColumn = batch.createColumn("variable",
 					ColumnSchema.of(IntList.of(), ObjectList.of(ColumnHashType.XXHASH32), true));
 			assertEquals(1, latency.existsMulti(0, variableColumn, keysOfSizes(7)).size());
 			assertEquals(1, latency.existsMulti(0, variableColumn, keysOfSizes(8)).size());
 			assertRocksFailure(() -> latency.existsMulti(0, variableColumn, keysOfSizes(9)));
+			assertDoesNotThrow(() -> latency.putMulti(0, variableColumn, keysOfSizes(1), valuesOfSizes(6)));
+			assertDoesNotThrow(() -> latency.putMulti(0, variableColumn, keysOfSizes(1), valuesOfSizes(7)));
+			assertRocksFailure(() -> latency.putMulti(0, variableColumn, keysOfSizes(1), valuesOfSizes(8)));
+			assertDoesNotThrow(() -> latency.deleteMulti(0, variableColumn, keysOfSizes(7)));
+			assertDoesNotThrow(() -> latency.deleteMulti(0, variableColumn, keysOfSizes(8)));
+			assertRocksFailure(() -> latency.deleteMulti(0, variableColumn, keysOfSizes(9)));
+			assertTrue(assertRocksFailure(() -> latency.mergeMulti(
+					0, variableColumn, keysOfSizes(1), valuesOfSizes(8)))
+					.getMessage().contains("must not exceed"));
 		}
 	}
 
@@ -260,6 +279,14 @@ class WorkloadResourceBindingTest {
 		return List.copyOf(result);
 	}
 
+	private static List<Buf> valuesOfSizes(int... sizes) {
+		var result = new ArrayList<Buf>(sizes.length);
+		for (int size : sizes) {
+			result.add(Buf.createZeroes(size));
+		}
+		return List.copyOf(result);
+	}
+
 	private static void awaitUninterruptibly(CountDownLatch latch) {
 		boolean interrupted = false;
 		while (true) {
@@ -379,6 +406,30 @@ class WorkloadResourceBindingTest {
 				async.putAsync(transactionId, columnId, key, value, RequestType.none()).join();
 			} else {
 				sync.put(transactionId, columnId, key, value, RequestType.none());
+			}
+		}
+
+		void putMulti(long transactionId, long columnId, List<Keys> keys, List<Buf> values) {
+			if (asyncMode) {
+				async.putMultiAsync(transactionId, columnId, keys, values, RequestType.none()).join();
+			} else {
+				sync.putMulti(transactionId, columnId, keys, values, RequestType.none());
+			}
+		}
+
+		void deleteMulti(long transactionId, long columnId, List<Keys> keys) {
+			if (asyncMode) {
+				async.deleteMultiAsync(transactionId, columnId, keys, RequestType.none()).join();
+			} else {
+				sync.deleteMulti(transactionId, columnId, keys, RequestType.none());
+			}
+		}
+
+		void mergeMulti(long transactionId, long columnId, List<Keys> keys, List<Buf> values) {
+			if (asyncMode) {
+				async.mergeMultiAsync(transactionId, columnId, keys, values, RequestType.none()).join();
+			} else {
+				sync.mergeMulti(transactionId, columnId, keys, values, RequestType.none());
 			}
 		}
 

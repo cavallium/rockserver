@@ -65,6 +65,7 @@ import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import it.unimi.dsi.fastutil.ints.Int2IntFunction;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -104,6 +105,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.function.ToLongFunction;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -1129,6 +1131,17 @@ public class GrpcServer extends Server {
 				Flux<DeleteRequest> dataFlux,
 				String requestName) {
 			var context = mapRequestContext(initialRequest.getContext());
+			if (context.profile() == WorkloadProfile.LATENCY) {
+				var contextualApi = client.getAsyncApi(context);
+				return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+						.flatMap(data -> Mono.fromFuture(() -> contextualApi.deleteMultiAsync(
+								initialRequest.getTransactionOrUpdateId(),
+								initialRequest.getColumnId(),
+								data.stream().map(value -> mapKeys(value.getKeysCount(), value::getKeys)).toList(),
+								new RequestNothing<>())))
+						.thenReturn(Empty.getDefaultInstance())
+						.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
+			}
 			var contextualApi = client.getSyncApi(context);
 			return dataFlux
 					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
@@ -1154,7 +1167,6 @@ public class GrpcServer extends Server {
 					}
 					var initialRequest = firstValue.getInitialRequest();
 					var context = mapRequestContext(initialRequest.getContext());
-					var contextualApi = client.getSyncApi(context);
 					var dataFlux = requestsFlux
 							.skip(1)
 							.map(deleteRequest -> {
@@ -1163,7 +1175,21 @@ public class GrpcServer extends Server {
 								}
 								return deleteRequest.getData();
 							});
-
+					if (context.profile() == WorkloadProfile.LATENCY) {
+						var contextualApi = client.getAsyncApi(context);
+						return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+								.flatMapMany(data -> Mono.fromFuture(() -> contextualApi.deleteMultiAsync(
+										initialRequest.getTransactionOrUpdateId(),
+										initialRequest.getColumnId(),
+										data.stream()
+												.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
+												.toList(),
+										requestType))
+										.flatMapMany(Flux::fromIterable)
+										.map(mapper))
+								.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
+					}
+					var contextualApi = client.getSyncApi(context);
 					return dataFlux
 							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 							.map(data -> mapper.apply(contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
@@ -1240,7 +1266,6 @@ public class GrpcServer extends Server {
 					}
 					var initialRequest = firstValue.getInitialRequest();
 					var context = mapRequestContext(initialRequest.getContext());
-					var contextualApi = client.getSyncApi(context);
 					var dataFlux = requestsFlux
 							.skip(1) // skip the initial request
 							.map(mergeRequest -> {
@@ -1249,7 +1274,25 @@ public class GrpcServer extends Server {
 								}
 								return mergeRequest.getData();
 							});
-
+					if (context.profile() == WorkloadProfile.LATENCY) {
+						var contextualApi = client.getAsyncApi(context);
+						return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes,
+								"mergeMultiGetMerged")
+								.flatMapMany(data -> Mono.fromFuture(() -> contextualApi.mergeMultiAsync(
+										initialRequest.getTransactionOrUpdateId(),
+										initialRequest.getColumnId(),
+										data.stream()
+												.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
+												.toList(),
+										data.stream().map(value -> toBuf(value.getValue())).toList(),
+										RequestType.merged()))
+										.flatMapMany(Flux::fromIterable)
+										.map(merged -> Merged.newBuilder()
+												.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
+												.build()))
+								.onErrorMap(ex -> this.handleError(ex).asRuntimeException());
+					}
+					var contextualApi = client.getSyncApi(context);
 					return dataFlux
 							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 							.map(data -> {
@@ -1273,6 +1316,20 @@ public class GrpcServer extends Server {
 		private Mono<Empty> mergeMultiDataFlux(MergeMultiInitialRequest initialRequest,
 				Flux<KV> dataFlux, String requestName) {
 			var context = mapRequestContext(initialRequest.getContext());
+			if (context.profile() == WorkloadProfile.LATENCY) {
+				var contextualApi = client.getAsyncApi(context);
+				return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+						.flatMap(data -> Mono.fromFuture(() -> contextualApi.mergeMultiAsync(
+								initialRequest.getTransactionOrUpdateId(),
+								initialRequest.getColumnId(),
+								data.stream()
+										.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
+										.toList(),
+								data.stream().map(value -> toBuf(value.getValue())).toList(),
+								new RequestNothing<>())))
+						.thenReturn(Empty.getDefaultInstance())
+						.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
+			}
 			var contextualApi = client.getSyncApi(context);
 			return dataFlux
 					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
@@ -1371,7 +1428,6 @@ public class GrpcServer extends Server {
 					}
 					var initialRequest = firstValue.getInitialRequest();
 					var context = mapRequestContext(initialRequest.getContext());
-					var contextualApi = client.getSyncApi(context);
 					var dataFlux = requestsFlux
 							.skip(1)
 							.map(putRequest -> {
@@ -1380,7 +1436,22 @@ public class GrpcServer extends Server {
 								}
 								return putRequest.getData();
 							});
-
+					if (context.profile() == WorkloadProfile.LATENCY) {
+						var contextualApi = client.getAsyncApi(context);
+						return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+								.flatMapMany(data -> Mono.fromFuture(() -> contextualApi.putMultiAsync(
+										initialRequest.getTransactionOrUpdateId(),
+										initialRequest.getColumnId(),
+										data.stream()
+												.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
+												.toList(),
+										data.stream().map(value -> toBuf(value.getValue())).toList(),
+										requestType))
+										.flatMapMany(Flux::fromIterable)
+										.map(mapper))
+								.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
+					}
+					var contextualApi = client.getSyncApi(context);
 					return dataFlux
 							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 							.map(data -> mapper.apply(contextualApi.put(initialRequest.getTransactionOrUpdateId(),
@@ -1399,6 +1470,20 @@ public class GrpcServer extends Server {
 		private Mono<Empty> putMultiDataFlux(PutMultiInitialRequest initialRequest,
 				Flux<KV> dataFlux, String requestName) {
 			var context = mapRequestContext(initialRequest.getContext());
+			if (context.profile() == WorkloadProfile.LATENCY) {
+				var contextualApi = client.getAsyncApi(context);
+				return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+						.flatMap(data -> Mono.fromFuture(() -> contextualApi.putMultiAsync(
+								initialRequest.getTransactionOrUpdateId(),
+								initialRequest.getColumnId(),
+								data.stream()
+										.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
+										.toList(),
+								data.stream().map(value -> toBuf(value.getValue())).toList(),
+								new RequestNothing<>())))
+						.thenReturn(Empty.getDefaultInstance())
+						.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
+			}
 			var contextualApi = client.getSyncApi(context);
 			return dataFlux
 					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
@@ -1411,6 +1496,70 @@ public class GrpcServer extends Server {
 					})
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
+		}
+
+		private <T> Mono<List<T>> collectLatencyMulti(Flux<T> dataFlux,
+				ToLongFunction<T> encodedInputBytes,
+				String requestName) {
+			int maximumItems = embeddedDatabase != null
+					? embeddedDatabase.getWorkloadSettings().latencyFanOutMaxItems()
+					: WorkloadAdmission.MAX_LATENCY_ITEMS;
+			long maximumBytes = embeddedDatabase != null
+					? embeddedDatabase.getWorkloadSettings().latencyFanOutMaxBytes()
+					: WorkloadAdmission.MAX_LATENCY_ENCODED_INPUT_BYTES;
+			return dataFlux.collect(
+					() -> new LatencyMultiBuffer<T>(maximumItems, maximumBytes, requestName),
+					(buffer, value) -> buffer.add(value, encodedInputBytes.applyAsLong(value)))
+					.map(LatencyMultiBuffer::values);
+		}
+
+		private static long encodedInputBytes(KV value) {
+			long bytes = value.getValue().size();
+			for (var key : value.getKeysList()) {
+				bytes += key.size();
+			}
+			return bytes;
+		}
+
+		private static long encodedInputBytes(DeleteRequest value) {
+			long bytes = 0L;
+			for (var key : value.getKeysList()) {
+				bytes += key.size();
+			}
+			return bytes;
+		}
+
+		private static final class LatencyMultiBuffer<T> {
+
+			private final int maximumItems;
+			private final long maximumBytes;
+			private final String requestName;
+			private final ArrayList<T> values;
+			private long encodedBytes;
+
+			private LatencyMultiBuffer(int maximumItems, long maximumBytes, String requestName) {
+				this.maximumItems = maximumItems;
+				this.maximumBytes = maximumBytes;
+				this.requestName = requestName;
+				this.values = new ArrayList<>(maximumItems);
+			}
+
+			private void add(T value, long valueBytes) {
+				if (values.size() >= maximumItems) {
+					throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+							requestName + " item count must not exceed " + maximumItems);
+				}
+				if (valueBytes > maximumBytes - encodedBytes) {
+					throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+							requestName + " encoded input must not exceed " + maximumBytes + " bytes");
+				}
+				values.add(value);
+				encodedBytes += valueBytes;
+			}
+
+			private List<T> values() {
+				return List.copyOf(values);
+			}
 		}
 
 		@Override
