@@ -211,6 +211,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
             case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
             case RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw scanRaw -> this.scanRawAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount());
             case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
+			case RocksDBAPICommand.CdcCommit cdcCommit -> db.cdcCommitAsyncInternal(cdcCommit.id(), cdcCommit.seq());
 			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> supplyAsyncPreservingRunningCompletion(
 					() -> withRequestContext(context, () -> req.handleSync(this)), commandExecutor(req));
             case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());

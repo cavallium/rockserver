@@ -64,10 +64,11 @@ parked while storage pressure is active.
 | Workload key | Default | Meaning |
 | --- | ---: | --- |
 | `retained-analytical-snapshots` | 1 | FIFO permit capacity for retained analytical snapshots |
-| `retained-snapshot-maximum-age` | `PT60S` | Absolute maximum lifetime of a retained snapshot |
+| `retained-snapshot-maximum-age` | `PT60S` | Absolute maximum lifetime of a retained analytical snapshot or CDC WAL cursor |
 
-The permit capacity and duration must be positive. The age is combined with the
-request and transport/operation deadline; the earliest deadline wins.
+The permit capacity must be positive; a zero maximum age is already expired. For
+retained analytical work, the age is combined with the request and
+transport/operation deadline, and the earliest deadline wins.
 
 ## Bounded work
 
@@ -77,7 +78,7 @@ request and transport/operation deadline; the earliest deadline wins.
 | `range-quantum-max-bytes` | `8MiB` | Maximum encoded key/value bytes in one range/count quantum |
 | `range-quantum-max-duration` | `PT0.008S` | Maximum monotonic runtime of one range/count quantum |
 | `cdc-quantum-max-mutations` | 4096 | Maximum mutations parsed in one CDC quantum |
-| `cdc-quantum-max-bytes` | `8MiB` | Maximum encoded CDC bytes in one quantum |
+| `cdc-quantum-max-bytes` | `8MiB` | Maximum decoded WAL key/value bytes scanned in one CDC quantum |
 | `cdc-quantum-max-duration` | `PT0.008S` | Maximum monotonic runtime of one CDC quantum |
 | `latency-range-max-items` | 4096 | Server maximum items accepted for a LATENCY range page |
 | `latency-range-max-bytes` | `8MiB` | Server maximum bytes accepted for a LATENCY range page |
@@ -89,6 +90,15 @@ positive and representable. A quantum stops at the first key, byte, or elapsed
 time bound it reaches; continuations reacquire workload admission. Configured
 LATENCY maxima may be lowered but cannot exceed the public 4096-item/8-MiB range
 or 256-item/2-MiB fan-out contract ceilings.
+
+CDC captures one conservative completed-mutation tail, then publishes the application
+WAL through `CDC + FLUSH` before opening the logical poll. WAL parsing,
+filtered-empty progress, latest-value resolution,
+and every continuation remain in the CDC profile. An indivisible mutation larger than
+the byte quantum is processed alone to guarantee cursor progress. The database-level
+CDC lag gauge is the maximum across durable subscriptions, using each subscription's
+furthest observed or durably committed cursor; it does not create per-subscription
+meters.
 
 The gRPC adapter validates and buffers a LATENCY fixed multi-operation within
 the configured fan-out bounds before executing its first mutation. INGEST and
