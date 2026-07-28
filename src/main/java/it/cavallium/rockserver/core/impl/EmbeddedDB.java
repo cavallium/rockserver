@@ -7665,7 +7665,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private record CdcPollPage(CdcBatch batch,
 			long emittedEvents,
 			long emittedBytes,
-			long scannedMutations) {}
+			long advancedMutations) {}
 	private record CdcResolvedPage(List<CDCEvent> events,
 			long emittedBytes,
 			@Nullable Long continuationSeq) {}
@@ -8638,6 +8638,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long accumulatedBytes = 0L;
 			long scannedMutations = 0L;
 			long scannedBytes = 0L;
+			long advancedMutations = 0L;
 			long quantumStartNanos = System.nanoTime();
 			long durationDeadlineNanos = maximumDurationNanos >= Long.MAX_VALUE - quantumStartNanos
 					? Long.MAX_VALUE
@@ -8707,6 +8708,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (handler.rejectedLastMutation()) {
 						currentBatch.rewindLastRecord();
 					}
+					advancedMutations = saturatingAdd(advancedMutations,
+							Math.max(0L, currentBatch.recordsRead() - firstOpIndex));
 					boolean batchFinished = currentBatch.isFinished();
 					long parsedNextSeq = batchFinished
 							? composeCdcSeq(Math.addExact(batchWalSequence, currentBatch.recordsRead()), 0L)
@@ -8777,7 +8780,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return new CdcPollPage(new CdcBatch(resolvedPage.events(), nextSeq),
 					resolvedPage.events().size(),
 					resolvedPage.emittedBytes(),
-					scannedMutations);
+					advancedMutations);
 		}
 
 		private CdcPollPage emptyPage() {
@@ -8879,7 +8882,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					long nextSeq = batch.nextSeq();
 					if (cursor.isExhausted()
 							|| extractCdcRocksSequence(nextSeq) > maxWalSequenceInclusive
-							|| nextSeq == pageStart && page.scannedMutations() == 0L) {
+							|| nextSeq == pageStart && page.advancedMutations() == 0L) {
 						break;
 					}
 					pageStart = nextSeq;
@@ -8941,7 +8944,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 										|| cursor.isExhausted()
 									|| extractCdcRocksSequence(nextSeq) > window.maxWalSequenceInclusive()
 										|| nextSeq == page.startSeq()
-												&& page.page().scannedMutations() == 0L) {
+										&& page.page().advancedMutations() == 0L) {
 									return Mono.empty();
 								}
 								boolean allowOversizedFirstEvent = page.allowOversizedFirstEvent()
