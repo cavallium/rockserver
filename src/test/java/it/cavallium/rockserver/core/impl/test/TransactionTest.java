@@ -58,8 +58,8 @@ database: {
 }
 """);
 		db = new EmbeddedConnection(null, "tx-test-db", configFile);
-		colId = db.createColumn("test-column", SCHEMA_WITH_BUCKETS);
-		colIdNoBuckets = db.createColumn("test-column-no-buckets", SCHEMA_NO_BUCKETS);
+		colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test-column", SCHEMA_WITH_BUCKETS);
+		colIdNoBuckets = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test-column-no-buckets", SCHEMA_NO_BUCKETS);
 	}
 
 	@AfterEach
@@ -75,7 +75,7 @@ database: {
 	@Test
 	@Order(1)
 	void testMultiplePutsInOneTransaction() {
-		long txId = db.openTransaction(10_000);
+		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(10_000);
 		
 		var key1 = makeKey(1, 1, 1);
 		var value1 = toBufSimple(100);
@@ -83,84 +83,84 @@ database: {
 		var value2 = toBufSimple(200);
 
 		// These should NOT commit yet
-		db.put(txId, colIdNoBuckets, key1, value1, RequestType.none());
-		db.put(txId, colIdNoBuckets, key2, value2, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId, colIdNoBuckets, key1, value1, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId, colIdNoBuckets, key2, value2, RequestType.none());
 
 		// Verify they are NOT visible to other transactions (0L = no tx)
-		Assertions.assertNull(db.get(0, colIdNoBuckets, key1, RequestType.current()));
-		Assertions.assertNull(db.get(0, colIdNoBuckets, key2, RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key2, RequestType.current()));
 
 		// Commit
-		boolean committed = db.closeTransaction(txId, true);
+		boolean committed = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(txId, true);
 		Assertions.assertTrue(committed);
 
 		// Verify they ARE visible now
-		assertBufEquals(value1, db.get(0, colIdNoBuckets, key1, RequestType.current()));
-		assertBufEquals(value2, db.get(0, colIdNoBuckets, key2, RequestType.current()));
+		assertBufEquals(value1, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.current()));
+		assertBufEquals(value2, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key2, RequestType.current()));
 	}
 
 	@Test
 	@Order(2)
 	void testPutAndMergeInOneTransaction() {
 		var key = makeKey(3, 3, 3);
-		db.put(0, colIdNoBuckets, key, toBufString("A"), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, toBufString("A"), RequestType.none());
 
-		long txId = db.openTransaction(10_000);
+		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(10_000);
 		
-		db.put(txId, colIdNoBuckets, key, toBufString("B"), RequestType.none());
-		db.merge(txId, colIdNoBuckets, key, toBufString("C"), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId, colIdNoBuckets, key, toBufString("B"), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(txId, colIdNoBuckets, key, toBufString("C"), RequestType.none());
 
 		// MyStringAppendOperator uses ',' as separator.
 		// B merge C -> B,C
-		assertBufEquals(toBufString("B,C"), db.get(txId, colIdNoBuckets, key, RequestType.current()));
+		assertBufEquals(toBufString("B,C"), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(txId, colIdNoBuckets, key, RequestType.current()));
 		// Verify NOT visible outside
-		assertBufEquals(toBufString("A"), db.get(0, colIdNoBuckets, key, RequestType.current()));
+		assertBufEquals(toBufString("A"), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current()));
 
-		db.closeTransaction(txId, true);
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(txId, true);
 
-		assertBufEquals(toBufString("B,C"), db.get(0, colIdNoBuckets, key, RequestType.current()));
+		assertBufEquals(toBufString("B,C"), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current()));
 	}
 
 	@Test
 	@Order(3)
 	void testMergeWithGetForUpdateUpdateId() {
 		var key = makeKey(4, 4, 4);
-		db.put(0, colIdNoBuckets, key, toBufString("Initial"), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, toBufString("Initial"), RequestType.none());
 
 		// getForUpdate returns an updateId
-		var updateContext = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var updateContext = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
 		long updateId = updateContext.updateId();
 		assertBufEquals(toBufString("Initial"), updateContext.previous());
 
 		// Merge using updateId
 		// Now it SHOULD auto-commit because we fixed the merge implementation
-		db.merge(updateId, colIdNoBuckets, key, toBufString("Merged"), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(updateId, colIdNoBuckets, key, toBufString("Merged"), RequestType.none());
 
 		// Outside view should be "Initial,Merged"
-		assertBufEquals(toBufString("Initial,Merged"), db.get(0, colIdNoBuckets, key, RequestType.current()));
+		assertBufEquals(toBufString("Initial,Merged"), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current()));
 
 		// Trying to commit again should FAIL with TX_NOT_FOUND
-		Assertions.assertThrowsExactly(RocksDBException.class, () -> db.closeTransaction(updateId, true));
+		Assertions.assertThrowsExactly(RocksDBException.class, () -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(updateId, true));
 	}
 
 	@Test
 	@Order(4)
 	void testPutWithGetForUpdateUpdateId_AutoCommits() {
 		var key = makeKey(5, 5, 5);
-		db.put(0, colIdNoBuckets, key, toBufString("Initial"), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, toBufString("Initial"), RequestType.none());
 
-		var updateContext = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var updateContext = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
 		long updateId = updateContext.updateId();
 
 		// Put using updateId
 		// Based on analysis, this SHOULD commit automatically because it's a getForUpdate tx
-		db.put(updateId, colIdNoBuckets, key, toBufString("NewValue"), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(updateId, colIdNoBuckets, key, toBufString("NewValue"), RequestType.none());
 
 		// Outside view should be "NewValue" because it auto-committed
-		assertBufEquals(toBufString("NewValue"), db.get(0, colIdNoBuckets, key, RequestType.current()));
+		assertBufEquals(toBufString("NewValue"), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current()));
 
 		// Trying to commit again should FAIL with TX_NOT_FOUND
-		Assertions.assertThrowsExactly(RocksDBException.class, () -> db.closeTransaction(updateId, true));
+		Assertions.assertThrowsExactly(RocksDBException.class, () -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(updateId, true));
 	}
 
 	private static void assertBufEquals(Buf expected, Buf actual) {

@@ -44,7 +44,69 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 
-public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, InternalConnection {
+/** Public embedded connection. Database operations are exposed only by context-bound API views. */
+public final class EmbeddedConnection extends BaseConnection implements InternalConnection {
+
+	public static final URI PRIVATE_MEMORY_URL = EmbeddedConnectionDelegate.PRIVATE_MEMORY_URL;
+
+	private final EmbeddedConnectionDelegate delegate;
+
+	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
+		super(name);
+		this.delegate = new EmbeddedConnectionDelegate(path, name, embeddedConfig);
+	}
+
+	@VisibleForTesting
+	public void closeTesting() throws IOException {
+		delegate.closeTesting();
+	}
+
+	@Override
+	public void close() throws IOException {
+		delegate.close();
+		super.close();
+	}
+
+	@Override
+	public URI getUrl() {
+		return delegate.getUrl();
+	}
+
+	@Override
+	public EmbeddedDB getEmbeddedDB() {
+		return delegate.getEmbeddedDB();
+	}
+
+	@Override
+	public RWScheduler getScheduler() {
+		return delegate.getScheduler();
+	}
+
+	public EmbeddedDB getInternalDB() {
+		return delegate.getInternalDB();
+	}
+
+	@Override
+	<R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+		return delegate.requestSync(context, request);
+	}
+
+	@Override
+	<R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+		return delegate.requestAsync(context, request);
+	}
+
+	@Override
+	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+			@NotNull String id,
+			@Nullable Long fromSeq,
+			long maxEvents) {
+		return delegate.cdcPollBatchAsync(context, id, fromSeq, maxEvents);
+	}
+}
+
+/** Package-private raw implementation behind {@link EmbeddedConnection}. */
+final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDBAPI, InternalConnection {
 
 	private static final Logger LOG = LoggerFactory.getLogger(EmbeddedConnection.class);
 	private static final String REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY = "reactor.onErrorDropped.local";
@@ -58,7 +120,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	private final Map<Long, CompletableFuture<Void>> closingAsyncIterators = new ConcurrentHashMap<>();
 	public static final URI PRIVATE_MEMORY_URL = URI.create("memory://private");
 
-	public EmbeddedConnection(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
+	EmbeddedConnectionDelegate(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
 		super(name);
 		this.db = new EmbeddedDB(path, name, embeddedConfig);
 	}
@@ -87,14 +149,14 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public long openTransaction(long timeoutMs) {
-		return db.openTransaction(timeoutMs, currentRequestContextOrBatch().profile());
+		return db.openTransaction(timeoutMs, currentRequestContext().profile());
 	}
 
 	@Override
 	public boolean closeTransaction(long transactionId, boolean commit) {
 		return db.closeTransaction(transactionId,
 				commit,
-				currentRequestContextOrBatch().profile());
+				currentRequestContext().profile());
 	}
 
 	@Override
@@ -264,7 +326,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
-		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContext().profile());
 		return db.put(transactionOrUpdateId, columnId, keys, value, requestType);
 	}
 
@@ -273,7 +335,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull Keys keys,
 			@NotNull RequestType.RequestDelete<? super Buf, T> requestType) throws RocksDBException {
-		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContext().profile());
 		return db.delete(transactionOrUpdateId, columnId, keys, requestType);
 	}
 
@@ -283,7 +345,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
-		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContext().profile());
 		return db.merge(transactionOrUpdateId, columnId, keys, value, requestType);
 	}
 
@@ -292,7 +354,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
-		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContext().profile());
 		return db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType);
 	}
 
@@ -309,7 +371,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull List<Keys> keys,
 			@NotNull List<@NotNull Buf> values,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
-		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContext().profile());
 		return db.putMulti(transactionOrUpdateId, columnId, keys, values, requestType);
 	}
 
@@ -319,7 +381,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull List<Keys> keys,
 			@NotNull List<@NotNull Buf> values,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
-		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContext().profile());
 		return db.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType);
 	}
 
@@ -328,7 +390,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
-		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContext().profile());
 		var executor = db.getScheduler().writeExecutor();
 		return supplyAsyncPreservingRunningCompletion(
 				() -> db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType), executor);
@@ -379,7 +441,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 				columnId,
 				keys,
 				requestType,
-				currentRequestContextOrBatch().profile());
+				currentRequestContext().profile());
 	}
 
 	@Override
@@ -387,7 +449,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
 			long timeoutMs) throws RocksDBException {
-		var context = currentRequestContextOrBatch();
+		var context = currentRequestContext();
 		return db.existsMulti(transactionId,
 				columnId,
 				keys,
@@ -401,7 +463,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
 			long timeoutMs) throws RocksDBException {
-		var context = currentRequestContextOrBatch();
+		var context = currentRequestContext();
 		return db.existsMultiAsyncInternal(transactionId,
 				columnId,
 				keys,
@@ -424,7 +486,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 				endKeysExclusive,
 				reverse,
 				timeoutMs,
-				currentRequestContextOrBatch().profile());
+				currentRequestContext().profile());
 	}
 
 	@Override
@@ -434,7 +496,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public void seekTo(long iterationId, Keys keys) throws RocksDBException {
-		db.validateIteratorProfile(iterationId, currentRequestContextOrBatch().profile());
+		db.validateIteratorProfile(iterationId, currentRequestContext().profile());
 		db.seekTo(iterationId, keys);
 	}
 
@@ -443,7 +505,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long skipCount,
 			long takeCount,
 			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws RocksDBException {
-		db.validateIteratorProfile(iterationId, currentRequestContextOrBatch().profile());
+		db.validateIteratorProfile(iterationId, currentRequestContext().profile());
 		return db.subsequent(iterationId, skipCount, takeCount, requestType);
 	}
 
@@ -463,7 +525,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Iterator skip and take counts must be non-negative"));
 		}
-		db.validateIteratorProfile(iterationId, currentRequestContextOrBatch().profile());
+		db.validateIteratorProfile(iterationId, currentRequestContext().profile());
 		var iteratorOperation = acquireAsyncIteratorOperation(iterationId);
 		if (iteratorOperation == null) {
 			return CompletableFuture.failedFuture(RocksDBException.of(
@@ -534,7 +596,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public CompletableFuture<Void> seekToAsync(long iterationId, @NotNull Keys keys) throws RocksDBException {
-		db.validateIteratorProfile(iterationId, currentRequestContextOrBatch().profile());
+		db.validateIteratorProfile(iterationId, currentRequestContext().profile());
 		var iteratorOperation = acquireAsyncIteratorOperation(iterationId);
 		if (iteratorOperation == null) {
 			return CompletableFuture.failedFuture(concurrentIteratorOperation(iterationId));
@@ -722,7 +784,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	@Override
 	@SuppressWarnings("unchecked")
 	public <T> T reduceRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestReduceRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		var context = currentRequestContextOrBatch();
+		var context = currentRequestContext();
 		db.validateTransactionProfile(transactionId, context.profile());
 		if (requestType instanceof RequestType.RequestEntriesCount<?>) {
 			var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
@@ -754,7 +816,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			boolean reverse,
 			@NotNull RequestType.RequestReduceRange<? super KV, T> requestType,
 		long timeoutMs) throws RocksDBException {
-		var context = currentRequestContextOrBatch();
+		var context = currentRequestContext();
 		db.validateTransactionProfile(transactionId, context.profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
 				transactionId,
@@ -801,7 +863,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
 			long timeoutMs,
 			@NotNull RangeBudget budget) throws RocksDBException {
-		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
+		db.validateTransactionProfile(transactionId, currentRequestContext().profile());
 		return db.getRangePage(transactionId,
 				columnId,
 				startKeysInclusive,
@@ -823,7 +885,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
 			long timeoutMs,
 			@NotNull RangeBudget budget) throws RocksDBException {
-		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
+		db.validateTransactionProfile(transactionId, currentRequestContext().profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<>(transactionId,
 				columnId,
 				startKeysInclusive,
@@ -993,7 +1055,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public <T> Stream<T> getRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		var context = currentRequestContextOrBatch();
+		var context = currentRequestContext();
 		db.validateTransactionProfile(transactionId, context.profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<>(
 				transactionId,
@@ -1016,7 +1078,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		var context = currentRequestContextOrBatch();
+		var context = currentRequestContext();
 		db.validateTransactionProfile(transactionId, context.profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<>(
 				transactionId,
@@ -1106,6 +1168,14 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
         // Default: defer to DB implementation; fallback to blocking stream if async is not supported
         return db.cdcPollAsyncInternal(id, fromSeq, maxEvents);
     }
+
+	@Override
+	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+			@NotNull String id,
+			@Nullable Long fromSeq,
+			long maxEvents) {
+		return withRequestContext(context, () -> cdcPollBatchAsync(id, fromSeq, maxEvents));
+	}
 
     @Override
     public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {

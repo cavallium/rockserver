@@ -91,14 +91,14 @@ database: {
 }
 """);
 		db = new EmbeddedConnection(null, "test", configFile);
-		colId = db.createColumn("col-buckets", SCHEMA_WITH_BUCKETS);
-		colIdNoBuckets = db.createColumn("col-nobuckets", SCHEMA_NO_BUCKETS);
+		colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("col-buckets", SCHEMA_WITH_BUCKETS);
+		colIdNoBuckets = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("col-nobuckets", SCHEMA_NO_BUCKETS);
 	}
 
 	@AfterEach
 	void tearDown() throws IOException {
-		db.deleteColumn(colId);
-		db.deleteColumn(colIdNoBuckets);
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteColumn(colId);
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteColumn(colIdNoBuckets);
 		db.close();
 		Files.deleteIfExists(configFile);
 	}
@@ -109,14 +109,14 @@ database: {
 	void putNone_noBuckets() {
 		var key = makeKey(1, 2, 3);
 		var value = toBufSimple(10, 20, 30);
-		Assertions.assertNull(db.put(0, colIdNoBuckets, key, value, RequestType.none()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.none()));
 	}
 
 	@Test
 	void putPrevious_noBuckets_returnsNullOnFirstInsert() {
 		var key = makeKey(1, 2, 3);
 		var value = toBufSimple(10, 20, 30);
-		Buf prev = db.put(0, colIdNoBuckets, key, value, RequestType.previous());
+		Buf prev = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.previous());
 		Assertions.assertNull(prev);
 	}
 
@@ -125,8 +125,8 @@ database: {
 		var key = makeKey(1, 2, 3);
 		var value1 = toBufSimple(10, 20, 30);
 		var value2 = toBufSimple(40, 50, 60);
-		db.put(0, colIdNoBuckets, key, value1, RequestType.none());
-		Buf prev = db.put(0, colIdNoBuckets, key, value2, RequestType.previous());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value1, RequestType.none());
+		Buf prev = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value2, RequestType.previous());
 		assertBufEquals(value1, prev);
 	}
 
@@ -136,10 +136,10 @@ database: {
 		var value1 = toBufSimple(10, 20, 30);
 		var value2 = toBufSimple(40, 50, 60);
 
-		Boolean present = db.put(0, colIdNoBuckets, key, value1, RequestType.previousPresence());
+		Boolean present = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value1, RequestType.previousPresence());
 		Assertions.assertFalse(present);
 
-		present = db.put(0, colIdNoBuckets, key, value2, RequestType.previousPresence());
+		present = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value2, RequestType.previousPresence());
 		Assertions.assertTrue(present);
 	}
 
@@ -150,15 +150,15 @@ database: {
 		var value2 = toBufSimple(40, 50, 60);
 
 		// First insert: previous is null, value is non-null => changed
-		Boolean changed = db.put(0, colIdNoBuckets, key, value1, RequestType.changed());
+		Boolean changed = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value1, RequestType.changed());
 		Assertions.assertTrue(changed);
 
 		// Same value => not changed
-		changed = db.put(0, colIdNoBuckets, key, value1, RequestType.changed());
+		changed = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value1, RequestType.changed());
 		Assertions.assertFalse(changed);
 
 		// Different value => changed
-		changed = db.put(0, colIdNoBuckets, key, value2, RequestType.changed());
+		changed = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value2, RequestType.changed());
 		Assertions.assertTrue(changed);
 	}
 
@@ -168,11 +168,11 @@ database: {
 		var value1 = toBufSimple(10, 20, 30);
 		var value2 = toBufSimple(40, 50, 60);
 
-		Delta<Buf> delta = db.put(0, colIdNoBuckets, key, value1, RequestType.delta());
+		Delta<Buf> delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value1, RequestType.delta());
 		Assertions.assertNull(delta.previous());
 		assertBufEquals(value1, delta.current());
 
-		delta = db.put(0, colIdNoBuckets, key, value2, RequestType.delta());
+		delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value2, RequestType.delta());
 		assertBufEquals(value1, delta.previous());
 		assertBufEquals(value2, delta.current());
 	}
@@ -183,7 +183,7 @@ database: {
 	void putPrevious_bucketed_returnsNullOnFirstInsert() {
 		var key = makeKeyWithVar(1, 2, 3, 10, 20);
 		var value = toBufSimple(100, 200);
-		Buf prev = db.put(0, colId, key, value, RequestType.previous());
+		Buf prev = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value, RequestType.previous());
 		Assertions.assertNull(prev);
 	}
 
@@ -192,8 +192,8 @@ database: {
 		var key = makeKeyWithVar(1, 2, 3, 10, 20);
 		var value1 = toBufSimple(100, 200);
 		var value2 = toBufSimple(150, 250);
-		db.put(0, colId, key, value1, RequestType.none());
-		Buf prev = db.put(0, colId, key, value2, RequestType.previous());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value1, RequestType.none());
+		Buf prev = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value2, RequestType.previous());
 		assertBufEquals(value1, prev);
 	}
 
@@ -203,11 +203,11 @@ database: {
 		var value1 = toBufSimple(100, 200);
 		var value2 = toBufSimple(150, 250);
 
-		Delta<Buf> delta = db.put(0, colId, key, value1, RequestType.delta());
+		Delta<Buf> delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value1, RequestType.delta());
 		Assertions.assertNull(delta.previous());
 		assertBufEquals(value1, delta.current());
 
-		delta = db.put(0, colId, key, value2, RequestType.delta());
+		delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value2, RequestType.delta());
 		assertBufEquals(value1, delta.previous());
 		assertBufEquals(value2, delta.current());
 	}
@@ -217,10 +217,10 @@ database: {
 		var key = makeKeyWithVar(1, 2, 3, 10, 20);
 		var value1 = toBufSimple(100, 200);
 
-		Boolean changed = db.put(0, colId, key, value1, RequestType.changed());
+		Boolean changed = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value1, RequestType.changed());
 		Assertions.assertTrue(changed);
 
-		changed = db.put(0, colId, key, value1, RequestType.changed());
+		changed = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value1, RequestType.changed());
 		Assertions.assertFalse(changed);
 	}
 
@@ -234,35 +234,35 @@ database: {
 		var value3 = toBufSimple(70, 80, 90);
 
 		// First writer gets forUpdate lock
-		var forUpdate1 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var forUpdate1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
 		Assertions.assertNull(forUpdate1.previous());
 
 		// Second writer gets forUpdate lock on same key
-		var forUpdate2 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var forUpdate2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
 		Assertions.assertNull(forUpdate2.previous());
 
 		// First writer commits successfully
-		db.put(forUpdate1.updateId(), colIdNoBuckets, key, value1, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate1.updateId(), colIdNoBuckets, key, value1, RequestType.none());
 
 		// Second writer should fail with RocksDBRetryException
 		Assertions.assertThrowsExactly(RocksDBRetryException.class,
-					() -> db.put(forUpdate2.updateId(), colIdNoBuckets, key, value2, RequestType.none()));
+					() -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate2.updateId(), colIdNoBuckets, key, value2, RequestType.none()));
 		Assertions.assertEquals(1, db.getInternalDB().getOpenTransactionsCount(),
 				"a retryable commit must remain mapped");
 		Assertions.assertEquals(1, db.getInternalDB().getPendingOpsCount(),
 				"a retryable commit must remain counted until its retry closes");
 
 		// Second writer retries with a new forUpdate on the same transaction
-		var forUpdate3 = db.get(forUpdate2.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
+		var forUpdate3 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(forUpdate2.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
 		assertBufEquals(value1, forUpdate3.previous());
 
 		// Now the retry should succeed
-		db.put(forUpdate3.updateId(), colIdNoBuckets, key, value3, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate3.updateId(), colIdNoBuckets, key, value3, RequestType.none());
 		Assertions.assertEquals(0, db.getInternalDB().getOpenTransactionsCount());
 		Assertions.assertEquals(0, db.getInternalDB().getPendingOpsCount());
 
 		// Verify final value
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		assertBufEquals(value3, result);
 	}
 
@@ -273,23 +273,23 @@ database: {
 		var value2 = toBufSimple(150, 250);
 		var value3 = toBufSimple(170, 270);
 
-		var forUpdate1 = db.get(0, colId, key, RequestType.forUpdate());
+		var forUpdate1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.forUpdate());
 		Assertions.assertNull(forUpdate1.previous());
 
-		var forUpdate2 = db.get(0, colId, key, RequestType.forUpdate());
+		var forUpdate2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.forUpdate());
 		Assertions.assertNull(forUpdate2.previous());
 
-		db.put(forUpdate1.updateId(), colId, key, value1, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate1.updateId(), colId, key, value1, RequestType.none());
 
 		Assertions.assertThrowsExactly(RocksDBRetryException.class,
-				() -> db.put(forUpdate2.updateId(), colId, key, value2, RequestType.none()));
+				() -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate2.updateId(), colId, key, value2, RequestType.none()));
 
-		var forUpdate3 = db.get(forUpdate2.updateId(), colId, key, RequestType.forUpdate());
+		var forUpdate3 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(forUpdate2.updateId(), colId, key, RequestType.forUpdate());
 		assertBufEquals(value1, forUpdate3.previous());
 
-		db.put(forUpdate3.updateId(), colId, key, value3, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate3.updateId(), colId, key, value3, RequestType.none());
 
-		Buf result = db.get(0, colId, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.current());
 		assertBufEquals(value3, result);
 	}
 
@@ -299,21 +299,21 @@ database: {
 		var value1 = toBufSimple(10, 20, 30);
 		var value2 = toBufSimple(40, 50, 60);
 
-		var forUpdate1 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
-		var forUpdate2 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var forUpdate1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var forUpdate2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
 
-		db.put(forUpdate1.updateId(), colIdNoBuckets, key, value1, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate1.updateId(), colIdNoBuckets, key, value1, RequestType.none());
 
 		try {
-			db.put(forUpdate2.updateId(), colIdNoBuckets, key, value2, RequestType.none());
+			db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate2.updateId(), colIdNoBuckets, key, value2, RequestType.none());
 			Assertions.fail("Should have thrown RocksDBRetryException");
 		} catch (RocksDBRetryException e) {
 			// Close the failed update cleanly
-			db.closeFailedUpdate(forUpdate2.updateId());
+			db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeFailedUpdate(forUpdate2.updateId());
 		}
 
 		// Verify the first write persisted
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		assertBufEquals(value1, result);
 	}
 
@@ -329,7 +329,7 @@ database: {
 		var errors = new ConcurrentLinkedQueue<Throwable>();
 
 		// Seed initial value
-		db.put(0, colIdNoBuckets, key, toBufSimple(0), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, toBufSimple(0), RequestType.none());
 
 		var futures = new ArrayList<Future<?>>();
 		for (int t = 0; t < numThreads; t++) {
@@ -340,7 +340,7 @@ database: {
 					for (int i = 0; i < putsPerThread; i++) {
 						var value = toBufSimple(threadId, i);
 						// RequestType.previous() forces a transaction with getForUpdate internally
-						db.put(0, colIdNoBuckets, key, value, RequestType.previous());
+						db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.previous());
 					}
 				} catch (Throwable e) {
 					errors.add(e);
@@ -356,7 +356,7 @@ database: {
 				"Errors during concurrent put: " + errors);
 
 		// Verify key is readable
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		Assertions.assertNotNull(result);
 	}
 
@@ -377,7 +377,7 @@ database: {
 					latch.await();
 					for (int i = 0; i < putsPerThread; i++) {
 						var value = toBufSimple(threadId, i);
-						Delta<Buf> delta = db.put(0, colIdNoBuckets, key, value, RequestType.delta());
+						Delta<Buf> delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.delta());
 						Assertions.assertNotNull(delta);
 						assertBufEquals(value, delta.current());
 					}
@@ -394,7 +394,7 @@ database: {
 		Assertions.assertTrue(errors.isEmpty(),
 				"Errors during concurrent put with delta: " + errors);
 
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		Assertions.assertNotNull(result);
 	}
 
@@ -415,7 +415,7 @@ database: {
 					latch.await();
 					for (int i = 0; i < putsPerThread; i++) {
 						var value = toBufSimple(threadId, i);
-						db.put(0, colIdNoBuckets, key, value, RequestType.changed());
+						db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.changed());
 					}
 				} catch (Throwable e) {
 					errors.add(e);
@@ -448,7 +448,7 @@ database: {
 					latch.await();
 					for (int i = 0; i < putsPerThread; i++) {
 						var value = toBufSimple(threadId, i);
-						db.put(0, colIdNoBuckets, key, value, RequestType.previousPresence());
+						db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.previousPresence());
 					}
 				} catch (Throwable e) {
 					errors.add(e);
@@ -481,7 +481,7 @@ database: {
 					latch.await();
 					for (int i = 0; i < putsPerThread; i++) {
 						var value = toBufSimple(threadId, i);
-						db.put(0, colId, key, value, RequestType.previous());
+						db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value, RequestType.previous());
 					}
 				} catch (Throwable e) {
 					errors.add(e);
@@ -496,7 +496,7 @@ database: {
 		Assertions.assertTrue(errors.isEmpty(),
 				"Errors during concurrent bucketed put: " + errors);
 
-		Buf result = db.get(0, colId, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.current());
 		Assertions.assertNotNull(result);
 	}
 
@@ -517,7 +517,7 @@ database: {
 					for (int i = 0; i < putsPerThread; i++) {
 						var key = makeKey(threadId, i, 0);
 						var value = toBufSimple(threadId, i);
-						Delta<Buf> delta = db.put(0, colIdNoBuckets, key, value, RequestType.delta());
+						Delta<Buf> delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.delta());
 						Assertions.assertNull(delta.previous());
 						assertBufEquals(value, delta.current());
 					}
@@ -538,7 +538,7 @@ database: {
 		for (int t = 0; t < numThreads; t++) {
 			for (int i = 0; i < putsPerThread; i++) {
 				var key = makeKey(t, i, 0);
-				Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+				Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 				assertBufEquals(toBufSimple(t, i), result);
 			}
 		}
@@ -550,34 +550,34 @@ database: {
 	void deleteNone_noBuckets() {
 		var key = makeKey(1, 1, 1);
 		var value = toBufSimple(10);
-		db.put(0, colIdNoBuckets, key, value, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.none());
 
-		db.delete(0, colIdNoBuckets, key, RequestType.none());
-		Assertions.assertNull(db.get(0, colIdNoBuckets, key, RequestType.current()));
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).delete(0, colIdNoBuckets, key, RequestType.none());
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current()));
 	}
 
 	@Test
 	void deletePrevious_noBuckets() {
 		var key = makeKey(1, 1, 1);
 		var value = toBufSimple(10);
-		db.put(0, colIdNoBuckets, key, value, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.none());
 
-		Buf previous = db.delete(0, colIdNoBuckets, key, RequestType.previous());
+		Buf previous = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).delete(0, colIdNoBuckets, key, RequestType.previous());
 		assertBufEquals(value, previous);
-		Assertions.assertNull(db.get(0, colIdNoBuckets, key, RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current()));
 	}
 
 	@Test
 	void deletePreviousPresence_noBuckets() {
 		var key = makeKey(1, 1, 1);
 		var value = toBufSimple(10);
-		db.put(0, colIdNoBuckets, key, value, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.none());
 
-		Boolean present = db.delete(0, colIdNoBuckets, key, RequestType.previousPresence());
+		Boolean present = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).delete(0, colIdNoBuckets, key, RequestType.previousPresence());
 		Assertions.assertTrue(present);
-		Assertions.assertNull(db.get(0, colIdNoBuckets, key, RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current()));
 
-		present = db.delete(0, colIdNoBuckets, key, RequestType.previousPresence());
+		present = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).delete(0, colIdNoBuckets, key, RequestType.previousPresence());
 		Assertions.assertFalse(present);
 	}
 
@@ -586,32 +586,32 @@ database: {
 		var key = makeKey(1, 2, 3);
 		var value1 = toBufSimple(10, 20, 30);
 
-		db.put(0, colIdNoBuckets, key, value1, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value1, RequestType.none());
 
 		// First writer gets forUpdate lock
-		var forUpdate1 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var forUpdate1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
 		assertBufEquals(value1, forUpdate1.previous());
 
 		// Second writer gets forUpdate lock on same key
-		var forUpdate2 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var forUpdate2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
 		assertBufEquals(value1, forUpdate2.previous());
 
 		// First writer commits delete successfully
-		db.delete(forUpdate1.updateId(), colIdNoBuckets, key, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).delete(forUpdate1.updateId(), colIdNoBuckets, key, RequestType.none());
 
 		// Second writer should fail with RocksDBRetryException
 		Assertions.assertThrowsExactly(RocksDBRetryException.class,
-				() -> db.delete(forUpdate2.updateId(), colIdNoBuckets, key, RequestType.none()));
+				() -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).delete(forUpdate2.updateId(), colIdNoBuckets, key, RequestType.none()));
 
 		// Second writer retries with a new forUpdate
-		var forUpdate3 = db.get(forUpdate2.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
+		var forUpdate3 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(forUpdate2.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
 		Assertions.assertNull(forUpdate3.previous());
 
 		// Now the retry should succeed (deleting what's already deleted is a no-op but should succeed)
-		db.delete(forUpdate3.updateId(), colIdNoBuckets, key, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).delete(forUpdate3.updateId(), colIdNoBuckets, key, RequestType.none());
 
 		// Verify final state
-		Assertions.assertNull(db.get(0, colIdNoBuckets, key, RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current()));
 	}
 
 	// ==================== Merge methods tests ====================
@@ -619,45 +619,45 @@ database: {
 	@Test
 	void mergeNone_noBuckets() {
 		var key = makeKey(2, 2, 2);
-		db.put(0, colIdNoBuckets, key, Buf.wrap("A".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, Buf.wrap("A".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
-		db.merge(0, colIdNoBuckets, key, Buf.wrap("B".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colIdNoBuckets, key, Buf.wrap("B".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		assertBufEquals(Buf.wrap("A,B".getBytes(StandardCharsets.UTF_8)), result);
 	}
 
 	@Test
 	void mergeMerged_noBuckets() {
 		var key = makeKey(2, 2, 2);
-		db.put(0, colIdNoBuckets, key, Buf.wrap("A".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, Buf.wrap("A".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
-		Buf merged = db.merge(0, colIdNoBuckets, key, Buf.wrap("B".getBytes(StandardCharsets.UTF_8)), RequestType.merged());
+		Buf merged = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colIdNoBuckets, key, Buf.wrap("B".getBytes(StandardCharsets.UTF_8)), RequestType.merged());
 		assertBufEquals(Buf.wrap("A,B".getBytes(StandardCharsets.UTF_8)), merged);
 	}
 
 	@Test
 	void mergeConcurrentUpdate_retrySucceeds() {
 		var key = makeKey(3, 3, 3);
-		db.put(0, colIdNoBuckets, key, Buf.wrap("A".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, Buf.wrap("A".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
-		var fu1 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
-		var fu2 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var fu1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var fu2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
 
 		// Writer 1 merges B
-		db.merge(fu1.updateId(), colIdNoBuckets, key, Buf.wrap("B".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(fu1.updateId(), colIdNoBuckets, key, Buf.wrap("B".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
 		// Writer 2 tries to merge C, should fail
 		Assertions.assertThrowsExactly(RocksDBRetryException.class,
-				() -> db.merge(fu2.updateId(), colIdNoBuckets, key, Buf.wrap("C".getBytes(StandardCharsets.UTF_8)), RequestType.none()));
+				() -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(fu2.updateId(), colIdNoBuckets, key, Buf.wrap("C".getBytes(StandardCharsets.UTF_8)), RequestType.none()));
 
 		// Writer 2 retries
-		var fu3 = db.get(fu2.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
+		var fu3 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(fu2.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
 		assertBufEquals(Buf.wrap("A,B".getBytes(StandardCharsets.UTF_8)), fu3.previous());
-		db.merge(fu3.updateId(), colIdNoBuckets, key, Buf.wrap("C".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(fu3.updateId(), colIdNoBuckets, key, Buf.wrap("C".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
 		// Final value A,B,C
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		assertBufEquals(Buf.wrap("A,B,C".getBytes(StandardCharsets.UTF_8)), result);
 	}
 
@@ -668,10 +668,10 @@ database: {
 		var keys = List.of(makeKey(10, 1, 1), makeKey(10, 1, 2));
 		var values = List.of(toBufSimple(101), toBufSimple(102));
 
-		db.putMulti(0, colIdNoBuckets, keys, values, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMulti(0, colIdNoBuckets, keys, values, RequestType.none());
 
-		assertBufEquals(values.get(0), db.get(0, colIdNoBuckets, keys.get(0), RequestType.current()));
-		assertBufEquals(values.get(1), db.get(0, colIdNoBuckets, keys.get(1), RequestType.current()));
+		assertBufEquals(values.get(0), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, keys.get(0), RequestType.current()));
+		assertBufEquals(values.get(1), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, keys.get(1), RequestType.current()));
 	}
 
 	@Test
@@ -681,111 +681,111 @@ database: {
 		var v1_initial = toBufSimple(1);
 		var v2_initial = toBufSimple(2);
 
-		db.put(0, colIdNoBuckets, key1, v1_initial, RequestType.none());
-		db.put(0, colIdNoBuckets, key2, v2_initial, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key1, v1_initial, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key2, v2_initial, RequestType.none());
 
-		var fu1 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
-		var fu2 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
 
 		// Writer 1 updates key 1
-		db.put(fu1.updateId(), colIdNoBuckets, key1, toBufSimple(10), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(fu1.updateId(), colIdNoBuckets, key1, toBufSimple(10), RequestType.none());
 
 		// Writer 2 tries putMulti on key 1 and key 2, should fail due to key 1 conflict
 		try {
-			db.putMulti(fu2.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(toBufSimple(11), toBufSimple(22)), RequestType.none());
+			db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMulti(fu2.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(toBufSimple(11), toBufSimple(22)), RequestType.none());
 			Assertions.fail("Should have thrown RocksDBRetryException");
 		} catch (RocksDBRetryException e) {
 			// Expected
 		}
 
 		// Writer 2 retries - since the previous updateId was closed on failure, we need a fresh one.
-		var fu3 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
-		db.putMulti(fu3.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(toBufSimple(111), toBufSimple(222)), RequestType.none());
+		var fu3 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMulti(fu3.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(toBufSimple(111), toBufSimple(222)), RequestType.none());
 
-		assertBufEquals(toBufSimple(111), db.get(0, colIdNoBuckets, key1, RequestType.current()));
-		assertBufEquals(toBufSimple(222), db.get(0, colIdNoBuckets, key2, RequestType.current()));
+		assertBufEquals(toBufSimple(111), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.current()));
+		assertBufEquals(toBufSimple(222), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key2, RequestType.current()));
 	}
 
 	@Test
 	void deleteMulti_success() {
 		var keys = List.of(makeKey(12, 1, 1), makeKey(12, 1, 2));
-		db.put(0, colIdNoBuckets, keys.get(0), toBufSimple(1), RequestType.none());
-		db.put(0, colIdNoBuckets, keys.get(1), toBufSimple(2), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, keys.get(0), toBufSimple(1), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, keys.get(1), toBufSimple(2), RequestType.none());
 
-		db.deleteMulti(0, colIdNoBuckets, keys, RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteMulti(0, colIdNoBuckets, keys, RequestType.none());
 
-		Assertions.assertNull(db.get(0, colIdNoBuckets, keys.get(0), RequestType.current()));
-		Assertions.assertNull(db.get(0, colIdNoBuckets, keys.get(1), RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, keys.get(0), RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, keys.get(1), RequestType.current()));
 	}
 
 	@Test
 	void deleteMultiConcurrentUpdate_retrySucceeds() {
 		var key1 = makeKey(13, 1, 1);
 		var key2 = makeKey(13, 1, 2);
-		db.put(0, colIdNoBuckets, key1, toBufSimple(1), RequestType.none());
-		db.put(0, colIdNoBuckets, key2, toBufSimple(2), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key1, toBufSimple(1), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key2, toBufSimple(2), RequestType.none());
 
-		var fu1 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
-		var fu2 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
 
 		// Writer 1 updates key 1
-		db.put(fu1.updateId(), colIdNoBuckets, key1, toBufSimple(10), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(fu1.updateId(), colIdNoBuckets, key1, toBufSimple(10), RequestType.none());
 
 		// Writer 2 tries deleteMulti, should fail
 		try {
-			db.deleteMulti(fu2.updateId(), colIdNoBuckets, List.of(key1, key2), RequestType.none());
+			db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteMulti(fu2.updateId(), colIdNoBuckets, List.of(key1, key2), RequestType.none());
 			Assertions.fail("Should have thrown RocksDBRetryException");
 		} catch (RocksDBRetryException e) {
 			// Expected
 		}
 
 		// Writer 2 retries - since the previous updateId was closed on failure, we need a fresh one.
-		var fu3 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
-		db.deleteMulti(fu3.updateId(), colIdNoBuckets, List.of(key1, key2), RequestType.none());
+		var fu3 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteMulti(fu3.updateId(), colIdNoBuckets, List.of(key1, key2), RequestType.none());
 
-		Assertions.assertNull(db.get(0, colIdNoBuckets, key1, RequestType.current()));
-		Assertions.assertNull(db.get(0, colIdNoBuckets, key2, RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key2, RequestType.current()));
 	}
 
 	@Test
 	void mergeMulti_success() {
 		var keys = List.of(makeKey(14, 1, 1), makeKey(14, 1, 2));
-		db.put(0, colIdNoBuckets, keys.get(0), Buf.wrap("A1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-		db.put(0, colIdNoBuckets, keys.get(1), Buf.wrap("B1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, keys.get(0), Buf.wrap("A1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, keys.get(1), Buf.wrap("B1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
-		db.mergeMulti(0, colIdNoBuckets, keys, List.of(Buf.wrap("A2".getBytes(StandardCharsets.UTF_8)), Buf.wrap("B2".getBytes(StandardCharsets.UTF_8))), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeMulti(0, colIdNoBuckets, keys, List.of(Buf.wrap("A2".getBytes(StandardCharsets.UTF_8)), Buf.wrap("B2".getBytes(StandardCharsets.UTF_8))), RequestType.none());
 
-		assertBufEquals(Buf.wrap("A1,A2".getBytes(StandardCharsets.UTF_8)), db.get(0, colIdNoBuckets, keys.get(0), RequestType.current()));
-		assertBufEquals(Buf.wrap("B1,B2".getBytes(StandardCharsets.UTF_8)), db.get(0, colIdNoBuckets, keys.get(1), RequestType.current()));
+		assertBufEquals(Buf.wrap("A1,A2".getBytes(StandardCharsets.UTF_8)), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, keys.get(0), RequestType.current()));
+		assertBufEquals(Buf.wrap("B1,B2".getBytes(StandardCharsets.UTF_8)), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, keys.get(1), RequestType.current()));
 	}
 
 	@Test
 	void mergeMultiConcurrentUpdate_retrySucceeds() {
 		var key1 = makeKey(15, 1, 1);
 		var key2 = makeKey(15, 1, 2);
-		db.put(0, colIdNoBuckets, key1, Buf.wrap("A".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-		db.put(0, colIdNoBuckets, key2, Buf.wrap("B".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key1, Buf.wrap("A".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key2, Buf.wrap("B".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
-		var fu1 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
-		var fu2 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
 
 		// Writer 1 updates key 1
-		db.put(fu1.updateId(), colIdNoBuckets, key1, Buf.wrap("A_new".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(fu1.updateId(), colIdNoBuckets, key1, Buf.wrap("A_new".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
 		// Writer 2 tries mergeMulti, should fail
 		try {
-			db.mergeMulti(fu2.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(Buf.wrap("A2".getBytes(StandardCharsets.UTF_8)), Buf.wrap("B2".getBytes(StandardCharsets.UTF_8))), RequestType.none());
+			db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeMulti(fu2.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(Buf.wrap("A2".getBytes(StandardCharsets.UTF_8)), Buf.wrap("B2".getBytes(StandardCharsets.UTF_8))), RequestType.none());
 			Assertions.fail("Should have thrown RocksDBRetryException");
 		} catch (RocksDBRetryException e) {
 			// Expected
 		}
 
 		// Writer 2 retries - since the previous updateId was closed on failure, we need a fresh one.
-		var fu3 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
-		db.mergeMulti(fu3.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(Buf.wrap("A3".getBytes(StandardCharsets.UTF_8)), Buf.wrap("B3".getBytes(StandardCharsets.UTF_8))), RequestType.none());
+		var fu3 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeMulti(fu3.updateId(), colIdNoBuckets, List.of(key1, key2), List.of(Buf.wrap("A3".getBytes(StandardCharsets.UTF_8)), Buf.wrap("B3".getBytes(StandardCharsets.UTF_8))), RequestType.none());
 
-		assertBufEquals(Buf.wrap("A_new,A3".getBytes(StandardCharsets.UTF_8)), db.get(0, colIdNoBuckets, key1, RequestType.current()));
-		assertBufEquals(Buf.wrap("B,B3".getBytes(StandardCharsets.UTF_8)), db.get(0, colIdNoBuckets, key2, RequestType.current()));
+		assertBufEquals(Buf.wrap("A_new,A3".getBytes(StandardCharsets.UTF_8)), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.current()));
+		assertBufEquals(Buf.wrap("B,B3".getBytes(StandardCharsets.UTF_8)), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key2, RequestType.current()));
 	}
 
 	@Test
@@ -805,8 +805,8 @@ database: {
 					latch.await();
 					for (int i = 0; i < opsPerThread; i++) {
 						var threadKey = makeKey(10, 10, 10 + threadId * opsPerThread + i);
-						db.put(0, colIdNoBuckets, threadKey, toBufSimple(1), RequestType.none());
-						db.delete(0, colIdNoBuckets, threadKey, RequestType.previous());
+						db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, threadKey, toBufSimple(1), RequestType.none());
+						db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).delete(0, colIdNoBuckets, threadKey, RequestType.previous());
 					}
 				} catch (Throwable e) {
 					errors.add(e);
@@ -830,7 +830,7 @@ database: {
 		var latch = new CountDownLatch(1);
 		var errors = new ConcurrentLinkedQueue<Throwable>();
 
-		db.put(0, colIdNoBuckets, key, Buf.wrap("initial".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, Buf.wrap("initial".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
 		var futures = new ArrayList<Future<?>>();
 		for (int t = 0; t < numThreads; t++) {
@@ -839,7 +839,7 @@ database: {
 				try {
 					latch.await();
 					for (int i = 0; i < opsPerThread; i++) {
-						db.merge(0, colIdNoBuckets, key, Buf.wrap(("v-" + threadId + "-" + i).getBytes(StandardCharsets.UTF_8)), RequestType.none());
+						db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colIdNoBuckets, key, Buf.wrap(("v-" + threadId + "-" + i).getBytes(StandardCharsets.UTF_8)), RequestType.none());
 					}
 				} catch (Throwable e) {
 					errors.add(e);
@@ -853,7 +853,7 @@ database: {
 
 		Assertions.assertTrue(errors.isEmpty(), "Errors during concurrent merge: " + errors);
 
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		String s = new String(Utils.toByteArray(result), StandardCharsets.UTF_8);
 		String[] parts = s.split(",");
 		Assertions.assertEquals(numThreads * opsPerThread + 1, parts.length, "Total merged elements mismatch");
@@ -868,7 +868,7 @@ database: {
 
 		for (int i = 0; i < 100; i++) {
 			var newValue = toBufSimple(i, i + 1, i + 2);
-			Delta<Buf> delta = db.put(0, colIdNoBuckets, key, newValue, RequestType.delta());
+			Delta<Buf> delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, newValue, RequestType.delta());
 			if (lastValue == null) {
 				Assertions.assertNull(delta.previous());
 			} else {
@@ -878,7 +878,7 @@ database: {
 			lastValue = newValue;
 		}
 
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		assertBufEquals(lastValue, result);
 	}
 
@@ -889,7 +889,7 @@ database: {
 
 		for (int i = 0; i < 100; i++) {
 			var newValue = toBufSimple(i, i + 1, i + 2);
-			Delta<Buf> delta = db.put(0, colId, key, newValue, RequestType.delta());
+			Delta<Buf> delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, newValue, RequestType.delta());
 			if (lastValue == null) {
 				Assertions.assertNull(delta.previous());
 			} else {
@@ -899,7 +899,7 @@ database: {
 			lastValue = newValue;
 		}
 
-		Buf result = db.get(0, colId, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.current());
 		assertBufEquals(lastValue, result);
 	}
 
@@ -910,9 +910,9 @@ database: {
 		// put with RequestType.none() and no buckets should not need a transaction at all
 		var key = makeKey(9, 8, 7);
 		var value = toBufSimple(1, 2, 3);
-		Assertions.assertNull(db.put(0, colIdNoBuckets, key, value, RequestType.none()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, value, RequestType.none()));
 
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		assertBufEquals(value, result);
 	}
 
@@ -921,9 +921,9 @@ database: {
 		// put with RequestType.none() on bucketed column still needs a transaction
 		var key = makeKeyWithVar(9, 8, 7, 1, 2);
 		var value = toBufSimple(1, 2, 3);
-		Assertions.assertNull(db.put(0, colId, key, value, RequestType.none()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value, RequestType.none()));
 
-		Buf result = db.get(0, colId, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.current());
 		assertBufEquals(value, result);
 	}
 
@@ -937,33 +937,33 @@ database: {
 		};
 
 		// Three concurrent forUpdate holders
-		var fu1 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
-		var fu2 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
-		var fu3 = db.get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var fu1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var fu2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
+		var fu3 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.forUpdate());
 
 		// First commits
-		db.put(fu1.updateId(), colIdNoBuckets, key, values[0], RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(fu1.updateId(), colIdNoBuckets, key, values[0], RequestType.none());
 
 		// Second fails
 		Assertions.assertThrowsExactly(RocksDBRetryException.class,
-				() -> db.put(fu2.updateId(), colIdNoBuckets, key, values[1], RequestType.none()));
+				() -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(fu2.updateId(), colIdNoBuckets, key, values[1], RequestType.none()));
 
 		// Third also fails
 		Assertions.assertThrowsExactly(RocksDBRetryException.class,
-				() -> db.put(fu3.updateId(), colIdNoBuckets, key, values[2], RequestType.none()));
+				() -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(fu3.updateId(), colIdNoBuckets, key, values[2], RequestType.none()));
 
 		// Second retries and succeeds
-		var fu2retry = db.get(fu2.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
+		var fu2retry = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(fu2.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
 		assertBufEquals(values[0], fu2retry.previous());
-		db.put(fu2retry.updateId(), colIdNoBuckets, key, values[1], RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(fu2retry.updateId(), colIdNoBuckets, key, values[1], RequestType.none());
 
 		// Third retries and succeeds
-		var fu3retry = db.get(fu3.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
+		var fu3retry = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(fu3.updateId(), colIdNoBuckets, key, RequestType.forUpdate());
 		assertBufEquals(values[1], fu3retry.previous());
-		db.put(fu3retry.updateId(), colIdNoBuckets, key, values[2], RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(fu3retry.updateId(), colIdNoBuckets, key, values[2], RequestType.none());
 
 		// Final value should be the last committed
-		Buf result = db.get(0, colIdNoBuckets, key, RequestType.current());
+		Buf result = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key, RequestType.current());
 		assertBufEquals(values[2], result);
 	}
 

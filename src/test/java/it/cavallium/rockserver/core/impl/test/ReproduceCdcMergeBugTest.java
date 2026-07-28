@@ -41,11 +41,11 @@ public class ReproduceCdcMergeBugTest {
             
             // Create column
             var schema = ColumnSchema.of(IntList.of(4), new ObjectArrayList<>(), true, null, null, "it.cavallium.rockserver.examples.MessagePatchMergeOperator");
-            long colId = db.createColumn("messages", schema);
+            long colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("messages", schema);
 
             // Create CDC subscription
             String subId = "test-sub";
-            db.cdcCreate(subId, null, List.of(colId));
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId));
 
             // Prepare stream of batches
             Sinks.Many<KVBatch> sink = Sinks.many().multicast().onBackpressureBuffer(2000);

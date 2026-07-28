@@ -87,7 +87,7 @@ database: {
     void many_concurrent_ranges_with_random_cancellation_have_no_leaks() {
         List<Disposable> subs = new ArrayList<>();
         for (int i = 0; i < 32; i++) {
-            var pub = db.getRangeAsync(0, colId, null, null, (i % 2) == 0, RequestType.allInRange(), Duration.ofSeconds(5).toMillis());
+            var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, (i % 2) == 0, RequestType.allInRange(), Duration.ofSeconds(5).toMillis());
             var sub = Flux.from(pub).take(1 + (i % 4)).subscribe();
             subs.add(sub);
         }

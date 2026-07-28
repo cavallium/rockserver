@@ -43,7 +43,7 @@ public class CdcBackpressureTest {
     // Helper to create column and subscription
     private long setupCdc(EmbeddedConnection db, String subId) {
         var schema = ColumnSchema.of(IntList.of(4), new ObjectArrayList<>(), true, null, null, "it.cavallium.rockserver.examples.MessagePatchMergeOperator");
-        long colId = db.createColumn("messages", schema);
+        long colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("messages", schema);
         try {
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId));
         } catch (Exception e) {

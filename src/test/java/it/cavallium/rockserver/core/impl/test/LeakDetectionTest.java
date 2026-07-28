@@ -82,7 +82,7 @@ database: {
         assertNotNull(merged);
 
         // Range scan with cancellation (iterator should be closed)
-        var pub = db.getRangeAsync(0, colId, null, null, false, RequestType.allInRange(), Duration.ofSeconds(5).toMillis());
+        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, false, RequestType.allInRange(), Duration.ofSeconds(5).toMillis());
         var sub = reactor.core.publisher.Flux.from(pub).take(1).subscribe();
         sub.dispose();
 
@@ -103,7 +103,7 @@ database: {
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, Buf.wrap(new byte[]{(byte) i}), RequestType.none());
         }
         // Start range and cancel after a few elements
-        var pub = db.getRangeAsync(0, colId, null, null, false, RequestType.allInRange(), Duration.ofSeconds(10).toMillis());
+        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, false, RequestType.allInRange(), Duration.ofSeconds(10).toMillis());
         var disposable = reactor.core.publisher.Flux.from(pub).take(3).subscribe();
         disposable.dispose();
         var internal = db.getInternalDB();

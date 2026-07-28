@@ -2,10 +2,14 @@ package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
+import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBAPI;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle;
+import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.impl.test.DBTest.ConnectionConfig;
 import it.cavallium.rockserver.core.impl.test.DBTest.ConnectionMethod;
@@ -88,7 +92,7 @@ public class TestDB implements AutoCloseable {
 
 	@Override
 	public void close() {
-		if (api instanceof AutoCloseable autoCloseable && !(api instanceof EmbeddedConnection)) {
+		if (api instanceof AutoCloseable autoCloseable) {
 			try {
 				autoCloseable.close();
 			} catch (Exception e) {
@@ -111,11 +115,15 @@ public class TestDB implements AutoCloseable {
 	private static class ForceAPIType implements RocksDBAPI, Closeable {
 
 		private final ConnectionType type;
-		private final RocksDBAPI db;
+		private final RocksDBConnection connection;
+		private final RocksDBSyncAPI syncApi;
+		private final RocksDBAsyncAPI asyncApi;
 
-		public ForceAPIType(ConnectionType type, RocksDBAPI db) {
+		public ForceAPIType(ConnectionType type, RocksDBConnection connection) {
 			this.type = type;
-			this.db = db;
+			this.connection = connection;
+			this.syncApi = connection.getSyncApi(RequestContext.batch());
+			this.asyncApi = connection.getAsyncApi(RequestContext.batch());
 		}
 
 		@Override
@@ -125,7 +133,7 @@ public class TestDB implements AutoCloseable {
 					case RocksDBAPICommandSingle<?> single -> {
 						RS result;
 						try {
-							result = req.handleSync(db);
+							result = req.handleSync(syncApi);
 						} catch (Throwable ex) {
 							yield (RA) CompletableFuture.failedFuture(ex);
 						}
@@ -134,25 +142,25 @@ public class TestDB implements AutoCloseable {
 					case RocksDBAPICommand.RocksDBAPICommandStream<?> stream -> {
 						Stream<?> result;
 						try {
-							result = (Stream<?>) req.handleSync(db);
+							result = (Stream<?>) req.handleSync(syncApi);
 						} catch (Throwable ex) {
 							yield (RA) Flux.error(ex);
 						}
 						yield (RA) Flux.fromStream(result);
 					}
 				};
-				case ASYNC -> db.requestAsync(req);
+				case ASYNC -> asyncApi.requestAsync(req);
 			};
 		}
 
 		@Override
 		public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> req) {
 			return switch (type) {
-				case SYNC -> db.requestSync(req);
+				case SYNC -> syncApi.requestSync(req);
 				case ASYNC -> switch (req) {
 						case RocksDBAPICommandSingle<?> single -> {
 						try {
-							var result = (CompletableFuture<?>) req.handleAsync(db);
+							var result = (CompletableFuture<?>) req.handleAsync(asyncApi);
 							yield (RS) result.join();
 						} catch (CompletionException ce) {
 							var cause = ce.getCause();
@@ -166,7 +174,7 @@ public class TestDB implements AutoCloseable {
 						}
 					}
 					case RocksDBAPICommand.RocksDBAPICommandStream<?> stream -> {
-						var result = (Flux<?>) req.handleAsync(db);
+						var result = (Flux<?>) req.handleAsync(asyncApi);
 
 						yield (RS) result.toStream();
 					}
@@ -176,9 +184,9 @@ public class TestDB implements AutoCloseable {
 
 		@Override
 		public void close() {
-			if (db instanceof AutoCloseable closeable && !(db instanceof EmbeddedConnection)) {
+			if (!(connection instanceof EmbeddedConnection)) {
 				try {
-					closeable.close();
+					connection.close();
 				} catch (Exception e) {
 					throw new RuntimeException(e);
 				}

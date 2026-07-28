@@ -92,7 +92,77 @@ import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
-public class GrpcConnection extends BaseConnection implements RocksDBAPI {
+/** Public gRPC connection. Database operations are exposed only by context-bound API views. */
+public final class GrpcConnection extends BaseConnection {
+
+	public static final String MAX_INBOUND_MESSAGE_SIZE_PROPERTY =
+			GrpcConnectionDelegate.MAX_INBOUND_MESSAGE_SIZE_PROPERTY;
+	public static final int DEFAULT_MAX_INBOUND_MESSAGE_SIZE =
+			GrpcConnectionDelegate.DEFAULT_MAX_INBOUND_MESSAGE_SIZE;
+	public static final int MIN_MAX_INBOUND_MESSAGE_SIZE =
+			GrpcConnectionDelegate.MIN_MAX_INBOUND_MESSAGE_SIZE;
+
+	private final GrpcConnectionDelegate delegate;
+	// Retained as test-observable lifecycle handles; ownership stays with the raw delegate.
+	private final ManagedChannel channel;
+	private final ExecutorService callbackExecutor;
+	private final EventLoopGroup eventLoopGroup;
+
+	private GrpcConnection(String name, SocketAddress socketAddress, URI address) {
+		super(name);
+		this.delegate = new GrpcConnectionDelegate(name, socketAddress, address);
+		this.channel = delegate.channel;
+		this.callbackExecutor = delegate.callbackExecutor;
+		this.eventLoopGroup = delegate.eventLoopGroup;
+	}
+
+	public static int configuredMaxInboundMessageSize() {
+		return GrpcConnectionDelegate.configuredMaxInboundMessageSize();
+	}
+
+	public static GrpcConnection forHostAndPort(String name, HostAndPort address) {
+		return new GrpcConnection(name,
+				new InetSocketAddress(address.host(), address.port()),
+				URI.create("http://" + address.host() + ":" + address.port()));
+	}
+
+	public static GrpcConnection forPath(String name, Path unixSocketPath) {
+		return new GrpcConnection(name,
+				new DomainSocketAddress(unixSocketPath.toFile()),
+				URI.create("unix://" + unixSocketPath));
+	}
+
+	@Override
+	public URI getUrl() {
+		return delegate.getUrl();
+	}
+
+	@Override
+	<R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+		return delegate.requestSync(context, request);
+	}
+
+	@Override
+	<R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+		return delegate.requestAsync(context, request);
+	}
+
+	@Override
+	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+			@NotNull String id,
+			@Nullable Long fromSeq,
+			long maxEvents) {
+		return delegate.cdcPollBatchAsync(context, id, fromSeq, maxEvents);
+	}
+
+	@Override
+	public void close() {
+		delegate.close();
+	}
+}
+
+/** Package-private raw implementation behind {@link GrpcConnection}. */
+final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI {
 
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcConnection.class);
 	private static final int EVENT_LOOP_THREADS_PER_CONNECTION = 1;
@@ -110,16 +180,16 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			= "it.cavallium.rockserver.grpc.client.max-inbound-message-size-bytes";
 	public static final int DEFAULT_MAX_INBOUND_MESSAGE_SIZE = 64 * 1024 * 1024;
 	public static final int MIN_MAX_INBOUND_MESSAGE_SIZE = 4 * 1024 * 1024;
-	private final ManagedChannel channel;
-	private final ExecutorService callbackExecutor;
-	private final EventLoopGroup eventLoopGroup;
+	final ManagedChannel channel;
+	final ExecutorService callbackExecutor;
+	final EventLoopGroup eventLoopGroup;
 	private final RocksDBServiceFutureStub futureStub;
 	private final ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStub;
 	private final AtomicBoolean legacyCdcPollBatchWarningLogged = new AtomicBoolean();
 	private final URI address;
 	private final int maxInboundMessageSize;
 
-	private GrpcConnection(String name, SocketAddress socketAddress, URI address) {
+	GrpcConnectionDelegate(String name, SocketAddress socketAddress, URI address) {
 		super(name);
 		int maxInboundMessageSize = configuredMaxInboundMessageSize();
 		NettyChannelBuilder channelBuilder;
@@ -289,20 +359,6 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}
 	}
 
-	public static GrpcConnection forHostAndPort(String name, HostAndPort address) {
-		return new GrpcConnection(name,
-				new InetSocketAddress(address.host(), address.port()),
-				URI.create("http://" + address.host() + ":" + address.port())
-		);
-	}
-
-	public static GrpcConnection forPath(String name, Path unixSocketPath) {
-		return new GrpcConnection(name,
-				new DomainSocketAddress(unixSocketPath.toFile()),
-				URI.create("unix://" + unixSocketPath)
-		);
-	}
-
 	@Override
 	public URI getUrl() {
 		return address;
@@ -450,9 +506,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestNothing<?> _ -> toResponse(futureStubWithRequestDeadline().put(request), _ -> null);
 			case RequestPrevious<?> _ ->
-					toResponse(futureStubWithRequestDeadline().putGetPrevious(request), GrpcConnection::mapPrevious);
+					toResponse(futureStubWithRequestDeadline().putGetPrevious(request), GrpcConnectionDelegate::mapPrevious);
 			case RequestDelta<?> _ ->
-					toResponse(futureStubWithRequestDeadline().putGetDelta(request), GrpcConnection::mapDelta);
+					toResponse(futureStubWithRequestDeadline().putGetDelta(request), GrpcConnectionDelegate::mapDelta);
 			case RequestChanged<?> _ ->
 					toResponse(futureStubWithRequestDeadline().putGetChanged(request), Changed::getChanged);
 			case RequestType.RequestPreviousPresence<?> _ ->
@@ -478,7 +534,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestNothing<?> _ -> toResponse(futureStubWithRequestDeadline().delete(request), _ -> null);
 			case RequestPrevious<?> _ ->
-					toResponse(futureStubWithRequestDeadline().deleteGetPrevious(request), GrpcConnection::mapPrevious);
+					toResponse(futureStubWithRequestDeadline().deleteGetPrevious(request), GrpcConnectionDelegate::mapPrevious);
 			case RequestPreviousPresence<?> _ ->
 					toResponse(futureStubWithRequestDeadline().deleteGetPreviousPresence(request), PreviousPresence::getPresent);
 		};
@@ -530,7 +586,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.build();
 
 		Mono<PutMultiRequest> initialRequestMono = Mono.just(initialRequest);
-		Flux<PutMultiRequest> dataRequestsFlux = Flux.fromIterable(() -> GrpcConnection
+		Flux<PutMultiRequest> dataRequestsFlux = Flux.fromIterable(() -> GrpcConnectionDelegate
 				.map(allKeys.iterator(), allValues.iterator(), (keys, value) -> PutMultiRequest.newBuilder()
 						.setData(mapKV(keys, value))
 						.build()));
@@ -545,11 +601,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			case RequestPrevious<?> _ ->
 					toResponse(reactiveStubWithRequestDeadline().putMultiGetPrevious(inputRequests)
 						.collect(() -> new ArrayList<@Nullable Buf>(),
-								(list, value) -> list.add(GrpcConnection.mapPrevious(value)))
+								(list, value) -> list.add(GrpcConnectionDelegate.mapPrevious(value)))
 						.toFuture());
 			case RequestDelta<?> _ ->
 					toResponse(reactiveStubWithRequestDeadline().putMultiGetDelta(inputRequests)
-						.map(GrpcConnection::mapDelta)
+						.map(GrpcConnectionDelegate::mapDelta)
 						.collectList()
 						.toFuture());
 			case RequestChanged<?> _ ->
@@ -601,7 +657,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			case RequestPrevious<?> _ ->
 					toResponse(reactiveStubWithRequestDeadline().deleteMultiGetPrevious(inputRequests)
 							.collect(() -> new ArrayList<@Nullable Buf>(),
-									(list, value) -> list.add(GrpcConnection.mapPrevious(value)))
+									(list, value) -> list.add(GrpcConnectionDelegate.mapPrevious(value)))
 							.toFuture());
 			case RequestPreviousPresence<?> _ ->
 					toResponse(reactiveStubWithRequestDeadline().deleteMultiGetPreviousPresence(inputRequests)
@@ -646,7 +702,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.build();
 
 		Mono<MergeMultiRequest> initialRequestMono = Mono.just(initialRequest);
-		Flux<MergeMultiRequest> dataRequestsFlux = Flux.fromIterable(() -> GrpcConnection
+		Flux<MergeMultiRequest> dataRequestsFlux = Flux.fromIterable(() -> GrpcConnectionDelegate
 				.map(allKeys.iterator(), allValues.iterator(), (keys, value) -> MergeMultiRequest.newBuilder()
 						.setData(mapKV(keys, value))
 						.build()));
@@ -774,7 +830,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		}
 		return toResponse(deadlineStub.existsMulti(request.build()),
 				response -> List.copyOf(response.getPresentList()),
-				GrpcConnection::mapReadDeadlineError);
+				GrpcConnectionDelegate::mapReadDeadlineError);
 	}
 
 	@Override
@@ -857,11 +913,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 					toResponse(deadlineStub.reduceRangeFirstAndLast(request), result -> new FirstAndLast<>(
 							result.hasFirst() ? mapKV(result.getFirst()) : null,
 							result.hasLast() ? mapKV(result.getLast()) : null
-					), GrpcConnection::mapReadDeadlineError);
+					), GrpcConnectionDelegate::mapReadDeadlineError);
 			case RequestType.RequestEntriesCount<?> _ ->
 					toResponse(deadlineStub.reduceRangeEntriesCount(request),
 							EntriesCount::getCount,
-							GrpcConnection::mapReadDeadlineError);
+							GrpcConnectionDelegate::mapReadDeadlineError);
 			default -> throw new UnsupportedOperationException();
 		};
 	}
@@ -948,16 +1004,16 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		return toResponse(futureStubWithReadDeadline(timeoutMs).getRangePage(requestBuilder.build()), response -> {
 			@SuppressWarnings("unchecked")
 			var items = (List<T>) (List<?>) response.getItemsList().stream()
-					.map(GrpcConnection::mapKV)
+					.map(GrpcConnectionDelegate::mapKV)
 					.toList();
 			var mappedResumeAfter = response.hasResumeAfter()
 					? new Keys(response.getResumeAfter().getKeysList().stream()
-							.map(GrpcConnection::mapByteString)
+							.map(GrpcConnectionDelegate::mapByteString)
 							.toArray(Buf[]::new))
 					: null;
 			return new it.cavallium.rockserver.core.common.RangePage<>(
 					items, mappedResumeAfter, response.getHasMore());
-		}, GrpcConnection::mapReadDeadlineError);
+		}, GrpcConnectionDelegate::mapReadDeadlineError);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -978,8 +1034,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			case RequestType.RequestGetAllInRange<?> _ -> toReadResponse(deadlineStub.getAllInRange(request)
 					.map(kv -> mapKV(kv)));
 			case RequestType.RequestGetAllInRangeNoCache<?> _ -> toReadResponse(deadlineStub.getAllInRangeNoCache(request)
-					.map(GrpcConnection::mapKV))
-					.onErrorMap(GrpcConnection::mapNoCacheRangeCompatibilityError);
+					.map(GrpcConnectionDelegate::mapKV))
+					.onErrorMap(GrpcConnectionDelegate::mapNoCacheRangeCompatibilityError);
 		};
 	}
 
@@ -1057,8 +1113,16 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
                 .setMaxResponseBytes(maxInboundMessageSize);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
         return toResponse(reactiveStub.cdcPoll(builder.build()))
-                .map(GrpcConnection::mapCDCEvent);
+                .map(GrpcConnectionDelegate::mapCDCEvent);
     }
+
+	@Override
+	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+			@NotNull String id,
+			@Nullable Long fromSeq,
+			long maxEvents) {
+		return withRequestContext(context, () -> cdcPollBatchAsync(id, fromSeq, maxEvents));
+	}
 
     @Override
     public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
@@ -1069,7 +1133,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
         if (fromSeq != null) builder.setFromSeq(fromSeq);
         return toResponse(reactiveStub.cdcPollBatch(builder.build()))
                 .map(response -> new CdcBatch(
-                        response.getEventsList().stream().map(GrpcConnection::mapCDCEvent).toList(),
+                        response.getEventsList().stream().map(GrpcConnectionDelegate::mapCDCEvent).toList(),
                         response.getNextSeq()))
                 .onErrorResume(
                         error -> Status.fromThrowable(error).getCode() == Code.UNIMPLEMENTED,
@@ -1321,19 +1385,19 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	private static <T> Mono<T> toResponse(Mono<T> mono) {
-		return mono.onErrorMap(GrpcConnection::mapGrpcStatusError);
+		return mono.onErrorMap(GrpcConnectionDelegate::mapGrpcStatusError);
 	}
 
 	private static <T> Flux<T> toResponse(Flux<T> flux) {
-		return flux.onErrorMap(GrpcConnection::mapGrpcStatusError);
+		return flux.onErrorMap(GrpcConnectionDelegate::mapGrpcStatusError);
 	}
 
 	private static <T> Flux<T> toReadResponse(Flux<T> flux) {
-		return flux.onErrorMap(GrpcConnection::mapReadDeadlineError);
+		return flux.onErrorMap(GrpcConnectionDelegate::mapReadDeadlineError);
 	}
 
 	private <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture, Function<T, U> mapper) {
-		return toResponse(listenableFuture, mapper, GrpcConnection::mapGrpcStatusError);
+		return toResponse(listenableFuture, mapper, GrpcConnectionDelegate::mapGrpcStatusError);
 	}
 
 	private <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture,

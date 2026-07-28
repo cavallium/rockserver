@@ -188,7 +188,7 @@ database: {
     }
 
     private void doRangeCancel(Random rnd) {
-        var pub = db.getRangeAsync(0, colId, null, null, rnd.nextBoolean(), RequestType.allInRange(), Duration.ofSeconds(5).toMillis());
+        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, rnd.nextBoolean(), RequestType.allInRange(), Duration.ofSeconds(5).toMillis());
         var d = reactor.core.publisher.Flux.from(pub).take(1 + rnd.nextInt(5)).subscribe();
         d.dispose();
     }
@@ -215,7 +215,7 @@ database: {
         Keys start = (fromBuf != null) ? new Keys(new Buf[]{fromBuf}) : null;
         Keys end = (toBuf != null) ? new Keys(new Buf[]{toBuf}) : null;
         boolean reverse = rnd.nextBoolean();
-        var pub = db.getRangeAsync(0, colId, start, end, reverse, RequestType.allInRange(), Duration.ofSeconds(10).toMillis());
+        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, start, end, reverse, RequestType.allInRange(), Duration.ofSeconds(10).toMillis());
         var sub = reactor.core.publisher.Flux.from(pub).take(1 + rnd.nextInt(8)).subscribe();
         subs.add(sub);
     }

@@ -53,8 +53,8 @@ module rockserver.core {
 	opens it.cavallium.rockserver.core.config to org.github.gestalt.core, org.github.gestalt.hocon;
 	opens it.cavallium.rockserver.core.client to rockserver.core.test;
 	opens it.cavallium.rockserver.core.impl to rockserver.core.test;
-	exports it.cavallium.rockserver.core.impl.rocksdb;
-	exports it.cavallium.rockserver.core.impl;
+	exports it.cavallium.rockserver.core.impl.rocksdb to rockserver.core.test;
+	exports it.cavallium.rockserver.core.impl to rockserver.core.test;
 	exports it.cavallium.rockserver.core.common.api.proto;
 	exports it.cavallium.rockserver.core.server to rockserver.core.test;
 }

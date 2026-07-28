@@ -63,7 +63,7 @@ class CdcLastCommittedSequenceTransportTest {
 			RocksDBAPI api = testDB.getAPI();
 			String subscriptionId = "replica-watermark";
 
-			assertEquals(embedded.cdcGetEarliestAvailableSequence(), readEarliest(api, connection.type()));
+			assertEquals(embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcGetEarliestAvailableSequence(), readEarliest(api, connection.type()));
 			assertEquals(OptionalLong.empty(), read(api, connection.type(), subscriptionId));
 
 			create(api, connection.type(), subscriptionId, 1L, null, false);
@@ -152,7 +152,7 @@ class CdcLastCommittedSequenceTransportTest {
 						Buf.wrap(new byte[] {1}),
 						RequestType.none());
 
-				var batch = client.cdcPollBatchAsync("filtered", startSeq, 100)
+				var batch = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("filtered", startSeq, 100)
 						.block(Duration.ofSeconds(10));
 				assertNotNull(batch);
 				assertTrue(batch.events().isEmpty());
@@ -162,7 +162,7 @@ class CdcLastCommittedSequenceTransportTest {
 				var selectedKey = new Keys(Buf.wrap(new byte[] {0, 0, 0, 2}));
 				var selectedValue = Buf.wrap(new byte[] {2});
 				api.put(0, selectedColumn, selectedKey, selectedValue, RequestType.none());
-				var selectedBatch = client.cdcPollBatchAsync("filtered", batch.nextSeq(), 100)
+				var selectedBatch = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("filtered", batch.nextSeq(), 100)
 						.block(Duration.ofSeconds(10));
 				assertNotNull(selectedBatch);
 				assertEquals(1, selectedBatch.events().size());
@@ -223,17 +223,17 @@ class CdcLastCommittedSequenceTransportTest {
 					maxFrameSize,
 					maxResponseSize)) {
 				var schema = ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true);
-				long columnId = embedded.createColumn("budgeted", schema);
-				long startSeq = embedded.cdcCreate("budgeted", null, List.of(columnId), false);
+				long columnId = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("budgeted", schema);
+				long startSeq = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("budgeted", null, List.of(columnId), false);
 				for (int i = 0; i < 3; i++) {
-					embedded.put(0,
+					embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0,
 							columnId,
 							new Keys(Buf.wrap(new byte[] {0, 0, 0, (byte) i})),
 							Buf.wrap(new byte[128]),
 							RequestType.none());
 				}
 
-				var expected = embedded.cdcPollBatchAsync("budgeted", startSeq, 100)
+				var expected = embedded.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("budgeted", startSeq, 100)
 						.block(Duration.ofSeconds(10));
 				assertNotNull(expected);
 				assertEquals(3, expected.events().size());
@@ -241,7 +241,7 @@ class CdcLastCommittedSequenceTransportTest {
 				var received = new ArrayList<it.cavallium.rockserver.core.common.cdc.CDCEvent>();
 				long cursor = startSeq;
 				for (int poll = 0; poll < 10 && cursor != expected.nextSeq(); poll++) {
-					var page = client.cdcPollBatchAsync("budgeted", cursor, 100)
+					var page = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("budgeted", cursor, 100)
 							.block(Duration.ofSeconds(10));
 					assertNotNull(page);
 					assertEquals(1, page.events().size(), "the configured boundary should fit one event group");
@@ -272,9 +272,9 @@ class CdcLastCommittedSequenceTransportTest {
 				var server = new ThriftServer(embedded, "127.0.0.1", port, maxFrameSize)) {
 			server.start();
 			var schema = ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true);
-			long columnId = embedded.createColumn("oversized", schema);
-			long startSeq = embedded.cdcCreate("oversized", null, List.of(columnId), false);
-			embedded.put(0,
+			long columnId = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("oversized", schema);
+			long startSeq = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("oversized", null, List.of(columnId), false);
+			embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0,
 					columnId,
 					new Keys(Buf.wrap(new byte[] {0, 0, 0, 1})),
 					Buf.wrap(new byte[512]),
@@ -286,7 +286,7 @@ class CdcLastCommittedSequenceTransportTest {
 					maxFrameSize,
 					256)) {
 				var error = assertThrows(RocksDBException.class,
-						() -> constrainedClient.cdcPollBatchAsync("oversized", startSeq, 100)
+						() -> constrainedClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("oversized", startSeq, 100)
 								.block(Duration.ofSeconds(10)));
 				assertEquals(RocksDBException.RocksDBErrorType.CDC_RESPONSE_TOO_LARGE,
 						error.getErrorUniqueId());
@@ -299,7 +299,7 @@ class CdcLastCommittedSequenceTransportTest {
 					port,
 					maxFrameSize,
 					2048)) {
-				var recovered = largerClient.cdcPollBatchAsync("oversized", startSeq, 100)
+				var recovered = largerClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("oversized", startSeq, 100)
 						.block(Duration.ofSeconds(10));
 				assertNotNull(recovered);
 				assertEquals(1, recovered.events().size(),
@@ -315,13 +315,13 @@ class CdcLastCommittedSequenceTransportTest {
 		Path databasePath = tempDir.resolve("db-reopen");
 
 		try (var embedded = new EmbeddedConnection(databasePath, "cdc-watermark", configFile)) {
-			embedded.cdcCreate("replica-watermark", 1L, null);
-			embedded.cdcCommit("replica-watermark", 42L);
+			embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("replica-watermark", 1L, null);
+			embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("replica-watermark", 42L);
 		}
 
 		try (var reopened = new EmbeddedConnection(databasePath, "cdc-watermark-reopened", configFile)) {
 			assertEquals(OptionalLong.of(42L),
-					reopened.cdcGetLastCommittedSequence("replica-watermark"));
+					reopened.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcGetLastCommittedSequence("replica-watermark"));
 		}
 	}
 

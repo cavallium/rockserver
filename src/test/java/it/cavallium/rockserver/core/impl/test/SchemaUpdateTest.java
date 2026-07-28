@@ -55,17 +55,17 @@ public class SchemaUpdateTest {
         // --- STEP 1: V1 ---
         try (EmbeddedConnection db = new EmbeddedConnection(tempDir, dbName, configV1)) {
             // Create column with V1 schema (explicit class name)
-            colId = db.createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.MyStringAppendOperator"));
+            colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.MyStringAppendOperator"));
             
             // Create CDC subscription (Resolved=true)
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), true);
 
             // Put "A", Merge "B" -> "A,B"
-            db.put(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("A".getBytes()), RequestType.none());
-            db.merge(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("B".getBytes()), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("A".getBytes()), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("B".getBytes()), RequestType.none());
 
             // Verify
-            Buf val = db.get(0, colId, new Keys(Buf.wrap(intToBytes(1))), RequestType.current());
+            Buf val = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, new Keys(Buf.wrap(intToBytes(1))), RequestType.current());
             assertEquals("A,B", new String(val.toByteArray()));
         }
 
@@ -73,12 +73,12 @@ public class SchemaUpdateTest {
         try (EmbeddedConnection db = new EmbeddedConnection(tempDir, dbName, configV2)) {
             // Call createColumn with V2 schema (New Class Name)
             // This exercises the fix: schema update on disk
-            colId = db.createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.test.MyStringAppendOperatorV2"));
+            colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.test.MyStringAppendOperatorV2"));
             
             // Merge "C" -> Should use V2 (semicolon) -> "A,B;C"
-            db.merge(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("C".getBytes()), RequestType.none());
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("C".getBytes()), RequestType.none());
 
-            Buf val = db.get(0, colId, new Keys(Buf.wrap(intToBytes(1))), RequestType.current());
+            Buf val = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, new Keys(Buf.wrap(intToBytes(1))), RequestType.current());
             String valStr = new String(val.toByteArray());
             System.out.println("[DEBUG_LOG] Result value: " + valStr);
             assertTrue(valStr.contains(";"), "Result " + valStr + " should contain semicolon, proving V2 was used");

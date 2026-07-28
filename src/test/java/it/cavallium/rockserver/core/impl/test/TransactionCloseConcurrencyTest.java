@@ -31,7 +31,7 @@ class TransactionCloseConcurrencyTest {
 	void duplicateCommitsSerializeAndBalanceTheTransactionOnce() throws Exception {
 		try (var db = new EmbeddedConnection(tempDir.resolve("duplicate-close"), "duplicate-close", null)) {
 			EmbeddedDB internal = db.getInternalDB();
-			long transactionId = db.openTransaction(10_000);
+			long transactionId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(10_000);
 			Object transactionMonitor = getTransactionMonitor(internal, transactionId);
 			assertEquals(1, internal.getOpenTransactionsCount());
 			assertEquals(1, internal.getPendingOpsCount());
@@ -71,7 +71,7 @@ class TransactionCloseConcurrencyTest {
 		ready.countDown();
 		start.await();
 		try {
-			return new CloseResult(db.closeTransaction(transactionId, true), null);
+			return new CloseResult(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(transactionId, true), null);
 		} catch (Throwable error) {
 			return new CloseResult(false, error);
 		}

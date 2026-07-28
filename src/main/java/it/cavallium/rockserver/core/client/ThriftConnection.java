@@ -81,7 +81,61 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
-public class ThriftConnection extends BaseConnection implements RocksDBAPI {
+/** Public Thrift connection. Database operations are exposed only by context-bound API views. */
+public final class ThriftConnection extends BaseConnection {
+
+	private final ThriftConnectionDelegate delegate;
+
+	public ThriftConnection(String name, String host, int port) throws TException {
+		super(name);
+		this.delegate = new ThriftConnectionDelegate(name, host, port);
+	}
+
+	public ThriftConnection(String name,
+			String host,
+			int port,
+			int maxFrameSize,
+			int maxCdcResponseSize) throws TException {
+		super(name);
+		this.delegate = new ThriftConnectionDelegate(name,
+				host,
+				port,
+				maxFrameSize,
+				maxCdcResponseSize);
+	}
+
+	@Override
+	public URI getUrl() {
+		return delegate.getUrl();
+	}
+
+	@Override
+	public void close() throws IOException {
+		delegate.close();
+		super.close();
+	}
+
+	@Override
+	<R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+		return delegate.requestSync(context, request);
+	}
+
+	@Override
+	<R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+		return delegate.requestAsync(context, request);
+	}
+
+	@Override
+	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+			String id,
+			Long fromSeq,
+			long maxEvents) {
+		return delegate.cdcPollBatchAsync(context, id, fromSeq, maxEvents);
+	}
+}
+
+/** Package-private raw implementation behind {@link ThriftConnection}. */
+final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAPI {
 
 	private final URI uri;
 	private final String host;
@@ -95,18 +149,18 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	private final Scheduler executorScheduler;
 	private final AtomicBoolean closed = new AtomicBoolean();
 
-	public ThriftConnection(String name, String host, int port) throws TException {
+	ThriftConnectionDelegate(String name, String host, int port) throws TException {
 		this(name, host, port, ThriftTransportLimits.configuredClientLimits());
 	}
 
-	private ThriftConnection(String name,
+	private ThriftConnectionDelegate(String name,
 			String host,
 			int port,
 			ThriftTransportLimits.ClientLimits limits) throws TException {
 		this(name, host, port, limits.maxFrameSize(), limits.maxCdcResponseSize());
 	}
 
-	public ThriftConnection(String name,
+	ThriftConnectionDelegate(String name,
 			String host,
 			int port,
 			int maxFrameSize,
@@ -988,6 +1042,14 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+			String id,
+			Long fromSeq,
+			long maxEvents) {
+		return withRequestContext(context, () -> cdcPollBatchAsync(id, fromSeq, maxEvents));
+	}
+
+	@Override
 	public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
 		var context = currentRequestContext();
 		return Mono.fromCallable(() -> withRequestContext(context, () -> cdcPollBatch(id, fromSeq, maxEvents)))
@@ -1037,7 +1099,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			}
 			var batch = client.cdcPollBatch(request);
 			return new CdcBatch(batch.getEvents().stream()
-					.map(ThriftConnection::mapCdcEvent)
+					.map(ThriftConnectionDelegate::mapCdcEvent)
 					.toList(), batch.getNextSeq());
 		} catch (TException e) {
 			throw wrap(e);

@@ -47,7 +47,7 @@ database: {
 }
 """);
 		db = new EmbeddedConnection(null, "multi-tx-test-db", configFile);
-		colIdNoBuckets = db.createColumn("test-column-no-buckets", SCHEMA_NO_BUCKETS);
+		colIdNoBuckets = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test-column-no-buckets", SCHEMA_NO_BUCKETS);
 	}
 
 	@AfterEach
@@ -64,24 +64,24 @@ database: {
 		var value2 = toBufSimple(20);
 
 		// First, populate key2 to have a conflict later
-		db.put(0, colIdNoBuckets, key2, toBufSimple(0), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key2, toBufSimple(0), RequestType.none());
 
 		// Holder 1 gets forUpdate on key1 and key2
-		var fu1_k1 = db.get(0, colIdNoBuckets, key1, RequestType.forUpdate());
-		var fu1_k2 = db.get(fu1_k1.updateId(), colIdNoBuckets, key2, RequestType.forUpdate());
+		var fu1_k1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.forUpdate());
+		var fu1_k2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(fu1_k1.updateId(), colIdNoBuckets, key2, RequestType.forUpdate());
 		long updateId1 = fu1_k1.updateId();
 
 		// Holder 2 gets forUpdate on key2
-		var fu2_k2 = db.get(0, colIdNoBuckets, key2, RequestType.forUpdate());
+		var fu2_k2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key2, RequestType.forUpdate());
 		long updateId2 = fu2_k2.updateId();
 
 		// Holder 2 commits key2
-		db.put(updateId2, colIdNoBuckets, key2, toBufSimple(100), RequestType.none());
+		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(updateId2, colIdNoBuckets, key2, toBufSimple(100), RequestType.none());
 
 		// Holder 1 tries putMulti on key1 and key2.
 		// It should fail on key2 because holder 2 committed.
 		try {
-			db.putMulti(updateId1, colIdNoBuckets, List.of(key1, key2), List.of(value1, value2), RequestType.none());
+			db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMulti(updateId1, colIdNoBuckets, List.of(key1, key2), List.of(value1, value2), RequestType.none());
 			Assertions.fail("Should have thrown RocksDBRetryException");
 		} catch (RocksDBRetryException e) {
 			// Expected
@@ -89,8 +89,8 @@ database: {
 
 		// The failed multi-operation must not leak its successful prefix, and it must not
 		// roll back the competing transaction that caused the conflict.
-		Assertions.assertNull(db.get(0, colIdNoBuckets, key1, RequestType.current()));
-		assertBufEquals(toBufSimple(100), db.get(0, colIdNoBuckets, key2, RequestType.current()));
+		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key1, RequestType.current()));
+		assertBufEquals(toBufSimple(100), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colIdNoBuckets, key2, RequestType.current()));
 	}
 
 	private static void assertBufEquals(Buf expected, Buf actual) {

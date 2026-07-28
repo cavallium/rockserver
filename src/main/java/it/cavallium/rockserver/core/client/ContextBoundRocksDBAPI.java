@@ -3,7 +3,6 @@ package it.cavallium.rockserver.core.client;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBAPI;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
-import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import java.util.Objects;
@@ -42,7 +41,6 @@ final class ContextBoundRocksDBAPI implements RocksDBAPI {
 		// filtered-empty pages still advance and transports enforce a response budget.
 		// Preserve the concrete connection implementation while binding the protected
 		// CDC dispatch to this immutable API view.
-		return dispatcher.withRequestContext(context,
-				() -> ((RocksDBAsyncAPI) dispatcher).cdcPollBatchAsync(id, fromSeq, maxEvents));
+		return dispatcher.cdcPollBatchAsync(context, id, fromSeq, maxEvents);
 	}
 }

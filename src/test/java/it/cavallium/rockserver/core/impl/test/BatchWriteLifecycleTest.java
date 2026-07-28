@@ -42,7 +42,7 @@ class BatchWriteLifecycleTest {
 	@Test
 	void putBatchProcessingFailureCancelsUpstreamAndReleasesNativeState() throws Exception {
 		try (var db = new EmbeddedConnection(tempDir.resolve("put-failure"), "put-failure", null)) {
-			long columnId = db.createColumn("data", fixedColumnSchema());
+			long columnId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("data", fixedColumnSchema());
 			var subscribed = new CountDownLatch(1);
 			var cancelled = new CountDownLatch(1);
 			var source = Flux.just(mismatchedBatch(false))
@@ -63,7 +63,7 @@ class BatchWriteLifecycleTest {
 	@Test
 	void mergeBatchProcessingFailureRollsBackItsBucketTransaction() throws Exception {
 		try (var db = new EmbeddedConnection(tempDir.resolve("merge-failure"), "merge-failure", null)) {
-			long columnId = db.createColumn("bucketed", bucketedColumnSchema());
+			long columnId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("bucketed", bucketedColumnSchema());
 			var subscribed = new CountDownLatch(1);
 			var cancelled = new CountDownLatch(1);
 			var source = Flux.just(mismatchedBatch(true))
@@ -85,7 +85,7 @@ class BatchWriteLifecycleTest {
 	@Test
 	void cancellingTheReturnedFutureCancelsTheSourceAndReleasesTheWriter() throws Exception {
 		try (var db = new EmbeddedConnection(tempDir.resolve("put-cancel"), "put-cancel", null)) {
-			long columnId = db.createColumn("data", fixedColumnSchema());
+			long columnId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("data", fixedColumnSchema());
 			var subscribed = new CountDownLatch(1);
 			var cancelled = new CountDownLatch(1);
 			var source = Flux.<KVBatch>never()
@@ -109,7 +109,7 @@ class BatchWriteLifecycleTest {
 		var droppedError = new AtomicReference<Throwable>();
 		Hooks.onErrorDropped(error -> droppedError.compareAndSet(null, error));
 		try (var db = new EmbeddedConnection(tempDir.resolve("put-active-cancel"), "put-active-cancel", null)) {
-			long columnId = db.createColumn("data", fixedColumnSchema());
+			long columnId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("data", fixedColumnSchema());
 			var key = new Keys(new Buf[] {Buf.wrap(new byte[] {0, 0, 0, 7})});
 			var value = Buf.wrap(new byte[] {7});
 			var source = Flux.just(blockingBatch(key, value, callbackEntered, releaseCallback))
@@ -130,7 +130,7 @@ class BatchWriteLifecycleTest {
 
 			assertTrue(future.isCancelled());
 			assertNull(droppedError.get(), "closing an active writer must not cause a dropped native error");
-			assertFalse(db.get(0, columnId, key, it.cavallium.rockserver.core.common.RequestType.exists()),
+			assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, columnId, key, it.cavallium.rockserver.core.common.RequestType.exists()),
 					"a cancelled write batch must not publish its pending write");
 		} finally {
 			releaseCallback.countDown();
@@ -146,7 +146,7 @@ class BatchWriteLifecycleTest {
 		var droppedError = new AtomicReference<Throwable>();
 		Hooks.onErrorDropped(error -> droppedError.compareAndSet(null, error));
 		try (var db = new EmbeddedConnection(tempDir.resolve("merge-active-cancel"), "merge-active-cancel", null)) {
-			long columnId = db.createColumn("bucketed", bucketedColumnSchema());
+			long columnId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("bucketed", bucketedColumnSchema());
 			var key = new Keys(new Buf[] {
 					Buf.wrap(new byte[] {0, 0, 0, 8}),
 					Buf.wrap(new byte[] {8})
@@ -173,7 +173,7 @@ class BatchWriteLifecycleTest {
 			assertTrue(future.isCancelled());
 			assertEquals(0, db.getInternalDB().getOpenTransactionsCount());
 			assertNull(droppedError.get(), "deferred rollback must not race the active merge callback");
-			assertFalse(db.get(0, columnId, key, it.cavallium.rockserver.core.common.RequestType.exists()),
+			assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, columnId, key, it.cavallium.rockserver.core.common.RequestType.exists()),
 					"the private merge transaction must be rolled back on cancellation");
 		} finally {
 			releaseCallback.countDown();
