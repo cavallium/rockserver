@@ -11,7 +11,24 @@ pub use crate::proto::{
 impl RequestContext {
 	/// Create a mandatory caller context. Protected profiles are rejected by Rockserver.
 	pub fn for_profile(profile: WorkloadProfile, deadline_epoch_millis: i64) -> Self {
-		Self { profile: profile as i32, deadline_epoch_millis }
+		let profile = match profile {
+			WorkloadProfile::Latency => 2,
+			WorkloadProfile::Analytical => 3,
+			WorkloadProfile::Ingest => 4,
+			WorkloadProfile::Batch => 6,
+			WorkloadProfile::Unspecified
+			| WorkloadProfile::Control
+			| WorkloadProfile::Cdc
+			| WorkloadProfile::PhysicalMaintenance => {
+				panic!("workload profile is owned by Rockserver")
+			}
+		};
+		assert!(deadline_epoch_millis > 0, "deadline_epoch_millis must be positive");
+		assert!(
+			profile != 2 || deadline_epoch_millis != i64::MAX,
+			"LATENCY requires a finite deadline"
+		);
+		Self { profile, deadline_epoch_millis }
 	}
 
 	/// Context for request-bound work with an absolute Unix-epoch deadline.

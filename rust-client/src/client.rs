@@ -1,5 +1,6 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::transport::Channel;
-use tonic::Status;
+use tonic::{Request, Status};
 use futures::{Stream, StreamExt};
 use crate::proto::rocks_db_service_client::RocksDbServiceClient;
 use crate::proto::*; // For request/response types
@@ -55,6 +56,66 @@ impl RockserverClient {
 		}
 	}
 
+	fn contextual_request<T>(&self, message: T) -> Result<Request<T>> {
+		self.contextual_request_with_timeout(message, None)
+	}
+
+	fn contextual_request_with_timeout<T>(
+		&self,
+		message: T,
+		operation_timeout_ms: Option<i64>,
+	) -> Result<Request<T>> {
+		match self.context.profile {
+			2 | 3 | 4 | 6 => {}
+			0 => return Err(Status::invalid_argument("request workload profile is required")),
+			1 | 5 | 7 => {
+				return Err(Status::invalid_argument("workload profile is owned by Rockserver"));
+			}
+			value => {
+				return Err(Status::invalid_argument(format!(
+					"unknown workload profile: {value}"
+				)));
+			}
+		}
+		if self.context.deadline_epoch_millis <= 0 {
+			return Err(Status::invalid_argument("deadline_epoch_millis must be positive"));
+		}
+		if self.context.profile == 2 && self.context.deadline_epoch_millis == i64::MAX {
+			return Err(Status::invalid_argument("LATENCY requires a finite deadline"));
+		}
+
+		let mut timeout = if self.context.deadline_epoch_millis == i64::MAX {
+			None
+		} else {
+			let now_millis = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.map_err(|_| Status::internal("system clock is before the Unix epoch"))?
+				.as_millis()
+				.min(i64::MAX as u128) as i64;
+			let remaining_millis = self.context.deadline_epoch_millis - now_millis;
+			if remaining_millis <= 0 {
+				return Err(Status::deadline_exceeded("request deadline already expired"));
+			}
+			Some(Duration::from_millis(remaining_millis as u64))
+		};
+
+		if let Some(operation_timeout_ms) = operation_timeout_ms {
+			if operation_timeout_ms < 0 {
+				return Err(Status::invalid_argument("operation timeout must be non-negative"));
+			}
+			if operation_timeout_ms != i64::MAX {
+				let operation_timeout = Duration::from_millis(operation_timeout_ms as u64);
+				timeout = Some(timeout.map_or(operation_timeout, |value| value.min(operation_timeout)));
+			}
+		}
+
+		let mut request = Request::new(message);
+		if let Some(timeout) = timeout {
+			request.set_timeout(timeout);
+		}
+		Ok(request)
+	}
+
     // ============================================================================================
     // Transaction Management
     // ============================================================================================
@@ -68,7 +129,7 @@ impl RockserverClient {
     /// The transaction ID.
     pub async fn open_transaction(&self, timeout_ms: i64) -> Result<i64> {
 		let req = OpenTransactionRequest { timeout_ms, context: Some(self.context.clone()) };
-        let resp = self.client.clone().open_transaction(req).await?;
+		let resp = self.client.clone().open_transaction(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().transaction_id)
     }
 
@@ -88,7 +149,8 @@ impl RockserverClient {
             commit,
             context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().close_transaction(req).await?;
+		let request = if commit { self.contextual_request(req)? } else { Request::new(req) };
+		let resp = self.client.clone().close_transaction(request).await?;
         Ok(resp.into_inner().successful)
     }
 
@@ -110,14 +172,14 @@ impl RockserverClient {
             schema: Some(schema.into()),
             context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().create_column(req).await?;
+		let resp = self.client.clone().create_column(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().column_id)
     }
 
     /// Deletes a column by its ID.
     pub async fn delete_column(&self, column_id: i64) -> Result<()> {
         let req = DeleteColumnRequest { column_id, context: Some(self.context.clone()) };
-        self.client.clone().delete_column(req).await?;
+		self.client.clone().delete_column(self.contextual_request(req)?).await?;
         Ok(())
     }
 
@@ -126,28 +188,28 @@ impl RockserverClient {
     /// Returns `true` when a physical column was deleted and `false` when it was already absent.
     pub async fn delete_column_if_exists(&self, name: String) -> Result<bool> {
         let req = DeleteColumnIfExistsRequest { name, context: Some(self.context.clone()) };
-        let resp = self.client.clone().delete_column_if_exists(req).await?;
+		let resp = self.client.clone().delete_column_if_exists(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().deleted)
     }
 
     /// Retrieves the ID of a column by its name.
     pub async fn get_column_id(&self, name: String) -> Result<i64> {
 		let req = GetColumnIdRequest { name, context: Some(self.context.clone()) };
-        let resp = self.client.clone().get_column_id(req).await?;
+		let resp = self.client.clone().get_column_id(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().column_id)
     }
 
     /// Returns RocksDB's unbounded estimate of physical keys in a column.
     pub async fn estimate_num_keys(&self, column_id: i64) -> Result<i64> {
 		let req = EstimateNumKeysRequest { column_id, context: Some(self.context.clone()) };
-        let resp = self.client.clone().estimate_num_keys(req).await?;
+		let resp = self.client.clone().estimate_num_keys(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().count)
     }
 
     /// Retrieves definitions for all existing columns.
     pub async fn get_all_column_definitions(&self) -> Result<Vec<Column>> {
 		let req = GetAllColumnDefinitionsRequest { context: Some(self.context.clone()) };
-        let resp = self.client.clone().get_all_column_definitions(req).await?;
+		let resp = self.client.clone().get_all_column_definitions(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().columns.into_iter().map(|c| c.into()).collect())
     }
 
@@ -163,7 +225,7 @@ impl RockserverClient {
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-        self.client.clone().put(req).await?;
+		self.client.clone().put(self.contextual_request(req)?).await?;
         Ok(())
     }
     
@@ -175,7 +237,7 @@ impl RockserverClient {
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().put_get_previous(req).await?;
+		let resp = self.client.clone().put_get_previous(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().previous)
     }
 
@@ -187,7 +249,7 @@ impl RockserverClient {
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().put_get_delta(req).await?;
+		let resp = self.client.clone().put_get_delta(self.contextual_request(req)?).await?;
         Ok(resp.into_inner())
     }
 
@@ -199,7 +261,7 @@ impl RockserverClient {
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().put_get_changed(req).await?;
+		let resp = self.client.clone().put_get_changed(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().changed)
     }
 
@@ -211,7 +273,7 @@ impl RockserverClient {
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().put_get_previous_presence(req).await?;
+		let resp = self.client.clone().put_get_previous_presence(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().present)
     }
 
@@ -241,7 +303,7 @@ impl RockserverClient {
             }
         };
 
-        self.client.clone().put_batch(request_stream).await?;
+		self.client.clone().put_batch(self.contextual_request(request_stream)?).await?;
         Ok(())
     }
     
@@ -271,7 +333,7 @@ impl RockserverClient {
             }
         };
 
-        self.client.clone().merge_batch(request_stream).await?;
+		self.client.clone().merge_batch(self.contextual_request(request_stream)?).await?;
         Ok(())
     }
 
@@ -290,7 +352,7 @@ impl RockserverClient {
             }),
             data,
         };
-        self.client.clone().put_multi_list(req).await?;
+		self.client.clone().put_multi_list(self.contextual_request(req)?).await?;
         Ok(())
     }
 
@@ -320,7 +382,7 @@ impl RockserverClient {
             }
         };
 
-        self.client.clone().put_multi(request_stream).await?;
+		self.client.clone().put_multi(self.contextual_request(request_stream)?).await?;
         Ok(())
     }
 
@@ -350,7 +412,7 @@ impl RockserverClient {
             }
         };
 
-        let resp = self.client.clone().put_multi_get_previous(request_stream).await?;
+		let resp = self.client.clone().put_multi_get_previous(self.contextual_request(request_stream)?).await?;
         Ok(resp.into_inner())
     }
 
@@ -380,7 +442,7 @@ impl RockserverClient {
             }
         };
 
-        let resp = self.client.clone().put_multi_get_delta(request_stream).await?;
+		let resp = self.client.clone().put_multi_get_delta(self.contextual_request(request_stream)?).await?;
         Ok(resp.into_inner())
     }
 
@@ -410,7 +472,7 @@ impl RockserverClient {
             }
         };
 
-        let resp = self.client.clone().put_multi_get_changed(request_stream).await?;
+		let resp = self.client.clone().put_multi_get_changed(self.contextual_request(request_stream)?).await?;
         Ok(resp.into_inner())
     }
 
@@ -440,7 +502,7 @@ impl RockserverClient {
             }
         };
 
-        let resp = self.client.clone().put_multi_get_previous_presence(request_stream).await?;
+		let resp = self.client.clone().put_multi_get_previous_presence(self.contextual_request(request_stream)?).await?;
         Ok(resp.into_inner())
     }
 
@@ -456,7 +518,7 @@ impl RockserverClient {
             keys,
             context: Some(self.context.clone()),
         };
-        self.client.clone().delete(req).await?;
+		self.client.clone().delete(self.contextual_request(req)?).await?;
         Ok(())
     }
 
@@ -473,7 +535,7 @@ impl RockserverClient {
             keys,
             context: Some(self.context.clone()),
         };
-        let response = self.client.clone().delete_get_previous(req).await?;
+		let response = self.client.clone().delete_get_previous(self.contextual_request(req)?).await?;
         Ok(response.into_inner().previous)
     }
 
@@ -490,7 +552,7 @@ impl RockserverClient {
             keys,
             context: Some(self.context.clone()),
         };
-        let response = self.client.clone().delete_get_previous_presence(req).await?;
+		let response = self.client.clone().delete_get_previous_presence(self.contextual_request(req)?).await?;
         Ok(response.into_inner().present)
     }
 
@@ -507,7 +569,7 @@ impl RockserverClient {
             end_keys_exclusive,
             context: Some(self.context.clone()),
         };
-        self.client.clone().delete_range(req).await?;
+		self.client.clone().delete_range(self.contextual_request(req)?).await?;
         Ok(())
     }
 
@@ -519,7 +581,7 @@ impl RockserverClient {
         keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
     ) -> Result<()> {
         let requests = self.delete_multi_requests(transaction_or_update_id, column_id, keys);
-        self.client.clone().delete_multi(requests).await?;
+		self.client.clone().delete_multi(self.contextual_request(requests)?).await?;
         Ok(())
     }
 
@@ -531,7 +593,7 @@ impl RockserverClient {
         keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
     ) -> Result<impl Stream<Item = Result<Previous>>> {
         let requests = self.delete_multi_requests(transaction_or_update_id, column_id, keys);
-        let response = self.client.clone().delete_multi_get_previous(requests).await?;
+		let response = self.client.clone().delete_multi_get_previous(self.contextual_request(requests)?).await?;
         Ok(response.into_inner())
     }
 
@@ -543,7 +605,7 @@ impl RockserverClient {
         keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
     ) -> Result<impl Stream<Item = Result<PreviousPresence>>> {
         let requests = self.delete_multi_requests(transaction_or_update_id, column_id, keys);
-        let response = self.client.clone().delete_multi_get_previous_presence(requests).await?;
+		let response = self.client.clone().delete_multi_get_previous_presence(self.contextual_request(requests)?).await?;
         Ok(response.into_inner())
     }
 
@@ -605,7 +667,7 @@ impl RockserverClient {
             }
         };
 
-        self.client.clone().merge_multi(request_stream).await?;
+		self.client.clone().merge_multi(self.contextual_request(request_stream)?).await?;
         Ok(())
     }
 
@@ -635,7 +697,7 @@ impl RockserverClient {
             }
         };
 
-        let resp = self.client.clone().merge_multi_get_merged(request_stream).await?;
+		let resp = self.client.clone().merge_multi_get_merged(self.contextual_request(request_stream)?).await?;
         Ok(resp.into_inner())
     }
 
@@ -647,7 +709,7 @@ impl RockserverClient {
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-        self.client.clone().merge(req).await?;
+		self.client.clone().merge(self.contextual_request(req)?).await?;
         Ok(())
     }
 
@@ -659,7 +721,7 @@ impl RockserverClient {
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().merge_get_merged(req).await?;
+		let resp = self.client.clone().merge_get_merged(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().merged)
     }
 
@@ -675,7 +737,7 @@ impl RockserverClient {
 			keys,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().get(req).await?;
+		let resp = self.client.clone().get(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().value)
     }
 
@@ -687,7 +749,7 @@ impl RockserverClient {
 			keys,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().get_for_update(req).await?;
+		let resp = self.client.clone().get_for_update(self.contextual_request(req)?).await?;
         Ok(resp.into_inner())
     }
 
@@ -699,7 +761,7 @@ impl RockserverClient {
 			keys,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().exists(req).await?;
+		let resp = self.client.clone().exists(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().present)
     }
 
@@ -721,7 +783,9 @@ impl RockserverClient {
 			timeout_ms,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().exists_multi(req).await?;
+		let resp = self.client.clone().exists_multi(
+			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
+		).await?;
         Ok(resp.into_inner().present)
     }
 
@@ -748,7 +812,7 @@ impl RockserverClient {
 			timeout_ms,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().open_iterator(req).await?;
+		let resp = self.client.clone().open_iterator(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().iterator_id)
     }
 
@@ -762,7 +826,7 @@ impl RockserverClient {
     /// Seeks the iterator to a specific key.
     pub async fn seek_to(&self, iteration_id: i64, keys: Vec<Vec<u8>>) -> Result<()> {
 		let req = SeekToRequest { iteration_id, keys, context: Some(self.context.clone()) };
-        self.client.clone().seek_to(req).await?;
+		self.client.clone().seek_to(self.contextual_request(req)?).await?;
         Ok(())
     }
 
@@ -774,7 +838,7 @@ impl RockserverClient {
 			take_count,
 			context: Some(self.context.clone()),
         };
-        self.client.clone().subsequent(req).await?;
+		self.client.clone().subsequent(self.contextual_request(req)?).await?;
         Ok(())
     }
     
@@ -786,7 +850,7 @@ impl RockserverClient {
 			take_count,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().subsequent_exists(req).await?;
+		let resp = self.client.clone().subsequent_exists(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().present)
     }
 
@@ -803,7 +867,7 @@ impl RockserverClient {
 			take_count,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().subsequent_multi_get(req).await?;
+		let resp = self.client.clone().subsequent_multi_get(self.contextual_request(req)?).await?;
         Ok(resp.into_inner())
     }
 
@@ -830,7 +894,9 @@ impl RockserverClient {
 			timeout_ms,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().reduce_range_first_and_last(req).await?;
+		let resp = self.client.clone().reduce_range_first_and_last(
+			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
+		).await?;
         Ok(resp.into_inner())
     }
 
@@ -853,7 +919,9 @@ impl RockserverClient {
 			timeout_ms,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().reduce_range_entries_count(req).await?;
+		let resp = self.client.clone().reduce_range_entries_count(
+			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
+		).await?;
         Ok(resp.into_inner().count)
     }
     
@@ -876,7 +944,9 @@ impl RockserverClient {
 			timeout_ms,
 			context: Some(self.context.clone()),
         };
-        let resp = self.client.clone().get_all_in_range(req).await?;
+		let resp = self.client.clone().get_all_in_range(
+			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
+		).await?;
         Ok(resp.into_inner())
     }
 
@@ -888,7 +958,7 @@ impl RockserverClient {
 			shard_count,
 			context: Some(self.context.clone()),
 		};
-        let resp = self.client.clone().scan_raw(req).await?;
+		let resp = self.client.clone().scan_raw(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().map(|res| {
             match res {
                 Ok(batch) => decode_kv_batch(&batch.serialized),
@@ -1226,10 +1296,36 @@ mod workload_context_tests {
 	async fn client_views_retain_independent_workload_contexts() {
 		let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
 		let ingest = RockserverClient::new(channel, RequestContext::ingest());
-		assert_eq!(ingest.context.profile, WorkloadProfile::Ingest as i32);
+		assert_eq!(ingest.context.profile, 4);
 
 		let analytical = ingest.with_context(RequestContext::analytical());
-		assert_eq!(analytical.context.profile, WorkloadProfile::Analytical as i32);
-		assert_eq!(ingest.context.profile, WorkloadProfile::Ingest as i32);
+		assert_eq!(analytical.context.profile, 3);
+		assert_eq!(ingest.context.profile, 4);
+	}
+
+	#[tokio::test]
+	async fn operation_timeout_is_applied_as_the_smaller_tonic_deadline() {
+		let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+		let context = RequestContext::for_profile(
+			WorkloadProfile::Batch,
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 + 10_000,
+		);
+		let client = RockserverClient::new(channel, context);
+		let request = client.contextual_request_with_timeout((), Some(5)).unwrap();
+		assert_eq!(request.metadata().get("grpc-timeout").unwrap(), "5000000n");
+	}
+
+	#[tokio::test]
+	async fn expired_context_fails_before_transport() {
+		let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+		let context = RequestContext {
+			profile: 2,
+			deadline_epoch_millis: 1,
+		};
+		let error = RockserverClient::new(channel, context)
+			.get_column_id("never-sent".to_owned())
+			.await
+			.unwrap_err();
+		assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
 	}
 }

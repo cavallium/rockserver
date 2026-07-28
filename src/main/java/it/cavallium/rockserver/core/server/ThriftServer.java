@@ -199,13 +199,15 @@ public class ThriftServer extends Server {
 					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Request context and workload profile are required");
 		}
-		int profileIndex = wireContext.profile.getValue() - 1;
-		if (profileIndex < 0 || profileIndex >= it.cavallium.rockserver.core.common.WorkloadProfile.values().length) {
+		final it.cavallium.rockserver.core.common.WorkloadProfile profile;
+		try {
+			profile = it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(
+					wireContext.profile.getValue());
+		} catch (IllegalArgumentException unknown) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(
 					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Unknown workload profile: " + wireContext.profile.getValue());
+					unknown.getMessage(), unknown);
 		}
-		var profile = it.cavallium.rockserver.core.common.WorkloadProfile.values()[profileIndex];
 		if (!profile.isClientSelectable()) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(
 					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,

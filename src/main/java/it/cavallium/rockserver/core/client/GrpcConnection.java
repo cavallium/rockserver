@@ -52,7 +52,6 @@ import it.cavallium.rockserver.core.common.api.proto.ColumnHashType;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
 import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceFutureStub;
-import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.RocksDBServiceStub;
 import it.unimi.dsi.fastutil.ints.Int2IntFunction;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -111,7 +110,6 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	private final ManagedChannel channel;
 	private final ExecutorService callbackExecutor;
 	private final EventLoopGroup eventLoopGroup;
-	private final RocksDBServiceStub asyncStub;
 	private final RocksDBServiceFutureStub futureStub;
 	private final ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStub;
 	private final AtomicBoolean legacyCdcPollBatchWarningLogged = new AtomicBoolean();
@@ -170,7 +168,6 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		this.channel = channel;
 		this.callbackExecutor = callbackExecutor;
 		this.eventLoopGroup = eventLoopGroup;
-		this.asyncStub = RocksDBServiceGrpc.newStub(channel);
 		this.futureStub = RocksDBServiceGrpc.newFutureStub(channel);
 		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 		this.address = address;
@@ -302,7 +299,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setTimeoutMs(timeoutMs)
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.openTransaction(request), OpenTransactionResponse::getTransactionId);
+		return toResponse(futureStubWithRequestDeadline().openTransaction(request), OpenTransactionResponse::getTransactionId);
 	}
 
 	@Override
@@ -312,7 +309,8 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setCommit(commit)
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.closeTransaction(request), CloseTransactionResponse::getSuccessful);
+		var stub = commit ? futureStubWithRequestDeadline() : futureStub;
+		return toResponse(stub.closeTransaction(request), CloseTransactionResponse::getSuccessful);
 	}
 
 	@Override
@@ -331,12 +329,12 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setSchema(mapColumnSchema(schema))
 				.setContext(currentWireRequestContext());
 		var request = requestBuilder.build();
-		return toResponse(this.futureStub.createColumn(request), CreateColumnResponse::getColumnId);
+		return toResponse(futureStubWithRequestDeadline().createColumn(request), CreateColumnResponse::getColumnId);
 	}
 
 	@Override
 	public CompletableFuture<Long> uploadMergeOperatorAsync(String name, String className, byte[] jarData) {
-		return toResponse(futureStub.uploadMergeOperator(UploadMergeOperatorRequest.newBuilder()
+		return toResponse(futureStubWithRequestDeadline().uploadMergeOperator(UploadMergeOperatorRequest.newBuilder()
 				.setOperatorName(name)
 				.setClassName(className)
 				.setJarPayload(ByteString.copyFrom(jarData))
@@ -346,7 +344,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public CompletableFuture<Long> checkMergeOperatorAsync(String name, byte[] hash) {
-		return toResponse(futureStub.checkMergeOperator(CheckMergeOperatorRequest.newBuilder()
+		return toResponse(futureStubWithRequestDeadline().checkMergeOperator(CheckMergeOperatorRequest.newBuilder()
 				.setOperatorName(name)
 				.setHash(UnsafeByteOperations.unsafeWrap(hash))
 				.setContext(currentWireRequestContext())
@@ -359,7 +357,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setColumnId(columnId)
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.deleteColumn(request), _ -> null);
+		return toResponse(futureStubWithRequestDeadline().deleteColumn(request), _ -> null);
 	}
 
 	@Override
@@ -368,7 +366,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setName(name)
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.deleteColumnIfExists(request), DeleteColumnIfExistsResponse::getDeleted);
+		return toResponse(futureStubWithRequestDeadline().deleteColumnIfExists(request), DeleteColumnIfExistsResponse::getDeleted);
 	}
 
 	@Override
@@ -377,7 +375,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setName(name)
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.getColumnId(request), GetColumnIdResponse::getColumnId);
+		return toResponse(futureStubWithRequestDeadline().getColumnId(request), GetColumnIdResponse::getColumnId);
 	}
 
 	@Override
@@ -386,7 +384,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setColumnId(columnId)
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.estimateNumKeys(request), EntriesCount::getCount);
+		return toResponse(futureStubWithRequestDeadline().estimateNumKeys(request), EntriesCount::getCount);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -406,15 +404,15 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Null request type");
 		}
 		return (CompletableFuture<T>) switch (requestType) {
-			case RequestNothing<?> _ -> toResponse(this.futureStub.put(request), _ -> null);
+			case RequestNothing<?> _ -> toResponse(futureStubWithRequestDeadline().put(request), _ -> null);
 			case RequestPrevious<?> _ ->
-					toResponse(this.futureStub.putGetPrevious(request), GrpcConnection::mapPrevious);
+					toResponse(futureStubWithRequestDeadline().putGetPrevious(request), GrpcConnection::mapPrevious);
 			case RequestDelta<?> _ ->
-					toResponse(this.futureStub.putGetDelta(request), GrpcConnection::mapDelta);
+					toResponse(futureStubWithRequestDeadline().putGetDelta(request), GrpcConnection::mapDelta);
 			case RequestChanged<?> _ ->
-					toResponse(this.futureStub.putGetChanged(request), Changed::getChanged);
+					toResponse(futureStubWithRequestDeadline().putGetChanged(request), Changed::getChanged);
 			case RequestType.RequestPreviousPresence<?> _ ->
-					toResponse(this.futureStub.putGetPreviousPresence(request), PreviousPresence::getPresent);
+					toResponse(futureStubWithRequestDeadline().putGetPreviousPresence(request), PreviousPresence::getPresent);
 		};
 	}
 
@@ -434,11 +432,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setContext(currentWireRequestContext())
 				.build();
 		return (CompletableFuture<T>) switch (requestType) {
-			case RequestNothing<?> _ -> toResponse(this.futureStub.delete(request), _ -> null);
+			case RequestNothing<?> _ -> toResponse(futureStubWithRequestDeadline().delete(request), _ -> null);
 			case RequestPrevious<?> _ ->
-					toResponse(this.futureStub.deleteGetPrevious(request), GrpcConnection::mapPrevious);
+					toResponse(futureStubWithRequestDeadline().deleteGetPrevious(request), GrpcConnection::mapPrevious);
 			case RequestPreviousPresence<?> _ ->
-					toResponse(this.futureStub.deleteGetPreviousPresence(request), PreviousPresence::getPresent);
+					toResponse(futureStubWithRequestDeadline().deleteGetPreviousPresence(request), PreviousPresence::getPresent);
 		};
 	}
 
@@ -459,9 +457,9 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Null request type");
 		}
 		return (CompletableFuture<T>) switch (requestType) {
-			case RequestNothing<?> _ -> toResponse(this.futureStub.merge(request), _ -> null);
+			case RequestNothing<?> _ -> toResponse(futureStubWithRequestDeadline().merge(request), _ -> null);
 			case RequestType.RequestMerged<?> _ ->
-					toResponse(this.futureStub.mergeGetMerged(request), x ->
+					toResponse(futureStubWithRequestDeadline().mergeGetMerged(request), x ->
 							x.hasMerged() ? mapByteString(x.getMerged()) : null);
 		};
 	}
@@ -496,27 +494,27 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 		return (CompletableFuture<List<T>>) (switch (requestType) {
 			case RequestNothing<?> _ ->
-					toResponse(this.reactiveStub.putMulti(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().putMulti(inputRequests)
 						.ignoreElement()
 						.toFuture())
 						.thenApply(_ -> List.of());
 			case RequestPrevious<?> _ ->
-					toResponse(this.reactiveStub.putMultiGetPrevious(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().putMultiGetPrevious(inputRequests)
 						.collect(() -> new ArrayList<@Nullable Buf>(),
 								(list, value) -> list.add(GrpcConnection.mapPrevious(value)))
 						.toFuture());
 			case RequestDelta<?> _ ->
-					toResponse(this.reactiveStub.putMultiGetDelta(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().putMultiGetDelta(inputRequests)
 						.map(GrpcConnection::mapDelta)
 						.collectList()
 						.toFuture());
 			case RequestChanged<?> _ ->
-					toResponse(this.reactiveStub.putMultiGetChanged(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().putMultiGetChanged(inputRequests)
 						.map(Changed::getChanged)
 						.collectList()
 						.toFuture());
 			case RequestPreviousPresence<?> _ ->
-					toResponse(this.reactiveStub.putMultiGetPreviousPresence(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().putMultiGetPreviousPresence(inputRequests)
 						.map(PreviousPresence::getPresent)
 						.collectList()
 						.toFuture());
@@ -552,17 +550,17 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 		return (CompletableFuture<List<T>>) (switch (requestType) {
 			case RequestNothing<?> _ ->
-					toResponse(this.reactiveStub.deleteMulti(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().deleteMulti(inputRequests)
 							.ignoreElement()
 							.toFuture())
 							.thenApply(_ -> List.of());
 			case RequestPrevious<?> _ ->
-					toResponse(this.reactiveStub.deleteMultiGetPrevious(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().deleteMultiGetPrevious(inputRequests)
 							.collect(() -> new ArrayList<@Nullable Buf>(),
 									(list, value) -> list.add(GrpcConnection.mapPrevious(value)))
 							.toFuture());
 			case RequestPreviousPresence<?> _ ->
-					toResponse(this.reactiveStub.deleteMultiGetPreviousPresence(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().deleteMultiGetPreviousPresence(inputRequests)
 							.map(PreviousPresence::getPresent)
 							.collectList()
 							.toFuture());
@@ -579,7 +577,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.deleteRange(request), _ -> null);
+		return toResponse(futureStubWithRequestDeadline().deleteRange(request), _ -> null);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -612,12 +610,12 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 		return (CompletableFuture<List<T>>) (switch (requestType) {
 			case RequestNothing<?> _ ->
-					toResponse(this.reactiveStub.mergeMulti(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().mergeMulti(inputRequests)
 						.ignoreElement()
 						.toFuture())
 						.thenApply(_ -> List.of());
 			case RequestType.RequestMerged<?> _ ->
-					toResponse(this.reactiveStub.mergeMultiGetMerged(inputRequests)
+					toResponse(reactiveStubWithRequestDeadline().mergeMultiGetMerged(inputRequests)
 						.map(v -> v.hasMerged() ? mapByteString(v.getMerged()) : null)
 						.collectList()
 						.toFuture());
@@ -626,7 +624,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
-		return reactiveStub.scanRaw(ScanRawRequest.newBuilder()
+		return reactiveStubWithRequestDeadline().scanRaw(ScanRawRequest.newBuilder()
 						.setColumnId(columnId)
 						.setShardIndex(shardIndex)
 						.setShardCount(shardCount)
@@ -657,7 +655,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			return request.build();
 		});
 		var inputFlux = initialRequest.concatWith(nextRequests);
-		return toResponse(reactiveStub.putBatch(inputFlux).then().toFuture());
+		return toResponse(reactiveStubWithRequestDeadline().putBatch(inputFlux).then().toFuture());
 	}
 
 	@Override
@@ -682,7 +680,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			return request.build();
 		});
 		var inputFlux = initialRequest.concatWith(nextRequests);
-		return toResponse(reactiveStub.mergeBatch(inputFlux).then().toFuture());
+		return toResponse(reactiveStubWithRequestDeadline().mergeBatch(inputFlux).then().toFuture());
 	}
 
 	@SuppressWarnings("unchecked")
@@ -701,14 +699,14 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setContext(currentWireRequestContext())
 				.build();
 		if (requestType instanceof RequestType.RequestForUpdate<?>) {
-			return toResponse(this.futureStub.getForUpdate(request), x -> (T) new UpdateContext<>(
+			return toResponse(futureStubWithRequestDeadline().getForUpdate(request), x -> (T) new UpdateContext<>(
 					x.hasPrevious() ? mapByteString(x.getPrevious()) : null,
 					x.getUpdateId()
 			));
 		} else if (requestType instanceof RequestType.RequestExists<?>) {
-			return toResponse(this.futureStub.exists(request), x -> (T) (Boolean) x.getPresent());
+			return toResponse(futureStubWithRequestDeadline().exists(request), x -> (T) (Boolean) x.getPresent());
 		} else {
-			return toResponse(this.futureStub.get(request), x -> switch (requestType) {
+			return toResponse(futureStubWithRequestDeadline().get(request), x -> switch (requestType) {
 				case RequestNothing<?> _ -> null;
 				case RequestType.RequestCurrent<?> _ -> x.hasValue() ? (T) mapByteString(x.getValue()) : null;
 				case RequestType.RequestForUpdate<?> _ -> throw new IllegalStateException();
@@ -751,7 +749,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setTimeoutMs(timeoutMs)
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.openIterator(request), OpenIteratorResponse::getIteratorId);
+		return toResponse(futureStubWithRequestDeadline().openIterator(request), OpenIteratorResponse::getIteratorId);
 	}
 
 	@Override
@@ -769,7 +767,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.addAllKeys(mapKeys(keys))
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.seekTo(request), _ -> null);
+		return toResponse(futureStubWithRequestDeadline().seekTo(request), _ -> null);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -785,11 +783,11 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 				.setContext(currentWireRequestContext())
 				.build();
 		return switch (requestType) {
-			case RequestNothing<?> _ -> toResponse(this.futureStub.subsequent(request), _ -> null);
+			case RequestNothing<?> _ -> toResponse(futureStubWithRequestDeadline().subsequent(request), _ -> null);
 			case RequestExists<?> _ ->
-					(CompletableFuture<T>) toResponse(this.futureStub.subsequentExists(request), PreviousPresence::getPresent);
+					(CompletableFuture<T>) toResponse(futureStubWithRequestDeadline().subsequentExists(request), PreviousPresence::getPresent);
 			case RequestMulti<?> _ ->
-					(CompletableFuture<T>) toResponse(this.reactiveStub.subsequentMultiGet(request)
+					(CompletableFuture<T>) toResponse(reactiveStubWithRequestDeadline().subsequentMultiGet(request)
 							.map(kv -> mapByteString(kv.getValue()))
 							.collectList()
 							.toFuture());
@@ -824,18 +822,47 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		};
 	}
 
+	private RocksDBServiceFutureStub futureStubWithRequestDeadline() {
+		long remainingMillis = remainingRequestDeadlineMillis();
+		return remainingMillis == RequestContext.NO_DEADLINE
+				? futureStub
+				: futureStub.withDeadlineAfter(remainingMillis, TimeUnit.MILLISECONDS);
+	}
+
+	private ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStubWithRequestDeadline() {
+		long remainingMillis = remainingRequestDeadlineMillis();
+		return remainingMillis == RequestContext.NO_DEADLINE
+				? reactiveStub
+				: reactiveStub.withDeadlineAfter(remainingMillis, TimeUnit.MILLISECONDS);
+	}
+
+	private long remainingRequestDeadlineMillis() {
+		long deadlineEpochMillis = currentRequestContext().deadlineEpochMillis();
+		if (deadlineEpochMillis == RequestContext.NO_DEADLINE) {
+			return RequestContext.NO_DEADLINE;
+		}
+		long remainingMillis = deadlineEpochMillis - System.currentTimeMillis();
+		if (remainingMillis <= 0L) {
+			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					"Request deadline already expired");
+		}
+		return remainingMillis;
+	}
+
 	private RocksDBServiceFutureStub futureStubWithReadDeadline(long timeoutMs) {
 		validateReadTimeout(timeoutMs);
-		return timeoutMs == Long.MAX_VALUE
+		long effectiveTimeoutMs = Math.min(timeoutMs, remainingRequestDeadlineMillis());
+		return effectiveTimeoutMs == Long.MAX_VALUE
 				? futureStub
-				: futureStub.withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS);
+				: futureStub.withDeadlineAfter(effectiveTimeoutMs, TimeUnit.MILLISECONDS);
 	}
 
 	private ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStubWithReadDeadline(long timeoutMs) {
 		validateReadTimeout(timeoutMs);
-		return timeoutMs == Long.MAX_VALUE
+		long effectiveTimeoutMs = Math.min(timeoutMs, remainingRequestDeadlineMillis());
+		return effectiveTimeoutMs == Long.MAX_VALUE
 				? reactiveStub
-				: reactiveStub.withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS);
+				: reactiveStub.withDeadlineAfter(effectiveTimeoutMs, TimeUnit.MILLISECONDS);
 	}
 
 	private static void validateReadTimeout(long timeoutMs) {
@@ -1005,7 +1032,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 		var request = GetAllColumnDefinitionsRequest.newBuilder()
 				.setContext(currentWireRequestContext())
 				.build();
-		return toResponse(this.futureStub.getAllColumnDefinitions(request),
+		return toResponse(futureStubWithRequestDeadline().getAllColumnDefinitions(request),
 				response -> response.getColumnsList().stream()
 						.collect(Collectors.toMap(Column::getName, col -> unmapColumnSchema(col.getSchema()))));
 	}
@@ -1048,7 +1075,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	private it.cavallium.rockserver.core.common.api.proto.RequestContext currentWireRequestContext() {
 		var context = currentRequestContext();
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
-				.setProfileValue(context.profile().ordinal() + 1)
+				.setProfileValue(context.profile().wireValue())
 				.setDeadlineEpochMillis(context.deadlineEpochMillis())
 				.build();
 	}

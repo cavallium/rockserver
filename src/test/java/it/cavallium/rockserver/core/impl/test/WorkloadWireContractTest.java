@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.google.protobuf.ByteString;
 import it.cavallium.rockserver.core.common.api.RocksDB;
@@ -12,6 +13,33 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class WorkloadWireContractTest {
+
+	@Test
+	void allSevenProfileNumbersAreExplicitAndStableAcrossJavaProtobufAndThrift() {
+		var profiles = List.of(
+				it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL,
+				it.cavallium.rockserver.core.common.WorkloadProfile.LATENCY,
+				it.cavallium.rockserver.core.common.WorkloadProfile.ANALYTICAL,
+				it.cavallium.rockserver.core.common.WorkloadProfile.INGEST,
+				it.cavallium.rockserver.core.common.WorkloadProfile.CDC,
+				it.cavallium.rockserver.core.common.WorkloadProfile.BATCH,
+				it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE);
+		for (int index = 0; index < profiles.size(); index++) {
+			int wireValue = index + 1;
+			var profile = profiles.get(index);
+			assertEquals(wireValue, profile.wireValue());
+			assertEquals(profile,
+					it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(wireValue));
+			assertEquals(wireValue,
+					it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.forNumber(wireValue).getNumber());
+			assertEquals(wireValue,
+					it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(wireValue).getValue());
+		}
+		assertThrows(IllegalArgumentException.class,
+				() -> it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(0));
+		assertThrows(IllegalArgumentException.class,
+				() -> it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(8));
+	}
 
 	@Test
 	void protobufRetainsProfileAndAbsoluteDeadlineOnUnaryAndStreamInitialRequests() throws Exception {

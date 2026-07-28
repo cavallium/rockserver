@@ -666,16 +666,16 @@ public class GrpcServer extends Server {
 
 		private it.cavallium.rockserver.core.common.RequestContext mapRequestContext(
 				it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext) {
-			if (wireContext == null
-					|| wireContext.getProfile() == it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.WORKLOAD_PROFILE_UNSPECIFIED
-					|| wireContext.getProfile() == it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.UNRECOGNIZED) {
+			if (wireContext == null || wireContext.getProfileValue() == 0) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Request context and workload profile are required");
 			}
-			int profileIndex = wireContext.getProfileValue() - 1;
-			if (profileIndex < 0 || profileIndex >= WorkloadProfile.values().length) {
+			final WorkloadProfile profile;
+			try {
+				profile = WorkloadProfile.fromWireValue(wireContext.getProfileValue());
+			} catch (IllegalArgumentException unknown) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Unknown workload profile: " + wireContext.getProfileValue());
+						unknown.getMessage(), unknown);
 			}
 			long deadlineEpochMillis = wireContext.getDeadlineEpochMillis();
 			var transportDeadline = Context.current().getDeadline();
@@ -688,7 +688,6 @@ public class GrpcServer extends Server {
 						: now + remainingMillis;
 				deadlineEpochMillis = Math.min(deadlineEpochMillis, transportEpochMillis);
 			}
-			var profile = WorkloadProfile.values()[profileIndex];
 			if (!profile.isClientSelectable()) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Workload profile " + profile + " is owned by Rockserver");

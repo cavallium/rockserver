@@ -177,7 +177,7 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	@Override
 	public boolean closeTransaction(long transactionId, boolean commit) {
 		try {
-			return client.closeTransaction(transactionId, commit, currentWireRequestContext());
+			return client.closeTransaction(transactionId, commit, currentWireRequestContext(commit));
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -924,11 +924,13 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 
 	@Override
 	public <R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		validateRequestDeadline(context, req);
 		return withRequestContext(context, () -> req.handleSync(this));
 	}
 
 	@Override
 	public <R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		validateRequestDeadline(context, req);
         if (req instanceof RocksDBAPICommand.RocksDBAPICommandStream) {
              // Let handleAsync dispatch to getRangeAsync etc
         }
@@ -1079,11 +1081,34 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 		return RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
 	}
 
+	private static void validateRequestDeadline(RequestContext context,
+			RocksDBAPICommand<?, ?, ?> request) {
+		if (request.protectedProfile() == null) {
+			validateRequestDeadline(context);
+		}
+	}
+
+	private static void validateRequestDeadline(RequestContext context) {
+		if (context.deadlineEpochMillis() != RequestContext.NO_DEADLINE
+				&& context.deadlineEpochMillis() <= System.currentTimeMillis()) {
+			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					"Request deadline already expired");
+		}
+	}
+
 	private it.cavallium.rockserver.core.common.api.RequestContext currentWireRequestContext() {
+		return currentWireRequestContext(true);
+	}
+
+	private it.cavallium.rockserver.core.common.api.RequestContext currentWireRequestContext(
+			boolean enforceCallerDeadline) {
 		var context = currentRequestContext();
+		if (enforceCallerDeadline) {
+			validateRequestDeadline(context);
+		}
 		return new it.cavallium.rockserver.core.common.api.RequestContext(
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(
-						context.profile().ordinal() + 1),
+						context.profile().wireValue()),
 				context.deadlineEpochMillis());
 	}
 

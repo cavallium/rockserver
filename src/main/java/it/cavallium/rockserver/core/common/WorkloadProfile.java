@@ -41,30 +41,51 @@ package it.cavallium.rockserver.core.common;
 public enum WorkloadProfile {
 
 	/** Short server-owned work required to release resources or preserve liveness. */
-	CONTROL(false),
+	CONTROL(1, false),
 
 	/** Request-bound work expected to complete inside the normal API latency budget. */
-	LATENCY(true),
+	LATENCY(2, true),
 
 	/** An intrinsically expensive query whose caller waits for the result. */
-	ANALYTICAL(true),
+	ANALYTICAL(3, true),
 
 	/** A sustained live pipeline whose lag affects primary freshness or durability. */
-	INGEST(true),
+	INGEST(4, true),
 
 	/** WAL discovery, publication, polling, acknowledgement, or required WAL flush work. */
-	CDC(false),
+	CDC(5, false),
 
 	/** Retryable or deferrable work with no waiting caller. */
-	BATCH(true),
+	BATCH(6, true),
 
 	/** Explicit manual physical database servicing such as flush or compaction. */
-	PHYSICAL_MAINTENANCE(false);
+	PHYSICAL_MAINTENANCE(7, false);
 
+	private final int wireValue;
 	private final boolean clientSelectable;
 
-	WorkloadProfile(boolean clientSelectable) {
+	WorkloadProfile(int wireValue, boolean clientSelectable) {
+		this.wireValue = wireValue;
 		this.clientSelectable = clientSelectable;
+	}
+
+	/** Stable numeric value shared by protobuf and Thrift. */
+	public int wireValue() {
+		return wireValue;
+	}
+
+	/** Decode one of the seven stable wire values without relying on enum order. */
+	public static WorkloadProfile fromWireValue(int wireValue) {
+		return switch (wireValue) {
+			case 1 -> CONTROL;
+			case 2 -> LATENCY;
+			case 3 -> ANALYTICAL;
+			case 4 -> INGEST;
+			case 5 -> CDC;
+			case 6 -> BATCH;
+			case 7 -> PHYSICAL_MAINTENANCE;
+			default -> throw new IllegalArgumentException("Unknown workload profile: " + wireValue);
+		};
 	}
 
 	/** Whether an external caller is allowed to put this profile in a request context. */

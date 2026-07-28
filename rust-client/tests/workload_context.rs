@@ -7,7 +7,7 @@ use rockserver_client::proto::{
 #[test]
 fn unary_request_retains_mandatory_workload_context() {
 	let context = RequestContext {
-		profile: WorkloadProfile::Ingest as i32,
+		profile: 4,
 		deadline_epoch_millis: i64::MAX,
 	};
 	let request = PutRequest {
@@ -23,7 +23,7 @@ fn unary_request_retains_mandatory_workload_context() {
 #[test]
 fn streaming_initial_request_retains_workload_context() {
 	let context = RequestContext {
-		profile: WorkloadProfile::Batch as i32,
+		profile: 6,
 		deadline_epoch_millis: i64::MAX,
 	};
 	let request = PutBatchRequest {
@@ -38,4 +38,27 @@ fn streaming_initial_request_retains_workload_context() {
 		panic!("expected initial request");
 	};
 	assert_eq!(initial.context, Some(context));
+}
+
+#[test]
+fn all_workload_profile_values_are_stable() {
+	assert_eq!(WorkloadProfile::Unspecified as i32, 0);
+	assert_eq!(WorkloadProfile::Control as i32, 1);
+	assert_eq!(WorkloadProfile::Latency as i32, 2);
+	assert_eq!(WorkloadProfile::Analytical as i32, 3);
+	assert_eq!(WorkloadProfile::Ingest as i32, 4);
+	assert_eq!(WorkloadProfile::Cdc as i32, 5);
+	assert_eq!(WorkloadProfile::Batch as i32, 6);
+	assert_eq!(WorkloadProfile::PhysicalMaintenance as i32, 7);
+}
+
+#[test]
+fn typed_context_constructor_rejects_protected_profiles() {
+	for profile in [
+		WorkloadProfile::Control,
+		WorkloadProfile::Cdc,
+		WorkloadProfile::PhysicalMaintenance,
+	] {
+		assert!(std::panic::catch_unwind(|| RequestContext::for_profile(profile, i64::MAX)).is_err());
+	}
 }
