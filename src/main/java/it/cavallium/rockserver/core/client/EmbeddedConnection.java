@@ -139,6 +139,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public <R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		resolveCommand(context, req);
 		if (db.getScheduler().isExecutingWorkloadTask()) {
 			return withRequestContext(context, () -> req.handleSync(this));
 		}
@@ -175,6 +176,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	@SuppressWarnings("unchecked")
     @Override
 	public <R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		resolveCommand(context, req);
 		return withRequestContext(context, () -> (RA) switch (req) {
             case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(
 					putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
@@ -217,7 +219,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	private java.util.concurrent.Executor commandExecutor(RocksDBAPICommand<?, ?, ?> command) {
 		var context = currentRequestContext();
-		var profile = WorkloadAdmission.resolve(context, command);
+		var profile = resolveCommand(context, command);
 		return db.getScheduler().executor(profile,
 				command.operationFamily(),
 				context.deadlineEpochMillis());
@@ -225,10 +227,19 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	private Scheduler commandScheduler(RocksDBAPICommand<?, ?, ?> command) {
 		var context = currentRequestContext();
-		var profile = WorkloadAdmission.resolve(context, command);
+		var profile = resolveCommand(context, command);
 		return db.getScheduler().scheduler(profile,
 				command.operationFamily(),
 				context.deadlineEpochMillis());
+	}
+
+	private WorkloadProfile resolveCommand(RequestContext context,
+			RocksDBAPICommand<?, ?, ?> command) {
+		var settings = db.getWorkloadSettings();
+		return WorkloadAdmission.resolve(context,
+				command,
+				settings.latencyFanOutMaxItems(),
+				settings.latencyFanOutMaxBytes());
 	}
 
 	@Override

@@ -11,6 +11,7 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.client.ThriftConnection;
+import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -97,6 +98,34 @@ class WorkloadResourceBindingTest {
 		}
 	}
 
+	@ParameterizedTest(name = "configured fan-out: {0}, async={1}")
+	@MethodSource("transportsAndApiModes")
+	void configuredLatencyFanOutLimitsAreServerAuthoritativeAcrossEveryTransport(Transport transport,
+			boolean async) throws Exception {
+		Path config = tempDir.resolve("fan-out-" + transport + "-" + async + ".conf");
+		java.nio.file.Files.writeString(config, """
+				database.parallelism.workload.latency-fan-out-max-items = 3
+				database.parallelism.workload.latency-fan-out-max-bytes = 8B
+				""");
+		try (var fixture = openFixture(transport, "fan-out-" + transport + "-" + async, config)) {
+			var latency = new Api(fixture.connection(),
+					RequestContext.latency(Duration.ofSeconds(30)), async);
+			var batch = new Api(fixture.connection(), RequestContext.batch(), async);
+			long fixedColumn = batch.createColumn("fixed",
+					ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
+
+			assertEquals(2, latency.existsMulti(0, fixedColumn, keysOfSizes(1, 1)).size());
+			assertEquals(3, latency.existsMulti(0, fixedColumn, keysOfSizes(1, 1, 1)).size());
+			assertRocksFailure(() -> latency.existsMulti(0, fixedColumn, keysOfSizes(1, 1, 1, 1)));
+
+			long variableColumn = batch.createColumn("variable",
+					ColumnSchema.of(IntList.of(), ObjectList.of(ColumnHashType.XXHASH32), true));
+			assertEquals(1, latency.existsMulti(0, variableColumn, keysOfSizes(7)).size());
+			assertEquals(1, latency.existsMulti(0, variableColumn, keysOfSizes(8)).size());
+			assertRocksFailure(() -> latency.existsMulti(0, variableColumn, keysOfSizes(9)));
+		}
+	}
+
 	@Test
 	void cancellationBetweenExistsMultiChunksReleasesAllLogicalState() throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("exists-cancel"),
@@ -170,7 +199,11 @@ class WorkloadResourceBindingTest {
 	}
 
 	private Fixture openFixture(Transport transport, String name) throws Exception {
-		var embedded = new EmbeddedConnection(tempDir.resolve(name), name, null);
+		return openFixture(transport, name, null);
+	}
+
+	private Fixture openFixture(Transport transport, String name, Path config) throws Exception {
+		var embedded = new EmbeddedConnection(tempDir.resolve(name), name, config);
 		try {
 			return switch (transport) {
 				case EMBEDDED -> new Fixture(embedded, embedded, null);
@@ -217,6 +250,14 @@ class WorkloadResourceBindingTest {
 
 	private static Keys key(int value) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Integer.BYTES).putInt(value).array()));
+	}
+
+	private static List<Keys> keysOfSizes(int... sizes) {
+		var result = new ArrayList<Keys>(sizes.length);
+		for (int size : sizes) {
+			result.add(new Keys(Buf.createZeroes(size)));
+		}
+		return List.copyOf(result);
 	}
 
 	private static void awaitUninterruptibly(CountDownLatch latch) {

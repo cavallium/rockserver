@@ -58,10 +58,22 @@ public final class WorkloadAdmission {
 
 	/** Validate the concrete command in addition to its server-derived family. */
 	public static void validateClient(RequestContext context, RocksDBAPICommand<?, ?, ?> command) {
+		validateClient(context, command, MAX_LATENCY_ITEMS, MAX_LATENCY_ENCODED_INPUT_BYTES);
+	}
+
+	/**
+	 * Validate a concrete command against server-resolved LATENCY limits. The configured
+	 * values may lower, but never raise, the public workload-contract ceilings.
+	 */
+	public static void validateClient(RequestContext context,
+			RocksDBAPICommand<?, ?, ?> command,
+			int maximumLatencyItems,
+			long maximumLatencyEncodedInputBytes) {
 		Objects.requireNonNull(context, "context");
 		Objects.requireNonNull(command, "command");
+		validateLatencyLimits(maximumLatencyItems, maximumLatencyEncodedInputBytes);
 		validateClient(context, command.operationFamily());
-		validateCommand(context.profile(), command);
+		validateCommand(context.profile(), command, maximumLatencyItems, maximumLatencyEncodedInputBytes);
 	}
 
 	/**
@@ -87,11 +99,19 @@ public final class WorkloadAdmission {
 
 	/** Resolve using both the server-derived family and protected command ownership. */
 	public static WorkloadProfile resolve(RequestContext context, RocksDBAPICommand<?, ?, ?> command) {
+		return resolve(context, command, MAX_LATENCY_ITEMS, MAX_LATENCY_ENCODED_INPUT_BYTES);
+	}
+
+	/** Resolve a command while enforcing server-configured LATENCY input maxima. */
+	public static WorkloadProfile resolve(RequestContext context,
+			RocksDBAPICommand<?, ?, ?> command,
+			int maximumLatencyItems,
+			long maximumLatencyEncodedInputBytes) {
 		Objects.requireNonNull(context, "context");
 		Objects.requireNonNull(command, "command");
 		var protectedProfile = command.protectedProfile();
 		if (protectedProfile == null) {
-			validateClient(context, command);
+			validateClient(context, command, maximumLatencyItems, maximumLatencyEncodedInputBytes);
 			return context.profile();
 		}
 		validate(protectedProfile, command.operationFamily());
@@ -127,7 +147,10 @@ public final class WorkloadAdmission {
 				"Invalid workload profile " + profile + " for " + command.getClass().getSimpleName() + ": " + reason);
 	}
 
-	private static void validateCommand(WorkloadProfile profile, RocksDBAPICommand<?, ?, ?> command) {
+	private static void validateCommand(WorkloadProfile profile,
+			RocksDBAPICommand<?, ?, ?> command,
+			int maximumLatencyItems,
+			long maximumLatencyEncodedInputBytes) {
 		switch (command) {
 			case RocksDBAPICommandSingle.CreateColumn _, RocksDBAPICommandSingle.UploadMergeOperator _,
 					RocksDBAPICommandSingle.DeleteColumn _, RocksDBAPICommandSingle.DeleteColumnIfExists _,
@@ -144,31 +167,45 @@ public final class WorkloadAdmission {
 			case RocksDBAPICommandSingle.Put<?> put -> validateLatencyInput(profile,
 					command,
 					1,
-					encodedBytes(put.keys(), put.value()));
+					encodedBytes(put.keys(), put.value()),
+					maximumLatencyItems,
+					maximumLatencyEncodedInputBytes);
 			case RocksDBAPICommandSingle.Delete<?> delete -> validateLatencyInput(profile,
 					command,
 					1,
-					encodedBytes(delete.keys()));
+					encodedBytes(delete.keys()),
+					maximumLatencyItems,
+					maximumLatencyEncodedInputBytes);
 			case RocksDBAPICommandSingle.Merge<?> merge -> validateLatencyInput(profile,
 					command,
 					1,
-					encodedBytes(merge.keys(), merge.value()));
+					encodedBytes(merge.keys(), merge.value()),
+					maximumLatencyItems,
+					maximumLatencyEncodedInputBytes);
 			case RocksDBAPICommandSingle.DeleteMulti<?> delete -> validateLatencyInput(profile,
 					command,
 					delete.keys().size(),
-					encodedBytes(delete.keys()));
+					encodedBytes(delete.keys()),
+					maximumLatencyItems,
+					maximumLatencyEncodedInputBytes);
 			case RocksDBAPICommandSingle.PutMulti<?> put -> validateLatencyInput(profile,
 					command,
 					Math.max(put.keys().size(), put.values().size()),
-					encodedBytes(put.keys(), put.values()));
+					encodedBytes(put.keys(), put.values()),
+					maximumLatencyItems,
+					maximumLatencyEncodedInputBytes);
 			case RocksDBAPICommandSingle.MergeMulti<?> merge -> validateLatencyInput(profile,
 					command,
 					Math.max(merge.keys().size(), merge.values().size()),
-					encodedBytes(merge.keys(), merge.values()));
+					encodedBytes(merge.keys(), merge.values()),
+					maximumLatencyItems,
+					maximumLatencyEncodedInputBytes);
 			case RocksDBAPICommandSingle.ExistsMulti exists -> validateLatencyInput(profile,
 					command,
 					exists.keys().size(),
-					encodedBytes(exists.keys()));
+					encodedBytes(exists.keys()),
+					maximumLatencyItems,
+					maximumLatencyEncodedInputBytes);
 			case RocksDBAPICommandSingle.Subsequent<?> subsequent -> {
 				if (profile == LATENCY && exceedsIteratorLimit(subsequent.skipCount(), subsequent.takeCount())) {
 					throw mismatch(profile, command,
@@ -205,17 +242,31 @@ public final class WorkloadAdmission {
 	private static void validateLatencyInput(WorkloadProfile profile,
 			RocksDBAPICommand<?, ?, ?> command,
 			int items,
-			long encodedBytes) {
+			long encodedBytes,
+			int maximumLatencyItems,
+			long maximumLatencyEncodedInputBytes) {
 		if (profile != LATENCY) {
 			return;
 		}
-		if (items > MAX_LATENCY_ITEMS) {
-			throw mismatch(profile, command, "item count must not exceed " + MAX_LATENCY_ITEMS);
+		if (items > maximumLatencyItems) {
+			throw mismatch(profile, command, "item count must not exceed " + maximumLatencyItems);
 		}
-		if (encodedBytes > MAX_LATENCY_ENCODED_INPUT_BYTES) {
+		if (encodedBytes > maximumLatencyEncodedInputBytes) {
 			throw mismatch(profile,
 					command,
-					"encoded input must not exceed " + MAX_LATENCY_ENCODED_INPUT_BYTES + " bytes");
+					"encoded input must not exceed " + maximumLatencyEncodedInputBytes + " bytes");
+		}
+	}
+
+	private static void validateLatencyLimits(int maximumLatencyItems,
+			long maximumLatencyEncodedInputBytes) {
+		if (maximumLatencyItems < 1 || maximumLatencyItems > MAX_LATENCY_ITEMS) {
+			throw new IllegalArgumentException("LATENCY item limit must be between 1 and " + MAX_LATENCY_ITEMS);
+		}
+		if (maximumLatencyEncodedInputBytes < 1
+				|| maximumLatencyEncodedInputBytes > MAX_LATENCY_ENCODED_INPUT_BYTES) {
+			throw new IllegalArgumentException("LATENCY encoded-input limit must be between 1 and "
+					+ MAX_LATENCY_ENCODED_INPUT_BYTES);
 		}
 	}
 

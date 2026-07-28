@@ -81,8 +81,8 @@ request and transport/operation deadline; the earliest deadline wins.
 | `cdc-quantum-max-duration` | `PT0.008S` | Maximum monotonic runtime of one CDC quantum |
 | `latency-range-max-items` | 4096 | Server maximum items accepted for a LATENCY range page |
 | `latency-range-max-bytes` | `8MiB` | Server maximum bytes accepted for a LATENCY range page |
-| `latency-fan-out-max-items` | 256 | Server maximum items accepted for LATENCY bounded fan-out |
-| `latency-fan-out-max-bytes` | `2MiB` | Server maximum input bytes accepted for LATENCY bounded fan-out |
+| `latency-fan-out-max-items` | 256 | Server maximum items accepted for LATENCY fixed multi/fan-out commands |
+| `latency-fan-out-max-bytes` | `2MiB` | Server maximum encoded input for LATENCY point mutations and fixed multi/fan-out commands |
 
 Every item, mutation, and byte limit must be positive. Quantum durations must be
 positive and representable. A quantum stops at the first key, byte, or elapsed

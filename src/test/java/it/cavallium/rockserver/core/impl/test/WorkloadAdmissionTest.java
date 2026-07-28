@@ -165,6 +165,47 @@ class WorkloadAdmissionTest {
 	}
 
 	@Test
+	void configuredLatencyLimitsApplyToEveryPointMutationFixedMultiAndExistsCommand() {
+		int configuredItems = 3;
+		long configuredBytes = 8;
+		List<BiFunction<Integer, Integer, RocksDBAPICommand<?, ?, ?>>> commands = List.of(
+				(count, bytes) -> new RocksDBAPICommandSingle.DeleteMulti<>(
+						0, 1, keysList(count, bytes), RequestType.none()),
+				(count, bytes) -> new RocksDBAPICommandSingle.PutMulti<>(
+						0, 1, emptyKeysList(count), valuesList(count, bytes), RequestType.none()),
+				(count, bytes) -> new RocksDBAPICommandSingle.MergeMulti<>(
+						0, 1, emptyKeysList(count), valuesList(count, bytes), RequestType.none()),
+				(count, bytes) -> new RocksDBAPICommandSingle.ExistsMulti(
+						0, 1, keysList(count, bytes), 1_000));
+
+		for (var command : commands) {
+			assertConfiguredLatencyAllowed(command.apply(configuredItems - 1, 0), configuredItems, configuredBytes);
+			assertConfiguredLatencyAllowed(command.apply(configuredItems, 0), configuredItems, configuredBytes);
+			assertConfiguredLatencyRejected(command.apply(configuredItems + 1, 0), configuredItems, configuredBytes);
+			assertConfiguredLatencyAllowed(command.apply(1, (int) configuredBytes - 1), configuredItems, configuredBytes);
+			assertConfiguredLatencyAllowed(command.apply(1, (int) configuredBytes), configuredItems, configuredBytes);
+			assertConfiguredLatencyRejected(command.apply(1, (int) configuredBytes + 1), configuredItems, configuredBytes);
+		}
+
+		List<IntFunction<RocksDBAPICommand<?, ?, ?>>> pointMutations = List.of(
+				bytes -> new RocksDBAPICommandSingle.Put<>(0, 1, EMPTY_KEYS, buffer(bytes), RequestType.none()),
+				bytes -> new RocksDBAPICommandSingle.Delete<>(0, 1, keys(bytes), RequestType.none()),
+				bytes -> new RocksDBAPICommandSingle.Merge<>(0, 1, EMPTY_KEYS, buffer(bytes), RequestType.none()));
+		for (var command : pointMutations) {
+			assertConfiguredLatencyAllowed(command.apply((int) configuredBytes - 1), configuredItems, configuredBytes);
+			assertConfiguredLatencyAllowed(command.apply((int) configuredBytes), configuredItems, configuredBytes);
+			assertConfiguredLatencyRejected(command.apply((int) configuredBytes + 1), configuredItems, configuredBytes);
+		}
+
+		var aboveConfiguredExists = new RocksDBAPICommandSingle.ExistsMulti(
+				0, 1, emptyKeysList(configuredItems + 1), 1_000);
+		for (var profile : List.of(ANALYTICAL, INGEST, BATCH)) {
+			assertEquals(profile, WorkloadAdmission.resolve(
+					context(profile), aboveConfiguredExists, configuredItems, configuredBytes));
+		}
+	}
+
+	@Test
 	void latencyIteratorAdvanceChecksCombinedLimitBelowAtAndAbove() {
 		assertLatencyAllowed(subsequent(0, WorkloadAdmission.MAX_LATENCY_ITERATOR_ADVANCE - 1));
 		assertLatencyAllowed(subsequent(1, WorkloadAdmission.MAX_LATENCY_ITERATOR_ADVANCE - 1));
@@ -339,6 +380,20 @@ class WorkloadAdmissionTest {
 
 	private static void assertLatencyRejected(RocksDBAPICommand<?, ?, ?> command) {
 		assertThrows(RocksDBException.class, () -> WorkloadAdmission.resolve(context(LATENCY), command));
+	}
+
+	private static void assertConfiguredLatencyAllowed(RocksDBAPICommand<?, ?, ?> command,
+			int maximumItems,
+			long maximumBytes) {
+		assertEquals(LATENCY, assertDoesNotThrow(() -> WorkloadAdmission.resolve(
+				context(LATENCY), command, maximumItems, maximumBytes)));
+	}
+
+	private static void assertConfiguredLatencyRejected(RocksDBAPICommand<?, ?, ?> command,
+			int maximumItems,
+			long maximumBytes) {
+		assertThrows(RocksDBException.class, () -> WorkloadAdmission.resolve(
+				context(LATENCY), command, maximumItems, maximumBytes));
 	}
 
 	private static RocksDBAPICommandSingle.Subsequent<Void> subsequent(long skip, long take) {
