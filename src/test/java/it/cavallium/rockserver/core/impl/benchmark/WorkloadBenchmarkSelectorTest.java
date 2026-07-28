@@ -4,7 +4,16 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.client.EmbeddedConnection;
+import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.unimi.dsi.fastutil.ints.IntList;
+import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.EnumMap;
@@ -137,6 +146,32 @@ class WorkloadBenchmarkSelectorTest {
 				"--ingest-isolated-baseline-file=" + baseline
 		}));
 		assertTrue(Files.notExists(root));
+	}
+
+	@Test
+	void coldReopenCreatesCdcSubscriptionAgainstLiveWal(@TempDir Path temporary) throws Exception {
+		Path database = temporary.resolve("db");
+		long columnId;
+		try (var prepared = new EmbeddedConnection(database, "benchmark-cdc-reopen", null)) {
+			var batch = prepared.getSyncApi(RequestContext.batch());
+			columnId = batch.createColumn("benchmark-cdc-reopen",
+					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+			batch.put(0L, columnId, key(1L), Buf.wrap(new byte[] { 1 }), RequestType.none());
+			batch.flush();
+		}
+
+		try (var reopened = new EmbeddedConnection(database, "benchmark-cdc-reopen", null)) {
+			var batch = reopened.getSyncApi(RequestContext.batch());
+			SevenProfileWorkloadBenchmark.createCdcSubscriptionForMixedRun(batch, columnId);
+			batch.put(0L, columnId, key(2L), Buf.wrap(new byte[] { 2 }), RequestType.none());
+			try (var events = batch.cdcPoll("seven-profile-workload-cdc", null, 100L)) {
+				assertEquals(1L, events.count());
+			}
+		}
+	}
+
+	private static Keys key(long value) {
+		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(value).array()));
 	}
 
 	private static WorkloadBenchmarkSelector.CandidateMeasurement candidate(int candidate,

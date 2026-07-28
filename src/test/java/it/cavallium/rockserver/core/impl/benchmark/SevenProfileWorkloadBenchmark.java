@@ -211,7 +211,6 @@ public final class SevenProfileWorkloadBenchmark {
 			long columnId = batch.createColumn(COLUMN_NAME,
 					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 			preload(batch, columnId, options);
-			batch.cdcCreate(CDC_SUBSCRIPTION, null, List.of(columnId), false);
 			success = true;
 			return new PreparedDataset(connection, columnId, fingerprint);
 		} finally {
@@ -292,6 +291,11 @@ public final class SevenProfileWorkloadBenchmark {
 		var analytical = connection.getSyncApi(RequestContext.analytical());
 		var ingest = connection.getSyncApi(RequestContext.ingest());
 		var batch = connection.getSyncApi(RequestContext.batch());
+		// Cold preparation closes RocksDB, which may retire every WAL file after
+		// flushing the preloaded dataset. Create the subscription only after the
+		// prepared database is reopened so its starting cursor is backed by the
+		// live WAL used by this one-shot mixed run.
+		createCdcSubscriptionForMixedRun(batch, dataset.columnId());
 		byte[][] writeValues = writeValues(options);
 		List<Keys> cancellationKeys = deterministicKeys(options.preloadKeys(), 256, options.seed() ^ 0x43414e43454cL);
 		Thread pressureThread = null;
@@ -441,6 +445,10 @@ public final class SevenProfileWorkloadBenchmark {
 				}
 			}
 		}
+	}
+
+	static long createCdcSubscriptionForMixedRun(RocksDBSyncAPI batch, long columnId) {
+		return batch.cdcCreate(CDC_SUBSCRIPTION, null, List.of(columnId), false);
 	}
 
 	private static double runIsolatedIngestBaseline(PreparedDataset dataset, Options options) throws Exception {
