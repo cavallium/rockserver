@@ -87,12 +87,14 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public long openTransaction(long timeoutMs) {
-		return db.openTransaction(timeoutMs);
+		return db.openTransaction(timeoutMs, currentRequestContextOrBatch().profile());
 	}
 
 	@Override
 	public boolean closeTransaction(long transactionId, boolean commit) {
-		return db.closeTransaction(transactionId, commit);
+		return db.closeTransaction(transactionId,
+				commit,
+				currentRequestContextOrBatch().profile());
 	}
 
 	@Override
@@ -238,6 +240,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
 		return db.put(transactionOrUpdateId, columnId, keys, value, requestType);
 	}
 
@@ -246,6 +249,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull Keys keys,
 			@NotNull RequestType.RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
 		return db.delete(transactionOrUpdateId, columnId, keys, requestType);
 	}
 
@@ -255,6 +259,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
 		return db.merge(transactionOrUpdateId, columnId, keys, value, requestType);
 	}
 
@@ -263,6 +268,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
 		return db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType);
 	}
 
@@ -279,6 +285,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull List<Keys> keys,
 			@NotNull List<@NotNull Buf> values,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
 		return db.putMulti(transactionOrUpdateId, columnId, keys, values, requestType);
 	}
 
@@ -288,6 +295,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@NotNull List<Keys> keys,
 			@NotNull List<@NotNull Buf> values,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
 		return db.mergeMulti(transactionOrUpdateId, columnId, keys, values, requestType);
 	}
 
@@ -296,6 +304,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContextOrBatch().profile());
 		var executor = db.getScheduler().writeExecutor();
 		return supplyAsyncPreservingRunningCompletion(
 				() -> db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType), executor);
@@ -342,7 +351,11 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			Keys keys,
 			RequestGet<? super Buf, T> requestType) throws RocksDBException {
-		return db.get(transactionOrUpdateId, columnId, keys, requestType);
+		return db.get(transactionOrUpdateId,
+				columnId,
+				keys,
+				requestType,
+				currentRequestContextOrBatch().profile());
 	}
 
 	@Override
@@ -350,7 +363,13 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
 			long timeoutMs) throws RocksDBException {
-		return db.existsMulti(transactionId, columnId, keys, timeoutMs);
+		var context = currentRequestContextOrBatch();
+		return db.existsMulti(transactionId,
+				columnId,
+				keys,
+				timeoutMs,
+				context.profile(),
+				context.deadlineEpochMillis());
 	}
 
 	@Override
@@ -358,7 +377,14 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
 			long timeoutMs) throws RocksDBException {
-		return db.existsMultiAsyncInternal(transactionId, columnId, keys, timeoutMs);
+		var context = currentRequestContextOrBatch();
+		return db.existsMultiAsyncInternal(transactionId,
+				columnId,
+				keys,
+				timeoutMs,
+				context.profile(),
+				db.getScheduler().executor(context, OperationFamily.BOUNDED_FAN_OUT),
+				context.deadlineEpochMillis());
 	}
 
 	@Override
@@ -368,7 +394,13 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
-		return db.openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+		return db.openIterator(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				timeoutMs,
+				currentRequestContextOrBatch().profile());
 	}
 
 	@Override
@@ -378,6 +410,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public void seekTo(long iterationId, Keys keys) throws RocksDBException {
+		db.validateIteratorProfile(iterationId, currentRequestContextOrBatch().profile());
 		db.seekTo(iterationId, keys);
 	}
 
@@ -386,6 +419,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			long skipCount,
 			long takeCount,
 			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws RocksDBException {
+		db.validateIteratorProfile(iterationId, currentRequestContextOrBatch().profile());
 		return db.subsequent(iterationId, skipCount, takeCount, requestType);
 	}
 
@@ -405,6 +439,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Iterator skip and take counts must be non-negative"));
 		}
+		db.validateIteratorProfile(iterationId, currentRequestContextOrBatch().profile());
 		var iteratorOperation = acquireAsyncIteratorOperation(iterationId);
 		if (iteratorOperation == null) {
 			return CompletableFuture.failedFuture(RocksDBException.of(
@@ -475,6 +510,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public CompletableFuture<Void> seekToAsync(long iterationId, @NotNull Keys keys) throws RocksDBException {
+		db.validateIteratorProfile(iterationId, currentRequestContextOrBatch().profile());
 		var iteratorOperation = acquireAsyncIteratorOperation(iterationId);
 		if (iteratorOperation == null) {
 			return CompletableFuture.failedFuture(concurrentIteratorOperation(iterationId));
@@ -661,6 +697,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public <T> T reduceRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestReduceRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
 		return db.reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
 	}
 
@@ -673,6 +710,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			boolean reverse,
 			@NotNull RequestType.RequestReduceRange<? super KV, T> requestType,
 		long timeoutMs) throws RocksDBException {
+		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
 				transactionId,
 				columnId,
@@ -845,11 +883,13 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public <T> Stream<T> getRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
 		return db.getRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
 	}
 
 	@Override
 	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<>(
 				transactionId,
 				columnId,

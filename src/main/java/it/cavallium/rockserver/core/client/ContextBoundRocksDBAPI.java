@@ -7,7 +7,6 @@ import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import reactor.core.publisher.Mono;
@@ -27,26 +26,14 @@ final class ContextBoundRocksDBAPI implements RocksDBAPI {
 	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
 		Objects.requireNonNull(request, "request");
 		WorkloadAdmission.resolve(context, request);
-		dispatcher.profileBindings().before(context, request);
-		var result = dispatcher.requestSync(context, request);
-		dispatcher.profileBindings().after(context, request, result);
-		return result;
+		return dispatcher.requestSync(context, request);
 	}
 
 	@Override
 	public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
 		Objects.requireNonNull(request, "request");
 		WorkloadAdmission.resolve(context, request);
-		dispatcher.profileBindings().before(context, request);
-		var result = dispatcher.requestAsync(context, request);
-		if (result instanceof CompletableFuture<?> future) {
-			future.whenComplete((value, failure) -> {
-				if (failure == null) {
-					dispatcher.profileBindings().after(context, request, value);
-				}
-			});
-		}
-		return result;
+		return dispatcher.requestAsync(context, request);
 	}
 
 	@Override

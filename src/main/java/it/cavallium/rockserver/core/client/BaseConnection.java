@@ -12,7 +12,6 @@ public abstract class BaseConnection implements RocksDBConnection, RocksDBContex
 
 	private final String name;
 	private final ThreadLocal<RequestContext> dispatchContext = new ThreadLocal<>();
-	private final ResourceProfileBindings profileBindings = new ResourceProfileBindings();
 
 	public BaseConnection(String name) {
 		this.name = name;
@@ -32,6 +31,16 @@ public abstract class BaseConnection implements RocksDBConnection, RocksDBContex
 		return Objects.requireNonNull(dispatchContext.get(), "No workload context is bound to this dispatch");
 	}
 
+	/**
+	 * Compatibility for the still-public raw connection methods. Context-bound API views
+	 * always install their immutable context before dispatch; direct internal callers keep
+	 * the historical BATCH behavior until the raw API surface is removed.
+	 */
+	protected final RequestContext currentRequestContextOrBatch() {
+		var context = dispatchContext.get();
+		return context != null ? context : RequestContext.batch();
+	}
+
 	protected final <T> T withRequestContext(RequestContext context, Supplier<T> operation) {
 		Objects.requireNonNull(context, "context");
 		Objects.requireNonNull(operation, "operation");
@@ -46,10 +55,6 @@ public abstract class BaseConnection implements RocksDBConnection, RocksDBContex
 				dispatchContext.set(previous);
 			}
 		}
-	}
-
-	final ResourceProfileBindings profileBindings() {
-		return profileBindings;
 	}
 
 	@Override

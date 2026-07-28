@@ -68,6 +68,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -1450,11 +1451,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@Override
 	public long openTransaction(long timeoutMs) {
+		return openTransaction(timeoutMs, WorkloadProfile.BATCH);
+	}
+
+	public long openTransaction(long timeoutMs, WorkloadProfile workloadProfile) {
 		var start = System.nanoTime();
 		actionLogger.logAction("OpenTransaction", start, null, null, null, null, null, timeoutMs, null);
 		ops.beginOp();
 		try {
-			return allocateTransactionInternal(openTransactionInternal(timeoutMs, false));
+			return allocateTransactionInternal(openTransactionInternal(timeoutMs, false, workloadProfile));
 		} finally {
 			ops.endOp();
 			var end = System.nanoTime();
@@ -1476,12 +1481,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private Tx openTransactionInternal(long timeoutMs, boolean isFromGetForUpdate) {
+		return openTransactionInternal(timeoutMs, isFromGetForUpdate, WorkloadProfile.BATCH);
+	}
+
+	private Tx openTransactionInternal(long timeoutMs,
+			boolean isFromGetForUpdate,
+			WorkloadProfile workloadProfile) {
+		Objects.requireNonNull(workloadProfile, "workloadProfile");
 		var expirationTimestamp = timeoutMs + System.currentTimeMillis();
 		TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
 		var writeOpts = new LeakSafeWriteOptions("open-transaction-internal-write-options");
 		var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
 		try {
-			var tx = new Tx(db.beginTransaction(writeOpts, txOpts), isFromGetForUpdate, expirationTimestamp, rocksObjects);
+			var tx = new Tx(db.beginTransaction(writeOpts, txOpts),
+					isFromGetForUpdate,
+					expirationTimestamp,
+					rocksObjects,
+					workloadProfile);
 			try {
 				retainResourceLease();
 				return tx;
@@ -1506,6 +1522,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var end = System.nanoTime();
 			closeTransactionTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
+	}
+
+	@Contract("_, false, _ -> true; _, true, _ -> _")
+	public boolean closeTransaction(long transactionId,
+			boolean commit,
+			WorkloadProfile workloadProfile) {
+		if (commit) {
+			validateTransactionProfile(transactionId, workloadProfile);
+		}
+		return closeTransaction(transactionId, commit);
 	}
 
 	/**
@@ -3881,6 +3907,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public <T> T get(long transactionOrUpdateId, long columnId, Keys keys, RequestGet<? super Buf, T> requestType)
 			throws RocksDBException {
+		return get(transactionOrUpdateId,
+				columnId,
+				keys,
+				requestType,
+				WorkloadProfile.BATCH);
+	}
+
+	public <T> T get(long transactionOrUpdateId,
+			long columnId,
+			Keys keys,
+			RequestGet<? super Buf, T> requestType,
+			WorkloadProfile workloadProfile) throws RocksDBException {
 		var start = System.nanoTime();
 		ColumnInstance col = null;
 		ops.beginOp();
@@ -3888,12 +3926,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			actionLogger.logAction("Get", start, columnId, keys, null, transactionOrUpdateId, null, null, requestType);
 			// Column id
 			col = beginColumnUse(columnId);
-			Tx prevTx = transactionOrUpdateId != 0 ? getTransaction(transactionOrUpdateId, true) : null;
+			Tx prevTx = transactionOrUpdateId != 0
+					? getTransaction(transactionOrUpdateId, true, workloadProfile)
+					: null;
 			Tx tx;
 			long updateId;
 			if (requestType instanceof RequestType.RequestForUpdate<?>) {
 				if (prevTx == null) {
-					tx = openTransactionInternal(MAX_TRANSACTION_DURATION_MS, true);
+					tx = openTransactionInternal(MAX_TRANSACTION_DURATION_MS, true, workloadProfile);
 					updateId = allocateTransactionInternal(tx);
 				} else {
 					tx = prevTx;
@@ -3948,6 +3988,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
 			long timeoutMs) throws RocksDBException {
+		return existsMulti(transactionId,
+				columnId,
+				keys,
+				timeoutMs,
+				WorkloadProfile.BATCH,
+				RequestContext.NO_DEADLINE);
+	}
+
+	public List<Boolean> existsMulti(long transactionId,
+			long columnId,
+			@NotNull List<@NotNull Keys> keys,
+			long timeoutMs,
+			WorkloadProfile workloadProfile,
+			long contextDeadlineEpochMillis) throws RocksDBException {
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
@@ -3965,10 +4019,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					null
 			);
 
-			var deadlineMicros = readDeadlineMicros(timeoutMs);
+			var deadlineMicros = readDeadlineMicros(timeoutMs, contextDeadlineEpochMillis);
 			var columnUse = acquireColumnUse(columnId);
 			try (columnUse) {
-				Tx tx = transactionId != 0 ? getTransaction(transactionId, false) : null;
+				Tx tx = transactionId != 0
+						? getTransaction(transactionId, false, workloadProfile)
+						: null;
 				try (var cursor = new ExistsMultiCursor(columnUse, tx, keys, deadlineMicros)) {
 				while (!cursor.readChunk()) {
 					// The synchronous API intentionally keeps processing on its caller thread.
@@ -3993,7 +4049,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public CompletableFuture<List<Boolean>> existsMultiAsyncInternal(long transactionId,
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
-			long timeoutMs) {
+			long timeoutMs,
+			WorkloadProfile workloadProfile,
+			Executor executor,
+			long contextDeadlineEpochMillis) {
 		long requestStartNanos = System.nanoTime();
 		if (keys == null) {
 			return CompletableFuture.failedFuture(
@@ -4003,7 +4062,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			// Establish the request deadline before validation/copying so admission work
 			// for a very large logical request cannot grant the native reads fresh time.
-			deadlineMicros = readDeadlineMicros(timeoutMs);
+			deadlineMicros = readDeadlineMicros(timeoutMs, contextDeadlineEpochMillis);
 		} catch (Throwable error) {
 			return CompletableFuture.failedFuture(error);
 		}
@@ -4019,7 +4078,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return CompletableFuture.failedFuture(error);
 		}
 		var request = new AsyncExistsMultiRequest(
-				transactionId, columnId, requestKeys, timeoutMs, requestStartNanos, deadlineMicros);
+				transactionId,
+				columnId,
+				requestKeys,
+				timeoutMs,
+				requestStartNanos,
+				deadlineMicros,
+				workloadProfile,
+				executor);
 		request.scheduleInitial();
 		return request;
 	}
@@ -4037,7 +4103,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final long timeoutMs;
 		private final long requestStartNanos;
 		private final long deadlineMicros;
-		private final java.util.concurrent.Executor executor = scheduler.readExecutor();
+		private final WorkloadProfile workloadProfile;
+		private final Executor executor;
 		private final Object lifecycleLock = new Object();
 		private final AtomicBoolean cancelRequested = new AtomicBoolean();
 		private int state = INITIAL_QUEUED;
@@ -4049,13 +4116,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				List<Keys> keys,
 				long timeoutMs,
 				long requestStartNanos,
-				long deadlineMicros) {
+				long deadlineMicros,
+				WorkloadProfile workloadProfile,
+				Executor executor) {
 			this.transactionId = transactionId;
 			this.columnId = columnId;
 			this.keys = keys;
 			this.timeoutMs = timeoutMs;
 			this.requestStartNanos = requestStartNanos;
 			this.deadlineMicros = deadlineMicros;
+			this.workloadProfile = Objects.requireNonNull(workloadProfile, "workloadProfile");
+			this.executor = Objects.requireNonNull(executor, "executor");
 		}
 
 		private void scheduleInitial() {
@@ -4180,7 +4251,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			var columnUse = acquireColumnUse(columnId);
 			try {
-				Tx tx = transactionId != 0 ? getTransaction(transactionId, false) : null;
+				Tx tx = transactionId != 0
+						? getTransaction(transactionId, false, workloadProfile)
+						: null;
 				cursor = new ExistsMultiCursor(columnUse, tx, keys, deadlineMicros);
 			} catch (Throwable error) {
 				columnUse.close();
@@ -4257,9 +4330,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		private void removeQueuedTask() {
-			if (executor instanceof java.util.concurrent.ThreadPoolExecutor threadPool) {
-				threadPool.remove(this);
-			}
+			scheduler.removeQueuedTask(executor, this);
 		}
 	}
 
@@ -4582,6 +4653,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
+		return openIterator(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				timeoutMs,
+				WorkloadProfile.BATCH);
+	}
+
+	public long openIterator(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			long timeoutMs,
+			WorkloadProfile workloadProfile) throws RocksDBException {
 		var start = System.nanoTime();
 		// Protect iterator construction as active work; the installed iterator's
 		// longer lifetime is accounted separately from shutdown admission.
@@ -4631,7 +4718,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 				if (transactionId != 0L) {
 					//noinspection resource
-					it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+					it = getTransaction(transactionId, false, workloadProfile).val().getIterator(ro, col.cfh());
 				} else {
 					it = db.get().newIterator(col.cfh(), ro);
 				}
@@ -4643,7 +4730,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 				checkIteratorStatusIfInvalid(it);
 
-				itEntry = new REntry<>(it, expirationTimestamp, state);
+				itEntry = new REntry<>(it, expirationTimestamp, state, workloadProfile);
 				retainResourceLease();
 				resourceLeaseRetained = true;
 				long iteratorId = FastRandomUtils.allocateNewValue(its, itEntry, 1, Long.MAX_VALUE);
@@ -4691,6 +4778,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		long nowMicros = TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
 		long timeoutMicros = TimeUnit.MILLISECONDS.toMicros(timeoutMs);
 		return timeoutMicros >= Long.MAX_VALUE - nowMicros ? Long.MAX_VALUE : nowMicros + timeoutMicros;
+	}
+
+	private static long readDeadlineMicros(long timeoutMs, long contextDeadlineEpochMillis) {
+		long operationDeadlineMicros = readDeadlineMicros(timeoutMs);
+		if (contextDeadlineEpochMillis == RequestContext.NO_DEADLINE) {
+			return operationDeadlineMicros;
+		}
+		long contextDeadlineMicros = contextDeadlineEpochMillis >= Long.MAX_VALUE / 1_000L
+				? Long.MAX_VALUE
+				: TimeUnit.MILLISECONDS.toMicros(contextDeadlineEpochMillis);
+		return Math.min(operationDeadlineMicros, contextDeadlineMicros);
 	}
 
 	private final class IteratorState extends RocksDBObjects {
@@ -6284,6 +6382,58 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return tx;
 		} else {
 			throw RocksDBException.of(RocksDBErrorType.TRANSACTION_NOT_FOUND, "No transaction with id " + transactionId);
+		}
+	}
+
+	private Tx getTransaction(long transactionId,
+			boolean allowGetForUpdate,
+			WorkloadProfile requestedProfile) {
+		var tx = getTransaction(transactionId, allowGetForUpdate);
+		requireResourceProfile("transaction or update",
+				transactionId,
+				tx.workloadProfile(),
+				requestedProfile);
+		return tx;
+	}
+
+	public void validateTransactionOrUpdateProfile(long transactionOrUpdateId,
+			WorkloadProfile requestedProfile) {
+		if (transactionOrUpdateId != 0L) {
+			getTransaction(transactionOrUpdateId, true, requestedProfile);
+		}
+	}
+
+	public void validateTransactionProfile(long transactionId, WorkloadProfile requestedProfile) {
+		if (transactionId != 0L) {
+			var tx = getTransaction(transactionId, true);
+			requireResourceProfile("transaction",
+					transactionId,
+					tx.workloadProfile(),
+					requestedProfile);
+		}
+	}
+
+	public void validateIteratorProfile(long iteratorId, WorkloadProfile requestedProfile) {
+		var iterator = its.get(iteratorId);
+		if (iterator == null) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Unknown iterator " + iteratorId);
+		}
+		requireResourceProfile("iterator",
+				iteratorId,
+				iterator.workloadProfile(),
+				requestedProfile);
+	}
+
+	private static void requireResourceProfile(String resourceType,
+			long id,
+			WorkloadProfile boundProfile,
+			WorkloadProfile requestedProfile) {
+		Objects.requireNonNull(requestedProfile, "requestedProfile");
+		if (boundProfile != requestedProfile) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Cannot change " + resourceType + " " + id + " from "
+							+ boundProfile + " to " + requestedProfile);
 		}
 	}
 
