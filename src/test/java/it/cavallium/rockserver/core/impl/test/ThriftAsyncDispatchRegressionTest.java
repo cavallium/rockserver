@@ -184,11 +184,11 @@ class ThriftAsyncDispatchRegressionTest {
 	}
 
 	@Test
-	void mergeBatchThroughAsyncThriftBridgeDoesNotSelfDeadlockWithOneWriteWorker() throws Exception {
+	void concurrentMergeBatchesThroughAsyncThriftBridgeDoNotSelfDeadlockAtWriteCapacity() throws Exception {
 		var config = tempDir.resolve("single-writer.conf");
 		Files.writeString(config, """
 				database: {
-				  parallelism: { read: 1, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: {
 				    enable-fast-get: false
 				    ingest-behind: false
@@ -206,17 +206,24 @@ class ThriftAsyncDispatchRegressionTest {
 			try (var client = new ThriftConnection("thrift-single-writer", "127.0.0.1", port)) {
 				long columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("entries",
 						ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-				var key = key(1);
-				var value = Buf.wrap("first".getBytes(StandardCharsets.UTF_8));
 				try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-					var completion = CompletableFuture.runAsync(() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeBatch(
-							columnId,
-							Flux.just(new KVBatchRef(List.of(key), List.of(value))),
-							MergeBatchMode.MERGE_WRITE_BATCH), executor);
-					completion.get(5, SECONDS);
+					var completions = new ArrayList<CompletableFuture<Void>>();
+					for (int i = 0; i < 3; i++) {
+						var key = key(i);
+						var value = Buf.wrap(("value-" + i).getBytes(StandardCharsets.UTF_8));
+						completions.add(CompletableFuture.runAsync(() -> client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeBatch(
+								columnId,
+								Flux.just(new KVBatchRef(List.of(key), List.of(value))),
+								MergeBatchMode.MERGE_WRITE_BATCH), executor));
+					}
+					CompletableFuture.allOf(completions.toArray(CompletableFuture[]::new)).get(5, SECONDS);
 				}
 
-				assertEquals(value, client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, columnId, key, RequestType.current()));
+				for (int i = 0; i < 3; i++) {
+					assertEquals(Buf.wrap(("value-" + i).getBytes(StandardCharsets.UTF_8)),
+							client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
+									.get(0, columnId, key(i), RequestType.current()));
+				}
 			}
 		}
 	}
@@ -226,7 +233,7 @@ class ThriftAsyncDispatchRegressionTest {
 		var config = tempDir.resolve("concurrent-thrift.conf");
 		Files.writeString(config, """
 				database: {
-				  parallelism: { read: 4, write: 2 }
+				  parallelism: { read: 4, write: 3 }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");

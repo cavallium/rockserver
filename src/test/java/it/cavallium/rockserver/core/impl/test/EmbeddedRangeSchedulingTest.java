@@ -29,6 +29,7 @@ import reactor.core.publisher.Flux;
 
 @Timeout(30)
 class EmbeddedRangeSchedulingTest {
+	private static final int DATA_WORKERS = 3;
 
 	@TempDir
 	Path tempDir;
@@ -38,19 +39,16 @@ class EmbeddedRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-writer-cleanup.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 1, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("cleanup-db"),
 				"cleanup-scheduling", configFile)) {
 			connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("progress", 1L, null, false);
-			var writeStarted = new CountDownLatch(1);
+			var writeStarted = new CountDownLatch(DATA_WORKERS);
 			var releaseWrite = new CountDownLatch(1);
-			connection.getScheduler().writeExecutor().execute(() -> {
-				writeStarted.countDown();
-				await(releaseWrite);
-			});
+			occupyWorkers(connection.getScheduler().writeExecutor(), DATA_WORKERS, writeStarted, releaseWrite);
 			try {
 				assertTrue(writeStarted.await(5, TimeUnit.SECONDS));
 				connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeFailedUpdateAsync(Long.MAX_VALUE)
@@ -79,7 +77,7 @@ class EmbeddedRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 1, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -90,6 +88,13 @@ class EmbeddedRangeSchedulingTest {
 			for (int i = 0; i < 128; i++) {
 				api.put(0, columnId, intKey(i), intValue(i), RequestType.none());
 			}
+			var occupiedWorkersEntered = new CountDownLatch(DATA_WORKERS - 1);
+			var releaseOccupiedWorkers = new CountDownLatch(1);
+			occupyWorkers(connection.getScheduler().readExecutor(),
+					DATA_WORKERS - 1,
+					occupiedWorkersEntered,
+					releaseOccupiedWorkers);
+			assertTrue(occupiedWorkersEntered.await(5, TimeUnit.SECONDS));
 
 			var firstItem = new AtomicBoolean(true);
 			var firstItemBlocked = new CountDownLatch(1);
@@ -117,11 +122,12 @@ class EmbeddedRangeSchedulingTest {
 			try {
 				connection.getInternalDB().getScheduler().interactiveRead().schedule(interactiveRan::countDown);
 				assertTrue(interactiveRan.await(5, TimeUnit.SECONDS),
-						"the only read worker stayed parked behind a blocked range consumer");
+						"the last available read worker stayed parked behind a blocked range consumer");
 				assertTrue(awaitPendingOps(connection, 0, 5, TimeUnit.SECONDS),
 						"an idle logical range retained a native read operation after its requested slice completed");
 			} finally {
 				releaseRange.countDown();
+				releaseOccupiedWorkers.countDown();
 			}
 
 			completion.get(5, TimeUnit.SECONDS);
@@ -148,7 +154,7 @@ class EmbeddedRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader-iterator.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 1, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -221,7 +227,7 @@ class EmbeddedRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader-multi.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 1, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -341,6 +347,18 @@ class EmbeddedRangeSchedulingTest {
 		}
 		if (interrupted) {
 			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static void occupyWorkers(java.util.concurrent.Executor executor,
+			int workers,
+			CountDownLatch entered,
+			CountDownLatch release) {
+		for (int i = 0; i < workers; i++) {
+			executor.execute(() -> {
+				entered.countDown();
+				await(release);
+			});
 		}
 	}
 

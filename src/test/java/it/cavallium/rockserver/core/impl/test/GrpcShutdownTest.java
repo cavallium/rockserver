@@ -83,7 +83,7 @@ class GrpcShutdownTest {
 		configFile = Files.createTempFile("rockserver-config", ".conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 2, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: { ingest-behind: false, optimistic: false }
 				}
 				""");

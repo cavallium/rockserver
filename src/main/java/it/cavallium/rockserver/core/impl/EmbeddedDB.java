@@ -6217,6 +6217,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				createdEndKeySlice = endKey != null ? toSlice(endKey) : null;
 				createdReadOptions = createReadOptions(createdStartKeySlice,
 						createdEndKeySlice);
+				if (transactionId != 0L) {
+					var transactionSnapshot = getTransaction(transactionId, false).val().getSnapshot();
+					if (transactionSnapshot != null) {
+						createdReadOptions.setSnapshot(transactionSnapshot);
+					}
+				}
 				if (retainSnapshot && transactionId == 0L) {
 					createdSnapshot = db.get().getSnapshot();
 					retainedRangeSnapshots.incrementAndGet();
@@ -8560,7 +8566,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				iteratorObserver.run();
 			}
 			try {
-				iterator = db.get().getUpdatesSince(initialRocksSequence);
+				// A composed CDC cursor can point inside one WAL batch. RocksDB seeks
+				// transaction-log iterators by the batch's first sequence, so reopen the
+				// containing batch and let EventCollector skip the earlier op indices.
+				iterator = db.get().getUpdatesSince(extractCdcWalSeq(startSeq));
 			} catch (org.rocksdb.RocksDBException error) {
 				if (error.getMessage() != null
 						&& error.getMessage().contains("Requested sequence not yet written")) {

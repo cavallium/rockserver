@@ -50,6 +50,7 @@ import sun.misc.Unsafe;
 class EmbeddedConnectionAsyncRegressionTest {
 
 	private static final int ITERATOR_CHUNK_SIZE = 4_096;
+	private static final int DATA_WORKERS = 3;
 
 	@TempDir
 	Path tempDir;
@@ -97,24 +98,18 @@ class EmbeddedConnectionAsyncRegressionTest {
 			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, 10_000);
 			var scheduler = connection.getScheduler();
 			var readExecutor = scheduler.readExecutor();
-			var initialWorkerEntered = new CountDownLatch(1);
+			var initialWorkerEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseInitialWorker = new CountDownLatch(1);
-			var betweenChunksEntered = new CountDownLatch(1);
+			var betweenChunksEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseBetweenChunks = new CountDownLatch(1);
 			CompletableFuture<Void> close = null;
 			try {
-				readExecutor.execute(() -> {
-					initialWorkerEntered.countDown();
-					awaitUninterruptibly(releaseInitialWorker);
-				});
+				occupyWorkers(readExecutor, initialWorkerEntered, releaseInitialWorker);
 				assertTrue(initialWorkerEntered.await(5, SECONDS));
 
 				var paging = asyncApi.subsequentAsync(
 						iteratorId, 0, ITERATOR_CHUNK_SIZE + 1L, RequestType.none());
-				readExecutor.execute(() -> {
-					betweenChunksEntered.countDown();
-					awaitUninterruptibly(releaseBetweenChunks);
-				});
+				occupyWorkers(readExecutor, betweenChunksEntered, releaseBetweenChunks);
 				releaseInitialWorker.countDown();
 				assertTrue(betweenChunksEntered.await(5, SECONDS),
 						"the test gate never ran between the two bounded iterator steps");
@@ -152,15 +147,12 @@ class EmbeddedConnectionAsyncRegressionTest {
 			var scheduler = connection.getScheduler();
 			var readExecutor = scheduler.readExecutor();
 			long completedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks();
-			var workerEntered = new CountDownLatch(1);
+			var workerEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseWorker = new CountDownLatch(1);
 			var nativeChunks = new AtomicInteger();
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(nativeChunks::incrementAndGet);
 			try {
-				readExecutor.execute(() -> {
-					workerEntered.countDown();
-					awaitUninterruptibly(releaseWorker);
-				});
+				occupyWorkers(readExecutor, workerEntered, releaseWorker);
 				assertTrue(workerEntered.await(5, SECONDS));
 
 				var queued = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
@@ -195,16 +187,13 @@ class EmbeddedConnectionAsyncRegressionTest {
 			var readExecutor = scheduler.readExecutor();
 			var nativeChunks = new AtomicInteger();
 			var snapshotAcquisitions = new AtomicInteger();
-			var betweenChunksEntered = new CountDownLatch(1);
+			var betweenChunksEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseBetweenChunks = new CountDownLatch(1);
 			connection.getInternalDB()
 					.setExistsMultiSnapshotObserverForTesting(snapshotAcquisitions::incrementAndGet);
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
 				if (nativeChunks.incrementAndGet() == 1) {
-					readExecutor.execute(() -> {
-						betweenChunksEntered.countDown();
-						awaitUninterruptibly(releaseBetweenChunks);
-					});
+					occupyWorkers(readExecutor, betweenChunksEntered, releaseBetweenChunks);
 				}
 			});
 			try {
@@ -252,13 +241,10 @@ class EmbeddedConnectionAsyncRegressionTest {
 			var scheduler = connection.getScheduler();
 			var readExecutor = scheduler.readExecutor();
 			var nativeChunks = new AtomicInteger();
-			var betweenChunksEntered = new CountDownLatch(1);
+			var betweenChunksEntered = new CountDownLatch(DATA_WORKERS);
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
 				if (nativeChunks.incrementAndGet() == 1) {
-					readExecutor.execute(() -> {
-						betweenChunksEntered.countDown();
-						awaitUninterruptibly(releaseBetweenChunks);
-					});
+					occupyWorkers(readExecutor, betweenChunksEntered, releaseBetweenChunks);
 				}
 			});
 
@@ -319,13 +305,10 @@ class EmbeddedConnectionAsyncRegressionTest {
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getScheduler();
 			var readExecutor = scheduler.readExecutor();
-			var workerEntered = new CountDownLatch(1);
+			var workerEntered = new CountDownLatch(DATA_WORKERS);
 			var nativeChunks = new AtomicInteger();
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(nativeChunks::incrementAndGet);
-			readExecutor.execute(() -> {
-				workerEntered.countDown();
-				awaitUninterruptibly(releaseWorker);
-			});
+			occupyWorkers(readExecutor, workerEntered, releaseWorker);
 			assertTrue(workerEntered.await(5, SECONDS));
 
 			var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
@@ -379,15 +362,12 @@ class EmbeddedConnectionAsyncRegressionTest {
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getScheduler();
 			var readExecutor = scheduler.readExecutor();
-			var workerEntered = new CountDownLatch(1);
+			var workerEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseWorker = new CountDownLatch(1);
 			var nativeChunks = new AtomicInteger();
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(nativeChunks::incrementAndGet);
 			try {
-				readExecutor.execute(() -> {
-					workerEntered.countDown();
-					awaitUninterruptibly(releaseWorker);
-				});
+				occupyWorkers(readExecutor, workerEntered, releaseWorker);
 				assertTrue(workerEntered.await(5, SECONDS));
 
 				var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
@@ -460,11 +440,22 @@ class EmbeddedConnectionAsyncRegressionTest {
 		var config = tempDir.resolve(name + ".conf");
 		Files.writeString(config, """
 				database: {
-				  parallelism: { read: 1, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
 		return new EmbeddedConnection(tempDir.resolve(name + "-db"), name, config);
+	}
+
+	private static void occupyWorkers(java.util.concurrent.Executor executor,
+			CountDownLatch entered,
+			CountDownLatch release) {
+		for (int i = 0; i < DATA_WORKERS; i++) {
+			executor.execute(() -> {
+				entered.countDown();
+				awaitUninterruptibly(release);
+			});
+		}
 	}
 
 	private static void assertConcurrentIteratorOperation(CompletableFuture<?> rejected) {

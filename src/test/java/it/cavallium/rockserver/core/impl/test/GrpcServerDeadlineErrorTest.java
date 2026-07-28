@@ -251,6 +251,7 @@ class GrpcServerDeadlineErrorTest {
 			try {
 				var request = it.cavallium.rockserver.core.common.api.proto.GetRangeRequest.newBuilder()
 						.setTimeoutMs(10_000)
+						.setContext(wireBatchContext())
 						.build();
 				it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newFutureStub(channel)
 						.withDeadlineAfter(2, TimeUnit.SECONDS)
@@ -280,6 +281,7 @@ class GrpcServerDeadlineErrorTest {
 			try {
 				var request = it.cavallium.rockserver.core.common.api.proto.GetRangeRequest.newBuilder()
 						.setTimeoutMs(10_000)
+						.setContext(wireBatchContext())
 						.build();
 				it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc
 						.newReactorStub(channel)
@@ -374,6 +376,13 @@ class GrpcServerDeadlineErrorTest {
 						"the server-side operation budget must be capped by the caller context");
 			}
 		}
+	}
+
+	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireBatchContext() {
+		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+				.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+				.setDeadlineEpochMillis(it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE)
+				.build();
 	}
 
 	private static final class DeadlineBackendConnection implements RocksDBConnection {

@@ -31,6 +31,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 @Timeout(30)
 class EmbeddedReduceRangeSchedulingTest {
+	private static final int DATA_WORKERS = 3;
 
 	@TempDir
 	Path tempDir;
@@ -53,7 +54,7 @@ class EmbeddedReduceRangeSchedulingTest {
 		var configFile = tempDir.resolve("range-async-io.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 1, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -78,7 +79,7 @@ class EmbeddedReduceRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 1, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -88,12 +89,11 @@ class EmbeddedReduceRangeSchedulingTest {
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			api.put(0, columnId, intKey(1), intValue(1), RequestType.none());
 
-			var blockerStarted = new CountDownLatch(1);
+			var blockerStarted = new CountDownLatch(DATA_WORKERS);
 			var releaseBlocker = new CountDownLatch(1);
-			connection.getInternalDB().getScheduler().read().schedule(() -> {
-				blockerStarted.countDown();
-				await(releaseBlocker);
-			});
+			occupyWorkers(connection.getInternalDB().getScheduler().readExecutor(),
+					blockerStarted,
+					releaseBlocker);
 			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
 
 			var iteratorOpens = new AtomicInteger();
@@ -123,7 +123,7 @@ class EmbeddedReduceRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader-cancellation.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 1, write: 1 }
+				  parallelism: { read: 3, write: 3 }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -133,12 +133,9 @@ class EmbeddedReduceRangeSchedulingTest {
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getInternalDB().getScheduler();
 			var readExecutor = scheduler.readExecutor();
-			var blockerStarted = new CountDownLatch(1);
+			var blockerStarted = new CountDownLatch(DATA_WORKERS);
 			var releaseBlocker = new CountDownLatch(1);
-			readExecutor.execute(() -> {
-				blockerStarted.countDown();
-				await(releaseBlocker);
-			});
+			occupyWorkers(readExecutor, blockerStarted, releaseBlocker);
 			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
 
 			try {
@@ -160,6 +157,17 @@ class EmbeddedReduceRangeSchedulingTest {
 			latch.await();
 		} catch (InterruptedException _) {
 			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static void occupyWorkers(java.util.concurrent.Executor executor,
+			CountDownLatch entered,
+			CountDownLatch release) {
+		for (int i = 0; i < DATA_WORKERS; i++) {
+			executor.execute(() -> {
+				entered.countDown();
+				await(release);
+			});
 		}
 	}
 

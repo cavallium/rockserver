@@ -60,7 +60,7 @@ public class LoggingClient implements RocksDBConnection {
 			logger.trace("Request input (sync): {}", req);
 			SYNC_RESULT result;
 			try {
-				result = syncApi.requestSync(req);
+				result = req.handleSync(syncApi);
 			} catch (Throwable e) {
 				logger.trace("Request failed: {}    Error: {}", req, e.getMessage());
 				throw e;
@@ -82,10 +82,10 @@ public class LoggingClient implements RocksDBConnection {
         @Override
 		public <RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> ASYNC_RESULT requestAsync(RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> req) {
 			if (!logger.isEnabledForLevel(Level.TRACE)) {
-				return asyncApi.requestAsync(req);
+				return req.handleAsync(asyncApi);
 			} else {
 				logger.trace("Request input (async): {}", req);
-				var r = asyncApi.requestAsync(req);
+				var r = req.handleAsync(asyncApi);
 				return switch (req) {
 					case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> {
 						var future = (CompletableFuture<?>) r;
