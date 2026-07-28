@@ -285,6 +285,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private volatile @Nullable LongConsumer rangeCountQuantumItemsObserver;
 	private volatile @Nullable Runnable rangeContinuationObserver;
 	private volatile @Nullable LongConsumer retainedQueryPermitGrantedObserver;
+	private volatile @Nullable Runnable forcedShutdownObserver;
 	private volatile @Nullable Runnable existsMultiChunkObserver;
 	private volatile @Nullable Runnable existsMultiSnapshotObserver;
 	private volatile @Nullable Runnable cdcPollTailCapturedObserver;
@@ -865,6 +866,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						+ ", retainedSnapshots=" + retainedRangeSnapshots.get());
 			}
 		} catch (TimeoutException e) {
+			var forcedObserver = forcedShutdownObserver;
+			if (forcedObserver != null) {
+				forcedObserver.run();
+			}
 			logger.error(
 					"Some active operations lasted more than {} ms, forcing database shutdown... activeOps={}, resourceLeases={}, openTxs={}, openIterators={}",
 					pendingOpsTimeoutMs,
@@ -1403,6 +1408,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setRetainedQueryPermitGrantedObserverForTesting(@Nullable LongConsumer observer) {
 		this.retainedQueryPermitGrantedObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setForcedShutdownObserverForTesting(@Nullable Runnable observer) {
+		this.forcedShutdownObserver = observer;
 	}
 
 	@VisibleForTesting
@@ -5449,7 +5459,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						.repeat()
 						.takeUntil(RangeReadChunk::exhausted)
 						// Request the next native quantum only after this decoded page is drained.
-						.concatMap(chunk -> Flux.fromIterable(castRangeItems(chunk.items())), 0),
+						.concatMap(chunk -> Flux.fromIterable(EmbeddedDB.<T>castRangeItems(chunk.items())), 0)
+						.takeUntilOther(retainedRangeDeadlineSignal(deadline)),
 				cursor -> closeRangeCursor(cursor, totalTime, getRangeTimer),
 				(cursor, _) -> closeRangeCursor(cursor, totalTime, getRangeTimer),
 				cursor -> closeRangeCursor(cursor, totalTime, getRangeTimer));
@@ -5532,11 +5543,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							}
 						})
 						.repeat()
-						.takeUntil(RangeCountChunk::exhausted),
+						.takeUntil(RangeCountChunk::exhausted)
+						.takeUntilOther(retainedRangeDeadlineSignal(deadline)),
 				cursor -> closeRangeCursor(cursor, totalTime, reduceRangeTimer),
 				(cursor, _) -> closeRangeCursor(cursor, totalTime, reduceRangeTimer),
 				cursor -> closeRangeCursor(cursor, totalTime, reduceRangeTimer))
 				.reduce(0L, (total, chunk) -> total + chunk.count());
+	}
+
+	/**
+	 * Signal the immutable logical-read deadline independently of downstream
+	 * demand. The cursor sweep remains a native-resource safety net, while this
+	 * signal guarantees that a stalled subscriber observes the terminal error.
+	 */
+	private Mono<Void> retainedRangeDeadlineSignal(ReadDeadline deadline) {
+		return Mono.defer(() -> {
+			long delayMillis = Math.max(0L, deadline.epochMillis() - System.currentTimeMillis());
+			return Mono.delay(Duration.ofMillis(delayMillis))
+					.then(Mono.error(retainedRangeDeadlineExceeded()));
+		});
 	}
 
 	private Mono<RangeCursor> openRetainedRangeCursorAsync(long transactionId,

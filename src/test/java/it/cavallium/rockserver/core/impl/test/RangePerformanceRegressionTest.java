@@ -8,6 +8,7 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -17,6 +18,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -242,12 +244,15 @@ class RangePerformanceRegressionTest {
 	}
 
 	@Test
-	void stalledRangeReleasesItsSnapshotAfterTheReadDeadline() throws Exception {
+	void stalledRangeUsesItsContextDeadlineWhenOperationTimeoutIsUnlimited() throws Exception {
 		// Keep more data than the one in-flight chunk plus the single delivery-side
 		// prefetch, so expiry is observed when buffered entries have drained.
 		final int entries = 5_000;
+		var config = Files.writeString(tempDir.resolve("expired-snapshot.conf"), """
+				database.parallelism.workload.retained-snapshot-maximum-age = PT10S
+				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("expired-snapshot-db"),
-				"range-expired-snapshot", null)) {
+				"range-expired-snapshot", config)) {
 			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var internal = connection.getInternalDB();
 			long columnId = api.createColumn("entries",
@@ -256,13 +261,14 @@ class RangePerformanceRegressionTest {
 				api.put(0, columnId, key(i), value(i), RequestType.none());
 			}
 
-			var range = Flux.from(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0,
+			var range = Flux.from(connection.getAsyncApi(
+					RequestContext.batch(Instant.now().plusMillis(500))).getRangeAsync(0,
 					columnId,
 					null,
 					null,
 					false,
 					RequestType.allInRange(),
-					500));
+					Long.MAX_VALUE));
 			StepVerifier.create(range, 1)
 					.assertNext(first -> assertEquals(key(0), first.keys()))
 					.thenAwait(Duration.ofMillis(600))

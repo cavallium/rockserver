@@ -25,6 +25,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -299,6 +300,43 @@ class ExactCountContinuationTest {
 	}
 
 	@Test
+	void cancellationAfterPermitGrantRemovesQueuedCursorConstruction() throws Exception {
+		try (var connection = populatedConnection("snapshot-granted-cancellation", """
+				database.parallelism.workload.retained-analytical-snapshots = 1
+				database.parallelism.workload.retained-snapshot-maximum-age = PT30S
+				""", 2)) {
+			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
+			var analyticalWorkerEntered = new CountDownLatch(1);
+			var releaseAnalyticalWorker = new CountDownLatch(1);
+			connection.getScheduler().executor(WorkloadProfile.ANALYTICAL,
+					OperationFamily.FULL_SCAN_AGGREGATE,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				analyticalWorkerEntered.countDown();
+				await(releaseAnalyticalWorker);
+			});
+			assertTrue(analyticalWorkerEntered.await(5, TimeUnit.SECONDS));
+			try {
+				var count = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+				assertTrue(awaitCondition(() -> connection.getInternalDB().getRetainedRangePermitCount() == 1
+						&& connection.getScheduler().poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1,
+						5_000));
+
+				assertTrue(count.cancel(false));
+				assertTrue(awaitCondition(() -> connection.getInternalDB().getRetainedRangePermitCount() == 0
+						&& connection.getInternalDB().getRetainedRangeWaiterCount() == 0
+						&& connection.getInternalDB().getActiveRangeCursorCount() == 0
+						&& connection.getInternalDB().getRetainedRangeSnapshotCount() == 0
+						&& connection.getScheduler().poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 0,
+						5_000));
+			} finally {
+				releaseAnalyticalWorker.countDown();
+			}
+			assertRetainedResourcesClosed(connection);
+		}
+	}
+
+	@Test
 	void configuredCountQuantumMaximumIsAppliedAndConstructionFailureReleasesPermit() throws Exception {
 		try (var connection = populatedConnection("snapshot-configured-quantum", """
 				database.parallelism.workload.range-quantum-max-items = 7
@@ -403,6 +441,87 @@ class ExactCountContinuationTest {
 			release.countDown();
 			if (!closed) {
 				connection.closeTesting();
+			}
+		}
+	}
+
+	@Test
+	void forcedShutdownDrainsActiveRetainedQueryAndPermitWaiter() throws Exception {
+		String timeoutProperty = "it.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms";
+		String previousTimeout = System.getProperty(timeoutProperty);
+		System.setProperty(timeoutProperty, "1");
+		var releaseContinuation = new CountDownLatch(1);
+		var releaseOperation = new CountDownLatch(1);
+		var connection = populatedConnection("snapshot-forced-shutdown", """
+				database.parallelism.workload.retained-analytical-snapshots = 1
+				database.parallelism.workload.retained-snapshot-maximum-age = PT30S
+				database.parallelism.workload.range-quantum-max-items = 1
+				""", 2);
+		CompletableFuture<Void> close = null;
+		boolean closed = false;
+		try {
+			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
+			var firstContinuation = new CountDownLatch(1);
+			var first = new AtomicBoolean(true);
+			connection.getInternalDB().setRangeContinuationObserverForTesting(() -> {
+				if (first.compareAndSet(true, false)) {
+					firstContinuation.countDown();
+					await(releaseContinuation);
+				}
+			});
+			connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+			assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
+			connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+			assertTrue(awaitCondition(
+					() -> connection.getInternalDB().getRetainedRangeWaiterCount() == 1, 5_000));
+
+			var operationEntered = new CountDownLatch(1);
+			var firstColumnUse = new AtomicBoolean(true);
+			connection.getInternalDB().setColumnUseAcquiredObserverForTesting(ignored -> {
+				if (firstColumnUse.compareAndSet(true, false)) {
+					operationEntered.countDown();
+					await(releaseOperation);
+				}
+			});
+			var blockingOperation = CompletableFuture.supplyAsync(() ->
+					connection.getSyncApi(RequestContext.batch()).estimateNumKeys(columnId));
+			assertTrue(operationEntered.await(5, TimeUnit.SECONDS));
+
+			var forced = new CountDownLatch(1);
+			connection.getInternalDB().setForcedShutdownObserverForTesting(forced::countDown);
+			close = CompletableFuture.runAsync(() -> {
+				try {
+					connection.closeTesting();
+				} catch (Exception error) {
+					throw new CompletionException(error);
+				}
+			});
+			assertTrue(forced.await(5, TimeUnit.SECONDS),
+					"shutdown must enter forced cleanup while the admitted operation is held");
+			assertRetainedResourcesClosed(connection);
+
+			releaseOperation.countDown();
+			blockingOperation.get(5, TimeUnit.SECONDS);
+			close.get(5, TimeUnit.SECONDS);
+			closed = true;
+			assertRetainedResourcesClosed(connection);
+		} finally {
+			releaseOperation.countDown();
+			releaseContinuation.countDown();
+			connection.getInternalDB().setRangeContinuationObserverForTesting(null);
+			connection.getInternalDB().setColumnUseAcquiredObserverForTesting(null);
+			connection.getInternalDB().setForcedShutdownObserverForTesting(null);
+			if (!closed && close == null) {
+				connection.closeTesting();
+			} else if (!closed && !close.isDone()) {
+				close.get(5, TimeUnit.SECONDS);
+			}
+			if (previousTimeout == null) {
+				System.clearProperty(timeoutProperty);
+			} else {
+				System.setProperty(timeoutProperty, previousTimeout);
 			}
 		}
 	}

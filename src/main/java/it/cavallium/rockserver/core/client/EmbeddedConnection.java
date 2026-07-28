@@ -719,8 +719,28 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	}
 
 	@Override
+	@SuppressWarnings("unchecked")
 	public <T> T reduceRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestReduceRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
+		var context = currentRequestContextOrBatch();
+		db.validateTransactionProfile(transactionId, context.profile());
+		if (requestType instanceof RequestType.RequestEntriesCount<?>) {
+			var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
+					transactionId,
+					columnId,
+					startKeysInclusive,
+					endKeysExclusive,
+					reverse,
+					requestType,
+					timeoutMs);
+			return (T) db.countRangeAsyncInternal(transactionId,
+					columnId,
+					startKeysInclusive,
+					endKeysExclusive,
+					reverse,
+					timeoutMs,
+					context.deadlineEpochMillis(),
+					resolveCommand(context, command)).block();
+		}
 		return db.reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
 	}
 
@@ -972,8 +992,25 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public <T> Stream<T> getRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
-		return db.getRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+		var context = currentRequestContextOrBatch();
+		db.validateTransactionProfile(transactionId, context.profile());
+		var command = new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<>(
+				transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs);
+		return Flux.from(db.getRangeAsyncInternal(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				requestType,
+				timeoutMs,
+				context.deadlineEpochMillis(),
+				resolveCommand(context, command))).toStream();
 	}
 
 	@Override
