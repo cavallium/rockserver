@@ -1460,7 +1460,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		actionLogger.logAction("OpenTransaction", start, null, null, null, null, null, timeoutMs, null);
 		ops.beginOp();
 		try {
-			return allocateTransactionInternal(openTransactionInternal(timeoutMs, false, workloadProfile));
+			return allocateTransactionInternal(openTransactionInternal(timeoutMs,
+					false,
+					workloadProfile,
+					true));
 		} finally {
 			ops.endOp();
 			var end = System.nanoTime();
@@ -1482,12 +1485,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private Tx openTransactionInternal(long timeoutMs, boolean isFromGetForUpdate) {
-		return openTransactionInternal(timeoutMs, isFromGetForUpdate, WorkloadProfile.BATCH);
+		return openTransactionInternal(timeoutMs, isFromGetForUpdate, WorkloadProfile.BATCH, false);
 	}
 
 	private Tx openTransactionInternal(long timeoutMs,
 			boolean isFromGetForUpdate,
-			WorkloadProfile workloadProfile) {
+			WorkloadProfile workloadProfile,
+			boolean captureSnapshot) {
 		Objects.requireNonNull(workloadProfile, "workloadProfile");
 		var expirationTimestamp = timeoutMs + System.currentTimeMillis();
 		TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
@@ -1496,10 +1500,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		org.rocksdb.Transaction transaction = null;
 		try {
 			transaction = db.beginTransaction(writeOpts, txOpts);
-			// A transaction-backed page is a fresh iterator on every request. Capture the
-			// transaction snapshot at open so every page and ordinary transaction read sees
-			// the same base sequence while still observing the transaction's own writes.
-			transaction.setSnapshot();
+			if (captureSnapshot) {
+				// A transaction-backed page is a fresh iterator on every request. Capture the
+				// snapshot before the externally usable ID becomes observable, while leaving
+				// internal throwaway write transactions on their existing read semantics.
+				transaction.setSnapshot();
+			}
 			var tx = new Tx(transaction,
 					isFromGetForUpdate,
 					expirationTimestamp,
@@ -3944,7 +3950,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long updateId;
 			if (requestType instanceof RequestType.RequestForUpdate<?>) {
 				if (prevTx == null) {
-					tx = openTransactionInternal(MAX_TRANSACTION_DURATION_MS, true, workloadProfile);
+					tx = openTransactionInternal(MAX_TRANSACTION_DURATION_MS,
+							true,
+							workloadProfile,
+							false);
 					updateId = allocateTransactionInternal(tx);
 				} else {
 					tx = prevTx;

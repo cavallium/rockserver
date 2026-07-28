@@ -1022,13 +1022,11 @@ impl RockserverClient {
 			1 | 2 => {}
 			_ => return Err(Status::invalid_argument("range request type is required")),
 		}
-		if budget.max_items <= 0 || budget.max_items > 4_096 {
-			return Err(Status::invalid_argument("range max_items must be between 1 and 4096"));
+		if budget.max_items <= 0 {
+			return Err(Status::invalid_argument("range max_items must be positive"));
 		}
-		if budget.max_bytes <= 0 || budget.max_bytes > 8 * 1024 * 1024 {
-			return Err(Status::invalid_argument(
-				"range max_bytes must be between 1 and 8388608",
-			));
+		if budget.max_bytes <= 0 {
+			return Err(Status::invalid_argument("range max_bytes must be positive"));
 		}
 		let req = GetRangePageRequest {
 			transaction_id,

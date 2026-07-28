@@ -19,6 +19,7 @@ import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RangePage;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
@@ -132,6 +133,24 @@ class RangePageContractTest {
 					TWO_ITEMS);
 			assertEquals(List.of(20L, 30L), values(noCache));
 			assertTrue(noCache.hasMore());
+		}
+	}
+
+	@Test
+	void embeddedGrpcAndThriftAsyncViewsExposeTheSameBoundedPageContract() {
+		for (var api : asyncApis(RequestContext.latency(Duration.ofSeconds(30)))) {
+			var page = api.getRangePageAsync(0,
+					columnId,
+					key(20),
+					key(80),
+					false,
+					null,
+					RequestType.allInRange(),
+					TIMEOUT_MS,
+					TWO_ITEMS).join();
+			assertEquals(List.of(20L, 30L), values(page));
+			assertEquals(key(30), page.resumeAfter());
+			assertTrue(page.hasMore());
 		}
 	}
 
@@ -268,6 +287,23 @@ class RangePageContractTest {
 		}
 	}
 
+	@Test
+	void grpcConstructionRejectsAPeerWithoutTheCapabilityRpc() throws Exception {
+		var server = ServerBuilder.forPort(0)
+				.addService(new ReactorRocksDBServiceGrpc.RocksDBServiceImplBase() {})
+				.build()
+				.start();
+		try {
+			var error = assertThrows(RocksDBException.class, () -> GrpcConnection.forHostAndPort(
+					"missing-range-capability",
+					new Utils.HostAndPort("127.0.0.1", server.getPort())));
+			assertEquals(RocksDBErrorType.NOT_IMPLEMENTED, error.getErrorUniqueId());
+		} finally {
+			server.shutdownNow();
+			server.awaitTermination();
+		}
+	}
+
 	private List<RocksDBSyncAPI> apis() {
 		return apis(RequestContext.batch());
 	}
@@ -277,6 +313,13 @@ class RangePageContractTest {
 				embedded.getSyncApi(context),
 				grpc.getSyncApi(context),
 				thrift.getSyncApi(context));
+	}
+
+	private List<RocksDBAsyncAPI> asyncApis(RequestContext context) {
+		return List.of(
+				embedded.getAsyncApi(context),
+				grpc.getAsyncApi(context),
+				thrift.getAsyncApi(context));
 	}
 
 	private void assertPages(RocksDBSyncAPI api, boolean reverse, List<Long> expected) {

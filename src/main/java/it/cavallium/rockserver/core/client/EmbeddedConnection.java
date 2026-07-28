@@ -806,7 +806,7 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 				resumeAfter,
 				requestType,
 				remainingReadTimeoutMillis(timeoutMs, queuedAtNanos),
-				budget), commandExecutor(command));
+				budget), commandExecutor(command), budget.maxBytes());
 	}
 
 	/**
@@ -834,12 +834,22 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 	 */
 	private <T> CompletableFuture<T> supplyAsyncPreservingRunningCompletion(Supplier<T> supplier,
 			Executor executor) {
+		return supplyAsyncPreservingRunningCompletion(supplier, executor, 0L);
+	}
+
+	private <T> CompletableFuture<T> supplyAsyncPreservingRunningCompletion(Supplier<T> supplier,
+			Executor executor,
+			long estimatedBytes) {
 		var future = new RunningCompletionFuture<>(
 				supplier,
 				executor,
 				db.getScheduler()::removeQueuedTask);
 		try {
-			executor.execute(future);
+			if (executor instanceof RWScheduler.WorkloadExecutor workloadExecutor) {
+				workloadExecutor.execute(future, estimatedBytes);
+			} else {
+				executor.execute(future);
+			}
 		} catch (Throwable error) {
 			future.reject(error);
 		}
