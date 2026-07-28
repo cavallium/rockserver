@@ -55,15 +55,18 @@ class EmbeddedRangeSchedulingTest {
 						.get(5, TimeUnit.SECONDS);
 				assertTrue(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransactionAsync(Long.MAX_VALUE, false)
 						.get(5, TimeUnit.SECONDS));
-				connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommitAsync("progress", 42L)
-						.get(5, TimeUnit.SECONDS);
-				assertEquals(java.util.OptionalLong.of(42L),
-						connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcGetLastCommittedSequence("progress"));
+				var cdcCommit = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
+						.cdcCommitAsync("progress", 42L);
+				assertThrows(TimeoutException.class, () -> cdcCommit.get(200, TimeUnit.MILLISECONDS),
+						"cdcCommit must remain queued as must-complete CDC mutation work");
 
 				var commit = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransactionAsync(Long.MAX_VALUE, true);
 				assertThrows(TimeoutException.class, () -> commit.get(200, TimeUnit.MILLISECONDS),
 						"commit=true must remain queued on the saturated write lane");
 				releaseWrite.countDown();
+				cdcCommit.get(5, TimeUnit.SECONDS);
+				assertEquals(java.util.OptionalLong.of(42L),
+						connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcGetLastCommittedSequence("progress"));
 				commit.handle((_, _) -> null).get(5, TimeUnit.SECONDS);
 				assertTrue(commit.isCompletedExceptionally());
 			} finally {

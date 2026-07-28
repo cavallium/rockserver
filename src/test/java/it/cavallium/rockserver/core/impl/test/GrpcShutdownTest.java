@@ -34,6 +34,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 class GrpcShutdownTest {
+	private static final int DATA_WORKERS = 3;
 
 	private static final String CLIENT_MAX_RETRY_ATTEMPTS
 			= "it.cavallium.rockserver.grpc.client.max-retry-attempts";
@@ -231,28 +232,33 @@ class GrpcShutdownTest {
 		var client = newClient();
 		var api = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("progress", 1L, null, false);
-		var writeStarted = new CountDownLatch(1);
+		var writeStarted = new CountDownLatch(DATA_WORKERS);
 		var releaseWrite = new CountDownLatch(1);
-		embeddedConnection.getScheduler().writeExecutor().execute(() -> {
-			writeStarted.countDown();
-			try {
-				releaseWrite.await();
-			} catch (InterruptedException ex) {
-				Thread.currentThread().interrupt();
-			}
-		});
+		for (int i = 0; i < DATA_WORKERS; i++) {
+			embeddedConnection.getScheduler().writeExecutor().execute(() -> {
+				writeStarted.countDown();
+				try {
+					releaseWrite.await();
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+				}
+			});
+		}
 		try {
 			assertTrue(writeStarted.await(5, TimeUnit.SECONDS));
 			api.closeFailedUpdateAsync(Long.MAX_VALUE).get(5, TimeUnit.SECONDS);
 			assertTrue(api.closeTransactionAsync(Long.MAX_VALUE, false).get(5, TimeUnit.SECONDS));
-			api.cdcCommitAsync("progress", 42L).get(5, TimeUnit.SECONDS);
-			assertEquals(java.util.OptionalLong.of(42L),
-					embeddedConnection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcGetLastCommittedSequence("progress"));
+			var cdcCommit = api.cdcCommitAsync("progress", 42L);
+			assertThrows(TimeoutException.class, () -> cdcCommit.get(200, TimeUnit.MILLISECONDS),
+					"remote cdcCommit must remain queued as must-complete CDC mutation work");
 
 			var commit = api.closeTransactionAsync(Long.MAX_VALUE, true);
 			assertThrows(TimeoutException.class, () -> commit.get(200, TimeUnit.MILLISECONDS),
 					"remote commit=true must remain queued on the saturated write lane");
 			releaseWrite.countDown();
+			cdcCommit.get(5, TimeUnit.SECONDS);
+			assertEquals(java.util.OptionalLong.of(42L),
+					embeddedConnection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcGetLastCommittedSequence("progress"));
 			commit.handle((_, _) -> null).get(5, TimeUnit.SECONDS);
 			assertTrue(commit.isCompletedExceptionally());
 		} finally {

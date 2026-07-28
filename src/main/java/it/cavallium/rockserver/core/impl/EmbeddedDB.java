@@ -7662,7 +7662,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long maxWalSequenceInclusive,
 			CdcSubscriptionMeta subscription,
 			CdcSubscriptionProgress progress) {}
-	private record CdcPollPage(CdcBatch batch, long emittedEvents, long emittedBytes) {}
+	private record CdcPollPage(CdcBatch batch,
+			long emittedEvents,
+			long emittedBytes,
+			long scannedMutations) {}
 	private record CdcResolvedPage(List<CDCEvent> events,
 			long emittedBytes,
 			@Nullable Long continuationSeq) {}
@@ -8773,11 +8776,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			return new CdcPollPage(new CdcBatch(resolvedPage.events(), nextSeq),
 					resolvedPage.events().size(),
-					resolvedPage.emittedBytes());
+					resolvedPage.emittedBytes(),
+					scannedMutations);
 		}
 
 		private CdcPollPage emptyPage() {
-			return new CdcPollPage(new CdcBatch(Collections.emptyList(), nextSeq), 0L, 0L);
+			return new CdcPollPage(new CdcBatch(Collections.emptyList(), nextSeq), 0L, 0L, 0L);
 		}
 
 		private RocksDBException cdcCursorDeadlineExceeded() {
@@ -8875,7 +8879,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					long nextSeq = batch.nextSeq();
 					if (cursor.isExhausted()
 							|| extractCdcRocksSequence(nextSeq) > maxWalSequenceInclusive
-							|| nextSeq == pageStart) {
+							|| nextSeq == pageStart && page.scannedMutations() == 0L) {
 						break;
 					}
 					pageStart = nextSeq;
@@ -8936,7 +8940,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 										|| (remainingBytes == 0L && emitted > 0L)
 										|| cursor.isExhausted()
 									|| extractCdcRocksSequence(nextSeq) > window.maxWalSequenceInclusive()
-										|| nextSeq == page.startSeq()) {
+										|| nextSeq == page.startSeq()
+												&& page.page().scannedMutations() == 0L) {
 									return Mono.empty();
 								}
 								boolean allowOversizedFirstEvent = page.allowOversizedFirstEvent()

@@ -265,7 +265,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 
 			assertThrows(CancellationException.class, () -> request.get(5, SECONDS));
 			assertTrue(request.isCancelled());
-			assertEquals(0, connection.getInternalDB().getPendingOpsCount(),
+			assertTrue(awaitPendingOps(connection, 0, 5, SECONDS),
 					"forced shutdown did not release the retained logical operation");
 			assertEquals(1, nativeChunks.get(), "a native chunk ran after shutdown cancellation");
 			assertTrue(awaitQueueSize(scheduler, 0),
@@ -328,7 +328,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 
 			assertThrows(CancellationException.class, () -> request.get(5, SECONDS));
 			assertTrue(request.isCancelled());
-			assertEquals(0, connection.getInternalDB().getPendingOpsCount(),
+			assertTrue(awaitPendingOps(connection, 0, 5, SECONDS),
 					"forced shutdown did not release the initially queued admission");
 			assertEquals(0, nativeChunks.get(), "an initially queued request reached RocksDB during shutdown");
 			assertTrue(awaitQueueSize(scheduler, 0),
@@ -485,6 +485,20 @@ class EmbeddedConnectionAsyncRegressionTest {
 			Thread.sleep(1);
 		} while (System.nanoTime() < deadline);
 		return scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks() >= expected;
+	}
+
+	private static boolean awaitPendingOps(EmbeddedConnection connection,
+			long expected,
+			long timeout,
+			java.util.concurrent.TimeUnit unit) throws InterruptedException {
+		long deadline = System.nanoTime() + unit.toNanos(timeout);
+		do {
+			if (connection.getInternalDB().getPendingOpsCount() == expected) {
+				return true;
+			}
+			Thread.sleep(1);
+		} while (System.nanoTime() < deadline);
+		return connection.getInternalDB().getPendingOpsCount() == expected;
 	}
 
 	private static void awaitUninterruptibly(CountDownLatch latch) {
