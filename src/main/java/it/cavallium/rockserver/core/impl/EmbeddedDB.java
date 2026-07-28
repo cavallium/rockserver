@@ -6788,7 +6788,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return config;
 	}
 
-	@VisibleForTesting
+	/** Resolved workload limits shared by scheduler and bounded-operation implementations. */
 	public WorkloadSettings getWorkloadSettings() {
 		return workloadSettings;
 	}

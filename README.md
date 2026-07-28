@@ -23,7 +23,7 @@ database.parallelism {
 
 Each queue rejects overflow immediately as `SERVER_OVERLOADED`; gRPC exposes it
 as `RESOURCE_EXHAUSTED`. Admission metrics use bounded `database`, `resource`,
-`profile`, and `family` tags:
+`profile`, and `operation` tags where applicable:
 
 - `rockserver.workload.queued`
 - `rockserver.workload.active`
@@ -34,6 +34,8 @@ as `RESOURCE_EXHAUSTED`. Admission metrics use bounded `database`, `resource`,
 - `rockserver.workload.cancellations`
 - `rockserver.workload.rejections`
 - `rockserver.workload.failures`
+- `rockserver.workload.worker.failures`
+- `rockserver.workload.storage.pressure`
 
 See [workload profiles](docs/workload-profiles.md) for admission rules and
 [workload configuration](docs/workload-configuration.md) for every setting,

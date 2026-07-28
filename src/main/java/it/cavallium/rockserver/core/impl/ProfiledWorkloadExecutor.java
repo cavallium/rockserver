@@ -1105,7 +1105,6 @@ final class WorkloadPressureController {
 	private final long batchIntervalNanos;
 	private boolean pressured;
 	private int activeBatches;
-	private boolean completedBatchAwaitingIdle;
 	private long nextBatchNanos = Long.MIN_VALUE;
 	private volatile Runnable notifier = () -> {};
 
@@ -1129,11 +1128,10 @@ final class WorkloadPressureController {
 	}
 
 	void setPressured(boolean pressured) {
-		synchronized (this) {
+			synchronized (this) {
 			this.pressured = pressured;
 			if (!pressured) {
 				nextBatchNanos = Long.MIN_VALUE;
-				completedBatchAwaitingIdle = false;
 			}
 		}
 		notifier.run();
@@ -1159,15 +1157,14 @@ final class WorkloadPressureController {
 			if (activeBatches <= 0) {
 				throw new IllegalStateException("No active BATCH quantum to finish");
 			}
-			if (ran && permit.startedUnderPressure() && pressured) {
-				completedBatchAwaitingIdle = true;
-			}
 			activeBatches--;
-			if (activeBatches == 0) {
-				if (pressured && completedBatchAwaitingIdle) {
-					nextBatchNanos = System.nanoTime() + batchIntervalNanos;
+			if (ran && permit.startedUnderPressure() && pressured) {
+				long nowNanos = System.nanoTime();
+				try {
+					nextBatchNanos = Math.addExact(nowNanos, batchIntervalNanos);
+				} catch (ArithmeticException overflow) {
+					nextBatchNanos = Long.MAX_VALUE;
 				}
-				completedBatchAwaitingIdle = false;
 			}
 		}
 		notifier.run();
@@ -1177,10 +1174,14 @@ final class WorkloadPressureController {
 		if (!pressured) {
 			return 0L;
 		}
-		if (activeBatches > 0) {
+		if (activeBatches >= maximumActiveBatches) {
 			return Long.MAX_VALUE;
 		}
-		return Math.max(0L, nextBatchNanos - nowNanos);
+		if (nowNanos >= nextBatchNanos) {
+			return 0L;
+		}
+		long remaining = nextBatchNanos - nowNanos;
+		return remaining > 0L ? remaining : Long.MAX_VALUE;
 	}
 
 	record BatchPermit(boolean startedUnderPressure) {

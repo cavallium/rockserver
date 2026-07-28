@@ -92,6 +92,9 @@ public record WorkloadSettings(
 		if (analyticalActiveLimit > Math.min(readParallelism, writeParallelism)) {
 			throw invalid("analytical-active-limit must not exceed either data-pool capacity");
 		}
+		if (pressuredBatchMaximumActive > (long) readParallelism + writeParallelism) {
+			throw invalid("pressured-batch-maximum-active must not exceed combined data-pool capacity");
+		}
 		if (latencyRangeMaxItems > LATENCY_RANGE_HARD_MAX_ITEMS
 				|| latencyRangeMaxBytes > LATENCY_RANGE_HARD_MAX_BYTES) {
 			throw invalid("LATENCY range maximum exceeds the 4096-item/8-MiB contract ceiling");
@@ -104,14 +107,6 @@ public record WorkloadSettings(
 				readLatencyReservation, readIngestReservation, readCdcReservation);
 		validateReservations("write", writeParallelism,
 				writeLatencyReservation, writeIngestReservation, writeCdcReservation);
-		if (readLatencyReservation > 0 && latencyQueueCapacity == 0
-				|| writeLatencyReservation > 0 && latencyQueueCapacity == 0
-				|| readIngestReservation > 0 && ingestQueueCapacity == 0
-				|| writeIngestReservation > 0 && ingestQueueCapacity == 0
-				|| readCdcReservation > 0 && cdcQueueCapacity == 0
-				|| writeCdcReservation > 0 && cdcQueueCapacity == 0) {
-			throw invalid("a reservation requires a non-zero queue capacity");
-		}
 	}
 
 	public static WorkloadSettings resolve(DatabaseConfig config) throws GestaltException {
@@ -198,23 +193,24 @@ public record WorkloadSettings(
 			int analyticalActiveLimit,
 			int foregroundQueueCapacity,
 			int batchQueueCapacity,
-			boolean reservations) {
-		int reservation = reservations ? 1 : 0;
+			boolean productionDefaults) {
+		int readReservation = productionDefaults || readParallelism >= MIN_PRODUCTION_DATA_THREADS ? 1 : 0;
+		int writeReservation = productionDefaults || writeParallelism >= MIN_PRODUCTION_DATA_THREADS ? 1 : 0;
 		return new WorkloadSettings(readParallelism,
 				writeParallelism,
 				foregroundQueueCapacity,
 				foregroundQueueCapacity,
-				Math.max(1, Math.min(foregroundQueueCapacity, 1_024)),
+				Math.max(64, Math.min(foregroundQueueCapacity, 1_024)),
 				Math.max(1, Math.min(batchQueueCapacity, 512)),
 				batchQueueCapacity,
 				256,
 				16,
-				reservation,
-				reservation,
-				reservation,
-				reservation,
-				reservation,
-				reservation,
+				readReservation,
+				readReservation,
+				readReservation,
+				writeReservation,
+				writeReservation,
+				writeReservation,
 				2,
 				1,
 				analyticalActiveLimit,

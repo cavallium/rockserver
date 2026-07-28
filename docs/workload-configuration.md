@@ -53,9 +53,11 @@ When that profile has queued work, dispatch restores its guaranteed share.
 | `pressured-batch-maximum-active` | 1 | Maximum active BATCH quanta while storage is pressured |
 | `pressured-batch-interval` | `PT1S` | Minimum idle interval after pressured BATCH completion |
 
-Weights must be between 1 and 16. The latency burst and pressured BATCH maximum must be positive.
-The pressured interval must be a positive, representable duration. Physical
-maintenance remains parked while storage pressure is active.
+Weights must be between 1 and 16. The latency burst and pressured BATCH maximum
+must be positive; the maximum cannot exceed the combined read/write worker
+capacity. The pressured interval must be a positive, representable duration and
+begins after each pressured BATCH completion. Physical maintenance remains
+parked while storage pressure is active.
 
 ## Retained analytical work
 

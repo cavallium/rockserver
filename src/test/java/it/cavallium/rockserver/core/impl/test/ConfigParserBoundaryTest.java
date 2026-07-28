@@ -159,6 +159,7 @@ class ConfigParserBoundaryTest {
 				"database.parallelism.workload.control-threads = 0",
 				"database.parallelism.workload.retained-snapshot-maximum-age = PT0S",
 				"database.parallelism.workload.pressured-batch-interval = PT-1S",
+				"database.parallelism.workload.pressured-batch-maximum-active = 57",
 				"database.parallelism.workload.range-quantum-max-duration = PT0S",
 				"database.parallelism.workload.cdc-quantum-max-bytes = 0B"
 		};
@@ -264,14 +265,45 @@ class ConfigParserBoundaryTest {
 	}
 
 	@Test
-	void printedConfigurationPreservesNonDefaultGlobalValues() throws IOException {
+	void printedConfigurationPreservesEveryNonDefaultWorkloadAndGlobalValue() throws Exception {
 		Path custom = write("custom.conf", """
-				database.parallelism.read = 7
-				database.parallelism.write = 12
-				database.parallelism.workload.latency-queue-capacity = 123
-				database.parallelism.workload.ingest-queue-capacity = 124
-				database.parallelism.workload.batch-queue-capacity = 45
-				database.parallelism.workload.control-threads = 3
+				database.parallelism.read = 20
+				database.parallelism.write = 21
+				database.parallelism.workload.latency-queue-capacity = 101
+				database.parallelism.workload.ingest-queue-capacity = 102
+				database.parallelism.workload.cdc-queue-capacity = 103
+				database.parallelism.workload.analytical-queue-capacity = 104
+				database.parallelism.workload.batch-queue-capacity = 105
+				database.parallelism.workload.control-queue-capacity = 106
+				database.parallelism.workload.physical-maintenance-queue-capacity = 107
+				database.parallelism.workload.read-latency-reservation = 2
+				database.parallelism.workload.read-ingest-reservation = 3
+				database.parallelism.workload.read-cdc-reservation = 4
+				database.parallelism.workload.write-latency-reservation = 5
+				database.parallelism.workload.write-ingest-reservation = 6
+				database.parallelism.workload.write-cdc-reservation = 7
+				database.parallelism.workload.control-threads = 8
+				database.parallelism.workload.physical-concurrency = 9
+				database.parallelism.workload.analytical-active-limit = 10
+				database.parallelism.workload.retained-analytical-snapshots = 11
+				database.parallelism.workload.retained-snapshot-maximum-age = PT12S
+				database.parallelism.workload.latency-burst = 13
+				database.parallelism.workload.ingest-drr-weight = 14
+				database.parallelism.workload.cdc-drr-weight = 15
+				database.parallelism.workload.analytical-drr-weight = 16
+				database.parallelism.workload.batch-drr-weight = 1
+				database.parallelism.workload.pressured-batch-maximum-active = 17
+				database.parallelism.workload.pressured-batch-interval = PT0.018S
+				database.parallelism.workload.range-quantum-max-items = 1900
+				database.parallelism.workload.range-quantum-max-bytes = 20MiB
+				database.parallelism.workload.range-quantum-max-duration = PT0.021S
+				database.parallelism.workload.cdc-quantum-max-mutations = 2200
+				database.parallelism.workload.cdc-quantum-max-bytes = 23MiB
+				database.parallelism.workload.cdc-quantum-max-duration = PT0.024S
+				database.parallelism.workload.latency-range-max-items = 2500
+				database.parallelism.workload.latency-range-max-bytes = 6MiB
+				database.parallelism.workload.latency-fan-out-max-items = 200
+				database.parallelism.workload.latency-fan-out-max-bytes = 1MiB
 				database.global.follow-rocksdb-optimizations = false
 				database.global.paranoid-checks = false
 				database.global.use-clock-cache = true
@@ -296,12 +328,9 @@ class ConfigParserBoundaryTest {
 		var reparsed = ConfigParser.parse(printed);
 
 		assertAll(
-				() -> assertEquals(7, reparsed.parallelism().read()),
-				() -> assertEquals(12, reparsed.parallelism().write()),
-				() -> assertEquals(123, reparsed.parallelism().workload().latencyQueueCapacity()),
-				() -> assertEquals(124, reparsed.parallelism().workload().ingestQueueCapacity()),
-				() -> assertEquals(45, reparsed.parallelism().workload().batchQueueCapacity()),
-				() -> assertEquals(3, reparsed.parallelism().workload().controlThreads()),
+				() -> assertEquals(20, reparsed.parallelism().read()),
+				() -> assertEquals(21, reparsed.parallelism().write()),
+				() -> assertEquals(WorkloadSettings.resolve(original), WorkloadSettings.resolve(reparsed)),
 				() -> assertFalse(reparsed.global().followRocksdbOptimizations()),
 				() -> assertFalse(reparsed.global().paranoidChecks()),
 				() -> assertTrue(reparsed.global().useClockCache()),
