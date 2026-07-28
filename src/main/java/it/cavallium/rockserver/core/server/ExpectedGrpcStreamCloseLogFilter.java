@@ -4,7 +4,6 @@ import io.netty.handler.codec.http2.Http2Exception;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.IdentityHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Filter;
 import java.util.logging.Level;
@@ -23,10 +22,15 @@ final class ExpectedGrpcStreamCloseLogFilter implements Filter {
 
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcServer.class.getName());
 	private static final String NETTY_SERVER_LOGGER = "io.grpc.netty.NettyServerHandler";
+	/*
+	 * LogManager only retains named JUL loggers weakly. Keep this instance alive so
+	 * NettyServerHandler obtains the filtered logger when it initializes later.
+	 */
+	private static final java.util.logging.Logger NETTY_SERVER_JUL_LOGGER =
+			java.util.logging.Logger.getLogger(NETTY_SERVER_LOGGER);
 	private static final String STREAM_ERROR_MESSAGE = "Stream Error";
 	private static final String CLOSED_BEFORE_WRITE_MESSAGE = "Stream closed before write could take place";
 	private static final long REPORT_INTERVAL_NANOS = Duration.ofMinutes(1).toNanos();
-	private static final AtomicBoolean INSTALLED = new AtomicBoolean();
 	private static final AtomicLong LAST_REPORT_NANOS = new AtomicLong();
 	private static final AtomicLong SUPPRESSED = new AtomicLong();
 
@@ -37,15 +41,16 @@ final class ExpectedGrpcStreamCloseLogFilter implements Filter {
 	}
 
 	static void install() {
-		if (!INSTALLED.compareAndSet(false, true)) {
-			return;
-		}
-		try {
-			var logger = java.util.logging.Logger.getLogger(NETTY_SERVER_LOGGER);
-			logger.setFilter(new ExpectedGrpcStreamCloseLogFilter(logger.getFilter()));
-		} catch (RuntimeException failure) {
-			INSTALLED.set(false);
-			LOG.warn("Could not install the expected gRPC client-cancellation log filter", failure);
+		synchronized (NETTY_SERVER_JUL_LOGGER) {
+			if (NETTY_SERVER_JUL_LOGGER.getFilter() instanceof ExpectedGrpcStreamCloseLogFilter) {
+				return;
+			}
+			try {
+				NETTY_SERVER_JUL_LOGGER.setFilter(
+						new ExpectedGrpcStreamCloseLogFilter(NETTY_SERVER_JUL_LOGGER.getFilter()));
+			} catch (RuntimeException failure) {
+				LOG.warn("Could not install the expected gRPC client-cancellation log filter", failure);
+			}
 		}
 	}
 

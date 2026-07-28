@@ -406,6 +406,11 @@ public class GrpcServer extends Server {
 		return ExpectedGrpcStreamCloseLogFilter.isExpectedClientCancellation(record);
 	}
 
+	@VisibleForTesting
+	public static void installExpectedGrpcClientCancellationLogFilterForTesting() {
+		ExpectedGrpcStreamCloseLogFilter.install();
+	}
+
 	private static class AdaptiveCompressionInterceptor implements ServerInterceptor {
 
 		@Override
