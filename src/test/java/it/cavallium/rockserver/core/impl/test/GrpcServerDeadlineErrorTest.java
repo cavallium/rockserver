@@ -53,6 +53,32 @@ class GrpcServerDeadlineErrorTest {
 	}
 
 	@Test
+	void genericGrpcTransportDeadlineMapsToRocksDbDeadlineError() throws Exception {
+		var backend = new GenericBlockingBackendConnection();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			try (var client = GrpcConnection.forHostAndPort("grpc-generic-transport-deadline",
+					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
+				try {
+					var response = client.getAsyncApi(
+							it.cavallium.rockserver.core.common.RequestContext.batch(Instant.now().plusSeconds(2)))
+							.getColumnIdAsync("blocked");
+					assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
+
+					var failure = assertThrows(ExecutionException.class,
+							() -> response.get(5, TimeUnit.SECONDS));
+					var rocksFailure = assertInstanceOf(RocksDBException.class, failure.getCause());
+					assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+							rocksFailure.getErrorUniqueId());
+					assertEquals("Deadline exceeded", rocksFailure.getMessage());
+				} finally {
+					backend.release.countDown();
+				}
+			}
+		}
+	}
+
+	@Test
 	void expiredCallerDeadlineDoesNotApplyToProtectedGrpcOperations() throws Exception {
 		var backend = new ProtectedOperationBackendConnection();
 		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
@@ -63,6 +89,8 @@ class GrpcServerDeadlineErrorTest {
 						it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, 1L);
 				var api = client.getSyncApi(expired);
 				assertTrue(api.closeTransaction(11L, false));
+				assertEquals(it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE,
+						backend.rollbackContextDeadline.get());
 				api.closeFailedUpdate(12L);
 				api.closeIterator(13L);
 				api.cdcCommit("protected", 14L);
@@ -72,6 +100,40 @@ class GrpcServerDeadlineErrorTest {
 		assertEquals(12L, backend.closedUpdate.get());
 		assertEquals(13L, backend.closedIterator.get());
 		assertEquals(14L, backend.committedCdcSequence.get());
+	}
+
+	@Test
+	void protectedGrpcWorkloadProfilesAreRejectedByServer() throws Exception {
+		var backend = new ProtectedOperationBackendConnection();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			var channel = io.grpc.ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort())
+					.usePlaintext()
+					.build();
+			try {
+				for (var profile : List.of(
+						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.CONTROL,
+						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.CDC,
+						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.PHYSICAL_MAINTENANCE)) {
+					var request = it.cavallium.rockserver.core.common.api.proto.PutRequest.newBuilder()
+							.setColumnId(1L)
+							.setData(it.cavallium.rockserver.core.common.api.proto.KV.newBuilder()
+									.addKeys(com.google.protobuf.ByteString.copyFrom(new byte[] {1}))
+									.setValue(com.google.protobuf.ByteString.copyFrom(new byte[] {2})))
+							.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+									.setProfile(profile)
+									.setDeadlineEpochMillis(Long.MAX_VALUE))
+							.build();
+					var error = assertThrows(io.grpc.StatusRuntimeException.class,
+							() -> it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc
+									.newBlockingStub(channel)
+									.put(request));
+					assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT, error.getStatus().getCode());
+				}
+			} finally {
+				channel.shutdownNow();
+			}
+		}
 	}
 
 	@Test
@@ -488,35 +550,75 @@ class GrpcServerDeadlineErrorTest {
 	private static final class ProtectedOperationBackendConnection implements RocksDBConnection {
 
 		private final AtomicBoolean rollback = new AtomicBoolean();
+		private final AtomicLong rollbackContextDeadline = new AtomicLong(-1L);
 		private final AtomicLong closedUpdate = new AtomicLong(-1L);
 		private final AtomicLong closedIterator = new AtomicLong(-1L);
 		private final AtomicLong committedCdcSequence = new AtomicLong(-1L);
+
+		@Override
+		public URI getUrl() {
+			return URI.create("test://protected-operation-backend");
+		}
+
+		@Override
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return new RocksDBSyncAPI() {
+				@Override
+				public boolean closeTransaction(long transactionId, boolean commit) {
+					rollbackContextDeadline.set(context.deadlineEpochMillis());
+					rollback.set(transactionId == 11L && !commit);
+					return true;
+				}
+
+				@Override
+				public void closeFailedUpdate(long updateId) {
+					closedUpdate.set(updateId);
+				}
+
+				@Override
+				public void closeIterator(long iteratorId) {
+					closedIterator.set(iteratorId);
+				}
+
+				@Override
+				public void cdcCommit(String id, long seq) {
+					committedCdcSequence.set(seq);
+				}
+			};
+		}
+
+		@Override
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return new RocksDBAsyncAPI() {};
+		}
+
+		@Override
+		public void close() {
+		}
+	}
+
+	private static final class GenericBlockingBackendConnection implements RocksDBConnection {
+
+		private final CountDownLatch entered = new CountDownLatch(1);
+		private final CountDownLatch release = new CountDownLatch(1);
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
 			@Override
-			public boolean closeTransaction(long transactionId, boolean commit) {
-				rollback.set(transactionId == 11L && !commit);
-				return true;
-			}
-
-			@Override
-			public void closeFailedUpdate(long updateId) {
-				closedUpdate.set(updateId);
-			}
-
-			@Override
-			public void closeIterator(long iteratorId) {
-				closedIterator.set(iteratorId);
-			}
-
-			@Override
-			public void cdcCommit(String id, long seq) {
-				committedCdcSequence.set(seq);
+			public long getColumnId(String name) {
+				entered.countDown();
+				while (true) {
+					try {
+						release.await();
+						return 1L;
+					} catch (InterruptedException ignored) {
+						// Model a native call that outlives transport cancellation.
+					}
+				}
 			}
 		};
 
 		@Override
 		public URI getUrl() {
-			return URI.create("test://protected-operation-backend");
+			return URI.create("test://generic-blocking-backend");
 		}
 
 		@Override

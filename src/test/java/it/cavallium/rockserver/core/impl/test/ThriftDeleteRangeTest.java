@@ -2,7 +2,6 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -12,8 +11,6 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
-import it.cavallium.rockserver.core.common.RocksDBException;
-import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.server.ThriftServer;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -124,24 +121,6 @@ class ThriftDeleteRangeTest {
 
 		assertEquals(List.of(new KV(key2, value(120)), new KV(key3, value(130))), noCache);
 		assertEquals(normal, noCache);
-	}
-
-	@Test
-	void expiredCallerContextFailsBeforeThriftTransport() {
-		var expired = new it.cavallium.rockserver.core.common.RequestContext(
-				it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, 1L);
-		var error = assertThrows(RocksDBException.class,
-				() -> client.getSyncApi(expired).getColumnId("test-col"));
-		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
-		assertEquals("Request deadline already expired", error.getMessage());
-	}
-
-	@Test
-	void expiredCallerContextDoesNotPreventProtectedCleanup() {
-		var expired = new it.cavallium.rockserver.core.common.RequestContext(
-				it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, 1L);
-		client.getSyncApi(expired).closeIterator(Long.MAX_VALUE);
-		client.getSyncApi(expired).closeFailedUpdate(Long.MAX_VALUE);
 	}
 
 	private static int findFreePort() throws IOException {

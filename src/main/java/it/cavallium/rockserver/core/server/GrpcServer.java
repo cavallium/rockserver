@@ -738,7 +738,8 @@ public class GrpcServer extends Server {
 						: scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL,
 								it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE);
 				return executeScheduled(() -> {
-					var committed = client.getSyncApi(context)
+					var backendApi = request.getCommit() ? client.getSyncApi(context) : protectedApi();
+					var committed = backendApi
 							.closeTransaction(request.getTransactionId(), request.getCommit());
 					return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
 				}, executionScheduler);

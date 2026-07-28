@@ -8,21 +8,24 @@ pub use crate::proto::{
     FirstAndLast, CdcEvent,
 };
 
+fn workload_profile_wire_value(profile: WorkloadProfile) -> i32 {
+	match profile {
+		WorkloadProfile::Unspecified => 0,
+		WorkloadProfile::Control => 1,
+		WorkloadProfile::Latency => 2,
+		WorkloadProfile::Analytical => 3,
+		WorkloadProfile::Ingest => 4,
+		WorkloadProfile::Cdc => 5,
+		WorkloadProfile::Batch => 6,
+		WorkloadProfile::PhysicalMaintenance => 7,
+	}
+}
+
 impl RequestContext {
 	/// Create a mandatory caller context. Protected profiles are rejected by Rockserver.
 	pub fn for_profile(profile: WorkloadProfile, deadline_epoch_millis: i64) -> Self {
-		let profile = match profile {
-			WorkloadProfile::Latency => 2,
-			WorkloadProfile::Analytical => 3,
-			WorkloadProfile::Ingest => 4,
-			WorkloadProfile::Batch => 6,
-			WorkloadProfile::Unspecified
-			| WorkloadProfile::Control
-			| WorkloadProfile::Cdc
-			| WorkloadProfile::PhysicalMaintenance => {
-				panic!("workload profile is owned by Rockserver")
-			}
-		};
+		let profile = workload_profile_wire_value(profile);
+		assert!(matches!(profile, 2 | 3 | 4 | 6), "workload profile is owned by Rockserver");
 		assert!(deadline_epoch_millis > 0, "deadline_epoch_millis must be positive");
 		assert!(
 			profile != 2 || deadline_epoch_millis != i64::MAX,

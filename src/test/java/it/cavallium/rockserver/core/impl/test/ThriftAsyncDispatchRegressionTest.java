@@ -4,6 +4,7 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -36,6 +37,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -109,6 +111,31 @@ class ThriftAsyncDispatchRegressionTest {
 				RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction.class,
 				RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction.class),
 				connection.asyncRequests);
+	}
+
+	@Test
+	void expiredThriftContextFailsLocallyButRollbackUsesProtectedBackendContext() throws Exception {
+		var connection = new TrackingConnection();
+		int port = freePort();
+		try (var server = new ThriftServer(connection, "127.0.0.1", port)) {
+			server.start();
+			try (var client = new ThriftConnection("thrift-deadline-contract", "127.0.0.1", port)) {
+				var expired = new it.cavallium.rockserver.core.common.RequestContext(
+						it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, 1L);
+				var error = assertThrows(RocksDBException.class,
+						() -> client.getSyncApi(expired).getColumnId("never-sent"));
+				assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						error.getErrorUniqueId());
+
+				var finite = it.cavallium.rockserver.core.common.RequestContext.batch(
+						java.time.Instant.now().plusSeconds(30));
+				long transactionId = client.getSyncApi(finite).openTransaction(10_000L);
+				assertEquals(finite.deadlineEpochMillis(), connection.lastApiContextDeadline.get());
+				assertTrue(client.getSyncApi(expired).closeTransaction(transactionId, false));
+				assertEquals(it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE,
+						connection.lastApiContextDeadline.get());
+			}
+		}
 	}
 
 	@Test
@@ -321,6 +348,7 @@ class ThriftAsyncDispatchRegressionTest {
 		private final CountDownLatch closeIteratorRequested = new CountDownLatch(1);
 		private final CountDownLatch cdcCommitRequested = new CountDownLatch(1);
 		private final AtomicBoolean openIteratorRunning = new AtomicBoolean();
+		private final AtomicLong lastApiContextDeadline = new AtomicLong(-1L);
 		private final CompletableFuture<Long> openIteratorFuture = new CompletableFuture<>();
 		private volatile CompletableFuture<Void> closeIteratorFuture = CompletableFuture.completedFuture(null);
 		private volatile CompletableFuture<Void> cdcCommitFuture = CompletableFuture.completedFuture(null);
@@ -390,11 +418,13 @@ class ThriftAsyncDispatchRegressionTest {
 
 		@Override
 		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			lastApiContextDeadline.set(context.deadlineEpochMillis());
 			return syncApi;
 		}
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			lastApiContextDeadline.set(context.deadlineEpochMillis());
 			return asyncApi;
 		}
 

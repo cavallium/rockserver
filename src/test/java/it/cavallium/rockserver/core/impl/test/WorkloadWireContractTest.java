@@ -17,16 +17,16 @@ class WorkloadWireContractTest {
 	@Test
 	void allSevenProfileNumbersAreExplicitAndStableAcrossJavaProtobufAndThrift() {
 		var profiles = List.of(
-				it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL,
-				it.cavallium.rockserver.core.common.WorkloadProfile.LATENCY,
-				it.cavallium.rockserver.core.common.WorkloadProfile.ANALYTICAL,
-				it.cavallium.rockserver.core.common.WorkloadProfile.INGEST,
-				it.cavallium.rockserver.core.common.WorkloadProfile.CDC,
-				it.cavallium.rockserver.core.common.WorkloadProfile.BATCH,
-				it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE);
-		for (int index = 0; index < profiles.size(); index++) {
-			int wireValue = index + 1;
-			var profile = profiles.get(index);
+				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL, 1),
+				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.LATENCY, 2),
+				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.ANALYTICAL, 3),
+				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.INGEST, 4),
+				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.CDC, 5),
+				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, 6),
+				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE, 7));
+		for (var expected : profiles) {
+			int wireValue = expected.wireValue();
+			var profile = expected.profile();
 			assertEquals(wireValue, profile.wireValue());
 			assertEquals(profile,
 					it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(wireValue));
@@ -39,6 +39,11 @@ class WorkloadWireContractTest {
 				() -> it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(0));
 		assertThrows(IllegalArgumentException.class,
 				() -> it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(8));
+	}
+
+	private record ProfileWireValue(
+			it.cavallium.rockserver.core.common.WorkloadProfile profile,
+			int wireValue) {
 	}
 
 	@Test

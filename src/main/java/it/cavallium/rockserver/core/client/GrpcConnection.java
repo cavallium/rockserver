@@ -1311,7 +1311,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			var desc = statusRuntimeException.getStatus().getDescription();
 			var closeIndex = desc.indexOf(']', grpcRocksDbErrorPrefixString.length());
 			if (closeIndex < 0) {
-				return t;
+				return mapTransportDeadlineError(t);
 			}
 			var errorCode = desc.substring(grpcRocksDbErrorPrefixString.length(), closeIndex);
 			var errorDescriptionStart = closeIndex + 1;
@@ -1323,26 +1323,25 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			try {
 				errorType = RocksDBErrorType.valueOf(errorCode);
 			} catch (IllegalArgumentException malformedOrFutureErrorCode) {
-				return t;
+				return mapTransportDeadlineError(t);
 			}
 			if (errorType == RocksDBErrorType.UPDATE_RETRY) {
 				return new RocksDBRetryException();
 			} else {
 				return RocksDBException.of(errorType, errorDescription);
 			}
-		} else {
-			return t;
 		}
+		return mapTransportDeadlineError(t);
 	}
 
-	private static Throwable mapReadDeadlineError(@NotNull Throwable error) {
-		var mapped = mapGrpcStatusError(error);
-		if (mapped != error) {
-			return mapped;
-		}
+	private static Throwable mapTransportDeadlineError(@NotNull Throwable error) {
 		return Status.fromThrowable(error).getCode() == Code.DEADLINE_EXCEEDED
 				? RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded")
 				: error;
+	}
+
+	private static Throwable mapReadDeadlineError(@NotNull Throwable error) {
+		return mapGrpcStatusError(error);
 	}
 
 	private <T> CompletableFuture<T> toResponse(ListenableFuture<T> listenableFuture) {

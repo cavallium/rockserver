@@ -62,3 +62,16 @@ fn typed_context_constructor_rejects_protected_profiles() {
 		assert!(std::panic::catch_unwind(|| RequestContext::for_profile(profile, i64::MAX)).is_err());
 	}
 }
+
+#[test]
+fn typed_context_constructor_uses_explicit_selectable_wire_values() {
+	for (profile, expected) in [
+		(WorkloadProfile::Latency, 2),
+		(WorkloadProfile::Analytical, 3),
+		(WorkloadProfile::Ingest, 4),
+		(WorkloadProfile::Batch, 6),
+	] {
+		let deadline = if profile == WorkloadProfile::Latency { 1 } else { i64::MAX };
+		assert_eq!(RequestContext::for_profile(profile, deadline).profile, expected);
+	}
+}
