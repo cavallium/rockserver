@@ -62,8 +62,8 @@ import java.util.stream.Stream;
  */
 public final class SevenProfileWorkloadBenchmark {
 
-	private static final String RESULT_SCHEMA = "rockserver-seven-profile-workload-v1";
-	private static final String DATASET_SCHEMA = "rockserver-seven-profile-dataset-v1";
+	private static final String RESULT_SCHEMA = "rockserver-seven-profile-workload-v2";
+	private static final String DATASET_SCHEMA = "rockserver-seven-profile-dataset-v2";
 	private static final String COLUMN_NAME = "seven-profile-workload";
 	private static final String CDC_SUBSCRIPTION = "seven-profile-workload-cdc";
 	private static final long LATENCY_DEADLINE_MILLIS = 5_000L;
@@ -114,11 +114,12 @@ public final class SevenProfileWorkloadBenchmark {
 			}
 			long nativeLeaks = awaitNativeLeakDetection(nativeLeaksBefore);
 			Files.writeString(options.root().resolve("ingest-baseline.properties"),
-					"schema=rockserver-ingest-isolated-baseline-v1\n"
+					"schema=rockserver-ingest-isolated-baseline-v2\n"
 							+ "dataset-fingerprint=" + dataset.fingerprint() + "\n"
+							+ "comparison-fingerprint=" + comparisonFingerprint(options) + "\n"
 							+ "storage-label=" + options.storageLabel() + "\n"
 							+ "candidate=" + options.candidate() + "\n"
-							+ "throughput=" + format(throughput) + "\n"
+							+ "throughput=" + Double.toString(throughput) + "\n"
 							+ "native-handle-leaks=" + nativeLeaks + "\n",
 					StandardOpenOption.CREATE_NEW);
 			if (nativeLeaks != 0L) {
@@ -204,7 +205,9 @@ public final class SevenProfileWorkloadBenchmark {
 		if (!Files.isRegularFile(marker) || !Files.isRegularFile(config) || !Files.isDirectory(root.resolve("db"))) {
 			throw new IllegalArgumentException("Prepared benchmark root is incomplete: " + root);
 		}
-		if (Files.exists(root.resolve("results.json")) || Files.exists(root.resolve("selection-input.properties"))) {
+		if (Files.exists(root.resolve("results.json")) || Files.exists(root.resolve("results.md"))
+				|| Files.exists(root.resolve("selection-input.properties"))
+				|| Files.exists(root.resolve("ingest-baseline.properties"))) {
 			throw new IllegalArgumentException("Prepared root already contains benchmark results: " + root);
 		}
 		Map<String, String> values = readKeyValues(marker);
@@ -265,7 +268,9 @@ public final class SevenProfileWorkloadBenchmark {
 					new WorkloadKey(WorkloadProfile.CONTROL, OperationFamily.CONTROL),
 					new Pacer(options.controlRate(), options.controlWorkers(), workerIndex), () -> {
 						long transactionId = batch.openTransaction(60_000L);
-						batch.closeTransaction(transactionId, false);
+						if (!batch.closeTransaction(transactionId, false)) {
+							throw new IllegalStateException("CONTROL rollback did not close its transaction");
+						}
 					})));
 		}
 		for (int worker = 0; worker < options.latencyWorkers(); worker++) {
@@ -313,9 +318,11 @@ public final class SevenProfileWorkloadBenchmark {
 			futures.add(workers.submit(() -> runWorker(control, pressure,
 					new WorkloadKey(WorkloadProfile.CDC, OperationFamily.WAL_PAGE),
 					new Pacer(options.cdcRate(), options.cdcWorkers(), workerIndex), () -> {
-						var events = batch.cdcPoll(CDC_SUBSCRIPTION, null, options.cdcMaxEvents()).toList();
-						if (!events.isEmpty()) {
-							batch.cdcCommit(CDC_SUBSCRIPTION, events.getLast().seq());
+						try (var events = batch.cdcPoll(CDC_SUBSCRIPTION, null, options.cdcMaxEvents())) {
+							var page = events.toList();
+							if (!page.isEmpty()) {
+								batch.cdcCommit(CDC_SUBSCRIPTION, page.getLast().seq());
+							}
 						}
 					})));
 		}
@@ -570,11 +577,16 @@ public final class SevenProfileWorkloadBenchmark {
 		}
 		checks.add(new Check("resources_drained", leakedResources == 0L,
 				"logical=" + run.resources().leakedResources() + ", native=" + nativeLeaks));
+		checks.add(new Check("storage_pressure_observed",
+				!run.pressure().injected() || run.observation().maximumStoragePressure() > 0L,
+				"observed=" + run.observation().maximumStoragePressure()));
 		checks.add(new Check("shutdown_clean", shutdownClean, "shutdown_clean=" + shutdownClean));
 		checks.add(new Check("unexpected_errors", run.errors().isEmpty(),
 				"unexpected_error_count=" + run.errors().size()));
+		boolean runChecksPassed = checks.stream().allMatch(Check::passed);
 		var measurement = new WorkloadBenchmarkSelector.CandidateMeasurement(
-				options.candidate(), fingerprint, options.storageLabel(), options.seed(), profiles,
+				options.candidate(), fingerprint, comparisonFingerprint(options), options.storageLabel(),
+				options.seed(), options.enforce(), runChecksPassed, profiles,
 				run.observation().maximumCdcLag(), run.observation().maximumRetainedSnapshots(),
 				run.observation().maximumStoragePressure(), leakedResources);
 		return new Result(RESULT_SCHEMA, started, finished, options, fingerprint, run, measurement,
@@ -598,8 +610,11 @@ public final class SevenProfileWorkloadBenchmark {
 			case ANALYTICAL -> p99Nanos > 0L && p99Nanos < FALLBACK_P99_LIMIT_NANOS;
 			case INGEST -> options.ingestIsolatedBaseline() <= 0.0d
 					|| throughput >= options.ingestIsolatedBaseline() * 0.95d;
-			case CDC -> run.observation().maximumCdcLag() <= options.cdcLagLimit();
-			case BATCH -> !run.pressure().injected() || run.pressure().batchAfterPressure() > 0L;
+			case CDC -> run.observation().cdcLagObserved()
+					&& run.observation().maximumCdcLag() <= options.cdcLagLimit();
+			case BATCH -> !run.pressure().injected()
+					|| (run.observation().maximumStoragePressure() > 0L
+							&& run.pressure().batchAfterPressure() > 0L);
 			case PHYSICAL_MAINTENANCE -> true;
 		};
 	}
@@ -736,8 +751,11 @@ public final class SevenProfileWorkloadBenchmark {
 		json.append(",\n  \"cache_state\": ");
 		appendJsonString(json, result.options().cacheState());
 		json.append(",\n  \"seed\": ").append(result.options().seed())
+				.append(",\n  \"enforced_hardware_run\": ").append(result.options().enforce())
 				.append(",\n  \"dataset_fingerprint\": ");
 		appendJsonString(json, result.datasetFingerprint());
+		json.append(",\n  \"comparison_fingerprint\": ");
+		appendJsonString(json, result.measurement().comparisonFingerprint());
 		json.append(",\n  \"duration_ms\": ")
 				.append(TimeUnit.NANOSECONDS.toMillis(result.run().durationNanos()))
 				.append(",\n  \"profiles\": {");
@@ -791,6 +809,7 @@ public final class SevenProfileWorkloadBenchmark {
 					.append(", \"errors\": ").append(operation.errors()).append('}');
 		}
 		json.append("\n  ],\n  \"maximum_cdc_lag\": ").append(result.measurement().maximumCdcLag())
+				.append(",\n  \"cdc_lag_observed\": ").append(result.run().observation().cdcLagObserved())
 				.append(",\n  \"maximum_retained_snapshots\": ").append(result.measurement().maximumRetainedSnapshots())
 				.append(",\n  \"maximum_storage_pressure\": ").append(result.measurement().maximumStoragePressure())
 				.append(",\n  \"batch_after_pressure\": ").append(result.run().pressure().batchAfterPressure())
@@ -805,8 +824,18 @@ public final class SevenProfileWorkloadBenchmark {
 				.append(", \"drain_ms\": ").append(result.run().resources().drainMillis()).append("},")
 				.append("\n  \"native_handle_leaks\": ").append(result.nativeLeaks())
 				.append(",\n  \"shutdown_clean\": ").append(result.shutdownClean())
-				.append(",\n  \"acceptance_passed\": ").append(result.acceptancePassed())
-				.append(",\n  \"checks\": [");
+				.append(",\n  \"workload_checks_passed\": ").append(result.acceptancePassed())
+				.append(",\n  \"hardware_acceptance_passed\": ")
+				.append(result.measurement().hardwareAcceptancePassed())
+				.append(",\n  \"errors\": [");
+		for (int index = 0; index < result.run().errors().size(); index++) {
+			if (index > 0) {
+				json.append(',');
+			}
+			json.append("\n    ");
+			appendJsonString(json, result.run().errors().get(index));
+		}
+		json.append("\n  ],\n  \"checks\": [");
 		for (int index = 0; index < result.checks().size(); index++) {
 			var check = result.checks().get(index);
 			if (index > 0) {
@@ -828,8 +857,11 @@ public final class SevenProfileWorkloadBenchmark {
 				.append("- Candidate: `").append(result.options().candidate()).append("`\n")
 				.append("- Storage: `").append(result.options().storageLabel()).append("`\n")
 				.append("- Cache state: `").append(result.options().cacheState()).append("`\n")
+				.append("- Enforced hardware run: `").append(result.options().enforce()).append("`\n")
 				.append("- Seed: `").append(result.options().seed()).append("`\n")
-				.append("- Dataset: `").append(result.datasetFingerprint()).append("`\n\n")
+				.append("- Dataset: `").append(result.datasetFingerprint()).append("`\n")
+				.append("- Comparison shape: `").append(result.measurement().comparisonFingerprint())
+				.append("`\n\n")
 				.append("| Profile | Throughput/s | Queue p99 ms | Execution p99 ms | End-to-end p99 ms | Max queued | Max active | Rejected | Cancelled | Quantums | SLO |\n")
 				.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
 		for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
@@ -846,6 +878,7 @@ public final class SevenProfileWorkloadBenchmark {
 		}
 		markdown.append("\n## Pressure and resources\n\n")
 				.append("- Maximum CDC lag: `").append(result.measurement().maximumCdcLag()).append("`\n")
+				.append("- CDC lag meter observed: `").append(result.run().observation().cdcLagObserved()).append("`\n")
 				.append("- Maximum retained snapshots: `").append(result.measurement().maximumRetainedSnapshots()).append("`\n")
 				.append("- Storage pressure observed: `").append(result.measurement().maximumStoragePressure()).append("`\n")
 				.append("- BATCH completions after pressure: `").append(result.run().pressure().batchAfterPressure()).append("`\n")
@@ -856,7 +889,16 @@ public final class SevenProfileWorkloadBenchmark {
 			markdown.append("- [").append(check.passed() ? 'x' : ' ').append("] `")
 					.append(check.name()).append("`: ").append(check.detail()).append('\n');
 		}
-		markdown.append("\nOverall: **").append(result.acceptancePassed() ? "PASS" : "FAIL").append("**.\n");
+		if (!result.run().errors().isEmpty()) {
+			markdown.append("\n## Unexpected errors (first ").append(MAX_ERRORS).append(")\n\n");
+			for (String error : result.run().errors()) {
+				markdown.append("- `").append(error.replace("`", "\\`")).append("`\n");
+			}
+		}
+		markdown.append("\nWorkload checks: **").append(result.acceptancePassed() ? "PASS" : "FAIL")
+				.append("**. Hardware acceptance: **")
+				.append(result.measurement().hardwareAcceptancePassed() ? "PASS" : "NOT PASSED")
+				.append("**.\n");
 		return markdown.toString();
 	}
 
@@ -905,7 +947,33 @@ public final class SevenProfileWorkloadBenchmark {
 
 	private static String datasetFingerprint(Options options) {
 		return sha256(DATASET_SCHEMA + "\nseed=" + options.seed() + "\npreload-keys=" + options.preloadKeys()
-				+ "\nvalue-bytes=" + options.valueBytes() + "\nrange-width=" + options.rangeWidth());
+				+ "\npreload-flush-keys=" + options.preloadFlushKeys()
+				+ "\nvalue-bytes=" + options.valueBytes());
+	}
+
+	private static String comparisonFingerprint(Options options) {
+		return sha256("rockserver-seven-profile-comparison-v1"
+				+ "\ndataset=" + datasetFingerprint(options)
+				+ "\ndatabase-name=" + options.databaseName()
+				+ "\ncache-state=" + options.cacheState()
+				+ "\nrange-width=" + options.rangeWidth()
+				+ "\nwrite-key-space=" + options.writeKeySpace()
+				+ "\nwarmup-seconds=" + options.warmupSeconds()
+				+ "\nmeasure-seconds=" + options.measureSeconds()
+				+ "\npressure-seconds=" + options.pressureSeconds()
+				+ "\ncdc-lag-limit=" + options.cdcLagLimit()
+				+ "\nworkers=" + options.controlWorkers() + ',' + options.latencyWorkers() + ','
+				+ options.analyticalWorkers() + ',' + options.ingestWorkers() + ',' + options.cdcWorkers() + ','
+				+ options.batchWorkers() + ',' + options.physicalWorkers() + ',' + options.cancellationWorkers()
+				+ "\nrates=" + options.controlRate() + ',' + options.latencyRate() + ',' + options.analyticalRate()
+				+ ',' + options.ingestRate() + ',' + options.cdcRate() + ',' + options.batchRate() + ','
+				+ options.physicalRate() + ',' + options.cancellationRate()
+				+ "\ncdc-max-events=" + options.cdcMaxEvents()
+				+ "\nsample-micros=" + options.sampleMicros()
+				+ "\nmax-latency-samples=" + options.maxLatencySamples()
+				+ "\nwrite-buffer-size=" + options.writeBufferSize()
+				+ "\ndirect-io=" + options.directIo()
+				+ "\nspinning=" + options.spinning());
 	}
 
 	private static Map<String, String> readKeyValues(Path input) throws IOException {
@@ -1065,7 +1133,14 @@ public final class SevenProfileWorkloadBenchmark {
 	}
 
 	private static boolean bool(Map<String, String> values, String name, boolean defaultValue) {
-		return Boolean.parseBoolean(values.getOrDefault(name, Boolean.toString(defaultValue)));
+		String value = values.getOrDefault(name, Boolean.toString(defaultValue));
+		if (value.equalsIgnoreCase("true")) {
+			return true;
+		}
+		if (value.equalsIgnoreCase("false")) {
+			return false;
+		}
+		throw new IllegalArgumentException("--" + name + " must be true or false");
 	}
 
 	private static String metricName(Enum<?> value) {
@@ -1169,6 +1244,7 @@ public final class SevenProfileWorkloadBenchmark {
 	private record ObservationSnapshot(Map<WorkloadProfile, Integer> maximumQueued,
 			Map<WorkloadProfile, Integer> maximumActive,
 			long maximumCdcLag,
+			boolean cdcLagObserved,
 			long maximumRetainedSnapshots,
 			long maximumStoragePressure) {
 	}
@@ -1296,6 +1372,7 @@ public final class SevenProfileWorkloadBenchmark {
 		private final int maxLatencySamples;
 		private final ConcurrentHashMap<WorkloadKey, MutableOperationStats> operations = new ConcurrentHashMap<>();
 		private final ConcurrentLinkedQueue<String> errors = new ConcurrentLinkedQueue<>();
+		private final AtomicInteger recordedErrors = new AtomicInteger();
 
 		private RunStats(int maxLatencySamples) {
 			this.maxLatencySamples = maxLatencySamples;
@@ -1314,7 +1391,7 @@ public final class SevenProfileWorkloadBenchmark {
 		}
 
 		private void recordError(WorkloadKey key, String detail) {
-			if (errors.size() < MAX_ERRORS) {
+			if (recordedErrors.getAndIncrement() < MAX_ERRORS) {
 				errors.add(key.profile() + "/" + key.family() + ": " + detail);
 			}
 		}
@@ -1384,24 +1461,39 @@ public final class SevenProfileWorkloadBenchmark {
 	private static final class LatencySamples {
 
 		private final long[] samples;
-		private final AtomicInteger next = new AtomicInteger();
+		private final AtomicLong next = new AtomicLong();
 
 		private LatencySamples(int capacity) {
 			this.samples = new long[capacity];
 		}
 
 		private void record(long latencyNanos) {
-			int index = next.getAndIncrement();
-			if (index < samples.length) {
-				samples[index] = Math.max(0L, latencyNanos);
+			long ordinal = next.getAndIncrement();
+			int index;
+			if (ordinal < samples.length) {
+				index = (int) ordinal;
+			} else {
+				long candidate = Long.remainderUnsigned(mix64(ordinal), ordinal + 1L);
+				if (candidate >= samples.length) {
+					return;
+				}
+				index = (int) candidate;
 			}
+			samples[index] = Math.max(0L, latencyNanos);
 		}
 
 		private long[] snapshot() {
-			long[] copy = Arrays.copyOf(samples, Math.min(samples.length, next.get()));
+			long[] copy = Arrays.copyOf(samples, (int) Math.min(samples.length, next.get()));
 			Arrays.sort(copy);
 			return copy;
 		}
+	}
+
+	private static long mix64(long value) {
+		long mixed = value + 0x9e3779b97f4a7c15L;
+		mixed = (mixed ^ (mixed >>> 30)) * 0xbf58476d1ce4e5b9L;
+		mixed = (mixed ^ (mixed >>> 27)) * 0x94d049bb133111ebL;
+		return mixed ^ (mixed >>> 31);
 	}
 
 	/** Visible for deterministic correctness tests. */
@@ -1418,6 +1510,7 @@ public final class SevenProfileWorkloadBenchmark {
 		private final EnumMap<WorkloadProfile, AtomicInteger> maximumQueued = new EnumMap<>(WorkloadProfile.class);
 		private final EnumMap<WorkloadProfile, AtomicInteger> maximumActive = new EnumMap<>(WorkloadProfile.class);
 		private final AtomicLong maximumCdcLag = new AtomicLong();
+		private final AtomicBoolean cdcLagObserved = new AtomicBoolean();
 		private final AtomicLong maximumRetainedSnapshots = new AtomicLong();
 		private final AtomicLong maximumStoragePressure = new AtomicLong();
 
@@ -1442,6 +1535,7 @@ public final class SevenProfileWorkloadBenchmark {
 			var cdcLag = meterRegistry.find("rockserver.workload.cdc.lag")
 					.tag("database", databaseName).gauge();
 			if (cdcLag != null) {
+				cdcLagObserved.set(true);
 				maximumCdcLag.accumulateAndGet(Math.max(0L, Math.round(cdcLag.value())), Math::max);
 			}
 		}
@@ -1454,6 +1548,7 @@ public final class SevenProfileWorkloadBenchmark {
 				active.put(profile, maximumActive.get(profile).get());
 			}
 			return new ObservationSnapshot(Map.copyOf(queued), Map.copyOf(active), maximumCdcLag.get(),
+					cdcLagObserved.get(),
 					maximumRetainedSnapshots.get(), maximumStoragePressure.get());
 		}
 	}
@@ -1605,7 +1700,9 @@ public final class SevenProfileWorkloadBenchmark {
 				throw new IllegalArgumentException("dataset dimensions are invalid");
 			}
 			if (warmupSeconds < 0 || measureSeconds < 1 || pressureSeconds < 0
-					|| pressureSeconds >= measureSeconds * 2 / 3 || cdcLagLimit < 0L) {
+					|| (pressureSeconds > 0 && (long) pressureSeconds * 3L >= (long) measureSeconds * 2L)
+					|| cdcLagLimit < 0L || !Double.isFinite(ingestIsolatedBaseline)
+					|| ingestIsolatedBaseline < 0.0d) {
 				throw new IllegalArgumentException("duration or CDC lag settings are invalid");
 			}
 			if (controlWorkers < 1 || latencyWorkers < 1 || analyticalWorkers < 1 || ingestWorkers < 1
@@ -1623,10 +1720,10 @@ public final class SevenProfileWorkloadBenchmark {
 			if (ingestBaselineOnly && enforce) {
 				throw new IllegalArgumentException("ingest-baseline-only does not run mixed-workload acceptance");
 			}
-			if (enforce && (!reusePrepared || !cacheState.equals("cold")
+			if (enforce && (!reusePrepared || !cacheState.equals("cold") || pressureSeconds <= 0
 					|| storageLabel.equals("ci-structural") || ingestIsolatedBaseline <= 0.0d)) {
 				throw new IllegalArgumentException("enforced hardware runs require a reused cold dataset, a hardware label, "
-						+ "and a positive ingest-isolated-baseline");
+						+ "positive pressure duration, and a positive ingest-isolated-baseline");
 			}
 		}
 

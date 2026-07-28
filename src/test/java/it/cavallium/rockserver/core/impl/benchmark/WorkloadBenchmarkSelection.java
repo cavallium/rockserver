@@ -15,8 +15,8 @@ import java.util.Properties;
 /** Command-line, machine-readable selection over completed seven-profile candidate runs. */
 public final class WorkloadBenchmarkSelection {
 
-	public static final String INPUT_SCHEMA = "rockserver-seven-profile-selection-input-v1";
-	public static final String OUTPUT_SCHEMA = "rockserver-seven-profile-selection-v1";
+	public static final String INPUT_SCHEMA = "rockserver-seven-profile-selection-input-v2";
+	public static final String OUTPUT_SCHEMA = "rockserver-seven-profile-selection-v2";
 
 	private WorkloadBenchmarkSelection() {
 	}
@@ -54,8 +54,11 @@ public final class WorkloadBenchmarkSelection {
 		lines.add("schema=" + INPUT_SCHEMA);
 		lines.add("candidate=" + measurement.candidate());
 		lines.add("dataset-fingerprint=" + measurement.datasetFingerprint());
+		lines.add("comparison-fingerprint=" + measurement.comparisonFingerprint());
 		lines.add("storage-label=" + measurement.storageLabel());
 		lines.add("seed=" + measurement.seed());
+		lines.add("enforced-hardware-run=" + measurement.enforcedHardwareRun());
+		lines.add("run-checks-passed=" + measurement.runChecksPassed());
 		lines.add("maximum-cdc-lag=" + measurement.maximumCdcLag());
 		lines.add("maximum-retained-snapshots=" + measurement.maximumRetainedSnapshots());
 		lines.add("maximum-storage-pressure=" + measurement.maximumStoragePressure());
@@ -63,7 +66,7 @@ public final class WorkloadBenchmarkSelection {
 		for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
 			String prefix = "profile." + metricName(profile) + ".";
 			var value = measurement.profiles().get(profile);
-			lines.add(prefix + "throughput=" + format(value.throughput()));
+			lines.add(prefix + "throughput=" + Double.toString(value.throughput()));
 			lines.add(prefix + "queue-p99-nanos=" + value.queueP99Nanos());
 			lines.add(prefix + "execution-p99-nanos=" + value.executionP99Nanos());
 			lines.add(prefix + "end-to-end-p99-nanos=" + value.endToEndP99Nanos());
@@ -95,14 +98,17 @@ public final class WorkloadBenchmarkSelection {
 					Long.parseLong(required(properties, prefix + "rejections")),
 					Long.parseLong(required(properties, prefix + "cancellations")),
 					Long.parseLong(required(properties, prefix + "quantum-count")),
-					Boolean.parseBoolean(required(properties, prefix + "relevant-p99")),
-					Boolean.parseBoolean(required(properties, prefix + "slo-passed"))));
+					requiredBoolean(properties, prefix + "relevant-p99"),
+					requiredBoolean(properties, prefix + "slo-passed")));
 		}
 		return new WorkloadBenchmarkSelector.CandidateMeasurement(
 				Integer.parseInt(required(properties, "candidate")),
 				required(properties, "dataset-fingerprint"),
+				required(properties, "comparison-fingerprint"),
 				required(properties, "storage-label"),
 				Long.parseLong(required(properties, "seed")),
+				requiredBoolean(properties, "enforced-hardware-run"),
+				requiredBoolean(properties, "run-checks-passed"),
 				profiles,
 				Long.parseLong(required(properties, "maximum-cdc-lag")),
 				Long.parseLong(required(properties, "maximum-retained-snapshots")),
@@ -112,7 +118,15 @@ public final class WorkloadBenchmarkSelection {
 
 	public static String toJson(WorkloadBenchmarkSelector.Selection selection) {
 		var json = new StringBuilder(2_048);
-		json.append("{\n  \"schema\": \"").append(OUTPUT_SCHEMA).append("\",")
+		json.append("{\n  \"schema\": ");
+		appendJsonString(json, OUTPUT_SCHEMA);
+		json.append(",\n  \"dataset_fingerprint\": ");
+		appendJsonString(json, selection.datasetFingerprint());
+		json.append(",\n  \"comparison_fingerprint\": ");
+		appendJsonString(json, selection.comparisonFingerprint());
+		json.append(",\n  \"storage_label\": ");
+		appendJsonString(json, selection.storageLabel());
+		json.append(",\n  \"seed\": ").append(selection.seed()).append(',')
 				.append("\n  \"winner\": ").append(selection.winner()).append(',')
 				.append("\n  \"maximum_throughput\": ").append(format(selection.maximumThroughput())).append(',')
 				.append("\n  \"minimum_relevant_p99_nanos\": ")
@@ -131,6 +145,7 @@ public final class WorkloadBenchmarkSelection {
 					.append(", \"p99_passed\": ").append(evaluation.p99Passed())
 					.append(", \"slos_passed\": ").append(evaluation.slosPassed())
 					.append(", \"leaks_passed\": ").append(evaluation.leaksPassed())
+					.append(", \"run_checks_passed\": ").append(evaluation.runChecksPassed())
 					.append(", \"eligible\": ").append(evaluation.eligible()).append('}');
 		}
 		json.append("\n  ]\n}\n");
@@ -145,12 +160,39 @@ public final class WorkloadBenchmarkSelection {
 		return value;
 	}
 
+	private static boolean requiredBoolean(Properties properties, String key) {
+		String value = required(properties, key);
+		if (value.equalsIgnoreCase("true")) {
+			return true;
+		}
+		if (value.equalsIgnoreCase("false")) {
+			return false;
+		}
+		throw new IllegalArgumentException("Property " + key + " must be true or false");
+	}
+
 	private static String metricName(WorkloadProfile profile) {
 		return profile.name().toLowerCase(Locale.ROOT);
 	}
 
 	private static String format(double value) {
 		return String.format(Locale.ROOT, "%.6f", value);
+	}
+
+	private static void appendJsonString(StringBuilder json, String value) {
+		json.append('"');
+		for (int index = 0; index < value.length(); index++) {
+			char character = value.charAt(index);
+			switch (character) {
+				case '"' -> json.append("\\\"");
+				case '\\' -> json.append("\\\\");
+				case '\n' -> json.append("\\n");
+				case '\r' -> json.append("\\r");
+				case '\t' -> json.append("\\t");
+				default -> json.append(character);
+			}
+		}
+		json.append('"');
 	}
 
 	private static void printUsage() {

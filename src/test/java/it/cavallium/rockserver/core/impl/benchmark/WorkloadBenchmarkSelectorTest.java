@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.EnumMap;
 import java.util.List;
@@ -53,15 +54,33 @@ class WorkloadBenchmarkSelectorTest {
 		assertEquals(8, selection.winner());
 
 		var differentHost = new WorkloadBenchmarkSelector.CandidateMeasurement(
-				16, "dataset", "nvme", 42L,
+				16, "dataset", "comparison", "nvme", 42L, true, true,
 				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L, 0L);
 		assertThrows(IllegalArgumentException.class,
 				() -> WorkloadBenchmarkSelector.select(List.of(candidate(8, 100, 10_000_000L, true, 0L), differentHost)));
+
+		var differentShape = new WorkloadBenchmarkSelector.CandidateMeasurement(
+				16, "dataset", "different-comparison", "hdd-zfs", 42L, true, true,
+				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L, 0L);
+		assertThrows(IllegalArgumentException.class,
+				() -> WorkloadBenchmarkSelector.select(List.of(
+						candidate(8, 100, 10_000_000L, true, 0L), differentShape)));
+		assertThrows(IllegalArgumentException.class,
+				() -> WorkloadBenchmarkSelector.select(List.of(
+						candidate(4, 100, 10_000_000L, true, 0L),
+						candidate(16, 100, 10_000_000L, true, 0L))));
+		assertThrows(IllegalArgumentException.class,
+				() -> WorkloadBenchmarkSelector.select(List.of(candidate(
+						8, 100, 10_000_000L, true, 0L, false, true))));
+		var checksFailed = WorkloadBenchmarkSelector.select(List.of(
+				candidate(4, 99, 10_000_000L, true, 0L, true, false),
+				candidate(8, 100, 10_000_000L, true, 0L)));
+		assertEquals(8, checksFailed.winner());
 	}
 
 	@Test
 	void selectionInputRoundTripsAndJsonNamesAdjacentVerification(@TempDir Path temporary) throws Exception {
-		var measurement = candidate(8, 100.0d, 10_000_000L, true, 0L);
+		var measurement = candidate(8, 100.123456789d, 10_000_000L, true, 0L);
 		Path input = temporary.resolve("selection-input.properties");
 		WorkloadBenchmarkSelection.writeSelectionInput(input, measurement);
 		assertEquals(measurement, WorkloadBenchmarkSelection.readSelectionInput(input));
@@ -72,6 +91,12 @@ class WorkloadBenchmarkSelectorTest {
 				candidate(16, 101.0d, 10_100_000L, true, 0L))));
 		assertTrue(json.contains("\"winner\": 4"));
 		assertTrue(json.contains("\"adjacent_verification_candidates\": [8]"));
+		assertTrue(json.contains("\"comparison_fingerprint\": \"comparison\""));
+
+		String malformed = Files.readString(input)
+				.replace("enforced-hardware-run=true", "enforced-hardware-run=tru");
+		Files.writeString(input, malformed);
+		assertThrows(IllegalArgumentException.class, () -> WorkloadBenchmarkSelection.readSelectionInput(input));
 	}
 
 	private static WorkloadBenchmarkSelector.CandidateMeasurement candidate(int candidate,
@@ -79,11 +104,24 @@ class WorkloadBenchmarkSelectorTest {
 			long p99Nanos,
 			boolean sloPassed,
 			long leaks) {
+		return candidate(candidate, perProfileThroughput, p99Nanos, sloPassed, leaks, true, true);
+	}
+
+	private static WorkloadBenchmarkSelector.CandidateMeasurement candidate(int candidate,
+			double perProfileThroughput,
+			long p99Nanos,
+			boolean sloPassed,
+			long leaks,
+			boolean enforcedHardwareRun,
+			boolean runChecksPassed) {
 		return new WorkloadBenchmarkSelector.CandidateMeasurement(
 				candidate,
 				"dataset",
+				"comparison",
 				"hdd-zfs",
 				42L,
+				enforcedHardwareRun,
+				runChecksPassed,
 				candidateProfiles(perProfileThroughput, p99Nanos, sloPassed),
 				0L,
 				0L,

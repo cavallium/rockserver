@@ -54,7 +54,7 @@ public final class WorkloadBenchmarkSelector {
 
 	/**
 	 * Choose the smallest setting that is within 5% of maximum throughput, within 10% of
-	 * the minimum relevant p99, and passes every per-profile SLO and leak gate.
+	 * the minimum relevant p99, and passes every per-profile SLO, run-check, and leak gate.
 	 */
 	public static Selection select(List<CandidateMeasurement> input) {
 		if (input.isEmpty()) {
@@ -65,17 +65,29 @@ public final class WorkloadBenchmarkSelector {
 				.toList();
 		var seen = new HashSet<Integer>();
 		String datasetFingerprint = measurements.getFirst().datasetFingerprint();
+		String comparisonFingerprint = measurements.getFirst().comparisonFingerprint();
 		String storageLabel = measurements.getFirst().storageLabel();
 		long seed = measurements.getFirst().seed();
+		int previousCandidate = 0;
 		for (var measurement : measurements) {
+			if (!measurement.enforcedHardwareRun()) {
+				throw new IllegalArgumentException(
+						"Selection requires enforced cold-cache hardware results");
+			}
 			if (!isPowerOfTwo(measurement.candidate()) || !seen.add(measurement.candidate())) {
 				throw new IllegalArgumentException("Candidates must be unique powers of two: "
 						+ measurement.candidate());
 			}
+			if (previousCandidate != 0 && measurement.candidate() != previousCandidate * 2) {
+				throw new IllegalArgumentException("Candidates must form a contiguous powers-of-two sequence");
+			}
+			previousCandidate = measurement.candidate();
 			if (!datasetFingerprint.equals(measurement.datasetFingerprint())
+					|| !comparisonFingerprint.equals(measurement.comparisonFingerprint())
 					|| !storageLabel.equals(measurement.storageLabel())
 					|| seed != measurement.seed()) {
-				throw new IllegalArgumentException("Candidates must share dataset, storage label, and seed");
+				throw new IllegalArgumentException(
+						"Candidates must share dataset, comparison shape, storage label, and seed");
 			}
 		}
 
@@ -106,14 +118,16 @@ public final class WorkloadBenchmarkSelector {
 					throughputPassed,
 					p99Passed,
 					slosPassed,
-					leaksPassed);
+					leaksPassed,
+					measurement.runChecksPassed());
 			evaluations.add(evaluation);
 			if (winner == null && evaluation.eligible()) {
 				winner = measurement;
 			}
 		}
 		if (winner == null) {
-			throw new IllegalStateException("No benchmark candidate satisfies throughput, p99, SLO, and leak gates");
+			throw new IllegalStateException(
+					"No benchmark candidate satisfies throughput, p99, SLO, run-check, and leak gates");
 		}
 
 		int winnerIndex = measurements.indexOf(winner);
@@ -125,6 +139,10 @@ public final class WorkloadBenchmarkSelector {
 			adjacent.add(measurements.get(winnerIndex + 1).candidate());
 		}
 		return new Selection(
+				datasetFingerprint,
+				comparisonFingerprint,
+				storageLabel,
+				seed,
 				winner.candidate(),
 				maximumThroughput,
 				minimumRelevantP99,
@@ -157,8 +175,11 @@ public final class WorkloadBenchmarkSelector {
 
 	public record CandidateMeasurement(int candidate,
 			String datasetFingerprint,
+			String comparisonFingerprint,
 			String storageLabel,
 			long seed,
+			boolean enforcedHardwareRun,
+			boolean runChecksPassed,
 			Map<WorkloadProfile, ProfileMeasurement> profiles,
 			long maximumCdcLag,
 			long maximumRetainedSnapshots,
@@ -167,10 +188,12 @@ public final class WorkloadBenchmarkSelector {
 
 		public CandidateMeasurement {
 			Objects.requireNonNull(datasetFingerprint, "datasetFingerprint");
+			Objects.requireNonNull(comparisonFingerprint, "comparisonFingerprint");
 			Objects.requireNonNull(storageLabel, "storageLabel");
 			Objects.requireNonNull(profiles, "profiles");
-			if (datasetFingerprint.isBlank() || storageLabel.isBlank()) {
-				throw new IllegalArgumentException("Dataset fingerprint and storage label are required");
+			if (datasetFingerprint.isBlank() || comparisonFingerprint.isBlank() || storageLabel.isBlank()) {
+				throw new IllegalArgumentException(
+						"Dataset fingerprint, comparison fingerprint, and storage label are required");
 			}
 			if (maximumCdcLag < 0L || maximumRetainedSnapshots < 0L
 					|| maximumStoragePressure < 0L || leakedResources < 0L) {
@@ -202,6 +225,10 @@ public final class WorkloadBenchmarkSelector {
 		public boolean allSlosPassed() {
 			return profiles.values().stream().allMatch(ProfileMeasurement::sloPassed);
 		}
+
+		public boolean hardwareAcceptancePassed() {
+			return enforcedHardwareRun && runChecksPassed;
+		}
 	}
 
 	public record CandidateEvaluation(int candidate,
@@ -210,14 +237,19 @@ public final class WorkloadBenchmarkSelector {
 			boolean throughputPassed,
 			boolean p99Passed,
 			boolean slosPassed,
-			boolean leaksPassed) {
+			boolean leaksPassed,
+			boolean runChecksPassed) {
 
 		public boolean eligible() {
-			return throughputPassed && p99Passed && slosPassed && leaksPassed;
+			return throughputPassed && p99Passed && slosPassed && leaksPassed && runChecksPassed;
 		}
 	}
 
-	public record Selection(int winner,
+	public record Selection(String datasetFingerprint,
+			String comparisonFingerprint,
+			String storageLabel,
+			long seed,
+			int winner,
 			double maximumThroughput,
 			long minimumRelevantP99Nanos,
 			List<Integer> adjacentCandidates,

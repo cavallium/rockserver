@@ -5,13 +5,17 @@ seven-profile scheduler. It is an opt-in `main` class under test sources; ordina
 may compile it and run the pure selector tests, but CI output is never hardware
 acceptance and must not change production defaults.
 
+The result keeps `workload_checks_passed` separate from
+`hardware_acceptance_passed`. The latter is true only for an `--enforce=true` run
+that satisfies every workload, pressure, metric-presence, shutdown, and leak check.
+
 The harness keeps these producers active at the same time:
 
 | Profile | Benchmark operation | Primary family |
 |---|---|---|
 | `CONTROL` | Open then protected rollback | `CONTROL` |
 | `LATENCY` | Point lookup with a fresh five-second absolute deadline | `POINT_LOOKUP` |
-| `ANALYTICAL` | Bounded full-range fallback scan | `RANGE_PAGE` |
+| `ANALYTICAL` | Bounded fallback range scan | `RANGE_PAGE` |
 | `INGEST` | Live point mutation | `MUTATION` |
 | `CDC` | Poll and commit against concurrent writes | `WAL_PAGE` |
 | `BATCH` | Recovery point mutation | `MUTATION` |
@@ -33,8 +37,9 @@ completed during pressure.
 - maximum retained snapshots, CDC lag, observed pressure, and queue/active depths;
 - post-run pending operations, transactions, iterators, range cursors, snapshots,
   native-handle leaks, and shutdown status;
-- the deterministic seed, dataset fingerprint, cache-state assertion, storage label,
-  candidate, and each per-profile SLO verdict.
+- the deterministic seed, dataset and comparison-shape fingerprints, cache-state
+  assertion, storage label, candidate, and each per-profile SLO verdict;
+- up to the first 32 unexpected error details, rather than only their count.
 
 The queue and execution p99 values come from Rockserver's own
 `rockserver.workload.queue.wait` and `rockserver.workload.execution` timers. The
@@ -48,10 +53,11 @@ The candidate SLO gates are intentionally conservative:
   seconds;
 - CONTROL and the ANALYTICAL fallback both make progress with p99 below one second;
 - mixed INGEST throughput is at least 95% of its candidate's isolated baseline;
-- CDC makes progress and stays below `--cdc-lag-limit`;
+- CDC makes progress, exposes its lag meter, and stays below `--cdc-lag-limit`;
 - ANALYTICAL and BATCH continue, and BATCH completes work after injected pressure;
-- PHYSICAL work progresses, every profile has zero unexpected errors, all logical
-  resources drain, no native handle leaks are detected, and shutdown is clean.
+- injected storage pressure is observed, PHYSICAL work progresses, every profile has
+  zero unexpected errors, all logical resources drain, no native handle leaks are
+  detected, and shutdown is clean.
 
 The LATENCY and ANALYTICAL rows are scheduler-level chat/fallback proxies. They do
 not replace the Yotsuba one-hour canary or prove the end-to-end message path.
@@ -187,9 +193,10 @@ java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
   "--ingest-isolated-baseline=${ingest_baseline}"
 ```
 
-Repeat this exact two-root procedure for every power-of-two candidate. Do not reuse
-a mutated candidate root, mix warm and cold results, merge different dataset
-fingerprints, or merge results from different storage labels.
+Repeat this exact two-root procedure for every power-of-two candidate. Verify that
+the baseline and mixed outputs have the same dataset and comparison fingerprints.
+Do not reuse a mutated candidate root, mix warm and cold results, merge different
+dataset or comparison fingerprints, or merge results from different storage labels.
 
 ## Select on HDD/ZFS
 
@@ -203,11 +210,17 @@ java -cp "${workload_classpath}" "${selector_main}" \
 
 Selection is mechanical:
 
-1. Find maximum aggregate throughput across the seven profiles.
-2. Retain candidates within 5% of that maximum.
-3. Retain candidates whose worst relevant p99 is within 10% of the minimum such p99.
-4. Reject any candidate with a per-profile SLO failure or any leak.
-5. Choose the smallest remaining candidate.
+1. Reject inputs that were not enforced cold-cache hardware runs.
+2. Find maximum aggregate throughput across the seven profiles.
+3. Retain candidates within 5% of that maximum.
+4. Retain candidates whose worst relevant p99 is within 10% of the minimum such p99.
+5. Reject any candidate with a per-profile SLO failure or any leak.
+6. Reject any candidate whose remaining pressure, metric-presence, error, or shutdown
+   checks failed.
+7. Choose the smallest remaining candidate.
+
+The selector also rejects gaps in the powers-of-two sequence so a missing candidate
+cannot be mislabeled as an adjacent setting.
 
 `workload-selection.json` includes the winner, every gate decision, and the lower
 and upper adjacent candidates available in the measured set. No candidate is
