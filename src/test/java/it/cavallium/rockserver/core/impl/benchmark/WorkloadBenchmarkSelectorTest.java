@@ -120,7 +120,7 @@ class WorkloadBenchmarkSelectorTest {
 	}
 
 	@Test
-	void rejectsInvalidBaselineBeforeOpeningPreparedRoot(@TempDir Path temporary) throws Exception {
+	void hddBtrfsLabelReachesBaselineValidationBeforeOpeningRoot(@TempDir Path temporary) throws Exception {
 		Path root = temporary.resolve("must-remain-unopened");
 		Path baseline = temporary.resolve("ingest-baseline.properties");
 		Files.writeString(baseline, "schema=rockserver-ingest-isolated-baseline-v3\n");
@@ -128,7 +128,7 @@ class WorkloadBenchmarkSelectorTest {
 				"--root=" + root,
 				"--candidate=4",
 				"--build-id=" + "d".repeat(40),
-				"--storage-label=hdd-zfs",
+				"--storage-label=hdd-btrfs",
 				"--cache-state=cold",
 				"--reuse-prepared=true",
 				"--measure-seconds=3",

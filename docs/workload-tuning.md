@@ -116,11 +116,15 @@ because its database may already have changed.
 The following options are the reference comparison shape; do not silently change
 them between candidates:
 
+Use `hdd-zfs` or `hdd-btrfs` according to the verified rotational mount. The
+reference below uses `hdd-btrfs`; never apply a storage label that does not match
+the measured filesystem.
+
 ```bash
 rockserver_rc_sha="REPLACE_WITH_EXACT_ROCKSERVER_RC_SHA"
 common_options=(
   "--build-id=${rockserver_rc_sha}"
-  "--storage-label=hdd-zfs"
+  "--storage-label=hdd-btrfs"
   "--seed=5931033225068892758"
   "--preload-keys=1000000"
   "--preload-flush-keys=50000"
@@ -166,7 +170,7 @@ java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
   --prepare-only=true
 ```
 
-Verify the mount really has the intended HDD/ZFS topology, then evict caches only
+Verify the mount really has the intended HDD/Btrfs topology, then evict caches only
 after the Java process is closed:
 
 ```bash
@@ -212,9 +216,9 @@ Hardware baseline and mixed runs require `--build-id` to be the full lowercase
 Do not reuse a mutated candidate root, mix warm and cold results, merge different
 dataset or comparison fingerprints, or merge results from different storage labels.
 
-## Select on HDD/ZFS
+## Select on the HDD reference filesystem
 
-Pass every HDD/ZFS `selection-input.properties` file to the pure selector:
+Pass every provenance-matched HDD `selection-input.properties` file to the pure selector:
 
 ```bash
 java -cp "${workload_classpath}" "${selector_main}" \
@@ -242,20 +246,20 @@ selected if all of them fail.
 
 ## Verify winner and adjacent settings on NVMe
 
-Prepare fresh NVMe baseline and mixed roots for the HDD/ZFS winner and every value
+Prepare fresh NVMe baseline and mixed roots for the HDD winner and every value
 in `adjacent_verification_candidates`. Change only `--storage-label=nvme` and the
 root mount; retain the exact SHA, seed, JVM, dimensions, rates, and cache workflow.
 
 Each NVMe mixed run must pass its own per-profile SLOs and leak/drain gates. Keep all
 three machine-readable results with the release evidence. The adjacent runs verify
 the selection boundary; they do not automatically retune defaults or override the
-HDD/ZFS winner. Any proposed winner change is a new tuning decision and requires a
+HDD winner. Any proposed winner change is a new tuning decision and requires a
 fresh complete comparison.
 
 ## Acceptance boundary
 
-The hardware evidence is incomplete until all HDD/ZFS candidates, the selected
-winner, and its available NVMe neighbors finish with comparable cold-cache inputs.
+The hardware evidence is incomplete until all candidates on the chosen HDD reference
+filesystem, the selected winner, and its available NVMe neighbors finish with comparable cold-cache inputs.
 Do not claim acceptance from a smoke run, tmpfs, CI, a single candidate, an
 incomplete round, a warm cache, or an operator-supplied label that was not checked
 against the real mount.

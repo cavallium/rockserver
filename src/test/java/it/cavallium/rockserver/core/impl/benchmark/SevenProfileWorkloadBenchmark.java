@@ -1896,8 +1896,9 @@ public final class SevenProfileWorkloadBenchmark {
 			if ((candidate & (candidate - 1)) != 0 || candidate < 4) {
 				throw new IllegalArgumentException("candidate must be a power of two and at least four");
 			}
-			if (!List.of("hdd-zfs", "nvme", "ci-structural").contains(storageLabel)) {
-				throw new IllegalArgumentException("storage-label must be hdd-zfs, nvme, or ci-structural");
+			if (!List.of("hdd-zfs", "hdd-btrfs", "nvme", "ci-structural").contains(storageLabel)) {
+				throw new IllegalArgumentException(
+						"storage-label must be hdd-zfs, hdd-btrfs, nvme, or ci-structural");
 			}
 			if (!List.of("cold", "warm", "unknown").contains(cacheState)) {
 				throw new IllegalArgumentException("cache-state must be cold, warm, or unknown");
