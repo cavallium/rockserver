@@ -26,7 +26,7 @@ Rockserver solves this by leveraging RocksDB's native **Merge Operators** combin
 
 === 2.1. RocksDB Merge Operator
 Instead of RMW, the client sends a `Merge` operation:
-`db.merge(key, delta)`
+`api.merge(key, delta)` through a context-bound API view.
 
 *   **Atomic**: RocksDB handles the merge internally. No user-side locks needed.
 *   **Fast**: Single fire-and-forget network call.
@@ -56,8 +56,8 @@ With `resolved=true`:
 *   **Stateless Consumer**: The indexer doesn't need to query the DB or know the merge logic. It receives "The value for Key X is now Y".
 *   **Efficiency**: Deduplicates rapid updates. If a key is updated 100 times in a millisecond, the CDC poll might resolve it once to the final value, saving 99 index operations (eventual consistency).
 *   **Simplified Architecture**:
-    *   **Write Path**: `client -> db.merge()` (Fast)
-    *   **Read Path**: `indexer -> db.cdcPoll(resolved=true) -> index.put()` (Simple)
+    *   **Write Path**: `client -> api.merge()` (Fast)
+    *   **Read Path**: `indexer -> api.cdcPoll(resolved=true) -> index.put()` (Simple)
 
 == 4. Handling Bucketed Columns
 
@@ -94,17 +94,17 @@ When `resolved=true` is used on a bucketed column, Rockserver performs **Automat
 
 . **Setup**:
     *   Define Column Schema (e.g., with Merge Operator `MyAppendOperator`).
-    *   Create CDC Subscription: `db.cdcCreate("index-sub", startSeq=0, columns=[col1], emitLatestValues=true)`.
+    *   Create CDC Subscription: `api.cdcCreate("index-sub", startSeq=0, columns=[col1], emitLatestValues=true)`.
 
 . **Write**:
-    *   Client calls `db.merge(key, delta)`.
+    *   Client calls `api.merge(key, delta)`.
     *   RocksDB appends to WAL and MemTable.
 
 . **Index**:
-    *   Indexer calls `db.cdcPoll("index-sub")`.
+    *   Indexer calls `api.cdcPoll("index-sub")`.
     *   Rockserver scans WAL.
     *   Finds `MERGE` on `key`.
-    *   Rockserver calls `db.get(key)` -> returns "OldValue + Delta".
+    *   Rockserver performs an internal read of `key` -> returns "OldValue + Delta".
     *   Rockserver emits `CDCEvent(Op=PUT, Key=key, Value="OldValue+Delta")`.
     *   Indexer updates Elasticsearch/Solr with "OldValue+Delta".
 
@@ -113,14 +113,16 @@ When `resolved=true` is used on a bucketed column, Rockserver performs **Automat
 === Java API
 [source,java]
 ----
+var api = connection.getSyncApi(RequestContext.ingest());
+
 // Create Subscription
 boolean emitLatestValues = true;
 String subId = "my-indexer";
-long startSeq = db.cdcCreate(subId, null, List.of(columnId), emitLatestValues);
+long startSeq = api.cdcCreate(subId, null, List.of(columnId), emitLatestValues);
 
 // Poll Loop
 while (running) {
-    List<CDCEvent> events = db.cdcPoll(subId, null, 100).toList();
+    List<CDCEvent> events = api.cdcPoll(subId, null, 100).toList();
     for (CDCEvent event : events) {
         // event.key() is the Real Key
         // event.value() is the Resolved Value
@@ -129,7 +131,7 @@ while (running) {
     }
     // Commit progress
    	if (!events.isEmpty()) {
-		db.cdcCommit(subId, events.get(events.size() - 1).seq());
+		api.cdcCommit(subId, events.get(events.size() - 1).seq());
 	}
 }
 ----

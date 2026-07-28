@@ -297,16 +297,16 @@ database: {
 			var key = getKey1();
 
 			if (!getHasValues()) {
-				Assertions.assertThrows(RocksDBException.class, () -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, toBufSimple(123), RequestType.delta()));
+				Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, toBufSimple(123), RequestType.delta()));
 			} else {
 				var emptyValue = emptyBuf();
-				var emptyDelta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, emptyValue, RequestType.delta());
+				var emptyDelta = db.put(0, colId, key, emptyValue, RequestType.delta());
 				Assertions.assertNull(emptyDelta.previous());
 				assertSegmentEquals(emptyValue, emptyDelta.current());
-				assertSegmentEquals(emptyValue, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.current()));
+				assertSegmentEquals(emptyValue, db.get(0, colId, key, RequestType.current()));
 				Assertions.assertThrows(RocksDBException.class, () -> {
 					try {
-						db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, null, RequestType.delta());
+						db.put(0, colId, key, null, RequestType.delta());
 					} catch (IllegalArgumentException ex) {
 						throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
 					}
@@ -315,21 +315,21 @@ database: {
 
 			Assertions.assertThrows(RocksDBException.class, () -> {
 				try {
-					db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, null, value1, RequestType.delta());
+					db.put(0, colId, null, value1, RequestType.delta());
 				} catch (IllegalArgumentException ex) {
 					throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
 				}
 			});
 			Assertions.assertThrows(RocksDBException.class, () -> {
 				try {
-					db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, null, null, RequestType.delta());
+					db.put(0, colId, null, null, RequestType.delta());
 				} catch (IllegalArgumentException ex) {
 					throw RocksDBException.of(RocksDBException.RocksDBErrorType.UNEXPECTED_NULL_VALUE, ex);
 				}
 			});
-			Assertions.assertThrows(RocksDBException.class, () -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value1, null));
-			Assertions.assertThrows(RocksDBException.class, () -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(1, colId, key, value1, RequestType.delta()));
-			Assertions.assertThrows(RocksDBException.class, () -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, 21203, key, value1, RequestType.delta()));
+			Assertions.assertThrows(RocksDBException.class, () -> db.put(0, colId, key, value1, null));
+			Assertions.assertThrows(RocksDBException.class, () -> db.put(1, colId, key, value1, RequestType.delta()));
+			Assertions.assertThrows(RocksDBException.class, () -> db.put(0, 21203, key, value1, RequestType.delta()));
 		}
 	}
 
@@ -344,11 +344,11 @@ database: {
 
 			Delta<Buf> delta;
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value1, RequestType.delta());
+			delta = db.put(0, colId, key, value1, RequestType.delta());
 			Assertions.assertNull(delta.previous());
 			assertSegmentEquals(value1, delta.current());
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, value2, RequestType.delta());
+			delta = db.put(0, colId, key, value2, RequestType.delta());
 			assertSegmentEquals(value1, delta.previous());
 			assertSegmentEquals(value2, delta.current());
 		}
@@ -372,61 +372,61 @@ database: {
 
 			Delta<Buf> delta;
 
-			Assertions.assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, getKeyI(3), value2, RequestType.previousPresence()));
-			Assertions.assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, getKeyI(4), value2, RequestType.previousPresence()));
+			Assertions.assertFalse(db.put(0, colId, getKeyI(3), value2, RequestType.previousPresence()));
+			Assertions.assertFalse(db.put(0, colId, getKeyI(4), value2, RequestType.previousPresence()));
 
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value1, RequestType.delta());
+			delta = db.put(0, colId, key1, value1, RequestType.delta());
 			Assertions.assertNull(delta.previous());
 			assertSegmentEquals(value1, delta.current());
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value2, RequestType.delta());
+			delta = db.put(0, colId, key2, value2, RequestType.delta());
 			Assertions.assertNull(delta.previous());
 			assertSegmentEquals(value2, delta.current());
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value1, RequestType.delta());
+			delta = db.put(0, colId, key2, value1, RequestType.delta());
 			assertSegmentEquals(value2, delta.previous());
 			assertSegmentEquals(value1, delta.current());
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value1, RequestType.delta());
+			delta = db.put(0, colId, key2, value1, RequestType.delta());
 			assertSegmentEquals(value1, delta.previous());
 			assertSegmentEquals(value1, delta.current());
 
 
-			Assertions.assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value2, RequestType.previousPresence()));
-			Assertions.assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value2, RequestType.previousPresence()));
+			Assertions.assertTrue(db.put(0, colId, key1, value2, RequestType.previousPresence()));
+			Assertions.assertTrue(db.put(0, colId, key2, value2, RequestType.previousPresence()));
 
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value1, RequestType.delta());
+			delta = db.put(0, colId, key1, value1, RequestType.delta());
 			assertSegmentEquals(value2, delta.previous());
 			assertSegmentEquals(value1, delta.current());
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value1, RequestType.delta());
+			delta = db.put(0, colId, key2, value1, RequestType.delta());
 			assertSegmentEquals(value2, delta.previous());
 			assertSegmentEquals(value1, delta.current());
 
 
-			Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value2, RequestType.none()));
-			Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value2, RequestType.none()));
+			Assertions.assertNull(db.put(0, colId, key1, value2, RequestType.none()));
+			Assertions.assertNull(db.put(0, colId, key2, value2, RequestType.none()));
 
 
-			assertSegmentEquals(value2, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value1, RequestType.previous()));
-			assertSegmentEquals(value2, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value1, RequestType.previous()));
+			assertSegmentEquals(value2, db.put(0, colId, key1, value1, RequestType.previous()));
+			assertSegmentEquals(value2, db.put(0, colId, key2, value1, RequestType.previous()));
 
-			assertSegmentEquals(value1, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value1, RequestType.previous()));
-			assertSegmentEquals(value1, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value1, RequestType.previous()));
+			assertSegmentEquals(value1, db.put(0, colId, key1, value1, RequestType.previous()));
+			assertSegmentEquals(value1, db.put(0, colId, key2, value1, RequestType.previous()));
 
 			if (!Utils.valueEquals(value1, value2)) {
-				Assertions.assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value2, RequestType.changed()));
-				Assertions.assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value2, RequestType.changed()));
+				Assertions.assertTrue(db.put(0, colId, key1, value2, RequestType.changed()));
+				Assertions.assertTrue(db.put(0, colId, key2, value2, RequestType.changed()));
 			}
 
-			Assertions.assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value2, RequestType.changed()));
-			Assertions.assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value2, RequestType.changed()));
+			Assertions.assertFalse(db.put(0, colId, key1, value2, RequestType.changed()));
+			Assertions.assertFalse(db.put(0, colId, key2, value2, RequestType.changed()));
 
 
-			assertSegmentEquals(value2, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value1, RequestType.previous()));
-			assertSegmentEquals(value2, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value1, RequestType.previous()));
+			assertSegmentEquals(value2, db.put(0, colId, key1, value1, RequestType.previous()));
+			assertSegmentEquals(value2, db.put(0, colId, key2, value1, RequestType.previous()));
 		}
 	}
 
@@ -457,23 +457,23 @@ database: {
 			var value1 = getValue1();
 			var value2 = getValue2();
 
-			var delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value1, RequestType.delta());
+			var delta = db.put(0, colId, key1, value1, RequestType.delta());
 			Assertions.assertNull(delta.previous());
 			assertSegmentEquals(value1, delta.current());
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, collidingKey1, value2, RequestType.delta());
+			delta = db.put(0, colId, collidingKey1, value2, RequestType.delta());
 			Assertions.assertNull(delta.previous());
 			assertSegmentEquals(value2, delta.current());
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, collidingKey1, value1, RequestType.delta());
+			delta = db.put(0, colId, collidingKey1, value1, RequestType.delta());
 			assertSegmentEquals(value2, delta.previous());
 			assertSegmentEquals(value1, delta.current());
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value1, RequestType.delta());
+			delta = db.put(0, colId, key2, value1, RequestType.delta());
 			Assertions.assertNull(delta.previous());
 			assertSegmentEquals(value1, delta.current());
 
-			delta = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value2, RequestType.delta());
+			delta = db.put(0, colId, key2, value2, RequestType.delta());
 			assertSegmentEquals(value1, delta.previous());
 			assertSegmentEquals(value2, delta.current());
 		}
@@ -485,27 +485,27 @@ database: {
 			var db = testDB.getAPI();
 
 			if (getHasValues()) {
-				Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, RequestType.current()));
-				Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, collidingKey1, RequestType.current()));
-				Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key2, RequestType.current()));
+				Assertions.assertNull(db.get(0, colId, key1, RequestType.current()));
+				Assertions.assertNull(db.get(0, colId, collidingKey1, RequestType.current()));
+				Assertions.assertNull(db.get(0, colId, key2, RequestType.current()));
 			}
-			Assertions.assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, RequestType.exists()));
-			Assertions.assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, collidingKey1, RequestType.exists()));
-			Assertions.assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key2, RequestType.exists()));
+			Assertions.assertFalse(db.get(0, colId, key1, RequestType.exists()));
+			Assertions.assertFalse(db.get(0, colId, collidingKey1, RequestType.exists()));
+			Assertions.assertFalse(db.get(0, colId, key2, RequestType.exists()));
 
 			fillSomeKeys();
 
 			if (getHasValues()) {
-				assertSegmentEquals(value1, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, RequestType.current()));
-				Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, getNotFoundKeyI(0), RequestType.current()));
-				assertSegmentEquals(value2, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, collidingKey1, RequestType.current()));
-				assertSegmentEquals(bigValue, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key2, RequestType.current()));
+				assertSegmentEquals(value1, db.get(0, colId, key1, RequestType.current()));
+				Assertions.assertNull(db.get(0, colId, getNotFoundKeyI(0), RequestType.current()));
+				assertSegmentEquals(value2, db.get(0, colId, collidingKey1, RequestType.current()));
+				assertSegmentEquals(bigValue, db.get(0, colId, key2, RequestType.current()));
 			}
 
-			Assertions.assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, RequestType.exists()));
-			Assertions.assertFalse(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, getNotFoundKeyI(0), RequestType.exists()));
-			Assertions.assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, collidingKey1, RequestType.exists()));
-			Assertions.assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key2, RequestType.exists()));
+			Assertions.assertTrue(db.get(0, colId, key1, RequestType.exists()));
+			Assertions.assertFalse(db.get(0, colId, getNotFoundKeyI(0), RequestType.exists()));
+			Assertions.assertTrue(db.get(0, colId, collidingKey1, RequestType.exists()));
+			Assertions.assertTrue(db.get(0, colId, key2, RequestType.exists()));
 		}
 	}
 
@@ -515,12 +515,12 @@ database: {
 			var db = testDB.getAPI();
 
 			if (getHasValues()) {
-				var forUpdate = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, RequestType.forUpdate());
+				var forUpdate = db.get(0, colId, key1, RequestType.forUpdate());
 				Assertions.assertNull(forUpdate.previous());
 				Assertions.assertTrue(forUpdate.updateId() != 0);
-				db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate.updateId(), colId, key1, value1, RequestType.none());
+				db.put(forUpdate.updateId(), colId, key1, value1, RequestType.none());
 
-				Assertions.assertThrows(Exception.class, () -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate.updateId(), colId, key1, value2, RequestType.none()));
+				Assertions.assertThrows(Exception.class, () -> db.put(forUpdate.updateId(), colId, key1, value2, RequestType.none()));
 			}
 		}
 	}
@@ -534,21 +534,21 @@ database: {
 			var lastKey = getKVSequenceLast().keys();
 			var prevLastKV = getKVSequence().get(getKVSequence().size() - 2);
 			if (getSchemaVarKeys().isEmpty()) {
-				FirstAndLast<KV> firstAndLast = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+				FirstAndLast<KV> firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
 				Assertions.assertNull(firstAndLast.first(), "First should be empty because the db is empty");
 				Assertions.assertNull(firstAndLast.last(), "Last should be empty because the db is empty");
 
 				fillSomeKeys();
 
-				firstAndLast = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+				firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
 				Assertions.assertEquals(getKVSequenceFirst(), firstAndLast.first(), "First key mismatch");
 				Assertions.assertEquals(prevLastKV, firstAndLast.last(), "Last key mismatch");
 
-				firstAndLast = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0, colId, firstKey, firstKey, false, RequestType.firstAndLast(), 1000);
+				firstAndLast = db.reduceRange(0, colId, firstKey, firstKey, false, RequestType.firstAndLast(), 1000);
 				Assertions.assertNull(firstAndLast.first(), "First should be empty because the range is empty");
 				Assertions.assertNull(firstAndLast.last(), "Last should be empty because the range is empty");
 			} else {
-				db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+				db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
 			}
 		}
 	}
@@ -566,14 +566,14 @@ database: {
 			var rangeEndKeyIncl = getKVSequence().get(initIndex + count - 1);
 			System.out.println("[DEBUG_LOG] " + this.getClass().getName() + " VarKeys: " + getSchemaVarKeys());
 			if (getSchemaVarKeys().isEmpty()) {
-				var results = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000).toList();
+				var results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000).toList();
 				Assertions.assertEquals(0, results.size(), "Results count must be 0");
 
 				fillSomeKeys();
 
 				boolean reverse = false;
 				while (true) {
-					results = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), reverse, RequestType.allInRange(), 1000).toList();
+					results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), reverse, RequestType.allInRange(), 1000).toList();
 
 					var expectedResults = getKVSequence().stream().skip(initIndex).limit(count).collect(Collectors.toCollection(ArrayList::new));
 					if (reverse) {
@@ -599,7 +599,7 @@ database: {
 				// For hashed keys, strictly verify full content via full scan
 				fillSomeKeys();
 				if (connection.method() != ConnectionMethod.THRIFT) {
-					var allResults = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRange(0, colId, null, null, false, RequestType.allInRange(), 10000).toList();
+					var allResults = db.getRange(0, colId, null, null, false, RequestType.allInRange(), 10000).toList();
 					// Range scans on hashed keys are problematic or not fully implemented in some backends.
 					// We only verify if we got results, otherwise warn or skip.
 					if (!allResults.isEmpty()) {
@@ -666,19 +666,19 @@ database: {
 				}
 			};
 			if (this.getSchema().variableLengthKeysCount() <= 0) {
-				db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
+				db.putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
 
 				if (getHasValues()) {
 					for (int i = 0; i < 4; i++) {
-						assertSegmentEquals(getValueI(i), db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, getKeyI(i), RequestType.current()));
+						assertSegmentEquals(getValueI(i), db.get(0, colId, getKeyI(i), RequestType.current()));
 					}
 				}
 				for (int i = 0; i < 4; i++) {
-					Assertions.assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, getKeyI(i), RequestType.exists()));
+					Assertions.assertTrue(db.get(0, colId, getKeyI(i), RequestType.exists()));
 				}
 			} else {
 				Assertions.assertThrows(RocksDBException.class, () -> {
-					db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
+					db.putBatch(colId, batchPublisher, PutBatchMode.SST_INGESTION);
 				});
 
 			}
@@ -822,23 +822,23 @@ database: {
 
 			if (getHasValues()) {
 				{
-					var forUpdate1 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, RequestType.forUpdate());
+					var forUpdate1 = db.get(0, colId, key1, RequestType.forUpdate());
 					try {
-						var forUpdate2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, RequestType.forUpdate());
+						var forUpdate2 = db.get(0, colId, key1, RequestType.forUpdate());
 						try {
-							db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate1.updateId(), colId, key1, value1, RequestType.none());
-							Assertions.assertThrowsExactly(RocksDBRetryException.class, () -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate2.updateId(), colId, key1, value2, RequestType.none()));
+							db.put(forUpdate1.updateId(), colId, key1, value1, RequestType.none());
+							Assertions.assertThrowsExactly(RocksDBRetryException.class, () -> db.put(forUpdate2.updateId(), colId, key1, value2, RequestType.none()));
 							// Retrying
-							var forUpdate3 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(forUpdate2.updateId(), colId, key1, RequestType.forUpdate());
+							var forUpdate3 = db.get(forUpdate2.updateId(), colId, key1, RequestType.forUpdate());
 							try {
 								assertSegmentEquals(value1, forUpdate3.previous());
-								db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(forUpdate3.updateId(), colId, key1, value2, RequestType.none());
+								db.put(forUpdate3.updateId(), colId, key1, value2, RequestType.none());
 							} catch (Throwable ex3) {
-								db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeFailedUpdate(forUpdate3.updateId());
+								db.closeFailedUpdate(forUpdate3.updateId());
 								throw ex3;
 							}
 						} catch (Throwable ex2) {
-							db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeFailedUpdate(forUpdate2.updateId());
+							db.closeFailedUpdate(forUpdate2.updateId());
 							throw ex2;
 						}
 					} catch (Throwable ex) {
@@ -866,15 +866,15 @@ database: {
 
 			fillSomeKeys();
 			Assertions.assertThrows(Exception.class,
-					() -> Utils.valueEquals(value1, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, null, RequestType.current()))
+					() -> Utils.valueEquals(value1, db.get(0, colId, null, RequestType.current()))
 			);
 			Assertions.assertThrows(Exception.class,
-					() -> Utils.valueEquals(value1, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, 18239, key1, RequestType.current()))
+					() -> Utils.valueEquals(value1, db.get(0, 18239, key1, RequestType.current()))
 			);
 			Assertions.assertThrows(Exception.class,
-					() -> Utils.valueEquals(value1, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(1, colId, key1, RequestType.current()))
+					() -> Utils.valueEquals(value1, db.get(1, colId, key1, RequestType.current()))
 			);
-			Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, null)));
+			Assertions.assertThrows(Exception.class, () -> Utils.valueEquals(value1, db.get(0, colId, key1, null)));
 		}
 	}
 
