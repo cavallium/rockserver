@@ -49,6 +49,7 @@ public final class RWScheduler {
 	private final ProfiledWorkloadExecutor writePool;
 	private final ProfiledWorkloadExecutor controlPool;
 	private final ProfiledWorkloadExecutor physicalPool;
+	private final List<ProfiledWorkloadExecutor> pools;
 	private final WorkloadPressureController pressureController;
 
 	public RWScheduler(int readCap, int writeCap, String name) {
@@ -158,6 +159,7 @@ public final class RWScheduler {
 				pressureController,
 				registry,
 				databaseName);
+		this.pools = List.of(readPool, writePool, controlPool, physicalPool);
 		pressureController.setNotifier(this::signalAllPools);
 		if (registry != null) {
 			Gauge.builder("rockserver.workload.storage.pressure",
@@ -426,7 +428,7 @@ public final class RWScheduler {
 	}
 
 	private List<ProfiledWorkloadExecutor> pools() {
-		return List.of(readPool, writePool, controlPool, physicalPool);
+		return pools;
 	}
 
 	public Mono<Void> disposeGracefully() {
@@ -510,6 +512,17 @@ public final class RWScheduler {
 	public interface WorkloadExecutor extends Executor {
 
 		void execute(Runnable command, long estimatedBytes);
+	}
+
+	/**
+	 * Optional submission hook for work that must release logical resources when it is
+	 * rejected after admission. The scheduler invokes it exactly once for DEADLINE,
+	 * CANCELLATION, OVERLOAD, or SHUTDOWN before disposing the task when applicable.
+	 */
+	@FunctionalInterface
+	public interface RejectionAwareTask {
+
+		void reject(RuntimeException failure);
 	}
 
 	public enum TerminalOutcome {

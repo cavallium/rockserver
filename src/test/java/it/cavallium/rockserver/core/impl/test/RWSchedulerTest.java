@@ -7,6 +7,11 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
+import io.micrometer.core.instrument.distribution.pause.PauseDetector;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -92,6 +97,32 @@ class RWSchedulerTest {
 		} finally {
 			release.countDown();
 			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void deadlineIsRecheckedAfterPotentiallySlowMetricLookup() throws Exception {
+		var registry = new BlockingTimerRegistry();
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "metric-deadline-test", registry, "metric-db");
+		var task = new ObservableTask(() -> {});
+		try {
+			registry.blockTimers();
+			var deadline = new RequestContext(WorkloadProfile.LATENCY, System.currentTimeMillis() + 100L);
+			scheduler.executor(deadline, OperationFamily.POINT_LOOKUP).execute(task);
+			assertTrue(registry.timerCreationStarted().await(5, SECONDS));
+			Thread.sleep(150L);
+			registry.releaseTimers();
+
+			var completion = assertThrows(ExecutionException.class, () -> task.get(5, SECONDS));
+			var failure = assertInstanceOf(RocksDBException.class, completion.getCause());
+			assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					failure.getErrorUniqueId());
+			assertFalse(task.ran());
+			assertEquals(1, task.disposeCount());
+		} finally {
+			registry.releaseTimers();
+			scheduler.dispose();
+			registry.close();
 		}
 	}
 
@@ -278,7 +309,7 @@ class RWSchedulerTest {
 	}
 
 	@Test
-	void storagePressureParksPhysicalAndSpacesBatchAfterCompletion() throws Exception {
+	void storagePressureParksPhysicalAndGloballySpacesBatchAfterCompletion() throws Exception {
 		var scheduler = scheduler(3, "pressure-test");
 		var physical = new ObservableTask(() -> {});
 		var firstStarted = new CountDownLatch(1);
@@ -295,7 +326,7 @@ class RWSchedulerTest {
 				firstFinishedNanos.set(System.nanoTime());
 			});
 			assertTrue(firstStarted.await(5, SECONDS));
-			scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE).execute(() -> {
+			scheduler.executor(RequestContext.batch(), OperationFamily.MUTATION).execute(() -> {
 				secondStartedNanos.set(System.nanoTime());
 				secondStarted.countDown();
 			});
@@ -315,6 +346,27 @@ class RWSchedulerTest {
 			assertFalse(scheduler.admissionSnapshot().storagePressure());
 		} finally {
 			releaseFirst.countDown();
+			scheduler.setStoragePressure(false);
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void cancellationImmediatelyBeforeRunDoesNotConsumeAPressureInterval() throws Exception {
+		var scheduler = scheduler(1, "pressure-cancel-test");
+		var cancelled = new CancelAtDispatchTask();
+		var nextStarted = new CountDownLatch(1);
+		try {
+			scheduler.setStoragePressure(true);
+			scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE).execute(cancelled);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)
+					.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION) == 1L);
+
+			scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE)
+					.execute(nextStarted::countDown);
+			assertTrue(nextStarted.await(800L, TimeUnit.MILLISECONDS),
+					"a BATCH task that never ran must not start the one-second pressure interval");
+		} finally {
 			scheduler.setStoragePressure(false);
 			scheduler.dispose();
 		}
@@ -390,11 +442,66 @@ class RWSchedulerTest {
 	}
 
 	@Test
+	void metricFailureCannotStrandAdmissionOrKillTheWorker() throws Exception {
+		var registry = new FailingCounterRegistry();
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "metric-failure-test", registry, "metric-db");
+		var first = new CompletableFuture<Void>();
+		var second = new CompletableFuture<Void>();
+		try {
+			registry.failCounters();
+			scheduler.readExecutor().execute(() -> first.complete(null));
+			first.get(5, SECONDS);
+			scheduler.readExecutor().execute(() -> second.complete(null));
+			second.get(5, SECONDS);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks() == 2L);
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(0, snapshot.activeTasks());
+			assertEquals(2L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			assertEquals(0L, snapshot.failedTasks());
+		} finally {
+			scheduler.dispose();
+			registry.close();
+		}
+	}
+
+	@Test
+	void queuedRemovalUsesIdentityEvenWhenTasksCompareEqual() throws Exception {
+		var scheduler = scheduler(1, "identity-removal-test");
+		var blockerStarted = new CountDownLatch(1);
+		var release = new CountDownLatch(1);
+		var first = new EqualTask();
+		var second = new EqualTask();
+		var view = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
+		try {
+			view.execute(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(release);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			view.execute(first);
+			view.execute(second);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 2);
+
+			assertTrue(scheduler.removeQueuedTask(view, second));
+			release.countDown();
+			first.get(5, SECONDS);
+			assertTrue(first.ran());
+			assertFalse(second.ran());
+			assertTrue(second.isCompletedExceptionally());
+			assertEquals(1, second.disposeCount());
+		} finally {
+			release.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
 	void forcedShutdownCompletesQueuedWorkDisposesItAndInterruptsRunningWork() throws Exception {
 		var scheduler = scheduler(1, "forced-shutdown");
 		var started = new CountDownLatch(1);
 		var interrupted = new AtomicBoolean();
-		var queued = new ObservableTask(() -> {});
+		var queued = new LifecycleTask(true);
+		var reactorRan = new AtomicBoolean();
 		scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE).execute(() -> {
 			started.countDown();
 			try {
@@ -406,17 +513,23 @@ class RWSchedulerTest {
 		});
 		assertTrue(started.await(5, SECONDS));
 		scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE).execute(queued);
-		assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+		var reactorTask = scheduler.scheduler(RequestContext.batch(), OperationFamily.RANGE_PAGE)
+				.schedule(() -> reactorRan.set(true));
+		assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 2);
 
 		scheduler.disposeNow();
 
 		var completion = assertThrows(ExecutionException.class, () -> queued.get(5, SECONDS));
 		assertInstanceOf(RejectedExecutionException.class, completion.getCause());
 		assertFalse(queued.ran());
+		assertEquals(1, queued.rejectionCount());
 		assertEquals(1, queued.disposeCount());
+		assertTrue(reactorTask.isDisposed());
+		assertFalse(reactorRan.get());
 		assertTrue(interrupted.get());
 		var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
-		assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
+		assertEquals(2L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
+		assertEquals(1L, snapshot.failedTasks());
 		assertTrue(snapshot.terminated());
 		assertThrows(RejectedExecutionException.class,
 				() -> scheduler.readExecutor().execute(() -> {}));
@@ -593,6 +706,163 @@ class RWSchedulerTest {
 
 		private int disposeCount() {
 			return disposeCount.get();
+		}
+	}
+
+	private static final class CancelAtDispatchTask implements Runnable, Disposable {
+
+		private final AtomicInteger disposalChecks = new AtomicInteger();
+
+		@Override
+		public void run() {
+			throw new AssertionError("cancelled task must not run");
+		}
+
+		@Override
+		public void dispose() {
+			disposalChecks.set(Integer.MAX_VALUE);
+		}
+
+		@Override
+		public boolean isDisposed() {
+			return disposalChecks.incrementAndGet() >= 2;
+		}
+	}
+
+	private static final class EqualTask extends CompletableFuture<Void> implements Runnable, Disposable {
+
+		private final AtomicBoolean ran = new AtomicBoolean();
+		private final AtomicInteger disposeCount = new AtomicInteger();
+
+		@Override
+		public void run() {
+			ran.set(true);
+			complete(null);
+		}
+
+		@Override
+		public void dispose() {
+			disposeCount.incrementAndGet();
+		}
+
+		@Override
+		public boolean isDisposed() {
+			return disposeCount.get() > 0;
+		}
+
+		@Override
+		public boolean equals(Object ignored) {
+			return ignored instanceof EqualTask;
+		}
+
+		@Override
+		public int hashCode() {
+			return 1;
+		}
+
+		private boolean ran() {
+			return ran.get();
+		}
+
+		private int disposeCount() {
+			return disposeCount.get();
+		}
+	}
+
+	private static final class LifecycleTask extends CompletableFuture<Void>
+			implements Runnable, Disposable, RWScheduler.RejectionAwareTask {
+
+		private final boolean failAfterReject;
+		private final AtomicBoolean ran = new AtomicBoolean();
+		private final AtomicInteger rejectionCount = new AtomicInteger();
+		private final AtomicInteger disposeCount = new AtomicInteger();
+
+		private LifecycleTask(boolean failAfterReject) {
+			this.failAfterReject = failAfterReject;
+		}
+
+		@Override
+		public void run() {
+			ran.set(true);
+			complete(null);
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			rejectionCount.incrementAndGet();
+			completeExceptionally(failure);
+			if (failAfterReject) {
+				throw new IllegalStateException("expected rejection callback failure");
+			}
+		}
+
+		@Override
+		public void dispose() {
+			disposeCount.incrementAndGet();
+		}
+
+		@Override
+		public boolean isDisposed() {
+			return disposeCount.get() > 0;
+		}
+
+		private boolean ran() {
+			return ran.get();
+		}
+
+		private int rejectionCount() {
+			return rejectionCount.get();
+		}
+
+		private int disposeCount() {
+			return disposeCount.get();
+		}
+	}
+
+	private static final class FailingCounterRegistry extends SimpleMeterRegistry {
+
+		private final AtomicBoolean failCounters = new AtomicBoolean();
+
+		private void failCounters() {
+			failCounters.set(true);
+		}
+
+		@Override
+		protected Counter newCounter(Meter.Id id) {
+			if (failCounters.get()) {
+				throw new IllegalStateException("expected counter failure");
+			}
+			return super.newCounter(id);
+		}
+	}
+
+	private static final class BlockingTimerRegistry extends SimpleMeterRegistry {
+
+		private final AtomicBoolean blockTimers = new AtomicBoolean();
+		private final CountDownLatch timerCreationStarted = new CountDownLatch(1);
+		private final CountDownLatch releaseTimers = new CountDownLatch(1);
+
+		private void blockTimers() {
+			blockTimers.set(true);
+		}
+
+		private CountDownLatch timerCreationStarted() {
+			return timerCreationStarted;
+		}
+
+		private void releaseTimers() {
+			releaseTimers.countDown();
+		}
+
+		@Override
+		protected Timer newTimer(Meter.Id id,
+				DistributionStatisticConfig distributionStatisticConfig,
+				PauseDetector pauseDetector) {
+			if (blockTimers.compareAndSet(true, false)) {
+				timerCreationStarted.countDown();
+				awaitUninterruptibly(releaseTimers);
+			}
+			return super.newTimer(id, distributionStatisticConfig, pauseDetector);
 		}
 	}
 }
