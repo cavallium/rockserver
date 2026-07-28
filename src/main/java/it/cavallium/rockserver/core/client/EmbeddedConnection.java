@@ -733,7 +733,8 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 			boolean reverse,
 			@NotNull RequestType.RequestReduceRange<? super KV, T> requestType,
 		long timeoutMs) throws RocksDBException {
-		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
+		var context = currentRequestContextOrBatch();
+		db.validateTransactionProfile(transactionId, context.profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
 				transactionId,
 				columnId,
@@ -752,8 +753,9 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 					endKeysExclusive,
 					reverse,
 					timeoutMs,
-					commandScheduler(command))
-					.contextWrite(context -> context.put(
+					context.deadlineEpochMillis(),
+					resolveCommand(context, command))
+					.contextWrite(reactorContext -> reactorContext.put(
 							REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY, lateFailureHandler))
 					.toFuture();
 		}
@@ -976,7 +978,8 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 
 	@Override
 	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
-		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
+		var context = currentRequestContextOrBatch();
+		db.validateTransactionProfile(transactionId, context.profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<>(
 				transactionId,
 				columnId,
@@ -992,7 +995,8 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 				reverse,
 				requestType,
 				timeoutMs,
-				commandScheduler(command));
+				context.deadlineEpochMillis(),
+				resolveCommand(context, command));
 	}
 
 	@Override
