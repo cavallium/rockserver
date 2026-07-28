@@ -2231,6 +2231,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				tx = null;
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
+			return merge(tx, col, updateId, keys, value, requestType);
 		} catch (RocksDBRetryException ex) {
 			throw ex;
 		} catch (RocksDBException ex) {
@@ -7619,7 +7620,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				iterator.next();
 			}
 			checkIteratorStatusIfInvalid(iterator);
-		} catch (org.rocksdb.RocksDBException | RocksDBException error) {
+		} catch (RocksDBException error) {
 			throw new IOException("Cannot load CDC subscription progress", error);
 		}
 	}
