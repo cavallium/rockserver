@@ -19,6 +19,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.PutBatchMode;
+import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
@@ -272,6 +273,8 @@ class WorkloadAdmissionTest {
 				0, 1, EMPTY_KEYS, null, false, RequestType.firstAndLast(), 1_000), seek));
 		commands.add(client("reduceExact", new RocksDBAPICommandSingle.ReduceRange<>(
 				0, 1, EMPTY_KEYS, null, false, RequestType.entriesCount(), 1_000), analyticalOrBatch));
+		commands.add(client("getRangePage", new RocksDBAPICommandSingle.GetRangePage<>(
+				0, 1, EMPTY_KEYS, null, false, null, RequestType.allInRange(), 1_000, RangeBudget.DEFAULT), all));
 		commands.add(client("getRange", new RocksDBAPICommandStream.GetRange<>(
 				0, 1, EMPTY_KEYS, null, false, RequestType.allInRange(), 1_000), analyticalOrBatch));
 		commands.add(client("scanRaw", new RocksDBAPICommandStream.ScanRaw(1, 0, 1), batch));

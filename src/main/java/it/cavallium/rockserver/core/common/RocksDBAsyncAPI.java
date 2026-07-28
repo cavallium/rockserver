@@ -22,6 +22,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction;
@@ -268,6 +269,27 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 				requestType,
 				timeoutMs
 		));
+	}
+
+	/** Return one bounded range page, excluding {@code resumeAfter} in either direction. */
+	default <T> CompletableFuture<RangePage<T>> getRangePageAsync(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			@Nullable Keys resumeAfter,
+			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
+			long timeoutMs,
+			@NotNull RangeBudget budget) throws RocksDBException {
+		return requestAsync(new GetRangePage<>(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				resumeAfter,
+				requestType,
+				timeoutMs,
+				budget));
 	}
 
 	/** See: {@link GetRange}. */

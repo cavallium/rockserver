@@ -196,6 +196,16 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 					reduceRange.reverse(),
 					reduceRange.requestType(),
 					reduceRange.timeoutMs());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<?> page -> this.getRangePageAsync(
+					page.transactionId(),
+					page.columnId(),
+					page.startKeysInclusive(),
+					page.endKeysExclusive(),
+					page.reverse(),
+					page.resumeAfter(),
+					page.requestType(),
+					page.timeoutMs(),
+					page.budget());
             case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
             case RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw scanRaw -> this.scanRawAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount());
             case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
@@ -743,6 +753,60 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 				reverse,
 				requestType,
 				remainingReadTimeoutMillis(timeoutMs, queuedAtNanos)), commandExecutor(command));
+	}
+
+	@Override
+	public <T> RangePage<T> getRangePage(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			@Nullable Keys resumeAfter,
+			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
+			long timeoutMs,
+			@NotNull RangeBudget budget) throws RocksDBException {
+		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
+		return db.getRangePage(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				resumeAfter,
+				requestType,
+				timeoutMs,
+				budget);
+	}
+
+	@Override
+	public <T> CompletableFuture<RangePage<T>> getRangePageAsync(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			@Nullable Keys resumeAfter,
+			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
+			long timeoutMs,
+			@NotNull RangeBudget budget) throws RocksDBException {
+		db.validateTransactionProfile(transactionId, currentRequestContextOrBatch().profile());
+		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<>(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				resumeAfter,
+				requestType,
+				timeoutMs,
+				budget);
+		long queuedAtNanos = System.nanoTime();
+		return supplyAsyncPreservingRunningCompletion(() -> db.getRangePage(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				resumeAfter,
+				requestType,
+				remainingReadTimeoutMillis(timeoutMs, queuedAtNanos),
+				budget), commandExecutor(command));
 	}
 
 	/**

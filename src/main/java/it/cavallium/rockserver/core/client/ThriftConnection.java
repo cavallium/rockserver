@@ -7,6 +7,8 @@ import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.PutBatchMode;
+import it.cavallium.rockserver.core.common.RangeBudget;
+import it.cavallium.rockserver.core.common.RangePage;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
@@ -35,6 +37,7 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
@@ -123,9 +126,19 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 			allClientSlots.add(slot);
 			availableClientSlots.add(slot);
 		}
-		// Retain the constructor's fail-fast connectivity check. The remaining
-		// transports are opened lazily as actual concurrency requires them.
-		allClientSlots.getFirst().client();
+		// Retain the constructor's fail-fast connectivity check and make the
+		// workload v2/bounded-range contract mandatory. The remaining transports
+		// are opened lazily as actual concurrency requires them.
+		try {
+			var capabilities = allClientSlots.getFirst().client().getCapabilities();
+			new RockserverCapabilities(capabilities.getWorkloadContractVersion(), capabilities.isBoundedRange())
+					.requireCompatible();
+		} catch (TException | RuntimeException | Error failure) {
+			for (var slot : allClientSlots) {
+				slot.close();
+			}
+			throw failure;
+		}
 		this.client = (RocksDB.Iface) Proxy.newProxyInstance(
 				RocksDB.Iface.class.getClassLoader(),
 				new Class<?>[] {RocksDB.Iface.class},
@@ -588,6 +601,49 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 	}
 
 	@Override
+	public <T> RangePage<T> getRangePage(long transactionId,
+			long columnId,
+			Keys startKeysInclusive,
+			Keys endKeysExclusive,
+			boolean reverse,
+			Keys resumeAfter,
+			RequestGetRange<? super KV, T> requestType,
+			long timeoutMs,
+			RangeBudget budget) {
+		try {
+			if (requestType == null) {
+				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
+			}
+			var wireType = switch (requestType) {
+				case RequestGetAllInRange<?> _ -> it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE;
+				case RequestGetAllInRangeNoCache<?> _ -> it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE_NO_CACHE;
+			};
+			var wireBudget = new it.cavallium.rockserver.core.common.api.RangeBudget(
+					budget.maxItems(), budget.maxBytes());
+			var page = client.getRangePage(transactionId,
+					columnId,
+					mapKeys(startKeysInclusive),
+					mapKeys(endKeysExclusive),
+					reverse,
+					mapKeys(resumeAfter),
+					wireType,
+					timeoutMs,
+					wireBudget,
+					currentWireRequestContext());
+			@SuppressWarnings("unchecked")
+			var items = (List<T>) (List<?>) page.getItems().stream().map(this::mapKV).toList();
+			var mappedResumeAfter = page.isSetResumeAfter()
+					? new Keys(page.getResumeAfter().stream()
+							.map(Utils::fromByteBuffer)
+							.toArray(Buf[]::new))
+					: null;
+			return new RangePage<>(items, mappedResumeAfter, page.isHasMore());
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@Override
 	public void flush() {
 		try {
 			client.flush();
@@ -854,6 +910,27 @@ public class ThriftConnection extends BaseConnection implements RocksDBAPI {
 				reverse,
 				requestType,
 				timeoutMs))).subscribeOn(executorScheduler);
+	}
+
+	@Override
+	public <T> CompletableFuture<RangePage<T>> getRangePageAsync(long transactionId,
+			long columnId,
+			Keys startKeysInclusive,
+			Keys endKeysExclusive,
+			boolean reverse,
+			Keys resumeAfter,
+			RequestGetRange<? super KV, T> requestType,
+			long timeoutMs,
+			RangeBudget budget) {
+		return supplyAsyncContextual(() -> getRangePage(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				resumeAfter,
+				requestType,
+				timeoutMs,
+				budget), executor);
 	}
 
 	@Override

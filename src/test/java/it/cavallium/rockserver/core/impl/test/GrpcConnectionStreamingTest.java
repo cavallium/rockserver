@@ -19,6 +19,8 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.api.proto.CdcPollRequest;
 import it.cavallium.rockserver.core.common.api.proto.CdcPollResponse;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse;
 import it.cavallium.rockserver.core.common.api.proto.GetColumnIdRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetColumnIdResponse;
 import it.cavallium.rockserver.core.common.api.proto.GetRangeRequest;
@@ -248,6 +250,14 @@ class GrpcConnectionStreamingTest {
 	}
 
 	private static final class RecordingService extends ReactorRocksDBServiceGrpc.RocksDBServiceImplBase {
+
+		@Override
+		public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
+			return Mono.just(CapabilitiesResponse.newBuilder()
+					.setWorkloadContractVersion(2)
+					.setBoundedRange(true)
+					.build());
+		}
 
 		private final AtomicInteger putCalls = new AtomicInteger();
 		private final AtomicInteger putInitialFrames = new AtomicInteger();

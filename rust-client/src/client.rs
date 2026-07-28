@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::transport::Channel;
 use tonic::{Request, Status};
@@ -8,6 +9,32 @@ use crate::types::*;
 use crate::types::{Column, ColumnSchema}; // Disambiguate from proto
 
 pub type Result<T> = std::result::Result<T, Status>;
+
+pub const REQUIRED_WORKLOAD_CONTRACT_VERSION: i32 = 2;
+
+#[derive(Debug)]
+pub enum RockserverConnectError {
+	Transport(tonic::transport::Error),
+	Capabilities(Status),
+}
+
+impl Display for RockserverConnectError {
+	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Transport(error) => write!(formatter, "failed to connect to Rockserver: {error}"),
+			Self::Capabilities(error) => write!(formatter, "Rockserver capability handshake failed: {error}"),
+		}
+	}
+}
+
+impl std::error::Error for RockserverConnectError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			Self::Transport(error) => Some(error),
+			Self::Capabilities(error) => Some(error),
+		}
+	}
+}
 
 /// Client for interacting with the RockServer via gRPC.
 ///
@@ -29,22 +56,49 @@ impl RockserverClient {
     /// * `dst` - The destination to connect to. Can be a string like `http://[::1]:50051`.
     ///
     /// # Returns
-    /// A `Result` containing the connected client or a transport error.
-	pub async fn connect<D>(dst: D, context: RequestContext) -> std::result::Result<Self, tonic::transport::Error>
+    /// A `Result` containing the connected client or a transport/capability error.
+	pub async fn connect<D>(dst: D, context: RequestContext) -> std::result::Result<Self, RockserverConnectError>
     where
         D: std::convert::TryInto<tonic::transport::Endpoint>,
         D::Error: Into<tonic::codegen::StdError>,
     {
-        let client = RocksDbServiceClient::connect(dst).await?;
+		let mut client = RocksDbServiceClient::connect(dst)
+			.await
+			.map_err(RockserverConnectError::Transport)?;
+		Self::require_capabilities(&mut client)
+			.await
+			.map_err(RockserverConnectError::Capabilities)?;
 		Ok(Self { client, context })
     }
 
-    /// Create a new client from an existing Tonic `Channel`.
-	pub fn new(channel: Channel, context: RequestContext) -> Self {
-		Self {
-			client: RocksDbServiceClient::new(channel),
-			context,
+	/// Creates a new client from an existing Tonic `Channel` after the mandatory
+	/// workload-contract capability handshake.
+	pub async fn new(channel: Channel, context: RequestContext) -> Result<Self> {
+		let mut client = RocksDbServiceClient::new(channel);
+		Self::require_capabilities(&mut client).await?;
+		Ok(Self { client, context })
+	}
+
+	#[cfg(test)]
+	fn new_unchecked(channel: Channel, context: RequestContext) -> Self {
+		Self { client: RocksDbServiceClient::new(channel), context }
+	}
+
+	async fn require_capabilities(client: &mut RocksDbServiceClient<Channel>) -> Result<()> {
+		let mut request = Request::new(CapabilitiesRequest {});
+		request.set_timeout(Duration::from_secs(10));
+		let capabilities = client.get_capabilities(request).await?.into_inner();
+		if capabilities.workload_contract_version != REQUIRED_WORKLOAD_CONTRACT_VERSION
+			|| !capabilities.bounded_range
+		{
+			return Err(Status::failed_precondition(format!(
+				"incompatible Rockserver workload contract: required version {} with bounded ranges, got version {} boundedRange={}",
+				REQUIRED_WORKLOAD_CONTRACT_VERSION,
+				capabilities.workload_contract_version,
+				capabilities.bounded_range,
+			)));
 		}
+		Ok(())
 	}
 
 	/// Returns a client view that applies one mandatory workload context to every generic request.
@@ -950,6 +1004,50 @@ impl RockserverClient {
         Ok(resp.into_inner())
     }
 
+	/// Retrieves one bounded page. `resume_after` is exclusive in both directions;
+	/// callers repeat the original bounds on every continuation.
+	pub async fn get_range_page(
+		&self,
+		transaction_id: i64,
+		column_id: i64,
+		start_keys_inclusive: Vec<Vec<u8>>,
+		end_keys_exclusive: Vec<Vec<u8>>,
+		reverse: bool,
+		resume_after: Option<Vec<Vec<u8>>>,
+		request_type: RangeRequestType,
+		timeout_ms: i64,
+		budget: RangeBudget,
+	) -> Result<RangePage> {
+		match request_type as i32 {
+			1 | 2 => {}
+			_ => return Err(Status::invalid_argument("range request type is required")),
+		}
+		if budget.max_items <= 0 || budget.max_items > 4_096 {
+			return Err(Status::invalid_argument("range max_items must be between 1 and 4096"));
+		}
+		if budget.max_bytes <= 0 || budget.max_bytes > 8 * 1024 * 1024 {
+			return Err(Status::invalid_argument(
+				"range max_bytes must be between 1 and 8388608",
+			));
+		}
+		let req = GetRangePageRequest {
+			transaction_id,
+			column_id,
+			start_keys_inclusive,
+			end_keys_exclusive,
+			reverse,
+			resume_after: resume_after.map(|keys| RangeKey { keys }),
+			request_type: request_type as i32,
+			timeout_ms,
+			budget: Some(budget),
+			context: Some(self.context.clone()),
+		};
+		let response = self.client.clone().get_range_page(
+			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
+		).await?;
+		Ok(response.into_inner())
+	}
+
     /// Scans the column raw (ignoring transactions, usually).
     pub async fn scan_raw(&self, column_id: i64, shard_index: i32, shard_count: i32) -> Result<impl Stream<Item = Result<KvBatch>>> {
 		let req = ScanRawRequest {
@@ -1295,7 +1393,7 @@ mod workload_context_tests {
     #[tokio::test]
 	async fn client_views_retain_independent_workload_contexts() {
 		let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-		let ingest = RockserverClient::new(channel, RequestContext::ingest());
+		let ingest = RockserverClient::new_unchecked(channel, RequestContext::ingest());
 		assert_eq!(ingest.context.profile, 4);
 
 		let analytical = ingest.with_context(RequestContext::analytical());
@@ -1310,7 +1408,7 @@ mod workload_context_tests {
 			WorkloadProfile::Batch,
 			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 + 10_000,
 		);
-		let client = RockserverClient::new(channel, context);
+		let client = RockserverClient::new_unchecked(channel, context);
 		let request = client.contextual_request_with_timeout((), Some(5)).unwrap();
 		assert_eq!(request.metadata().get("grpc-timeout").unwrap(), "5000000n");
 	}
@@ -1322,7 +1420,7 @@ mod workload_context_tests {
 			profile: 2,
 			deadline_epoch_millis: 1,
 		};
-		let error = RockserverClient::new(channel, context)
+		let error = RockserverClient::new_unchecked(channel, context)
 			.get_column_id("never-sent".to_owned())
 			.await
 			.unwrap_err();

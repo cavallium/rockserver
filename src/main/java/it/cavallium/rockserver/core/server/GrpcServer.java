@@ -81,6 +81,7 @@ import java.net.SocketAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map.Entry;
@@ -827,6 +828,14 @@ public class GrpcServer extends Server {
 
 		// functions
 
+		@Override
+		public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
+			var capabilities = RockserverCapabilities.CURRENT;
+			return Mono.just(CapabilitiesResponse.newBuilder()
+					.setWorkloadContractVersion(capabilities.workloadContractVersion())
+					.setBoundedRange(capabilities.boundedRange())
+					.build());
+		}
 
 		@Override
 		public Mono<OpenTransactionResponse> openTransaction(OpenTransactionRequest request) {
@@ -1706,6 +1715,56 @@ public class GrpcServer extends Server {
 		@Override
 		public Flux<KV> getAllInRangeNoCache(GetRangeRequest request) {
 			return getAllInRange(request, RequestType.allInRangeNoCache(), "getAllInRangeNoCache");
+		}
+
+		@Override
+		public Mono<it.cavallium.rockserver.core.common.api.proto.RangePage> getRangePage(
+				GetRangePageRequest request) {
+			var transportDeadline = Context.current().getDeadline();
+			return Mono.defer(() -> {
+				if (!request.hasBudget()) {
+					return Mono.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+							"Range budget is required"));
+				}
+				final it.cavallium.rockserver.core.common.RangeBudget budget;
+				try {
+					budget = new it.cavallium.rockserver.core.common.RangeBudget(
+							request.getBudget().getMaxItems(), request.getBudget().getMaxBytes());
+				} catch (IllegalArgumentException invalid) {
+					return Mono.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+							invalid.getMessage(), invalid));
+				}
+				var requestType = switch (request.getRequestTypeValue()) {
+					case 1 -> RequestType.<it.cavallium.rockserver.core.common.KV>allInRange();
+					case 2 -> RequestType.<it.cavallium.rockserver.core.common.KV>allInRangeNoCache();
+					default -> throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+							"Unknown range request type: " + request.getRequestTypeValue());
+				};
+				var resumeAfter = request.hasResumeAfter()
+						? mapKeys(request.getResumeAfter().getKeysCount(), request.getResumeAfter()::getKeys)
+						: null;
+				return fromCancellableFuture(asyncApi(request.getContext()).getRangePageAsync(
+						request.getTransactionId(),
+						request.getColumnId(),
+						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
+						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+						request.getReverse(),
+						resumeAfter,
+						requestType,
+						effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline),
+						budget));
+			}).map(page -> {
+				var response = it.cavallium.rockserver.core.common.api.proto.RangePage.newBuilder()
+						.addAllItems(page.items().stream().map(GrpcServerImpl::unmapKVHeap).toList())
+						.setHasMore(page.hasMore());
+				if (page.resumeAfter() != null) {
+					response.setResumeAfter(RangeKey.newBuilder()
+							.addAllKeys(Arrays.stream(page.resumeAfter().keys())
+									.map(Utils::toByteString)
+									.toList()));
+				}
+				return response.build();
+			}).transform(this.onErrorMapMonoWithRequestInfo("getRangePage", request));
 		}
 
 		private Flux<KV> getAllInRange(GetRangeRequest request,

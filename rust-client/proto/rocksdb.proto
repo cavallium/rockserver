@@ -85,6 +85,12 @@ message RequestContext {
   int64 deadlineEpochMillis = 2;
 }
 
+message CapabilitiesRequest {}
+message CapabilitiesResponse {
+  int32 workloadContractVersion = 1;
+  bool boundedRange = 2;
+}
+
 enum PutBatchMode {
   WRITE_BATCH = 0;
   WRITE_BATCH_NO_WAL = 1;
@@ -186,6 +192,32 @@ message GetRangeRequest {int64 transactionId = 1; int64 columnId = 2; repeated b
 message FirstAndLast {optional KV first = 1; optional KV last = 2;}
 message EntriesCount {int64 count = 1;}
 
+enum RangeRequestType {
+  RANGE_REQUEST_TYPE_UNSPECIFIED = 0;
+  ALL_IN_RANGE = 1;
+  ALL_IN_RANGE_NO_CACHE = 2;
+}
+
+message RangeKey {repeated bytes keys = 1;}
+message RangeBudget {int32 maxItems = 1; int64 maxBytes = 2;}
+message GetRangePageRequest {
+  int64 transactionId = 1;
+  int64 columnId = 2;
+  repeated bytes startKeysInclusive = 3;
+  repeated bytes endKeysExclusive = 4;
+  bool reverse = 5;
+  optional RangeKey resumeAfter = 6;
+  RangeRequestType requestType = 7;
+  int64 timeoutMs = 8;
+  RangeBudget budget = 9;
+  RequestContext context = 10;
+}
+message RangePage {
+  repeated KV items = 1;
+  optional RangeKey resumeAfter = 2;
+  bool hasMore = 3;
+}
+
 
 message ScanRawRequest {int64 columnId = 1; int32 shardIndex = 2; int32 shardCount = 3; RequestContext context = 4;}
 /*
@@ -229,6 +261,7 @@ message GetAllColumnDefinitionsRequest {RequestContext context = 1;}
 message GetAllColumnDefinitionsResponse {repeated Column columns = 1;}
 
 service RocksDBService {
+  rpc getCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
   rpc openTransaction(OpenTransactionRequest) returns (OpenTransactionResponse);
   rpc closeTransaction(CloseTransactionRequest) returns (CloseTransactionResponse);
   rpc closeFailedUpdate(CloseFailedUpdateRequest) returns (google.protobuf.Empty);
@@ -275,6 +308,7 @@ service RocksDBService {
   rpc reduceRangeEntriesCount(GetRangeRequest) returns (EntriesCount);
   rpc getAllInRange(GetRangeRequest) returns (stream KV);
   rpc getAllInRangeNoCache(GetRangeRequest) returns (stream KV);
+  rpc getRangePage(GetRangePageRequest) returns (RangePage);
   rpc scanRaw(ScanRawRequest) returns (stream ScanRawResponse);
   rpc flush(FlushRequest) returns (google.protobuf.Empty);
   rpc compact(CompactRequest) returns (google.protobuf.Empty);

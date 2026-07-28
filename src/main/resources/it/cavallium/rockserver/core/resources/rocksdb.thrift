@@ -48,6 +48,11 @@ struct RequestContext {
   2: required i64 deadlineEpochMillis
 }
 
+struct Capabilities {
+  1: required i32 workloadContractVersion,
+  2: required bool boundedRange
+}
+
 enum PutBatchMode {
   WRITE_BATCH = 0,
   WRITE_BATCH_NO_WAL = 1,
@@ -127,6 +132,22 @@ struct FirstAndLast {
   2: optional KV last
 }
 
+enum RangeRequestType {
+  ALL_IN_RANGE = 1,
+  ALL_IN_RANGE_NO_CACHE = 2
+}
+
+struct RangeBudget {
+  1: required i32 maxItems,
+  2: required i64 maxBytes
+}
+
+struct RangePage {
+  1: required list<KV> items,
+  2: optional list<binary> resumeAfter,
+  3: required bool hasMore
+}
+
 enum RocksDBErrorType {
   PUT_UNKNOWN_ERROR = 0,
   PUT_2 = 1,
@@ -171,7 +192,8 @@ enum RocksDBErrorType {
 	CDC_RESPONSE_TOO_LARGE = 40,
 	CDC_SUBSCRIPTION_CHANGED = 41,
 	CDC_SUBSCRIPTION_NOT_FOUND = 42,
-	SERVER_OVERLOADED = 43
+	SERVER_OVERLOADED = 43,
+	RANGE_ITEM_TOO_LARGE = 44
 }
 
 exception RocksDBThriftException {
@@ -292,5 +314,9 @@ service RocksDB {
    CdcPollBatchResult cdcPollBatch(1: required CdcPollRequest request) throws (1: RocksDBThriftException e),
 
    void cdcCommit(1: required string id, 2: required i64 seq) throws (1: RocksDBThriftException e),
+
+   Capabilities getCapabilities(),
+
+   RangePage getRangePage(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: list<binary> resumeAfter, 7: required RangeRequestType requestType, 8: required i64 timeoutMs, 9: required RangeBudget budget, 10: required RequestContext context) throws (1: RocksDBThriftException e),
 
 }

@@ -61,6 +61,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 					reduce.requestType().getRequestTypeId() == RequestType.RequestTypeId.FIRST_AND_LAST
 							? OperationFamily.BOUNDARY_SEEK
 							: OperationFamily.FULL_SCAN_AGGREGATE;
+			case RocksDBAPICommandSingle.GetRangePage<?> _ -> OperationFamily.RANGE_PAGE;
 			case RocksDBAPICommandStream.GetRange<?> _ -> OperationFamily.RANGE_PAGE;
 			case RocksDBAPICommandStream.ScanRaw _ -> OperationFamily.RANGE_PAGE;
 			case RocksDBAPICommandStream.CdcPoll _ -> OperationFamily.WAL_PAGE;
@@ -951,6 +952,49 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return true;
 			}
 
+		}
+
+		/** One bounded range page whose continuation excludes {@code resumeAfter}. */
+		record GetRangePage<T>(long transactionId,
+				long columnId,
+				@Nullable Keys startKeysInclusive,
+				@Nullable Keys endKeysExclusive,
+				boolean reverse,
+				@Nullable Keys resumeAfter,
+				@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
+				long timeoutMs,
+				@NotNull RangeBudget budget) implements RocksDBAPICommandSingle<RangePage<T>> {
+
+			@Override
+			public RangePage<T> handleSync(RocksDBSyncAPI api) {
+				return api.getRangePage(transactionId,
+						columnId,
+						startKeysInclusive,
+						endKeysExclusive,
+						reverse,
+						resumeAfter,
+						requestType,
+						timeoutMs,
+						budget);
+			}
+
+			@Override
+			public CompletableFuture<RangePage<T>> handleAsync(RocksDBAsyncAPI api) {
+				return api.getRangePageAsync(transactionId,
+						columnId,
+						startKeysInclusive,
+						endKeysExclusive,
+						reverse,
+						resumeAfter,
+						requestType,
+						timeoutMs,
+						budget);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
+			}
 		}
 	}
 	sealed interface RocksDBAPICommandStream<R> extends RocksDBAPICommand<R, Stream<R>, Publisher<R>> {

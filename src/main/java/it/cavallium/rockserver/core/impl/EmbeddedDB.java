@@ -1493,12 +1493,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
 		var writeOpts = new LeakSafeWriteOptions("open-transaction-internal-write-options");
 		var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
+		org.rocksdb.Transaction transaction = null;
 		try {
-			var tx = new Tx(db.beginTransaction(writeOpts, txOpts),
+			transaction = db.beginTransaction(writeOpts, txOpts);
+			// A transaction-backed page is a fresh iterator on every request. Capture the
+			// transaction snapshot at open so every page and ordinary transaction read sees
+			// the same base sequence while still observing the transaction's own writes.
+			transaction.setSnapshot();
+			var tx = new Tx(transaction,
 					isFromGetForUpdate,
 					expirationTimestamp,
 					rocksObjects,
 					workloadProfile);
+			transaction = null;
 			try {
 				retainResourceLease();
 				return tx;
@@ -1507,6 +1514,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				throw error;
 			}
 		} catch (Throwable ex) {
+			if (transaction != null) {
+				transaction.close();
+			}
 			rocksObjects.close();
 			throw ex;
 		}
@@ -5243,6 +5253,68 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
+	public <T> RangePage<T> getRangePage(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			@Nullable Keys resumeAfter,
+			@NotNull RequestGetRange<? super KV, T> requestType,
+			long timeoutMs,
+			@NotNull RangeBudget budget) throws RocksDBException {
+		Objects.requireNonNull(requestType, "requestType");
+		Objects.requireNonNull(budget, "budget");
+		if (budget.maxItems() > RangeBudget.DEFAULT_MAX_ITEMS) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Range maxItems exceeds the server maximum of " + RangeBudget.DEFAULT_MAX_ITEMS);
+		}
+		if (budget.maxBytes() > RangeBudget.DEFAULT_MAX_BYTES) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Range maxBytes exceeds the server maximum of " + RangeBudget.DEFAULT_MAX_BYTES);
+		}
+
+		LongAdder totalTime = new LongAdder();
+		long start = System.nanoTime();
+		long deadlineMicros = readDeadlineMicros(timeoutMs);
+		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
+		actionLogger.logAction("GetRangePage",
+				start,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				transactionId,
+				budget.maxItems(),
+				timeoutMs,
+				requestType);
+
+		RangeCursor cursor = openRangeCursor(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				deadlineMicros,
+				fillCache,
+				false,
+				totalTime,
+				resumeAfter,
+				true);
+		try {
+			var page = cursor.readPage(totalTime, budget);
+			@SuppressWarnings("unchecked")
+			var typedItems = (List<T>) (List<?>) page.items();
+			return new RangePage<>(typedItems, page.resumeAfter(), page.hasMore());
+		} finally {
+			var closeStart = System.nanoTime();
+			try {
+				cursor.close();
+			} finally {
+				totalTime.add(System.nanoTime() - closeStart);
+				getRangeTimer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
+			}
+		}
+	}
+
+	@Override
 	public <T> Stream<T> getRange(long transactionId,
 			long columnId,
 			@Nullable Keys startKeysInclusive,
@@ -5445,6 +5517,30 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean fillCache,
 			boolean retainSnapshot,
 			LongAdder totalTime) {
+		return openRangeCursor(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				deadlineMicros,
+				fillCache,
+				retainSnapshot,
+				totalTime,
+				null,
+				false);
+	}
+
+	private RangeCursor openRangeCursor(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			long deadlineMicros,
+			boolean fillCache,
+			boolean retainSnapshot,
+			LongAdder totalTime,
+			@Nullable Keys resumeAfter,
+			boolean deterministicBucketOrder) {
 		ops.beginOp();
 		var initializationStart = System.nanoTime();
 		ColumnInstance.ColumnUse columnUse = null;
@@ -5457,6 +5553,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Buf calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0
 					? col.calculateKey(endKeysExclusive.keys())
 					: null;
+			Buf calculatedResumeKey = resumeAfter != null
+					? col.calculateKey(resumeAfter.keys())
+					: null;
+			validateResumeBounds(calculatedStartKey, calculatedEndKey, calculatedResumeKey);
 			var cursor = new RangeCursor(transactionId,
 					columnUse,
 					calculatedStartKey,
@@ -5464,7 +5564,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					reverse,
 					deadlineMicros,
 					fillCache,
-					retainSnapshot);
+					retainSnapshot,
+					calculatedResumeKey,
+					resumeAfter,
+					deterministicBucketOrder);
 			try {
 				activeRangeResources.add(cursor);
 				return cursor;
@@ -5480,6 +5583,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} finally {
 			totalTime.add(System.nanoTime() - initializationStart);
 			ops.endOp();
+		}
+	}
+
+	private static void validateResumeBounds(@Nullable Buf startKey,
+			@Nullable Buf endKey,
+			@Nullable Buf resumeKey) {
+		if (resumeKey == null) {
+			return;
+		}
+		var resumeBytes = resumeKey.toByteArray();
+		if (startKey != null && Arrays.compareUnsigned(resumeBytes, startKey.toByteArray()) < 0) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"resumeAfter is before the original inclusive range bound");
+		}
+		if (endKey != null && Arrays.compareUnsigned(resumeBytes, endKey.toByteArray()) >= 0) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"resumeAfter is at or after the original exclusive range bound");
 		}
 	}
 
@@ -5501,6 +5621,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final boolean reverse;
 		private final long deadlineMicros;
 		private final boolean fillCache;
+		private final boolean deterministicBucketOrder;
 		private final AbstractSlice<?> startKeySlice;
 		private final AbstractSlice<?> endKeySlice;
 		private final @Nullable Snapshot snapshot;
@@ -5518,13 +5639,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				boolean reverse,
 				long deadlineMicros,
 				boolean fillCache,
-				boolean retainSnapshot) {
+				boolean retainSnapshot,
+				@Nullable Buf resumeKey,
+				@Nullable Keys resumeAfter,
+				boolean deterministicBucketOrder) {
 			this.transactionId = transactionId;
 			this.columnUse = columnUse;
 			this.col = columnUse.column();
 			this.reverse = reverse;
 			this.deadlineMicros = deadlineMicros;
 			this.fillCache = fillCache;
+			this.deterministicBucketOrder = deterministicBucketOrder;
 
 			AbstractSlice<?> createdStartKeySlice = null;
 			AbstractSlice<?> createdEndKeySlice = null;
@@ -5542,11 +5667,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					createdReadOptions.setSnapshot(createdSnapshot);
 				}
 				createdIterator = createIterator(createdReadOptions);
-				if (reverse) {
-					createdIterator.seekToLast();
-				} else {
-					createdIterator.seekToFirst();
-				}
+				positionIterator(createdIterator, resumeKey, resumeAfter);
 			} catch (Throwable error) {
 				if (createdIterator != null) {
 					createdIterator.close();
@@ -5576,6 +5697,88 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.iterator = createdIterator;
 		}
 
+		private void positionIterator(RocksIterator createdIterator,
+				@Nullable Buf resumeKey,
+				@Nullable Keys resumeAfter) {
+			if (resumeKey == null) {
+				if (reverse) {
+					createdIterator.seekToLast();
+				} else {
+					createdIterator.seekToFirst();
+				}
+				return;
+			}
+
+			byte[] resumeBytes = resumeKey.toByteArray();
+			if (reverse) {
+				createdIterator.seekForPrev(resumeBytes);
+			} else {
+				createdIterator.seek(resumeBytes);
+			}
+			if (!createdIterator.isValid()
+					|| Arrays.compareUnsigned(createdIterator.key(), resumeBytes) != 0) {
+				return;
+			}
+			if (!col.hasBuckets()) {
+				advanceIterator(createdIterator);
+				return;
+			}
+
+			var elements = orderedBucketElements(createdIterator);
+			var resumeVariableKeys = col.getBucketElementKeys(Objects.requireNonNull(resumeAfter).keys());
+			int insertionPoint = 0;
+			while (insertionPoint < elements.size()
+					&& compareKeys(elements.get(insertionPoint).getKey(), resumeVariableKeys) < 0) {
+				insertionPoint++;
+			}
+			while (insertionPoint < elements.size()
+					&& compareKeys(elements.get(insertionPoint).getKey(), resumeVariableKeys) == 0) {
+				insertionPoint++;
+			}
+			if (reverse) {
+				int beforeResume = insertionPoint;
+				while (beforeResume > 0
+						&& compareKeys(elements.get(beforeResume - 1).getKey(), resumeVariableKeys) >= 0) {
+					beforeResume--;
+				}
+				if (beforeResume == 0) {
+					advanceIterator(createdIterator);
+				} else {
+					bucketIterator = elements.listIterator(beforeResume);
+				}
+			} else if (insertionPoint == elements.size()) {
+				advanceIterator(createdIterator);
+			} else {
+				bucketIterator = elements.listIterator(insertionPoint);
+			}
+		}
+
+		private void advanceIterator(RocksIterator target) {
+			if (reverse) {
+				target.prev();
+			} else {
+				target.next();
+			}
+		}
+
+		private ArrayList<Entry<Buf[], Buf>> orderedBucketElements(RocksIterator target) {
+			var elements = new ArrayList<>(new Bucket(col, toBuf(target.value())).getElements());
+			if (deterministicBucketOrder) {
+				elements.sort((left, right) -> compareKeys(left.getKey(), right.getKey()));
+			}
+			return elements;
+		}
+
+		private int compareKeys(Buf[] left, Buf[] right) {
+			for (int i = 0; i < left.length; i++) {
+				int compared = Arrays.compareUnsigned(left[i].toByteArray(), right[i].toByteArray());
+				if (compared != 0) {
+					return compared;
+				}
+			}
+			return Integer.compare(left.length, right.length);
+		}
+
 		private ReadOptions createReadOptions(@Nullable AbstractSlice<?> lowerBound,
 				@Nullable AbstractSlice<?> upperBound) {
 			return newRangeReadOptions(deadlineMicros, fillCache, lowerBound, upperBound);
@@ -5592,6 +5795,102 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				created.close();
 				throw error;
 			}
+		}
+
+		private RangePage<KV> readPage(LongAdder totalTime, RangeBudget budget) {
+			ops.beginOp();
+			var sliceStart = System.nanoTime();
+			try {
+				synchronized (this) {
+					if (expired) {
+						throw rangeDeadlineExceeded();
+					}
+					if (closed || exhausted) {
+						return RangePage.empty();
+					}
+
+					var results = new ArrayList<KV>(budget.maxItems());
+					long encodedBytes = 0L;
+					boolean hasMore = false;
+					while (results.size() < budget.maxItems()) {
+						var next = nextPageItem();
+						if (next == null) {
+							break;
+						}
+						long nextBytes = decodedKVBytes(next);
+						if (nextBytes > budget.maxBytes() - encodedBytes) {
+							if (results.isEmpty()) {
+								throw RocksDBException.of(RocksDBErrorType.RANGE_ITEM_TOO_LARGE,
+										"Range item requires " + nextBytes
+												+ " encoded key/value bytes, exceeding page budget "
+												+ budget.maxBytes());
+							}
+							hasMore = true;
+							break;
+						}
+						results.add(next);
+						encodedBytes += nextBytes;
+					}
+					if (!hasMore && results.size() == budget.maxItems()) {
+						hasMore = nextPageItem() != null;
+					}
+					if (results.isEmpty()) {
+						return RangePage.empty();
+					}
+					return new RangePage<>(results, results.getLast().keys(), hasMore);
+				}
+			} finally {
+				totalTime.add(System.nanoTime() - sliceStart);
+				ops.endOp();
+			}
+		}
+
+		private @Nullable KV nextPageItem() {
+			while (!exhausted) {
+				if (deadlineMicros != Long.MAX_VALUE
+						&& TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis()) >= deadlineMicros) {
+					throw rangeDeadlineExceeded();
+				}
+				if (bucketIterator != null) {
+					if (reverse ? bucketIterator.hasPrevious() : bucketIterator.hasNext()) {
+						var entry = reverse ? bucketIterator.previous() : bucketIterator.next();
+						var result = decodeBucketEntry(col, toBuf(iterator.key()), entry);
+						boolean bucketHasMore = reverse
+								? bucketIterator.hasPrevious()
+								: bucketIterator.hasNext();
+						if (!bucketHasMore) {
+							bucketIterator = null;
+							advanceIterator();
+						}
+						return Objects.requireNonNull(result);
+					}
+					bucketIterator = null;
+					advanceIterator();
+					continue;
+				}
+
+				if (!iterator.isValid()) {
+					checkIteratorStatusIfInvalid(iterator);
+					exhausted = true;
+					return null;
+				}
+				if (col.hasBuckets()) {
+					var elements = orderedBucketElements(iterator);
+					bucketIterator = elements.listIterator(reverse ? elements.size() : 0);
+					if (elements.isEmpty()) {
+						bucketIterator = null;
+						advanceIterator();
+					}
+					continue;
+				}
+
+				var calculatedKey = toBuf(iterator.key());
+				var calculatedValue = col.schema().hasValue() ? toBuf(iterator.value()) : emptyBuf();
+				var result = Objects.requireNonNull(decodeKV(col, calculatedKey, calculatedValue));
+				advanceIterator();
+				return result;
+			}
+			return null;
 		}
 
 		private List<KV> readChunk(LongAdder totalTime) {

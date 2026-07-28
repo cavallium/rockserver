@@ -10,6 +10,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils;
@@ -34,6 +35,7 @@ import it.cavallium.buffer.Buf;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
@@ -479,6 +481,13 @@ public class ThriftServer extends Server {
 					it.cavallium.rockserver.core.common.api.RocksDBErrorType.valueOf(e.getErrorUniqueId().name()),
 					e.getMessage()
 			);
+		}
+
+		@Override
+		public it.cavallium.rockserver.core.common.api.Capabilities getCapabilities() {
+			var capabilities = RockserverCapabilities.CURRENT;
+			return new it.cavallium.rockserver.core.common.api.Capabilities(
+					capabilities.workloadContractVersion(), capabilities.boundedRange());
 		}
 
 		@Override
@@ -1018,6 +1027,66 @@ public class ThriftServer extends Server {
 				return api(context).getRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.allInRangeNoCache(), timeoutMs)
 						.map(ThriftServer::mapKV)
 						.collect(Collectors.toList());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public it.cavallium.rockserver.core.common.api.RangePage getRangePage(long transactionId,
+				long columnId,
+				List<ByteBuffer> startKeysInclusive,
+				List<ByteBuffer> endKeysExclusive,
+				boolean reverse,
+				List<ByteBuffer> resumeAfter,
+				it.cavallium.rockserver.core.common.api.RangeRequestType requestType,
+				long timeoutMs,
+				it.cavallium.rockserver.core.common.api.RangeBudget budget,
+				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
+			try {
+				if (requestType == null) {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(
+							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+							"Range request type is required");
+				}
+				if (budget == null) {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(
+							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+							"Range budget is required");
+				}
+				var mappedRequestType = switch (requestType.getValue()) {
+					case 1 -> RequestType.<it.cavallium.rockserver.core.common.KV>allInRange();
+					case 2 -> RequestType.<it.cavallium.rockserver.core.common.KV>allInRangeNoCache();
+					default -> throw it.cavallium.rockserver.core.common.RocksDBException.of(
+							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+							"Unknown range request type: " + requestType.getValue());
+				};
+				final it.cavallium.rockserver.core.common.RangeBudget mappedBudget;
+				try {
+					mappedBudget = new it.cavallium.rockserver.core.common.RangeBudget(
+							budget.getMaxItems(), budget.getMaxBytes());
+				} catch (IllegalArgumentException invalid) {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(
+							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+							invalid.getMessage(), invalid);
+				}
+				var page = api(context).getRangePage(transactionId,
+						columnId,
+						keysToRecord(startKeysInclusive),
+						keysToRecord(endKeysExclusive),
+						reverse,
+						keysToRecord(resumeAfter),
+						mappedRequestType,
+						timeoutMs,
+						mappedBudget);
+				var response = new it.cavallium.rockserver.core.common.api.RangePage(
+						page.items().stream().map(ThriftServer::mapKV).toList(), page.hasMore());
+				if (page.resumeAfter() != null) {
+					response.setResumeAfter(Arrays.stream(page.resumeAfter().keys())
+							.map(Utils::asByteBuffer)
+							.toList());
+				}
+				return response;
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}

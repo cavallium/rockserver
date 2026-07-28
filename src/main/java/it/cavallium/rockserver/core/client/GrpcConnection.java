@@ -71,9 +71,11 @@ import java.util.Map;
 import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -95,6 +97,7 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcConnection.class);
 	private static final int EVENT_LOOP_THREADS_PER_CONNECTION = 1;
 	private static final long CALLBACK_EXECUTOR_SHUTDOWN_SECONDS = 5;
+	private static final long CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS = 10;
 	private static final String MAX_RETRY_ATTEMPTS_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.max-retry-attempts";
 	private static final String INITIAL_RETRY_BACKOFF_PROPERTY
@@ -165,13 +168,54 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			}
 			throw ex;
 		}
+		var futureStub = RocksDBServiceGrpc.newFutureStub(channel);
+		try {
+			var response = futureStub
+					.withDeadlineAfter(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+					.getCapabilities(CapabilitiesRequest.getDefaultInstance())
+					.get(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+			new RockserverCapabilities(response.getWorkloadContractVersion(), response.getBoundedRange())
+					.requireCompatible();
+		} catch (InterruptedException interrupted) {
+			Thread.currentThread().interrupt();
+			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR,
+					"Interrupted during the Rockserver capability handshake", interrupted);
+		} catch (ExecutionException | TimeoutException failure) {
+			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
+			var cause = failure instanceof ExecutionException && failure.getCause() != null
+					? failure.getCause()
+					: failure;
+			if (Status.fromThrowable(cause).getCode() == Code.UNIMPLEMENTED) {
+				throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
+						"The connected Rockserver does not expose the mandatory workload capability handshake", cause);
+			}
+			if (cause instanceof RuntimeException runtime) {
+				throw runtime;
+			}
+			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR,
+					"Rockserver capability handshake failed", cause);
+		} catch (RuntimeException | Error failure) {
+			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
+			throw failure;
+		}
 		this.channel = channel;
 		this.callbackExecutor = callbackExecutor;
 		this.eventLoopGroup = eventLoopGroup;
-		this.futureStub = RocksDBServiceGrpc.newFutureStub(channel);
+		this.futureStub = futureStub;
 		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 		this.address = address;
 		this.maxInboundMessageSize = maxInboundMessageSize;
+	}
+
+	private static void closeFailedConstruction(ManagedChannel channel,
+			@Nullable EventLoopGroup eventLoopGroup,
+			ExecutorService callbackExecutor) {
+		channel.shutdownNow();
+		if (eventLoopGroup != null) {
+			eventLoopGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
+		}
+		callbackExecutor.shutdownNow();
 	}
 
 	public static int configuredMaxInboundMessageSize() {
@@ -870,6 +914,50 @@ public class GrpcConnection extends BaseConnection implements RocksDBAPI {
 			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Read timeout must be non-negative");
 		}
+	}
+
+	@Override
+	public <T> CompletableFuture<it.cavallium.rockserver.core.common.RangePage<T>> getRangePageAsync(
+			long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			@Nullable Keys resumeAfter,
+			@NotNull RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType,
+			long timeoutMs,
+			@NotNull it.cavallium.rockserver.core.common.RangeBudget budget) throws RocksDBException {
+		var requestBuilder = GetRangePageRequest.newBuilder()
+				.setTransactionId(transactionId)
+				.setColumnId(columnId)
+				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
+				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
+				.setReverse(reverse)
+				.setRequestTypeValue(switch (requestType) {
+					case RequestType.RequestGetAllInRange<?> _ -> 1;
+					case RequestType.RequestGetAllInRangeNoCache<?> _ -> 2;
+				})
+				.setTimeoutMs(timeoutMs)
+				.setBudget(it.cavallium.rockserver.core.common.api.proto.RangeBudget.newBuilder()
+						.setMaxItems(budget.maxItems())
+						.setMaxBytes(budget.maxBytes()))
+				.setContext(currentWireRequestContext());
+		if (resumeAfter != null) {
+			requestBuilder.setResumeAfter(RangeKey.newBuilder().addAllKeys(mapKeys(resumeAfter)));
+		}
+		return toResponse(futureStubWithReadDeadline(timeoutMs).getRangePage(requestBuilder.build()), response -> {
+			@SuppressWarnings("unchecked")
+			var items = (List<T>) (List<?>) response.getItemsList().stream()
+					.map(GrpcConnection::mapKV)
+					.toList();
+			var mappedResumeAfter = response.hasResumeAfter()
+					? new Keys(response.getResumeAfter().getKeysList().stream()
+							.map(GrpcConnection::mapByteString)
+							.toArray(Buf[]::new))
+					: null;
+			return new it.cavallium.rockserver.core.common.RangePage<>(
+					items, mappedResumeAfter, response.getHasMore());
+		}, GrpcConnection::mapReadDeadlineError);
 	}
 
 	@SuppressWarnings("unchecked")

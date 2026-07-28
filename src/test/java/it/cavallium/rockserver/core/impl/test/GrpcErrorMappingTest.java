@@ -13,6 +13,8 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse;
 import it.cavallium.rockserver.core.common.api.proto.GetColumnIdRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetColumnIdResponse;
 import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
@@ -134,6 +136,14 @@ class GrpcErrorMappingTest {
 	}
 
 	private static final class ErrorService extends ReactorRocksDBServiceGrpc.RocksDBServiceImplBase {
+
+		@Override
+		public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
+			return Mono.just(CapabilitiesResponse.newBuilder()
+					.setWorkloadContractVersion(2)
+					.setBoundedRange(true)
+					.build());
+		}
 
 		@Override
 		public Mono<GetColumnIdResponse> getColumnId(GetColumnIdRequest request) {
