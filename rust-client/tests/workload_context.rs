@@ -42,14 +42,18 @@ fn streaming_initial_request_retains_workload_context() {
 
 #[test]
 fn all_workload_profile_values_are_stable() {
-	assert_eq!(WorkloadProfile::Unspecified as i32, 0);
-	assert_eq!(WorkloadProfile::Control as i32, 1);
-	assert_eq!(WorkloadProfile::Latency as i32, 2);
-	assert_eq!(WorkloadProfile::Analytical as i32, 3);
-	assert_eq!(WorkloadProfile::Ingest as i32, 4);
-	assert_eq!(WorkloadProfile::Cdc as i32, 5);
-	assert_eq!(WorkloadProfile::Batch as i32, 6);
-	assert_eq!(WorkloadProfile::PhysicalMaintenance as i32, 7);
+	for (wire_value, expected) in [
+		(0, WorkloadProfile::Unspecified),
+		(1, WorkloadProfile::Control),
+		(2, WorkloadProfile::Latency),
+		(3, WorkloadProfile::Analytical),
+		(4, WorkloadProfile::Ingest),
+		(5, WorkloadProfile::Cdc),
+		(6, WorkloadProfile::Batch),
+		(7, WorkloadProfile::PhysicalMaintenance),
+	] {
+		assert_eq!(WorkloadProfile::try_from(wire_value), Ok(expected));
+	}
 }
 
 #[test]
