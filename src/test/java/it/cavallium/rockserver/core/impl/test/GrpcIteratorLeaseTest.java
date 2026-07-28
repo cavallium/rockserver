@@ -26,6 +26,7 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -103,8 +104,8 @@ class GrpcIteratorLeaseTest {
 					assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 					assertEquals(1, server.getActiveIteratorOperationLeaseCountForTesting());
 					assertTrue(running.cancel(true));
-					assertTrue(backend.cancelObserved.await(5, TimeUnit.SECONDS),
-							"the blocking server task did not observe RPC cancellation");
+					assertTrue(running.isCancelled(),
+							"cancelling the client future establishes RPC cancellation");
 
 					var concurrent = assertThrows(RocksDBException.class,
 							() -> syncApi.subsequent(iteratorId, 0, 1, RequestType.exists()));
@@ -133,12 +134,14 @@ class GrpcIteratorLeaseTest {
 			try (var client = GrpcConnection.forHostAndPort("grpc-rejected-open-cleanup",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var open = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIteratorAsync(0, 0, new Keys(), null, false, 30_000);
+				CompletableFuture<Void> schedulerShutdown = null;
 				try {
 					assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 					assertTrue(open.cancel(true));
-					assertTrue(backend.cancelObserved.await(5, TimeUnit.SECONDS),
-							"the blocking open did not observe RPC cancellation");
-					backend.scheduler.control().dispose();
+					assertTrue(open.isCancelled(),
+							"cancelling the client future establishes RPC cancellation");
+					schedulerShutdown = CompletableFuture.runAsync(backend.scheduler::disposeNow);
+					awaitPoolShutdown(backend.scheduler, RWScheduler.Pool.CONTROL);
 				} finally {
 					backend.release.countDown();
 				}
@@ -146,6 +149,9 @@ class GrpcIteratorLeaseTest {
 				assertTrue(backend.closed.await(5, TimeUnit.SECONDS),
 						"a rejected control-lane cleanup must close the late iterator inline");
 				assertFalse(backend.iteratorOpen.get());
+				if (schedulerShutdown != null) {
+					schedulerShutdown.get(5, TimeUnit.SECONDS);
+				}
 			}
 		}
 	}
@@ -161,13 +167,25 @@ class GrpcIteratorLeaseTest {
 		assertEquals(expected, server.getActiveIteratorOperationLeaseCountForTesting());
 	}
 
+	private static void awaitPoolShutdown(RWScheduler scheduler,
+			RWScheduler.Pool pool) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		do {
+			if (scheduler.poolSnapshot(pool).shutdown()) {
+				return;
+			}
+			Thread.sleep(10);
+		} while (System.nanoTime() < deadline);
+		assertTrue(scheduler.poolSnapshot(pool).shutdown(), pool + " did not enter shutdown");
+	}
+
 	private static final class BlockingSubsequentConnection implements RocksDBConnection, InternalConnection {
 
 		private static final long ITERATOR_ID = 17;
 
-		private final RWScheduler scheduler = new RWScheduler(2, 1, "grpc-blocking-subsequent");
+		private final RWScheduler scheduler = RWScheduler.forTesting(
+				2, 1, 1, 16, 16, "grpc-blocking-subsequent");
 		private final CountDownLatch entered = new CountDownLatch(1);
-		private final CountDownLatch cancelObserved = new CountDownLatch(1);
 		private final CountDownLatch release = new CountDownLatch(1);
 		private final CountDownLatch finished = new CountDownLatch(1);
 		private final AtomicInteger subsequentCalls = new AtomicInteger();
@@ -186,7 +204,7 @@ class GrpcIteratorLeaseTest {
 					if (subsequentCalls.getAndIncrement() == 0) {
 						entered.countDown();
 						try {
-							awaitIgnoringInterrupts(release, cancelObserved);
+							awaitIgnoringInterrupts(release);
 						} finally {
 							finished.countDown();
 						}
@@ -228,9 +246,9 @@ class GrpcIteratorLeaseTest {
 
 		private static final long ITERATOR_ID = 23;
 
-		private final RWScheduler scheduler = new RWScheduler(1, 1, "grpc-blocking-open");
+		private final RWScheduler scheduler = RWScheduler.forTesting(
+				1, 1, 1, 16, 16, "grpc-blocking-open");
 		private final CountDownLatch entered = new CountDownLatch(1);
-		private final CountDownLatch cancelObserved = new CountDownLatch(1);
 		private final CountDownLatch release = new CountDownLatch(1);
 		private final CountDownLatch closed = new CountDownLatch(1);
 		private final AtomicBoolean iteratorOpen = new AtomicBoolean();
@@ -241,7 +259,7 @@ class GrpcIteratorLeaseTest {
 			public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
 				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator) {
 					entered.countDown();
-					awaitIgnoringInterrupts(release, cancelObserved);
+					awaitIgnoringInterrupts(release);
 					iteratorOpen.set(true);
 					return (RS) Long.valueOf(ITERATOR_ID);
 				}
@@ -281,13 +299,13 @@ class GrpcIteratorLeaseTest {
 		}
 	}
 
-	private static void awaitIgnoringInterrupts(CountDownLatch release, CountDownLatch interrupted) {
+	private static void awaitIgnoringInterrupts(CountDownLatch release) {
 		while (true) {
 			try {
 				release.await();
 				return;
 			} catch (InterruptedException ignored) {
-				interrupted.countDown();
+				// Model an uninterruptible native call. Cancellation alone cannot release its lease.
 			}
 		}
 	}

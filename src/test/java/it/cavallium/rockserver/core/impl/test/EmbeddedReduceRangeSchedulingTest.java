@@ -14,6 +14,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
@@ -21,7 +22,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -131,8 +131,8 @@ class EmbeddedReduceRangeSchedulingTest {
 			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			var readExecutor = assertInstanceOf(ThreadPoolExecutor.class,
-					connection.getInternalDB().getScheduler().readExecutor());
+			var scheduler = connection.getInternalDB().getScheduler();
+			var readExecutor = scheduler.readExecutor();
 			var blockerStarted = new CountDownLatch(1);
 			var releaseBlocker = new CountDownLatch(1);
 			readExecutor.execute(() -> {
@@ -144,10 +144,10 @@ class EmbeddedReduceRangeSchedulingTest {
 			try {
 				var result = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(
 						0, columnId, null, null, false, RequestType.firstAndLast(), 5_000);
-				awaitQueueSize(readExecutor, 1);
+				awaitQueueSize(scheduler, 1);
 
 				assertTrue(result.cancel(true));
-				awaitQueueSize(readExecutor, 0);
+				awaitQueueSize(scheduler, 0);
 				assertTrue(result.isCancelled());
 			} finally {
 				releaseBlocker.countDown();
@@ -163,12 +163,13 @@ class EmbeddedReduceRangeSchedulingTest {
 		}
 	}
 
-	private static void awaitQueueSize(ThreadPoolExecutor executor, int expected) throws InterruptedException {
+	private static void awaitQueueSize(RWScheduler scheduler, int expected) throws InterruptedException {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-		while (executor.getQueue().size() != expected && System.nanoTime() < deadline) {
+		while (scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() != expected
+				&& System.nanoTime() < deadline) {
 			Thread.sleep(10);
 		}
-		assertEquals(expected, executor.getQueue().size());
+		assertEquals(expected, scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks());
 	}
 
 	private static Keys intKey(int value) {

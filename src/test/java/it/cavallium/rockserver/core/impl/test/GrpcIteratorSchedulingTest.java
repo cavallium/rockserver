@@ -9,13 +9,13 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
-import java.util.concurrent.ThreadPoolExecutor;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -44,14 +44,12 @@ class GrpcIteratorSchedulingTest {
 					var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 					long iteratorId = api.openIterator(0, columnId, null, null, false, 10_000);
 					try {
-						var readExecutor = (ThreadPoolExecutor) embedded.getInternalDB()
-								.getScheduler()
-								.readExecutor();
-						long tasksBefore = readExecutor.getTaskCount();
+						var scheduler = embedded.getInternalDB().getScheduler();
+						long tasksBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 
 						api.subsequent(iteratorId, 0, entries, RequestType.none());
 
-						long scheduledTasks = readExecutor.getTaskCount() - tasksBefore;
+						long scheduledTasks = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - tasksBefore;
 						assertEquals(2L, scheduledTasks,
 								"4,200 non-materializing entries should use two 4,096-entry read steps");
 					} finally {

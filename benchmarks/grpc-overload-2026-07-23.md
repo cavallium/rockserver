@@ -2,11 +2,15 @@
 
 ## Scope
 
-`GrpcOverloadBenchmark` models the production failure shape through the real
-local gRPC server and generated client:
+`GrpcOverloadBenchmark` is the retained two-profile regression for the original
+production failure shape through the real local gRPC server and generated client.
+Its historical foreground and maintenance labels now submit `INGEST` and `BATCH`
+work. The seven-profile harness, not this runner, owns pressured-BATCH acceptance
+and release candidate selection:
 
-- continuous explicit `MAINTENANCE` projection-style puts;
-- rate-limited `FOREGROUND` puts, point reads, and cold first/last ranges;
+- continuous `BATCH` projection-style puts (reported as `maintenance-write`);
+- rate-limited `INGEST` puts, point reads, and cold first/last ranges (reported
+  as `foreground`);
 - bounded bursts of cancellable maintenance requests;
 - a fixed 5,000 ms gRPC deadline and matching first/last storage budget;
 - foreground-only and maintenance-flood phases against the same preloaded
@@ -19,13 +23,11 @@ queue depth, per-lane rejections, active concurrency, maintenance progress, and
 drain state. `results.json` is the machine-readable source of truth;
 `results.md` contains the same measurements for humans.
 
-The runner fails its explicit release gate when any of these is false:
+The runner fails its focused regression gate when any of these is false:
 
 - foreground and first/last deadline counts are zero;
 - maintenance-flood foreground p99 is at most 2x foreground-only p99;
-- maintenance and cancellation both make progress;
-- combined active writes and active maintenance writes stay within configured
-  limits;
+- cancellation makes progress;
 - no foreground request is rejected and no unexpected request fails;
 - both queues, pending operations, transactions, iterators, range cursors, and
   gRPC iterator leases drain;
@@ -76,7 +78,6 @@ overload_options=(
   "--range-width=1024"
   "--read-parallelism=20"
   "--write-parallelism=36"
-  "--maintenance-write-parallelism=1"
   "--foreground-queue-capacity=4096"
   "--maintenance-queue-capacity=512"
   "--admission-sample-micros=250"
@@ -113,15 +114,19 @@ jq '{passed:.acceptance.passed, phases:[.phases[] | {
 ```
 
 The generated config always retains `maximum-open-files: -1`. `write=36` is the
-hard combined worker limit; `maintenance-write=1` is a sub-limit, not an extra
-worker. The 5,000 ms deadline and 2x p99 gate are not command-line knobs.
+hard write worker limit. The historical queue option names generate
+`database.parallelism.workload.ingest-queue-capacity` and
+`database.parallelism.workload.batch-queue-capacity`; no removed
+`maintenance-write` key or separate maintenance concurrency limit is emitted.
+The 5,000 ms deadline and 2x p99 gate are not command-line knobs. Active-count
+fields remain diagnostics and are not a pressured-BATCH acceptance gate.
 
 ## Local structural baseline
 
 This development host exposes only a non-rotational Samsung NVMe device, and
 the writable `/tmp` benchmark root is tmpfs. Therefore the following is a
-transport, admission, report, drain, and leak baseline—not the required HDD
-release result. The prepare/reopen workflow was exercised without privileged
+transport, admission, report, drain, and leak baseline—not current workload
+hardware acceptance. The prepare/reopen workflow was exercised without privileged
 global page-cache eviction using OpenJDK 25.0.3, 12 available processors,
 10,000 preloaded keys, 1 second warmup, and 2 second measurement phases.
 
@@ -143,6 +148,7 @@ global page-cache eviction using OpenJDK 25.0.3, 12 available processors,
 
 The local run passed every gate: p99 ratio 0.668, queues and pending operations
 drained, open transactions/iterators/range cursors were zero, native-handle leak
-count was zero, and shutdown was clean. The HDD/cold-cache row must be generated
-on the rotational reference host with the exact command above before release;
-no HDD result is inferred from this tmpfs baseline.
+count was zero, and shutdown was clean. No HDD result is inferred from this tmpfs
+baseline. Rockserver 1.3.8 hardware acceptance instead requires the complete
+seven-profile HDD/ZFS selection and NVMe adjacency workflow in
+`docs/workload-tuning.md`.

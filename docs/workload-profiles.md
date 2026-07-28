@@ -44,11 +44,17 @@ validates the concrete command and rejects these invalid caller/profile combinat
   mutation.
 - `LATENCY ExistsMulti` uses the same 256-item and 2-MiB encoded-key ceilings.
 - A `LATENCY` iterator `Subsequent` call has `skip + take <= 4096`.
+- Every `GetRangePage` request has an explicit positive `RangeBudget` no larger
+  than 4096 items and 8 MiB for every profile. LATENCY must additionally fit the
+  configured `latency-range-max-items` and `latency-range-max-bytes`; exceeding
+  either limit is rejected rather than clamped.
 - Exact range aggregates are never accepted as `LATENCY` or `INGEST` work.
 
 All thresholds are inclusive. Commands one byte or item above a threshold are rejected
-before scheduler admission. The limits apply only to `LATENCY`; other profiles retain
-their family/command rules and are bounded by their own queue or quantum contracts.
+before scheduler admission. Point, fixed-multi, and iterator-advance limits apply only
+to `LATENCY`; the public range-page ceiling applies to every profile. Other profiles
+retain their family/command rules and are also bounded by their queue and quantum
+contracts.
 
 Rollback, failed-update close, iterator close, CDC lifecycle/poll/acknowledgement, and
 physical flush/compaction remain server-owned. Their protected profile is derived from

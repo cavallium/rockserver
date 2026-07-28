@@ -36,6 +36,8 @@ as `RESOURCE_EXHAUSTED`. Admission metrics use bounded `database`, `resource`,
 - `rockserver.workload.failures`
 - `rockserver.workload.worker.failures`
 - `rockserver.workload.storage.pressure`
+- `rockserver.workload.retained.snapshots`
+- `rockserver.workload.cdc.lag`
 
 See [workload profiles](docs/workload-profiles.md) for admission rules and
 [workload configuration](docs/workload-configuration.md) for every setting,
@@ -43,17 +45,20 @@ default, and startup invariant.
 
 ## gRPC overload regression benchmark
 
-`GrpcOverloadBenchmark` is an opt-in, disk-backed runner separate from ordinary
-CI and the embedded `FastGetBenchmark`. It compares foreground-only and
-maintenance-flood phases against one preloaded database while keeping every
-foreground and first/last request on the fixed five-second deadline. Each run
-emits `results.json` and `results.md` and enforces foreground latency,
-maintenance progress, admission limits, cancellation, drain, native-handle,
-and shutdown checks.
+`GrpcOverloadBenchmark` is a legacy two-profile, opt-in disk runner separate
+from ordinary CI and the embedded `FastGetBenchmark`. Its foreground and
+maintenance labels now map to `INGEST` and `BATCH`; it is retained as a focused
+gRPC latency/cancellation/drain regression, not as the release workload tuner.
+Each run emits `results.json` and `results.md` and gates foreground deadlines
+and p99 ratio, cancellation, drain, native-handle, error, rejection, and
+shutdown checks. Pressured-BATCH acceptance and release candidate selection
+belong exclusively to `SevenProfileWorkloadBenchmark` and its selector.
 
 Use the prepare/reopen workflow for a real cold page cache. The exact reference
 command, options, acceptance rules, and current local baseline are documented in
 [`benchmarks/grpc-overload-2026-07-23.md`](benchmarks/grpc-overload-2026-07-23.md).
+The release hardware workflow and deterministic 5% throughput/10% p99 selector
+are documented in [`docs/workload-tuning.md`](docs/workload-tuning.md).
 
 ## Fast unary GET
 

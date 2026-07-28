@@ -22,6 +22,7 @@ import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.lang.reflect.Field;
@@ -37,7 +38,6 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -95,7 +95,8 @@ class EmbeddedConnectionAsyncRegressionTest {
 					PutBatchMode.WRITE_BATCH_NO_WAL);
 
 			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, 10_000);
-			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var scheduler = connection.getScheduler();
+			var readExecutor = scheduler.readExecutor();
 			var initialWorkerEntered = new CountDownLatch(1);
 			var releaseInitialWorker = new CountDownLatch(1);
 			var betweenChunksEntered = new CountDownLatch(1);
@@ -148,7 +149,9 @@ class EmbeddedConnectionAsyncRegressionTest {
 			var syncApi = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var scheduler = connection.getScheduler();
+			var readExecutor = scheduler.readExecutor();
+			long completedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks();
 			var workerEntered = new CountDownLatch(1);
 			var releaseWorker = new CountDownLatch(1);
 			var nativeChunks = new AtomicInteger();
@@ -162,13 +165,13 @@ class EmbeddedConnectionAsyncRegressionTest {
 
 				var queued = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
 						0, columnId, List.of(key(1)), 10_000);
-				assertTrue(awaitQueueSize(readExecutor, 1), "the read never entered the executor queue");
+				assertTrue(awaitQueueSize(scheduler, 1), "the read never entered the executor queue");
 				assertTrue(queued.cancel(true));
-				assertTrue(awaitQueueSize(readExecutor, 0),
+				assertTrue(awaitQueueSize(scheduler, 0),
 						"cancelling queued work must remove it from the bounded executor queue");
 
 				releaseWorker.countDown();
-				assertTrue(awaitCompletedTasks(readExecutor, 1));
+				assertTrue(awaitCompletedTasks(scheduler, completedBefore + 1));
 				assertEquals(0, nativeChunks.get(), "cancelled queued work reached RocksDB");
 				assertTrue(queued.isCancelled());
 			} finally {
@@ -188,7 +191,8 @@ class EmbeddedConnectionAsyncRegressionTest {
 			for (int i = 0; i <= ITERATOR_CHUNK_SIZE; i++) {
 				keys.add(key(i));
 			}
-			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var scheduler = connection.getScheduler();
+			var readExecutor = scheduler.readExecutor();
 			var nativeChunks = new AtomicInteger();
 			var snapshotAcquisitions = new AtomicInteger();
 			var betweenChunksEntered = new CountDownLatch(1);
@@ -207,14 +211,14 @@ class EmbeddedConnectionAsyncRegressionTest {
 				var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
 						0, columnId, keys, 10_000);
 				assertTrue(betweenChunksEntered.await(5, SECONDS));
-				assertTrue(awaitQueueSize(readExecutor, 1),
+				assertTrue(awaitQueueSize(scheduler, 1),
 						"the second native chunk never entered the composite queue");
 
 				assertFalse(request.cancel(true),
 						"a started logical read must retain its terminal completion");
 				assertThrows(CancellationException.class, () -> request.get(5, SECONDS));
 				assertTrue(request.isCancelled());
-				assertTrue(awaitQueueSize(readExecutor, 0),
+				assertTrue(awaitQueueSize(scheduler, 0),
 						"cancellation did not remove the queued continuation");
 				assertEquals(0, connection.getInternalDB().getPendingOpsCount(),
 						"cancellation did not release the retained logical operation");
@@ -245,7 +249,8 @@ class EmbeddedConnectionAsyncRegressionTest {
 			for (int i = 0; i <= ITERATOR_CHUNK_SIZE; i++) {
 				keys.add(key(i));
 			}
-			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var scheduler = connection.getScheduler();
+			var readExecutor = scheduler.readExecutor();
 			var nativeChunks = new AtomicInteger();
 			var betweenChunksEntered = new CountDownLatch(1);
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
@@ -260,7 +265,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
 					0, columnId, keys, 10_000);
 			assertTrue(betweenChunksEntered.await(5, SECONDS));
-			assertTrue(awaitQueueSize(readExecutor, 1),
+			assertTrue(awaitQueueSize(scheduler, 1),
 					"the second native chunk never entered the composite queue");
 
 			var connectionToClose = connection;
@@ -277,7 +282,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			assertEquals(0, connection.getInternalDB().getPendingOpsCount(),
 					"forced shutdown did not release the retained logical operation");
 			assertEquals(1, nativeChunks.get(), "a native chunk ran after shutdown cancellation");
-			assertTrue(awaitQueueSize(readExecutor, 0),
+			assertTrue(awaitQueueSize(scheduler, 0),
 					"shutdown cancellation did not remove the queued continuation");
 
 			releaseBetweenChunks.countDown();
@@ -312,7 +317,8 @@ class EmbeddedConnectionAsyncRegressionTest {
 			connection = singleThreadedConnection("initial-queue-shutdown");
 			long columnId = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var scheduler = connection.getScheduler();
+			var readExecutor = scheduler.readExecutor();
 			var workerEntered = new CountDownLatch(1);
 			var nativeChunks = new AtomicInteger();
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(nativeChunks::incrementAndGet);
@@ -324,7 +330,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 
 			var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
 					0, columnId, List.of(key(1)), 10_000);
-			assertTrue(awaitQueueSize(readExecutor, 1), "the initial read never entered the executor queue");
+			assertTrue(awaitQueueSize(scheduler, 1), "the initial read never entered the executor queue");
 			assertEquals(1, connection.getInternalDB().getPendingOpsCount(),
 					"initial queue residence must retain one admitted logical operation");
 
@@ -342,7 +348,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			assertEquals(0, connection.getInternalDB().getPendingOpsCount(),
 					"forced shutdown did not release the initially queued admission");
 			assertEquals(0, nativeChunks.get(), "an initially queued request reached RocksDB during shutdown");
-			assertTrue(awaitQueueSize(readExecutor, 0),
+			assertTrue(awaitQueueSize(scheduler, 0),
 					"shutdown cancellation did not remove the initially queued request");
 
 			releaseWorker.countDown();
@@ -371,7 +377,8 @@ class EmbeddedConnectionAsyncRegressionTest {
 			var syncApi = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			var readExecutor = (ThreadPoolExecutor) connection.getScheduler().readExecutor();
+			var scheduler = connection.getScheduler();
+			var readExecutor = scheduler.readExecutor();
 			var workerEntered = new CountDownLatch(1);
 			var releaseWorker = new CountDownLatch(1);
 			var nativeChunks = new AtomicInteger();
@@ -385,7 +392,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 
 				var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
 						0, columnId, List.of(key(1)), 25);
-				assertTrue(awaitQueueSize(readExecutor, 1));
+				assertTrue(awaitQueueSize(scheduler, 1));
 				Thread.sleep(75);
 				releaseWorker.countDown();
 
@@ -467,26 +474,26 @@ class EmbeddedConnectionAsyncRegressionTest {
 		assertTrue(rocksFailure.getMessage().contains("Concurrent operation on iterator"));
 	}
 
-	private static boolean awaitQueueSize(ThreadPoolExecutor executor, int expected) throws InterruptedException {
+	private static boolean awaitQueueSize(RWScheduler scheduler, int expected) throws InterruptedException {
 		long deadline = System.nanoTime() + SECONDS.toNanos(5);
 		do {
-			if (executor.getQueue().size() == expected) {
+			if (scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == expected) {
 				return true;
 			}
 			Thread.sleep(1);
 		} while (System.nanoTime() < deadline);
-		return executor.getQueue().size() == expected;
+		return scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == expected;
 	}
 
-	private static boolean awaitCompletedTasks(ThreadPoolExecutor executor, long expected) throws InterruptedException {
+	private static boolean awaitCompletedTasks(RWScheduler scheduler, long expected) throws InterruptedException {
 		long deadline = System.nanoTime() + SECONDS.toNanos(5);
 		do {
-			if (executor.getCompletedTaskCount() >= expected) {
+			if (scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks() >= expected) {
 				return true;
 			}
 			Thread.sleep(1);
 		} while (System.nanoTime() < deadline);
-		return executor.getCompletedTaskCount() >= expected;
+		return scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks() >= expected;
 	}
 
 	private static void awaitUninterruptibly(CountDownLatch latch) {

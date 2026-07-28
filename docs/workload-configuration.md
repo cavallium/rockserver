@@ -87,9 +87,13 @@ transport/operation deadline, and the earliest deadline wins.
 
 Every item, mutation, and byte limit must be positive. Quantum durations must be
 positive and representable. A quantum stops at the first key, byte, or elapsed
-time bound it reaches; continuations reacquire workload admission. Configured
-LATENCY maxima may be lowered but cannot exceed the public 4096-item/8-MiB range
-or 256-item/2-MiB fan-out contract ceilings.
+time bound it reaches; continuations reacquire workload admission. Every bounded
+range page is rejected if its explicit `RangeBudget` exceeds the public
+4096-item/8-MiB ceiling, regardless of profile. LATENCY pages are also rejected
+when they exceed `latency-range-max-items` or `latency-range-max-bytes`; those
+settings may lower but never raise the public ceiling. Rockserver rejects
+over-budget requests rather than silently clamping them. The 256-item/2-MiB
+fan-out ceiling remains specific to LATENCY point and fixed multi commands.
 
 CDC captures one conservative completed-mutation tail, then publishes the application
 WAL through `CDC + FLUSH` before opening the logical poll. WAL parsing,

@@ -10,6 +10,7 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
@@ -17,7 +18,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -164,10 +164,8 @@ class EmbeddedRangeSchedulingTest {
 
 			long iteratorId = api.openIterator(0, columnId, new Keys(), null, false, 10_000);
 			try {
-				var readExecutor = (ThreadPoolExecutor) connection.getInternalDB()
-						.getScheduler()
-						.readExecutor();
-				long tasksBefore = readExecutor.getTaskCount();
+				var scheduler = connection.getInternalDB().getScheduler();
+				long tasksBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 				var values = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 						.subsequentAsync(iteratorId, 0, entries, RequestType.<Buf>multi())
 						.get(5, TimeUnit.SECONDS);
@@ -175,15 +173,15 @@ class EmbeddedRangeSchedulingTest {
 				assertEquals(entries, values.size());
 				assertEquals(intValue(0), values.getFirst());
 				assertEquals(intValue(entries - 1), values.getLast());
-				long continuationTasks = readExecutor.getTaskCount() - tasksBefore;
+				long continuationTasks = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - tasksBefore;
 				assertTrue(continuationTasks >= 2 && continuationTasks <= 3,
 						"large iterator reads should use a few bounded tasks, got " + continuationTasks);
 
-				long exhaustedTasksBefore = readExecutor.getTaskCount();
+				long exhaustedTasksBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 				connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 						.subsequentAsync(iteratorId, 0, Long.MAX_VALUE, RequestType.none())
 						.get(5, TimeUnit.SECONDS);
-				assertTrue(readExecutor.getTaskCount() - exhaustedTasksBefore <= 2,
+				assertTrue(scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - exhaustedTasksBefore <= 2,
 						"an exhausted iterator must not schedule work proportional to the requested count");
 			} finally {
 				api.closeIterator(iteratorId);
@@ -246,10 +244,9 @@ class EmbeddedRangeSchedulingTest {
 			var competingCompositeRan = new CountDownLatch(1);
 			var secondChunkSawCompetingComposite = new AtomicBoolean();
 			var pendingOpsBetweenChunks = new java.util.concurrent.atomic.AtomicLong(-1L);
-			var readExecutor = (ThreadPoolExecutor) connection.getInternalDB()
-					.getScheduler()
-					.readExecutor();
-			long tasksBefore = readExecutor.getTaskCount();
+			var scheduler = connection.getInternalDB().getScheduler();
+			var readExecutor = scheduler.readExecutor();
+			long tasksBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 			connection.getInternalDB()
 					.setExistsMultiSnapshotObserverForTesting(snapshotAcquisitions::incrementAndGet);
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
@@ -281,7 +278,7 @@ class EmbeddedRangeSchedulingTest {
 					"a queued composite task must run before the next native MultiGet chunk");
 			assertEquals(1L, pendingOpsBetweenChunks.get(),
 					"the yielded request must retain one active logical operation between chunks");
-			long tasks = readExecutor.getTaskCount() - tasksBefore;
+			long tasks = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - tasksBefore;
 			assertEquals(3, tasks,
 					"two MultiGet chunks plus the competing composite should require three tasks, got " + tasks);
 		}

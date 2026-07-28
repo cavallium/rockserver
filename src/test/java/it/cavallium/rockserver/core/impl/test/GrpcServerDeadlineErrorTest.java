@@ -28,6 +28,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -41,14 +42,20 @@ class GrpcServerDeadlineErrorTest {
 
 	@Test
 	void expiredRequestContextFailsLocallyBeforeGrpcTransport() throws Exception {
-		try (var client = GrpcConnection.forHostAndPort("grpc-expired-context",
-				new Utils.HostAndPort("127.0.0.1", 1))) {
-			var expired = new it.cavallium.rockserver.core.common.RequestContext(
-					it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, 1L);
-			var error = assertThrows(RocksDBException.class,
-					() -> client.getAsyncApi(expired).getColumnIdAsync("never-sent"));
-			assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
-			assertEquals("Request deadline already expired", error.getMessage());
+		var backend = new CountingBackendConnection();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			try (var client = GrpcConnection.forHostAndPort("grpc-expired-context",
+					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
+				var expired = new it.cavallium.rockserver.core.common.RequestContext(
+						it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, 1L);
+				var error = assertThrows(RocksDBException.class,
+						() -> client.getAsyncApi(expired).getColumnIdAsync("never-sent"));
+				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
+				assertEquals("Request deadline already expired", error.getMessage());
+				assertEquals(0, backend.operations.get(),
+						"an expired contextual call must fail before transport reaches the backend");
+			}
 		}
 	}
 
@@ -397,6 +404,37 @@ class GrpcServerDeadlineErrorTest {
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return asyncApi;
+		}
+
+		@Override
+		public void close() {
+		}
+	}
+
+	private static final class CountingBackendConnection implements RocksDBConnection {
+
+		private final AtomicInteger operations = new AtomicInteger();
+		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
+			@Override
+			public long getColumnId(String name) {
+				operations.incrementAndGet();
+				return 1L;
+			}
+		};
+
+		@Override
+		public URI getUrl() {
+			return URI.create("test://counting-backend");
+		}
+
+		@Override
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return syncApi;
+		}
+
+		@Override
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return new RocksDBAsyncAPI() {};
 		}
 
 		@Override

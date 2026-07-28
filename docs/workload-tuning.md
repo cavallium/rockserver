@@ -24,8 +24,9 @@ The harness keeps these producers active at the same time:
 A separate LATENCY bounded-fan-out producer deliberately cancels requests so the
 same result also records cancellation behavior. During the measured interval the
 harness can assert storage pressure, keep it asserted for a fixed interval, and then
-clear it. This records BATCH progress before/during/after pressure and physical work
-completed during pressure.
+clear it. This records BATCH progress before/during/after pressure, verifies BATCH
+recovery after pressure, and confirms that parked physical work resumes after pressure
+clears.
 
 ## What every result records
 
