@@ -1,36 +1,43 @@
 # Rockserver
 
-## Write admission
+## Workload admission
 
-Mutating APIs default to the `FOREGROUND` write class. Rebuildable/background
-callers may select `MAINTENANCE`; both classes share the hard `write` worker
-limit, while maintenance also obeys its smaller sub-limit. Foreground work can
-use every worker when maintenance is absent. With both queues populated, one
-maintenance task is selected after at most 32 foreground dequeues.
+Rockserver schedules requests by the explicit `LATENCY`, `INGEST`, `CDC`,
+`ANALYTICAL`, `BATCH`, `CONTROL`, and `PHYSICAL_MAINTENANCE` profiles. Data
+profiles share hard read/write worker limits with borrowable reservations;
+CONTROL and physical maintenance use isolated pools.
 
 ```hocon
 database.parallelism {
   read = 20
   write = 36
-  maintenance-write = 1
-  foreground-write-queue-capacity = 4096
-  maintenance-write-queue-capacity = 512
+  workload {
+    latency-queue-capacity = 4096
+    ingest-queue-capacity = 4096
+    cdc-queue-capacity = 1024
+    analytical-queue-capacity = 512
+    batch-queue-capacity = 512
+  }
 }
 ```
 
 Each queue rejects overflow immediately as `SERVER_OVERLOADED`; gRPC exposes it
-as `RESOURCE_EXHAUSTED`. Admission publishes the following metrics with
-`database` and `lane` (`foreground` or `maintenance`) tags:
+as `RESOURCE_EXHAUSTED`. Admission metrics use bounded `database`, `resource`,
+`profile`, and `family` tags:
 
-- `rockserver.write.admission.queued`
-- `rockserver.write.admission.active`
-- `rockserver.write.admission.queue.wait`
-- `rockserver.write.admission.execution`
-- `rockserver.write.admission.completed`
-- `rockserver.write.admission.cancelled`
-- `rockserver.write.admission.rejected`
-- `rockserver.write.admission.worker.limit`
-- `rockserver.write.admission.queue.limit`
+- `rockserver.workload.queued`
+- `rockserver.workload.active`
+- `rockserver.workload.queue.wait`
+- `rockserver.workload.execution`
+- `rockserver.workload.quantums`
+- `rockserver.workload.outcomes`
+- `rockserver.workload.cancellations`
+- `rockserver.workload.rejections`
+- `rockserver.workload.failures`
+
+See [workload profiles](docs/workload-profiles.md) for admission rules and
+[workload configuration](docs/workload-configuration.md) for every setting,
+default, and startup invariant.
 
 ## gRPC overload regression benchmark
 

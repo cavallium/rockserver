@@ -39,7 +39,6 @@ import reactor.core.Disposable;
  */
 final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
-	static final int MAX_LATENCY_BURST = 8;
 	static final long COST_BYTES = 2L * 1024L * 1024L;
 	static final int MAX_TASK_COST = 16;
 	private static final int MAX_DEFICIT = MAX_TASK_COST;
@@ -50,15 +49,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			WorkloadProfile.CDC,
 			WorkloadProfile.ANALYTICAL,
 			WorkloadProfile.BATCH);
-	private static final Map<WorkloadProfile, Integer> QUANTA = Map.of(
-			WorkloadProfile.INGEST, 4,
-			WorkloadProfile.CDC, 4,
-			WorkloadProfile.ANALYTICAL, 2,
-			WorkloadProfile.BATCH, 1);
-
 	private final String poolName;
 	private final int workerCount;
 	private final int analyticalLimit;
+	private final int maxLatencyBurst;
+	private final EnumMap<WorkloadProfile, Integer> quanta;
 	private final EnumMap<WorkloadProfile, Integer> capacities;
 	private final EnumMap<WorkloadProfile, Integer> reservations;
 	private final EnumMap<WorkloadProfile, PriorityQueue<WorkloadTask>> latencyQueues;
@@ -91,6 +86,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			int analyticalLimit,
 			Map<WorkloadProfile, Integer> capacities,
 			Map<WorkloadProfile, Integer> reservations,
+			int maxLatencyBurst,
+			Map<WorkloadProfile, Integer> quanta,
 			String poolName,
 			String resourceKind,
 			WorkloadPressureController pressureController,
@@ -102,9 +99,21 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (analyticalLimit < 1 || analyticalLimit > workerCount) {
 			throw new IllegalArgumentException("analyticalLimit must be between one and workerCount");
 		}
+		if (maxLatencyBurst < 1) {
+			throw new IllegalArgumentException("maxLatencyBurst must be positive");
+		}
 		this.poolName = Objects.requireNonNull(poolName, "poolName");
 		this.workerCount = workerCount;
 		this.analyticalLimit = analyticalLimit;
+		this.maxLatencyBurst = maxLatencyBurst;
+		this.quanta = new EnumMap<>(WorkloadProfile.class);
+		for (var profile : GUARANTEED) {
+			int quantum = Objects.requireNonNull(quanta.get(profile), "Missing DRR weight for " + profile);
+			if (quantum < 1) {
+				throw new IllegalArgumentException("DRR weight must be positive for " + profile);
+			}
+			this.quanta.put(profile, quantum);
+		}
 		this.capacities = new EnumMap<>(WorkloadProfile.class);
 		this.reservations = new EnumMap<>(WorkloadProfile.class);
 		this.latencyQueues = new EnumMap<>(WorkloadProfile.class);
@@ -417,7 +426,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		boolean reservedLatency = hasReservationDeficitUnsafe(WorkloadProfile.LATENCY);
 		boolean reservedGuaranteed = hasGuaranteedReservationDeficitUnsafe();
 		if (reservedLatency || reservedGuaranteed) {
-			if (reservedLatency && (latencyBurst < MAX_LATENCY_BURST || !reservedGuaranteed)) {
+			if (reservedLatency && (latencyBurst < maxLatencyBurst || !reservedGuaranteed)) {
 				return selectLatencyUnsafe();
 			}
 			var guaranteed = selectGuaranteedUnsafe(true);
@@ -432,7 +441,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		boolean latencyEligible = isEligibleUnsafe(WorkloadProfile.LATENCY);
 		boolean guaranteedEligible = hasGuaranteedEligibleUnsafe(false);
-		if (latencyEligible && (latencyBurst < MAX_LATENCY_BURST || !guaranteedEligible)) {
+		if (latencyEligible && (latencyBurst < maxLatencyBurst || !guaranteedEligible)) {
 			return selectLatencyUnsafe();
 		}
 		var guaranteed = selectGuaranteedUnsafe(false);
@@ -489,7 +498,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				continue;
 			}
 			if (guaranteedNeedsQuantum) {
-				deficit.put(profile, Math.min(MAX_DEFICIT, deficit.get(profile) + QUANTA.get(profile)));
+				deficit.put(profile, Math.min(MAX_DEFICIT, deficit.get(profile) + quanta.get(profile)));
 				guaranteedNeedsQuantum = false;
 			}
 			var head = queue.peek();
@@ -1092,12 +1101,24 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 final class WorkloadPressureController {
 
-	private static final long BATCH_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
+	private final int maximumActiveBatches;
+	private final long batchIntervalNanos;
 	private boolean pressured;
 	private int activeBatches;
 	private boolean completedBatchAwaitingIdle;
 	private long nextBatchNanos = Long.MIN_VALUE;
 	private volatile Runnable notifier = () -> {};
+
+	WorkloadPressureController(int maximumActiveBatches, java.time.Duration batchInterval) {
+		if (maximumActiveBatches < 1) {
+			throw new IllegalArgumentException("maximumActiveBatches must be positive");
+		}
+		this.maximumActiveBatches = maximumActiveBatches;
+		this.batchIntervalNanos = Objects.requireNonNull(batchInterval, "batchInterval").toNanos();
+		if (batchIntervalNanos < 1L) {
+			throw new IllegalArgumentException("batchInterval must be positive");
+		}
+	}
 
 	synchronized boolean isPressured() {
 		return pressured;
@@ -1119,7 +1140,9 @@ final class WorkloadPressureController {
 	}
 
 	synchronized boolean canStartBatch(boolean ignorePressure, long nowNanos) {
-		return ignorePressure || !pressured || activeBatches == 0 && nowNanos >= nextBatchNanos;
+		return ignorePressure
+				|| !pressured
+				|| activeBatches < maximumActiveBatches && nowNanos >= nextBatchNanos;
 	}
 
 	synchronized @Nullable BatchPermit tryStartBatch(boolean ignorePressure, long nowNanos) {
@@ -1142,7 +1165,7 @@ final class WorkloadPressureController {
 			activeBatches--;
 			if (activeBatches == 0) {
 				if (pressured && completedBatchAwaitingIdle) {
-					nextBatchNanos = System.nanoTime() + BATCH_INTERVAL_NANOS;
+					nextBatchNanos = System.nanoTime() + batchIntervalNanos;
 				}
 				completedBatchAwaitingIdle = false;
 			}

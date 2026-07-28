@@ -130,16 +130,89 @@ public class ConfigPrinter {
 				{
 				    "read": %d,
 				    "write": %d,
-				    "maintenance-write": %d,
-				    "foreground-write-queue-capacity": %d,
-				    "maintenance-write-queue-capacity": %d
+				    "workload": %s
 				  }\
 				""".formatted(o.read(),
 				o.write(),
-				o.maintenanceWrite(),
-				o.foregroundWriteQueueCapacity(),
-				o.maintenanceWriteQueueCapacity()
+				stringifyWorkload(o.workload())
 		);
+	}
+
+	public static String stringifyWorkload(WorkloadConfig o) throws GestaltException {
+		return """
+				{
+				      "latency-queue-capacity": %d,
+				      "ingest-queue-capacity": %d,
+				      "cdc-queue-capacity": %d,
+				      "analytical-queue-capacity": %d,
+				      "batch-queue-capacity": %d,
+				      "control-queue-capacity": %d,
+				      "physical-maintenance-queue-capacity": %d,
+				      "read-latency-reservation": %d,
+				      "read-ingest-reservation": %d,
+				      "read-cdc-reservation": %d,
+				      "write-latency-reservation": %d,
+				      "write-ingest-reservation": %d,
+				      "write-cdc-reservation": %d,
+				      "control-threads": %d,
+				      "physical-concurrency": %d,
+				      "analytical-active-limit": %d,
+				      "retained-analytical-snapshots": %d,
+				      "retained-snapshot-maximum-age": %s,
+				      "latency-burst": %d,
+				      "ingest-drr-weight": %d,
+				      "cdc-drr-weight": %d,
+				      "analytical-drr-weight": %d,
+				      "batch-drr-weight": %d,
+				      "pressured-batch-maximum-active": %d,
+				      "pressured-batch-interval": %s,
+				      "range-quantum-max-items": %d,
+				      "range-quantum-max-bytes": %s,
+				      "range-quantum-max-duration": %s,
+				      "cdc-quantum-max-mutations": %d,
+				      "cdc-quantum-max-bytes": %s,
+				      "cdc-quantum-max-duration": %s,
+				      "latency-range-max-items": %d,
+				      "latency-range-max-bytes": %s,
+				      "latency-fan-out-max-items": %d,
+				      "latency-fan-out-max-bytes": %s
+				    }\
+				""".formatted(
+				o.latencyQueueCapacity(),
+				o.ingestQueueCapacity(),
+				o.cdcQueueCapacity(),
+				o.analyticalQueueCapacity(),
+				o.batchQueueCapacity(),
+				o.controlQueueCapacity(),
+				o.physicalMaintenanceQueueCapacity(),
+				o.readLatencyReservation(),
+				o.readIngestReservation(),
+				o.readCdcReservation(),
+				o.writeLatencyReservation(),
+				o.writeIngestReservation(),
+				o.writeCdcReservation(),
+				o.controlThreads(),
+				o.physicalConcurrency(),
+				o.analyticalActiveLimit(),
+				o.retainedAnalyticalSnapshots(),
+				quote(o.retainedSnapshotMaximumAge()),
+				o.latencyBurst(),
+				o.ingestDrrWeight(),
+				o.cdcDrrWeight(),
+				o.analyticalDrrWeight(),
+				o.batchDrrWeight(),
+				o.pressuredBatchMaximumActive(),
+				quote(o.pressuredBatchInterval()),
+				o.rangeQuantumMaxItems(),
+				quote(o.rangeQuantumMaxBytes()),
+				quote(o.rangeQuantumMaxDuration()),
+				o.cdcQuantumMaxMutations(),
+				quote(o.cdcQuantumMaxBytes()),
+				quote(o.cdcQuantumMaxDuration()),
+				o.latencyRangeMaxItems(),
+				quote(o.latencyRangeMaxBytes()),
+				o.latencyFanOutMaxItems(),
+				quote(o.latencyFanOutMaxBytes()));
 	}
 
 	public static String stringifyMetrics(MetricsConfig o) throws GestaltException {

@@ -52,11 +52,13 @@ class GrpcDeleteTest {
 		Files.writeString(configFile, """
 				database: {
 				  parallelism: {
-				    read: 2
-				    write: 1
-				    maintenance-write: 1
-				    foreground-write-queue-capacity: 1
-				    maintenance-write-queue-capacity: 1
+				    read: 3
+				    write: 3
+				    workload: {
+				      latency-queue-capacity: 1
+				      ingest-queue-capacity: 1
+				      batch-queue-capacity: 1
+				    }
 				  }
 				  global: { ingest-behind: false, optimistic: false }
 				}

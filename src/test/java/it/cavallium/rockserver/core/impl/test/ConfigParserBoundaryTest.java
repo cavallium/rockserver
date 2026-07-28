@@ -12,6 +12,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.config.ConfigPrinter;
 import it.cavallium.rockserver.core.config.DataSize;
+import it.cavallium.rockserver.core.config.WorkloadSettings;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -31,9 +32,10 @@ class ConfigParserBoundaryTest {
 		assertAll(
 				() -> assertEquals(20, config.parallelism().read()),
 				() -> assertEquals(36, config.parallelism().write()),
-				() -> assertEquals(1, config.parallelism().maintenanceWrite()),
-				() -> assertEquals(4_096, config.parallelism().foregroundWriteQueueCapacity()),
-				() -> assertEquals(512, config.parallelism().maintenanceWriteQueueCapacity()),
+				() -> assertEquals(4_096, config.parallelism().workload().latencyQueueCapacity()),
+				() -> assertEquals(1, config.parallelism().workload().readLatencyReservation()),
+				() -> assertEquals(Duration.ofSeconds(60),
+						config.parallelism().workload().retainedSnapshotMaximumAge()),
 				() -> assertEquals("default", config.metrics().databaseName()),
 				() -> assertFalse(config.metrics().influx().enabled()),
 				() -> assertTrue(config.metrics().influx().allowInsecureCertificates()),
@@ -85,14 +87,101 @@ class ConfigParserBoundaryTest {
 		assertAll(
 				() -> assertEquals(9, config.parallelism().read()),
 				() -> assertEquals(36, config.parallelism().write()),
-				() -> assertEquals(1, config.parallelism().maintenanceWrite()),
-				() -> assertEquals(4_096, config.parallelism().foregroundWriteQueueCapacity()),
-				() -> assertEquals(512, config.parallelism().maintenanceWriteQueueCapacity()),
+				() -> assertEquals(4_096, config.parallelism().workload().latencyQueueCapacity()),
+				() -> assertEquals(512, config.parallelism().workload().batchQueueCapacity()),
 				() -> assertEquals(new DataSize("1GiB"), config.global().blockCache()),
 				() -> assertEquals(3, config.global().maxBackgroundJobs()),
 				() -> assertTrue(config.global().unorderedWrite()),
 				() -> assertTrue(config.global().checksum())
 		);
+	}
+
+	@Test
+	void defaultWorkloadConfigurationIsCompleteAndPrintedWithoutLegacyLanes() throws Exception {
+		var config = ConfigParser.parseDefault();
+		var settings = WorkloadSettings.resolve(config);
+		var printed = ConfigPrinter.stringify(config);
+
+		assertEquals(WorkloadSettings.defaults(20, 36), settings);
+		assertFalse(printed.contains("maintenance-write"));
+		assertFalse(printed.contains("foreground-write-queue-capacity"));
+		assertFalse(printed.contains("maintenance-write-queue-capacity"));
+		for (String key : new String[] {
+				"latency-queue-capacity",
+				"ingest-queue-capacity",
+				"cdc-queue-capacity",
+				"analytical-queue-capacity",
+				"batch-queue-capacity",
+				"control-queue-capacity",
+				"physical-maintenance-queue-capacity",
+				"read-latency-reservation",
+				"read-ingest-reservation",
+				"read-cdc-reservation",
+				"write-latency-reservation",
+				"write-ingest-reservation",
+				"write-cdc-reservation",
+				"control-threads",
+				"physical-concurrency",
+				"analytical-active-limit",
+				"retained-analytical-snapshots",
+				"retained-snapshot-maximum-age",
+				"latency-burst",
+				"ingest-drr-weight",
+				"cdc-drr-weight",
+				"analytical-drr-weight",
+				"batch-drr-weight",
+				"pressured-batch-maximum-active",
+				"pressured-batch-interval",
+				"range-quantum-max-items",
+				"range-quantum-max-bytes",
+				"range-quantum-max-duration",
+				"cdc-quantum-max-mutations",
+				"cdc-quantum-max-bytes",
+				"cdc-quantum-max-duration",
+				"latency-range-max-items",
+				"latency-range-max-bytes",
+				"latency-fan-out-max-items",
+				"latency-fan-out-max-bytes"
+		}) {
+			assertTrue(printed.contains('"' + key + '"'), "missing effective key " + key);
+		}
+	}
+
+	@Test
+	void invalidWorkloadCapacitiesReservationsAndDurationsAreConfigErrors() throws IOException {
+		String[] invalidOverrides = {
+				"database.parallelism.read = 2",
+				"database.parallelism.workload.latency-queue-capacity = 0",
+				"database.parallelism.workload.read-latency-reservation = -1",
+				"database.parallelism.read = 3\n"
+						+ "database.parallelism.workload.read-latency-reservation = 2",
+				"database.parallelism.workload.analytical-active-limit = 21",
+				"database.parallelism.workload.control-threads = 0",
+				"database.parallelism.workload.retained-snapshot-maximum-age = PT0S",
+				"database.parallelism.workload.pressured-batch-interval = PT-1S",
+				"database.parallelism.workload.range-quantum-max-duration = PT0S",
+				"database.parallelism.workload.cdc-quantum-max-bytes = 0B"
+		};
+		for (int i = 0; i < invalidOverrides.length; i++) {
+			Path invalid = write("invalid-workload-" + i + ".conf", invalidOverrides[i]);
+			var exception = assertThrows(RocksDBException.class,
+					() -> ConfigParser.parse(invalid), invalidOverrides[i]);
+			assertEquals(RocksDBErrorType.CONFIG_ERROR, exception.getErrorUniqueId());
+		}
+	}
+
+	@Test
+	void removedForegroundAndMaintenanceKeysFailInsteadOfFallingBack() throws IOException {
+		for (String key : new String[] {
+				"maintenance-write",
+				"foreground-write-queue-capacity",
+				"maintenance-write-queue-capacity"
+		}) {
+			Path invalid = write("removed-" + key + ".conf", "database.parallelism." + key + " = 1");
+			var exception = assertThrows(RocksDBException.class, () -> ConfigParser.parse(invalid));
+			assertEquals(RocksDBErrorType.CONFIG_ERROR, exception.getErrorUniqueId());
+			assertTrue(exception.getMessage().contains("Removed workload configuration key"));
+		}
 	}
 
 	@Test
@@ -132,12 +221,8 @@ class ConfigParserBoundaryTest {
 		assertAll(
 				() -> assertEquals(original.parallelism().read(), reparsed.parallelism().read()),
 				() -> assertEquals(original.parallelism().write(), reparsed.parallelism().write()),
-				() -> assertEquals(original.parallelism().maintenanceWrite(),
-						reparsed.parallelism().maintenanceWrite()),
-				() -> assertEquals(original.parallelism().foregroundWriteQueueCapacity(),
-						reparsed.parallelism().foregroundWriteQueueCapacity()),
-				() -> assertEquals(original.parallelism().maintenanceWriteQueueCapacity(),
-						reparsed.parallelism().maintenanceWriteQueueCapacity()),
+				() -> assertEquals(ConfigPrinter.stringifyWorkload(original.parallelism().workload()),
+						ConfigPrinter.stringifyWorkload(reparsed.parallelism().workload())),
 				() -> assertEquals(original.metrics().databaseName(), reparsed.metrics().databaseName()),
 				() -> assertEquals(original.global().followRocksdbOptimizations(),
 						reparsed.global().followRocksdbOptimizations()),
@@ -183,9 +268,10 @@ class ConfigParserBoundaryTest {
 		Path custom = write("custom.conf", """
 				database.parallelism.read = 7
 				database.parallelism.write = 12
-				database.parallelism.maintenance-write = 2
-				database.parallelism.foreground-write-queue-capacity = 123
-				database.parallelism.maintenance-write-queue-capacity = 45
+				database.parallelism.workload.latency-queue-capacity = 123
+				database.parallelism.workload.ingest-queue-capacity = 124
+				database.parallelism.workload.batch-queue-capacity = 45
+				database.parallelism.workload.control-threads = 3
 				database.global.follow-rocksdb-optimizations = false
 				database.global.paranoid-checks = false
 				database.global.use-clock-cache = true
@@ -212,9 +298,10 @@ class ConfigParserBoundaryTest {
 		assertAll(
 				() -> assertEquals(7, reparsed.parallelism().read()),
 				() -> assertEquals(12, reparsed.parallelism().write()),
-				() -> assertEquals(2, reparsed.parallelism().maintenanceWrite()),
-				() -> assertEquals(123, reparsed.parallelism().foregroundWriteQueueCapacity()),
-				() -> assertEquals(45, reparsed.parallelism().maintenanceWriteQueueCapacity()),
+				() -> assertEquals(123, reparsed.parallelism().workload().latencyQueueCapacity()),
+				() -> assertEquals(124, reparsed.parallelism().workload().ingestQueueCapacity()),
+				() -> assertEquals(45, reparsed.parallelism().workload().batchQueueCapacity()),
+				() -> assertEquals(3, reparsed.parallelism().workload().controlThreads()),
 				() -> assertFalse(reparsed.global().followRocksdbOptimizations()),
 				() -> assertFalse(reparsed.global().paranoidChecks()),
 				() -> assertTrue(reparsed.global().useClockCache()),

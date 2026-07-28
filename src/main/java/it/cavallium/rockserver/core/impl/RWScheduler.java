@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.config.WorkloadSettings;
 import java.time.Duration;
 import java.util.EnumMap;
 import java.util.List;
@@ -24,24 +25,11 @@ import reactor.core.scheduler.Schedulers;
  *
  * <p>LATENCY requests are ordered by absolute deadline. INGEST, CDC, ANALYTICAL,
  * and BATCH use byte-cost deficit round-robin. Read and write pools each reserve
- * one borrowable slot for LATENCY, INGEST, and CDC while retaining a hard worker
- * cap. CONTROL is isolated and physical maintenance is serialized.</p>
+ * one borrowable slot for LATENCY, INGEST, and CDC by default while retaining a
+ * hard worker cap. CONTROL and physical maintenance have isolated pools.</p>
  */
 public final class RWScheduler {
 
-	public static final int DEFAULT_ANALYTICAL_QUEUE_CAPACITY = 512;
-	public static final int DEFAULT_BATCH_QUEUE_CAPACITY = 512;
-	public static final int DEFAULT_LATENCY_QUEUE_CAPACITY = 4_096;
-	public static final int DEFAULT_INGEST_QUEUE_CAPACITY = 4_096;
-	public static final int DEFAULT_CDC_QUEUE_CAPACITY = 1_024;
-	// Stage G replaces these compatibility constants with explicit workload settings.
-	public static final int DEFAULT_MAINTENANCE_WRITE_PARALLELISM = 1;
-	public static final int DEFAULT_FOREGROUND_WRITE_QUEUE_CAPACITY = DEFAULT_INGEST_QUEUE_CAPACITY;
-	public static final int DEFAULT_MAINTENANCE_WRITE_QUEUE_CAPACITY = DEFAULT_BATCH_QUEUE_CAPACITY;
-	private static final int MIN_PRODUCTION_DATA_THREADS = 3;
-	private static final int CONTROL_THREADS = 2;
-	private static final int CONTROL_QUEUE_CAPACITY = 256;
-	private static final int PHYSICAL_QUEUE_CAPACITY = 16;
 	private static final long SHUTDOWN_WAIT_SECONDS = 10L;
 	private static final Logger LOG = LoggerFactory.getLogger(RWScheduler.class);
 
@@ -53,107 +41,72 @@ public final class RWScheduler {
 	private final WorkloadPressureController pressureController;
 
 	public RWScheduler(int readCap, int writeCap, String name) {
-		this(readCap,
-				writeCap,
-				1,
-				DEFAULT_INGEST_QUEUE_CAPACITY,
-				DEFAULT_BATCH_QUEUE_CAPACITY,
-				name);
+		this(WorkloadSettings.defaults(readCap, writeCap), name, null, name, true);
 	}
 
-	public RWScheduler(int readCap,
-			int writeCap,
-			int analyticalCap,
-			int foregroundQueueCapacity,
-			int batchQueueCapacity,
-			String name) {
-		this(readCap,
-				writeCap,
-				analyticalCap,
-				foregroundQueueCapacity,
-				batchQueueCapacity,
-				name,
-				null,
-				name);
-	}
-
-	public RWScheduler(int readCap,
-			int writeCap,
-			int analyticalCap,
-			int foregroundQueueCapacity,
-			int batchQueueCapacity,
+	public RWScheduler(WorkloadSettings settings,
 			String name,
 			@Nullable MeterRegistry registry,
 			String databaseName) {
-		this(readCap,
-				writeCap,
-				analyticalCap,
-				foregroundQueueCapacity,
-				batchQueueCapacity,
-				name,
-				registry,
-				databaseName,
-				true);
+		this(settings, name, registry, databaseName, true);
 	}
 
-	private RWScheduler(int readCap,
-			int writeCap,
-			int analyticalCap,
-			int foregroundQueueCapacity,
-			int batchQueueCapacity,
+	private RWScheduler(WorkloadSettings settings,
 			String name,
 			@Nullable MeterRegistry registry,
 			String databaseName,
 			boolean productionCapacities) {
+		Objects.requireNonNull(settings, "settings");
 		Objects.requireNonNull(name, "name");
 		Objects.requireNonNull(databaseName, "databaseName");
-		if (readCap < 1 || writeCap < 1 || analyticalCap < 1) {
-			throw new IllegalArgumentException("Scheduler capacities must be positive");
-		}
 		if (productionCapacities
-				&& (readCap < MIN_PRODUCTION_DATA_THREADS || writeCap < MIN_PRODUCTION_DATA_THREADS)) {
-			throw new IllegalArgumentException("Production read and write capacities must each be at least "
-					+ MIN_PRODUCTION_DATA_THREADS + " for LATENCY, INGEST, and CDC reservations");
+				&& (settings.readParallelism() < WorkloadSettings.MIN_PRODUCTION_DATA_THREADS
+				|| settings.writeParallelism() < WorkloadSettings.MIN_PRODUCTION_DATA_THREADS)) {
+			settings.validateProductionCapacities();
 		}
-		if (analyticalCap > readCap || analyticalCap > writeCap) {
-			throw new IllegalArgumentException("Analytical active limit must not exceed a data pool capacity");
-		}
-		if (foregroundQueueCapacity < 1 || batchQueueCapacity < 1) {
-			throw new IllegalArgumentException("Queue capacities must be positive");
-		}
-		this.pressureController = new WorkloadPressureController();
-		var dataCapacities = dataCapacities(foregroundQueueCapacity, batchQueueCapacity);
-		this.readPool = new ProfiledWorkloadExecutor(readCap,
-				analyticalCap,
+		this.pressureController = new WorkloadPressureController(
+				settings.pressuredBatchMaximumActive(), settings.pressuredBatchInterval());
+		var dataCapacities = settings.queueCapacities();
+		var drrWeights = settings.drrWeights();
+		this.readPool = new ProfiledWorkloadExecutor(settings.readParallelism(),
+				settings.analyticalActiveLimit(),
 				dataCapacities,
-				dataReservations(readCap),
+				settings.readReservations(),
+				settings.latencyBurst(),
+				drrWeights,
 				name + "-read",
 				"read",
 				pressureController,
 				registry,
 				databaseName);
-		this.writePool = new ProfiledWorkloadExecutor(writeCap,
-				analyticalCap,
+		this.writePool = new ProfiledWorkloadExecutor(settings.writeParallelism(),
+				settings.analyticalActiveLimit(),
 				dataCapacities,
-				dataReservations(writeCap),
+				settings.writeReservations(),
+				settings.latencyBurst(),
+				drrWeights,
 				name + "-write",
 				"write",
 				pressureController,
 				registry,
 				databaseName);
-		this.controlPool = new ProfiledWorkloadExecutor(CONTROL_THREADS,
-				CONTROL_THREADS,
-				Map.of(WorkloadProfile.CONTROL, CONTROL_QUEUE_CAPACITY),
+		this.controlPool = new ProfiledWorkloadExecutor(settings.controlThreads(),
+				settings.controlThreads(),
+				Map.of(WorkloadProfile.CONTROL, settings.controlQueueCapacity()),
 				Map.of(),
+				settings.latencyBurst(),
+				drrWeights,
 				name + "-control",
 				"control",
 				pressureController,
 				registry,
 				databaseName);
-		this.physicalPool = new ProfiledWorkloadExecutor(1,
-				1,
-				Map.of(WorkloadProfile.PHYSICAL_MAINTENANCE, PHYSICAL_QUEUE_CAPACITY),
+		this.physicalPool = new ProfiledWorkloadExecutor(settings.physicalConcurrency(),
+				settings.physicalConcurrency(),
+				Map.of(WorkloadProfile.PHYSICAL_MAINTENANCE, settings.physicalMaintenanceQueueCapacity()),
 				Map.of(),
+				settings.latencyBurst(),
+				drrWeights,
 				name + "-physical",
 				"physical",
 				pressureController,
@@ -177,11 +130,11 @@ public final class RWScheduler {
 			int foregroundQueueCapacity,
 			int batchQueueCapacity,
 			String name) {
-		return new RWScheduler(readCap,
+		return new RWScheduler(WorkloadSettings.testingDefaults(readCap,
 				writeCap,
 				analyticalCap,
 				foregroundQueueCapacity,
-				batchQueueCapacity,
+				batchQueueCapacity),
 				name,
 				null,
 				name,
@@ -197,35 +150,15 @@ public final class RWScheduler {
 			String name,
 			@Nullable MeterRegistry registry,
 			String databaseName) {
-		return new RWScheduler(readCap,
+		return new RWScheduler(WorkloadSettings.testingDefaults(readCap,
 				writeCap,
 				analyticalCap,
 				foregroundQueueCapacity,
-				batchQueueCapacity,
+				batchQueueCapacity),
 				name,
 				registry,
 				databaseName,
 				false);
-	}
-
-	private static Map<WorkloadProfile, Integer> dataCapacities(int foreground, int batch) {
-		var capacities = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
-		capacities.put(WorkloadProfile.LATENCY, foreground);
-		capacities.put(WorkloadProfile.INGEST, foreground);
-		capacities.put(WorkloadProfile.CDC, Math.max(64, Math.min(foreground, DEFAULT_CDC_QUEUE_CAPACITY)));
-		capacities.put(WorkloadProfile.ANALYTICAL, Math.max(1, Math.min(batch, DEFAULT_ANALYTICAL_QUEUE_CAPACITY)));
-		capacities.put(WorkloadProfile.BATCH, batch);
-		return capacities;
-	}
-
-	private static Map<WorkloadProfile, Integer> dataReservations(int capacity) {
-		if (capacity < MIN_PRODUCTION_DATA_THREADS) {
-			return Map.of();
-		}
-		return Map.of(
-				WorkloadProfile.LATENCY, 1,
-				WorkloadProfile.INGEST, 1,
-				WorkloadProfile.CDC, 1);
 	}
 
 	/** Resolve and validate the caller context, then return its resource-specific view. */

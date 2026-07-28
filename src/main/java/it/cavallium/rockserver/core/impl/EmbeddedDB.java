@@ -191,8 +191,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final int RANGE_READ_CHUNK_SIZE = 1_024;
 	private static final int RANGE_READ_MAX_PHYSICAL_KEYS_PER_CHUNK = 4_096;
 	private static final long RANGE_READ_MAX_DECODED_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
-	private static final String MAX_RETAINED_SNAPSHOT_AGE_PROPERTY =
-			"it.cavallium.rockserver.workload.max-retained-snapshot-age-ms";
 	private static final long STORAGE_PRESSURE_PENDING_COMPACTION_BYTES = Math.max(1L, Long.getLong(
 			"it.cavallium.rockserver.workload.storage-pressure-pending-compaction-bytes",
 			64L * SizeUnit.GB));
@@ -233,8 +231,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Set<ActiveRangeResource> activeRangeResources = ConcurrentHashMap.newKeySet();
 	private final AtomicInteger retainedRangeSnapshots = new AtomicInteger();
 	private final AtomicLong cdcLagSequences = new AtomicLong();
-	private final long maxRetainedSnapshotAgeMs = Math.max(1L,
-			Long.getLong(MAX_RETAINED_SNAPSHOT_AGE_PROPERTY, 60_000L));
+	private final long maxRetainedSnapshotAgeMs;
 	private final Set<CdcPollCursor> activeCdcPollCursors = ConcurrentHashMap.newKeySet();
 	private final Set<AsyncExistsMultiRequest> activeExistsMultiRequests = ConcurrentHashMap.newKeySet();
 	private final ConcurrentMap<String, CdcMetadataLock> cdcMetadataLocks = new ConcurrentHashMap<>();
@@ -244,6 +241,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicLong resourceLeases = new AtomicLong();
 	private final Object columnEditLock = new Object();
 	private final DatabaseConfig config;
+	private final WorkloadSettings workloadSettings;
 	private final RocksDBObjects refs;
 	private final @Nullable Cache cache;
 	private final MetricsManager metrics;
@@ -306,43 +304,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.ops = new SafeShutdown();
 		DatabaseConfig config = ConfigParser.parse(embeddedConfigPath);
 		this.config = config;
-		int readCap;
-		int writeCap;
-		int maintenanceWriteCap;
-		int foregroundWriteQueueCapacity;
-		int maintenanceWriteQueueCapacity;
+		WorkloadSettings workloadSettings;
 		try {
-			readCap = Objects.requireNonNullElse(
-					config.parallelism().read(), Runtime.getRuntime().availableProcessors());
-			writeCap = Objects.requireNonNullElse(
-					config.parallelism().write(), Runtime.getRuntime().availableProcessors());
-			maintenanceWriteCap = Objects.requireNonNullElse(
-					config.parallelism().maintenanceWrite(), RWScheduler.DEFAULT_MAINTENANCE_WRITE_PARALLELISM);
-			foregroundWriteQueueCapacity = Objects.requireNonNullElse(
-					config.parallelism().foregroundWriteQueueCapacity(),
-					RWScheduler.DEFAULT_FOREGROUND_WRITE_QUEUE_CAPACITY);
-			maintenanceWriteQueueCapacity = Objects.requireNonNullElse(
-					config.parallelism().maintenanceWriteQueueCapacity(),
-					RWScheduler.DEFAULT_MAINTENANCE_WRITE_QUEUE_CAPACITY);
+			workloadSettings = WorkloadSettings.resolve(config);
 			this.fastGet = config.global().enableFastGet();
 		} catch (GestaltException e) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-					"Can't get scheduler parallelism, write admission, or fast-get configuration",
+					"Can't resolve workload or fast-get configuration",
 					e);
 		}
-		if (readCap < 1 || writeCap < 1
-				|| maintenanceWriteCap < 1
-				|| maintenanceWriteCap > writeCap
-				|| foregroundWriteQueueCapacity < 1
-				|| maintenanceWriteQueueCapacity < 1) {
-			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-					"Invalid database.parallelism configuration: read=" + readCap
-							+ ", write=" + writeCap
-							+ ", maintenance-write=" + maintenanceWriteCap
-							+ ", foreground-write-queue-capacity=" + foregroundWriteQueueCapacity
-							+ ", maintenance-write-queue-capacity=" + maintenanceWriteQueueCapacity
-							+ "; values must be positive and maintenance-write must not exceed write");
-		}
+		this.workloadSettings = workloadSettings;
+		this.maxRetainedSnapshotAgeMs = workloadSettings.retainedSnapshotMaximumAge().toMillis();
+		int readCap = workloadSettings.readParallelism();
+		int writeCap = workloadSettings.writeParallelism();
 
 		this.metrics = new MetricsManager(config);
 		Timer loadTimer = createTimer(Tags.of("action", "load"));
@@ -486,11 +460,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache,
 				this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig, walMetricsConfig);
 		this.scheduler = new RWScheduler(
-				readCap,
-				writeCap,
-				maintenanceWriteCap,
-				foregroundWriteQueueCapacity,
-				maintenanceWriteQueueCapacity,
+				workloadSettings,
 				"db[" + name + "]",
 				metrics.getRegistry(),
 				name);
@@ -6816,6 +6786,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public DatabaseConfig getConfig() {
 		return config;
+	}
+
+	@VisibleForTesting
+	public WorkloadSettings getWorkloadSettings() {
+		return workloadSettings;
 	}
 
 	private AbstractSlice<?> toDirectSlice(Buf calculatedKey) {

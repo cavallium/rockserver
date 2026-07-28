@@ -8,6 +8,7 @@ import it.cavallium.rockserver.core.resources.DefaultConfig;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import org.github.gestalt.config.Gestalt;
 import org.github.gestalt.config.builder.GestaltBuilder;
 import org.github.gestalt.config.builder.SourceBuilder;
 import org.github.gestalt.config.exceptions.GestaltException;
@@ -63,10 +64,28 @@ public class ConfigParser {
 			}
 			var gestalt = gsb.build();
 			gestalt.loadConfigs();
+			rejectLegacyWorkloadKeys(gestalt);
 
-			return gestalt.getConfig("database", DatabaseConfig.class);
+			var config = gestalt.getConfig("database", DatabaseConfig.class);
+			WorkloadSettings.resolve(config);
+			return config;
 		} catch (GestaltException ex) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, ex);
+		} catch (IllegalArgumentException | NullPointerException ex) {
+			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, ex.getMessage(), ex);
+		}
+	}
+
+	private static void rejectLegacyWorkloadKeys(Gestalt gestalt) {
+		for (String key : List.of(
+				"maintenance-write",
+				"foreground-write-queue-capacity",
+				"maintenance-write-queue-capacity")) {
+			String path = "database.parallelism." + key;
+			if (gestalt.getConfigOptional(path, String.class).isPresent()) {
+				throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+						"Removed workload configuration key: " + path);
+			}
 		}
 	}
 }

@@ -325,10 +325,13 @@ class RocksDBLoaderComplexConfigTest {
 		var invalidSettings = List.of(
 				"database.parallelism.read = 0",
 				"database.parallelism.write = -3",
-				"database.parallelism.maintenance-write = 0",
-				"database.parallelism.maintenance-write = 37",
-				"database.parallelism.foreground-write-queue-capacity = 0",
-				"database.parallelism.maintenance-write-queue-capacity = -1"
+				"database.parallelism.workload.control-threads = 0",
+				"database.parallelism.workload.analytical-active-limit = 37",
+				"database.parallelism.workload.latency-queue-capacity = 0",
+				"database.parallelism.workload.batch-queue-capacity = -1",
+				"database.parallelism.workload.read-latency-reservation = -1",
+				"database.parallelism.read = 3\n"
+						+ "database.parallelism.workload.read-latency-reservation = 2"
 		);
         for (int i = 0; i < invalidSettings.size(); i++) {
             Path configPath = tempDir.resolve("invalid-scheduler-parallelism-" + i + ".conf");
