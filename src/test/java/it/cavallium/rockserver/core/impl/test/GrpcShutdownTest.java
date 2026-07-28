@@ -261,7 +261,7 @@ class GrpcShutdownTest {
 	}
 
 	@Test
-	void cancelledQueuedRemoteIteratorCloseCanBeRetried() throws Exception {
+	void cancelledQueuedRemoteIteratorCloseStillCompletes() throws Exception {
 		var client = newClient();
 		var api = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 		var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("cancelled-close-col",
@@ -301,18 +301,15 @@ class GrpcShutdownTest {
 			var close = api.closeIteratorAsync(iteratorId);
 			awaitQueuedTask(scheduler, WorkloadProfile.CONTROL);
 			assertTrue(close.cancel(true));
-			awaitQueueDrained(scheduler, WorkloadProfile.CONTROL);
-
-			assertTrue(api.subsequentAsync(iteratorId, 0, 1, RequestType.exists())
-					.get(5, TimeUnit.SECONDS),
-					"cancelling a queued close must leave the server registration and native iterator usable");
+			assertEquals(1, grpcServer.getAcceptedMustCompleteOperationCountForTesting());
 			assertEquals(1, embeddedConnection.getInternalDB().getOpenIteratorsCount());
 			assertEquals(1, embeddedConnection.getInternalDB().getPendingOpsCount());
 		} finally {
 			releaseControl.countDown();
 		}
 
-		api.closeIteratorAsync(iteratorId).get(5, TimeUnit.SECONDS);
+		awaitOpenIteratorCount(0);
+		assertEquals(0, grpcServer.getAcceptedMustCompleteOperationCountForTesting());
 		assertEquals(0, embeddedConnection.getInternalDB().getOpenIteratorsCount());
 		assertEquals(0, embeddedConnection.getInternalDB().getPendingOpsCount());
 	}
@@ -342,15 +339,15 @@ class GrpcShutdownTest {
 		throw new AssertionError("remote iterator close was not queued on the blocked control lane");
 	}
 
-	private static void awaitQueueDrained(RWScheduler scheduler, WorkloadProfile profile) throws InterruptedException {
+	private void awaitOpenIteratorCount(int expected) throws InterruptedException {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
 		do {
-			if (scheduler.queuedTasks(profile) == 0) {
+			if (embeddedConnection.getInternalDB().getOpenIteratorsCount() == expected) {
 				return;
 			}
 			Thread.sleep(10);
 		} while (System.nanoTime() < deadline);
-		throw new AssertionError("queued remote iterator close did not leave the control queue after cancellation");
+		throw new AssertionError("open iterator count did not reach " + expected);
 	}
 
 	private static Keys key(long id) {

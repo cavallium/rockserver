@@ -27,6 +27,7 @@ import io.grpc.Status.Code;
 import io.grpc.StatusException;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyServerBuilder;
+import io.micrometer.core.instrument.Metrics;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.ServerChannel;
@@ -90,10 +91,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -119,6 +122,8 @@ public class GrpcServer extends Server {
 	// Reactor exposes sequence-local dropped-error handling through this documented context key, while
 	// keeping Hooks.KEY_ON_ERROR_DROPPED package-private.
 	private static final String REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY = "reactor.onErrorDropped.local";
+	private static final String LATE_PROTECTED_OPERATION_FAILURE_METRIC
+			= "rockserver.grpc.protected.late.failures";
 	private static final Consumer<Throwable> UNCONTEXTUALIZED_LATE_ERROR_HANDLER
 			= GrpcServer::logUncontextualizedLateError;
 	private static final long LATE_READ_DEADLINE_LOG_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
@@ -132,6 +137,64 @@ public class GrpcServer extends Server {
 	private final boolean ownsScheduler;
 	private final @Nullable EmbeddedDB embeddedDatabase;
 	private final GrpcGetStrategy grpcGetStrategy;
+	private final MustCompleteOperationTracker mustCompleteOperations = new MustCompleteOperationTracker();
+	private final ConcurrentMap<String, LongAdder> lateProtectedOperationFailures = new ConcurrentHashMap<>();
+
+	private enum ScheduledCancellationPolicy {
+		CANCEL_WHILE_QUEUED,
+		MUST_COMPLETE
+	}
+
+	private static final class MustCompleteOperationTracker {
+
+		private final Object monitor = new Object();
+		private int acceptedOperations;
+		private boolean accepting = true;
+
+		private boolean register() {
+			synchronized (monitor) {
+				if (!accepting) {
+					return false;
+				}
+				acceptedOperations++;
+				return true;
+			}
+		}
+
+		private void operationTerminated() {
+			synchronized (monitor) {
+				if (acceptedOperations == 0) {
+					throw new IllegalStateException("Must-complete operation accounting underflow");
+				}
+				acceptedOperations--;
+				if (acceptedOperations == 0) {
+					monitor.notifyAll();
+				}
+			}
+		}
+
+		private boolean stopAcceptingAndAwait(Duration timeout) throws InterruptedException {
+			long remainingNanos = timeout.toNanos();
+			long deadlineNanos = System.nanoTime() + remainingNanos;
+			synchronized (monitor) {
+				accepting = false;
+				while (acceptedOperations != 0) {
+					if (remainingNanos <= 0L) {
+						return false;
+					}
+					TimeUnit.NANOSECONDS.timedWait(monitor, remainingNanos);
+					remainingNanos = deadlineNanos - System.nanoTime();
+				}
+				return true;
+			}
+		}
+
+		private int acceptedOperations() {
+			synchronized (monitor) {
+				return acceptedOperations;
+			}
+		}
+	}
 
 	private enum GrpcGetStrategy {
 		LEGACY,
@@ -220,6 +283,14 @@ public class GrpcServer extends Server {
 		return status.getCode() == Code.UNKNOWN ? Code.INTERNAL : status.getCode();
 	}
 
+	private void recordLateProtectedOperationFailure(String operation,
+			Throwable error,
+			ContextView context) {
+		lateProtectedOperationFailures.computeIfAbsent(operation, _ -> new LongAdder()).increment();
+		Metrics.counter(LATE_PROTECTED_OPERATION_FAILURE_METRIC, "operation", operation).increment();
+		GrpcServerImpl.lateErrorHandler(context).accept(error);
+	}
+
 	private static final class LateReadDeadlineLogState {
 
 		private final AtomicLong lastLogNanos = new AtomicLong();
@@ -284,6 +355,17 @@ public class GrpcServer extends Server {
 	@VisibleForTesting
 	public int getActiveIteratorOperationLeaseCountForTesting() {
 		return grpc.iteratorOperations.size();
+	}
+
+	@VisibleForTesting
+	public int getAcceptedMustCompleteOperationCountForTesting() {
+		return mustCompleteOperations.acceptedOperations();
+	}
+
+	@VisibleForTesting
+	public long getLateProtectedOperationFailureCountForTesting(String operation) {
+		var failures = lateProtectedOperationFailures.get(operation);
+		return failures == null ? 0L : failures.sum();
 	}
 
 	@VisibleForTesting
@@ -733,22 +815,27 @@ public class GrpcServer extends Server {
 		public Mono<CloseTransactionResponse> closeTransaction(CloseTransactionRequest request) {
 			return Mono.defer(() -> {
 				var context = mapRequestContext(request.getContext());
-				var executionScheduler = request.getCommit()
-						? scheduler.scheduler(context, OperationFamily.MUTATION)
-						: scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL,
-								it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE);
-				return executeScheduled(() -> {
-					var backendApi = request.getCommit() ? client.getSyncApi(context) : protectedApi();
-					var committed = backendApi
-							.closeTransaction(request.getTransactionId(), request.getCommit());
-					return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
-				}, executionScheduler);
+				if (request.getCommit()) {
+					return executeScheduled(() -> {
+						var committed = client.getSyncApi(context)
+								.closeTransaction(request.getTransactionId(), true);
+						return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
+					},
+							scheduler.scheduler(context, OperationFamily.MUTATION));
+				}
+				return executeMustComplete("rollback",
+						() -> {
+							var rolledBack = protectedApi().closeTransaction(request.getTransactionId(), false);
+							return CloseTransactionResponse.newBuilder().setSuccessful(rolledBack).build();
+						},
+						scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL,
+								it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE));
 			}).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
 		}
 
 		@Override
 		public Mono<Empty> closeFailedUpdate(CloseFailedUpdateRequest request) {
-			return executeScheduled(() -> {
+			return executeMustComplete("closeFailedUpdate", () -> {
 				protectedApi().closeFailedUpdate(request.getUpdateId());
 				return Empty.getDefaultInstance();
 			}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
@@ -1484,7 +1571,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> closeIterator(CloseIteratorRequest request) {
-			return executeScheduled(() -> {
+			return executeMustComplete("closeIterator", () -> {
 					protectedApi().closeIterator(request.getIteratorId());
 					return Empty.getDefaultInstance();
 				}, scheduler.control())
@@ -1768,9 +1855,9 @@ public class GrpcServer extends Server {
                         : LEGACY_GRPC_MAX_INBOUND_MESSAGE_SIZE;
             }
 
-            @Override
+			@Override
 			public Mono<Empty> cdcCommit(CdcCommitRequest request) {
-				return executeScheduled(() -> {
+				return executeMustComplete("cdcCommit", () -> {
 					protectedApi().cdcCommit(request.getId(), request.getSeq());
 					return Empty.getDefaultInstance();
 				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
@@ -2032,13 +2119,43 @@ public class GrpcServer extends Server {
 		}
 
 		private <T> Mono<T> executeScheduled(Callable<T> callable, reactor.core.scheduler.Scheduler executionScheduler) {
-			return executeScheduled(callable, executionScheduler, null, null);
+			return executeScheduled(callable,
+					executionScheduler,
+					null,
+					null,
+					ScheduledCancellationPolicy.CANCEL_WHILE_QUEUED,
+					null);
+		}
+
+		private <T> Mono<T> executeMustComplete(String operation,
+				Callable<T> callable,
+				reactor.core.scheduler.Scheduler executionScheduler) {
+			return executeScheduled(callable,
+					executionScheduler,
+					null,
+					null,
+					ScheduledCancellationPolicy.MUST_COMPLETE,
+					operation);
 		}
 
 		private <T> Mono<T> executeScheduled(Callable<T> callable,
 				reactor.core.scheduler.Scheduler executionScheduler,
 				@Nullable Consumer<T> lateSuccessCleanup,
 				@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler) {
+			return executeScheduled(callable,
+					executionScheduler,
+					lateSuccessCleanup,
+					lateSuccessCleanupScheduler,
+					ScheduledCancellationPolicy.CANCEL_WHILE_QUEUED,
+					null);
+		}
+
+		private <T> Mono<T> executeScheduled(Callable<T> callable,
+				reactor.core.scheduler.Scheduler executionScheduler,
+				@Nullable Consumer<T> lateSuccessCleanup,
+				@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler,
+				ScheduledCancellationPolicy cancellationPolicy,
+				@Nullable String protectedOperation) {
 			return Mono.deferContextual(contextView -> {
 				var iteratorLease = contextView.<IteratorOperationLease>getOrDefault(
 						ITERATOR_OPERATION_LEASE_CONTEXT_KEY, null);
@@ -2056,18 +2173,29 @@ public class GrpcServer extends Server {
 					var emissionLock = new Object();
 					var cancelled = new AtomicBoolean();
 					var task = Disposables.swap();
+					boolean mustComplete = cancellationPolicy == ScheduledCancellationPolicy.MUST_COMPLETE;
+					if (mustComplete && !mustCompleteOperations.register()) {
+						if (taskLifecycle != null) {
+							taskLifecycle.cancelBeforeStart();
+						}
+						sink.error(new RejectedExecutionException("gRPC server is shutting down"));
+						return;
+					}
 
 					// RocksDB JNI calls may keep running after interruption until their native deadline. Serialize
 					// cancellation with terminal delivery so a late native error is not emitted to an already-cancelled
-					// gRPC subscriber (which Reactor would otherwise report through onErrorDropped).
+					// gRPC subscriber (which Reactor would otherwise report through onErrorDropped). Protected
+					// cleanup and CDC acknowledgement remain scheduled; cancellation only suppresses their response.
 					sink.onCancel(() -> {
 						synchronized (emissionLock) {
 							cancelled.set(true);
 						}
-						if (taskLifecycle != null) {
-							taskLifecycle.cancelBeforeStart();
+						if (!mustComplete) {
+							if (taskLifecycle != null) {
+								taskLifecycle.cancelBeforeStart();
+							}
+							task.dispose();
 						}
-						task.dispose();
 					});
 
 					try {
@@ -2113,17 +2241,30 @@ public class GrpcServer extends Server {
 									}
 								}
 								if (lateError) {
-									lateErrorHandler(sink.contextView()).accept(error);
+									if (mustComplete) {
+										recordLateProtectedOperationFailure(
+												Objects.requireNonNull(protectedOperation),
+												error,
+												sink.contextView());
+									} else {
+										lateErrorHandler(sink.contextView()).accept(error);
+									}
 								}
 							} finally {
 								if (taskLifecycle != null) {
 									taskLifecycle.runningTaskTerminated();
+								}
+								if (mustComplete) {
+									mustCompleteOperations.operationTerminated();
 								}
 							}
 						}));
 					} catch (Throwable schedulingError) {
 						if (taskLifecycle != null) {
 							taskLifecycle.cancelBeforeStart();
+						}
+						if (mustComplete) {
+							mustCompleteOperations.operationTerminated();
 						}
 						boolean lateError;
 						synchronized (emissionLock) {
@@ -2560,6 +2701,17 @@ public class GrpcServer extends Server {
 			Thread.currentThread().interrupt();
 			LOG.error("Server shutdown interrupted", e);
 			server.shutdownNow();
+		}
+		try {
+			if (!mustCompleteOperations.stopAcceptingAndAwait(schedulerShutdownTimeout)) {
+				LOG.error("GRPC server timed out draining {} accepted protected operations",
+						mustCompleteOperations.acceptedOperations());
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			LOG.error("GRPC protected-operation drain interrupted with {} operations remaining",
+					mustCompleteOperations.acceptedOperations(),
+					e);
 		}
 		try {
 			elg.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync();
