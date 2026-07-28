@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.config;
 
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.common.RangeBudget;
 import java.time.Duration;
 import java.util.EnumMap;
 import java.util.Map;
@@ -52,8 +53,8 @@ public record WorkloadSettings(
 
 	public static final int MIN_PRODUCTION_DATA_THREADS = 3;
 	private static final int MAX_DRR_WEIGHT = 16;
-	private static final int LATENCY_RANGE_HARD_MAX_ITEMS = 4_096;
-	private static final long LATENCY_RANGE_HARD_MAX_BYTES = 8L * 1024L * 1024L;
+	private static final int LATENCY_RANGE_HARD_MAX_ITEMS = RangeBudget.DEFAULT_MAX_ITEMS;
+	private static final long LATENCY_RANGE_HARD_MAX_BYTES = RangeBudget.DEFAULT_MAX_BYTES;
 	private static final int LATENCY_FAN_OUT_HARD_MAX_ITEMS = 256;
 	private static final long LATENCY_FAN_OUT_HARD_MAX_BYTES = 2L * 1024L * 1024L;
 

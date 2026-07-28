@@ -150,7 +150,7 @@ public final class GrpcOverloadBenchmark {
 		boolean shutdownClean = closeFailure == null;
 		Acceptance acceptance = phases.size() == 2
 				? evaluateAcceptance(gateInput(
-						phases.get(0), phases.get(1), options, shutdownClean, nativeLeaksDetected))
+						phases.get(0), phases.get(1), shutdownClean, nativeLeaksDetected))
 				: Acceptance.failed("Both benchmark phases must complete");
 		BenchmarkResult result = new BenchmarkResult(
 				RESULT_SCHEMA,
@@ -711,7 +711,6 @@ public final class GrpcOverloadBenchmark {
 
 	private static GateInput gateInput(PhaseResult foreground,
 			PhaseResult flood,
-			Options options,
 			boolean shutdownClean,
 			long nativeLeaksDetected) {
 		return new GateInput(
@@ -721,13 +720,7 @@ public final class GrpcOverloadBenchmark {
 						+ flood.operation(Operation.FIRST_LAST).deadlines(),
 				foreground.operation(Operation.FOREGROUND).p99Nanos(),
 				flood.operation(Operation.FOREGROUND).p99Nanos(),
-				flood.operation(Operation.MAINTENANCE_WRITE).successes(),
 				flood.operation(Operation.CANCELLATION).cancellations(),
-				Math.max(foreground.admission().maxTotalActive(), flood.admission().maxTotalActive()),
-				Math.max(foreground.admission().maxMaintenanceActive(),
-						flood.admission().maxMaintenanceActive()),
-				options.writeParallelism(),
-				options.maintenanceWriteParallelism(),
 				foreground.resources().drained() && flood.resources().drained(),
 				foreground.unexpectedErrors() + flood.unexpectedErrors(),
 				foreground.admission().foregroundRejected() + flood.admission().foregroundRejected(),
@@ -749,16 +742,8 @@ public final class GrpcOverloadBenchmark {
 				: Double.POSITIVE_INFINITY;
 		checks.add(new GateCheck("foreground_p99_ratio", p99Available && p99Ratio <= 2.0,
 				"maintenance-flood/foreground-only p99=" + format(p99Ratio) + " (limit=2.000)"));
-		checks.add(new GateCheck("maintenance_progress", input.maintenanceSuccesses() > 0,
-				"maintenance successful writes=" + input.maintenanceSuccesses()));
 		checks.add(new GateCheck("cancellation_progress", input.cancellations() > 0,
 				"cancelled queued calls=" + input.cancellations()));
-		checks.add(new GateCheck("combined_write_limit", input.maxTotalActive() <= input.writeLimit(),
-				"max active writes=" + input.maxTotalActive() + " (limit=" + input.writeLimit() + ")"));
-		checks.add(new GateCheck("maintenance_write_limit",
-				input.maxMaintenanceActive() <= input.maintenanceLimit(),
-				"max active maintenance writes=" + input.maxMaintenanceActive()
-						+ " (limit=" + input.maintenanceLimit() + ")"));
 		checks.add(new GateCheck("queues_and_resources_drained", input.resourcesDrained(),
 				"all queues, pending operations, transactions, iterators, and range cursors drained"));
 		checks.add(new GateCheck("unexpected_errors", input.unexpectedErrors() == 0,
@@ -808,9 +793,10 @@ public final class GrpcOverloadBenchmark {
 				  parallelism: {
 				    read: %d
 				    write: %d
-				    maintenance-write: %d
-				    foreground-write-queue-capacity: %d
-				    maintenance-write-queue-capacity: %d
+				    workload: {
+				      ingest-queue-capacity: %d
+				      batch-queue-capacity: %d
+				    }
 				  }
 				  global: {
 				    enable-fast-get: true
@@ -830,12 +816,16 @@ public final class GrpcOverloadBenchmark {
 				escapeHocon(options.databaseName()),
 				options.readParallelism(),
 				options.writeParallelism(),
-				options.maintenanceWriteParallelism(),
 				options.foregroundQueueCapacity(),
 				options.maintenanceQueueCapacity(),
 				options.spinning(),
 				options.directIo(),
 				escapeHocon(options.writeBufferSize()));
+	}
+
+	/** Generated HOCON exposed for deterministic configuration-contract tests. */
+	public static String generatedConfigForTesting() {
+		return configText(Options.parse(new String[] {"--smoke=true"}));
 	}
 
 	private static String escapeHocon(String value) {
@@ -927,8 +917,6 @@ public final class GrpcOverloadBenchmark {
 				.append(",\n    \"range_width\": ").append(options.rangeWidth())
 				.append(",\n    \"read_parallelism\": ").append(options.readParallelism())
 				.append(",\n    \"write_parallelism\": ").append(options.writeParallelism())
-				.append(",\n    \"maintenance_write_parallelism\": ")
-				.append(options.maintenanceWriteParallelism())
 				.append(",\n    \"foreground_queue_capacity\": ")
 				.append(options.foregroundQueueCapacity())
 				.append(",\n    \"maintenance_queue_capacity\": ")
@@ -1043,10 +1031,8 @@ public final class GrpcOverloadBenchmark {
 				.append("- Finished: `").append(result.finished()).append("`\n")
 				.append("- Fixed client/range deadline: `").append(DEADLINE_MILLIS).append(" ms`\n")
 				.append("- Preloaded keys: `").append(result.options().preloadKeys()).append("`\n")
-				.append("- Write limits: combined `").append(result.options().writeParallelism())
-				.append("`, maintenance `").append(result.options().maintenanceWriteParallelism()).append("`\n")
-				.append("- Queue capacities: foreground `").append(result.options().foregroundQueueCapacity())
-				.append("`, maintenance `").append(result.options().maintenanceQueueCapacity()).append("`\n\n")
+				.append("- Queue capacities: INGEST `").append(result.options().foregroundQueueCapacity())
+				.append("`, BATCH `").append(result.options().maintenanceQueueCapacity()).append("`\n\n")
 				.append("## Operations\n\n")
 				.append("| Phase | Operation | Throughput/s | p50 ms | p95 ms | p99 ms | max ms | Deadlines | Rejected | Cancelled | Errors |\n")
 				.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
@@ -1130,7 +1116,7 @@ public final class GrpcOverloadBenchmark {
 				  first-last-readers=2  cancellation-workers=2
 				  foreground-write-rate=1000  maintenance-write-rate=0
 				  first-last-rate=50  cancellation-rate=100  cancellation-burst=64
-				  read-parallelism=20  write-parallelism=36  maintenance-write-parallelism=1
+				  read-parallelism=20  write-parallelism=36
 				  foreground-queue-capacity=4096  maintenance-queue-capacity=512
 				  point-request-count=8192  range-request-count=8192  range-width=1024
 				  direct-io=false  spinning=false  enforce=true  smoke=false
@@ -1671,12 +1657,7 @@ public final class GrpcOverloadBenchmark {
 			long firstLastDeadlines,
 			long foregroundOnlyP99Nanos,
 			long maintenanceFloodP99Nanos,
-			long maintenanceSuccesses,
 			long cancellations,
-			int maxTotalActive,
-			int maxMaintenanceActive,
-			int writeLimit,
-			int maintenanceLimit,
 			boolean resourcesDrained,
 			long unexpectedErrors,
 			long foregroundRejections,
@@ -1735,7 +1716,6 @@ public final class GrpcOverloadBenchmark {
 			int rangeWidth,
 			int readParallelism,
 			int writeParallelism,
-			int maintenanceWriteParallelism,
 			int foregroundQueueCapacity,
 			int maintenanceQueueCapacity,
 			int admissionSampleMicros,
@@ -1773,7 +1753,6 @@ public final class GrpcOverloadBenchmark {
 				"range-width",
 				"read-parallelism",
 				"write-parallelism",
-				"maintenance-write-parallelism",
 				"foreground-queue-capacity",
 				"maintenance-queue-capacity",
 				"admission-sample-micros",
@@ -1831,7 +1810,6 @@ public final class GrpcOverloadBenchmark {
 					integer(values, "range-width", smoke ? 64 : 1_024),
 					integer(values, "read-parallelism", 20),
 					integer(values, "write-parallelism", 36),
-					integer(values, "maintenance-write-parallelism", 1),
 					integer(values, "foreground-queue-capacity", 4_096),
 					integer(values, "maintenance-queue-capacity", 512),
 					integer(values, "admission-sample-micros", 250),
@@ -1885,8 +1863,7 @@ public final class GrpcOverloadBenchmark {
 			if (pointRequestCount < 1 || rangeRequestCount < 1 || rangeWidth < 1 || rangeWidth > preloadKeys) {
 				throw new IllegalArgumentException("request counts and range width are invalid for the preload");
 			}
-			if (readParallelism < 1 || writeParallelism < 1 || maintenanceWriteParallelism < 1
-					|| maintenanceWriteParallelism > writeParallelism) {
+			if (readParallelism < 1 || writeParallelism < 1) {
 				throw new IllegalArgumentException("parallelism limits are invalid");
 			}
 			if (foregroundQueueCapacity < 1 || maintenanceQueueCapacity < 1) {

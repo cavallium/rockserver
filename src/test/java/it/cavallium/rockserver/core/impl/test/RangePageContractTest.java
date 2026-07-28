@@ -55,7 +55,9 @@ import reactor.core.publisher.Mono;
 class RangePageContractTest {
 
 	private static final long TIMEOUT_MS = 10_000L;
-	private static final RangeBudget TWO_ITEMS = new RangeBudget(2, RangeBudget.DEFAULT_MAX_BYTES);
+	private static final int LATENCY_MAX_ITEMS = 2;
+	private static final long LATENCY_MAX_BYTES = 64;
+	private static final RangeBudget TWO_ITEMS = new RangeBudget(LATENCY_MAX_ITEMS, LATENCY_MAX_BYTES);
 
 	private EmbeddedConnection embedded;
 	private GrpcServer grpcServer;
@@ -69,7 +71,17 @@ class RangePageContractTest {
 	void setUp(@TempDir Path tempDir) throws IOException, TException {
 		System.setProperty("rockserver.core.print-config", "false");
 		var config = tempDir.resolve("rockserver.conf");
-		Files.writeString(config, "database: { global: { ingest-behind: false, optimistic: false } }");
+		Files.writeString(config, """
+				database: {
+				  parallelism: {
+				    workload: {
+				      latency-range-max-items: %d
+				      latency-range-max-bytes: %dB
+				    }
+				  }
+				  global: { ingest-behind: false, optimistic: false }
+				}
+				""".formatted(LATENCY_MAX_ITEMS, LATENCY_MAX_BYTES));
 		embedded = new EmbeddedConnection(tempDir.resolve("db"), "range-page-contract", config);
 		var batch = embedded.getSyncApi(RequestContext.batch());
 		columnId = batch.createColumn("ranges",
@@ -155,7 +167,34 @@ class RangePageContractTest {
 	}
 
 	@Test
-	void itemThatCannotFitAnEmptyPageHasDedicatedErrorOnEveryTransport() {
+	void loweredLatencyCeilingsAcceptTheLimitAndRejectOverLimitWithoutClamping() {
+		for (var api : apis(RequestContext.latency(Duration.ofSeconds(30)))) {
+			var atLimit = api.getRangePage(0,
+					columnId,
+					key(0),
+					key(100),
+					false,
+					null,
+					RequestType.allInRange(),
+					TIMEOUT_MS,
+					new RangeBudget(LATENCY_MAX_ITEMS, LATENCY_MAX_BYTES));
+			assertEquals(LATENCY_MAX_ITEMS, atLimit.items().size());
+			assertTrue(atLimit.hasMore());
+
+			var tooManyItems = assertThrows(RocksDBException.class, () -> api.getRangePage(0,
+					columnId, key(0), key(100), false, null, RequestType.allInRange(), TIMEOUT_MS,
+					new RangeBudget(LATENCY_MAX_ITEMS + 1, LATENCY_MAX_BYTES)));
+			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, tooManyItems.getErrorUniqueId());
+
+			var tooManyBytes = assertThrows(RocksDBException.class, () -> api.getRangePage(0,
+					columnId, key(0), key(100), false, null, RequestType.allInRange(), TIMEOUT_MS,
+					new RangeBudget(LATENCY_MAX_ITEMS, LATENCY_MAX_BYTES + 1)));
+			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, tooManyBytes.getErrorUniqueId());
+		}
+	}
+
+	@Test
+	void itemAndPublicHardCeilingsHaveParityOnEveryTransport() {
 		for (var api : apis()) {
 			var error = assertThrows(RocksDBException.class, () -> api.getRangePage(
 					0, columnId, key(0), key(100), false, null,

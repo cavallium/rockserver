@@ -239,7 +239,9 @@ public class EmbeddedConnection extends BaseConnection implements RocksDBAPI, In
 		return WorkloadAdmission.resolve(context,
 				command,
 				settings.latencyFanOutMaxItems(),
-				settings.latencyFanOutMaxBytes());
+				settings.latencyFanOutMaxBytes(),
+				settings.latencyRangeMaxItems(),
+				settings.latencyRangeMaxBytes());
 	}
 
 	@Override

@@ -497,8 +497,17 @@ public class GrpcServer extends Server {
 					Disposable scheduled;
 					try {
 						var context = grpc.mapRequestContext(currentRequest.getContext());
-						scheduled = scheduler.scheduler(context, OperationFamily.POINT_LOOKUP).schedule(callContext.wrap(
-								() -> runFastGetCall(call, currentRequest, cancelled)));
+						var keys = GrpcServerImpl.mapKeys(currentRequest.getKeysCount(), currentRequest::getKeys);
+						var command = new RocksDBAPICommand.RocksDBAPICommandSingle.Get<>(
+								currentRequest.getTransactionOrUpdateId(),
+								currentRequest.getColumnId(),
+								keys,
+								new RequestCurrent<>());
+						var profile = grpc.resolveCommand(context, command);
+						scheduled = scheduler.scheduler(profile,
+								command.operationFamily(),
+								context.deadlineEpochMillis()).schedule(callContext.wrap(
+								() -> runFastGetCall(call, currentRequest, context, keys, cancelled)));
 					} catch (Throwable schedulingError) {
 						closeFastGetFailure(call, currentRequest, schedulingError, cancelled);
 						return;
@@ -523,13 +532,15 @@ public class GrpcServer extends Server {
 
 	private void runFastGetCall(ServerCall<GetRequest, FastGetResponse> call,
 			GetRequest request,
+			it.cavallium.rockserver.core.common.RequestContext context,
+			Keys keys,
 			AtomicBoolean cancelled) {
 		FastGetResponse response = null;
 		try {
 			if (cancelled.get() || call.isCancelled()) {
 				return;
 			}
-			response = grpc.createFastGetResponse(request, grpcGetStrategy, embeddedDatabase);
+			response = grpc.createFastGetResponse(request, context, keys, grpcGetStrategy, embeddedDatabase);
 			if (cancelled.get() || call.isCancelled()) {
 				return;
 			}
@@ -770,6 +781,16 @@ public class GrpcServer extends Server {
 		private final RocksDBConnection client;
 		private final ConcurrentMap<Long, Object> iteratorOperations = new ConcurrentHashMap<>();
 
+		private final class CapturedCommand extends RuntimeException {
+
+			private final RocksDBAPICommand<?, ?, ?> command;
+
+			private CapturedCommand(RocksDBAPICommand<?, ?, ?> command) {
+				super(null, null, false, false);
+				this.command = command;
+			}
+		}
+
 		public GrpcServerImpl(RocksDBConnection client) {
 			this.client = Objects.requireNonNull(client, "client");
 		}
@@ -810,11 +831,6 @@ public class GrpcServer extends Server {
 			}
 		}
 
-		private RocksDBSyncAPI api(
-				it.cavallium.rockserver.core.common.api.proto.RequestContext context) {
-			return client.getSyncApi(mapRequestContext(context));
-		}
-
 		private RocksDBAsyncAPI asyncApi(
 				it.cavallium.rockserver.core.common.api.proto.RequestContext context) {
 			return client.getAsyncApi(mapRequestContext(context));
@@ -826,6 +842,48 @@ public class GrpcServer extends Server {
 
 		private RocksDBAsyncAPI protectedAsyncApi() {
 			return client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+		}
+
+		private RocksDBAPICommand<?, ?, ?> captureCommand(Function<RocksDBSyncAPI, ?> operation) {
+			RocksDBSyncAPI captureApi = new RocksDBSyncAPI() {
+				@Override
+				public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
+					throw new CapturedCommand(request);
+				}
+			};
+			try {
+				operation.apply(captureApi);
+			} catch (CapturedCommand captured) {
+				return captured.command;
+			}
+			throw new IllegalStateException("gRPC operation did not dispatch a concrete Rockserver command");
+		}
+
+		private WorkloadProfile resolveCommand(
+				it.cavallium.rockserver.core.common.RequestContext context,
+				RocksDBAPICommand<?, ?, ?> command) {
+			if (embeddedDatabase == null) {
+				return WorkloadAdmission.resolve(context, command);
+			}
+			var settings = embeddedDatabase.getWorkloadSettings();
+			return WorkloadAdmission.resolve(context,
+					command,
+					settings.latencyFanOutMaxItems(),
+					settings.latencyFanOutMaxBytes(),
+					settings.latencyRangeMaxItems(),
+					settings.latencyRangeMaxBytes());
+		}
+
+		private WorkloadProfile preAdmit(
+				it.cavallium.rockserver.core.common.RequestContext context,
+				OperationFamily expectedFamily,
+				RocksDBAPICommand<?, ?, ?> command) {
+			if (command.operationFamily() != expectedFamily) {
+				throw new IllegalStateException("gRPC adapter expected " + expectedFamily
+						+ " but decoded " + command.operationFamily() + " for "
+						+ command.getClass().getSimpleName());
+			}
+			return resolveCommand(context, command);
 		}
 
 		// functions
@@ -850,14 +908,11 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<CloseTransactionResponse> closeTransaction(CloseTransactionRequest request) {
 			return Mono.defer(() -> {
-				var context = mapRequestContext(request.getContext());
 				if (request.getCommit()) {
-					return executeScheduled(() -> {
-						var committed = client.getSyncApi(context)
-								.closeTransaction(request.getTransactionId(), true);
+					return executeSync(request.getContext(), OperationFamily.MUTATION, contextualApi -> {
+						var committed = contextualApi.closeTransaction(request.getTransactionId(), true);
 						return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
-					},
-							scheduler.scheduler(context, OperationFamily.MUTATION));
+					});
 				}
 				return executeMustComplete("rollback",
 						() -> {
@@ -1670,9 +1725,10 @@ public class GrpcServer extends Server {
 		}
 
 		private FastGetResponse createFastGetResponse(GetRequest request,
+				it.cavallium.rockserver.core.common.RequestContext context,
+				Keys keys,
 				GrpcGetStrategy strategy,
 				@Nullable EmbeddedDB embeddedDatabase) {
-			Keys keys = mapKeys(request.getKeysCount(), request::getKeys);
 			if (request.getTransactionOrUpdateId() == 0 && embeddedDatabase != null) {
 				EmbeddedDB.FastGetOutput output = switch (strategy) {
 					case EXACT_HEAP -> EmbeddedDB.FastGetOutput.EXACT_HEAP;
@@ -1695,7 +1751,7 @@ public class GrpcServer extends Server {
 				}
 			}
 
-			Buf current = api(request.getContext()).get(request.getTransactionOrUpdateId(),
+			Buf current = client.getSyncApi(context).get(request.getTransactionOrUpdateId(),
 					request.getColumnId(),
 					keys,
 					new RequestCurrent<>());
@@ -1735,9 +1791,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<OpenIteratorResponse> openIterator(OpenIteratorRequest request) {
-			var context = mapRequestContext(request.getContext());
-			var contextualApi = client.getSyncApi(context);
-			return executeScheduled(() -> {
+			return executeSync(request.getContext(), OperationFamily.BOUNDARY_SEEK, contextualApi -> {
 				var iteratorId = contextualApi.openIterator(request.getTransactionId(),
 						request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
@@ -1746,7 +1800,7 @@ public class GrpcServer extends Server {
 						request.getTimeoutMs()
 				);
 				return OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build();
-			}, scheduler.scheduler(context, OperationFamily.BOUNDARY_SEEK), response -> {
+			}, response -> {
 				long iteratorId = response.getIteratorId();
 				protectedApi().closeIterator(iteratorId);
 			}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
@@ -1773,6 +1827,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Empty> subsequent(SubsequentRequest request) {
 			return validateIteratorCounts(request)
+					.then(validateSubsequentCommand(request, new RequestExists<>()))
 					.then(withIteratorLease(request.getIterationId(), () ->
 							advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), request.getTakeCount())
 									.thenReturn(Empty.getDefaultInstance())))
@@ -1782,6 +1837,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<PreviousPresence> subsequentExists(SubsequentRequest request) {
 			return validateIteratorCounts(request)
+					.then(validateSubsequentCommand(request, new RequestExists<>()))
 					.then(withIteratorLease(request.getIterationId(), () ->
 							advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), 0)
 									.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_ADVANCE_STEP_SIZE))
@@ -1796,6 +1852,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Flux<KV> subsequentMultiGet(SubsequentRequest request) {
 			return validateIteratorCounts(request)
+					.then(validateSubsequentCommand(request, new RequestMulti<>()))
 					.thenMany(withIteratorFluxLease(request.getIterationId(), () ->
 							advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), 0)
 									.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_VALUE_PAGE_SIZE)
@@ -2106,19 +2163,34 @@ public class GrpcServer extends Server {
 				Function<RocksDBSyncAPI, T> operation) {
 			return Mono.defer(() -> {
 				var context = mapRequestContext(wireContext);
+				var command = captureCommand(operation);
+				var profile = preAdmit(context, family, command);
 				return executeScheduled(() -> operation.apply(client.getSyncApi(context)),
-						scheduler.scheduler(context, family));
+						scheduler.scheduler(profile, command.operationFamily(), context.deadlineEpochMillis()));
+			});
+		}
+
+		private <T> Mono<T> executeSync(
+				it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext,
+				OperationFamily family,
+				Function<RocksDBSyncAPI, T> operation,
+				Consumer<T> lateSuccessCleanup,
+				reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler) {
+			return Mono.defer(() -> {
+				var context = mapRequestContext(wireContext);
+				var command = captureCommand(operation);
+				var profile = preAdmit(context, family, command);
+				return executeScheduled(() -> operation.apply(client.getSyncApi(context)),
+						scheduler.scheduler(profile, command.operationFamily(), context.deadlineEpochMillis()),
+						lateSuccessCleanup,
+						lateSuccessCleanupScheduler);
 			});
 		}
 
 		private <T> Mono<T> executeWrite(
 				it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext,
 				Function<RocksDBSyncAPI, T> operation) {
-			return Mono.defer(() -> {
-				var context = mapRequestContext(wireContext);
-				return executeScheduled(() -> operation.apply(client.getSyncApi(context)),
-						scheduler.scheduler(context, OperationFamily.MUTATION));
-			});
+			return executeSync(wireContext, OperationFamily.MUTATION, operation);
 		}
 
 		private <T> Mono<T> executeCompositeRead(
@@ -2134,6 +2206,19 @@ public class GrpcServer extends Server {
 						"Iterator skip and take counts must be non-negative"));
 			}
 			return Mono.empty();
+		}
+
+		private Mono<Void> validateSubsequentCommand(SubsequentRequest request,
+				RequestType.RequestIterate<? super Buf, ?> requestType) {
+			return Mono.fromRunnable(() -> {
+				var context = mapRequestContext(request.getContext());
+				var command = new RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<>(
+						request.getIterationId(),
+						request.getSkipCount(),
+						request.getTakeCount(),
+						requestType);
+				preAdmit(context, OperationFamily.RANGE_PAGE, command);
+			});
 		}
 
 		private Flux<Long> iteratorChunks(long count, long stepSize) {

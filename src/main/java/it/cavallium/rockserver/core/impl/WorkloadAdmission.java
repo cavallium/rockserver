@@ -21,6 +21,7 @@ import static it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINT
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.OperationFamily;
+import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -69,11 +70,32 @@ public final class WorkloadAdmission {
 			RocksDBAPICommand<?, ?, ?> command,
 			int maximumLatencyItems,
 			long maximumLatencyEncodedInputBytes) {
+		validateClient(context,
+				command,
+				maximumLatencyItems,
+				maximumLatencyEncodedInputBytes,
+				RangeBudget.DEFAULT_MAX_ITEMS,
+				RangeBudget.DEFAULT_MAX_BYTES);
+	}
+
+	/** Validate a concrete command against all server-resolved bounded-input maxima. */
+	public static void validateClient(RequestContext context,
+			RocksDBAPICommand<?, ?, ?> command,
+			int maximumLatencyItems,
+			long maximumLatencyEncodedInputBytes,
+			int maximumLatencyRangeItems,
+			long maximumLatencyRangeBytes) {
 		Objects.requireNonNull(context, "context");
 		Objects.requireNonNull(command, "command");
 		validateLatencyLimits(maximumLatencyItems, maximumLatencyEncodedInputBytes);
+		validateLatencyRangeLimits(maximumLatencyRangeItems, maximumLatencyRangeBytes);
 		validateClient(context, command.operationFamily());
-		validateCommand(context.profile(), command, maximumLatencyItems, maximumLatencyEncodedInputBytes);
+		validateCommand(context.profile(),
+				command,
+				maximumLatencyItems,
+				maximumLatencyEncodedInputBytes,
+				maximumLatencyRangeItems,
+				maximumLatencyRangeBytes);
 	}
 
 	/**
@@ -107,11 +129,31 @@ public final class WorkloadAdmission {
 			RocksDBAPICommand<?, ?, ?> command,
 			int maximumLatencyItems,
 			long maximumLatencyEncodedInputBytes) {
+		return resolve(context,
+				command,
+				maximumLatencyItems,
+				maximumLatencyEncodedInputBytes,
+				RangeBudget.DEFAULT_MAX_ITEMS,
+				RangeBudget.DEFAULT_MAX_BYTES);
+	}
+
+	/** Resolve a command while enforcing server-configured LATENCY input and range maxima. */
+	public static WorkloadProfile resolve(RequestContext context,
+			RocksDBAPICommand<?, ?, ?> command,
+			int maximumLatencyItems,
+			long maximumLatencyEncodedInputBytes,
+			int maximumLatencyRangeItems,
+			long maximumLatencyRangeBytes) {
 		Objects.requireNonNull(context, "context");
 		Objects.requireNonNull(command, "command");
 		var protectedProfile = command.protectedProfile();
 		if (protectedProfile == null) {
-			validateClient(context, command, maximumLatencyItems, maximumLatencyEncodedInputBytes);
+			validateClient(context,
+					command,
+					maximumLatencyItems,
+					maximumLatencyEncodedInputBytes,
+					maximumLatencyRangeItems,
+					maximumLatencyRangeBytes);
 			return context.profile();
 		}
 		validate(protectedProfile, command.operationFamily());
@@ -150,7 +192,9 @@ public final class WorkloadAdmission {
 	private static void validateCommand(WorkloadProfile profile,
 			RocksDBAPICommand<?, ?, ?> command,
 			int maximumLatencyItems,
-			long maximumLatencyEncodedInputBytes) {
+			long maximumLatencyEncodedInputBytes,
+			int maximumLatencyRangeItems,
+			long maximumLatencyRangeBytes) {
 		switch (command) {
 			case RocksDBAPICommandSingle.CreateColumn _, RocksDBAPICommandSingle.UploadMergeOperator _,
 					RocksDBAPICommandSingle.DeleteColumn _, RocksDBAPICommandSingle.DeleteColumnIfExists _,
@@ -212,10 +256,15 @@ public final class WorkloadAdmission {
 							"iterator skip + take must not exceed " + MAX_LATENCY_ITERATOR_ADVANCE);
 				}
 			}
+			case RocksDBAPICommandSingle.GetRangePage<?> page -> validateRangeBudget(profile,
+					command,
+					page.budget(),
+					maximumLatencyRangeItems,
+					maximumLatencyRangeBytes);
 			case RocksDBAPICommandSingle.OpenTransaction _, RocksDBAPICommandSingle.CloseTransaction _,
 					RocksDBAPICommandSingle.CloseFailedUpdate _, RocksDBAPICommandSingle.CheckMergeOperator _,
 					RocksDBAPICommandSingle.GetColumnId _, RocksDBAPICommandSingle.EstimateNumKeys _,
-					RocksDBAPICommandSingle.Get<?> _, RocksDBAPICommandSingle.GetRangePage<?> _,
+					RocksDBAPICommandSingle.Get<?> _,
 					RocksDBAPICommandSingle.OpenIterator _,
 					RocksDBAPICommandSingle.CloseIterator _, RocksDBAPICommandSingle.SeekTo _,
 					RocksDBAPICommandSingle.ReduceRange<?> _, RocksDBAPICommandStream.CdcPoll _,
@@ -267,6 +316,38 @@ public final class WorkloadAdmission {
 				|| maximumLatencyEncodedInputBytes > MAX_LATENCY_ENCODED_INPUT_BYTES) {
 			throw new IllegalArgumentException("LATENCY encoded-input limit must be between 1 and "
 					+ MAX_LATENCY_ENCODED_INPUT_BYTES);
+		}
+	}
+
+	private static void validateLatencyRangeLimits(int maximumLatencyRangeItems,
+			long maximumLatencyRangeBytes) {
+		if (maximumLatencyRangeItems < 1 || maximumLatencyRangeItems > RangeBudget.DEFAULT_MAX_ITEMS) {
+			throw new IllegalArgumentException("LATENCY range item limit must be between 1 and "
+					+ RangeBudget.DEFAULT_MAX_ITEMS);
+		}
+		if (maximumLatencyRangeBytes < 1 || maximumLatencyRangeBytes > RangeBudget.DEFAULT_MAX_BYTES) {
+			throw new IllegalArgumentException("LATENCY range byte limit must be between 1 and "
+					+ RangeBudget.DEFAULT_MAX_BYTES);
+		}
+	}
+
+	private static void validateRangeBudget(WorkloadProfile profile,
+			RocksDBAPICommand<?, ?, ?> command,
+			RangeBudget budget,
+			int maximumLatencyRangeItems,
+			long maximumLatencyRangeBytes) {
+		Objects.requireNonNull(budget, "budget");
+		int maximumItems = profile == LATENCY
+				? maximumLatencyRangeItems
+				: RangeBudget.DEFAULT_MAX_ITEMS;
+		long maximumBytes = profile == LATENCY
+				? maximumLatencyRangeBytes
+				: RangeBudget.DEFAULT_MAX_BYTES;
+		if (budget.maxItems() > maximumItems) {
+			throw mismatch(profile, command, "range maxItems must not exceed " + maximumItems);
+		}
+		if (budget.maxBytes() > maximumBytes) {
+			throw mismatch(profile, command, "range maxBytes must not exceed " + maximumBytes);
 		}
 	}
 

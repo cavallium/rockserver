@@ -20,11 +20,6 @@ class GrpcOverloadBenchmarkTest {
 				100,
 				200,
 				1,
-				1,
-				36,
-				1,
-				36,
-				1,
 				true,
 				0,
 				0,
@@ -43,11 +38,6 @@ class GrpcOverloadBenchmarkTest {
 				100,
 				201,
 				0,
-				0,
-				37,
-				2,
-				36,
-				1,
 				false,
 				3,
 				4,
@@ -63,10 +53,7 @@ class GrpcOverloadBenchmarkTest {
 				"foreground_deadlines",
 				"first_last_deadlines",
 				"foreground_p99_ratio",
-				"maintenance_progress",
 				"cancellation_progress",
-				"combined_write_limit",
-				"maintenance_write_limit",
 				"queues_and_resources_drained",
 				"unexpected_errors",
 				"foreground_rejections",
@@ -77,7 +64,7 @@ class GrpcOverloadBenchmarkTest {
 	@Test
 	void acceptanceRejectsMissingLatencySamples() {
 		var report = GrpcOverloadBenchmark.evaluateAcceptance(new GrpcOverloadBenchmark.GateInput(
-				0, 0, 0, 0, 1, 1, 1, 1, 1, 1, true, 0, 0, 0, true));
+				0, 0, 0, 0, 1, true, 0, 0, 0, true));
 
 		assertFalse(report.passed());
 		assertTrue(report.failedSummary().contains("foreground_p99_ratio"));

@@ -206,6 +206,51 @@ class WorkloadAdmissionTest {
 	}
 
 	@Test
+	void rangePagesUseConfiguredLatencyLimitsAndPublicHardCeilingsForOtherProfiles() {
+		int configuredItems = 2;
+		long configuredBytes = 64;
+		var atConfiguredLimit = rangePage(new RangeBudget(configuredItems, configuredBytes));
+		assertEquals(LATENCY, WorkloadAdmission.resolve(context(LATENCY),
+				atConfiguredLimit,
+				WorkloadAdmission.MAX_LATENCY_ITEMS,
+				WorkloadAdmission.MAX_LATENCY_ENCODED_INPUT_BYTES,
+				configuredItems,
+				configuredBytes));
+
+		for (var overConfigured : List.of(
+				rangePage(new RangeBudget(configuredItems + 1, configuredBytes)),
+				rangePage(new RangeBudget(configuredItems, configuredBytes + 1)))) {
+			assertThrows(RocksDBException.class, () -> WorkloadAdmission.resolve(context(LATENCY),
+					overConfigured,
+					WorkloadAdmission.MAX_LATENCY_ITEMS,
+					WorkloadAdmission.MAX_LATENCY_ENCODED_INPUT_BYTES,
+					configuredItems,
+					configuredBytes));
+		}
+
+		var publicLimit = rangePage(RangeBudget.DEFAULT);
+		for (var profile : List.of(ANALYTICAL, INGEST, BATCH)) {
+			assertEquals(profile, WorkloadAdmission.resolve(context(profile), publicLimit,
+					WorkloadAdmission.MAX_LATENCY_ITEMS,
+					WorkloadAdmission.MAX_LATENCY_ENCODED_INPUT_BYTES,
+					configuredItems,
+					configuredBytes));
+		}
+		for (var abovePublicLimit : List.of(
+				rangePage(new RangeBudget(RangeBudget.DEFAULT_MAX_ITEMS + 1, RangeBudget.DEFAULT_MAX_BYTES)),
+				rangePage(new RangeBudget(RangeBudget.DEFAULT_MAX_ITEMS, RangeBudget.DEFAULT_MAX_BYTES + 1)))) {
+			for (var profile : List.of(ANALYTICAL, INGEST, BATCH)) {
+				assertThrows(RocksDBException.class, () -> WorkloadAdmission.resolve(context(profile),
+						abovePublicLimit,
+						WorkloadAdmission.MAX_LATENCY_ITEMS,
+						WorkloadAdmission.MAX_LATENCY_ENCODED_INPUT_BYTES,
+						configuredItems,
+						configuredBytes));
+			}
+		}
+	}
+
+	@Test
 	void latencyIteratorAdvanceChecksCombinedLimitBelowAtAndAbove() {
 		assertLatencyAllowed(subsequent(0, WorkloadAdmission.MAX_LATENCY_ITERATOR_ADVANCE - 1));
 		assertLatencyAllowed(subsequent(1, WorkloadAdmission.MAX_LATENCY_ITERATOR_ADVANCE - 1));
@@ -372,6 +417,11 @@ class WorkloadAdmissionTest {
 			case BATCH -> RequestContext.batch();
 			default -> throw new IllegalArgumentException("Not a client profile: " + profile);
 		};
+	}
+
+	private static RocksDBAPICommandSingle.GetRangePage<?> rangePage(RangeBudget budget) {
+		return new RocksDBAPICommandSingle.GetRangePage<>(
+				0, 1, EMPTY_KEYS, null, false, null, RequestType.allInRange(), 1_000, budget);
 	}
 
 	private static void assertLatencyAllowed(RocksDBAPICommand<?, ?, ?> command) {
