@@ -18,25 +18,33 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import reactor.core.Disposable;
 
 /**
- * One bounded worker pool with independent workload queues. LATENCY uses EDF;
- * guaranteed-progress profiles use deficit round-robin without a global priority chain.
+ * One hard-bounded worker pool with independent workload queues. LATENCY uses EDF;
+ * guaranteed-progress profiles use byte-cost deficit round-robin.
  */
 final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
-	private static final int MAX_LATENCY_BURST = 8;
-	private static final ThreadLocal<Boolean> EXECUTING = ThreadLocal.withInitial(() -> false);
-	private static final long PRESSURED_BATCH_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
+	static final int MAX_LATENCY_BURST = 8;
+	static final long COST_BYTES = 2L * 1024L * 1024L;
+	static final int MAX_TASK_COST = 16;
+	private static final int MAX_DEFICIT = MAX_TASK_COST;
+	private static final Logger LOG = LoggerFactory.getLogger(ProfiledWorkloadExecutor.class);
+	private static final ThreadLocal<ProfiledWorkloadExecutor> EXECUTING_POOL = new ThreadLocal<>();
 	private static final List<WorkloadProfile> GUARANTEED = List.of(
 			WorkloadProfile.INGEST,
 			WorkloadProfile.CDC,
@@ -49,62 +57,75 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			WorkloadProfile.BATCH, 1);
 
 	private final String poolName;
-	private final int sharedWorkerLimit;
 	private final int workerCount;
 	private final int analyticalLimit;
 	private final EnumMap<WorkloadProfile, Integer> capacities;
+	private final EnumMap<WorkloadProfile, Integer> reservations;
 	private final EnumMap<WorkloadProfile, PriorityQueue<WorkloadTask>> latencyQueues;
 	private final EnumMap<WorkloadProfile, ArrayDeque<WorkloadTask>> queues;
 	private final EnumMap<WorkloadProfile, Integer> active = new EnumMap<>(WorkloadProfile.class);
 	private final EnumMap<WorkloadProfile, Integer> deficit = new EnumMap<>(WorkloadProfile.class);
+	private final EnumMap<RWScheduler.TerminalOutcome, Long> outcomes =
+			new EnumMap<>(RWScheduler.TerminalOutcome.class);
 	private final ReentrantLock lock = new ReentrantLock();
 	private final Condition workAvailable = lock.newCondition();
 	private final List<Thread> workers = new ArrayList<>();
 	private final AtomicLong sequence = new AtomicLong();
-	private final AtomicBoolean storagePressure;
+	private final WorkloadPressureController pressureController;
 	private final @Nullable MeterRegistry registry;
 	private final String databaseName;
 	private final String resourceKind;
+	private final ThreadFactory threadFactory;
 	private volatile boolean shutdown;
 	private volatile boolean terminated;
 	private int startedWorkers;
 	private int latencyBurst;
 	private int guaranteedCursor;
-	private long lastPressuredBatchAdmissionNanos;
+	private boolean guaranteedNeedsQuantum = true;
+	private long acceptedTasks;
+	private long startedTasks;
+	private long completedTasks;
+	private long failedTasks;
 
 	ProfiledWorkloadExecutor(int workerCount,
 			int analyticalLimit,
 			Map<WorkloadProfile, Integer> capacities,
+			Map<WorkloadProfile, Integer> reservations,
 			String poolName,
 			String resourceKind,
-			AtomicBoolean storagePressure,
+			WorkloadPressureController pressureController,
 			@Nullable MeterRegistry registry,
 			String databaseName) {
 		if (workerCount < 1) {
 			throw new IllegalArgumentException("workerCount must be positive");
 		}
+		if (analyticalLimit < 1 || analyticalLimit > workerCount) {
+			throw new IllegalArgumentException("analyticalLimit must be between one and workerCount");
+		}
 		this.poolName = Objects.requireNonNull(poolName, "poolName");
-		this.sharedWorkerLimit = workerCount;
-		// Data pools retain one slot exclusively for CDC. The configured read/write
-		// cap still bounds all non-CDC work; the extra worker cannot take another
-		// profile while that cap is occupied.
-		this.workerCount = capacities.getOrDefault(WorkloadProfile.CDC, 0) > 0
-				? Math.addExact(workerCount, 1)
-				: workerCount;
-		this.analyticalLimit = Math.max(1, Math.min(workerCount, analyticalLimit));
+		this.workerCount = workerCount;
+		this.analyticalLimit = analyticalLimit;
 		this.capacities = new EnumMap<>(WorkloadProfile.class);
+		this.reservations = new EnumMap<>(WorkloadProfile.class);
 		this.latencyQueues = new EnumMap<>(WorkloadProfile.class);
 		this.queues = new EnumMap<>(WorkloadProfile.class);
-		this.storagePressure = Objects.requireNonNull(storagePressure, "storagePressure");
+		this.pressureController = Objects.requireNonNull(pressureController, "pressureController");
 		this.registry = registry;
 		this.databaseName = Objects.requireNonNull(databaseName, "databaseName");
 		this.resourceKind = Objects.requireNonNull(resourceKind, "resourceKind");
+		int reservationTotal = 0;
 		for (var profile : WorkloadProfile.values()) {
 			int capacity = capacities.getOrDefault(profile, 0);
+			int reservation = reservations.getOrDefault(profile, 0);
 			if (capacity < 0) {
 				throw new IllegalArgumentException("Negative queue capacity for " + profile);
 			}
+			if (reservation < 0 || reservation > workerCount || (reservation > 0 && capacity == 0)) {
+				throw new IllegalArgumentException("Invalid reservation for " + profile);
+			}
+			reservationTotal = Math.addExact(reservationTotal, reservation);
 			this.capacities.put(profile, capacity);
+			this.reservations.put(profile, reservation);
 			this.active.put(profile, 0);
 			this.deficit.put(profile, 0);
 			if (profile == WorkloadProfile.LATENCY) {
@@ -115,10 +136,23 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				this.queues.put(profile, new ArrayDeque<>());
 			}
 		}
+		if (reservationTotal > workerCount) {
+			throw new IllegalArgumentException("Reservation sum exceeds workerCount");
+		}
+		for (var outcome : RWScheduler.TerminalOutcome.values()) {
+			outcomes.put(outcome, 0L);
+		}
+		this.threadFactory = new ThreadFactoryBuilder()
+				.setDaemon(false)
+				.setNameFormat(poolName + "-%d")
+				.setUncaughtExceptionHandler(this::uncaughtWorkerFailure)
+				.build();
 		registerGauges();
 	}
 
-	Executor view(WorkloadProfile profile, OperationFamily family, long deadlineEpochMillis) {
+	RWScheduler.WorkloadExecutor view(WorkloadProfile profile,
+			OperationFamily family,
+			long deadlineEpochMillis) {
 		Objects.requireNonNull(profile, "profile");
 		Objects.requireNonNull(family, "family");
 		return new WorkloadExecutorView(this, profile, family, deadlineEpochMillis);
@@ -127,71 +161,91 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	void execute(WorkloadProfile profile,
 			OperationFamily family,
 			long deadlineEpochMillis,
+			long estimatedBytes,
 			Runnable command) {
 		Objects.requireNonNull(command, "command");
-		long nowMillis = System.currentTimeMillis();
-		if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
-			rejection(profile, family, "deadline");
-			throw RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
-					"Workload deadline expired before admission");
-		}
+		int cost = taskCost(estimatedBytes);
+		var terminalActions = new ArrayList<TerminalAction>();
+		RuntimeException admissionFailure = null;
 		lock.lock();
 		try {
-			if (shutdown) {
-				rejection(profile, family, "shutdown");
-				throw new RejectedExecutionException(poolName + " is shutting down");
-			}
-			if (!admitUnderPressure(profile, family)) {
-				rejection(profile, family, "storage_pressure");
-				throw RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
-						"Storage pressure paused " + profile + " " + family);
-			}
-			purgeDisposedUnsafe(profile);
-			if (capacities.get(profile) == 0 || queuedUnsafe(profile) >= capacities.get(profile)) {
-				rejection(profile, family, "queue_full");
-				throw RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
+			long nowMillis = System.currentTimeMillis();
+			purgeTerminalUnsafe(profile, nowMillis, terminalActions);
+			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
+				admissionFailure = deadlineFailure("Workload deadline expired before admission");
+				recordUnacceptedUnsafe(profile,
+						family,
+						RWScheduler.TerminalOutcome.DEADLINE,
+						"deadline",
+						command,
+						admissionFailure,
+						terminalActions);
+			} else if (shutdown) {
+				admissionFailure = new RejectedExecutionException(poolName + " is shutting down");
+				recordUnacceptedUnsafe(profile,
+						family,
+						RWScheduler.TerminalOutcome.SHUTDOWN,
+						"shutdown",
+						command,
+						admissionFailure,
+						terminalActions);
+			} else if (capacities.get(profile) == 0 || queuedUnsafe(profile) >= capacities.get(profile)) {
+				admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 						"Workload queue is full for " + profile + " " + family);
+				recordUnacceptedUnsafe(profile,
+						family,
+						RWScheduler.TerminalOutcome.OVERLOAD,
+						"queue_full",
+						command,
+						admissionFailure,
+						terminalActions);
+			} else {
+				var task = new WorkloadTask(profile,
+						family,
+						deadlineEpochMillis,
+						sequence.getAndIncrement(),
+						System.nanoTime(),
+						cost,
+						command);
+				queueUnsafe(profile).add(task);
+				acceptedTasks++;
+				ensureWorkersStartedUnsafe();
+				workAvailable.signalAll();
 			}
-			var task = new WorkloadTask(profile,
-					family,
-					deadlineEpochMillis,
-					sequence.getAndIncrement(),
-					System.nanoTime(),
-					command);
-			queueUnsafe(profile).add(task);
-			ensureWorkersStartedUnsafe();
-			workAvailable.signal();
 		} finally {
 			lock.unlock();
 		}
+		completeTerminalActions(terminalActions);
+		if (admissionFailure != null) {
+			throw admissionFailure;
+		}
 	}
 
-	private boolean admitUnderPressure(WorkloadProfile profile, OperationFamily family) {
-		if (!storagePressure.get()) {
-			return true;
+	static int taskCost(long estimatedBytes) {
+		if (estimatedBytes < 0L) {
+			throw new IllegalArgumentException("estimatedBytes must not be negative");
 		}
-		if (profile == WorkloadProfile.PHYSICAL_MAINTENANCE) {
-			return false;
+		if (estimatedBytes == 0L) {
+			return 1;
 		}
-		if (profile != WorkloadProfile.BATCH) {
-			return true;
-		}
-		long now = System.nanoTime();
-		if (lastPressuredBatchAdmissionNanos == 0L
-				|| now - lastPressuredBatchAdmissionNanos >= PRESSURED_BATCH_INTERVAL_NANOS) {
-			lastPressuredBatchAdmissionNanos = now;
-			return true;
-		}
-		return false;
+		long cost = 1L + (estimatedBytes - 1L) / COST_BYTES;
+		return (int) Math.max(1L, Math.min(MAX_TASK_COST, cost));
+	}
+
+	private void recordUnacceptedUnsafe(WorkloadProfile profile,
+			OperationFamily family,
+			RWScheduler.TerminalOutcome outcome,
+			String reason,
+			Runnable command,
+			RuntimeException failure,
+			List<TerminalAction> terminalActions) {
+		recordOutcomeUnsafe(profile, family, outcome, reason);
+		terminalActions.add(new TerminalAction(command, failure, outcome));
 	}
 
 	private void ensureWorkersStartedUnsafe() {
 		while (startedWorkers < workerCount) {
-			var worker = new ThreadFactoryBuilder()
-					.setDaemon(false)
-					.setNameFormat(poolName + "-%d")
-					.build()
-					.newThread(this::workerLoop);
+			var worker = threadFactory.newThread(this::workerLoop);
 			startedWorkers++;
 			workers.add(worker);
 			worker.start();
@@ -199,108 +253,260 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void workerLoop() {
-		while (true) {
-			WorkloadTask task;
-			lock.lock();
-			try {
-				while ((task = selectUnsafe()) == null) {
-					if (shutdown && queuedTotalUnsafe() == 0) {
-						workerTerminatedUnsafe();
-						return;
-					}
-					workAvailable.awaitUninterruptibly();
-				}
-				active.put(task.profile(), active.get(task.profile()) + 1);
-			} finally {
-				lock.unlock();
-			}
-			var metrics = metrics(task.profile(), task.family());
-			if (metrics != null) {
-				metrics.queueWait().record(System.nanoTime() - task.enqueuedNanos(), TimeUnit.NANOSECONDS);
-				metrics.quantum().increment();
-			}
-			long executionStart = System.nanoTime();
-			try {
-				EXECUTING.set(true);
-				task.command().run();
-			} catch (Throwable error) {
-				if (error instanceof VirtualMachineError virtualMachineError) {
-					throw virtualMachineError;
-				}
-			} finally {
-				EXECUTING.remove();
-				if (metrics != null) {
-					metrics.execution().record(System.nanoTime() - executionStart, TimeUnit.NANOSECONDS);
-				}
+		try {
+			while (true) {
+				WorkloadTask task = null;
+				var terminalActions = new ArrayList<TerminalAction>();
 				lock.lock();
 				try {
-					active.put(task.profile(), active.get(task.profile()) - 1);
-					workAvailable.signalAll();
+					purgeTerminalUnsafe(System.currentTimeMillis(), terminalActions);
+					if (terminalActions.isEmpty()) {
+						task = selectUnsafe();
+						if (task != null) {
+							active.put(task.profile(), active.get(task.profile()) + 1);
+						} else if (shutdown && queuedTotalUnsafe() == 0) {
+							return;
+						} else {
+							awaitWorkUnsafe();
+						}
+					}
 				} finally {
 					lock.unlock();
 				}
+				completeTerminalActions(terminalActions);
+				if (task != null) {
+					runSelected(task);
+				}
+			}
+		} finally {
+			lock.lock();
+			try {
+				workerTerminatedUnsafe();
+			} finally {
+				lock.unlock();
 			}
 		}
 	}
 
-	static boolean isExecutingTask() {
-		return EXECUTING.get();
+	private void awaitWorkUnsafe() {
+		long waitNanos = Math.min(pressureWaitNanosUnsafe(), deadlineWaitNanosUnsafe());
+		try {
+			if (waitNanos == Long.MAX_VALUE) {
+				workAvailable.await();
+			} else if (waitNanos > 0L) {
+				workAvailable.awaitNanos(waitNanos);
+			}
+		} catch (InterruptedException interrupted) {
+			// shutdownNow interrupts workers to break waits. A stray interrupt is
+			// consumed so it cannot turn the worker into a busy loop.
+		}
+	}
+
+	private long pressureWaitNanosUnsafe() {
+		if (shutdown || queueUnsafe(WorkloadProfile.BATCH).isEmpty()) {
+			return Long.MAX_VALUE;
+		}
+		return pressureController.nanosUntilBatchEligible(System.nanoTime());
+	}
+
+	private long deadlineWaitNanosUnsafe() {
+		long earliestDeadlineMillis = RequestContext.NO_DEADLINE;
+		for (var profile : WorkloadProfile.values()) {
+			for (var task : queueUnsafe(profile)) {
+				earliestDeadlineMillis = Math.min(earliestDeadlineMillis, task.deadlineEpochMillis());
+			}
+		}
+		if (earliestDeadlineMillis == RequestContext.NO_DEADLINE) {
+			return Long.MAX_VALUE;
+		}
+		long remainingMillis = earliestDeadlineMillis - System.currentTimeMillis();
+		return remainingMillis <= 0L ? 0L : TimeUnit.MILLISECONDS.toNanos(remainingMillis);
+	}
+
+	private void runSelected(WorkloadTask task) {
+		var terminalActions = new ArrayList<TerminalAction>(1);
+		boolean run;
+		lock.lock();
+		try {
+			long nowMillis = System.currentTimeMillis();
+			if (isCancelled(task.command())) {
+				terminateUnsafe(task,
+						RWScheduler.TerminalOutcome.CANCELLATION,
+						"cancellation",
+						new CancellationException("Workload submission cancelled before execution"),
+						terminalActions);
+				run = false;
+			} else if (task.deadlineEpochMillis() != RequestContext.NO_DEADLINE
+					&& nowMillis >= task.deadlineEpochMillis()) {
+				terminateUnsafe(task,
+						RWScheduler.TerminalOutcome.DEADLINE,
+						"deadline",
+						deadlineFailure("Workload deadline expired immediately before execution"),
+						terminalActions);
+				run = false;
+			} else {
+				run = terminateUnsafe(task, RWScheduler.TerminalOutcome.RUN, "run", null, terminalActions);
+				if (run) {
+					startedTasks++;
+				}
+			}
+		} finally {
+			lock.unlock();
+		}
+		completeTerminalActions(terminalActions);
+		if (!run) {
+			finishActive(task, false);
+			return;
+		}
+
+		var metrics = metrics(task.profile(), task.family());
+		if (metrics != null) {
+			metrics.queueWait().record(System.nanoTime() - task.enqueuedNanos(), TimeUnit.NANOSECONDS);
+			metrics.quantum().increment();
+		}
+		long executionStart = System.nanoTime();
+		var previousPool = EXECUTING_POOL.get();
+		try {
+			EXECUTING_POOL.set(this);
+			task.command().run();
+		} catch (VirtualMachineError fatal) {
+			throw fatal;
+		} catch (Throwable error) {
+			recordTaskFailure(task, error);
+		} finally {
+			if (previousPool == null) {
+				EXECUTING_POOL.remove();
+			} else {
+				EXECUTING_POOL.set(previousPool);
+			}
+			if (metrics != null) {
+				metrics.execution().record(System.nanoTime() - executionStart, TimeUnit.NANOSECONDS);
+			}
+			finishActive(task, true);
+		}
+	}
+
+	private void finishActive(WorkloadTask task, boolean completed) {
+		lock.lock();
+		try {
+			active.put(task.profile(), active.get(task.profile()) - 1);
+			if (completed) {
+				completedTasks++;
+			}
+			workAvailable.signalAll();
+		} finally {
+			lock.unlock();
+		}
+		if (task.batchPermit() != null) {
+			pressureController.finishBatch(Objects.requireNonNull(task.batchPermit()));
+		}
+	}
+
+	boolean isExecutingTask() {
+		return EXECUTING_POOL.get() == this;
 	}
 
 	private WorkloadTask selectUnsafe() {
-		purgeDisposedUnsafe();
-		var latency = latencyQueues.get(WorkloadProfile.LATENCY);
-		boolean latencyEligible = latency != null && !latency.isEmpty() && belowActiveLimit(WorkloadProfile.LATENCY);
-		boolean guaranteedEligible = hasGuaranteedEligibleUnsafe();
-		if (latencyEligible && (latencyBurst < MAX_LATENCY_BURST || !guaranteedEligible)) {
-			latencyBurst++;
-			return latency.poll();
+		if (activeTotalUnsafe() >= workerCount) {
+			return null;
 		}
-		var guaranteed = selectGuaranteedUnsafe();
+		boolean reservedLatency = hasReservationDeficitUnsafe(WorkloadProfile.LATENCY);
+		boolean reservedGuaranteed = hasGuaranteedReservationDeficitUnsafe();
+		if (reservedLatency || reservedGuaranteed) {
+			if (reservedLatency && (latencyBurst < MAX_LATENCY_BURST || !reservedGuaranteed)) {
+				return selectLatencyUnsafe();
+			}
+			var guaranteed = selectGuaranteedUnsafe(true);
+			if (guaranteed != null) {
+				latencyBurst = 0;
+				return guaranteed;
+			}
+			if (reservedLatency) {
+				return selectLatencyUnsafe();
+			}
+		}
+
+		boolean latencyEligible = isEligibleUnsafe(WorkloadProfile.LATENCY);
+		boolean guaranteedEligible = hasGuaranteedEligibleUnsafe(false);
+		if (latencyEligible && (latencyBurst < MAX_LATENCY_BURST || !guaranteedEligible)) {
+			return selectLatencyUnsafe();
+		}
+		var guaranteed = selectGuaranteedUnsafe(false);
 		if (guaranteed != null) {
 			latencyBurst = 0;
 			return guaranteed;
 		}
 		if (latencyEligible) {
-			latencyBurst++;
-			return latency.poll();
+			return selectLatencyUnsafe();
 		}
 		for (var profile : List.of(WorkloadProfile.CONTROL, WorkloadProfile.PHYSICAL_MAINTENANCE)) {
-			var queue = queues.get(profile);
-			if (queue != null && !queue.isEmpty() && belowActiveLimit(profile)) {
-				return queue.poll();
+			if (isEligibleUnsafe(profile)) {
+				return pollUnsafe(profile);
 			}
 		}
 		return null;
 	}
 
-	private boolean hasGuaranteedEligibleUnsafe() {
+	private WorkloadTask selectLatencyUnsafe() {
+		latencyBurst++;
+		return pollUnsafe(WorkloadProfile.LATENCY);
+	}
+
+	private boolean hasGuaranteedReservationDeficitUnsafe() {
 		for (var profile : GUARANTEED) {
-			var queue = queues.get(profile);
-			if (queue != null && !queue.isEmpty() && belowActiveLimit(profile)) {
+			if (hasReservationDeficitUnsafe(profile) && isEligibleUnsafe(profile)) {
 				return true;
 			}
 		}
 		return false;
 	}
 
-	private WorkloadTask selectGuaranteedUnsafe() {
-		for (int attempts = 0; attempts < GUARANTEED.size() * 2; attempts++) {
+	private boolean hasGuaranteedEligibleUnsafe(boolean reservationOnly) {
+		for (var profile : GUARANTEED) {
+			if ((!reservationOnly || hasReservationDeficitUnsafe(profile)) && isEligibleUnsafe(profile)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private WorkloadTask selectGuaranteedUnsafe(boolean reservationOnly) {
+		int maxAttempts = GUARANTEED.size() * (MAX_TASK_COST + 1);
+		for (int attempts = 0; attempts < maxAttempts; attempts++) {
 			var profile = GUARANTEED.get(guaranteedCursor);
 			var queue = queues.get(profile);
-			if (queue == null || queue.isEmpty() || !belowActiveLimit(profile)) {
+			if (queue == null || queue.isEmpty()) {
 				deficit.put(profile, 0);
 				advanceGuaranteedCursor();
 				continue;
 			}
-			int available = deficit.get(profile);
-			if (available == 0) {
-				available = QUANTA.get(profile);
+			if ((reservationOnly && !hasReservationDeficitUnsafe(profile)) || !isEligibleUnsafe(profile)) {
+				advanceGuaranteedCursor();
+				continue;
 			}
-			var task = queue.poll();
-			available--;
-			deficit.put(profile, available);
-			if (available == 0 || queue.isEmpty()) {
+			if (guaranteedNeedsQuantum) {
+				deficit.put(profile, Math.min(MAX_DEFICIT, deficit.get(profile) + QUANTA.get(profile)));
+				guaranteedNeedsQuantum = false;
+			}
+			var head = queue.peek();
+			if (deficit.get(profile) < head.cost()) {
+				advanceGuaranteedCursor();
+				continue;
+			}
+			if (profile == WorkloadProfile.BATCH) {
+				var permit = pressureController.tryStartBatch(shutdown, System.nanoTime());
+				if (permit == null) {
+					advanceGuaranteedCursor();
+					continue;
+				}
+				head.batchPermit(permit);
+			}
+			var task = queue.remove();
+			deficit.put(profile, deficit.get(profile) - task.cost());
+			if (queue.isEmpty()) {
+				deficit.put(profile, 0);
+				advanceGuaranteedCursor();
+			} else if (deficit.get(profile) < queue.peek().cost()) {
 				advanceGuaranteedCursor();
 			}
 			return task;
@@ -310,22 +516,29 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private void advanceGuaranteedCursor() {
 		guaranteedCursor = (guaranteedCursor + 1) % GUARANTEED.size();
+		guaranteedNeedsQuantum = true;
 	}
 
-	private boolean belowActiveLimit(WorkloadProfile profile) {
+	private WorkloadTask pollUnsafe(WorkloadProfile profile) {
+		return queueUnsafe(profile).remove();
+	}
+
+	private boolean hasReservationDeficitUnsafe(WorkloadProfile profile) {
+		return reservations.get(profile) > active.get(profile) && !queueUnsafe(profile).isEmpty();
+	}
+
+	private boolean isEligibleUnsafe(WorkloadProfile profile) {
+		if (queueUnsafe(profile).isEmpty() || activeTotalUnsafe() >= workerCount) {
+			return false;
+		}
 		if (profile == WorkloadProfile.ANALYTICAL && active.get(profile) >= analyticalLimit) {
 			return false;
 		}
-		if (profile == WorkloadProfile.CDC || capacities.get(WorkloadProfile.CDC) == 0) {
-			return true;
+		if (!shutdown && profile == WorkloadProfile.PHYSICAL_MAINTENANCE && pressureController.isPressured()) {
+			return false;
 		}
-		int activeNonCdc = 0;
-		for (var entry : active.entrySet()) {
-			if (entry.getKey() != WorkloadProfile.CDC) {
-				activeNonCdc += entry.getValue();
-			}
-		}
-		return activeNonCdc < sharedWorkerLimit;
+		return profile != WorkloadProfile.BATCH
+				|| pressureController.canStartBatch(shutdown, System.nanoTime());
 	}
 
 	boolean remove(Executor view, Runnable command) {
@@ -335,7 +548,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return remove(workloadView.profile(), workloadView.family(), command);
 	}
 
-	boolean remove(WorkloadProfile profile, OperationFamily family, Runnable command) {
+	private boolean remove(WorkloadProfile profile, OperationFamily family, Runnable command) {
+		var terminalActions = new ArrayList<TerminalAction>(1);
+		boolean removed = false;
 		lock.lock();
 		try {
 			var iterator = queueUnsafe(profile).iterator();
@@ -343,27 +558,34 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				var task = iterator.next();
 				if (task.family() == family && task.command().equals(command)) {
 					iterator.remove();
-					var metrics = metrics(profile, family);
-					if (metrics != null) {
-						metrics.cancellation().increment();
-					}
-					return true;
+					removed = terminateUnsafe(task,
+							RWScheduler.TerminalOutcome.CANCELLATION,
+							"cancellation",
+							new CancellationException("Workload submission cancelled while queued"),
+							terminalActions);
+					workAvailable.signalAll();
+					break;
 				}
 			}
-			return false;
 		} finally {
 			lock.unlock();
 		}
+		completeTerminalActions(terminalActions);
+		return removed;
 	}
 
 	int queued(WorkloadProfile profile) {
+		var terminalActions = new ArrayList<TerminalAction>();
+		int queued;
 		lock.lock();
 		try {
-			purgeDisposedUnsafe(profile);
-			return queuedUnsafe(profile);
+			purgeTerminalUnsafe(profile, System.currentTimeMillis(), terminalActions);
+			queued = queuedUnsafe(profile);
 		} finally {
 			lock.unlock();
 		}
+		completeTerminalActions(terminalActions);
+		return queued;
 	}
 
 	int active(WorkloadProfile profile) {
@@ -383,26 +605,152 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return workerCount;
 	}
 
+	ExecutorSnapshot snapshot() {
+		var terminalActions = new ArrayList<TerminalAction>();
+		ExecutorSnapshot snapshot;
+		lock.lock();
+		try {
+			purgeTerminalUnsafe(System.currentTimeMillis(), terminalActions);
+			var queuedByProfile = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
+			for (var profile : WorkloadProfile.values()) {
+				queuedByProfile.put(profile, queuedUnsafe(profile));
+			}
+			snapshot = new ExecutorSnapshot(
+					workerCount,
+					queuedTotalUnsafe(),
+					activeTotalUnsafe(),
+					acceptedTasks,
+					startedTasks,
+					completedTasks,
+					failedTasks,
+					Map.copyOf(queuedByProfile),
+					Map.copyOf(active),
+					Map.copyOf(outcomes),
+					workers.stream().map(Thread::getName).toList(),
+					shutdown,
+					terminated);
+		} finally {
+			lock.unlock();
+		}
+		completeTerminalActions(terminalActions);
+		return snapshot;
+	}
+
+	void signalAvailability() {
+		lock.lock();
+		try {
+			workAvailable.signalAll();
+		} finally {
+			lock.unlock();
+		}
+	}
+
 	private int queuedUnsafe(WorkloadProfile profile) {
 		return queueUnsafe(profile).size();
 	}
 
-	private void purgeDisposedUnsafe() {
+	private void purgeTerminalUnsafe(long nowMillis, List<TerminalAction> terminalActions) {
 		for (var profile : WorkloadProfile.values()) {
-			purgeDisposedUnsafe(profile);
+			purgeTerminalUnsafe(profile, nowMillis, terminalActions);
 		}
 	}
 
-	private void purgeDisposedUnsafe(WorkloadProfile profile) {
+	private void purgeTerminalUnsafe(WorkloadProfile profile,
+			long nowMillis,
+			List<TerminalAction> terminalActions) {
 		var iterator = queueUnsafe(profile).iterator();
 		while (iterator.hasNext()) {
 			var task = iterator.next();
-			if (task.command() instanceof Disposable disposable && disposable.isDisposed()) {
+			if (isCancelled(task.command())) {
 				iterator.remove();
-				var taskMetrics = metrics(task.profile(), task.family());
-				if (taskMetrics != null) {
-					taskMetrics.cancellation().increment();
+				terminateUnsafe(task,
+						RWScheduler.TerminalOutcome.CANCELLATION,
+						"cancellation",
+						new CancellationException("Workload submission cancelled while queued"),
+						terminalActions);
+			} else if (task.deadlineEpochMillis() != RequestContext.NO_DEADLINE
+					&& nowMillis >= task.deadlineEpochMillis()) {
+				iterator.remove();
+				terminateUnsafe(task,
+						RWScheduler.TerminalOutcome.DEADLINE,
+						"deadline",
+						deadlineFailure("Workload deadline expired while queued"),
+						terminalActions);
+			}
+		}
+	}
+
+	private boolean terminateUnsafe(WorkloadTask task,
+			RWScheduler.TerminalOutcome outcome,
+			String reason,
+			@Nullable RuntimeException failure,
+			List<TerminalAction> terminalActions) {
+		if (task.outcome() != null) {
+			return false;
+		}
+		task.outcome(outcome);
+		recordOutcomeUnsafe(task.profile(), task.family(), outcome, reason);
+		if (outcome != RWScheduler.TerminalOutcome.RUN) {
+			terminalActions.add(new TerminalAction(task.command(), Objects.requireNonNull(failure), outcome));
+		}
+		return true;
+	}
+
+	private void recordOutcomeUnsafe(WorkloadProfile profile,
+			OperationFamily family,
+			RWScheduler.TerminalOutcome outcome,
+			String reason) {
+		outcomes.put(outcome, outcomes.get(outcome) + 1L);
+		if (registry == null) {
+			return;
+		}
+		registry.counter("rockserver.workload.outcomes",
+				"database", databaseName,
+				"resource", resourceKind,
+				"profile", metricName(profile),
+				"operation", metricName(family),
+				"outcome", metricName(outcome)).increment();
+		if (outcome == RWScheduler.TerminalOutcome.CANCELLATION) {
+			registry.counter("rockserver.workload.cancellations",
+					"database", databaseName,
+					"resource", resourceKind,
+					"profile", metricName(profile),
+					"operation", metricName(family)).increment();
+		} else if (outcome == RWScheduler.TerminalOutcome.DEADLINE
+				|| outcome == RWScheduler.TerminalOutcome.OVERLOAD
+				|| outcome == RWScheduler.TerminalOutcome.SHUTDOWN) {
+			registry.counter("rockserver.workload.rejections",
+					"database", databaseName,
+					"resource", resourceKind,
+					"profile", metricName(profile),
+					"operation", metricName(family),
+					"reason", reason).increment();
+		}
+	}
+
+	private static boolean isCancelled(Runnable command) {
+		return command instanceof Future<?> future && future.isCancelled()
+				|| command instanceof Disposable disposable && disposable.isDisposed();
+	}
+
+	private static RocksDBException deadlineFailure(String message) {
+		return RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED, message);
+	}
+
+	private void completeTerminalActions(List<TerminalAction> terminalActions) {
+		for (var action : terminalActions) {
+			try {
+				if (action.command() instanceof CompletableFuture<?> future) {
+					future.completeExceptionally(action.failure());
+				} else if (action.command() instanceof Future<?> future) {
+					future.cancel(false);
 				}
+				if (action.command() instanceof Disposable disposable && !disposable.isDisposed()) {
+					disposable.dispose();
+				}
+			} catch (Throwable terminalFailure) {
+				recordInfrastructureFailure("Failed to complete " + action.outcome()
+						+ " workload submission in " + poolName, terminalFailure);
 			}
 		}
 	}
@@ -415,19 +763,16 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return total;
 	}
 
-	private java.util.Queue<WorkloadTask> queueUnsafe(WorkloadProfile profile) {
-		return profile == WorkloadProfile.LATENCY ? latencyQueues.get(profile) : queues.get(profile);
+	private int activeTotalUnsafe() {
+		int total = 0;
+		for (var count : active.values()) {
+			total += count;
+		}
+		return total;
 	}
 
-	private void rejection(WorkloadProfile profile, OperationFamily family, String reason) {
-		if (registry != null) {
-			registry.counter("rockserver.workload.rejections",
-					"database", databaseName,
-					"resource", resourceKind,
-					"profile", metricName(profile),
-					"operation", metricName(family),
-					"reason", reason).increment();
-		}
+	private java.util.Queue<WorkloadTask> queueUnsafe(WorkloadProfile profile) {
+		return profile == WorkloadProfile.LATENCY ? latencyQueues.get(profile) : queues.get(profile);
 	}
 
 	private @Nullable TaskMetrics metrics(WorkloadProfile profile, OperationFamily family) {
@@ -441,11 +786,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						"profile", metricName(profile),
 						"operation", metricName(family)),
 				registry.timer("rockserver.workload.execution",
-						"database", databaseName,
-						"resource", resourceKind,
-						"profile", metricName(profile),
-						"operation", metricName(family)),
-				registry.counter("rockserver.workload.cancellations",
 						"database", databaseName,
 						"resource", resourceKind,
 						"profile", metricName(profile),
@@ -475,6 +815,47 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
+	private void recordTaskFailure(WorkloadTask task, Throwable failure) {
+		lock.lock();
+		try {
+			failedTasks++;
+		} finally {
+			lock.unlock();
+		}
+		if (registry != null) {
+			registry.counter("rockserver.workload.failures",
+					"database", databaseName,
+					"resource", resourceKind,
+					"profile", metricName(task.profile()),
+					"operation", metricName(task.family())).increment();
+		}
+		LOG.error("Workload task failed: pool={}, profile={}, operation={}",
+				poolName,
+				task.profile(),
+				task.family(),
+				failure);
+	}
+
+	private void uncaughtWorkerFailure(Thread worker, Throwable failure) {
+		recordInfrastructureFailure("Uncaught workload worker failure: pool=" + poolName
+				+ ", thread=" + worker.getName(), failure);
+	}
+
+	private void recordInfrastructureFailure(String message, Throwable failure) {
+		lock.lock();
+		try {
+			failedTasks++;
+		} finally {
+			lock.unlock();
+		}
+		if (registry != null) {
+			registry.counter("rockserver.workload.worker.failures",
+					"database", databaseName,
+					"resource", resourceKind).increment();
+		}
+		LOG.error(message, failure);
+	}
+
 	private static String metricName(Enum<?> value) {
 		return value.name().toLowerCase(java.util.Locale.ROOT);
 	}
@@ -500,24 +881,35 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	@Override
 	public List<Runnable> shutdownNow() {
+		var terminalActions = new ArrayList<TerminalAction>();
+		var remaining = new ArrayList<Runnable>();
 		lock.lock();
 		try {
 			shutdown = true;
-			var remaining = new ArrayList<Runnable>();
 			for (var profile : WorkloadProfile.values()) {
 				var queue = queueUnsafe(profile);
 				while (!queue.isEmpty()) {
-					remaining.add(queue.remove().command());
+					var task = queue.remove();
+					remaining.add(task.command());
+					terminateUnsafe(task,
+							RWScheduler.TerminalOutcome.SHUTDOWN,
+							"shutdown",
+							new RejectedExecutionException(poolName + " was forced to shut down"),
+							terminalActions);
 				}
 			}
 			for (var worker : workers) {
 				worker.interrupt();
 			}
+			if (startedWorkers == 0) {
+				terminated = true;
+			}
 			workAvailable.signalAll();
-			return remaining;
 		} finally {
 			lock.unlock();
 		}
+		completeTerminalActions(terminalActions);
+		return remaining;
 	}
 
 	@Override
@@ -545,18 +937,18 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private void workerTerminatedUnsafe() {
 		startedWorkers--;
-		if (startedWorkers == 0) {
+		if (startedWorkers == 0 && shutdown) {
 			terminated = true;
 			workAvailable.signalAll();
 		}
 	}
 
-	record WorkloadExecutorView(ProfiledWorkloadExecutor owner,
+	private record WorkloadExecutorView(ProfiledWorkloadExecutor owner,
 			WorkloadProfile profile,
 			OperationFamily family,
-			long deadlineEpochMillis) implements Executor {
+			long deadlineEpochMillis) implements RWScheduler.WorkloadExecutor {
 
-		WorkloadExecutorView {
+		private WorkloadExecutorView {
 			Objects.requireNonNull(owner, "owner");
 			Objects.requireNonNull(profile, "profile");
 			Objects.requireNonNull(family, "family");
@@ -564,21 +956,177 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		@Override
 		public void execute(Runnable command) {
-			owner.execute(profile, family, deadlineEpochMillis, command);
+			long estimatedBytes = command instanceof RWScheduler.EstimatedWork estimatedWork
+					? estimatedWork.estimatedBytes()
+					: 0L;
+			execute(command, estimatedBytes);
+		}
+
+		@Override
+		public void execute(Runnable command, long estimatedBytes) {
+			owner.execute(profile, family, deadlineEpochMillis, estimatedBytes, command);
 		}
 	}
 
-	private record WorkloadTask(WorkloadProfile profile,
-			OperationFamily family,
-			long deadlineEpochMillis,
-			long sequence,
-			long enqueuedNanos,
-			Runnable command) {
+	private static final class WorkloadTask {
+
+		private final WorkloadProfile profile;
+		private final OperationFamily family;
+		private final long deadlineEpochMillis;
+		private final long sequence;
+		private final long enqueuedNanos;
+		private final int cost;
+		private final Runnable command;
+		private @Nullable WorkloadPressureController.BatchPermit batchPermit;
+		private @Nullable RWScheduler.TerminalOutcome outcome;
+
+		private WorkloadTask(WorkloadProfile profile,
+				OperationFamily family,
+				long deadlineEpochMillis,
+				long sequence,
+				long enqueuedNanos,
+				int cost,
+				Runnable command) {
+			this.profile = profile;
+			this.family = family;
+			this.deadlineEpochMillis = deadlineEpochMillis;
+			this.sequence = sequence;
+			this.enqueuedNanos = enqueuedNanos;
+			this.cost = cost;
+			this.command = command;
+		}
+
+		private WorkloadProfile profile() {
+			return profile;
+		}
+
+		private OperationFamily family() {
+			return family;
+		}
+
+		private long deadlineEpochMillis() {
+			return deadlineEpochMillis;
+		}
+
+		private long sequence() {
+			return sequence;
+		}
+
+		private long enqueuedNanos() {
+			return enqueuedNanos;
+		}
+
+		private int cost() {
+			return cost;
+		}
+
+		private Runnable command() {
+			return command;
+		}
+
+		private @Nullable WorkloadPressureController.BatchPermit batchPermit() {
+			return batchPermit;
+		}
+
+		private void batchPermit(WorkloadPressureController.BatchPermit batchPermit) {
+			this.batchPermit = batchPermit;
+		}
+
+		private @Nullable RWScheduler.TerminalOutcome outcome() {
+			return outcome;
+		}
+
+		private void outcome(RWScheduler.TerminalOutcome outcome) {
+			this.outcome = outcome;
+		}
 	}
 
-	private record TaskMetrics(Timer queueWait,
-			Timer execution,
-			Counter cancellation,
-			Counter quantum) {
+	private record TerminalAction(Runnable command,
+			RuntimeException failure,
+			RWScheduler.TerminalOutcome outcome) {
 	}
+
+	private record TaskMetrics(Timer queueWait, Timer execution, Counter quantum) {
+	}
+}
+
+final class WorkloadPressureController {
+
+	private static final long BATCH_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
+	private boolean pressured;
+	private int activeBatches;
+	private long nextBatchNanos = Long.MIN_VALUE;
+	private volatile Runnable notifier = () -> {};
+
+	synchronized boolean isPressured() {
+		return pressured;
+	}
+
+	void setNotifier(Runnable notifier) {
+		this.notifier = Objects.requireNonNull(notifier, "notifier");
+	}
+
+	void setPressured(boolean pressured) {
+		synchronized (this) {
+			this.pressured = pressured;
+			if (!pressured) {
+				nextBatchNanos = Long.MIN_VALUE;
+			}
+		}
+		notifier.run();
+	}
+
+	synchronized boolean canStartBatch(boolean ignorePressure, long nowNanos) {
+		return ignorePressure || !pressured || activeBatches == 0 && nowNanos >= nextBatchNanos;
+	}
+
+	synchronized @Nullable BatchPermit tryStartBatch(boolean ignorePressure, long nowNanos) {
+		if (!canStartBatch(ignorePressure, nowNanos)) {
+			return null;
+		}
+		boolean startedUnderPressure = pressured && !ignorePressure;
+		activeBatches++;
+		return new BatchPermit(startedUnderPressure);
+	}
+
+	void finishBatch(BatchPermit permit) {
+		synchronized (this) {
+			if (activeBatches <= 0) {
+				throw new IllegalStateException("No active BATCH quantum to finish");
+			}
+			activeBatches--;
+			if (pressured && activeBatches == 0 && (permit.startedUnderPressure() || pressured)) {
+				nextBatchNanos = System.nanoTime() + BATCH_INTERVAL_NANOS;
+			}
+		}
+		notifier.run();
+	}
+
+	synchronized long nanosUntilBatchEligible(long nowNanos) {
+		if (!pressured) {
+			return 0L;
+		}
+		if (activeBatches > 0) {
+			return Long.MAX_VALUE;
+		}
+		return Math.max(0L, nextBatchNanos - nowNanos);
+	}
+
+	record BatchPermit(boolean startedUnderPressure) {
+	}
+}
+
+record ExecutorSnapshot(int workerCount,
+		int queuedTasks,
+		int activeTasks,
+		long acceptedTasks,
+		long startedTasks,
+		long completedTasks,
+		long failedTasks,
+		Map<WorkloadProfile, Integer> queuedByProfile,
+		Map<WorkloadProfile, Integer> activeByProfile,
+		Map<RWScheduler.TerminalOutcome, Long> outcomes,
+		List<String> workerThreadNames,
+		boolean shutdown,
+		boolean terminated) {
 }
