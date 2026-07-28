@@ -14,6 +14,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -141,8 +142,13 @@ class RangePerformanceRegressionTest {
 
 	@Test
 	void valueRangeChunksHaveABoundedDecodedByteFootprint() throws Exception {
+		var config = Files.writeString(tempDir.resolve("byte-bounded-range.conf"), """
+				database.parallelism.workload.range-quantum-max-items = 4096
+				database.parallelism.workload.range-quantum-max-bytes = 2MiB
+				database.parallelism.workload.range-quantum-max-duration = PT1S
+				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("byte-bounded-range-db"),
-				"range-byte-bound", null)) {
+				"range-byte-bound", config)) {
 			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var internal = connection.getInternalDB();
 			long columnId = api.createColumn("entries",
@@ -164,8 +170,8 @@ class RangePerformanceRegressionTest {
 
 			assertNotNull(rows);
 			assertEquals(3, rows.size());
-			assertEquals(List.of(2, 1, 0), chunkSizes,
-					"decoded range pages must stop at the 2 MiB soft byte boundary");
+			assertEquals(List.of(1, 1, 1), chunkSizes,
+					"decoded range quanta must never cross the configured 2 MiB boundary");
 		}
 	}
 

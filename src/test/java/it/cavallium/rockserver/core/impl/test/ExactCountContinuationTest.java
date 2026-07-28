@@ -1,19 +1,32 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
@@ -62,7 +75,7 @@ class ExactCountContinuationTest {
 	}
 
 	@Test
-	void cancellationClosesRetainedIteratorAndSnapshotImmediately() throws Exception {
+	void cancellationClosesRetainedIteratorAndSnapshotAfterRunningQuantumFinishes() throws Exception {
 		try (var connection = populatedConnection("snapshot-cancellation")) {
 			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
 			var firstQuantum = new CountDownLatch(1);
@@ -80,9 +93,11 @@ class ExactCountContinuationTest {
 				assertTrue(firstQuantum.await(10, TimeUnit.SECONDS));
 				assertEquals(1, connection.getInternalDB().getRetainedRangeSnapshotCount());
 				assertTrue(count.cancel(false));
+				release.countDown();
 				assertTrue(awaitCondition(
 						() -> connection.getInternalDB().getRetainedRangeSnapshotCount() == 0, 2_000));
 				assertEquals(0, connection.getInternalDB().getActiveRangeCursorCount());
+				assertEquals(0, connection.getInternalDB().getRetainedRangePermitCount());
 			} finally {
 				release.countDown();
 				connection.getInternalDB().setRangeCountChunkObserverForTesting(null);
@@ -92,45 +107,325 @@ class ExactCountContinuationTest {
 
 	@Test
 	void configuredMaximumSnapshotAgeClosesAStalledCount() throws Exception {
-		var property = "it.cavallium.rockserver.workload.max-retained-snapshot-age-ms";
-		var previous = System.getProperty(property);
-		System.setProperty(property, "100");
-		try (var connection = populatedConnection("snapshot-max-age")) {
+		try (var connection = populatedConnection("snapshot-max-age", """
+				database.parallelism.workload.retained-snapshot-maximum-age = PT0.5S
+				database.parallelism.workload.range-quantum-max-items = 64
+				""")) {
 			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
-			var firstQuantum = new CountDownLatch(1);
+			var firstContinuation = new CountDownLatch(1);
 			var release = new CountDownLatch(1);
 			var first = new AtomicBoolean(true);
-			connection.getInternalDB().setRangeCountChunkObserverForTesting(() -> {
+			connection.getInternalDB().setRangeContinuationObserverForTesting(() -> {
 				if (first.compareAndSet(true, false)) {
-					firstQuantum.countDown();
+					firstContinuation.countDown();
 					await(release);
 				}
 			});
 			try {
-				connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+				var count = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
 						0, columnId, null, null, false, RequestType.entriesCount(), Long.MAX_VALUE);
-				assertTrue(firstQuantum.await(10, TimeUnit.SECONDS));
+				assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
+				assertEquals(1, connection.getInternalDB().getRetainedRangeSnapshotCount());
 				assertTrue(awaitCondition(
 						() -> connection.getInternalDB().getRetainedRangeSnapshotCount() == 0, 2_000));
+				release.countDown();
+				assertReadDeadline(count);
+				assertRetainedResourcesClosed(connection);
 			} finally {
 				release.countDown();
-				connection.getInternalDB().setRangeCountChunkObserverForTesting(null);
+				connection.getInternalDB().setRangeContinuationObserverForTesting(null);
 			}
+		}
+	}
+
+	@Test
+	void contextDeadlineExpiresAStalledUnlimitedCount() throws Exception {
+		try (var connection = populatedConnection("snapshot-context-deadline", """
+				database.parallelism.workload.retained-snapshot-maximum-age = PT10S
+				database.parallelism.workload.range-quantum-max-items = 64
+				""")) {
+			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
+			var firstContinuation = new CountDownLatch(1);
+			var release = new CountDownLatch(1);
+			var first = new AtomicBoolean(true);
+			connection.getInternalDB().setRangeContinuationObserverForTesting(() -> {
+				if (first.compareAndSet(true, false)) {
+					firstContinuation.countDown();
+					await(release);
+				}
+			});
+			try {
+				var deadline = RequestContext.analytical(Instant.now().plusMillis(500));
+				var count = connection.getAsyncApi(deadline).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount(), Long.MAX_VALUE);
+				assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
+				assertTrue(awaitCondition(
+						() -> connection.getInternalDB().getRetainedRangeSnapshotCount() == 0, 2_000));
+				release.countDown();
+				assertReadDeadline(count);
+				assertRetainedResourcesClosed(connection);
+			} finally {
+				release.countDown();
+				connection.getInternalDB().setRangeContinuationObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void negativeExactCountTimeoutIsRejectedAndZeroIsAlreadyExpired() throws Exception {
+		try (var connection = populatedConnection("snapshot-invalid-timeout")) {
+			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
+			var negative = assertThrows(RocksDBException.class,
+					() -> connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+							0, columnId, null, null, false, RequestType.entriesCount(), -1));
+			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, negative.getErrorUniqueId());
+
+			var zero = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+					0, columnId, null, null, false, RequestType.entriesCount(), 0);
+			assertReadDeadline(zero);
+			assertRetainedResourcesClosed(connection);
+		}
+	}
+
+	@Test
+	void fifoLimiterKeepsHundredsOfWaitersOutOfTheSchedulerAndSkipsCancelledWaiters() throws Exception {
+		final int waiterCount = 240;
+		try (var connection = populatedConnection("snapshot-fifo", """
+				database.parallelism.workload.retained-analytical-snapshots = 1
+				database.parallelism.workload.retained-snapshot-maximum-age = PT30S
+				database.parallelism.workload.range-quantum-max-items = 1
+				database.parallelism.workload.range-quantum-max-bytes = 1MiB
+				database.parallelism.workload.range-quantum-max-duration = PT1S
+				""", 2)) {
+			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
+			var firstContinuation = new CountDownLatch(1);
+			var release = new CountDownLatch(1);
+			var first = new AtomicBoolean(true);
+			var grantedTickets = new ArrayList<Long>();
+			connection.getInternalDB().setRetainedQueryPermitGrantedObserverForTesting(ticket -> {
+				synchronized (grantedTickets) {
+					grantedTickets.add(ticket);
+				}
+			});
+			connection.getInternalDB().setRangeContinuationObserverForTesting(() -> {
+				if (first.compareAndSet(true, false)) {
+					firstContinuation.countDown();
+					await(release);
+				}
+			});
+			var firstCount = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+			assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
+
+			var waiters = new ArrayList<CompletableFuture<Long>>(waiterCount);
+			for (int i = 0; i < waiterCount; i++) {
+				waiters.add(connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount(), 30_000));
+			}
+			assertTrue(awaitCondition(
+					() -> connection.getInternalDB().getRetainedRangeWaiterCount() == waiterCount, 5_000));
+			assertTrue(awaitCondition(() -> {
+				var snapshot = connection.getScheduler().poolSnapshot(RWScheduler.Pool.READ);
+				return snapshot.queuedTasks() == 0 && snapshot.activeTasks() == 0;
+			}, 5_000));
+			var readPool = connection.getScheduler().poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(0, readPool.queuedTasks(), "permit waiters must not occupy the workload queue");
+			assertEquals(0, readPool.activeTasks(), "continuation handoff must not retain a read worker");
+
+			var expectedTickets = new ArrayList<Long>();
+			expectedTickets.add(0L);
+			for (int i = 0; i < waiters.size(); i++) {
+				if (i % 4 == 0) {
+					assertTrue(waiters.get(i).cancel(false));
+				} else {
+					expectedTickets.add((long) i + 1L);
+				}
+			}
+			release.countDown();
+			assertEquals(2L, firstCount.get(10, TimeUnit.SECONDS));
+			for (var waiter : waiters) {
+				if (!waiter.isCancelled()) {
+					assertEquals(2L, waiter.get(20, TimeUnit.SECONDS));
+				}
+			}
+			synchronized (grantedTickets) {
+				assertEquals(expectedTickets, List.copyOf(grantedTickets));
+			}
+			assertRetainedResourcesClosed(connection);
+		}
+	}
+
+	@Test
+	void permitWaiterExpiresWithoutEnteringTheScheduler() throws Exception {
+		try (var connection = populatedConnection("snapshot-waiter-deadline", """
+				database.parallelism.workload.retained-analytical-snapshots = 1
+				database.parallelism.workload.retained-snapshot-maximum-age = PT30S
+				database.parallelism.workload.range-quantum-max-items = 1
+				""", 2)) {
+			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
+			var firstContinuation = new CountDownLatch(1);
+			var release = new CountDownLatch(1);
+			var first = new AtomicBoolean(true);
+			connection.getInternalDB().setRangeContinuationObserverForTesting(() -> {
+				if (first.compareAndSet(true, false)) {
+					firstContinuation.countDown();
+					await(release);
+				}
+			});
+			try {
+				var active = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+				assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
+				long acceptedBefore = connection.getScheduler()
+						.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
+				var waiting = connection.getAsyncApi(
+						RequestContext.analytical(Instant.now().plusMillis(500))).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount(), Long.MAX_VALUE);
+				assertTrue(awaitCondition(
+						() -> connection.getInternalDB().getRetainedRangeWaiterCount() == 1, 2_000));
+				assertReadDeadline(waiting);
+				assertEquals(0, connection.getInternalDB().getRetainedRangeWaiterCount());
+				assertEquals(acceptedBefore, connection.getScheduler()
+						.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks());
+
+				release.countDown();
+				assertEquals(2L, active.get(10, TimeUnit.SECONDS));
+				assertRetainedResourcesClosed(connection);
+			} finally {
+				release.countDown();
+				connection.getInternalDB().setRangeContinuationObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void configuredCountQuantumMaximumIsAppliedAndConstructionFailureReleasesPermit() throws Exception {
+		try (var connection = populatedConnection("snapshot-configured-quantum", """
+				database.parallelism.workload.range-quantum-max-items = 7
+				database.parallelism.workload.range-quantum-max-bytes = 1MiB
+				database.parallelism.workload.range-quantum-max-duration = PT0.000001S
+				""", 29)) {
+			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
+			var quantumSizes = new ArrayList<Long>();
+			connection.getInternalDB().setRangeCountQuantumItemsObserverForTesting(quantumSizes::add);
+			assertEquals(29L, connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+					0, columnId, null, null, false, RequestType.entriesCount(), 30_000)
+					.get(10, TimeUnit.SECONDS));
+			assertTrue(quantumSizes.size() > 5,
+					"the configured duration must yield before the seven-item ceiling at least once");
+			assertTrue(quantumSizes.stream().allMatch(size -> size > 0L && size <= 7L));
+
+			var missingColumn = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+					0, Long.MAX_VALUE, null, null, false, RequestType.entriesCount(), 30_000);
+			assertThrows(ExecutionException.class, () -> missingColumn.get(10, TimeUnit.SECONDS));
+			assertRetainedResourcesClosed(connection);
+		}
+	}
+
+	@Test
+	void latencyAndCdcProgressBetweenAnalyticalCountQuanta() throws Exception {
+		try (var connection = populatedConnection("snapshot-inter-quantum-progress", """
+				database.parallelism.workload.range-quantum-max-items = 1
+				database.parallelism.workload.range-quantum-max-duration = PT1S
+				""", 2)) {
+			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
+			var firstContinuation = new CountDownLatch(1);
+			var release = new CountDownLatch(1);
+			var first = new AtomicBoolean(true);
+			connection.getInternalDB().setRangeContinuationObserverForTesting(() -> {
+				if (first.compareAndSet(true, false)) {
+					firstContinuation.countDown();
+					await(release);
+				}
+			});
+			try {
+				var count = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+				assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
+				assertTrue(awaitCondition(() -> connection.getScheduler()
+						.poolSnapshot(RWScheduler.Pool.READ).activeTasks() == 0, 5_000));
+				assertEquals(0, connection.getScheduler().poolSnapshot(RWScheduler.Pool.READ).activeTasks());
+
+				var latencyProgress = new CountDownLatch(1);
+				var cdcProgress = new CountDownLatch(1);
+				connection.getScheduler().executor(WorkloadProfile.LATENCY,
+						OperationFamily.POINT_LOOKUP,
+						System.currentTimeMillis() + 5_000L).execute(latencyProgress::countDown);
+				connection.getScheduler().executor(WorkloadProfile.CDC,
+						OperationFamily.WAL_PAGE,
+						RequestContext.NO_DEADLINE).execute(cdcProgress::countDown);
+				assertTrue(latencyProgress.await(5, TimeUnit.SECONDS));
+				assertTrue(cdcProgress.await(5, TimeUnit.SECONDS));
+
+				release.countDown();
+				assertEquals(2L, count.get(10, TimeUnit.SECONDS));
+				assertRetainedResourcesClosed(connection);
+			} finally {
+				release.countDown();
+				connection.getInternalDB().setRangeContinuationObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void shutdownDrainsActiveRetainedQueryAndPermitWaiters() throws Exception {
+		var connection = populatedConnection("snapshot-shutdown", """
+				database.parallelism.workload.retained-analytical-snapshots = 1
+				database.parallelism.workload.retained-snapshot-maximum-age = PT30S
+				database.parallelism.workload.range-quantum-max-items = 1
+				""", 2);
+		var release = new CountDownLatch(1);
+		boolean closed = false;
+		try {
+			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
+			var firstContinuation = new CountDownLatch(1);
+			var first = new AtomicBoolean(true);
+			connection.getInternalDB().setRangeContinuationObserverForTesting(() -> {
+				if (first.compareAndSet(true, false)) {
+					firstContinuation.countDown();
+					await(release);
+				}
+			});
+			connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+			assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
+			for (int i = 0; i < 8; i++) {
+				connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+			}
+			assertTrue(awaitCondition(
+					() -> connection.getInternalDB().getRetainedRangeWaiterCount() == 8, 5_000));
+
+			connection.closeTesting();
+			closed = true;
+			assertRetainedResourcesClosed(connection);
 		} finally {
-			if (previous == null) {
-				System.clearProperty(property);
-			} else {
-				System.setProperty(property, previous);
+			release.countDown();
+			if (!closed) {
+				connection.closeTesting();
 			}
 		}
 	}
 
 	private EmbeddedConnection populatedConnection(String name) throws Exception {
-		var connection = new EmbeddedConnection(tempDir.resolve(name), name, null);
+		return populatedConnection(name, "", INITIAL_ENTRIES);
+	}
+
+	private EmbeddedConnection populatedConnection(String name, String configuration) throws Exception {
+		return populatedConnection(name, configuration, INITIAL_ENTRIES);
+	}
+
+	private EmbeddedConnection populatedConnection(String name, String configuration, int entries) throws Exception {
+		Path config = null;
+		if (!configuration.isBlank()) {
+			config = Files.writeString(tempDir.resolve(name + ".conf"), configuration);
+		}
+		var connection = new EmbeddedConnection(tempDir.resolve(name), name, config);
+		var batch = connection.getSyncApi(RequestContext.batch());
 		var ingest = connection.getSyncApi(RequestContext.ingest());
-		long columnId = ingest.createColumn("entries",
+		long columnId = batch.createColumn("entries",
 				ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-		for (int i = 0; i < INITIAL_ENTRIES; i++) {
+		for (int i = 0; i < entries; i++) {
 			ingest.put(0, columnId, key(i), value(i), RequestType.none());
 		}
 		return connection;
@@ -159,5 +454,18 @@ class ExactCountContinuationTest {
 			Thread.sleep(10L);
 		}
 		return condition.getAsBoolean();
+	}
+
+	private static void assertReadDeadline(CompletableFuture<?> future) throws Exception {
+		var failure = assertThrows(ExecutionException.class, () -> future.get(10, TimeUnit.SECONDS));
+		var rocks = assertInstanceOf(RocksDBException.class, failure.getCause());
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks.getErrorUniqueId());
+	}
+
+	private static void assertRetainedResourcesClosed(EmbeddedConnection connection) throws InterruptedException {
+		assertTrue(awaitCondition(() -> connection.getInternalDB().getActiveRangeCursorCount() == 0
+				&& connection.getInternalDB().getRetainedRangeSnapshotCount() == 0
+				&& connection.getInternalDB().getRetainedRangePermitCount() == 0
+				&& connection.getInternalDB().getRetainedRangeWaiterCount() == 0, 5_000));
 	}
 }
