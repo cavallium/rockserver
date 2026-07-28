@@ -14,6 +14,7 @@ public final class WorkloadBenchmarkSelector {
 
 	public static final double THROUGHPUT_TOLERANCE = 0.05d;
 	public static final double P99_TOLERANCE = 0.10d;
+	public static final int MINIMUM_CANDIDATE = 4;
 	public static final List<WorkloadProfile> ALL_PROFILES = List.of(
 			WorkloadProfile.CONTROL,
 			WorkloadProfile.LATENCY,
@@ -32,8 +33,9 @@ public final class WorkloadBenchmarkSelector {
 			throw new IllegalArgumentException("Candidate bounds must be positive and ordered");
 		}
 		var candidates = new ArrayList<Integer>();
-		int candidate = Integer.highestOneBit(minimum);
-		if (candidate < minimum) {
+		int effectiveMinimum = Math.max(minimum, MINIMUM_CANDIDATE);
+		int candidate = Integer.highestOneBit(effectiveMinimum);
+		if (candidate < effectiveMinimum) {
 			if (candidate >= (1 << 30)) {
 				throw new IllegalArgumentException("Candidate range overflows int powers of two");
 			}
@@ -66,6 +68,7 @@ public final class WorkloadBenchmarkSelector {
 		var seen = new HashSet<Integer>();
 		String datasetFingerprint = measurements.getFirst().datasetFingerprint();
 		String comparisonFingerprint = measurements.getFirst().comparisonFingerprint();
+		String buildId = measurements.getFirst().buildId();
 		String storageLabel = measurements.getFirst().storageLabel();
 		long seed = measurements.getFirst().seed();
 		int previousCandidate = 0;
@@ -74,8 +77,9 @@ public final class WorkloadBenchmarkSelector {
 				throw new IllegalArgumentException(
 						"Selection requires enforced cold-cache hardware results");
 			}
-			if (!isPowerOfTwo(measurement.candidate()) || !seen.add(measurement.candidate())) {
-				throw new IllegalArgumentException("Candidates must be unique powers of two: "
+			if (measurement.candidate() < MINIMUM_CANDIDATE
+					|| !isPowerOfTwo(measurement.candidate()) || !seen.add(measurement.candidate())) {
+				throw new IllegalArgumentException("Candidates must be unique powers of two of at least four: "
 						+ measurement.candidate());
 			}
 			if (previousCandidate != 0 && measurement.candidate() != previousCandidate * 2) {
@@ -84,10 +88,11 @@ public final class WorkloadBenchmarkSelector {
 			previousCandidate = measurement.candidate();
 			if (!datasetFingerprint.equals(measurement.datasetFingerprint())
 					|| !comparisonFingerprint.equals(measurement.comparisonFingerprint())
+					|| !buildId.equals(measurement.buildId())
 					|| !storageLabel.equals(measurement.storageLabel())
 					|| seed != measurement.seed()) {
 				throw new IllegalArgumentException(
-						"Candidates must share dataset, comparison shape, storage label, and seed");
+						"Candidates must share dataset, comparison shape, build ID, storage label, and seed");
 			}
 		}
 
@@ -141,6 +146,7 @@ public final class WorkloadBenchmarkSelector {
 		return new Selection(
 				datasetFingerprint,
 				comparisonFingerprint,
+				buildId,
 				storageLabel,
 				seed,
 				winner.candidate(),
@@ -176,6 +182,7 @@ public final class WorkloadBenchmarkSelector {
 	public record CandidateMeasurement(int candidate,
 			String datasetFingerprint,
 			String comparisonFingerprint,
+			String buildId,
 			String storageLabel,
 			long seed,
 			boolean enforcedHardwareRun,
@@ -189,11 +196,13 @@ public final class WorkloadBenchmarkSelector {
 		public CandidateMeasurement {
 			Objects.requireNonNull(datasetFingerprint, "datasetFingerprint");
 			Objects.requireNonNull(comparisonFingerprint, "comparisonFingerprint");
+			Objects.requireNonNull(buildId, "buildId");
 			Objects.requireNonNull(storageLabel, "storageLabel");
 			Objects.requireNonNull(profiles, "profiles");
-			if (datasetFingerprint.isBlank() || comparisonFingerprint.isBlank() || storageLabel.isBlank()) {
+			if (datasetFingerprint.isBlank() || comparisonFingerprint.isBlank()
+					|| buildId.isBlank() || storageLabel.isBlank()) {
 				throw new IllegalArgumentException(
-						"Dataset fingerprint, comparison fingerprint, and storage label are required");
+						"Dataset fingerprint, comparison fingerprint, build ID, and storage label are required");
 			}
 			if (maximumCdcLag < 0L || maximumRetainedSnapshots < 0L
 					|| maximumStoragePressure < 0L || leakedResources < 0L) {
@@ -206,6 +215,9 @@ public final class WorkloadBenchmarkSelector {
 			}
 			for (var profile : ALL_PROFILES) {
 				Objects.requireNonNull(copy.get(profile), "Missing profile measurement: " + profile);
+			}
+			if (!Double.isFinite(copy.values().stream().mapToDouble(ProfileMeasurement::throughput).sum())) {
+				throw new IllegalArgumentException("Aggregate candidate throughput must be finite");
 			}
 			profiles = Map.copyOf(copy);
 		}
@@ -247,6 +259,7 @@ public final class WorkloadBenchmarkSelector {
 
 	public record Selection(String datasetFingerprint,
 			String comparisonFingerprint,
+			String buildId,
 			String storageLabel,
 			long seed,
 			int winner,

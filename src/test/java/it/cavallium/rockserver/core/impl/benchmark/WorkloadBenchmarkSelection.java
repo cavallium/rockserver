@@ -15,8 +15,8 @@ import java.util.Properties;
 /** Command-line, machine-readable selection over completed seven-profile candidate runs. */
 public final class WorkloadBenchmarkSelection {
 
-	public static final String INPUT_SCHEMA = "rockserver-seven-profile-selection-input-v2";
-	public static final String OUTPUT_SCHEMA = "rockserver-seven-profile-selection-v2";
+	public static final String INPUT_SCHEMA = "rockserver-seven-profile-selection-input-v3";
+	public static final String OUTPUT_SCHEMA = "rockserver-seven-profile-selection-v3";
 
 	private WorkloadBenchmarkSelection() {
 	}
@@ -55,6 +55,7 @@ public final class WorkloadBenchmarkSelection {
 		lines.add("candidate=" + measurement.candidate());
 		lines.add("dataset-fingerprint=" + measurement.datasetFingerprint());
 		lines.add("comparison-fingerprint=" + measurement.comparisonFingerprint());
+		lines.add("build-id=" + measurement.buildId());
 		lines.add("storage-label=" + measurement.storageLabel());
 		lines.add("seed=" + measurement.seed());
 		lines.add("enforced-hardware-run=" + measurement.enforcedHardwareRun());
@@ -105,6 +106,7 @@ public final class WorkloadBenchmarkSelection {
 				Integer.parseInt(required(properties, "candidate")),
 				required(properties, "dataset-fingerprint"),
 				required(properties, "comparison-fingerprint"),
+				required(properties, "build-id"),
 				required(properties, "storage-label"),
 				Long.parseLong(required(properties, "seed")),
 				requiredBoolean(properties, "enforced-hardware-run"),
@@ -124,6 +126,8 @@ public final class WorkloadBenchmarkSelection {
 		appendJsonString(json, selection.datasetFingerprint());
 		json.append(",\n  \"comparison_fingerprint\": ");
 		appendJsonString(json, selection.comparisonFingerprint());
+		json.append(",\n  \"build_id\": ");
+		appendJsonString(json, selection.buildId());
 		json.append(",\n  \"storage_label\": ");
 		appendJsonString(json, selection.storageLabel());
 		json.append(",\n  \"seed\": ").append(selection.seed()).append(',')

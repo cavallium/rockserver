@@ -17,8 +17,11 @@ class WorkloadBenchmarkSelectorTest {
 	@Test
 	void generatesInclusivePowersOfTwo() {
 		assertEquals(List.of(4, 8, 16, 32), WorkloadBenchmarkSelector.powersOfTwo(3, 33));
+		assertEquals(List.of(4, 8), WorkloadBenchmarkSelector.powersOfTwo(1, 8));
 		assertThrows(IllegalArgumentException.class,
 				() -> WorkloadBenchmarkSelector.powersOfTwo(17, 31));
+		assertThrows(IllegalArgumentException.class,
+				() -> WorkloadBenchmarkSelector.powersOfTwo(1, 2));
 	}
 
 	@Test
@@ -54,17 +57,23 @@ class WorkloadBenchmarkSelectorTest {
 		assertEquals(8, selection.winner());
 
 		var differentHost = new WorkloadBenchmarkSelector.CandidateMeasurement(
-				16, "dataset", "comparison", "nvme", 42L, true, true,
+				16, "dataset", "comparison", "build", "nvme", 42L, true, true,
 				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L, 0L);
 		assertThrows(IllegalArgumentException.class,
 				() -> WorkloadBenchmarkSelector.select(List.of(candidate(8, 100, 10_000_000L, true, 0L), differentHost)));
 
 		var differentShape = new WorkloadBenchmarkSelector.CandidateMeasurement(
-				16, "dataset", "different-comparison", "hdd-zfs", 42L, true, true,
+				16, "dataset", "different-comparison", "build", "hdd-zfs", 42L, true, true,
 				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L, 0L);
 		assertThrows(IllegalArgumentException.class,
 				() -> WorkloadBenchmarkSelector.select(List.of(
 						candidate(8, 100, 10_000_000L, true, 0L), differentShape)));
+		var differentBuild = new WorkloadBenchmarkSelector.CandidateMeasurement(
+				16, "dataset", "comparison", "other-build", "hdd-zfs", 42L, true, true,
+				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L, 0L);
+		assertThrows(IllegalArgumentException.class,
+				() -> WorkloadBenchmarkSelector.select(List.of(
+						candidate(8, 100, 10_000_000L, true, 0L), differentBuild)));
 		assertThrows(IllegalArgumentException.class,
 				() -> WorkloadBenchmarkSelector.select(List.of(
 						candidate(4, 100, 10_000_000L, true, 0L),
@@ -92,11 +101,42 @@ class WorkloadBenchmarkSelectorTest {
 		assertTrue(json.contains("\"winner\": 4"));
 		assertTrue(json.contains("\"adjacent_verification_candidates\": [8]"));
 		assertTrue(json.contains("\"comparison_fingerprint\": \"comparison\""));
+		assertTrue(json.contains("\"build_id\": \"build\""));
 
 		String malformed = Files.readString(input)
 				.replace("enforced-hardware-run=true", "enforced-hardware-run=tru");
 		Files.writeString(input, malformed);
 		assertThrows(IllegalArgumentException.class, () -> WorkloadBenchmarkSelection.readSelectionInput(input));
+	}
+
+	@Test
+	void rejectsUnknownHarnessOptionsBeforeTouchingRoot(@TempDir Path temporary) {
+		Path root = temporary.resolve("must-not-be-created");
+		assertThrows(IllegalArgumentException.class, () -> SevenProfileWorkloadBenchmark.main(new String[] {
+				"--root=" + root,
+				"--mesure-seconds=1"
+		}));
+		assertTrue(Files.notExists(root));
+	}
+
+	@Test
+	void rejectsInvalidBaselineBeforeOpeningPreparedRoot(@TempDir Path temporary) throws Exception {
+		Path root = temporary.resolve("must-remain-unopened");
+		Path baseline = temporary.resolve("ingest-baseline.properties");
+		Files.writeString(baseline, "schema=rockserver-ingest-isolated-baseline-v3\n");
+		assertThrows(IllegalArgumentException.class, () -> SevenProfileWorkloadBenchmark.main(new String[] {
+				"--root=" + root,
+				"--candidate=4",
+				"--build-id=" + "d".repeat(40),
+				"--storage-label=hdd-zfs",
+				"--cache-state=cold",
+				"--reuse-prepared=true",
+				"--measure-seconds=3",
+				"--pressure-seconds=1",
+				"--enforce=true",
+				"--ingest-isolated-baseline-file=" + baseline
+		}));
+		assertTrue(Files.notExists(root));
 	}
 
 	private static WorkloadBenchmarkSelector.CandidateMeasurement candidate(int candidate,
@@ -118,6 +158,7 @@ class WorkloadBenchmarkSelectorTest {
 				candidate,
 				"dataset",
 				"comparison",
+				"build",
 				"hdd-zfs",
 				42L,
 				enforcedHardwareRun,

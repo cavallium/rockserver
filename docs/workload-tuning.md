@@ -33,12 +33,14 @@ completed during pressure.
 
 - throughput by profile and by profile/family;
 - queue, execution, and end-to-end p99;
-- rejections, cancellations, and scheduler quantum counts;
+- scheduler rejection/cancellation counters, client-observed rejected/cancelled
+  attempts, deadlines, and scheduler quantum counts;
 - maximum retained snapshots, CDC lag, observed pressure, and queue/active depths;
 - post-run pending operations, transactions, iterators, range cursors, snapshots,
   native-handle leaks, and shutdown status;
-- the deterministic seed, dataset and comparison-shape fingerprints, cache-state
-  assertion, storage label, candidate, and each per-profile SLO verdict;
+- the deterministic seed, exact build ID, dataset and comparison-shape fingerprints,
+  cache-state assertion, storage label, candidate, and each per-profile SLO verdict;
+- the exact isolated INGEST throughput used by the mixed-run acceptance gate;
 - up to the first 32 unexpected error details, rather than only their count.
 
 The queue and execution p99 values come from Rockserver's own
@@ -57,21 +59,23 @@ The candidate SLO gates are intentionally conservative:
 - ANALYTICAL and BATCH continue, and BATCH completes work after injected pressure;
 - injected storage pressure is observed, PHYSICAL work progresses, every profile has
   zero unexpected errors, all logical resources drain, no native handle leaks are
-  detected, and shutdown is clean.
+  detected, intentional cancellation appears in both client outcomes and scheduler
+  metrics, and shutdown is clean.
 
 The LATENCY and ANALYTICAL rows are scheduler-level chat/fallback proxies. They do
 not replace the Yotsuba one-hour canary or prove the end-to-end message path.
 
-## Build a direct-launch classpath
+## Obtain the direct-launch classpath
 
-Run this after the integration worker has merged F, G, and H. This is preparation
-for the opt-in hardware run, not an additional release Maven gate:
+N's consolidated Rockserver Maven gate compiles the harness and writes the test
+runtime classpath into its Surefire reports. Reuse that output after the gate; do
+not invoke Maven again just to launch the hardware harness:
 
 ```bash
-mvn -q -DskipTests test-compile dependency:build-classpath \
-  -Dmdep.outputFile=target/workload-benchmark.classpath
-
-workload_classpath="target/test-classes:target/classes:$(<target/workload-benchmark.classpath)"
+surefire_report="target/surefire-reports/TEST-it.cavallium.rockserver.core.impl.test.GrpcControlCleanupCancellationTest.xml"
+workload_classpath="$(sed -n 's/.*<property name="java.class.path" value="\([^"]*\)".*/\1/p' \
+  "${surefire_report}" | head -n 1)"
+test -n "${workload_classpath}"
 workload_main="it.cavallium.rockserver.core.impl.benchmark.SevenProfileWorkloadBenchmark"
 selector_main="it.cavallium.rockserver.core.impl.benchmark.WorkloadBenchmarkSelection"
 ```
@@ -104,13 +108,17 @@ throughout one comparison.
 Use a separate root for every candidate and for every candidate's isolated INGEST
 baseline. A root is prepared once and reopened once. The preparation process closes
 the database before asking the operator to evict the page cache. The harness never
-drops host caches itself.
+drops host caches itself. Opening a prepared root atomically creates
+`run-attempt.properties`; even an interrupted or failed attempt consumes that root,
+because its database may already have changed.
 
 The following options are the reference comparison shape; do not silently change
 them between candidates:
 
 ```bash
+rockserver_rc_sha="REPLACE_WITH_EXACT_ROCKSERVER_RC_SHA"
 common_options=(
+  "--build-id=${rockserver_rc_sha}"
   "--storage-label=hdd-zfs"
   "--seed=5931033225068892758"
   "--preload-keys=1000000"
@@ -143,6 +151,9 @@ common_options=(
 )
 ```
 
+A rate of zero means unpaced, not disabled. Every producer remains present because
+each worker count must be positive.
+
 For candidate 8, first prepare and close the isolated-baseline root:
 
 ```bash
@@ -172,12 +183,11 @@ java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
   --reuse-prepared=true --cache-state=cold --ingest-baseline-only=true
 ```
 
-Read `throughput` from `ingest-baseline.properties`. Then repeat the prepare,
-hardware verification, and cache eviction workflow with a fresh mixed root:
+Keep the generated `ingest-baseline.properties`. Then repeat the prepare, hardware
+verification, and cache eviction workflow with a fresh mixed root:
 
 ```bash
 candidate_root="/mnt/rockserver-hdd/workload-candidate-8-mixed"
-ingest_baseline="10000.000"
 
 java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
   -cp "${workload_classpath}" "${workload_main}" \
@@ -190,11 +200,14 @@ java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
   -cp "${workload_classpath}" "${workload_main}" \
   "--root=${candidate_root}" --candidate=8 "${common_options[@]}" \
   --reuse-prepared=true --cache-state=cold --enforce=true \
-  "--ingest-isolated-baseline=${ingest_baseline}"
+  "--ingest-isolated-baseline-file=${baseline_root}/ingest-baseline.properties"
 ```
 
-Repeat this exact two-root procedure for every power-of-two candidate. Verify that
-the baseline and mixed outputs have the same dataset and comparison fingerprints.
+The mixed runner validates the baseline schema, exact throughput, zero baseline
+leaks, candidate, build ID, storage/cache labels, and dataset/comparison fingerprints
+before starting. Repeat this exact two-root procedure for every power-of-two candidate.
+Hardware baseline and mixed runs require `--build-id` to be the full lowercase
+40-character Rockserver release-candidate Git SHA.
 Do not reuse a mutated candidate root, mix warm and cold results, merge different
 dataset or comparison fingerprints, or merge results from different storage labels.
 

@@ -40,6 +40,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.SplittableRandom;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -62,14 +63,28 @@ import java.util.stream.Stream;
  */
 public final class SevenProfileWorkloadBenchmark {
 
-	private static final String RESULT_SCHEMA = "rockserver-seven-profile-workload-v2";
-	private static final String DATASET_SCHEMA = "rockserver-seven-profile-dataset-v2";
+	private static final String RESULT_SCHEMA = "rockserver-seven-profile-workload-v3";
+	private static final String DATASET_SCHEMA = "rockserver-seven-profile-dataset-v3";
+	private static final String RUN_ATTEMPT_SCHEMA = "rockserver-seven-profile-run-attempt-v1";
+	private static final String RUN_ATTEMPT_FILE = "run-attempt.properties";
 	private static final String COLUMN_NAME = "seven-profile-workload";
 	private static final String CDC_SUBSCRIPTION = "seven-profile-workload-cdc";
 	private static final long LATENCY_DEADLINE_MILLIS = 5_000L;
 	private static final long FALLBACK_P99_LIMIT_NANOS = TimeUnit.SECONDS.toNanos(1L);
 	private static final long RESOURCE_DRAIN_SECONDS = 30L;
 	private static final int MAX_ERRORS = 32;
+	private static final Set<String> PRINT_CANDIDATE_OPTIONS = Set.of(
+			"print-candidates", "candidate-min", "candidate-max");
+	private static final Set<String> RUN_OPTIONS = Set.of(
+			"root", "database-name", "build-id", "candidate", "storage-label", "cache-state", "seed",
+			"preload-keys", "preload-flush-keys", "value-bytes", "range-width", "write-key-space",
+			"warmup-seconds", "measure-seconds", "pressure-seconds", "cdc-lag-limit",
+			"ingest-isolated-baseline-file", "control-workers", "latency-workers",
+			"analytical-workers", "ingest-workers", "cdc-workers", "batch-workers", "physical-workers",
+			"cancellation-workers", "control-rate", "latency-rate", "analytical-rate", "ingest-rate",
+			"cdc-rate", "batch-rate", "physical-rate", "cancellation-rate", "cdc-max-events",
+			"sample-micros", "max-latency-samples", "write-buffer-size", "direct-io", "spinning",
+			"prepare-only", "reuse-prepared", "ingest-baseline-only", "enforce");
 	private static final Comparator<WorkloadKey> WORKLOAD_KEY_ORDER = Comparator
 			.comparingInt((WorkloadKey key) -> WorkloadBenchmarkSelector.ALL_PROFILES.indexOf(key.profile()))
 			.thenComparing(key -> key.family().name());
@@ -83,16 +98,23 @@ public final class SevenProfileWorkloadBenchmark {
 			return;
 		}
 		var raw = parseArguments(args);
-		if (Boolean.parseBoolean(raw.getOrDefault("print-candidates", "false"))) {
+		if (raw.containsKey("print-candidates")) {
+			validateOptionNames(raw, PRINT_CANDIDATE_OPTIONS);
+			if (!bool(raw, "print-candidates", false)) {
+				throw new IllegalArgumentException("--print-candidates must be true when specified");
+			}
 			printCandidates(integer(raw, "candidate-min", 4), integer(raw, "candidate-max", 64));
 			return;
 		}
 
+		validateOptionNames(raw, RUN_OPTIONS);
 		Options options = Options.parse(raw);
 		System.setProperty("rockserver.core.print-config", "false");
 		System.setProperty("it.cavallium.rockserver.leakdetection", "true");
 		Instant started = Instant.now();
 		long nativeLeaksBefore = RocksLeakDetector.detectedLeakCount();
+		double ingestIsolatedBaseline = options.prepareOnly() || options.ingestBaselineOnly()
+				? 0.0d : loadIngestBaseline(options, datasetFingerprint(options));
 		PreparedDataset dataset = options.reusePrepared()
 				? openPrepared(options)
 				: prepare(options);
@@ -114,10 +136,12 @@ public final class SevenProfileWorkloadBenchmark {
 			}
 			long nativeLeaks = awaitNativeLeakDetection(nativeLeaksBefore);
 			Files.writeString(options.root().resolve("ingest-baseline.properties"),
-					"schema=rockserver-ingest-isolated-baseline-v2\n"
+					"schema=rockserver-ingest-isolated-baseline-v3\n"
 							+ "dataset-fingerprint=" + dataset.fingerprint() + "\n"
 							+ "comparison-fingerprint=" + comparisonFingerprint(options) + "\n"
 							+ "storage-label=" + options.storageLabel() + "\n"
+							+ "cache-state=" + options.cacheState() + "\n"
+							+ "build-id=" + options.buildId() + "\n"
 							+ "candidate=" + options.candidate() + "\n"
 							+ "throughput=" + Double.toString(throughput) + "\n"
 							+ "native-handle-leaks=" + nativeLeaks + "\n",
@@ -128,7 +152,6 @@ public final class SevenProfileWorkloadBenchmark {
 			System.out.println("Isolated INGEST throughput: " + format(throughput) + " operations/s");
 			return;
 		}
-
 		RunSnapshot snapshot = null;
 		Throwable runFailure = null;
 		Throwable closeFailure = null;
@@ -156,7 +179,7 @@ public final class SevenProfileWorkloadBenchmark {
 			throw rethrow(closeFailure);
 		}
 		Objects.requireNonNull(snapshot, "snapshot");
-		var result = finishResult(started, Instant.now(), options, dataset.fingerprint(), snapshot,
+		var result = finishResult(started, Instant.now(), options, dataset.fingerprint(), ingestIsolatedBaseline, snapshot,
 				shutdownClean, nativeLeaks);
 		writeReports(options.root(), result);
 		System.out.println(toMarkdown(result));
@@ -207,8 +230,9 @@ public final class SevenProfileWorkloadBenchmark {
 		}
 		if (Files.exists(root.resolve("results.json")) || Files.exists(root.resolve("results.md"))
 				|| Files.exists(root.resolve("selection-input.properties"))
-				|| Files.exists(root.resolve("ingest-baseline.properties"))) {
-			throw new IllegalArgumentException("Prepared root already contains benchmark results: " + root);
+				|| Files.exists(root.resolve("ingest-baseline.properties"))
+				|| Files.exists(root.resolve(RUN_ATTEMPT_FILE))) {
+			throw new IllegalArgumentException("Prepared root was already consumed by a benchmark attempt: " + root);
 		}
 		Map<String, String> values = readKeyValues(marker);
 		String expectedFingerprint = datasetFingerprint(options);
@@ -219,6 +243,12 @@ public final class SevenProfileWorkloadBenchmark {
 				|| !expectedConfig.equals(Files.readString(config))) {
 			throw new IllegalArgumentException("Prepared dataset, seed, dimensions, or configuration do not match");
 		}
+		Files.writeString(root.resolve(RUN_ATTEMPT_FILE),
+				"schema=" + RUN_ATTEMPT_SCHEMA + "\n"
+						+ "started=" + Instant.now() + "\n"
+						+ "mode=" + (options.ingestBaselineOnly() ? "ingest-baseline" : "mixed") + "\n"
+						+ "comparison-fingerprint=" + comparisonFingerprint(options) + "\n",
+				StandardOpenOption.CREATE_NEW);
 		var connection = new EmbeddedConnection(root.resolve("db"), options.databaseName(), config);
 		long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId(COLUMN_NAME);
 		return new PreparedDataset(connection, columnId, expectedFingerprint);
@@ -229,8 +259,9 @@ public final class SevenProfileWorkloadBenchmark {
 				options.preloadKeys(), options.valueBytes());
 		byte[] value = valueBytes(options.valueBytes(), options.seed());
 		int batchSize = 256;
-		for (int start = 0; start < options.preloadKeys(); start += batchSize) {
-			int end = Math.min(options.preloadKeys(), start + batchSize);
+		long nextFlush = Math.min((long) options.preloadKeys(), options.preloadFlushKeys());
+		for (int start = 0; start < options.preloadKeys();) {
+			int end = (int) Math.min(Math.min((long) start + batchSize, nextFlush), options.preloadKeys());
 			var keys = new ArrayList<Keys>(end - start);
 			var values = new ArrayList<Buf>(end - start);
 			for (int index = start; index < end; index++) {
@@ -238,9 +269,11 @@ public final class SevenProfileWorkloadBenchmark {
 				values.add(Buf.wrap(value));
 			}
 			batch.putMulti(0L, columnId, keys, values, RequestType.none());
-			if (end % options.preloadFlushKeys() == 0 || end == options.preloadKeys()) {
+			if (end == nextFlush) {
 				batch.flush();
+				nextFlush = Math.min((long) options.preloadKeys(), nextFlush + options.preloadFlushKeys());
 			}
+			start = end;
 		}
 	}
 
@@ -261,7 +294,12 @@ public final class SevenProfileWorkloadBenchmark {
 		var batch = connection.getSyncApi(RequestContext.batch());
 		byte[][] writeValues = writeValues(options);
 		List<Keys> cancellationKeys = deterministicKeys(options.preloadKeys(), 256, options.seed() ^ 0x43414e43454cL);
+		Thread pressureThread = null;
+		boolean registryAdded = false;
+		boolean workersStopped = false;
+		Throwable failure = null;
 
+		try {
 		for (int worker = 0; worker < options.controlWorkers(); worker++) {
 			int workerIndex = worker;
 			futures.add(workers.submit(() -> runWorker(control, pressure,
@@ -367,24 +405,14 @@ public final class SevenProfileWorkloadBenchmark {
 		control.releaseWorkers();
 		sleepPhase(options.warmupSeconds(), control.stop());
 		composite.add(meterRegistry);
+		registryAdded = true;
 		control.startMeasurement();
-		Thread pressureThread = Thread.ofPlatform().name("seven-profile-pressure").start(
+		pressureThread = Thread.ofPlatform().name("seven-profile-pressure").start(
 				() -> pressureLoop(connection, control, pressure, options));
 		sleepPhase(options.measureSeconds(), control.stop());
 		long durationNanos = control.stopMeasurement();
-		control.stop().set(true);
-		connection.getScheduler().setStoragePressure(false);
-		pressureThread.interrupt();
-		pressureThread.join(TimeUnit.SECONDS.toMillis(2L));
-		workers.shutdownNow();
-		if (!workers.awaitTermination(RESOURCE_DRAIN_SECONDS, TimeUnit.SECONDS)) {
-			throw new IllegalStateException("Benchmark workers did not terminate");
-		}
-		for (var future : futures) {
-			if (!future.isDone()) {
-				future.cancel(true);
-			}
-		}
+		stopHarnessWorkers(connection, control, workers, futures, pressureThread);
+		workersStopped = true;
 		ResourceSnapshot resources = awaitDrain(connection);
 		return new RunSnapshot(durationNanos,
 				stats.snapshot(durationNanos),
@@ -393,6 +421,26 @@ public final class SevenProfileWorkloadBenchmark {
 				resources,
 				snapshotSchedulerMetrics(meterRegistry),
 				stats.errors());
+		} catch (Throwable caught) {
+			failure = caught;
+			throw rethrow(caught);
+		} finally {
+			try {
+				if (!workersStopped) {
+					stopHarnessWorkers(connection, control, workers, futures, pressureThread);
+				}
+				if (registryAdded) {
+					composite.remove(meterRegistry);
+				}
+				meterRegistry.close();
+			} catch (Throwable cleanupFailure) {
+				if (failure != null) {
+					failure.addSuppressed(cleanupFailure);
+				} else {
+					throw rethrow(cleanupFailure);
+				}
+			}
+		}
 	}
 
 	private static double runIsolatedIngestBaseline(PreparedDataset dataset, Options options) throws Exception {
@@ -403,9 +451,13 @@ public final class SevenProfileWorkloadBenchmark {
 		byte[][] values = writeValues(options);
 		ExecutorService workers = Executors.newFixedThreadPool(options.ingestWorkers(),
 				Thread.ofPlatform().name("isolated-ingest-baseline-", 0).factory());
+		var futures = new ArrayList<java.util.concurrent.Future<?>>();
+		boolean workersStopped = false;
+		Throwable failure = null;
+		try {
 		for (int worker = 0; worker < options.ingestWorkers(); worker++) {
 			int workerIndex = worker;
-			workers.submit(() -> {
+			futures.add(workers.submit(() -> {
 				var sequence = new AtomicLong(workerIndex);
 				runWorker(control, pressure,
 						new WorkloadKey(WorkloadProfile.INGEST, OperationFamily.MUTATION),
@@ -414,7 +466,7 @@ public final class SevenProfileWorkloadBenchmark {
 							ingest.put(0L, dataset.columnId(), key((1L << 60) + value % options.writeKeySpace()),
 									Buf.wrap(values[(int) (value & (values.length - 1))]), RequestType.none());
 						});
-			});
+			}));
 		}
 		control.awaitReady();
 		control.releaseWorkers();
@@ -422,11 +474,8 @@ public final class SevenProfileWorkloadBenchmark {
 		control.startMeasurement();
 		sleepPhase(options.measureSeconds(), control.stop());
 		long durationNanos = control.stopMeasurement();
-		control.stop().set(true);
-		workers.shutdownNow();
-		if (!workers.awaitTermination(RESOURCE_DRAIN_SECONDS, TimeUnit.SECONDS)) {
-			throw new IllegalStateException("Isolated INGEST workers did not terminate");
-		}
+		stopHarnessWorkers(dataset.connection(), control, workers, futures, null);
+		workersStopped = true;
 		ResourceSnapshot resources = awaitDrain(dataset.connection());
 		if (resources.leakedResources() != 0L || !stats.errors().isEmpty()) {
 			throw new IllegalStateException("Isolated INGEST baseline did not drain cleanly: resources="
@@ -438,6 +487,66 @@ public final class SevenProfileWorkloadBenchmark {
 			throw new IllegalStateException("Isolated INGEST baseline made no progress");
 		}
 		return measurement.throughput();
+		} catch (Throwable caught) {
+			failure = caught;
+			throw rethrow(caught);
+		} finally {
+			if (!workersStopped) {
+				try {
+					stopHarnessWorkers(dataset.connection(), control, workers, futures, null);
+				} catch (Throwable cleanupFailure) {
+					if (failure != null) {
+						failure.addSuppressed(cleanupFailure);
+					} else {
+						throw rethrow(cleanupFailure);
+					}
+				}
+			}
+		}
+	}
+
+	private static void stopHarnessWorkers(EmbeddedConnection connection,
+			RunControl control,
+			ExecutorService workers,
+			List<? extends java.util.concurrent.Future<?>> futures,
+			Thread pressureThread) {
+		control.stopMeasuring();
+		control.stop().set(true);
+		control.releaseWorkers();
+		for (var future : futures) {
+			future.cancel(true);
+		}
+		workers.shutdownNow();
+		if (pressureThread != null) {
+			pressureThread.interrupt();
+		}
+		connection.getScheduler().setStoragePressure(false);
+
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(RESOURCE_DRAIN_SECONDS);
+		boolean interrupted = false;
+		while (!workers.isTerminated() && System.nanoTime() < deadline) {
+			try {
+				workers.awaitTermination(Math.max(1L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+			} catch (InterruptedException ignored) {
+				interrupted = true;
+			}
+		}
+		if (pressureThread != null) {
+			while (pressureThread.isAlive() && System.nanoTime() < deadline) {
+				try {
+					pressureThread.join(Math.max(1L,
+							TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())));
+				} catch (InterruptedException ignored) {
+					interrupted = true;
+				}
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
+		if (!workers.isTerminated() || (pressureThread != null && pressureThread.isAlive())) {
+			throw new IllegalStateException("Benchmark workers did not terminate");
+		}
 	}
 
 	private static void runWorker(RunControl control,
@@ -450,6 +559,10 @@ public final class SevenProfileWorkloadBenchmark {
 			control.awaitStart();
 			while (!control.stop().get()) {
 				pacer.awaitNext(control.stop());
+				if (control.stop().get()) {
+					break;
+				}
+				boolean measuringAtStart = control.measuring().get();
 				long started = System.nanoTime();
 				Outcome outcome;
 				String detail = null;
@@ -461,12 +574,12 @@ public final class SevenProfileWorkloadBenchmark {
 					outcome = classify(unwrapped);
 					detail = describe(unwrapped);
 				}
-				if (control.measuring().get()) {
+				if (measuringAtStart && control.measuring().get()) {
 					control.stats().record(key, outcome, System.nanoTime() - started, detail);
 					if (outcome == Outcome.SUCCESS) {
 						pressure.record(key.profile());
 					}
-				} else if (outcome == Outcome.ERROR && !control.stop().get()) {
+				} else if (!measuringAtStart && outcome == Outcome.ERROR && !control.stop().get()) {
 					control.stats().recordWarmupError(key, detail);
 				}
 			}
@@ -527,6 +640,7 @@ public final class SevenProfileWorkloadBenchmark {
 			Instant finished,
 			Options options,
 			String fingerprint,
+			double ingestIsolatedBaseline,
 			RunSnapshot run,
 			boolean shutdownClean,
 			long nativeLeaks) {
@@ -548,6 +662,12 @@ public final class SevenProfileWorkloadBenchmark {
 			long errors = run.operations().entrySet().stream()
 					.filter(entry -> entry.getKey().profile() == profile)
 					.mapToLong(entry -> entry.getValue().errors()).sum();
+			long attemptRejections = run.operations().entrySet().stream()
+					.filter(entry -> entry.getKey().profile() == profile)
+					.mapToLong(entry -> entry.getValue().rejections()).sum();
+			long attemptCancellations = run.operations().entrySet().stream()
+					.filter(entry -> entry.getKey().profile() == profile)
+					.mapToLong(entry -> entry.getValue().cancellations()).sum();
 			long queueP99 = run.schedulerMetrics().entrySet().stream()
 					.filter(entry -> entry.getKey().profile() == profile)
 					.mapToLong(entry -> entry.getValue().queueP99Nanos()).max().orElse(0L);
@@ -563,7 +683,8 @@ public final class SevenProfileWorkloadBenchmark {
 			long quantums = run.schedulerMetrics().entrySet().stream()
 					.filter(entry -> entry.getKey().profile() == profile)
 					.mapToLong(entry -> entry.getValue().quantums()).sum();
-			boolean sloPassed = profileSlo(profile, throughput, endToEndP99, deadlines, errors, run, options);
+			boolean sloPassed = profileSlo(profile, throughput, endToEndP99, deadlines, errors, run,
+					ingestIsolatedBaseline, options);
 			boolean relevant = switch (profile) {
 				case CONTROL, LATENCY, ANALYTICAL, INGEST, CDC -> true;
 				case BATCH, PHYSICAL_MAINTENANCE -> false;
@@ -573,8 +694,17 @@ public final class SevenProfileWorkloadBenchmark {
 					quantums, relevant, sloPassed));
 			checks.add(new Check("profile_" + metricName(profile), sloPassed,
 					"throughput=" + format(throughput) + ", p99_ms=" + formatMillis(endToEndP99)
-							+ ", deadlines=" + deadlines + ", errors=" + errors));
+							+ ", deadlines=" + deadlines + ", attempt_rejections=" + attemptRejections
+							+ ", attempt_cancellations=" + attemptCancellations + ", errors=" + errors));
 		}
+		var cancellationKey = new WorkloadKey(WorkloadProfile.LATENCY, OperationFamily.BOUNDED_FAN_OUT);
+		long attemptCancellations = run.operations().getOrDefault(cancellationKey,
+				new OperationMeasurement(0L, 0L, 0.0d, 0L, 0L, 0L, 0L, 0L)).cancellations();
+		long schedulerCancellations = run.schedulerMetrics().getOrDefault(cancellationKey,
+				new SchedulerMetricValues(0L, 0L, 0L, 0L, 0L)).cancellations();
+		checks.add(new Check("intentional_cancellation_observed",
+				attemptCancellations > 0L && schedulerCancellations > 0L,
+				"attempts=" + attemptCancellations + ", scheduler_metric=" + schedulerCancellations));
 		checks.add(new Check("resources_drained", leakedResources == 0L,
 				"logical=" + run.resources().leakedResources() + ", native=" + nativeLeaks));
 		checks.add(new Check("storage_pressure_observed",
@@ -585,11 +715,11 @@ public final class SevenProfileWorkloadBenchmark {
 				"unexpected_error_count=" + run.errors().size()));
 		boolean runChecksPassed = checks.stream().allMatch(Check::passed);
 		var measurement = new WorkloadBenchmarkSelector.CandidateMeasurement(
-				options.candidate(), fingerprint, comparisonFingerprint(options), options.storageLabel(),
+				options.candidate(), fingerprint, comparisonFingerprint(options), options.buildId(), options.storageLabel(),
 				options.seed(), options.enforce(), runChecksPassed, profiles,
 				run.observation().maximumCdcLag(), run.observation().maximumRetainedSnapshots(),
 				run.observation().maximumStoragePressure(), leakedResources);
-		return new Result(RESULT_SCHEMA, started, finished, options, fingerprint, run, measurement,
+		return new Result(RESULT_SCHEMA, started, finished, options, fingerprint, ingestIsolatedBaseline, run, measurement,
 				List.copyOf(checks), shutdownClean, nativeLeaks);
 	}
 
@@ -599,6 +729,7 @@ public final class SevenProfileWorkloadBenchmark {
 			long deadlines,
 			long errors,
 			RunSnapshot run,
+			double ingestIsolatedBaseline,
 			Options options) {
 		if (throughput <= 0.0d || errors != 0L) {
 			return false;
@@ -608,8 +739,8 @@ public final class SevenProfileWorkloadBenchmark {
 			case LATENCY -> deadlines == 0L && p99Nanos > 0L
 					&& p99Nanos < TimeUnit.MILLISECONDS.toNanos(LATENCY_DEADLINE_MILLIS);
 			case ANALYTICAL -> p99Nanos > 0L && p99Nanos < FALLBACK_P99_LIMIT_NANOS;
-			case INGEST -> options.ingestIsolatedBaseline() <= 0.0d
-					|| throughput >= options.ingestIsolatedBaseline() * 0.95d;
+			case INGEST -> ingestIsolatedBaseline <= 0.0d
+					|| throughput >= ingestIsolatedBaseline * 0.95d;
 			case CDC -> run.observation().cdcLagObserved()
 					&& run.observation().maximumCdcLag() <= options.cdcLagLimit();
 			case BATCH -> !run.pressure().injected()
@@ -737,6 +868,18 @@ public final class SevenProfileWorkloadBenchmark {
 				result.measurement());
 	}
 
+	private static long profileAttemptRejections(RunSnapshot run, WorkloadProfile profile) {
+		return run.operations().entrySet().stream()
+				.filter(entry -> entry.getKey().profile() == profile)
+				.mapToLong(entry -> entry.getValue().rejections()).sum();
+	}
+
+	private static long profileAttemptCancellations(RunSnapshot run, WorkloadProfile profile) {
+		return run.operations().entrySet().stream()
+				.filter(entry -> entry.getKey().profile() == profile)
+				.mapToLong(entry -> entry.getValue().cancellations()).sum();
+	}
+
 	private static String toJson(Result result) {
 		var json = new StringBuilder(16_384);
 		json.append("{\n  \"schema\": ");
@@ -752,10 +895,14 @@ public final class SevenProfileWorkloadBenchmark {
 		appendJsonString(json, result.options().cacheState());
 		json.append(",\n  \"seed\": ").append(result.options().seed())
 				.append(",\n  \"enforced_hardware_run\": ").append(result.options().enforce())
-				.append(",\n  \"dataset_fingerprint\": ");
+				.append(",\n  \"build_id\": ");
+		appendJsonString(json, result.options().buildId());
+		json.append(",\n  \"dataset_fingerprint\": ");
 		appendJsonString(json, result.datasetFingerprint());
 		json.append(",\n  \"comparison_fingerprint\": ");
 		appendJsonString(json, result.measurement().comparisonFingerprint());
+		json.append(",\n  \"ingest_isolated_baseline_throughput\": ")
+				.append(Double.toString(result.ingestIsolatedBaseline()));
 		json.append(",\n  \"duration_ms\": ")
 				.append(TimeUnit.NANOSECONDS.toMillis(result.run().durationNanos()))
 				.append(",\n  \"profiles\": {");
@@ -776,6 +923,10 @@ public final class SevenProfileWorkloadBenchmark {
 					.append(result.run().observation().maximumActive().get(profile))
 					.append(", \"rejections\": ").append(value.rejections())
 					.append(", \"cancellations\": ").append(value.cancellations())
+					.append(", \"attempt_rejections\": ")
+					.append(profileAttemptRejections(result.run(), profile))
+					.append(", \"attempt_cancellations\": ")
+					.append(profileAttemptCancellations(result.run(), profile))
 					.append(", \"quantum_count\": ").append(value.quantumCount())
 					.append(", \"slo_passed\": ").append(value.sloPassed()).append('}');
 		}
@@ -805,6 +956,9 @@ public final class SevenProfileWorkloadBenchmark {
 					.append(", \"end_to_end_p99_nanos\": ").append(operation.p99Nanos())
 					.append(", \"rejections\": ").append(scheduler.rejections())
 					.append(", \"cancellations\": ").append(scheduler.cancellations())
+					.append(", \"attempt_rejections\": ").append(operation.rejections())
+					.append(", \"attempt_cancellations\": ").append(operation.cancellations())
+					.append(", \"deadlines\": ").append(operation.deadlines())
 					.append(", \"quantum_count\": ").append(scheduler.quantums())
 					.append(", \"errors\": ").append(operation.errors()).append('}');
 		}
@@ -858,10 +1012,13 @@ public final class SevenProfileWorkloadBenchmark {
 				.append("- Storage: `").append(result.options().storageLabel()).append("`\n")
 				.append("- Cache state: `").append(result.options().cacheState()).append("`\n")
 				.append("- Enforced hardware run: `").append(result.options().enforce()).append("`\n")
+				.append("- Build ID: `").append(result.options().buildId()).append("`\n")
 				.append("- Seed: `").append(result.options().seed()).append("`\n")
 				.append("- Dataset: `").append(result.datasetFingerprint()).append("`\n")
 				.append("- Comparison shape: `").append(result.measurement().comparisonFingerprint())
-				.append("`\n\n")
+				.append("`\n")
+				.append("- Isolated INGEST baseline: `")
+				.append(format(result.ingestIsolatedBaseline())).append(" operations/s`\n\n")
 				.append("| Profile | Throughput/s | Queue p99 ms | Execution p99 ms | End-to-end p99 ms | Max queued | Max active | Rejected | Cancelled | Quantums | SLO |\n")
 				.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
 		for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
@@ -939,10 +1096,11 @@ public final class SevenProfileWorkloadBenchmark {
 				config-sha256=%s
 				candidate=%d
 				preload-keys=%d
+				preload-flush-keys=%d
 				value-bytes=%d
 				seed=%d
 				""".formatted(DATASET_SCHEMA, fingerprint, sha256(configText), options.candidate(),
-				options.preloadKeys(), options.valueBytes(), options.seed());
+				options.preloadKeys(), options.preloadFlushKeys(), options.valueBytes(), options.seed());
 	}
 
 	private static String datasetFingerprint(Options options) {
@@ -952,9 +1110,10 @@ public final class SevenProfileWorkloadBenchmark {
 	}
 
 	private static String comparisonFingerprint(Options options) {
-		return sha256("rockserver-seven-profile-comparison-v1"
+		return sha256("rockserver-seven-profile-comparison-v2"
 				+ "\ndataset=" + datasetFingerprint(options)
 				+ "\ndatabase-name=" + options.databaseName()
+				+ "\nbuild-id=" + options.buildId()
 				+ "\ncache-state=" + options.cacheState()
 				+ "\nrange-width=" + options.rangeWidth()
 				+ "\nwrite-key-space=" + options.writeKeySpace()
@@ -974,6 +1133,40 @@ public final class SevenProfileWorkloadBenchmark {
 				+ "\nwrite-buffer-size=" + options.writeBufferSize()
 				+ "\ndirect-io=" + options.directIo()
 				+ "\nspinning=" + options.spinning());
+	}
+
+	private static double loadIngestBaseline(Options options, String datasetFingerprint) throws IOException {
+		if (options.ingestIsolatedBaselineFile().isBlank()) {
+			return 0.0d;
+		}
+		Path input = Path.of(options.ingestIsolatedBaselineFile()).toAbsolutePath().normalize();
+		if (!Files.isRegularFile(input)) {
+			throw new IllegalArgumentException("INGEST baseline file does not exist: " + input);
+		}
+		Map<String, String> values = readKeyValues(input);
+		if (!"rockserver-ingest-isolated-baseline-v3".equals(requiredValue(values, "schema"))
+				|| !datasetFingerprint.equals(requiredValue(values, "dataset-fingerprint"))
+				|| !comparisonFingerprint(options).equals(requiredValue(values, "comparison-fingerprint"))
+				|| !options.storageLabel().equals(requiredValue(values, "storage-label"))
+				|| !options.cacheState().equals(requiredValue(values, "cache-state"))
+				|| !options.buildId().equals(requiredValue(values, "build-id"))
+				|| options.candidate() != Integer.parseInt(requiredValue(values, "candidate"))
+				|| Long.parseLong(requiredValue(values, "native-handle-leaks")) != 0L) {
+			throw new IllegalArgumentException("INGEST baseline provenance does not match this candidate run: " + input);
+		}
+		double throughput = Double.parseDouble(requiredValue(values, "throughput"));
+		if (!Double.isFinite(throughput) || throughput <= 0.0d) {
+			throw new IllegalArgumentException("INGEST baseline throughput must be finite and positive: " + input);
+		}
+		return throughput;
+	}
+
+	private static String requiredValue(Map<String, String> values, String key) {
+		String value = values.get(key);
+		if (value == null || value.isBlank()) {
+			throw new IllegalArgumentException("Missing property " + key);
+		}
+		return value;
 	}
 
 	private static Map<String, String> readKeyValues(Path input) throws IOException {
@@ -1114,6 +1307,13 @@ public final class SevenProfileWorkloadBenchmark {
 		return values;
 	}
 
+	private static void validateOptionNames(Map<String, String> values, Set<String> permitted) {
+		List<String> unknown = values.keySet().stream().filter(key -> !permitted.contains(key)).sorted().toList();
+		if (!unknown.isEmpty()) {
+			throw new IllegalArgumentException("Unknown options: " + unknown);
+		}
+	}
+
 	private static void printCandidates(int minimum, int maximum) {
 		List<Integer> candidates = WorkloadBenchmarkSelector.powersOfTwo(minimum, maximum);
 		System.out.println("{\"schema\":\"rockserver-workload-candidates-v1\",\"candidates\":"
@@ -1126,10 +1326,6 @@ public final class SevenProfileWorkloadBenchmark {
 
 	private static long longValue(Map<String, String> values, String name, long defaultValue) {
 		return Long.parseLong(values.getOrDefault(name, Long.toString(defaultValue)));
-	}
-
-	private static double doubleValue(Map<String, String> values, String name, double defaultValue) {
-		return Double.parseDouble(values.getOrDefault(name, Double.toString(defaultValue)));
 	}
 
 	private static boolean bool(Map<String, String> values, String name, boolean defaultValue) {
@@ -1186,11 +1382,13 @@ public final class SevenProfileWorkloadBenchmark {
 
 				Run the cold-cache candidate:
 				  SevenProfileWorkloadBenchmark --root=/mnt/bench/candidate-8 --candidate=8 \\
-				    --storage-label=hdd-zfs --reuse-prepared=true --cache-state=cold --enforce=true \\
-				    --ingest-isolated-baseline=10000
+				    --build-id=<exact-RC-SHA> --storage-label=hdd-zfs \\
+				    --reuse-prepared=true --cache-state=cold --enforce=true \\
+				    --ingest-isolated-baseline-file=/mnt/bench/baseline-8/ingest-baseline.properties
 
 				Use a separately prepared root with --ingest-baseline-only=true to produce the matching
 				ingest-baseline.properties value before the mixed candidate runs.
+				A rate of zero means unpaced; it does not disable that producer.
 
 				Important options (defaults): preload-keys=1000000 preload-flush-keys=50000
 				value-bytes=256 range-width=4096 write-key-space=65536 seed=5931033225068892758
@@ -1292,6 +1490,7 @@ public final class SevenProfileWorkloadBenchmark {
 			Instant finished,
 			Options options,
 			String datasetFingerprint,
+			double ingestIsolatedBaseline,
 			RunSnapshot run,
 			WorkloadBenchmarkSelector.CandidateMeasurement measurement,
 			List<Check> checks,
@@ -1348,6 +1547,10 @@ public final class SevenProfileWorkloadBenchmark {
 			measuring.set(false);
 			measurementStoppedNanos = System.nanoTime();
 			return Math.max(1L, measurementStoppedNanos - measurementStartedNanos);
+		}
+
+		private void stopMeasuring() {
+			measuring.set(false);
 		}
 
 		private AtomicBoolean stop() {
@@ -1640,6 +1843,7 @@ public final class SevenProfileWorkloadBenchmark {
 
 	private record Options(Path root,
 			String databaseName,
+			String buildId,
 			int candidate,
 			String storageLabel,
 			String cacheState,
@@ -1653,7 +1857,7 @@ public final class SevenProfileWorkloadBenchmark {
 			int measureSeconds,
 			int pressureSeconds,
 			long cdcLagLimit,
-			double ingestIsolatedBaseline,
+			String ingestIsolatedBaselineFile,
 			int controlWorkers,
 			int latencyWorkers,
 			int analyticalWorkers,
@@ -1684,8 +1888,11 @@ public final class SevenProfileWorkloadBenchmark {
 		private Options {
 			Objects.requireNonNull(root, "root");
 			Objects.requireNonNull(databaseName, "databaseName");
+			Objects.requireNonNull(buildId, "buildId");
 			Objects.requireNonNull(storageLabel, "storageLabel");
 			Objects.requireNonNull(cacheState, "cacheState");
+			Objects.requireNonNull(ingestIsolatedBaselineFile, "ingestIsolatedBaselineFile");
+			int pressureStartSeconds = Math.max(1, measureSeconds / 3);
 			if ((candidate & (candidate - 1)) != 0 || candidate < 4) {
 				throw new IllegalArgumentException("candidate must be a power of two and at least four");
 			}
@@ -1701,8 +1908,8 @@ public final class SevenProfileWorkloadBenchmark {
 			}
 			if (warmupSeconds < 0 || measureSeconds < 1 || pressureSeconds < 0
 					|| (pressureSeconds > 0 && (long) pressureSeconds * 3L >= (long) measureSeconds * 2L)
-					|| cdcLagLimit < 0L || !Double.isFinite(ingestIsolatedBaseline)
-					|| ingestIsolatedBaseline < 0.0d) {
+					|| (pressureSeconds > 0 && pressureStartSeconds + pressureSeconds >= measureSeconds)
+					|| cdcLagLimit < 0L) {
 				throw new IllegalArgumentException("duration or CDC lag settings are invalid");
 			}
 			if (controlWorkers < 1 || latencyWorkers < 1 || analyticalWorkers < 1 || ingestWorkers < 1
@@ -1720,11 +1927,30 @@ public final class SevenProfileWorkloadBenchmark {
 			if (ingestBaselineOnly && enforce) {
 				throw new IllegalArgumentException("ingest-baseline-only does not run mixed-workload acceptance");
 			}
-			if (enforce && (!reusePrepared || !cacheState.equals("cold") || pressureSeconds <= 0
-					|| storageLabel.equals("ci-structural") || ingestIsolatedBaseline <= 0.0d)) {
-				throw new IllegalArgumentException("enforced hardware runs require a reused cold dataset, a hardware label, "
-						+ "positive pressure duration, and a positive ingest-isolated-baseline");
+			if (prepareOnly && ingestBaselineOnly) {
+				throw new IllegalArgumentException("prepare-only and ingest-baseline-only are mutually exclusive");
 			}
+			if (cacheState.equals("cold") && !reusePrepared) {
+				throw new IllegalArgumentException("cache-state=cold requires reuse-prepared=true");
+			}
+			if (!buildId.matches("[A-Za-z0-9._-]+")) {
+				throw new IllegalArgumentException("build-id must use only letters, digits, dot, underscore, or dash");
+			}
+			if (ingestBaselineOnly && (!reusePrepared || !cacheState.equals("cold")
+					|| storageLabel.equals("ci-structural") || !isFullGitSha(buildId))) {
+				throw new IllegalArgumentException(
+						"ingest-baseline-only requires a full Git SHA, reused cold dataset, and hardware storage label");
+			}
+			if (enforce && (!reusePrepared || !cacheState.equals("cold") || pressureSeconds <= 0
+					|| storageLabel.equals("ci-structural") || !isFullGitSha(buildId)
+					|| ingestIsolatedBaselineFile.isBlank())) {
+				throw new IllegalArgumentException("enforced hardware runs require a reused cold dataset, a hardware label, "
+						+ "full Git SHA, positive pressure duration, and an ingest-isolated-baseline-file");
+			}
+		}
+
+		private static boolean isFullGitSha(String value) {
+			return value.matches("[0-9a-f]{40}");
 		}
 
 		private static Options parse(Map<String, String> values) {
@@ -1734,6 +1960,7 @@ public final class SevenProfileWorkloadBenchmark {
 			}
 			return new Options(Path.of(root),
 					values.getOrDefault("database-name", "seven-profile-workload"),
+					values.getOrDefault("build-id", "unverified"),
 					integer(values, "candidate", 8),
 					values.getOrDefault("storage-label", "ci-structural"),
 					values.getOrDefault("cache-state", "unknown"),
@@ -1747,7 +1974,7 @@ public final class SevenProfileWorkloadBenchmark {
 					integer(values, "measure-seconds", 60),
 					integer(values, "pressure-seconds", 5),
 					longValue(values, "cdc-lag-limit", 100_000L),
-					doubleValue(values, "ingest-isolated-baseline", 0.0d),
+					values.getOrDefault("ingest-isolated-baseline-file", ""),
 					integer(values, "control-workers", 1),
 					integer(values, "latency-workers", 8),
 					integer(values, "analytical-workers", 1),
