@@ -27,6 +27,7 @@ import io.grpc.Status.Code;
 import io.grpc.StatusException;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyServerBuilder;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Metrics;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
@@ -136,8 +137,10 @@ public class GrpcServer extends Server {
 	private final RWScheduler scheduler;
 	private final boolean ownsScheduler;
 	private final @Nullable EmbeddedDB embeddedDatabase;
+	private final MeterRegistry metricsRegistry;
 	private final GrpcGetStrategy grpcGetStrategy;
 	private final MustCompleteOperationTracker mustCompleteOperations = new MustCompleteOperationTracker();
+	private final AtomicLong cancelledMustCompleteOperations = new AtomicLong();
 	private final ConcurrentMap<String, LongAdder> lateProtectedOperationFailures = new ConcurrentHashMap<>();
 
 	private enum ScheduledCancellationPolicy {
@@ -173,19 +176,24 @@ public class GrpcServer extends Server {
 			}
 		}
 
-		private boolean stopAcceptingAndAwait(Duration timeout) throws InterruptedException {
+		private DrainResult stopAcceptingAndAwait(Duration timeout) {
 			long remainingNanos = timeout.toNanos();
 			long deadlineNanos = System.nanoTime() + remainingNanos;
+			boolean interrupted = false;
 			synchronized (monitor) {
 				accepting = false;
 				while (acceptedOperations != 0) {
 					if (remainingNanos <= 0L) {
-						return false;
+						return new DrainResult(false, interrupted);
 					}
-					TimeUnit.NANOSECONDS.timedWait(monitor, remainingNanos);
+					try {
+						TimeUnit.NANOSECONDS.timedWait(monitor, remainingNanos);
+					} catch (InterruptedException _) {
+						interrupted = true;
+					}
 					remainingNanos = deadlineNanos - System.nanoTime();
 				}
-				return true;
+				return new DrainResult(true, interrupted);
 			}
 		}
 
@@ -195,6 +203,10 @@ public class GrpcServer extends Server {
 			}
 		}
 	}
+
+	private record DrainResult(boolean drained, boolean interrupted) {}
+
+	private record AwaitTerminationResult(boolean terminated, boolean interrupted) {}
 
 	private enum GrpcGetStrategy {
 		LEGACY,
@@ -287,7 +299,7 @@ public class GrpcServer extends Server {
 			Throwable error,
 			ContextView context) {
 		lateProtectedOperationFailures.computeIfAbsent(operation, _ -> new LongAdder()).increment();
-		Metrics.counter(LATE_PROTECTED_OPERATION_FAILURE_METRIC, "operation", operation).increment();
+		metricsRegistry.counter(LATE_PROTECTED_OPERATION_FAILURE_METRIC, "operation", operation).increment();
 		GrpcServerImpl.lateErrorHandler(context).accept(error);
 	}
 
@@ -312,6 +324,9 @@ public class GrpcServer extends Server {
 			this.ownsScheduler = true;
 			this.embeddedDatabase = null;
 		}
+		this.metricsRegistry = embeddedDatabase != null
+				? embeddedDatabase.getMetricsRegistry()
+				: Metrics.globalRegistry;
 		this.grpcGetStrategy = GrpcGetStrategy.configured();
 		this.grpc = new GrpcServerImpl(this.getClient());
 		EventLoopGroup elg;
@@ -363,9 +378,19 @@ public class GrpcServer extends Server {
 	}
 
 	@VisibleForTesting
+	public long getCancelledMustCompleteOperationCountForTesting() {
+		return cancelledMustCompleteOperations.get();
+	}
+
+	@VisibleForTesting
 	public long getLateProtectedOperationFailureCountForTesting(String operation) {
 		var failures = lateProtectedOperationFailures.get(operation);
 		return failures == null ? 0L : failures.sum();
+	}
+
+	@VisibleForTesting
+	public RWScheduler getSchedulerForTesting() {
+		return scheduler;
 	}
 
 	@VisibleForTesting
@@ -2187,8 +2212,15 @@ public class GrpcServer extends Server {
 					// gRPC subscriber (which Reactor would otherwise report through onErrorDropped). Protected
 					// cleanup and CDC acknowledgement remain scheduled; cancellation only suppresses their response.
 					sink.onCancel(() -> {
+						boolean firstCancellation;
 						synchronized (emissionLock) {
-							cancelled.set(true);
+							firstCancellation = cancelled.compareAndSet(false, true);
+						}
+						if (!firstCancellation) {
+							return;
+						}
+						if (mustComplete) {
+							cancelledMustCompleteOperations.incrementAndGet();
 						}
 						if (!mustComplete) {
 							if (taskLifecycle != null) {
@@ -2274,7 +2306,14 @@ public class GrpcServer extends Server {
 							}
 						}
 						if (lateError) {
-							lateErrorHandler(sink.contextView()).accept(schedulingError);
+							if (mustComplete) {
+								recordLateProtectedOperationFailure(
+										Objects.requireNonNull(protectedOperation),
+										schedulingError,
+										sink.contextView());
+							} else {
+								lateErrorHandler(sink.contextView()).accept(schedulingError);
+							}
 						}
 					}
 				});
@@ -2689,45 +2728,86 @@ public class GrpcServer extends Server {
 				Duration.ofMinutes(1));
 		var schedulerShutdownTimeout = durationProperty("it.cavallium.rockserver.grpc.server.scheduler-shutdown-timeout-ms",
 				Duration.ofMinutes(2));
+		boolean interrupted = false;
+		IOException closeFailure = null;
 		server.shutdown();
-		try {
-			if (!server.awaitTermination(gracefulShutdownTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
-				server.shutdownNow();
-				if (!server.awaitTermination(forcedShutdownTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
-					LOG.error("GRPC server did not terminate after forced shutdown");
-				}
-			}
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			LOG.error("Server shutdown interrupted", e);
+		var gracefulTermination = awaitTerminationUninterruptibly(server, gracefulShutdownTimeout);
+		interrupted |= gracefulTermination.interrupted();
+		if (!gracefulTermination.terminated()) {
 			server.shutdownNow();
-		}
-		try {
-			if (!mustCompleteOperations.stopAcceptingAndAwait(schedulerShutdownTimeout)) {
-				LOG.error("GRPC server timed out draining {} accepted protected operations",
-						mustCompleteOperations.acceptedOperations());
+			var forcedTermination = awaitTerminationUninterruptibly(server, forcedShutdownTimeout);
+			interrupted |= forcedTermination.interrupted();
+			if (!forcedTermination.terminated()) {
+				LOG.error("GRPC server did not terminate after forced shutdown");
 			}
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			LOG.error("GRPC protected-operation drain interrupted with {} operations remaining",
-					mustCompleteOperations.acceptedOperations(),
-					e);
+		}
+		var protectedDrain = mustCompleteOperations.stopAcceptingAndAwait(schedulerShutdownTimeout);
+		interrupted |= protectedDrain.interrupted();
+		if (!protectedDrain.drained()) {
+			int remaining = mustCompleteOperations.acceptedOperations();
+			LOG.error("GRPC server timed out draining {} accepted protected operations; "
+					+ "its scheduler will not be terminated by this server", remaining);
+			closeFailure = new IOException("Timed out draining " + remaining
+					+ " accepted protected gRPC operations");
 		}
 		try {
 			elg.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync();
 		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			LOG.error("Grpc server event loop shutdown interrupted", e);
+			interrupted = true;
+			LOG.warn("Grpc server event loop shutdown interrupted; continuing to wait", e);
+			elg.terminationFuture().syncUninterruptibly();
 		}
-		if (ownsScheduler) {
-			scheduler.disposeGracefully().timeout(schedulerShutdownTimeout).onErrorResume(ex -> {
-				LOG.error("Grpc server executor shutdown timed out, terminating...", ex);
-				scheduler.dispose();
-				return Mono.empty();
-			}).block();
+		if (ownsScheduler && protectedDrain.drained()) {
+			try {
+				scheduler.disposeGracefully().timeout(schedulerShutdownTimeout).onErrorResume(ex -> {
+					LOG.error("Grpc server executor shutdown timed out, terminating...", ex);
+					scheduler.dispose();
+					return Mono.empty();
+				}).block();
+			} catch (RuntimeException error) {
+				closeFailure = appendCloseFailure(closeFailure,
+						new IOException("Failed to terminate the gRPC scheduler", error));
+			}
 		}
-		super.close();
+		try {
+			super.close();
+		} catch (IOException error) {
+			closeFailure = appendCloseFailure(closeFailure, error);
+		} finally {
+			if (interrupted) {
+				Thread.currentThread().interrupt();
+			}
+		}
+		if (closeFailure != null) {
+			throw closeFailure;
+		}
 		LOG.info("GRPC server shut down.");
+	}
+
+	private static AwaitTerminationResult awaitTerminationUninterruptibly(io.grpc.Server server,
+			Duration timeout) {
+		long remainingNanos = timeout.toNanos();
+		long deadlineNanos = System.nanoTime() + remainingNanos;
+		boolean interrupted = false;
+		do {
+			try {
+				return new AwaitTerminationResult(
+						server.awaitTermination(Math.max(0L, remainingNanos), TimeUnit.NANOSECONDS),
+						interrupted);
+			} catch (InterruptedException _) {
+				interrupted = true;
+				remainingNanos = deadlineNanos - System.nanoTime();
+			}
+		} while (remainingNanos > 0L);
+		return new AwaitTerminationResult(server.isTerminated(), interrupted);
+	}
+
+	private static IOException appendCloseFailure(@Nullable IOException current, IOException additional) {
+		if (current == null) {
+			return additional;
+		}
+		current.addSuppressed(additional);
+		return current;
 	}
 
 	private static Duration durationProperty(String name, Duration defaultValue) {

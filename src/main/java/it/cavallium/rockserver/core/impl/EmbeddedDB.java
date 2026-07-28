@@ -7,6 +7,7 @@ import static it.cavallium.rockserver.core.common.Utils.toBuf;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.util.NamedThreadFactory;
@@ -6553,6 +6554,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Override
 	public RWScheduler getScheduler() {
 		return scheduler;
+	}
+
+	/** Returns the registry used for this database's operational metrics. */
+	public MeterRegistry getMetricsRegistry() {
+		return metrics.getRegistry();
 	}
 
 	private static interface ActionLoggerConsumer {
