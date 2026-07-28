@@ -25,6 +25,35 @@ Heavy exact counts are `ANALYTICAL` when a user or operator waits for the result
 `BATCH` when periodically calculated, exported, or otherwise retryable. A count is
 `LATENCY` only when it uses a bounded metadata estimate such as `estimateNumKeys`.
 
+## Concrete command validation
+
+The family matrix is necessary but not sufficient. Before admission, Rockserver also
+validates the concrete command and rejects these invalid caller/profile combinations:
+
+- `ScanRaw` is `BATCH` only.
+- Streaming `GetRange` is `ANALYTICAL` or `BATCH` only. `LATENCY` and `INGEST`
+  callers must use the bounded page API.
+- `PutBatch`, `MergeBatch`, and `DeleteRange` are `INGEST` or `BATCH` only.
+- Column creation/deletion and merge-operator upload are administrative mutations and
+  are `BATCH` only.
+- `LATENCY` mutations are limited to `Put`, `Delete`, `Merge`, and their fixed
+  `*Multi` forms. A fixed multi-operation contains at most 256 items, and every
+  point or multi-operation contains at most 2 MiB of encoded input. Encoded input is
+  the sum of logical key-component bytes plus mutation value bytes; response size is
+  not part of this admission bound. Transaction commit is not a `LATENCY` point
+  mutation.
+- `LATENCY ExistsMulti` uses the same 256-item and 2-MiB encoded-key ceilings.
+- A `LATENCY` iterator `Subsequent` call has `skip + take <= 4096`.
+- Exact range aggregates are never accepted as `LATENCY` or `INGEST` work.
+
+All thresholds are inclusive. Commands one byte or item above a threshold are rejected
+before scheduler admission. The limits apply only to `LATENCY`; other profiles retain
+their family/command rules and are bounded by their own queue or quantum contracts.
+
+Rollback, failed-update close, iterator close, CDC lifecycle/poll/acknowledgement, and
+physical flush/compaction remain server-owned. Their protected profile is derived from
+the concrete command and cannot be changed by the caller's view context.
+
 ## Decision tree
 
 Apply these rules in order:
