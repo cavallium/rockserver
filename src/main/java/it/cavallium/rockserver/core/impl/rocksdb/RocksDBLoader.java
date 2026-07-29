@@ -31,6 +31,7 @@ public class RocksDBLoader {
 
     static final String WAL_TTL_SECONDS_PROPERTY = "it.cavallium.dbengine.wal.ttl.seconds";
     static final long DEFAULT_WAL_TTL_SECONDS = 24L * 60L * 60L;
+    static final long DEFAULT_WAL_SIZE_LIMIT_MB = 100L * 1024L;
 
     private static final long AUTO_MEMTABLE_MAX_RANGE_DELETION_BYTES_PER_TOMBSTONE = 64L * SizeUnit.KB;
     private static final int AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MIN = 64;
@@ -687,6 +688,7 @@ public class RocksDBLoader {
                     .map(DataSize::longValue)
                     .orElse(0L);
             long walTtlSeconds = resolveWalTtlSeconds(databaseOptions.global());
+            long walSizeLimitMb = resolveWalSizeLimitMb(databaseOptions.global());
 
             options
                     .setDbWriteBufferSize(dbWriteBufferSize)
@@ -694,7 +696,7 @@ public class RocksDBLoader {
                     .setWalBytesPerSync(64 * SizeUnit.MB)
 
                     .setWalTtlSeconds(walTtlSeconds)
-                    .setWalSizeLimitMB(0) // Auto
+                    .setWalSizeLimitMB(walSizeLimitMb)
                     .setMaxTotalWalSize(maxTotalWalSize)
             ;
             long blockCacheSize;
@@ -835,6 +837,18 @@ public class RocksDBLoader {
                             walTtlSeconds));
         }
         return walTtlSeconds;
+    }
+
+    public static long resolveWalSizeLimitMb(GlobalDatabaseConfig globalConfig) throws GestaltException {
+        long walSizeLimitMb = Objects.requireNonNullElse(
+                globalConfig.walSizeLimitMb(), DEFAULT_WAL_SIZE_LIMIT_MB);
+        if (walSizeLimitMb < 0) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(
+                    RocksDBErrorType.CONFIG_ERROR,
+                    "database.global.wal-size-limit-mb must be zero (disabled) or greater, but was "
+                            + walSizeLimitMb);
+        }
+        return walSizeLimitMb;
     }
 
     private static Optional<Path> getWalDir(Path definitiveDbPath, DatabaseConfig databaseOptions)
@@ -982,10 +996,11 @@ public class RocksDBLoader {
                 handles.forEach(refs::add);
 
                 logger.info("Opened RocksDB with effective WAL configuration: "
-                        + "max-total-wal-size=%s (%d bytes), wal-ttl-seconds=%d".formatted(
+                        + "max-total-wal-size=%s (%d bytes), wal-ttl-seconds=%d, wal-size-limit-mb=%d".formatted(
                         new DataSize(rocksdbOptions.maxTotalWalSize()),
                         rocksdbOptions.maxTotalWalSize(),
-                        rocksdbOptions.walTtlSeconds()));
+                        rocksdbOptions.walTtlSeconds(),
+                        rocksdbOptions.walSizeLimitMB()));
 
                 if (logger.isTraceEnabled()) {
                     try {

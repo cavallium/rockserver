@@ -8,6 +8,7 @@ import static org.mockito.Mockito.verify;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,12 @@ class RocksDBLoaderWalConfigTest {
     }
 
     @Test
+    void boundsArchivedWalByDefault() throws Exception {
+        assertEquals(102_400L,
+                RocksDBLoader.resolveWalSizeLimitMb(ConfigParser.parseDefault().global()));
+    }
+
+    @Test
     void typedWalConfigurationReachesNativeOptionsAndStartupDiagnostics(@TempDir Path tempDir)
             throws Exception {
         var logger = mock(Logger.class);
@@ -43,8 +50,10 @@ class RocksDBLoaderWalConfigTest {
         try {
             assertEquals(4L * 1024 * 1024 * 1024, loaded.dbOptions().maxTotalWalSize());
             assertEquals(86_400L, loaded.dbOptions().walTtlSeconds());
+            assertEquals(102_400L, loaded.dbOptions().walSizeLimitMB());
             verify(logger).info("Opened RocksDB with effective WAL configuration: "
-                    + "max-total-wal-size=4GiB (4294967296 bytes), wal-ttl-seconds=86400");
+                    + "max-total-wal-size=4GiB (4294967296 bytes), wal-ttl-seconds=86400, "
+                    + "wal-size-limit-mb=102400");
         } finally {
             loaded.db().close();
             loaded.refs().close();
@@ -66,5 +75,19 @@ class RocksDBLoaderWalConfigTest {
 
         System.setProperty(WAL_TTL_SECONDS_PROPERTY, "not-a-number");
         assertThrows(RocksDBException.class, () -> RocksDBLoader.resolveWalTtlSeconds(global));
+    }
+
+    @Test
+    void archiveSizeLimitAllowsZeroButRejectsNegativeValues(@TempDir Path tempDir) throws Exception {
+        Path disabled = Files.writeString(tempDir.resolve("disabled.conf"),
+                "database.global.wal-size-limit-mb = 0\n");
+        assertEquals(0L,
+                RocksDBLoader.resolveWalSizeLimitMb(ConfigParser.parse(disabled).global()));
+
+        Path invalid = Files.writeString(tempDir.resolve("invalid.conf"),
+                "database.global.wal-size-limit-mb = -1\n");
+        var invalidGlobal = ConfigParser.parse(invalid).global();
+        assertThrows(RocksDBException.class,
+                () -> RocksDBLoader.resolveWalSizeLimitMb(invalidGlobal));
     }
 }

@@ -58,6 +58,7 @@ class ConfigParserBoundaryTest {
 				() -> assertNull(config.global().databaseWriteBufferSize()),
 				() -> assertEquals(new DataSize("4GiB"), config.global().maxTotalWalSize()),
 				() -> assertEquals(86_400L, config.global().walTtlSeconds()),
+				() -> assertEquals(102_400L, config.global().walSizeLimitMb()),
 				() -> assertEquals(Duration.ofSeconds(5), config.global().delayWalFlushDuration()),
 				() -> assertNull(config.global().maxSubcompactions()),
 				() -> assertNull(config.global().maxBackgroundJobs()),
@@ -246,6 +247,7 @@ class ConfigParserBoundaryTest {
 				() -> assertEquals(original.global().maxTotalWalSize(),
 						reparsed.global().maxTotalWalSize()),
 				() -> assertEquals(original.global().walTtlSeconds(), reparsed.global().walTtlSeconds()),
+				() -> assertEquals(original.global().walSizeLimitMb(), reparsed.global().walSizeLimitMb()),
 				() -> assertEquals(original.global().maxSubcompactions(), reparsed.global().maxSubcompactions()),
 				() -> assertEquals(original.global().fallbackColumnOptions().levels().length,
 						reparsed.global().fallbackColumnOptions().levels().length),
@@ -320,6 +322,7 @@ class ConfigParserBoundaryTest {
 				database.global.database-write-buffer-size = 2GiB
 				database.global.max-total-wal-size = 6GiB
 				database.global.wal-ttl-seconds = 43200
+				database.global.wal-size-limit-mb = 2048
 				database.global.block-cache-high-priority-ratio = 0.25
 				""");
 		var original = ConfigParser.parse(custom);
@@ -346,6 +349,7 @@ class ConfigParserBoundaryTest {
 				() -> assertEquals(new DataSize("2GiB"), reparsed.global().databaseWriteBufferSize()),
 				() -> assertEquals(new DataSize("6GiB"), reparsed.global().maxTotalWalSize()),
 				() -> assertEquals(43_200L, reparsed.global().walTtlSeconds()),
+				() -> assertEquals(2_048L, reparsed.global().walSizeLimitMb()),
 				() -> assertEquals(original.global().maxBackgroundJobs(), reparsed.global().maxBackgroundJobs()),
 				() -> assertEquals(0.25d, reparsed.global().blockCacheHighPriorityRatio())
 		);

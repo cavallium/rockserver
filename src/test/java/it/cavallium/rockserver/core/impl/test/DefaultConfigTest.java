@@ -20,5 +20,6 @@ class DefaultConfigTest {
 		Assertions.assertEquals("10TiB", def.global().columnOptions()[0].volumes()[0].targetSize().toString());
 		Assertions.assertEquals(new DataSize("32KiB"), def.global().fallbackColumnOptions().levels()[6].maxDictBytes());
 		Assertions.assertEquals(86_400L, def.global().walTtlSeconds());
+		Assertions.assertEquals(102_400L, def.global().walSizeLimitMb());
 	}
 }

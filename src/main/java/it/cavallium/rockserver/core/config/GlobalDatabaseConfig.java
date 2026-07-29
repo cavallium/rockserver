@@ -48,6 +48,8 @@ public interface GlobalDatabaseConfig {
 
 	@Nullable Long walTtlSeconds() throws GestaltException;
 
+	@Nullable Long walSizeLimitMb() throws GestaltException;
+
 	@Nullable Path tempSstPath() throws GestaltException;
 
 	@Nullable Duration delayWalFlushDuration() throws GestaltException;
