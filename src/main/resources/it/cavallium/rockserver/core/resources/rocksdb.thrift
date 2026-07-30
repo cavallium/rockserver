@@ -223,7 +223,11 @@ service RocksDB {
 
    void put(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
+   void putEnsure(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
+
    void putMulti(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
+
+   void putMultiEnsure(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
    OptionalBinary putGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 

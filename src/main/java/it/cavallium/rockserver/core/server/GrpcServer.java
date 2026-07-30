@@ -782,6 +782,7 @@ public class GrpcServer extends Server {
 
 		private static final long ITERATOR_VALUE_PAGE_SIZE = 64L;
 		private static final long ITERATOR_ADVANCE_STEP_SIZE = 4_096L;
+		private static final int WRITE_ELISION_MULTI_STEP_SIZE = 4_096;
 
 		private final RocksDBConnection client;
 		private final ConcurrentMap<Long, Object> iteratorOperations = new ConcurrentHashMap<>();
@@ -988,6 +989,18 @@ public class GrpcServer extends Server {
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("put", request));
+		}
+
+		@Override
+		public Mono<Empty> putEnsure(PutRequest request) {
+			return executeWrite(request.getContext(), contextualApi -> {
+				contextualApi.put(request.getTransactionOrUpdateId(),
+						request.getColumnId(),
+						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						toBuf(request.getData().getValue()),
+						RequestType.ensure());
+				return Empty.getDefaultInstance();
+			}).transform(this.onErrorMapMonoWithRequestInfo("putEnsure", request));
 		}
 
 		@Override
@@ -1286,6 +1299,13 @@ public class GrpcServer extends Server {
 		}
 
 		@Override
+		public Mono<Empty> putMultiListEnsure(PutMultiListRequest request) {
+			var initialRequest = request.getInitialRequest();
+			var dataFlux = Flux.fromIterable(request.getDataList());
+			return putMultiEnsureDataFlux(initialRequest, dataFlux, "putMultiListEnsure");
+		}
+
+		@Override
 		public Mono<Empty> mergeMulti(Flux<MergeMultiRequest> request) {
 			return request.switchOnFirst((firstSignal, requestsFlux) -> {
 				if (firstSignal.isOnNext()) {
@@ -1434,6 +1454,35 @@ public class GrpcServer extends Server {
 		}
 
 		@Override
+		public Mono<Empty> putMultiEnsure(Flux<PutMultiRequest> request) {
+			return request.switchOnFirst((firstSignal, requestsFlux) -> {
+				if (firstSignal.isOnNext()) {
+					var firstValue = firstSignal.get();
+					assert firstValue != null;
+					if (!firstValue.hasInitialRequest()) {
+						return Mono.<Empty>error(RocksDBException.of(
+								RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "Missing initial request"));
+					}
+					var initialRequest = firstValue.getInitialRequest();
+					var dataFlux = requestsFlux
+							.skip(1)
+							.map(putRequest -> {
+								if (!putRequest.hasData()) {
+									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Multiple initial requests");
+								}
+								return putRequest.getData();
+							});
+					return putMultiEnsureDataFlux(initialRequest, dataFlux, "putMultiEnsure");
+				} else if (firstSignal.isOnComplete()) {
+					return Mono.error(RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, "No initial request"));
+				} else {
+					return requestsFlux;
+				}
+			}).then(Mono.just(Empty.getDefaultInstance()));
+		}
+
+		@Override
 		public Flux<Previous> putMultiGetPrevious(Flux<PutMultiRequest> request) {
 			return putMultiResponseFlux(request, "putMultiGetPrevious", new RequestPrevious<>(), previous -> {
 				var builder = Previous.newBuilder();
@@ -1554,6 +1603,39 @@ public class GrpcServer extends Server {
 								toBuf(data.getValue()),
 								new RequestNothing<>());
 					})
+					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
+					.then(Mono.just(Empty.getDefaultInstance()));
+		}
+
+		private Mono<Empty> putMultiEnsureDataFlux(PutMultiInitialRequest initialRequest,
+				Flux<KV> dataFlux,
+				String requestName) {
+			var context = mapRequestContext(initialRequest.getContext());
+			if (context.profile() == WorkloadProfile.LATENCY) {
+				var contextualApi = client.getAsyncApi(context);
+				return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+						.flatMap(data -> Mono.fromFuture(() -> contextualApi.putMultiAsync(
+								initialRequest.getTransactionOrUpdateId(),
+								initialRequest.getColumnId(),
+								data.stream()
+										.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
+										.toList(),
+								data.stream().map(value -> toBuf(value.getValue())).toList(),
+								RequestType.ensure())))
+						.thenReturn(Empty.getDefaultInstance())
+						.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
+			}
+			var contextualApi = client.getSyncApi(context);
+			return dataFlux
+					.buffer(WRITE_ELISION_MULTI_STEP_SIZE)
+					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+					.doOnNext(data -> contextualApi.putMulti(initialRequest.getTransactionOrUpdateId(),
+							initialRequest.getColumnId(),
+							data.stream()
+									.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
+									.toList(),
+							data.stream().map(value -> toBuf(value.getValue())).toList(),
+							RequestType.ensure()))
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
 		}

@@ -339,6 +339,9 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			if (requestType instanceof RequestNothing) {
 				client.put(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context);
 				return null;
+			} else if (requestType instanceof RequestType.RequestEnsure) {
+				client.putEnsure(transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context);
+				return null;
 			} else if (requestType instanceof RequestPrevious) {
 				return (T) mapOptionalBinary(client.putGetPrevious(
 						transactionOrUpdateId, columnId, mapKeys(keys), mapBuf(value), context));
@@ -413,6 +416,9 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			if (requestType instanceof RequestNothing) {
 				client.putMulti(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context);
 				return Collections.nCopies(keys.size(), null);
+			} else if (requestType instanceof RequestType.RequestEnsure) {
+				client.putMultiEnsure(transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context);
+				return List.of();
 			} else if (requestType instanceof RequestPrevious) {
 				return (List<T>) mapOptionalBinaryList(client.putMultiGetPrevious(
 						transactionOrUpdateId, columnId, mapKeysList(keys), mapBufList(values), context));

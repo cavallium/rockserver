@@ -22,7 +22,8 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		FIRST_AND_LAST(new RequestGetFirstAndLast()),
 		ALL_IN_RANGE(new RequestGetAllInRange()),
 		ENTRIES_COUNT(new RequestEntriesCount()),
-		ALL_IN_RANGE_NO_CACHE(new RequestGetAllInRangeNoCache());
+		ALL_IN_RANGE_NO_CACHE(new RequestGetAllInRangeNoCache()),
+		ENSURE(RequestEnsure.INSTANCE);
 
 		private final RequestType requestType;
 
@@ -103,6 +104,16 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 	@SuppressWarnings("unchecked")
 	static <T> RequestPreviousPresence<T> previousPresence() {
 		return (RequestPreviousPresence<T>) RequestPreviousPresence.INSTANCE;
+	}
+
+	/**
+	 * Ensures that a Put's logical value exists. Eligible non-transactional writes may be elided
+	 * when the RocksDB memory tier proves that the current logical value is equal; all other calls
+	 * retain ordinary Put semantics.
+	 */
+	@SuppressWarnings("unchecked")
+	static <T> RequestEnsure<T> ensure() {
+		return (RequestEnsure<T>) RequestEnsure.INSTANCE;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -239,6 +250,20 @@ public sealed interface RequestType<METHOD_DATA_TYPE, RESULT_TYPE> {
 		@Override
 		public RequestTypeId getRequestTypeId() {
 			return RequestTypeId.PREVIOUS_PRESENCE;
+		}
+	}
+
+	/** Request type returned by {@link #ensure()}. */
+	final class RequestEnsure<T> implements RequestPut<T, Void> {
+
+		private static final RequestEnsure<Object> INSTANCE = new RequestEnsure<>();
+
+		private RequestEnsure() {
+		}
+
+		@Override
+		public RequestTypeId getRequestTypeId() {
+			return RequestTypeId.ENSURE;
 		}
 	}
 

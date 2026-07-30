@@ -355,6 +355,67 @@ database: {
 	}
 
 	@TestAllImplementations
+	void ensurePutAndPutMulti(String name, ConnectionConfig connection) {
+		try (var testDB = new TestDB(db, connection)) {
+			var api = testDB.getAPI();
+
+			Assertions.assertNull(api.put(0, colId, key1, value1, RequestType.ensure()));
+			Assertions.assertNull(api.put(0, colId, key1, value1, RequestType.ensure()));
+			Assertions.assertTrue(api.get(0, colId, key1, RequestType.exists()));
+			if (getHasValues()) {
+				assertSegmentEquals(value1, api.get(0, colId, key1, RequestType.current()));
+				Assertions.assertNull(api.put(0, colId, key1, value2, RequestType.ensure()));
+				assertSegmentEquals(value2, api.get(0, colId, key1, RequestType.current()));
+			}
+
+			var results = api.putMulti(0,
+					colId,
+					List.of(key1, collidingKey1, key2),
+					List.of(value1, value2, value1),
+					RequestType.ensure());
+			Assertions.assertTrue(results.isEmpty(), "Ensure PutMulti must not allocate per-entry results");
+			Assertions.assertTrue(api.get(0, colId, collidingKey1, RequestType.exists()));
+			Assertions.assertTrue(api.get(0, colId, key2, RequestType.exists()));
+
+			var rolledBackKey = getNotFoundKeyI(100);
+			long rollbackTransaction = api.openTransaction(5_000);
+			Assertions.assertTrue(api.putMulti(rollbackTransaction,
+					colId,
+					List.of(rolledBackKey),
+					List.of(value1),
+					RequestType.ensure()).isEmpty());
+			Assertions.assertTrue(api.get(rollbackTransaction, colId, rolledBackKey, RequestType.exists()));
+			Assertions.assertFalse(api.get(0, colId, rolledBackKey, RequestType.exists()));
+			Assertions.assertTrue(api.closeTransaction(rollbackTransaction, false));
+			Assertions.assertFalse(api.get(0, colId, rolledBackKey, RequestType.exists()));
+
+			var committedKey = getNotFoundKeyI(101);
+			long commitTransaction = api.openTransaction(5_000);
+			Assertions.assertTrue(api.putMulti(commitTransaction,
+					colId,
+					List.of(committedKey),
+					List.of(value1),
+					RequestType.ensure()).isEmpty());
+			Assertions.assertFalse(api.get(0, colId, committedKey, RequestType.exists()));
+			Assertions.assertTrue(api.closeTransaction(commitTransaction, true));
+			Assertions.assertTrue(api.get(0, colId, committedKey, RequestType.exists()));
+
+			if (getHasValues()) {
+				var firstUpdatedKey = getNotFoundKeyI(102);
+				var secondUpdatedKey = getNotFoundKeyI(103);
+				var update = api.get(0, colId, firstUpdatedKey, RequestType.forUpdate());
+				Assertions.assertTrue(api.putMulti(update.updateId(),
+						colId,
+						List.of(firstUpdatedKey, secondUpdatedKey),
+						List.of(value1, value2),
+						RequestType.ensure()).isEmpty());
+				Assertions.assertTrue(api.get(0, colId, firstUpdatedKey, RequestType.exists()));
+				Assertions.assertTrue(api.get(0, colId, secondUpdatedKey, RequestType.exists()));
+			}
+		}
+	}
+
+	@TestAllImplementations
 	void putSameBucketDifferentKey(String name, ConnectionConfig connection) {
 		try (var testDB = new TestDB(db, connection)) {
 			var db = testDB.getAPI();

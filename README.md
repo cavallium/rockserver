@@ -63,7 +63,7 @@ are documented in [`docs/workload-tuning.md`](docs/workload-tuning.md).
 ## Fast unary GET
 
 Embedded databases with `database.global.enable-fast-get=true` use the owned
-native GET API from `it.cavallium:rocksdbjni:11.1.2.5`. The public synchronous
+native GET API from `it.cavallium:rocksdbjni:11.1.2.6`. The public synchronous
 API always returns an independent heap `Buf`. Unary gRPC current-value reads may
 instead retain a RocksDB pin only for synchronous response framing; transactions,
 bucketed columns, and proxy backends keep the ordinary implementation.

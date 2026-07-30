@@ -282,6 +282,18 @@ impl RockserverClient {
 		self.client.clone().put(self.contextual_request(req)?).await?;
         Ok(())
     }
+
+    /// Ensures a value exists, eliding the write only when RockServer proves equality from memory.
+    pub async fn put_ensure(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<()> {
+        let req = PutRequest {
+            transaction_or_update_id,
+            column_id,
+            data: Some(Kv { keys, value }),
+            context: Some(self.context.clone()),
+        };
+		self.client.clone().put_ensure(self.contextual_request(req)?).await?;
+        Ok(())
+    }
     
     /// Puts a value and returns the previous value if it existed.
     pub async fn put_get_previous(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
@@ -437,6 +449,36 @@ impl RockserverClient {
         };
 
 		self.client.clone().put_multi(self.contextual_request(request_stream)?).await?;
+        Ok(())
+    }
+
+    /// Streams values to ensure, using RockServer's memory-tier write-elision path when eligible.
+    pub async fn put_multi_ensure(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        items: impl Stream<Item = Kv> + Send + 'static,
+    ) -> Result<()> {
+        let initial = PutMultiRequest {
+            put_multi_request_type: Some(put_multi_request::PutMultiRequestType::InitialRequest(
+                PutMultiInitialRequest {
+                    transaction_or_update_id,
+                    column_id,
+                    context: Some(self.context.clone()),
+                },
+            )),
+        };
+
+        let request_stream = async_stream::stream! {
+            yield initial;
+            for await item in items {
+                yield PutMultiRequest {
+                    put_multi_request_type: Some(put_multi_request::PutMultiRequestType::Data(item)),
+                };
+            }
+        };
+
+		self.client.clone().put_multi_ensure(self.contextual_request(request_stream)?).await?;
         Ok(())
     }
 

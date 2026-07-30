@@ -271,9 +271,12 @@ service RocksDBService {
   rpc getColumnId(GetColumnIdRequest) returns (GetColumnIdResponse);
   rpc estimateNumKeys(EstimateNumKeysRequest) returns (EntriesCount);
   rpc put(PutRequest) returns (google.protobuf.Empty);
+  rpc putEnsure(PutRequest) returns (google.protobuf.Empty);
   rpc putBatch(stream PutBatchRequest) returns (google.protobuf.Empty);
   rpc putMulti(stream PutMultiRequest) returns (google.protobuf.Empty);
+  rpc putMultiEnsure(stream PutMultiRequest) returns (google.protobuf.Empty);
   rpc putMultiList(PutMultiListRequest) returns (google.protobuf.Empty);
+  rpc putMultiListEnsure(PutMultiListRequest) returns (google.protobuf.Empty);
   rpc putGetPrevious(PutRequest) returns (Previous);
   rpc putMultiGetPrevious(stream PutMultiRequest) returns (stream Previous);
   rpc putGetDelta(PutRequest) returns (Delta);

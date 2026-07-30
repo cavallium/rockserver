@@ -56,8 +56,10 @@ import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.math.BigInteger;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -110,6 +112,7 @@ import org.rocksdb.DBOptions;
 import org.rocksdb.DirectSlice;
 import org.rocksdb.FlushOptions;
 import org.rocksdb.ReadOptions;
+import org.rocksdb.ReadTier;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.Snapshot;
@@ -188,6 +191,77 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private enum WriteElisionRequest {
+		ENSURE("ensure"),
+		PREVIOUS_PRESENCE("previous_presence");
+
+		private final String tag;
+
+		WriteElisionRequest(String tag) {
+			this.tag = tag;
+		}
+
+		private static @Nullable WriteElisionRequest from(RequestPut<?, ?> requestType) {
+			if (requestType instanceof RequestType.RequestEnsure<?>) {
+				return ENSURE;
+			}
+			if (requestType instanceof RequestType.RequestPreviousPresence<?>) {
+				return PREVIOUS_PRESENCE;
+			}
+			return null;
+		}
+	}
+
+	private enum WriteElisionDecision {
+		ELIDED("elided"),
+		FALLBACK_NOT_FOUND("fallback_not_found"),
+		FALLBACK_DIFFERENT("fallback_different"),
+		FALLBACK_INCOMPLETE("fallback_incomplete"),
+		BYPASS_OVERSIZED("bypass_oversized"),
+		BYPASS_WRITER("bypass_writer");
+
+		private final String tag;
+
+		WriteElisionDecision(String tag) {
+			this.tag = tag;
+		}
+	}
+
+	private static final class PhysicalKey {
+
+		private final byte[] bytes;
+		private final int hashCode;
+
+		private PhysicalKey(byte[] bytes) {
+			this.bytes = bytes;
+			this.hashCode = Arrays.hashCode(bytes);
+		}
+
+		@Override
+		public boolean equals(Object other) {
+			return this == other || other instanceof PhysicalKey key && Arrays.equals(bytes, key.bytes);
+		}
+
+		@Override
+		public int hashCode() {
+			return hashCode;
+		}
+	}
+
+	private record MultiWriteElisionProbe(PhysicalKey[] physicalKeys, WriteElisionDecision[] decisions) {
+	}
+
+	private static final class BucketWriteElisionProbe {
+
+		private final PhysicalKey physicalKey;
+		private final ArrayList<Integer> logicalIndexes = new ArrayList<>();
+		private int requiredSize;
+
+		private BucketWriteElisionProbe(PhysicalKey physicalKey) {
+			this.physicalKey = physicalKey;
+		}
+	}
+
 	private static final int PINNED_GET_MIN_BYTES_OVERRIDE = Integer.getInteger(
 			"rockserver.fast-get.pinned-min-bytes", -1);
 
@@ -196,6 +270,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			64L * SizeUnit.GB));
 	private static final int EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL = 4_096;
 	private static final long EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
+	private static final int WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL = 4_096;
+	private static final long WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
 	private static final int RAW_SCAN_MAX_ENTRIES_PER_CHUNK = 65_536;
 	private static final long RAW_SCAN_MAX_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
@@ -275,6 +351,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicBoolean nativeDeleteRangeFallbackLogged = new AtomicBoolean();
 	private final Counter cdcEventsEmitted;
 	private final Counter cdcBytesEmitted;
+	private final EnumMap<WriteElisionRequest, EnumMap<WriteElisionDecision, Counter>> writeElisionDecisionCounters;
 	private final RocksDBStatistics rocksDBStatistics;
 	private final boolean fastGet;
 	private final @Nullable NativeRocksDBGet fastGetReader;
@@ -289,6 +366,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private volatile @Nullable Runnable forcedShutdownObserver;
 	private volatile @Nullable Runnable existsMultiChunkObserver;
 	private volatile @Nullable Runnable existsMultiSnapshotObserver;
+	private volatile @Nullable BiConsumer<Integer, Long> writeElisionMultiGetObserver;
 	private volatile @Nullable Runnable cdcPollTailCapturedObserver;
 	private volatile @Nullable Runnable cdcWalIteratorOpenObserver;
 	private volatile @Nullable LongConsumer cdcQuantumMutationsObserver;
@@ -355,6 +433,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.getAllColumnDefinitionsTimer = createActionTimer(GetAllColumnDefinitions.class);
 		this.cdcEventsEmitted = metrics.getRegistry().counter("rockserver.cdc.events", "db", name);
 		this.cdcBytesEmitted = metrics.getRegistry().counter("rockserver.cdc.bytes", "db", name);
+		this.writeElisionDecisionCounters = new EnumMap<>(WriteElisionRequest.class);
+		for (var request : WriteElisionRequest.values()) {
+			var counters = new EnumMap<WriteElisionDecision, Counter>(WriteElisionDecision.class);
+			for (var decision : WriteElisionDecision.values()) {
+				counters.put(decision, metrics.getRegistry().counter("rockserver.write.elision.decisions",
+						"db", name,
+						"request_type", request.tag,
+						"decision", decision.tag));
+			}
+			writeElisionDecisionCounters.put(request, counters);
+		}
 
 		// Expose gauges to help detect potential resource leaks at runtime
 		try {
@@ -1356,6 +1445,322 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return ro;
 	}
 
+	private ReadOptions newWriteElisionReadOptions() {
+		var readOptions = newReadOptions("write-elision-cache-probe");
+		readOptions.setReadTier(ReadTier.BLOCK_CACHE_TIER);
+		readOptions.setFillCache(false);
+		return readOptions;
+	}
+
+	private void recordWriteElisionDecision(WriteElisionRequest request, WriteElisionDecision decision) {
+		writeElisionDecisionCounters.get(request).get(decision).increment();
+	}
+
+	private WriteElisionDecision probeCachedLogicalValue(ColumnInstance col,
+			PhysicalKey physicalKey,
+			Keys logicalKeys,
+			Buf requestedValue) {
+		try (var readOptions = newWriteElisionReadOptions()) {
+			byte[] rawValue;
+			try {
+				rawValue = db.get().get(col.cfh(), readOptions, physicalKey.bytes);
+			} catch (org.rocksdb.RocksDBException exception) {
+				return switch (exception.getStatus().getCode()) {
+					case NotFound -> WriteElisionDecision.FALLBACK_NOT_FOUND;
+					case Incomplete -> WriteElisionDecision.FALLBACK_INCOMPLETE;
+					default -> throw mapWriteElisionProbeFailure(exception);
+				};
+			}
+			if (rawValue == null) {
+				return WriteElisionDecision.FALLBACK_NOT_FOUND;
+			}
+			return cachedLogicalValueEquals(col, logicalKeys, requestedValue, Buf.wrap(rawValue))
+					? WriteElisionDecision.ELIDED
+					: WriteElisionDecision.FALLBACK_DIFFERENT;
+		}
+	}
+
+	private static boolean cachedLogicalValueEquals(ColumnInstance col,
+			Keys logicalKeys,
+			Buf requestedValue,
+			Buf rawValue) {
+		if (col.hasBuckets()) {
+			var bucket = new Bucket(col, rawValue);
+			var existing = bucket.getElement(col.getBucketElementKeys(logicalKeys.keys()));
+			return existing != null && (!col.schema().hasValue() || Utils.valueEquals(existing, requestedValue));
+		}
+		return !col.schema().hasValue() || Utils.valueEquals(rawValue, requestedValue);
+	}
+
+	private static RocksDBException mapWriteElisionProbeFailure(org.rocksdb.RocksDBException exception) {
+		return RocksDBException.of(RocksDBErrorType.PUT_2, exception);
+	}
+
+	private static RocksDBException mapWriteElisionProbeFailure(org.rocksdb.Status status) {
+		return mapWriteElisionProbeFailure(new org.rocksdb.RocksDBException(status));
+	}
+
+	private MultiWriteElisionProbe probeCachedLogicalValues(ColumnInstance col,
+			List<Keys> logicalKeys,
+			List<Buf> requestedValues) {
+		var physicalKeys = new PhysicalKey[logicalKeys.size()];
+		var decisions = new WriteElisionDecision[logicalKeys.size()];
+		for (int i = 0; i < logicalKeys.size(); i++) {
+			col.checkNullableValue(requestedValues.get(i));
+			physicalKeys[i] = new PhysicalKey(col.calculateKey(logicalKeys.get(i).keys()).toByteArray());
+		}
+		if (col.hasBuckets()) {
+			probeCachedBuckets(col, logicalKeys, requestedValues, physicalKeys, decisions);
+		} else {
+			probeCachedDirectValues(col, requestedValues, physicalKeys, decisions);
+		}
+		return new MultiWriteElisionProbe(physicalKeys, decisions);
+	}
+
+	private void probeCachedDirectValues(ColumnInstance col,
+			List<Buf> requestedValues,
+			PhysicalKey[] physicalKeys,
+			WriteElisionDecision[] decisions) {
+		int offset = 0;
+		try (var readOptions = newWriteElisionReadOptions()) {
+			while (offset < physicalKeys.length) {
+				var indexes = new ArrayList<Integer>();
+				long probeBytes = 0L;
+				while (offset < physicalKeys.length && indexes.size() < WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL) {
+					var physicalKey = physicalKeys[offset];
+					var requestedValue = requestedValues.get(offset);
+					long entryBytes = saturatingAdd(physicalKey.bytes.length,
+							col.schema().hasValue() ? requestedValue.size() : 0L);
+					if (entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL) {
+						decisions[offset++] = WriteElisionDecision.BYPASS_OVERSIZED;
+						continue;
+					}
+					if (!indexes.isEmpty()
+							&& entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL - probeBytes) {
+						break;
+					}
+					indexes.add(offset);
+					probeBytes += entryBytes;
+					offset++;
+				}
+				if (indexes.isEmpty()) {
+					continue;
+				}
+				try (var arena = Arena.ofConfined()) {
+					var nativeKeys = new MemorySegment[indexes.size()];
+					var nativeValues = new MemorySegment[indexes.size()];
+					for (int i = 0; i < indexes.size(); i++) {
+						int logicalIndex = indexes.get(i);
+						nativeKeys[i] = copyToNativeSegment(arena, physicalKeys[logicalIndex].bytes);
+						nativeValues[i] = arena.allocate(col.schema().hasValue()
+								? requestedValues.get(logicalIndex).size()
+								: 0);
+					}
+					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
+					for (int i = 0; i < statuses.size(); i++) {
+						int logicalIndex = indexes.get(i);
+						var status = statuses.get(i);
+						decisions[logicalIndex] = switch (status.status.getCode()) {
+							case Ok -> !col.schema().hasValue()
+									|| status.requiredSize == requestedValues.get(logicalIndex).size()
+									&& memorySegmentEquals(nativeValues[i],
+									requestedValues.get(logicalIndex), status.requiredSize)
+									? WriteElisionDecision.ELIDED
+									: WriteElisionDecision.FALLBACK_DIFFERENT;
+							case NotFound -> WriteElisionDecision.FALLBACK_NOT_FOUND;
+							case Incomplete -> WriteElisionDecision.FALLBACK_INCOMPLETE;
+							default -> throw mapWriteElisionProbeFailure(status.status);
+						};
+					}
+				}
+			}
+		} catch (org.rocksdb.RocksDBException exception) {
+			throw mapWriteElisionProbeFailure(exception);
+		}
+	}
+
+	private void probeCachedBuckets(ColumnInstance col,
+			List<Keys> logicalKeys,
+			List<Buf> requestedValues,
+			PhysicalKey[] physicalKeys,
+			WriteElisionDecision[] decisions) {
+		var groupsByKey = new LinkedHashMap<PhysicalKey, BucketWriteElisionProbe>();
+		for (int i = 0; i < physicalKeys.length; i++) {
+			long individualProbeBytes = saturatingAdd(physicalKeys[i].bytes.length, requestedValues.get(i).size());
+			if (individualProbeBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL) {
+				decisions[i] = WriteElisionDecision.BYPASS_OVERSIZED;
+				continue;
+			}
+			groupsByKey.computeIfAbsent(physicalKeys[i], BucketWriteElisionProbe::new).logicalIndexes.add(i);
+		}
+		var groups = new ArrayList<>(groupsByKey.values());
+		var valuePassGroups = new ArrayList<BucketWriteElisionProbe>();
+		try (var readOptions = newWriteElisionReadOptions()) {
+			int offset = 0;
+			while (offset < groups.size()) {
+				var chunk = new ArrayList<BucketWriteElisionProbe>();
+				long probeBytes = 0L;
+				while (offset < groups.size() && chunk.size() < WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL) {
+					var group = groups.get(offset);
+					long entryBytes = group.physicalKey.bytes.length;
+					if (entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL) {
+						setBucketDecision(group, decisions, WriteElisionDecision.BYPASS_OVERSIZED);
+						offset++;
+						continue;
+					}
+					if (!chunk.isEmpty()
+							&& entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL - probeBytes) {
+						break;
+					}
+					chunk.add(group);
+					probeBytes += entryBytes;
+					offset++;
+				}
+				if (chunk.isEmpty()) {
+					continue;
+				}
+				try (var arena = Arena.ofConfined()) {
+					var nativeKeys = new MemorySegment[chunk.size()];
+					var nativeValues = new MemorySegment[chunk.size()];
+					for (int i = 0; i < chunk.size(); i++) {
+						nativeKeys[i] = copyToNativeSegment(arena, chunk.get(i).physicalKey.bytes);
+						nativeValues[i] = arena.allocate(0);
+					}
+					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
+					for (int i = 0; i < statuses.size(); i++) {
+						var group = chunk.get(i);
+						var status = statuses.get(i);
+						switch (status.status.getCode()) {
+							case Ok -> {
+								group.requiredSize = status.requiredSize;
+								long valuePassBytes = saturatingAdd(group.physicalKey.bytes.length,
+										status.requiredSize);
+								if (valuePassBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL) {
+									setBucketDecision(group, decisions, WriteElisionDecision.BYPASS_OVERSIZED);
+								} else {
+									valuePassGroups.add(group);
+								}
+							}
+							case NotFound -> setBucketDecision(group, decisions, WriteElisionDecision.FALLBACK_NOT_FOUND);
+							case Incomplete -> setBucketDecision(group, decisions, WriteElisionDecision.FALLBACK_INCOMPLETE);
+							default -> throw mapWriteElisionProbeFailure(status.status);
+						}
+					}
+				}
+			}
+
+			offset = 0;
+			while (offset < valuePassGroups.size()) {
+				var chunk = new ArrayList<BucketWriteElisionProbe>();
+				long probeBytes = 0L;
+				while (offset < valuePassGroups.size() && chunk.size() < WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL) {
+					var group = valuePassGroups.get(offset);
+					long entryBytes = saturatingAdd(group.physicalKey.bytes.length, group.requiredSize);
+					if (!chunk.isEmpty()
+							&& entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL - probeBytes) {
+						break;
+					}
+					chunk.add(group);
+					probeBytes += entryBytes;
+					offset++;
+				}
+				try (var arena = Arena.ofConfined()) {
+					var nativeKeys = new MemorySegment[chunk.size()];
+					var nativeValues = new MemorySegment[chunk.size()];
+					for (int i = 0; i < chunk.size(); i++) {
+						var group = chunk.get(i);
+						nativeKeys[i] = copyToNativeSegment(arena, group.physicalKey.bytes);
+						nativeValues[i] = arena.allocate(group.requiredSize);
+					}
+					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
+					for (int i = 0; i < statuses.size(); i++) {
+						var group = chunk.get(i);
+						var status = statuses.get(i);
+						switch (status.status.getCode()) {
+							case Ok -> {
+								if (status.requiredSize > nativeValues[i].byteSize()) {
+									var decision = saturatingAdd(group.physicalKey.bytes.length, status.requiredSize)
+											> WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL
+											? WriteElisionDecision.BYPASS_OVERSIZED
+											: WriteElisionDecision.FALLBACK_DIFFERENT;
+									setBucketDecision(group, decisions, decision);
+									continue;
+								}
+								var rawBucket = Buf.wrap(copyMemorySegment(nativeValues[i], status.requiredSize));
+								var bucket = new Bucket(col, rawBucket);
+								for (int logicalIndex : group.logicalIndexes) {
+									var existing = bucket.getElement(
+											col.getBucketElementKeys(logicalKeys.get(logicalIndex).keys()));
+									decisions[logicalIndex] = existing != null
+											&& (!col.schema().hasValue()
+											|| Utils.valueEquals(existing, requestedValues.get(logicalIndex)))
+											? WriteElisionDecision.ELIDED
+											: WriteElisionDecision.FALLBACK_DIFFERENT;
+								}
+							}
+							case NotFound -> setBucketDecision(group, decisions, WriteElisionDecision.FALLBACK_NOT_FOUND);
+							case Incomplete -> setBucketDecision(group, decisions, WriteElisionDecision.FALLBACK_INCOMPLETE);
+							default -> throw mapWriteElisionProbeFailure(status.status);
+						}
+					}
+				}
+			}
+		} catch (org.rocksdb.RocksDBException exception) {
+			throw mapWriteElisionProbeFailure(exception);
+		}
+	}
+
+	private List<org.rocksdb.ByteBufferGetStatus> runWriteElisionMultiGet(ColumnInstance col,
+			ReadOptions readOptions,
+			MemorySegment[] nativeKeys,
+			MemorySegment[] nativeValues) throws org.rocksdb.RocksDBException {
+		var observer = writeElisionMultiGetObserver;
+		if (observer != null) {
+			long probeBytes = 0L;
+			for (int i = 0; i < nativeKeys.length; i++) {
+				probeBytes = saturatingAdd(probeBytes, nativeKeys[i].byteSize());
+				probeBytes = saturatingAdd(probeBytes, nativeValues[i].byteSize());
+			}
+			observer.accept(nativeKeys.length, probeBytes);
+		}
+		return db.get().multiGetByteBuffers(readOptions, List.of(col.cfh()), nativeKeys, nativeValues);
+	}
+
+	private static void setBucketDecision(BucketWriteElisionProbe group,
+			WriteElisionDecision[] decisions,
+			WriteElisionDecision decision) {
+		for (int logicalIndex : group.logicalIndexes) {
+			decisions[logicalIndex] = decision;
+		}
+	}
+
+	private static MemorySegment copyToNativeSegment(Arena arena, byte[] value) {
+		return arena.allocateFrom(ValueLayout.JAVA_BYTE, value);
+	}
+
+	private static MemorySegment copyToNativeSegment(Arena arena, Buf value) {
+		var segment = arena.allocate(value.size());
+		MemorySegment.copy(value.getBackingByteArray(), value.getBackingByteArrayOffset(), segment,
+				ValueLayout.JAVA_BYTE, 0, value.getBackingByteArrayLength());
+		return segment;
+	}
+
+	private static boolean memorySegmentEquals(MemorySegment actual, Buf expected, int length) {
+		if (length != expected.size() || actual.byteSize() < length) {
+			return false;
+		}
+		for (int i = 0; i < length; i++) {
+			if (actual.get(ValueLayout.JAVA_BYTE, i) != expected.getByte(i)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private static byte[] copyMemorySegment(MemorySegment source, int length) {
+		return source.asSlice(0, length).toArray(ValueLayout.JAVA_BYTE);
+	}
+
 	private ReadOptions newRangeReadOptions(long deadlineMicros,
 			boolean fillCache,
 			@Nullable AbstractSlice<?> startKeySlice,
@@ -1434,6 +1839,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setExistsMultiSnapshotObserverForTesting(@Nullable Runnable observer) {
 		this.existsMultiSnapshotObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setWriteElisionMultiGetObserverForTesting(@Nullable BiConsumer<Integer, Long> observer) {
+		this.writeElisionMultiGetObserver = observer;
 	}
 
 	@VisibleForTesting
@@ -2552,9 +2962,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (updateId != 0) {
 				return putMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
 			}
+			if (tx == null && WriteElisionRequest.from(requestType) != null) {
+				return putMultiWithWriteElision(start, columnId, col, keysList, valueList, requestType);
+			}
 
 			List<T> responses =
-					requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+					requestType instanceof RequestType.RequestNothing<?>
+							|| requestType instanceof RequestType.RequestEnsure<?>
+							? null
+							: new ArrayList<>(keysList.size());
 			for (int i = 0; i < keysList.size(); i++) {
 				var keys = keysList.get(i);
 				var value = valueList.get(i);
@@ -2588,6 +3004,54 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private <T> List<T> putMultiWithWriteElision(long start,
+			long columnId,
+			ColumnInstance col,
+			List<Keys> keysList,
+			List<Buf> valueList,
+			RequestPut<? super Buf, T> requestType) {
+		var writeElisionRequest = Objects.requireNonNull(WriteElisionRequest.from(requestType));
+		var probe = probeCachedLogicalValues(col, keysList, valueList);
+		var dirtyPhysicalKeys = new HashSet<PhysicalKey>();
+		List<T> responses = requestType instanceof RequestType.RequestEnsure<?>
+				? null
+				: new ArrayList<>(keysList.size());
+		for (int i = 0; i < keysList.size(); i++) {
+			var keys = keysList.get(i);
+			var value = valueList.get(i);
+			actionLogger.logAction("putMulti (next)",
+					start,
+					columnId,
+					keys,
+					value,
+					0L,
+					null,
+					null,
+					requestType
+			);
+			var physicalKey = probe.physicalKeys()[i];
+			var decision = probe.decisions()[i];
+			if (decision != WriteElisionDecision.BYPASS_OVERSIZED
+					&& dirtyPhysicalKeys.contains(physicalKey)) {
+				decision = probeCachedLogicalValues(col, List.of(keys), List.of(value)).decisions()[0];
+			}
+			recordWriteElisionDecision(writeElisionRequest, decision);
+			T result;
+			if (decision == WriteElisionDecision.ELIDED) {
+				result = RequestType.safeCast(requestType instanceof RequestType.RequestPreviousPresence<?>
+						? Boolean.TRUE
+						: null);
+			} else {
+				result = put(null, col, 0L, keys, value, requestType, false);
+				dirtyPhysicalKeys.add(physicalKey);
+			}
+			if (responses != null) {
+				responses.add(result);
+			}
+		}
+		return responses != null ? responses : List.of();
+	}
+
 	private <T> List<T> putMultiWithUpdateId(Tx tx,
 			long updateId,
 			ColumnInstance col,
@@ -2605,7 +3069,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				} catch (org.rocksdb.RocksDBException e) {
 					logger.debug("Failed to set savepoint", e);
 				}
-				responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+				responses = requestType instanceof RequestType.RequestNothing<?>
+						|| requestType instanceof RequestType.RequestEnsure<?>
+						? null
+						: new ArrayList<>(keysList.size());
 				try {
 					for (int i = 0; i < keysList.size(); i++) {
 						var keys = keysList.get(i);
@@ -3394,9 +3861,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestPut<? super Buf, U> callback) throws RocksDBException {
+		return put(optionalDbWriter, col, updateId, keys, value, callback, true);
+	}
+
+	private <U> U put(@Nullable DBWriter optionalDbWriter,
+			ColumnInstance col,
+			long updateId,
+			@NotNull Keys keys,
+			@NotNull Buf value,
+			RequestPut<? super Buf, U> callback,
+			boolean allowWriteElisionProbe) throws RocksDBException {
 		// Check for null value
 		col.checkNullableValue(value);
 		try {
+			var writeElisionRequest = WriteElisionRequest.from(callback);
+			if (writeElisionRequest != null && allowWriteElisionProbe) {
+				if (optionalDbWriter == null && updateId == 0L) {
+					var physicalKey = new PhysicalKey(col.calculateKey(keys.keys()).toByteArray());
+					var decision = probeCachedLogicalValue(col, physicalKey, keys, value);
+					recordWriteElisionDecision(writeElisionRequest, decision);
+					if (decision == WriteElisionDecision.ELIDED) {
+						return RequestType.safeCast(callback instanceof RequestType.RequestPreviousPresence<?>
+								? Boolean.TRUE
+								: null);
+					}
+				} else {
+					recordWriteElisionDecision(writeElisionRequest, WriteElisionDecision.BYPASS_WRITER);
+				}
+			}
 			boolean requirePreviousValue = RequestType.requiresGettingPreviousValue(callback);
 			boolean requirePreviousPresence = RequestType.requiresGettingPreviousPresence(callback);
 			boolean needsTx = col.hasBuckets() || requirePreviousValue || requirePreviousPresence;
@@ -3492,6 +3984,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					result = RequestType.safeCast(switch (callback) {
 						case RequestType.RequestNothing<?> ignored -> null;
+						case RequestType.RequestEnsure<?> ignored -> null;
 						case RequestType.RequestPrevious<?> ignored -> previousValue;
 						case RequestType.RequestPreviousPresence<?> ignored -> previousValue != null;
 						case RequestType.RequestChanged<?> ignored -> !Utils.valueEquals(previousValue, value);
@@ -4613,28 +5106,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private List<Boolean> existsMultiStatusOnly(ColumnInstance col,
 			ReadOptions readOptions,
 			List<Buf> calculatedKeys) throws org.rocksdb.RocksDBException {
-		var nativeKeys = new ArrayList<ByteBuffer>(calculatedKeys.size());
-		var emptyValues = new ArrayList<ByteBuffer>(calculatedKeys.size());
-		for (var calculatedKey : calculatedKeys) {
-			var nativeKey = ByteBuffer.allocateDirect(calculatedKey.size());
-			nativeKey.put(calculatedKey.getBackingByteArray(),
-					calculatedKey.getBackingByteArrayOffset(),
-					calculatedKey.getBackingByteArrayLength());
-			nativeKey.flip();
-			nativeKeys.add(nativeKey);
-			emptyValues.add(ByteBuffer.allocateDirect(0));
-		}
+		try (var arena = Arena.ofConfined()) {
+			var nativeKeys = new MemorySegment[calculatedKeys.size()];
+			var emptyValues = new MemorySegment[calculatedKeys.size()];
+			for (int i = 0; i < calculatedKeys.size(); i++) {
+				nativeKeys[i] = copyToNativeSegment(arena, calculatedKeys.get(i));
+				emptyValues[i] = arena.allocate(0);
+			}
 
-		var statuses = db.get().multiGetByteBuffers(readOptions, List.of(col.cfh()), nativeKeys, emptyValues);
-		var result = new ArrayList<Boolean>(statuses.size());
-		for (var status : statuses) {
-			result.add(switch (status.status.getCode()) {
-				case Ok -> true;
-				case NotFound -> false;
-				default -> throw mapIteratorStatusException(new org.rocksdb.RocksDBException(status.status));
-			});
+			var statuses = db.get().multiGetByteBuffers(readOptions, List.of(col.cfh()), nativeKeys, emptyValues);
+			var result = new ArrayList<Boolean>(statuses.size());
+			for (var status : statuses) {
+				result.add(switch (status.status.getCode()) {
+					case Ok -> true;
+					case NotFound -> false;
+					default -> throw mapIteratorStatusException(new org.rocksdb.RocksDBException(status.status));
+				});
+			}
+			return result;
 		}
-		return result;
 	}
 
 	private List<Boolean> existsMultiWithValues(@Nullable Tx tx,

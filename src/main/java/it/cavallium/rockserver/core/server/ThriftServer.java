@@ -607,6 +607,23 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
+		public void putEnsure(long transactionOrUpdateId,
+				long columnId,
+				List<ByteBuffer> keys,
+				ByteBuffer value,
+				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
+			try {
+				api(context).put(transactionOrUpdateId,
+						columnId,
+						keysToRecord(keys),
+						keyToRecord(value),
+						RequestType.ensure());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
 		public void putMulti(long transactionOrUpdateId,
 				long columnId,
 				List<List<ByteBuffer>> keysMulti,
@@ -618,6 +635,23 @@ public class ThriftServer extends Server {
 						keysToRecords(keysMulti),
 						keyToRecords(valueMulti),
 						RequestType.none());
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
+		public void putMultiEnsure(long transactionOrUpdateId,
+				long columnId,
+				List<List<ByteBuffer>> keysMulti,
+				List<ByteBuffer> valueMulti,
+				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
+			try {
+				api(context).putMulti(transactionOrUpdateId,
+						columnId,
+						keysToRecords(keysMulti),
+						keyToRecords(valueMulti),
+						RequestType.ensure());
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}

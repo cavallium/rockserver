@@ -1,4 +1,17 @@
-use rockserver_client::{ColumnSchema, ColumnHashType};
+use rockserver_client::proto::Kv;
+use rockserver_client::{ColumnHashType, ColumnSchema, RockserverClient};
+
+#[allow(dead_code)]
+async fn ensure_api_compiles(client: &RockserverClient) {
+    client
+        .put_ensure(0, 1, vec![vec![1]], vec![2])
+        .await
+        .unwrap();
+    client
+        .put_multi_ensure(0, 1, futures::stream::empty::<Kv>())
+        .await
+        .unwrap();
+}
 
 #[tokio::test]
 async fn test_api_compilation() {

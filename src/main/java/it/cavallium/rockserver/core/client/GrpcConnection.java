@@ -505,6 +505,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		}
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestNothing<?> _ -> toResponse(futureStubWithRequestDeadline().put(request), _ -> null);
+			case RequestType.RequestEnsure<?> _ ->
+					toResponse(futureStubWithRequestDeadline().putEnsure(request), _ -> null);
 			case RequestPrevious<?> _ ->
 					toResponse(futureStubWithRequestDeadline().putGetPrevious(request), GrpcConnectionDelegate::mapPrevious);
 			case RequestDelta<?> _ ->
@@ -598,6 +600,11 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 						.ignoreElement()
 						.toFuture())
 						.thenApply(_ -> List.of());
+			case RequestType.RequestEnsure<?> _ ->
+					toResponse(reactiveStubWithRequestDeadline().putMultiEnsure(inputRequests)
+							.ignoreElement()
+							.toFuture())
+							.thenApply(_ -> List.of());
 			case RequestPrevious<?> _ ->
 					toResponse(reactiveStubWithRequestDeadline().putMultiGetPrevious(inputRequests)
 						.collect(() -> new ArrayList<@Nullable Buf>(),
