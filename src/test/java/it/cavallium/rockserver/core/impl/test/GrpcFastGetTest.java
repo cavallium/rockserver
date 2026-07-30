@@ -64,6 +64,11 @@ class GrpcFastGetTest {
 	};
 	private static final Metadata.Key<String> GRPC_ENCODING = Metadata.Key.of(
 			"grpc-encoding", Metadata.ASCII_STRING_MARSHALLER);
+	private static final it.cavallium.rockserver.core.common.api.proto.RequestContext BATCH_CONTEXT =
+			it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+					.setDeadlineEpochMillis(Long.MAX_VALUE)
+					.build();
 
 	@TempDir
 	Path tempDir;
@@ -296,6 +301,7 @@ class GrpcFastGetTest {
 				.setTransactionOrUpdateId(transactionId)
 				.setColumnId(columnId)
 				.addKeys(ByteString.copyFrom(keyBytes(key)))
+				.setContext(BATCH_CONTEXT)
 				.build();
 	}
 

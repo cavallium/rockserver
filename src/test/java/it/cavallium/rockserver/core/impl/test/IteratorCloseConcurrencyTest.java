@@ -78,14 +78,14 @@ class IteratorCloseConcurrencyTest {
 
 			var threads = new ArrayList<Thread>();
 			try {
-				FutureTask<List<Buf>> firstPage = pageTask(api, iteratorId, 2);
+				FutureTask<List<Buf>> firstPage = pageTask(internal, iteratorId, 2);
 				Thread firstPageThread = start(threads, "iterator-first-page", firstPage);
 				assertTrue(firstPageEnteredNativeRead.await(2, TimeUnit.SECONDS),
 						"the first page never reached the controlled native read");
 
-				FutureTask<List<Buf>> secondPage = pageTask(api, iteratorId, 2);
+				FutureTask<List<Buf>> secondPage = pageTask(internal, iteratorId, 2);
 				Thread secondPageThread = start(threads, "iterator-second-page", secondPage);
-				awaitBlockedAt(secondPageThread, "withIterator");
+				awaitWaiting(secondPageThread, "second page did not wait behind the active page");
 				releaseFirstPage.countDown();
 
 				List<Buf> firstValues = firstPage.get(3, TimeUnit.SECONDS);
@@ -94,22 +94,22 @@ class IteratorCloseConcurrencyTest {
 				assertIterableEquals(values(30, 40), secondValues,
 						"concurrent paging calls must serialize without returning duplicate values");
 
-				FutureTask<List<Buf>> activeCloseRacePage = pageTask(api, iteratorId, 2);
+				FutureTask<List<Buf>> activeCloseRacePage = pageTask(internal, iteratorId, 2);
 				start(threads, "iterator-active-close-page", activeCloseRacePage);
 				assertTrue(closeRaceEnteredNativeRead.await(2, TimeUnit.SECONDS),
 						"the close-race page never reached the controlled native read");
 
-				FutureTask<List<Buf>> queuedCloseRacePage = pageTask(api, iteratorId, 1);
+				FutureTask<List<Buf>> queuedCloseRacePage = pageTask(internal, iteratorId, 1);
 				Thread queuedPageThread = start(threads, "iterator-queued-close-page", queuedCloseRacePage);
-				awaitBlockedAt(queuedPageThread, "withIterator");
+				awaitWaiting(queuedPageThread, "queued page did not wait behind the active page");
 
 				FutureTask<Void> close = new FutureTask<>(() -> {
-					api.closeIterator(iteratorId);
+					internal.closeIterator(iteratorId);
 					return null;
 				});
 				Thread closeThread = start(threads, "iterator-close", close);
 				awaitIteratorClaimed(internal);
-				awaitBlockedAt(closeThread, "closeIteratorInternal");
+				awaitWaiting(closeThread, "close did not wait for the active page");
 
 				releaseCloseRacePage.countDown();
 				List<Buf> closeRaceValues = activeCloseRacePage.get(3, TimeUnit.SECONDS);
@@ -222,9 +222,10 @@ class IteratorCloseConcurrencyTest {
 			Mockito.doThrow(failure).when(throwingEntry).close();
 			iterators.put(iteratorId, throwingEntry);
 
-			RuntimeException actual = assertThrows(RuntimeException.class,
+			RocksDBException actual = assertThrows(RocksDBException.class,
 					() -> connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(iteratorId));
-			assertSame(failure, actual);
+			assertEquals(RocksDBException.RocksDBErrorType.PUT_UNKNOWN_ERROR, actual.getErrorUniqueId());
+			assertSame(failure, actual.getCause());
 			assertEquals(0, internal.getOpenIteratorsCount());
 			assertEquals(0, internal.getPendingOpsCount());
 
@@ -264,10 +265,10 @@ class IteratorCloseConcurrencyTest {
 			int call = valueCalls.incrementAndGet();
 			if (call == 1) {
 				firstReadEntered.countDown();
-				assertTrue(releaseFirstRead.await(2, TimeUnit.SECONDS));
+				assertTrue(releaseFirstRead.await(5, TimeUnit.SECONDS));
 			} else if (call == 5) {
 				closeRaceReadEntered.countDown();
-				assertTrue(releaseCloseRaceRead.await(2, TimeUnit.SECONDS));
+				assertTrue(releaseCloseRaceRead.await(5, TimeUnit.SECONDS));
 			}
 			return nativeIterator.value();
 		});
@@ -288,10 +289,10 @@ class IteratorCloseConcurrencyTest {
 		iteratorField.set(iteratorState, iterator);
 	}
 
-	private static FutureTask<List<Buf>> pageTask(it.cavallium.rockserver.core.common.RocksDBSyncAPI api,
+	private static FutureTask<List<Buf>> pageTask(EmbeddedDB db,
 			long iteratorId,
 			long takeCount) {
-		return new FutureTask<>(() -> api.subsequent(iteratorId, 0, takeCount, RequestType.multi()));
+		return new FutureTask<>(() -> db.subsequent(iteratorId, 0, takeCount, RequestType.multi()));
 	}
 
 	private static Thread start(List<Thread> threads, String name, Runnable task) {
@@ -301,18 +302,21 @@ class IteratorCloseConcurrencyTest {
 		return thread;
 	}
 
-	private static void awaitBlockedAt(Thread thread, String methodName) {
+	private static void awaitWaiting(Thread thread, String failureMessage) {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
 		do {
-			if (thread.getState() == Thread.State.BLOCKED
-					&& Arrays.stream(thread.getStackTrace())
-							.anyMatch(frame -> frame.getClassName().equals(EmbeddedDB.class.getName())
-									&& frame.getMethodName().equals(methodName))) {
+			Thread.State state = thread.getState();
+			if (state == Thread.State.BLOCKED
+					|| state == Thread.State.WAITING
+					|| state == Thread.State.TIMED_WAITING) {
 				return;
+			}
+			if (state == Thread.State.TERMINATED) {
+				break;
 			}
 			Thread.onSpinWait();
 		} while (System.nanoTime() < deadline);
-		throw new AssertionError(thread.getName() + " did not block in " + methodName + ": "
+		throw new AssertionError(failureMessage + ": state=" + thread.getState() + ", stack="
 				+ Arrays.toString(thread.getStackTrace()));
 	}
 

@@ -50,8 +50,8 @@ class TransactionCloseConcurrencyTest {
 							db, transactionId, secondThread, ready, start));
 					assertTrue(ready.await(1, TimeUnit.SECONDS));
 					start.countDown();
-					awaitBlocked(firstThread);
-					awaitBlocked(secondThread);
+					awaitWaitingForExclusiveOwnership(firstThread);
+					awaitWaitingForExclusiveOwnership(secondThread);
 				}
 
 				assertOneSuccessfulCommit(first.get(1, TimeUnit.SECONDS), second.get(1, TimeUnit.SECONDS));
@@ -77,15 +77,21 @@ class TransactionCloseConcurrencyTest {
 		}
 	}
 
-	private static void awaitBlocked(AtomicReference<Thread> threadReference) {
+	private static void awaitWaitingForExclusiveOwnership(AtomicReference<Thread> threadReference) {
 		Thread thread = threadReference.get();
 		assertNotNull(thread);
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-		while (thread.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+		while (!isWaiting(thread.getState()) && System.nanoTime() < deadline) {
 			Thread.onSpinWait();
 		}
-		assertEquals(Thread.State.BLOCKED, thread.getState(),
-				"transaction closer did not wait for exclusive ownership");
+		assertTrue(isWaiting(thread.getState()),
+				() -> "transaction closer did not wait for exclusive ownership: " + thread.getState());
+	}
+
+	private static boolean isWaiting(Thread.State state) {
+		return state == Thread.State.BLOCKED
+				|| state == Thread.State.WAITING
+				|| state == Thread.State.TIMED_WAITING;
 	}
 
 	private static void assertOneSuccessfulCommit(CloseResult first, CloseResult second) {

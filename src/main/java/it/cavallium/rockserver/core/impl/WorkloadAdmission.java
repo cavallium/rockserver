@@ -359,13 +359,22 @@ public final class WorkloadAdmission {
 
 	private static long encodedBytes(Keys keys, Buf... values) {
 		long total = encodedBytes(keys);
+		if (values == null) {
+			throw unexpectedNull("values");
+		}
 		for (var value : values) {
+			if (value == null) {
+				throw unexpectedNull("value");
+			}
 			total = addSize(total, value.size());
 		}
 		return total;
 	}
 
 	private static long encodedBytes(List<Keys> keys) {
+		if (keys == null) {
+			throw unexpectedNull("keys");
+		}
 		long total = 0;
 		for (var key : keys) {
 			total = addSize(total, encodedBytes(key));
@@ -375,18 +384,34 @@ public final class WorkloadAdmission {
 
 	private static long encodedBytes(List<Keys> keys, List<Buf> values) {
 		long total = encodedBytes(keys);
+		if (values == null) {
+			throw unexpectedNull("values");
+		}
 		for (var value : values) {
+			if (value == null) {
+				throw unexpectedNull("value");
+			}
 			total = addSize(total, value.size());
 		}
 		return total;
 	}
 
 	private static long encodedBytes(Keys keys) {
+		if (keys == null || keys.keys() == null) {
+			throw unexpectedNull("keys");
+		}
 		long total = 0;
 		for (var key : keys.keys()) {
+			if (key == null) {
+				throw unexpectedNull("key");
+			}
 			total = addSize(total, key.size());
 		}
 		return total;
+	}
+
+	private static RocksDBException unexpectedNull(String name) {
+		return RocksDBException.of(RocksDBErrorType.UNEXPECTED_NULL_VALUE, name);
 	}
 
 	private static long addSize(long total, long bytes) {
