@@ -1443,11 +1443,13 @@ final class WorkloadPressureController {
 	}
 
 	void finishBatch(BatchPermit permit) {
+		boolean notifySharedPressureWaiters;
 		synchronized (this) {
 			if (activeBatches <= 0) {
 				throw new IllegalStateException("No active BATCH quantum to finish");
 			}
 			activeBatches--;
+			notifySharedPressureWaiters = pressured;
 			if (permit.startedUnderPressure() && pressured) {
 				long nowNanos = System.nanoTime();
 				try {
@@ -1457,7 +1459,9 @@ final class WorkloadPressureController {
 				}
 			}
 		}
-		notifier.run();
+		if (notifySharedPressureWaiters) {
+			notifier.run();
+		}
 	}
 
 	synchronized long nanosUntilBatchEligible(long nowNanos) {

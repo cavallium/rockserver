@@ -18,7 +18,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
-import reactor.core.scheduler.Schedulers;
 
 /**
  * Workload-aware shared read/write admission for one database.
@@ -189,7 +188,7 @@ public final class RWScheduler {
 	public Scheduler scheduler(WorkloadProfile profile,
 			OperationFamily family,
 			long deadlineEpochMillis) {
-		return Schedulers.fromExecutor(executor(profile, family, deadlineEpochMillis));
+		return new IndexedWorkloadScheduler(this, executor(profile, family, deadlineEpochMillis));
 	}
 
 	/** Server-only executor entry for protected CDC/control/physical work. */

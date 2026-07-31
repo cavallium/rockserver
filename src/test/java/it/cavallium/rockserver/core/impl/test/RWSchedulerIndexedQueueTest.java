@@ -548,6 +548,81 @@ class RWSchedulerIndexedQueueTest {
 	}
 
 	@Test
+	void reactorSchedulerDisposalImmediatelyUsesIndexedRemoval() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-reactor-disposal");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var ran = new AtomicBoolean();
+		var view = scheduler.scheduler(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+		try {
+			view.schedule(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+
+			var queued = view.schedule(() -> ran.set(true));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+			queued.dispose();
+
+			assertTrue(queued.isDisposed());
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 0);
+			assertFalse(ran.get());
+			assertEquals(1L,
+					scheduler.poolSnapshot(RWScheduler.Pool.READ)
+							.outcomes()
+							.get(RWScheduler.TerminalOutcome.CANCELLATION));
+		} finally {
+			releaseBlocker.countDown();
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void reactorWorkerDisposalImmediatelyUnlinksEveryQueuedTask() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-reactor-worker-disposal");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var firstRan = new AtomicBoolean();
+		var secondRan = new AtomicBoolean();
+		var view = scheduler.scheduler(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+		var worker = view.createWorker();
+		try {
+			view.schedule(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+
+			var first = worker.schedule(() -> firstRan.set(true));
+			worker.schedule(() -> secondRan.set(true));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 2);
+
+			first.dispose();
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+			worker.dispose();
+
+			assertTrue(first.isDisposed());
+			assertTrue(worker.isDisposed());
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 0);
+			assertFalse(firstRan.get());
+			assertFalse(secondRan.get());
+			assertEquals(2L,
+					scheduler.poolSnapshot(RWScheduler.Pool.READ)
+							.outcomes()
+							.get(RWScheduler.TerminalOutcome.CANCELLATION));
+		} finally {
+			releaseBlocker.countDown();
+			worker.dispose();
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void dispatchCancellationRaceHasOneTerminalCallback() throws Exception {
 		var scheduler = scheduler(1, 8, "indexed-dispatch-race");
 		var blockerStarted = new CountDownLatch(1);
