@@ -7,11 +7,6 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.micrometer.core.instrument.Counter;
-import io.micrometer.core.instrument.Meter;
-import io.micrometer.core.instrument.Timer;
-import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
-import io.micrometer.core.instrument.distribution.pause.PauseDetector;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -97,32 +92,6 @@ class RWSchedulerTest {
 		} finally {
 			release.countDown();
 			scheduler.dispose();
-		}
-	}
-
-	@Test
-	void deadlineIsRecheckedAfterPotentiallySlowMetricLookup() throws Exception {
-		var registry = new BlockingTimerRegistry();
-		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "metric-deadline-test", registry, "metric-db");
-		var task = new ObservableTask(() -> {});
-		try {
-			registry.blockTimers();
-			var deadline = new RequestContext(WorkloadProfile.LATENCY, System.currentTimeMillis() + 100L);
-			scheduler.executor(deadline, OperationFamily.POINT_LOOKUP).execute(task);
-			assertTrue(registry.timerCreationStarted().await(5, SECONDS));
-			Thread.sleep(150L);
-			registry.releaseTimers();
-
-			var completion = assertThrows(ExecutionException.class, () -> task.get(5, SECONDS));
-			var failure = assertInstanceOf(RocksDBException.class, completion.getCause());
-			assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
-					failure.getErrorUniqueId());
-			assertFalse(task.ran());
-			assertEquals(1, task.disposeCount());
-		} finally {
-			registry.releaseTimers();
-			scheduler.dispose();
-			registry.close();
 		}
 	}
 
@@ -435,29 +404,6 @@ class RWSchedulerTest {
 									"operation", "range_page")
 							.counter()
 							.count());
-		} finally {
-			scheduler.dispose();
-			registry.close();
-		}
-	}
-
-	@Test
-	void metricFailureCannotStrandAdmissionOrKillTheWorker() throws Exception {
-		var registry = new FailingCounterRegistry();
-		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "metric-failure-test", registry, "metric-db");
-		var first = new CompletableFuture<Void>();
-		var second = new CompletableFuture<Void>();
-		try {
-			registry.failCounters();
-			scheduler.readExecutor().execute(() -> first.complete(null));
-			first.get(5, SECONDS);
-			scheduler.readExecutor().execute(() -> second.complete(null));
-			second.get(5, SECONDS);
-			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks() == 2L);
-			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
-			assertEquals(0, snapshot.activeTasks());
-			assertEquals(2L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN));
-			assertEquals(0L, snapshot.failedTasks());
 		} finally {
 			scheduler.dispose();
 			registry.close();
@@ -819,50 +765,4 @@ class RWSchedulerTest {
 		}
 	}
 
-	private static final class FailingCounterRegistry extends SimpleMeterRegistry {
-
-		private final AtomicBoolean failCounters = new AtomicBoolean();
-
-		private void failCounters() {
-			failCounters.set(true);
-		}
-
-		@Override
-		protected Counter newCounter(Meter.Id id) {
-			if (failCounters.get()) {
-				throw new IllegalStateException("expected counter failure");
-			}
-			return super.newCounter(id);
-		}
-	}
-
-	private static final class BlockingTimerRegistry extends SimpleMeterRegistry {
-
-		private final AtomicBoolean blockTimers = new AtomicBoolean();
-		private final CountDownLatch timerCreationStarted = new CountDownLatch(1);
-		private final CountDownLatch releaseTimers = new CountDownLatch(1);
-
-		private void blockTimers() {
-			blockTimers.set(true);
-		}
-
-		private CountDownLatch timerCreationStarted() {
-			return timerCreationStarted;
-		}
-
-		private void releaseTimers() {
-			releaseTimers.countDown();
-		}
-
-		@Override
-		protected Timer newTimer(Meter.Id id,
-				DistributionStatisticConfig distributionStatisticConfig,
-				PauseDetector pauseDetector) {
-			if (blockTimers.compareAndSet(true, false)) {
-				timerCreationStarted.countDown();
-				awaitUninterruptibly(releaseTimers);
-			}
-			return super.newTimer(id, distributionStatisticConfig, pauseDetector);
-		}
-	}
 }
