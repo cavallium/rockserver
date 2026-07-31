@@ -114,12 +114,25 @@ public final class RWScheduler {
 				databaseName);
 		this.pools = List.of(readPool, writePool, controlPool, physicalPool);
 		pressureController.setNotifier(this::signalAllPools);
-		if (registry != null) {
+		registerStoragePressureGauge(registry, databaseName);
+	}
+
+	private void registerStoragePressureGauge(@Nullable MeterRegistry registry, String databaseName) {
+		if (registry == null) {
+			return;
+		}
+		try {
 			Gauge.builder("rockserver.workload.storage.pressure",
 					pressureController,
 					value -> value.isPressured() ? 1 : 0)
 					.tag("database", databaseName)
 					.register(registry);
+		} catch (VirtualMachineError fatal) {
+			throw fatal;
+		} catch (Throwable registrationFailure) {
+			LOG.error("Failed to register workload storage-pressure gauge: database={}",
+					databaseName,
+					registrationFailure);
 		}
 	}
 
