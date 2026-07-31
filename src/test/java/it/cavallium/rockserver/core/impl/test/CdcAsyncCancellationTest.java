@@ -42,12 +42,15 @@ class CdcAsyncCancellationTest {
 	@Test
 	void cancellingQueuedPreparationReleasesItsShutdownLeaseWithoutRunningLater() throws Exception {
 		try (var db = new EmbeddedDB(tempDir.resolve("queued"), "cdc-cancel-queued", null)) {
-			var cdcStarted = new CountDownLatch(1);
+			int readWorkers = db.getScheduler().poolSnapshot(RWScheduler.Pool.READ).workerCount();
+			var cdcStarted = new CountDownLatch(readWorkers);
 			var releaseCdc = new CountDownLatch(1);
-			db.getScheduler().cdc().schedule(() -> {
-				cdcStarted.countDown();
-				awaitUninterruptibly(releaseCdc);
-			});
+			for (int i = 0; i < readWorkers; i++) {
+				db.getScheduler().cdc().schedule(() -> {
+					cdcStarted.countDown();
+					awaitUninterruptibly(releaseCdc);
+				});
+			}
 			assertTrue(cdcStarted.await(5, TimeUnit.SECONDS));
 
 			var delivered = new AtomicBoolean();
