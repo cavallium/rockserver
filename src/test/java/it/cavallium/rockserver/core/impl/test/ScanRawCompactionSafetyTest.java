@@ -7,10 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
-import it.cavallium.rockserver.core.common.ColumnSchema;
-import it.cavallium.rockserver.core.common.Keys;
-import it.cavallium.rockserver.core.common.RequestType;
-import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.SafeShutdown;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -40,6 +37,63 @@ class ScanRawCompactionSafetyTest {
 	private static final String COLUMN_NAME = "events";
 	private static final int GENERATIONS = 4;
 	private static final int KEYS_PER_GENERATION = 32;
+	private static final int COOPERATIVE_SCAN_KEYS = 5_000;
+
+	@Test
+	void competingReadWorkYieldsWithoutShorteningWireBatches(@TempDir Path tempDir) throws Exception {
+		Path configFile = tempDir.resolve("scan-raw-cooperative.conf");
+		Files.writeString(configFile, """
+				database.parallelism.workload.range-quantum-max-duration = PT0.000001S
+				""");
+		String databaseName = "scan-raw-cooperative";
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), databaseName, configFile)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = api.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			for (int i = 0; i < COOPERATIVE_SCAN_KEYS; i++) {
+				api.put(0, columnId, key(i), value(0, i), RequestType.none());
+			}
+			api.flush();
+
+			var foregroundStarted = new CountDownLatch(1);
+			var releaseForeground = new CountDownLatch(1);
+			internal.getScheduler().executor(
+					WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30)).execute(() -> {
+				foregroundStarted.countDown();
+				awaitLatch(releaseForeground);
+			});
+			assertTrue(foregroundStarted.await(10, TimeUnit.SECONDS));
+
+			var quantumCounter = internal.getMetricsRegistry()
+					.get("rockserver.workload.quantums")
+					.tags("database", databaseName,
+							"resource", "read",
+							"profile", "batch",
+							"operation", "range_page")
+					.counter();
+			double quantumsBefore = quantumCounter.count();
+			try {
+				var batches = internal.scanRawAsyncInternal(columnId, 0, 1)
+						.collectList()
+						.block(Duration.ofSeconds(30));
+				assertEquals(1, batches.size(),
+						"cooperative yields must retain the partial buffer instead of shortening wire batches");
+				assertEquals(COOPERATIVE_SCAN_KEYS, batches.getFirst().decode().count());
+				long metricDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+				while (quantumCounter.count() - quantumsBefore <= 10.0
+						&& System.nanoTime() < metricDeadline) {
+					Thread.onSpinWait();
+				}
+				assertTrue(quantumCounter.count() - quantumsBefore > 10.0,
+						"the competing LATENCY task must force repeated raw-scan scheduler quanta");
+			} finally {
+				releaseForeground.countDown();
+			}
+		}
+	}
 
 	@Test
 	void compactionCannotDeleteCapturedSstsUntilScanCompletes(@TempDir Path tempDir) throws Exception {

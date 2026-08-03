@@ -38,6 +38,7 @@ public final class RWScheduler {
 	private final ProfiledWorkloadExecutor physicalPool;
 	private final List<ProfiledWorkloadExecutor> pools;
 	private final WorkloadPressureController pressureController;
+	private final EnumMap<WorkloadProfile, EnumMap<OperationFamily, WorkloadExecutor>> noDeadlineExecutors;
 
 	public RWScheduler(int readCap, int writeCap, String name) {
 		this(WorkloadSettings.defaults(readCap, writeCap), name, null, name, true);
@@ -64,7 +65,12 @@ public final class RWScheduler {
 			settings.validateProductionCapacities();
 		}
 		this.pressureController = new WorkloadPressureController(
-				settings.pressuredBatchMaximumActive(), settings.pressuredBatchInterval());
+				settings.competingBatchReadMaximumActive(),
+				settings.competingBatchWriteMaximumActive(),
+				settings.competingBatchWriteInterval(),
+				settings.pressuredBatchMaximumActive(),
+				settings.rangeQuantumMaxDuration(),
+				settings.pressuredBatchInterval());
 		var dataCapacities = settings.queueCapacities();
 		var drrWeights = settings.drrWeights();
 		this.readPool = new ProfiledWorkloadExecutor(settings.readParallelism(),
@@ -75,6 +81,7 @@ public final class RWScheduler {
 				drrWeights,
 				name + "-read",
 				"read",
+				Pool.READ,
 				pressureController,
 				registry,
 				databaseName);
@@ -86,6 +93,7 @@ public final class RWScheduler {
 				drrWeights,
 				name + "-write",
 				"write",
+				Pool.WRITE,
 				pressureController,
 				registry,
 				databaseName);
@@ -97,6 +105,7 @@ public final class RWScheduler {
 				drrWeights,
 				name + "-control",
 				"control",
+				Pool.CONTROL,
 				pressureController,
 				registry,
 				databaseName);
@@ -108,12 +117,29 @@ public final class RWScheduler {
 				drrWeights,
 				name + "-physical",
 				"physical",
+				Pool.PHYSICAL,
 				pressureController,
 				registry,
 				databaseName);
 		this.pools = List.of(readPool, writePool, controlPool, physicalPool);
+		this.noDeadlineExecutors = createNoDeadlineExecutors();
 		pressureController.setNotifier(this::signalAllPools);
+		pressureController.setBatchNotifier(this::signalBatchPools);
 		registerStoragePressureGauge(registry, databaseName);
+	}
+
+	private EnumMap<WorkloadProfile, EnumMap<OperationFamily, WorkloadExecutor>> createNoDeadlineExecutors() {
+		var result = new EnumMap<WorkloadProfile, EnumMap<OperationFamily, WorkloadExecutor>>(WorkloadProfile.class);
+		for (var profile : WorkloadProfile.values()) {
+			var byFamily = new EnumMap<OperationFamily, WorkloadExecutor>(OperationFamily.class);
+			for (var family : OperationFamily.values()) {
+				if (WorkloadAdmission.isAllowed(profile, family)) {
+					byFamily.put(family, pool(profile, family).view(profile, family, RequestContext.NO_DEADLINE));
+				}
+			}
+			result.put(profile, byFamily);
+		}
+		return result;
 	}
 
 	private void registerStoragePressureGauge(@Nullable MeterRegistry registry, String databaseName) {
@@ -196,6 +222,9 @@ public final class RWScheduler {
 			OperationFamily family,
 			long deadlineEpochMillis) {
 		WorkloadAdmission.validate(profile, family);
+		if (deadlineEpochMillis == RequestContext.NO_DEADLINE) {
+			return Objects.requireNonNull(noDeadlineExecutors.get(profile).get(family));
+		}
 		return pool(profile, family).view(profile, family, deadlineEpochMillis);
 	}
 
@@ -315,6 +344,7 @@ public final class RWScheduler {
 			case PHYSICAL -> physicalPool.snapshot();
 		};
 		return new PoolSnapshot(snapshot.workerCount(),
+				snapshot.waitingWorkers(),
 				snapshot.queuedTasks(),
 				snapshot.activeTasks(),
 				snapshot.acceptedTasks(),
@@ -324,6 +354,8 @@ public final class RWScheduler {
 				snapshot.queuedByProfile(),
 				snapshot.activeByProfile(),
 				snapshot.outcomes(),
+				snapshot.batchDispatchLimited(),
+				snapshot.batchStartAllowance(),
 				snapshot.workerThreadNames(),
 				snapshot.shutdown(),
 				snapshot.terminated());
@@ -369,6 +401,15 @@ public final class RWScheduler {
 	private void signalAllPools() {
 		for (var pool : pools()) {
 			pool.signalAvailability();
+		}
+	}
+
+	private void signalBatchPools(int poolMask) {
+		if ((poolMask & 1 << Pool.READ.ordinal()) != 0) {
+			readPool.signalOneAvailability();
+		}
+		if ((poolMask & 1 << Pool.WRITE.ordinal()) != 0) {
+			writePool.signalOneAvailability();
 		}
 	}
 
@@ -457,6 +498,49 @@ public final class RWScheduler {
 	public interface WorkloadExecutor extends Executor {
 
 		void execute(Runnable command, long estimatedBytes);
+
+		default CooperativeHandle executeCooperatively(CooperativeTask command, long estimatedBytes) {
+			throw new UnsupportedOperationException("Cooperative execution is not supported by this view");
+		}
+	}
+
+	/**
+	 * A reusable command whose scheduler node survives cooperative yields and backpressure parks.
+	 */
+	public interface CooperativeTask extends Runnable, RejectionAwareTask {
+
+		CooperativeResult runCooperatively(CooperativeContext context);
+
+		@Override
+		default void run() {
+			throw new IllegalStateException("Cooperative tasks require a cooperative scheduler context");
+		}
+	}
+
+	/**
+	 * Lock-free state exposed to the currently running cooperative quantum.
+	 */
+	public interface CooperativeContext {
+
+		boolean preemptionRequested();
+
+		boolean terminationRequested();
+
+		@Nullable RuntimeException terminationFailure();
+	}
+
+	/**
+	 * Stable handle for resuming parked work or cancelling its logical submission.
+	 */
+	public interface CooperativeHandle extends reactor.core.Disposable {
+
+		void resume();
+	}
+
+	public enum CooperativeResult {
+		COMPLETE,
+		YIELD,
+		PARK
 	}
 
 	/**
@@ -499,6 +583,7 @@ public final class RWScheduler {
 	}
 
 	public record PoolSnapshot(int workerCount,
+			int waitingWorkers,
 			int queuedTasks,
 			int activeTasks,
 			long acceptedTasks,
@@ -508,6 +593,8 @@ public final class RWScheduler {
 			Map<WorkloadProfile, Integer> queuedByProfile,
 			Map<WorkloadProfile, Integer> activeByProfile,
 			Map<TerminalOutcome, Long> outcomes,
+			boolean batchDispatchLimited,
+			int batchStartAllowance,
 			List<String> workerThreadNames,
 			boolean shutdown,
 			boolean terminated) {

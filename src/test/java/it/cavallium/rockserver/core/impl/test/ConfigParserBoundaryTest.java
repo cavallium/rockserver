@@ -131,6 +131,9 @@ class ConfigParserBoundaryTest {
 				"cdc-drr-weight",
 				"analytical-drr-weight",
 				"batch-drr-weight",
+				"competing-batch-read-maximum-active",
+				"competing-batch-write-maximum-active",
+				"competing-batch-write-interval",
 				"pressured-batch-maximum-active",
 				"pressured-batch-interval",
 				"range-quantum-max-items",
@@ -160,6 +163,9 @@ class ConfigParserBoundaryTest {
 				"database.parallelism.workload.control-threads = 0",
 				"database.parallelism.workload.retained-snapshot-maximum-age = PT0S",
 				"database.parallelism.workload.pressured-batch-interval = PT-1S",
+				"database.parallelism.workload.competing-batch-read-maximum-active = 57",
+				"database.parallelism.workload.competing-batch-write-maximum-active = 57",
+				"database.parallelism.workload.competing-batch-write-interval = PT0S",
 				"database.parallelism.workload.pressured-batch-maximum-active = 57",
 				"database.parallelism.workload.range-quantum-max-duration = PT0S",
 				"database.parallelism.workload.cdc-quantum-max-bytes = 0B"
@@ -294,6 +300,9 @@ class ConfigParserBoundaryTest {
 				database.parallelism.workload.cdc-drr-weight = 15
 				database.parallelism.workload.analytical-drr-weight = 16
 				database.parallelism.workload.batch-drr-weight = 1
+				database.parallelism.workload.competing-batch-read-maximum-active = 18
+				database.parallelism.workload.competing-batch-write-maximum-active = 19
+				database.parallelism.workload.competing-batch-write-interval = PT0.019S
 				database.parallelism.workload.pressured-batch-maximum-active = 17
 				database.parallelism.workload.pressured-batch-interval = PT0.018S
 				database.parallelism.workload.range-quantum-max-items = 1900

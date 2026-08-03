@@ -623,14 +623,15 @@ class RWSchedulerIndexedQueueTest {
 	}
 
 	@Test
-	void dispatchCancellationRaceHasOneTerminalCallback() throws Exception {
-		var scheduler = scheduler(1, 8, "indexed-dispatch-race");
+	void dispatchCancellationChecksNeverInvokeQueuedCommands() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-dispatch-inspection");
 		var blockerStarted = new CountDownLatch(1);
 		var releaseBlocker = new CountDownLatch(1);
-		var task = new DispatchRaceTask();
+		var ran = new CountDownLatch(1);
+		var cancellationChecks = new AtomicInteger();
+		var task = new InspectionProbeTask(cancellationChecks, ran);
 		var view = scheduler.executor(
 				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
-		CompletableFuture<Boolean> removal = null;
 		try {
 			view.execute(() -> {
 				blockerStarted.countDown();
@@ -640,29 +641,16 @@ class RWSchedulerIndexedQueueTest {
 			view.execute(task);
 
 			releaseBlocker.countDown();
-			assertTrue(task.awaitCancellationInspection());
-			assertTrue(task.cancel(false));
-			removal = CompletableFuture.supplyAsync(() -> scheduler.removeQueuedTask(view, task));
-			task.releaseCancellationInspection();
-
-			assertFalse(removal.get(5, SECONDS));
-			assertEventually(() -> task.rejectionCount() == 1);
-			assertEquals(0, task.runCount());
-			assertEquals(1, task.rejectionCount());
-			assertEquals(1L,
+			assertTrue(ran.await(5, SECONDS));
+			assertEquals(0, cancellationChecks.get(),
+					"dispatch must read scheduler-owned cancellation state, not invoke queued commands");
+			assertEquals(2L,
 					scheduler.poolSnapshot(RWScheduler.Pool.READ)
 							.outcomes()
-							.get(RWScheduler.TerminalOutcome.CANCELLATION));
+							.get(RWScheduler.TerminalOutcome.RUN));
 		} finally {
-			task.releaseCancellationInspection();
 			releaseBlocker.countDown();
-			try {
-				if (removal != null) {
-					removal.get(5, SECONDS);
-				}
-			} finally {
-				scheduler.disposeNow();
-			}
+			scheduler.disposeNow();
 		}
 	}
 
@@ -828,13 +816,22 @@ class RWSchedulerIndexedQueueTest {
 	private static final class InspectionProbeTask implements Runnable, Disposable {
 
 		private final AtomicInteger cancellationChecks;
+		private final CountDownLatch ran;
 
 		private InspectionProbeTask(AtomicInteger cancellationChecks) {
+			this(cancellationChecks, null);
+		}
+
+		private InspectionProbeTask(AtomicInteger cancellationChecks, CountDownLatch ran) {
 			this.cancellationChecks = cancellationChecks;
+			this.ran = ran;
 		}
 
 		@Override
 		public void run() {
+			if (ran != null) {
+				ran.countDown();
+			}
 		}
 
 		@Override
@@ -983,50 +980,4 @@ class RWSchedulerIndexedQueueTest {
 		}
 	}
 
-	private static final class DispatchRaceTask extends CompletableFuture<Void>
-			implements Runnable, RWScheduler.RejectionAwareTask {
-
-		private final AtomicBoolean firstCancellationInspection = new AtomicBoolean(true);
-		private final CountDownLatch cancellationInspectionStarted = new CountDownLatch(1);
-		private final CountDownLatch releaseCancellationInspection = new CountDownLatch(1);
-		private final AtomicInteger runCount = new AtomicInteger();
-		private final AtomicInteger rejectionCount = new AtomicInteger();
-
-		@Override
-		public void run() {
-			runCount.incrementAndGet();
-			complete(null);
-		}
-
-		@Override
-		public boolean isCancelled() {
-			if (firstCancellationInspection.compareAndSet(true, false)) {
-				cancellationInspectionStarted.countDown();
-				awaitUninterruptibly(releaseCancellationInspection);
-			}
-			return super.isCancelled();
-		}
-
-		@Override
-		public void reject(RuntimeException failure) {
-			rejectionCount.incrementAndGet();
-			completeExceptionally(failure);
-		}
-
-		private boolean awaitCancellationInspection() throws InterruptedException {
-			return cancellationInspectionStarted.await(5, SECONDS);
-		}
-
-		private void releaseCancellationInspection() {
-			releaseCancellationInspection.countDown();
-		}
-
-		private int runCount() {
-			return runCount.get();
-		}
-
-		private int rejectionCount() {
-			return rejectionCount.get();
-		}
-	}
 }

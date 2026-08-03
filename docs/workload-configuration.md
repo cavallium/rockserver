@@ -50,14 +50,24 @@ When that profile has queued work, dispatch restores its guaranteed share.
 | `cdc-drr-weight` | 4 | CDC deficit-round-robin quantum |
 | `analytical-drr-weight` | 2 | ANALYTICAL deficit-round-robin quantum |
 | `batch-drr-weight` | 1 | BATCH deficit-round-robin quantum |
+| `competing-batch-read-maximum-active` | 4 | Read-side BATCH quantum cap while any non-BATCH request is queued or active |
+| `competing-batch-write-maximum-active` | 1 | Write-side BATCH quantum cap while any non-BATCH request is queued or active |
+| `competing-batch-write-interval` | `PT0.001S` | Minimum interval after a competing BATCH write quantum completes |
 | `pressured-batch-maximum-active` | 1 | Maximum active BATCH quanta while storage is pressured |
 | `pressured-batch-interval` | `PT1S` | Minimum idle interval after pressured BATCH completion |
 
-Weights must be between 1 and 16. The latency burst and pressured BATCH maximum
-must be positive; the maximum cannot exceed the combined read/write worker
-capacity. The pressured interval must be a positive, representable duration and
-begins after each pressured BATCH completion. Physical maintenance remains
-parked while storage pressure is active.
+Weights must be between 1 and 16. The latency burst and all BATCH maxima must be
+positive; neither maximum can exceed the combined read/write worker capacity.
+The competing caps are coordinated across the read and write pools. They preserve
+the existing four-way raw-SST parallelism while preventing an otherwise idle write
+pool from flooding RocksDB behind a saturated foreground read pool. They are removed
+within one cooperative quantum after all non-BATCH work drains, so BATCH again
+borrows every worker without mistaking ordinary client/server gaps for idle capacity.
+The write interval is enforced only during that competing window; idle-only BATCH
+writes are not paced.
+The pressured interval must be a positive, representable duration and begins
+after each pressured BATCH completion. Physical maintenance remains parked while
+storage pressure is active.
 
 ## Retained analytical work
 
@@ -94,6 +104,20 @@ when they exceed `latency-range-max-items` or `latency-range-max-bytes`; those
 settings may lower but never raise the public ceiling. Rockserver rejects
 over-budget requests rather than silently clamping them. The 256-item/2-MiB
 fan-out ceiling remains specific to LATENCY point and fixed multi commands.
+
+Raw SST scans are work-conserving BATCH work. Each active SST keeps one reusable
+cooperative scheduler task, iterator, readahead configuration, and partial wire buffer.
+With no competing work in any scheduler pool it keeps producing the existing full 2 MiB/65,536-entry
+wire batches without a duration cap or scheduler delay. Once any non-BATCH submission
+is queued or active in any pool, the scan observes the same `range-quantum-max-duration` bound,
+yields after the current indivisible RocksDB iterator call, and later resumes the same
+task and partial batch. Four-way SST concurrency and sharded scan ordering are unchanged.
+
+Cooperative queue-wait and execution timers are published once per logical SST task at
+terminal completion. Queue wait remains admission-to-first-dispatch latency; it does not
+misclassify downstream backpressure or later cooperative redispatch as initial queueing.
+Execution is total active time, and `rockserver.workload.quantums` retains the exact number
+of scheduler quanta. Registry recording is therefore outside repeated cooperative yields.
 
 CDC captures one conservative completed-mutation tail, then publishes the application
 WAL through `CDC + FLUSH` before opening the logical poll. WAL parsing,

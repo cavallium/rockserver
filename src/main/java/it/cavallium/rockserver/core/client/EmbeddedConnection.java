@@ -280,7 +280,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		});
     }
 
-	private java.util.concurrent.Executor commandExecutor(RocksDBAPICommand<?, ?, ?> command) {
+	private RWScheduler.WorkloadExecutor commandExecutor(RocksDBAPICommand<?, ?, ?> command) {
 		var context = currentRequestContext();
 		var profile = resolveCommand(context, command);
 		return db.getScheduler().executor(profile,
@@ -312,7 +312,11 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		var command = new RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw(
 				columnId, shardIndex, shardCount);
 		return db.scanRawAsyncInternal(
-				columnId, shardIndex, shardCount, commandScheduler(command));
+				columnId,
+				shardIndex,
+				shardCount,
+				commandScheduler(command),
+				commandExecutor(command));
 	}
 
 	@Override

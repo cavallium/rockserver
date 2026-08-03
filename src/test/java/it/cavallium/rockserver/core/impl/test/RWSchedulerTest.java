@@ -192,7 +192,13 @@ class RWSchedulerTest {
 			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			assertEquals(3, snapshot.workerCount());
 			assertEquals(3, snapshot.activeTasks());
+			assertEquals(0, snapshot.waitingWorkers());
 			assertEquals(3, snapshot.activeByProfile().get(WorkloadProfile.BATCH));
+			release.countDown();
+			assertEventually(() -> {
+				var idle = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				return idle.activeTasks() == 0 && idle.queuedTasks() == 0 && idle.waitingWorkers() == 3;
+			});
 		} finally {
 			release.countDown();
 			scheduler.dispose();
@@ -323,19 +329,33 @@ class RWSchedulerTest {
 	@Test
 	void cancellationImmediatelyBeforeRunDoesNotConsumeAPressureInterval() throws Exception {
 		var scheduler = scheduler(1, "pressure-cancel-test");
-		var cancelled = new CancelAtDispatchTask();
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
 		var nextStarted = new CountDownLatch(1);
+		var batchView = scheduler.scheduler(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
 		try {
 			scheduler.setStoragePressure(true);
-			scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE).execute(cancelled);
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+					.execute(() -> {
+						blockerStarted.countDown();
+						awaitUninterruptibly(releaseBlocker);
+					});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			var cancelled = batchView.schedule(() -> {
+			});
+			cancelled.dispose();
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)
 					.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION) == 1L);
 
+			releaseBlocker.countDown();
 			scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE)
 					.execute(nextStarted::countDown);
 			assertTrue(nextStarted.await(800L, TimeUnit.MILLISECONDS),
 					"a BATCH task that never ran must not start the one-second pressure interval");
 		} finally {
+			releaseBlocker.countDown();
+			batchView.dispose();
 			scheduler.setStoragePressure(false);
 			scheduler.dispose();
 		}
@@ -551,12 +571,125 @@ class RWSchedulerTest {
 	}
 
 	@Test
+	void competingForegroundCapsGlobalBatchThenImmediatelyReclaimsIdleWorkers() throws Exception {
+		var scheduler = RWScheduler.forTesting(6, 6, 1, 128, 128, "global-batch-contention");
+		var foregroundStarted = new CountDownLatch(1);
+		var releaseForeground = new CountDownLatch(1);
+		var firstBatchStarted = new CountDownLatch(1);
+		var allBatchStarted = new CountDownLatch(6);
+		var releaseBatch = new CountDownLatch(1);
+		var batchStarts = new AtomicInteger();
+		try {
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					System.currentTimeMillis() + SECONDS.toMillis(30)).execute(() -> {
+				foregroundStarted.countDown();
+				awaitUninterruptibly(releaseForeground);
+			});
+			assertTrue(foregroundStarted.await(5, SECONDS));
+
+			var batch = scheduler.executor(
+					WorkloadProfile.BATCH, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
+			for (int i = 0; i < 6; i++) {
+				batch.execute(() -> {
+					batchStarts.incrementAndGet();
+					firstBatchStarted.countDown();
+					allBatchStarted.countDown();
+					awaitUninterruptibly(releaseBatch);
+				});
+			}
+			assertTrue(firstBatchStarted.await(5, SECONDS));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.WRITE).batchDispatchLimited());
+			assertEquals(1, batchStarts.get(),
+					"foreground competition must limit write-side BATCH without reducing read-side SST parallelism");
+			assertEquals(1,
+					scheduler.poolSnapshot(RWScheduler.Pool.WRITE)
+							.activeByProfile().get(WorkloadProfile.BATCH));
+
+			releaseForeground.countDown();
+			assertTrue(allBatchStarted.await(5, SECONDS),
+					"every idle write worker must be reclaimed as soon as global competition drains");
+			assertEquals(6, batchStarts.get());
+			assertFalse(scheduler.poolSnapshot(RWScheduler.Pool.WRITE).batchDispatchLimited());
+		} finally {
+			releaseForeground.countDown();
+			releaseBatch.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void competingBatchWritesArePacedWithoutDelayingBatchOnlyWork() throws Exception {
+		var scheduler = RWScheduler.forTesting(6, 6, 1, 128, 128, "competing-batch-pacing");
+		var foregroundStarted = new CountDownLatch(1);
+		var releaseForeground = new CountDownLatch(1);
+		var pacedDone = new CountDownLatch(3);
+		var pacedStarts = Collections.synchronizedList(new ArrayList<Long>());
+		try {
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					System.currentTimeMillis() + SECONDS.toMillis(30)).execute(() -> {
+				foregroundStarted.countDown();
+				awaitUninterruptibly(releaseForeground);
+			});
+			assertTrue(foregroundStarted.await(5, SECONDS));
+			var batch = scheduler.executor(
+					WorkloadProfile.BATCH, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
+			for (int i = 0; i < 3; i++) {
+				batch.execute(() -> {
+					pacedStarts.add(System.nanoTime());
+					pacedDone.countDown();
+				});
+			}
+			assertTrue(pacedDone.await(5, SECONDS));
+			for (int i = 1; i < pacedStarts.size(); i++) {
+				assertTrue(pacedStarts.get(i) - pacedStarts.get(i - 1)
+						>= TimeUnit.MICROSECONDS.toNanos(800),
+						"competing write-side BATCH starts must observe the one-millisecond interval");
+			}
+
+			releaseForeground.countDown();
+			var unpacedStarted = new CountDownLatch(6);
+			var releaseUnpaced = new CountDownLatch(1);
+			for (int i = 0; i < 6; i++) {
+				batch.execute(() -> {
+					unpacedStarted.countDown();
+					awaitUninterruptibly(releaseUnpaced);
+				});
+			}
+			try {
+				assertTrue(unpacedStarted.await(5, SECONDS),
+						"BATCH-only work must immediately recover unpaced write-pool parallelism");
+			} finally {
+				releaseUnpaced.countDown();
+			}
+		} finally {
+			releaseForeground.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void productionConstructorsRequireAllThreeReservationsAndExposeNoUnmanagedVariant() {
 		assertThrows(IllegalArgumentException.class, () -> new RWScheduler(2, 3, "too-small-read"));
 		assertThrows(IllegalArgumentException.class, () -> new RWScheduler(3, 2, "too-small-write"));
 		assertTrue(java.util.Arrays.stream(RWScheduler.class.getConstructors())
 				.noneMatch(constructor -> java.util.Arrays.stream(constructor.getParameterTypes())
 						.anyMatch(type -> type.getName().equals("reactor.core.scheduler.Scheduler"))));
+	}
+
+	@Test
+	void instrumentationReportsZeroBatchAllowanceForIsolatedPools() {
+		var scheduler = scheduler(3, "isolated-instrumentation");
+		try {
+			var snapshot = scheduler.instrumentationSnapshot();
+			assertEquals(0, snapshot.pools().get(RWScheduler.Pool.CONTROL).batchStartAllowance());
+			assertEquals(0, snapshot.pools().get(RWScheduler.Pool.PHYSICAL).batchStartAllowance());
+			assertFalse(snapshot.pools().get(RWScheduler.Pool.CONTROL).batchDispatchLimited());
+			assertFalse(snapshot.pools().get(RWScheduler.Pool.PHYSICAL).batchDispatchLimited());
+		} finally {
+			scheduler.disposeNow();
+		}
 	}
 
 	private static RWScheduler scheduler(int threads, String name) {
@@ -652,26 +785,6 @@ class RWSchedulerTest {
 
 		private int disposeCount() {
 			return disposeCount.get();
-		}
-	}
-
-	private static final class CancelAtDispatchTask implements Runnable, Disposable {
-
-		private final AtomicInteger disposalChecks = new AtomicInteger();
-
-		@Override
-		public void run() {
-			throw new AssertionError("cancelled task must not run");
-		}
-
-		@Override
-		public void dispose() {
-			disposalChecks.set(Integer.MAX_VALUE);
-		}
-
-		@Override
-		public boolean isDisposed() {
-			return disposalChecks.incrementAndGet() >= 2;
 		}
 	}
 

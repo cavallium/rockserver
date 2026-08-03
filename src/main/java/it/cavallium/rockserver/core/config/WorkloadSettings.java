@@ -38,6 +38,9 @@ public record WorkloadSettings(
 		int cdcDrrWeight,
 		int analyticalDrrWeight,
 		int batchDrrWeight,
+		int competingBatchReadMaximumActive,
+		int competingBatchWriteMaximumActive,
+		Duration competingBatchWriteInterval,
 		int pressuredBatchMaximumActive,
 		Duration pressuredBatchInterval,
 		int rangeQuantumMaxItems,
@@ -77,6 +80,9 @@ public record WorkloadSettings(
 		drrWeight("cdc-drr-weight", cdcDrrWeight);
 		drrWeight("analytical-drr-weight", analyticalDrrWeight);
 		drrWeight("batch-drr-weight", batchDrrWeight);
+		positive("competing-batch-read-maximum-active", competingBatchReadMaximumActive);
+		positive("competing-batch-write-maximum-active", competingBatchWriteMaximumActive);
+		positiveDuration("competing-batch-write-interval", competingBatchWriteInterval, false);
 		positive("pressured-batch-maximum-active", pressuredBatchMaximumActive);
 		positive("range-quantum-max-items", rangeQuantumMaxItems);
 		positive("range-quantum-max-bytes", rangeQuantumMaxBytes);
@@ -93,7 +99,12 @@ public record WorkloadSettings(
 		if (analyticalActiveLimit > Math.min(readParallelism, writeParallelism)) {
 			throw invalid("analytical-active-limit must not exceed either data-pool capacity");
 		}
-		if (pressuredBatchMaximumActive > (long) readParallelism + writeParallelism) {
+		long combinedDataCapacity = (long) readParallelism + writeParallelism;
+		if (competingBatchReadMaximumActive > combinedDataCapacity
+				|| competingBatchWriteMaximumActive > combinedDataCapacity) {
+			throw invalid("competing BATCH maxima must not exceed combined data-pool capacity");
+		}
+		if (pressuredBatchMaximumActive > combinedDataCapacity) {
 			throw invalid("pressured-batch-maximum-active must not exceed combined data-pool capacity");
 		}
 		if (latencyRangeMaxItems > LATENCY_RANGE_HARD_MAX_ITEMS
@@ -175,6 +186,9 @@ public record WorkloadSettings(
 				require(o.cdcDrrWeight(), "cdc-drr-weight"),
 				require(o.analyticalDrrWeight(), "analytical-drr-weight"),
 				require(o.batchDrrWeight(), "batch-drr-weight"),
+				require(o.competingBatchReadMaximumActive(), "competing-batch-read-maximum-active"),
+				require(o.competingBatchWriteMaximumActive(), "competing-batch-write-maximum-active"),
+				require(o.competingBatchWriteInterval(), "competing-batch-write-interval"),
 				require(o.pressuredBatchMaximumActive(), "pressured-batch-maximum-active"),
 				require(o.pressuredBatchInterval(), "pressured-batch-interval"),
 				require(o.rangeQuantumMaxItems(), "range-quantum-max-items"),
@@ -222,6 +236,9 @@ public record WorkloadSettings(
 				4,
 				2,
 				1,
+				Math.min(4, readParallelism),
+				1,
+				Duration.ofMillis(1),
 				1,
 				Duration.ofSeconds(1),
 				4_096,

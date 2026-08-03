@@ -52,6 +52,12 @@ public interface WorkloadConfig {
 
 	Integer batchDrrWeight() throws GestaltException;
 
+	Integer competingBatchReadMaximumActive() throws GestaltException;
+
+	Integer competingBatchWriteMaximumActive() throws GestaltException;
+
+	Duration competingBatchWriteInterval() throws GestaltException;
+
 	Integer pressuredBatchMaximumActive() throws GestaltException;
 
 	Duration pressuredBatchInterval() throws GestaltException;

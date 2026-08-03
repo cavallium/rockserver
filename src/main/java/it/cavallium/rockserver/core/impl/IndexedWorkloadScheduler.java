@@ -29,6 +29,10 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		this.executor = Objects.requireNonNull(executor, "executor");
 	}
 
+	RWScheduler.WorkloadExecutor workloadExecutor() {
+		return executor;
+	}
+
 	@Override
 	public Disposable schedule(Runnable task) {
 		if (disposed.get()) {
@@ -104,7 +108,9 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		}
 	}
 
-	private static final class IndexedScheduledTask implements Runnable, Disposable {
+	private static final class IndexedScheduledTask implements Runnable,
+			Disposable,
+			ProfiledWorkloadExecutor.CancellationTrackedTask {
 
 		private static final int QUEUED = 0;
 		private static final int RUNNING = 1;
@@ -117,6 +123,8 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		private final Runnable task;
 		private final @Nullable IndexedWorker parent;
 		private final AtomicInteger state = new AtomicInteger(QUEUED);
+		private final ProfiledWorkloadExecutor.CancellationState cancellationState =
+				new ProfiledWorkloadExecutor.CancellationState();
 		private boolean submitted;
 
 		private IndexedScheduledTask(RWScheduler scheduler,
@@ -146,7 +154,15 @@ final class IndexedWorkloadScheduler implements Scheduler {
 
 		@Override
 		public void run() {
-			if (!state.compareAndSet(QUEUED, RUNNING)) {
+			int currentState = state.get();
+			if (currentState == QUEUED) {
+				if (!state.compareAndSet(QUEUED, RUNNING)) {
+					currentState = state.get();
+				} else {
+					currentState = RUNNING;
+				}
+			}
+			if (currentState != RUNNING && currentState != CANCELLED_WHILE_RUNNING) {
 				deleteFromParent();
 				return;
 			}
@@ -160,12 +176,15 @@ final class IndexedWorkloadScheduler implements Scheduler {
 
 		@Override
 		public void dispose() {
+			boolean cancelledBeforeDispatch = cancellationState.cancel();
 			boolean removeQueued = false;
 			synchronized (this) {
-				if (state.compareAndSet(QUEUED, CANCELLED)) {
+				if (cancelledBeforeDispatch && state.compareAndSet(QUEUED, CANCELLED)) {
 					removeQueued = submitted;
-				} else {
-					state.compareAndSet(RUNNING, CANCELLED_WHILE_RUNNING);
+				} else if (!cancelledBeforeDispatch) {
+					if (!state.compareAndSet(RUNNING, CANCELLED_WHILE_RUNNING)) {
+						state.compareAndSet(QUEUED, CANCELLED_WHILE_RUNNING);
+					}
 				}
 			}
 			if (removeQueued) {
@@ -177,6 +196,11 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		@Override
 		public boolean isDisposed() {
 			return state.get() >= FINISHED;
+		}
+
+		@Override
+		public ProfiledWorkloadExecutor.CancellationState workloadCancellationState() {
+			return cancellationState;
 		}
 
 		private void deleteFromParent() {

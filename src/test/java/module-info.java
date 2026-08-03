@@ -2,6 +2,7 @@ module rockserver.core.test {
 	requires org.lz4.java;
 	requires rockserver.core;
 	requires com.google.common;
+	requires com.google.protobuf;
 	requires org.slf4j;
 	requires org.github.gestalt.core;
 	requires rocksdbjni;

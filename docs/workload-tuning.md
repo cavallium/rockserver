@@ -65,6 +65,11 @@ The candidate SLO gates are intentionally conservative:
 
 The LATENCY and ANALYTICAL rows are scheduler-level chat/fallback proxies. They do
 not replace the Yotsuba one-hour canary or prove the end-to-end message path.
+Run the complementary
+[`GrpcOverloadBenchmark`](grpc-mixed-workload-benchmark.md) to exercise all seven
+profiles through the generated gRPC client and server, prove exact RPC terminal
+accounting and acknowledged-write round trips, and gate avoidable sleeping workers
+plus paired foreground confidence intervals. Neither harness replaces the canary.
 
 ## Obtain the direct-launch classpath
 

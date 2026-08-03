@@ -82,7 +82,6 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
@@ -129,13 +128,13 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.MarkerFactory;
 import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import org.rocksdb.TransactionLogIterator;
 import org.rocksdb.WriteBatch;
-import reactor.core.publisher.SynchronousSink;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
@@ -7247,19 +7246,50 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private final class ScanState implements AutoCloseable {
+	private final class ScanState implements RWScheduler.CooperativeTask, LongConsumer, reactor.core.Disposable {
 		private final ColumnInstance col;
+		private final String cfName;
 		private final LiveFileMetaData file;
-		private final SstFileReader reader;
-		private final SstFileReaderIterator it;
-		private final ReadOptions readOptions;
-		private final Options options;
-		private boolean closed = false;
+		private final FluxSink<SerializedKVBatch> sink;
+		private final long maximumQuantumNanos;
+		private final AtomicLong demand = new AtomicLong();
+		private final AtomicBoolean terminated = new AtomicBoolean();
+		private volatile boolean cancellationRequested;
+		private volatile @Nullable RWScheduler.CooperativeHandle handle;
+		private @Nullable SstFileReader reader;
+		private @Nullable SstFileReaderIterator it;
+		private @Nullable ReadOptions readOptions;
+		private @Nullable Options options;
 		private final Buf outBuf = Buf.create(Math.toIntExact(SizeUnit.MB));
+		private int batchSize;
+		private int currentBatchBytes;
+		private int currentSerializedBatchBytes = Integer.BYTES;
 
-		private ScanState(ColumnInstance col, String cfName, LiveFileMetaData file) throws org.rocksdb.RocksDBException {
+		private ScanState(ColumnInstance col,
+		                  String cfName,
+		                  LiveFileMetaData file,
+		                  FluxSink<SerializedKVBatch> sink,
+		                  long maximumQuantumNanos) {
 			this.col = col;
+			this.cfName = cfName;
 			this.file = file;
+			this.sink = sink;
+			this.maximumQuantumNanos = maximumQuantumNanos;
+		}
+
+		private void attach(RWScheduler.CooperativeHandle handle) {
+			this.handle = Objects.requireNonNull(handle, "handle");
+			if (cancellationRequested) {
+				handle.dispose();
+			} else if (demand.get() > 0L) {
+				handle.resume();
+			}
+		}
+
+		private void open() throws org.rocksdb.RocksDBException {
+			if (it != null) {
+				return;
+			}
 			String filePath = file.path();
 			if (!filePath.endsWith(".sst")) {
 				filePath = filePath + file.fileName();
@@ -7311,42 +7341,53 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 				throw e;
 			}
-			this.options = createdOptions;
-			this.reader = createdReader;
-			this.readOptions = createdReadOptions;
-			this.it = createdIterator;
+			options = createdOptions;
+			reader = createdReader;
+			readOptions = createdReadOptions;
+			it = createdIterator;
 		}
 
-		private synchronized void generateNext(SynchronousSink<SerializedKVBatch> sink) {
-			if (closed) {
-				sink.complete();
-				return;
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			if (terminated.get()) {
+				return RWScheduler.CooperativeResult.COMPLETE;
 			}
-			if (it == null) {
-				sink.complete();
-				return;
+			if (cancellationRequested) {
+				finish(null, false);
+				return RWScheduler.CooperativeResult.COMPLETE;
 			}
-			if (!it.isValid()) {
-				try {
-					it.status();
-				} catch (org.rocksdb.RocksDBException e) {
-					sink.error(e);
-					return;
-				}
-				sink.complete();
-				return;
+			if (context.terminationRequested()) {
+				finish(context.terminationFailure(), true);
+				return RWScheduler.CooperativeResult.COMPLETE;
 			}
-
-			int batchSize = 0;
-			int currentBatchBytes = 0;
-			int currentSerializedBatchBytes = Integer.BYTES;
-
+			if (demand.get() == 0L) {
+				return RWScheduler.CooperativeResult.PARK;
+			}
 			try {
-				while (it.isValid()) {
-					if (closed) return;
+				open();
+				long preemptionStartNanos = 0L;
+				while (true) {
+					if (cancellationRequested) {
+						finish(null, false);
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					if (context.terminationRequested()) {
+						finish(context.terminationFailure(), true);
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					var iterator = Objects.requireNonNull(it, "Raw scan iterator");
+					if (!iterator.isValid()) {
+						iterator.status();
+						if (batchSize > 0) {
+							emitBatch();
+						}
+						finish(null, true);
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+
 					batchSize++;
-					byte[] k = it.key();
-					byte[] v = it.value();
+					byte[] k = iterator.key();
+					byte[] v = iterator.value();
 					var kBuf = Buf.wrap(k);
 					var vBuf = Buf.wrap(v);
 					currentBatchBytes += k.length + v.length;
@@ -7370,57 +7411,160 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						currentSerializedBatchBytes += Integer.BYTES;
 					}
 
-					it.next();
+					iterator.next();
 					if (batchSize >= RAW_SCAN_MAX_ENTRIES_PER_CHUNK
 							|| currentBatchBytes >= RAW_SCAN_MAX_BYTES_PER_CHUNK) {
-						break;
+						emitBatch();
+						if (demand.get() == 0L) {
+							return RWScheduler.CooperativeResult.PARK;
+						}
+					}
+
+					if (context.preemptionRequested()) {
+						long nowNanos = System.nanoTime();
+						if (preemptionStartNanos == 0L) {
+							preemptionStartNanos = nowNanos;
+						} else if (nowNanos - preemptionStartNanos >= maximumQuantumNanos) {
+							return RWScheduler.CooperativeResult.YIELD;
+						}
+					} else {
+						preemptionStartNanos = 0L;
 					}
 				}
-			} catch (Exception e) {
-				sink.error(e);
-				return;
+			} catch (VirtualMachineError fatal) {
+				throw fatal;
+			} catch (Throwable failure) {
+				finish(failure, true);
+				return RWScheduler.CooperativeResult.COMPLETE;
 			}
+		}
 
-			if (batchSize > 0) {
-				outBuf.setIntLE(0, batchSize);
-				sink.next(new SerializedKVBatch.SerializedKVBatchRef(outBuf.copyOfRange(0, currentSerializedBatchBytes)));
-			} else {
-				try {
-					it.status();
-				} catch (org.rocksdb.RocksDBException e) {
-					sink.error(e);
+		private void emitBatch() {
+			producedOne();
+			outBuf.setIntLE(0, batchSize);
+			var batch = new SerializedKVBatch.SerializedKVBatchRef(
+					outBuf.copyOfRange(0, currentSerializedBatchBytes));
+			batchSize = 0;
+			currentBatchBytes = 0;
+			currentSerializedBatchBytes = Integer.BYTES;
+			sink.next(batch);
+		}
+
+		private void producedOne() {
+			while (true) {
+				long current = demand.get();
+				if (current == Long.MAX_VALUE) {
 					return;
 				}
-				sink.complete();
+				if (current <= 0L) {
+					throw new IllegalStateException("Raw scan produced without downstream demand");
+				}
+				if (demand.compareAndSet(current, current - 1L)) {
+					return;
+				}
 			}
 		}
 
 		@Override
-		public synchronized void close() {
-			if (closed) {
+		public void accept(long requested) {
+			if (requested <= 0L || terminated.get()) {
 				return;
 			}
-			closed = true;
+			while (true) {
+				long current = demand.get();
+				long updated = current + requested;
+				if (updated < 0L) {
+					updated = Long.MAX_VALUE;
+				}
+				if (demand.compareAndSet(current, updated)) {
+					break;
+				}
+			}
+			var currentHandle = handle;
+			if (currentHandle != null) {
+				currentHandle.resume();
+			}
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			finish(failure, !(failure instanceof CancellationException));
+		}
+
+		@Override
+		public void dispose() {
+			if (terminated.get()) {
+				return;
+			}
+			cancellationRequested = true;
+			var currentHandle = handle;
+			if (currentHandle != null) {
+				currentHandle.dispose();
+			}
+		}
+
+		@Override
+		public boolean isDisposed() {
+			return terminated.get();
+		}
+
+		private void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
+			if (!terminated.compareAndSet(false, true)) {
+				return;
+			}
+			Throwable failure = originalFailure;
+			try {
+				closeNativeResources();
+			} catch (Throwable closeFailure) {
+				failure = appendFailure(failure, closeFailure);
+			}
+			if (!signalTerminal) {
+				return;
+			}
+			if (failure == null) {
+				sink.complete();
+			} else {
+				sink.error(failure);
+			}
+		}
+
+		private void closeNativeResources() {
 			Throwable failure = null;
-			try {
-				it.close();
-			} catch (Throwable error) {
-				failure = error;
+			var iterator = it;
+			it = null;
+			if (iterator != null) {
+				try {
+					iterator.close();
+				} catch (Throwable error) {
+					failure = error;
+				}
 			}
-			try {
-				readOptions.close();
-			} catch (Throwable error) {
-				failure = appendFailure(failure, error);
+			var localReadOptions = readOptions;
+			readOptions = null;
+			if (localReadOptions != null) {
+				try {
+					localReadOptions.close();
+				} catch (Throwable error) {
+					failure = appendFailure(failure, error);
+				}
 			}
-			try {
-				reader.close();
-			} catch (Throwable error) {
-				failure = appendFailure(failure, error);
+			var localReader = reader;
+			reader = null;
+			if (localReader != null) {
+				try {
+					localReader.close();
+				} catch (Throwable error) {
+					failure = appendFailure(failure, error);
+				}
 			}
-			try {
-				options.close();
-			} catch (Throwable error) {
-				failure = appendFailure(failure, error);
+			var localOptions = options;
+			options = null;
+			if (localOptions != null) {
+				try {
+					localOptions.close();
+				} catch (Throwable error) {
+					failure = appendFailure(failure, error);
+				}
 			}
 			if (failure instanceof RuntimeException runtimeException) {
 				throw runtimeException;
@@ -7435,13 +7579,33 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId, int shardIndex, int shardCount) {
-		return scanRawAsyncInternal(columnId, shardIndex, shardCount, scheduler.read());
+		return scanRawAsyncInternal(columnId,
+				shardIndex,
+				shardCount,
+				scheduler.read(),
+				scheduler.readExecutor());
 	}
 
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId,
 			int shardIndex,
 			int shardCount,
 			@NotNull Scheduler workloadScheduler) {
+		var workloadExecutor = workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler
+				? indexedScheduler.workloadExecutor()
+				: scheduler.readExecutor();
+		return scanRawAsyncInternal(columnId,
+				shardIndex,
+				shardCount,
+				workloadScheduler,
+				workloadExecutor);
+	}
+
+	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId,
+			int shardIndex,
+			int shardCount,
+			@NotNull Scheduler workloadScheduler,
+			@NotNull RWScheduler.WorkloadExecutor workloadExecutor) {
+		long maximumQuantumNanos = workloadSettings.rangeQuantumMaxDuration().toNanos();
 		return Flux.using(
 				() -> {
 					ops.beginOp();
@@ -7470,14 +7634,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						}
 
 						Function<LiveFileMetaData, Publisher<SerializedKVBatch>> mapper = f ->
-								Flux.<SerializedKVBatch, ScanState>generate(
-										() -> new ScanState(col, cfName, f),
-										(state, sink) -> {
-											state.generateNext(sink);
-											return state;
-										},
-										ScanState::close)
-										.subscribeOn(workloadScheduler)
+								Flux.<SerializedKVBatch>create(rawSink -> {
+									var state = new ScanState(col, cfName, f, rawSink, maximumQuantumNanos);
+									rawSink.onRequest(state);
+									rawSink.onCancel(state);
+									rawSink.onDispose(state);
+									try {
+										state.attach(workloadExecutor.executeCooperatively(
+												state,
+												RAW_SCAN_MAX_BYTES_PER_CHUNK));
+									} catch (RuntimeException admissionFailure) {
+										state.reject(admissionFailure);
+									}
+								}, FluxSink.OverflowStrategy.ERROR)
 										.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
 
 						var ssts = Flux.fromIterable(lease.files())

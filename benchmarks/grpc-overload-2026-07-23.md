@@ -1,5 +1,9 @@
 # gRPC overload admission benchmark — 2026-07-23
 
+> Historical result: this documents the former two-profile v1 runner. The current
+> seven-profile, request-conserving v4 runner and its non-comparable acceptance
+> contract are documented in `docs/grpc-mixed-workload-benchmark.md`.
+
 ## Scope
 
 `GrpcOverloadBenchmark` is the retained two-profile regression for the original

@@ -3,11 +3,26 @@ package it.cavallium.rockserver.core.impl.benchmark;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
+import io.grpc.CallOptions;
+import io.grpc.Channel;
+import io.grpc.ClientCall;
+import io.grpc.ClientInterceptor;
+import io.grpc.ClientInterceptors;
+import io.grpc.ForwardingClientCall;
+import io.grpc.ForwardingClientCallListener;
 import io.grpc.ManagedChannel;
+import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import io.grpc.StatusException;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
+import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
+import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
+import io.micrometer.core.instrument.distribution.pause.PauseDetector;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
@@ -16,26 +31,39 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.api.proto.FirstAndLast;
+import it.cavallium.rockserver.core.common.api.proto.CdcCommitRequest;
+import it.cavallium.rockserver.core.common.api.proto.CdcCreateRequest;
+import it.cavallium.rockserver.core.common.api.proto.CdcPollRequest;
+import it.cavallium.rockserver.core.common.api.proto.CloseTransactionRequest;
+import it.cavallium.rockserver.core.common.api.proto.FlushRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetRangeRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetResponse;
 import it.cavallium.rockserver.core.common.api.proto.KV;
+import it.cavallium.rockserver.core.common.api.proto.OpenTransactionRequest;
 import it.cavallium.rockserver.core.common.api.proto.PutRequest;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumMap;
+import java.util.EnumSet;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -53,6 +81,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 
@@ -60,9 +89,11 @@ import java.util.concurrent.locks.LockSupport;
  * Opt-in, disk-backed gRPC overload regression benchmark.
  *
  * <p>The runner opens one real RocksDB database, preloads and flushes it, then runs a
- * foreground-only phase followed by a maintenance-flood phase against the same state. The
+ * foreground-only phase followed by a seven-profile mixed-flood phase against the same state. The
  * five-second client and range budgets are fixed deliberately: changing the timeout is not a
- * benchmark knob. This class lives in test sources and is not executed by ordinary CI.</p>
+ * benchmark knob. Every transport call is independently counted at start and terminal close, and
+ * the mixed phase samples scheduler work conservation in every pool. This class lives in test
+ * sources and is not executed by ordinary CI.</p>
  */
 public final class GrpcOverloadBenchmark {
 
@@ -71,7 +102,16 @@ public final class GrpcOverloadBenchmark {
 	private static final long RESOURCE_DRAIN_TIMEOUT_SECONDS = 30;
 	private static final int WRITE_REQUEST_VARIANTS = 64;
 	private static final int MAX_RECORDED_ERRORS = 20;
-	private static final String RESULT_SCHEMA = "rockserver-grpc-overload-v1";
+	private static final double MIN_FOREGROUND_THROUGHPUT_RATIO = 0.80d;
+	private static final long COOPERATIVE_QUANTUM_NANOS = TimeUnit.MILLISECONDS.toNanos(8L);
+	private static final String CDC_SUBSCRIPTION_PREFIX = "grpc-overload-cdc-";
+	private static final String RESULT_SCHEMA = "rockserver-grpc-overload-v4";
+	private static final String DATASET_SCHEMA = "rockserver-grpc-overload-dataset-v3";
+	private static final String RUN_ATTEMPT_SCHEMA = "rockserver-grpc-overload-run-attempt-v1";
+	private static final String DATASET_MARKER_FILE = ".rockserver-overload-benchmark";
+	private static final String RUN_ATTEMPT_FILE = "run-attempt.properties";
+	private static final long GIBIBYTE = 1L << 30;
+	private static final int MIN_RELEASE_HOST_AVAILABLE_GIB = 8;
 
 	private GrpcOverloadBenchmark() {
 	}
@@ -86,20 +126,25 @@ public final class GrpcOverloadBenchmark {
 		System.setProperty("rockserver.core.print-config", "false");
 		System.setProperty("it.cavallium.rockserver.leakdetection", "true");
 		Instant started = Instant.now();
+		RunEnvironment environment = RunEnvironment.capture(options.root());
+		verifyHostMemory(options, environment.hostMemory());
+		verifyStorage(options, environment.storage());
+		verifyCompetingBenchmarks(options, environment.competingBenchmarkProcesses());
 		long nativeLeaksBefore = RocksLeakDetector.detectedLeakCount();
 		Path root;
 		Path config;
 		if (options.reusePreloaded()) {
-			root = openPreparedRoot(options);
+			root = openPreparedRoot(options, environment);
 			config = root.resolve("rockserver.conf");
-			writeMetadata(root.resolve("run-metadata.txt"), options, started);
+			writeMetadata(root.resolve("run-metadata.txt"), options, environment, started);
 		} else {
 			root = createFreshRoot(options);
 			config = writeConfig(root, options);
-			writeMetadata(root.resolve("metadata.txt"), options, started);
+			writeMetadata(root.resolve("metadata.txt"), options, environment, started);
 		}
 
-		List<PhaseResult> phases = new ArrayList<>(2);
+		List<PhaseResult> phases = new ArrayList<>(options.rounds() * 2);
+		IntegrityResult integrity = IntegrityResult.notRun();
 		Throwable runFailure = null;
 		Throwable closeFailure = null;
 		EmbeddedConnection embedded = null;
@@ -115,10 +160,16 @@ public final class GrpcOverloadBenchmark {
 				server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0));
 				server.start();
 				client = Client.open(server.getPort());
-				preflight(client, requests);
+				preflight(client, requests, columnId, options);
 
-				phases.add(runPhase(Phase.FOREGROUND_ONLY, client, embedded, server, requests, options));
-				phases.add(runPhase(Phase.MAINTENANCE_FLOOD, client, embedded, server, requests, options));
+				for (int round = 1; round <= options.rounds(); round++) {
+					Phase first = (round & 1) == 1 ? Phase.FOREGROUND_ONLY : Phase.MAINTENANCE_FLOOD;
+					Phase second = first == Phase.FOREGROUND_ONLY
+							? Phase.MAINTENANCE_FLOOD : Phase.FOREGROUND_ONLY;
+					phases.add(runPhase(round, first, client, embedded, server, requests, options));
+					phases.add(runPhase(round, second, client, embedded, server, requests, options));
+				}
+				integrity = runIntegrityProbe(client, columnId, options);
 			}
 		} catch (Throwable failure) {
 			runFailure = failure;
@@ -143,21 +194,23 @@ public final class GrpcOverloadBenchmark {
 				throw new IllegalStateException("Preparation detected native-handle leaks: " + nativeLeaksDetected);
 			}
 			System.out.println("Prepared and closed benchmark database: " + root);
-			System.out.println("Drop the host page cache, then rerun with --reuse-preloaded=true and identical options.");
+			System.out.println("Drop the host page cache, then rerun once with identical build/workload options, "
+					+ "--cache-state=cold, and --reuse-preloaded=true.");
 			return;
 		}
 
 		boolean shutdownClean = closeFailure == null;
-		Acceptance acceptance = phases.size() == 2
-				? evaluateAcceptance(gateInput(
-						phases.get(0), phases.get(1), shutdownClean, nativeLeaksDetected))
-				: Acceptance.failed("Both benchmark phases must complete");
+		Acceptance acceptance = phases.size() == options.rounds() * 2
+				? evaluateAcceptance(gateInput(phases, integrity, shutdownClean, nativeLeaksDetected))
+				: Acceptance.failed("Every alternating benchmark round must complete both phases");
 		BenchmarkResult result = new BenchmarkResult(
 				RESULT_SCHEMA,
 				started,
 				Instant.now(),
 				options,
+				environment,
 				List.copyOf(phases),
+				integrity,
 				shutdownClean,
 				nativeLeaksDetected,
 				acceptance);
@@ -187,18 +240,14 @@ public final class GrpcOverloadBenchmark {
 			throw new IllegalArgumentException("Benchmark root already exists; refusing to reuse state: " + root);
 		}
 		Files.createDirectories(root);
-		Files.writeString(root.resolve(".rockserver-overload-benchmark"), """
-				schema=%s
-				preload_keys=%d
-				value_bytes=%d
-				""".formatted(RESULT_SCHEMA, options.preloadKeys(), options.valueBytes()),
+		Files.writeString(root.resolve(DATASET_MARKER_FILE), datasetMarker(options),
 				StandardOpenOption.CREATE_NEW);
 		return root;
 	}
 
-	private static Path openPreparedRoot(Options options) throws IOException {
+	private static Path openPreparedRoot(Options options, RunEnvironment environment) throws IOException {
 		Path root = options.root().toAbsolutePath().normalize();
-		Path marker = root.resolve(".rockserver-overload-benchmark");
+		Path marker = root.resolve(DATASET_MARKER_FILE);
 		Path config = root.resolve("rockserver.conf");
 		Path database = root.resolve("db");
 		if (!Files.isRegularFile(marker) || !Files.isRegularFile(config) || !Files.isDirectory(database)) {
@@ -211,18 +260,149 @@ public final class GrpcOverloadBenchmark {
 				markerValues.put(line.substring(0, equals), line.substring(equals + 1));
 			}
 		}
-		if (!RESULT_SCHEMA.equals(markerValues.get("schema"))
-				|| options.preloadKeys() != Integer.parseInt(markerValues.getOrDefault("preload_keys", "-1"))
-				|| options.valueBytes() != Integer.parseInt(markerValues.getOrDefault("value_bytes", "-1"))) {
-			throw new IllegalArgumentException("Prepared preload settings do not match the requested run");
+		if (!DATASET_SCHEMA.equals(markerValues.get("schema"))
+				|| !datasetFingerprint(options).equals(markerValues.get("dataset-fingerprint"))
+				|| !workloadFingerprint(options).equals(markerValues.get("workload-fingerprint"))
+				|| !sha256(configText(options)).equals(markerValues.get("config-sha256"))
+				|| !options.buildId().equals(markerValues.get("build-id"))
+				|| !options.buildState().equals(markerValues.get("build-state"))
+				|| !options.storageLabel().equals(markerValues.get("storage-label"))
+				|| !options.hostState().equals(markerValues.get("host-state"))) {
+			throw new IllegalArgumentException(
+					"Prepared dataset, build provenance, workload, or configuration does not match the requested run");
 		}
 		if (!Files.readString(config).equals(configText(options))) {
 			throw new IllegalArgumentException("Prepared Rockserver configuration does not match the requested run");
 		}
-		if (Files.exists(root.resolve("results.json")) || Files.exists(root.resolve("results.md"))) {
-			throw new IllegalArgumentException("Prepared root already contains benchmark results: " + root);
+		if (Files.exists(root.resolve("results.json")) || Files.exists(root.resolve("results.md"))
+				|| Files.exists(root.resolve(RUN_ATTEMPT_FILE))) {
+			throw new IllegalArgumentException("Prepared root was already consumed by a benchmark attempt: " + root);
 		}
+		writeRunAttempt(root, options, environment);
 		return root;
+	}
+
+	private static String datasetMarker(Options options) {
+		String config = configText(options);
+		return """
+				schema=%s
+				dataset-fingerprint=%s
+				workload-fingerprint=%s
+				config-sha256=%s
+				build-id=%s
+				build-state=%s
+				storage-label=%s
+				host-state=%s
+				preload-keys=%d
+				value-bytes=%d
+				seed=%d
+				""".formatted(DATASET_SCHEMA,
+				datasetFingerprint(options),
+				workloadFingerprint(options),
+				sha256(config),
+				options.buildId(),
+				options.buildState(),
+				options.storageLabel(),
+				options.hostState(),
+				options.preloadKeys(),
+				options.valueBytes(),
+				options.seed());
+	}
+
+	private static String datasetFingerprint(Options options) {
+		return sha256(DATASET_SCHEMA
+				+ "\nseed=" + options.seed()
+				+ "\npreload-keys=" + options.preloadKeys()
+				+ "\npreload-flush-keys=" + options.preloadFlushKeys()
+				+ "\nvalue-bytes=" + options.valueBytes());
+	}
+
+	private static String workloadFingerprint(Options options) {
+		return sha256("rockserver-grpc-overload-workload-v3"
+				+ "\ndataset=" + datasetFingerprint(options)
+				+ "\ndatabase-name=" + options.databaseName()
+				+ "\nbuild-id=" + options.buildId()
+				+ "\nbuild-state=" + options.buildState()
+				+ "\nstorage-label=" + options.storageLabel()
+				+ "\nhost-state=" + options.hostState()
+				+ "\ndeadline-ms=" + DEADLINE_MILLIS
+				+ "\nwarmup-seconds=" + options.warmupSeconds()
+				+ "\nmeasure-seconds=" + options.measureSeconds()
+				+ "\nrounds=" + options.rounds()
+				+ "\nworkers=" + options.pointReaders() + ',' + options.foregroundWriters() + ','
+				+ options.maintenanceWriters() + ',' + options.firstLastReaders() + ','
+				+ options.cancellationWorkers() + ',' + options.analyticalReaders() + ','
+				+ options.controlWorkers() + ',' + options.cdcWorkers() + ',' + options.physicalWorkers()
+				+ "\nrates=" + options.foregroundWriteRate() + ',' + options.maintenanceWriteRate() + ','
+				+ options.firstLastRate() + ',' + options.cancellationRate() + ',' + options.analyticalRate()
+				+ ',' + options.controlRate() + ',' + options.cdcRate() + ',' + options.physicalRate()
+				+ "\ncancellation=" + options.cancellationDelayMillis() + ',' + options.cancellationBurst()
+				+ "\nintegrity-requests=" + options.integrityRequests()
+				+ "\nrequest-counts=" + options.pointRequestCount() + ',' + options.rangeRequestCount()
+				+ "\nrange-width=" + options.rangeWidth()
+				+ "\nparallelism=" + options.readParallelism() + ',' + options.writeParallelism()
+				+ "\nqueue-capacities=" + options.foregroundQueueCapacity() + ','
+				+ options.maintenanceQueueCapacity()
+				+ "\nadmission-sample-micros=" + options.admissionSampleMicros()
+				+ "\ninstrumentation-mode=" + options.instrumentationMode()
+				+ "\nmax-latency-samples=" + options.maxLatencySamples()
+				+ "\nwrite-buffer-size=" + options.writeBufferSize()
+				+ "\ndirect-io=" + options.directIo()
+				+ "\nspinning=" + options.spinning());
+	}
+
+	private static String comparisonFingerprint(Options options) {
+		return sha256(workloadFingerprint(options) + "\ncache-state=" + options.cacheState());
+	}
+
+	private static String sha256(String value) {
+		try {
+			return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+					.digest(value.getBytes(StandardCharsets.UTF_8)));
+		} catch (NoSuchAlgorithmException impossible) {
+			throw new AssertionError(impossible);
+		}
+	}
+
+	private static void writeRunAttempt(Path root, Options options, RunEnvironment environment) throws IOException {
+		writeRunAttempt(root, "schema=" + RUN_ATTEMPT_SCHEMA + "\n"
+				+ "started=" + Instant.now() + "\n"
+				+ "build-id=" + options.buildId() + "\n"
+				+ "build-state=" + options.buildState() + "\n"
+				+ "storage-label=" + options.storageLabel() + "\n"
+				+ "host-state=" + options.hostState() + "\n"
+				+ "cache-state=" + options.cacheState() + "\n"
+				+ "dataset-fingerprint=" + datasetFingerprint(options) + "\n"
+				+ "comparison-fingerprint=" + comparisonFingerprint(options) + "\n"
+				+ "host-memory-total-bytes=" + environment.hostMemory().totalBytes() + "\n"
+				+ "host-memory-available-bytes=" + environment.hostMemory().availableBytes() + "\n"
+				+ "host-swap-free-bytes=" + environment.hostMemory().swapFreeBytes() + "\n"
+				+ "storage-mount-point=" + environment.storage().mountPoint() + "\n"
+				+ "storage-source=" + environment.storage().source() + "\n"
+				+ "storage-filesystem=" + environment.storage().filesystem() + "\n"
+				+ "storage-rotational=" + environment.storage().rotational() + "\n"
+				+ "storage-model=" + environment.storage().model() + "\n"
+				+ "competing-benchmark-processes=" + environment.competingBenchmarkProcesses() + "\n");
+	}
+
+	private static void writeRunAttempt(Path root, String content) throws IOException {
+		Files.writeString(root.resolve(RUN_ATTEMPT_FILE), content, StandardOpenOption.CREATE_NEW);
+	}
+
+	/** Exercises the exact atomic one-shot primitive without opening RocksDB. */
+	public static void claimRunAttemptForTesting(Path root) throws IOException {
+		Files.createDirectories(root);
+		writeRunAttempt(root, "schema=" + RUN_ATTEMPT_SCHEMA + "\n");
+	}
+
+	/** Parses and validates options without creating a benchmark root. */
+	public static void validateOptionsForTesting(String... args) {
+		Options.parse(args);
+	}
+
+	/** Stable comparison identity exposed to deterministic contract tests. */
+	public static String comparisonFingerprintForTesting(String... args) {
+		return comparisonFingerprint(Options.parse(args));
 	}
 
 	private static long preload(RocksDBSyncAPI api, Options options) {
@@ -249,18 +429,53 @@ public final class GrpcOverloadBenchmark {
 		return columnId;
 	}
 
-	private static void preflight(Client client, Requests requests) {
+	private static void preflight(Client client, Requests requests, long columnId, Options options) {
 		GetResponse point = client.blockingWithDeadline().get(requests.pointReads()[0]);
 		if (!point.hasValue()) {
 			throw new IllegalStateException("Point-read preflight returned an absent value");
 		}
-		RangeCase range = requests.ranges()[0];
+		RangeCase range = requests.latencyRanges()[0];
 		validateRange(client.blockingWithDeadline().reduceRangeFirstAndLast(range.request()), range);
+		RangeCase analytical = requests.analyticalRanges()[0];
+		validateRange(client.blockingWithDeadline().reduceRangeFirstAndLast(analytical.request()), analytical);
 		client.blockingWithDeadline().put(requests.foregroundWrites()[0][0]);
 		client.blockingWithDeadline().put(requests.maintenanceWrites()[0][0]);
+		long transactionId = client.blockingWithDeadline().openTransaction(OpenTransactionRequest.newBuilder()
+				.setTimeoutMs(DEADLINE_MILLIS)
+				.setContext(wireContext(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH))
+				.build()).getTransactionId();
+		var rollback = client.blockingWithDeadline().closeTransaction(CloseTransactionRequest.newBuilder()
+				.setTransactionId(transactionId)
+				.setTimeoutMs(DEADLINE_MILLIS)
+				.setCommit(false)
+				.setContext(wireContext(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH))
+				.build());
+		if (!rollback.getSuccessful()) {
+			throw new IllegalStateException("CONTROL rollback preflight was not successful");
+		}
+		for (int worker = 0; worker < options.cdcWorkers(); worker++) {
+			client.blockingWithDeadline().cdcCreate(CdcCreateRequest.newBuilder()
+					.setId(cdcSubscription(worker))
+					.addColumnIds(columnId)
+					.build());
+		}
+		client.blockingWithDeadline().flush(FlushRequest.getDefaultInstance());
 	}
 
-	private static PhaseResult runPhase(Phase phase,
+	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext(
+			it.cavallium.rockserver.core.common.api.proto.WorkloadProfile profile) {
+		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+				.setProfile(profile)
+				.setDeadlineEpochMillis(Long.MAX_VALUE - 1L)
+				.build();
+	}
+
+	private static String cdcSubscription(int worker) {
+		return CDC_SUBSCRIPTION_PREFIX + worker;
+	}
+
+	private static PhaseResult runPhase(int round,
+			Phase phase,
 			Client client,
 			EmbeddedConnection embedded,
 			GrpcServer server,
@@ -269,22 +484,37 @@ public final class GrpcOverloadBenchmark {
 		boolean maintenanceFlood = phase == Phase.MAINTENANCE_FLOOD;
 		int maintenanceWorkers = maintenanceFlood ? options.maintenanceWriters() : 0;
 		int cancellationWorkers = maintenanceFlood ? options.cancellationWorkers() : 0;
+		int analyticalWorkers = maintenanceFlood ? options.analyticalReaders() : 0;
+		int controlWorkers = maintenanceFlood ? options.controlWorkers() : 0;
+		int cdcWorkers = maintenanceFlood ? options.cdcWorkers() : 0;
+		int physicalWorkers = maintenanceFlood ? options.physicalWorkers() : 0;
 		int workerCount = options.pointReaders()
 				+ options.foregroundWriters()
 				+ options.firstLastReaders()
 				+ maintenanceWorkers
 				+ cancellationWorkers
+				+ analyticalWorkers
+				+ controlWorkers
+				+ cdcWorkers
+				+ physicalWorkers
 				+ 1;
-		PhaseControl control = new PhaseControl(workerCount, options.maxLatencySamples());
+		PhaseControl control = new PhaseControl(workerCount,
+				options.maxLatencySamples(),
+				options.instrumentationMode().equals("strict"),
+				TimeUnit.MICROSECONDS.toNanos(options.admissionSampleMicros()));
+		var meterRegistry = new BenchmarkMeterRegistry();
+		var composite = (CompositeMeterRegistry) embedded.getEmbeddedDB().getMetricsRegistry();
+		boolean registryAdded = false;
 		ExecutorService executor = Executors.newFixedThreadPool(workerCount,
-				Thread.ofPlatform().name("grpc-overload-" + phase.value + "-", 0).factory());
+				Thread.ofPlatform().name("grpc-overload-r" + round + '-' + phase.value + "-", 0).factory());
 		List<Future<?>> futures = new ArrayList<>(workerCount);
 		System.out.printf(Locale.ROOT,
-				"Starting %s: warmup=%ds measure=%ds point-readers=%d foreground-writers=%d "
-						+ "first-last-readers=%d maintenance-writers=%d cancellation-workers=%d%n",
-				phase.value, options.warmupSeconds(), options.measureSeconds(), options.pointReaders(),
+				"Starting round %d %s: warmup=%ds measure=%ds point-readers=%d foreground-writers=%d "
+						+ "first-last-readers=%d maintenance-writers=%d cancellation-workers=%d "
+						+ "analytical=%d control=%d cdc=%d physical=%d%n",
+				round, phase.value, options.warmupSeconds(), options.measureSeconds(), options.pointReaders(),
 				options.foregroundWriters(), options.firstLastReaders(), maintenanceWorkers,
-				cancellationWorkers);
+				cancellationWorkers, analyticalWorkers, controlWorkers, cdcWorkers, physicalWorkers);
 		try {
 			for (int index = 0; index < options.pointReaders(); index++) {
 				int worker = index;
@@ -324,6 +554,26 @@ public final class GrpcOverloadBenchmark {
 						() -> runCancellationWorker(client,
 								requests.cancellationWrites()[worker], options, worker, control));
 			}
+			for (int index = 0; index < analyticalWorkers; index++) {
+				int worker = index;
+				submit(executor, futures, control,
+						() -> runAnalyticalReader(client, requests, options, worker, control));
+			}
+			for (int index = 0; index < controlWorkers; index++) {
+				int worker = index;
+				submit(executor, futures, control,
+						() -> runControlWorker(client, options, worker, control));
+			}
+			for (int index = 0; index < cdcWorkers; index++) {
+				int worker = index;
+				submit(executor, futures, control,
+						() -> runCdcWorker(client, options, worker, control));
+			}
+			for (int index = 0; index < physicalWorkers; index++) {
+				int worker = index;
+				submit(executor, futures, control,
+						() -> runPhysicalWorker(client, options, worker, control));
+			}
 			submit(executor, futures, control,
 					() -> monitorAdmission(embedded, options, control));
 
@@ -337,8 +587,12 @@ public final class GrpcOverloadBenchmark {
 				control.stop.set(true);
 				throw new IllegalStateException("Worker failed during warmup", control.failures.peek());
 			}
+			composite.add(meterRegistry);
+			registryAdded = true;
+			client.requestTracker().startTracking();
 			control.startMeasurement();
 			sleepPhase(options.measureSeconds(), control.stop);
+			client.requestTracker().stopTracking();
 			long durationNanos = control.stopMeasurement();
 			control.stop.set(true);
 			executor.shutdown();
@@ -357,15 +611,24 @@ public final class GrpcOverloadBenchmark {
 			}
 
 			ResourceResult resources = awaitDrain(embedded, server);
+			RequestAccounting requestAccounting = client.requestTracker().awaitSnapshot();
 			AdmissionResult admission = control.admission.finish(embedded, control.metrics);
-			PhaseResult result = control.metrics.snapshot(phase, durationNanos, admission, resources);
+			Map<WorkloadProfile, SchedulerProfileMetrics> schedulerMetrics =
+					snapshotSchedulerMetrics(meterRegistry);
+			PhaseResult result = control.metrics.snapshot(
+					round, phase, durationNanos, admission, resources, requestAccounting, schedulerMetrics);
 			printPhase(result);
 			return result;
 		} finally {
+			client.requestTracker().stopTrackingIfActive();
 			control.measuring.set(false);
 			control.stop.set(true);
 			control.start.countDown();
 			executor.shutdownNow();
+			if (registryAdded) {
+				composite.remove(meterRegistry);
+			}
+			meterRegistry.close();
 		}
 	}
 
@@ -431,10 +694,11 @@ public final class GrpcOverloadBenchmark {
 		Pacer pacer = new Pacer(options.firstLastRate(), options.firstLastReaders(), worker);
 		control.ready.countDown();
 		control.start.await();
-		long requestSequence = (phase == Phase.MAINTENANCE_FLOOD ? requests.ranges().length / 2L : 0L) + worker;
+		long requestSequence = (phase == Phase.MAINTENANCE_FLOOD
+				? requests.latencyRanges().length / 2L : 0L) + worker;
 		long operationSequence = worker;
 		while (!control.stop.get()) {
-			RangeCase range = requests.ranges()[(int) (requestSequence % requests.ranges().length)];
+			RangeCase range = requests.latencyRanges()[(int) (requestSequence % requests.latencyRanges().length)];
 			long started = System.nanoTime();
 			Outcome outcome;
 			String detail = null;
@@ -451,6 +715,149 @@ public final class GrpcOverloadBenchmark {
 					operationSequence++,
 					detail);
 			requestSequence += options.firstLastReaders();
+			pacer.awaitNext(control.stop);
+		}
+	}
+
+	private static void runAnalyticalReader(Client client,
+			Requests requests,
+			Options options,
+			int worker,
+			PhaseControl control) throws InterruptedException {
+		Pacer pacer = new Pacer(options.analyticalRate(), options.analyticalReaders(), worker);
+		control.ready.countDown();
+		control.start.await();
+		long requestSequence = worker;
+		long operationSequence = worker;
+		while (!control.stop.get()) {
+			RangeCase range = requests.analyticalRanges()[
+					(int) (requestSequence % requests.analyticalRanges().length)];
+			long started = System.nanoTime();
+			Outcome outcome;
+			String detail = null;
+			try {
+				validateRange(client.blockingWithDeadline().reduceRangeFirstAndLast(range.request()), range);
+				outcome = Outcome.SUCCESS;
+			} catch (Throwable failure) {
+				outcome = classify(failure);
+				detail = describe(failure);
+			}
+			control.record(Operation.ANALYTICAL_READ,
+					outcome,
+					System.nanoTime() - started,
+					operationSequence++,
+					detail);
+			requestSequence += options.analyticalReaders();
+			pacer.awaitNext(control.stop);
+		}
+	}
+
+	private static void runControlWorker(Client client,
+			Options options,
+			int worker,
+			PhaseControl control) throws InterruptedException {
+		Pacer pacer = new Pacer(options.controlRate(), options.controlWorkers(), worker);
+		var context = wireContext(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH);
+		var open = OpenTransactionRequest.newBuilder()
+				.setTimeoutMs(DEADLINE_MILLIS)
+				.setContext(context)
+				.build();
+		control.ready.countDown();
+		control.start.await();
+		long sequence = worker;
+		while (!control.stop.get()) {
+			long started = System.nanoTime();
+			Outcome outcome;
+			String detail = null;
+			try {
+				long transactionId = client.blockingWithDeadline().openTransaction(open).getTransactionId();
+				var closed = client.blockingWithDeadline().closeTransaction(CloseTransactionRequest.newBuilder()
+						.setTransactionId(transactionId)
+						.setTimeoutMs(DEADLINE_MILLIS)
+						.setCommit(false)
+						.setContext(context)
+						.build());
+				if (!closed.getSuccessful()) {
+					throw new IllegalStateException("CONTROL rollback did not close its transaction");
+				}
+				outcome = Outcome.SUCCESS;
+			} catch (Throwable failure) {
+				outcome = classify(failure);
+				detail = describe(failure);
+			}
+			control.record(Operation.CONTROL,
+					outcome,
+					System.nanoTime() - started,
+					sequence++,
+					detail);
+			pacer.awaitNext(control.stop);
+		}
+	}
+
+	private static void runCdcWorker(Client client,
+			Options options,
+			int worker,
+			PhaseControl control) throws InterruptedException {
+		Pacer pacer = new Pacer(options.cdcRate(), options.cdcWorkers(), worker);
+		var poll = CdcPollRequest.newBuilder()
+				.setId(cdcSubscription(worker))
+				.setMaxEvents(256L)
+				.setMaxResponseBytes(4 * 1024 * 1024)
+				.build();
+		control.ready.countDown();
+		control.start.await();
+		long sequence = worker;
+		while (!control.stop.get()) {
+			long started = System.nanoTime();
+			Outcome outcome;
+			String detail = null;
+			try {
+				var response = client.blockingWithDeadline().cdcPollBatch(poll);
+				if (response.getEventsCount() > 0) {
+					long committed = response.getEvents(response.getEventsCount() - 1).getSeq();
+					client.blockingWithDeadline().cdcCommit(CdcCommitRequest.newBuilder()
+							.setId(cdcSubscription(worker))
+							.setSeq(committed)
+							.build());
+				}
+				outcome = Outcome.SUCCESS;
+			} catch (Throwable failure) {
+				outcome = classify(failure);
+				detail = describe(failure);
+			}
+			control.record(Operation.CDC,
+					outcome,
+					System.nanoTime() - started,
+					sequence++,
+					detail);
+			pacer.awaitNext(control.stop);
+		}
+	}
+
+	private static void runPhysicalWorker(Client client,
+			Options options,
+			int worker,
+			PhaseControl control) throws InterruptedException {
+		Pacer pacer = new Pacer(options.physicalRate(), options.physicalWorkers(), worker);
+		control.ready.countDown();
+		control.start.await();
+		long sequence = worker;
+		while (!control.stop.get()) {
+			long started = System.nanoTime();
+			Outcome outcome;
+			String detail = null;
+			try {
+				client.blockingWithDeadline().flush(FlushRequest.getDefaultInstance());
+				outcome = Outcome.SUCCESS;
+			} catch (Throwable failure) {
+				outcome = classify(failure);
+				detail = describe(failure);
+			}
+			control.record(Operation.PHYSICAL,
+					outcome,
+					System.nanoTime() - started,
+					sequence++,
+					detail);
 			pacer.awaitNext(control.stop);
 		}
 	}
@@ -548,6 +955,83 @@ public final class GrpcOverloadBenchmark {
 		}
 	}
 
+	private static IntegrityResult runIntegrityProbe(Client client,
+			long columnId,
+			Options options) throws InterruptedException {
+		long keyBase = 4L << 60;
+		byte[][] expected = new byte[options.integrityRequests()][];
+		boolean[] acknowledged = new boolean[options.integrityRequests()];
+		long writesAcknowledged = 0L;
+		long readsMatched = 0L;
+		long mismatches = 0L;
+		long errors = 0L;
+		var errorDetails = new ArrayList<String>();
+		client.requestTracker().startTracking();
+		try {
+			for (int index = 0; index < options.integrityRequests(); index++) {
+				long key = keyBase + index;
+				expected[index] = valueBytes(options.valueBytes(), options.seed() ^ key);
+				var profile = (index & 1) == 0
+						? it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.INGEST
+						: it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH;
+				var request = PutRequest.newBuilder()
+						.setTransactionOrUpdateId(0L)
+						.setColumnId(columnId)
+						.setData(KV.newBuilder()
+								.addKeys(keyByteString(key))
+								.setValue(ByteString.copyFrom(expected[index])))
+						.setContext(wireContext(profile))
+						.build();
+				try {
+					client.blockingWithDeadline().put(request);
+					acknowledged[index] = true;
+					writesAcknowledged++;
+				} catch (Throwable failure) {
+					errors++;
+					addIntegrityError(errorDetails, "put[" + index + "]", failure);
+				}
+			}
+			for (int index = 0; index < options.integrityRequests(); index++) {
+				long key = keyBase + index;
+				try {
+					GetResponse response = client.blockingWithDeadline().get(GetRequest.newBuilder()
+							.setTransactionOrUpdateId(0L)
+							.setColumnId(columnId)
+							.addKeys(keyByteString(key))
+							.setContext(wireContext(
+									it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY))
+							.build());
+					if (acknowledged[index] && response.hasValue()
+							&& response.getValue().equals(ByteString.copyFrom(expected[index]))) {
+						readsMatched++;
+					} else {
+						mismatches++;
+					}
+				} catch (Throwable failure) {
+					errors++;
+					addIntegrityError(errorDetails, "get[" + index + "]", failure);
+				}
+			}
+		} finally {
+			client.requestTracker().stopTrackingIfActive();
+		}
+		RequestAccounting accounting = client.requestTracker().awaitSnapshot();
+		return new IntegrityResult(options.integrityRequests(),
+				writesAcknowledged,
+				options.integrityRequests(),
+				readsMatched,
+				mismatches,
+				errors,
+				List.copyOf(errorDetails),
+				accounting);
+	}
+
+	private static void addIntegrityError(List<String> errors, String operation, Throwable failure) {
+		if (errors.size() < MAX_RECORDED_ERRORS) {
+			errors.add(operation + ": " + describe(failure));
+		}
+	}
+
 	private static void validateRange(FirstAndLast response, RangeCase expected) {
 		if (!response.hasFirst() || !response.hasLast()
 				|| response.getFirst().getKeysCount() != 1
@@ -622,15 +1106,16 @@ public final class GrpcOverloadBenchmark {
 		int maintenanceQueued = admission.queued().get(WorkloadProfile.BATCH);
 		int foregroundActive = admission.active().get(WorkloadProfile.INGEST);
 		int maintenanceActive = admission.active().get(WorkloadProfile.BATCH);
+		int totalQueued = admission.totalQueued();
+		int totalActive = admission.totalActive();
 		long pending = db.getPendingOpsCount();
 		int transactions = db.getOpenTransactionsCount();
 		int iterators = db.getOpenIteratorsCount();
 		int ranges = db.getActiveRangeCursorCount();
 		int iteratorLeases = server.getActiveIteratorOperationLeaseCountForTesting();
-		boolean drained = foregroundQueued == 0
-				&& maintenanceQueued == 0
-				&& foregroundActive == 0
-				&& maintenanceActive == 0
+		SchedulerConservation schedulerConservation = schedulerConservation(scheduler);
+		boolean drained = totalQueued == 0
+				&& totalActive == 0
 				&& pending == 0
 				&& transactions == 0
 				&& iterators == 0
@@ -640,13 +1125,53 @@ public final class GrpcOverloadBenchmark {
 				maintenanceQueued,
 				foregroundActive,
 				maintenanceActive,
+				totalQueued,
+				totalActive,
 				pending,
 				transactions,
 				iterators,
 				ranges,
 				iteratorLeases,
 				TimeUnit.NANOSECONDS.toMillis(drainNanos),
-				drained);
+				drained,
+				schedulerConservation);
+	}
+
+	private static SchedulerConservation schedulerConservation(RWScheduler scheduler) {
+		long accepted = 0L;
+		long started = 0L;
+		long completed = 0L;
+		long failures = 0L;
+		long terminalOutcomes = 0L;
+		var failuresByPool = new ArrayList<String>();
+		for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
+			var snapshot = scheduler.poolSnapshot(pool);
+			accepted += snapshot.acceptedTasks();
+			started += snapshot.startedTasks();
+			completed += snapshot.completedTasks();
+			failures += snapshot.failedTasks();
+			terminalOutcomes += snapshot.outcomes().values().stream().mapToLong(Long::longValue).sum();
+			if (snapshot.queuedTasks() != 0 || snapshot.activeTasks() != 0
+					|| snapshot.startedTasks() != snapshot.completedTasks()
+					|| snapshot.failedTasks() != 0L
+					|| snapshot.outcomes().values().stream().mapToLong(Long::longValue).sum()
+					< snapshot.acceptedTasks()) {
+				failuresByPool.add(pool.name().toLowerCase(Locale.ROOT)
+						+ " queued=" + snapshot.queuedTasks()
+						+ " active=" + snapshot.activeTasks()
+						+ " started=" + snapshot.startedTasks()
+						+ " completed=" + snapshot.completedTasks()
+						+ " accepted=" + snapshot.acceptedTasks()
+						+ " outcomes=" + snapshot.outcomes()
+						+ " failures=" + snapshot.failedTasks());
+			}
+		}
+		return new SchedulerConservation(accepted,
+				started,
+				completed,
+				terminalOutcomes,
+				failures,
+				List.copyOf(failuresByPool));
 	}
 
 	private static Throwable closeAll(Client client, GrpcServer server, EmbeddedConnection embedded) {
@@ -709,23 +1234,313 @@ public final class GrpcOverloadBenchmark {
 		}
 	}
 
-	private static GateInput gateInput(PhaseResult foreground,
-			PhaseResult flood,
+	private static GateInput gateInput(List<PhaseResult> phases,
+			IntegrityResult integrity,
 			boolean shutdownClean,
 			long nativeLeaksDetected) {
-		return new GateInput(
-				foreground.operation(Operation.FOREGROUND).deadlines()
-						+ flood.operation(Operation.FOREGROUND).deadlines(),
-				foreground.operation(Operation.FIRST_LAST).deadlines()
-						+ flood.operation(Operation.FIRST_LAST).deadlines(),
-				foreground.operation(Operation.FOREGROUND).p99Nanos(),
-				flood.operation(Operation.FOREGROUND).p99Nanos(),
-				flood.operation(Operation.CANCELLATION).cancellations(),
-				foreground.resources().drained() && flood.resources().drained(),
-				foreground.unexpectedErrors() + flood.unexpectedErrors(),
-				foreground.admission().foregroundRejected() + flood.admission().foregroundRejected(),
+		List<PhaseResult> foreground = phases.stream()
+				.filter(phase -> phase.phase() == Phase.FOREGROUND_ONLY)
+				.sorted(java.util.Comparator.comparingInt(PhaseResult::round))
+				.toList();
+		List<PhaseResult> flood = phases.stream()
+				.filter(phase -> phase.phase() == Phase.MAINTENANCE_FLOOD)
+				.sorted(java.util.Comparator.comparingInt(PhaseResult::round))
+				.toList();
+		if (foreground.isEmpty() || foreground.size() != flood.size()) {
+			throw new IllegalArgumentException("Alternating benchmark phases are incomplete");
+		}
+		double[] p99Ratios = new double[foreground.size()];
+		double[] throughputRatios = new double[foreground.size()];
+		for (int index = 0; index < foreground.size(); index++) {
+			if (foreground.get(index).round() != flood.get(index).round()) {
+				throw new IllegalArgumentException("Alternating benchmark round pairing is incomplete");
+			}
+			OperationResult baseline = foreground.get(index).operation(Operation.FOREGROUND);
+			OperationResult mixed = flood.get(index).operation(Operation.FOREGROUND);
+			p99Ratios[index] = baseline.p99Nanos() > 0L
+					? mixed.p99Nanos() / (double) baseline.p99Nanos() : Double.POSITIVE_INFINITY;
+			throughputRatios[index] = baseline.throughput() > 0.0d
+					? mixed.throughput() / baseline.throughput() : 0.0d;
+		}
+		var progressedProfiles = EnumSet.noneOf(WorkloadProfile.class);
+		if (successes(flood, Operation.CONTROL) > 0L) {
+			progressedProfiles.add(WorkloadProfile.CONTROL);
+		}
+		if (successes(flood, Operation.POINT_READ) + successes(flood, Operation.FIRST_LAST) > 0L) {
+			progressedProfiles.add(WorkloadProfile.LATENCY);
+		}
+		if (successes(flood, Operation.ANALYTICAL_READ) > 0L) {
+			progressedProfiles.add(WorkloadProfile.ANALYTICAL);
+		}
+		if (successes(flood, Operation.FOREGROUND_WRITE) > 0L) {
+			progressedProfiles.add(WorkloadProfile.INGEST);
+		}
+		if (successes(flood, Operation.CDC) > 0L) {
+			progressedProfiles.add(WorkloadProfile.CDC);
+		}
+		if (successes(flood, Operation.MAINTENANCE_WRITE) > 0L) {
+			progressedProfiles.add(WorkloadProfile.BATCH);
+		}
+		if (successes(flood, Operation.PHYSICAL) > 0L) {
+			progressedProfiles.add(WorkloadProfile.PHYSICAL_MAINTENANCE);
+		}
+		SchedulerConservation schedulerConservation = aggregateSchedulerConservation(phases);
+			return new GateInput(
+					deadlines(phases, Operation.FOREGROUND),
+					deadlines(phases, Operation.FIRST_LAST),
+					unexpectedDeadlines(phases),
+				ratioConfidenceInterval(p99Ratios),
+				ratioConfidenceInterval(throughputRatios),
+				cancellations(flood, Operation.CANCELLATION),
+				phases.stream().allMatch(phase -> phase.resources().drained()),
+				phases.stream().mapToLong(PhaseResult::unexpectedErrors).sum(),
+				phases.stream().mapToLong(phase -> phase.admission().foregroundRejected()).sum(),
+				combineRequestAccounting(foreground),
+				combineRequestAccounting(flood),
+				integrity,
+				Set.copyOf(progressedProfiles),
+				combinePoolUtilization(flood, RWScheduler.Pool.READ),
+				combinePoolUtilization(flood, RWScheduler.Pool.WRITE),
+				schedulerConservation,
+				schedulerConservation,
+					new PriorityEvidence(
+							maximumSchedulerMetric(foreground, WorkloadProfile.LATENCY, false),
+							maximumSchedulerMetric(flood, WorkloadProfile.LATENCY, true),
+							medianSchedulerMetric(flood, WorkloadProfile.LATENCY, true),
+							medianSchedulerMetric(flood, WorkloadProfile.ANALYTICAL, true),
+							medianSchedulerMetric(flood, WorkloadProfile.INGEST, true),
+							medianSchedulerMetric(flood, WorkloadProfile.BATCH, true),
+							flood.size(),
+							orderedSchedulerRounds(flood, WorkloadProfile.LATENCY, WorkloadProfile.ANALYTICAL),
+							orderedSchedulerRounds(flood, WorkloadProfile.INGEST, WorkloadProfile.BATCH)),
 				nativeLeaksDetected,
 				shutdownClean);
+	}
+
+	private static long successes(List<PhaseResult> phases, Operation operation) {
+		return phases.stream().mapToLong(phase -> phase.operation(operation).successes()).sum();
+	}
+
+	private static long deadlines(List<PhaseResult> phases, Operation operation) {
+		return phases.stream().mapToLong(phase -> phase.operation(operation).deadlines()).sum();
+	}
+
+	private static long unexpectedDeadlines(List<PhaseResult> phases) {
+		long deadlines = 0L;
+		for (PhaseResult phase : phases) {
+			for (Operation operation : Operation.values()) {
+				if (operation != Operation.FOREGROUND && operation != Operation.CANCELLATION) {
+					deadlines += phase.operation(operation).deadlines();
+				}
+			}
+		}
+		return deadlines;
+	}
+
+	private static long cancellations(List<PhaseResult> phases, Operation operation) {
+		return phases.stream().mapToLong(phase -> phase.operation(operation).cancellations()).sum();
+	}
+
+	private static RequestAccounting combineRequestAccounting(List<PhaseResult> phases) {
+		long submitted = 0L;
+		long terminal = 0L;
+		long inFlight = 0L;
+		long duplicateTerminal = 0L;
+		long maximumInFlight = 0L;
+		var statuses = new EnumMap<Status.Code, Long>(Status.Code.class);
+		for (Status.Code code : Status.Code.values()) {
+			statuses.put(code, 0L);
+		}
+		for (PhaseResult phase : phases) {
+			RequestAccounting accounting = phase.requestAccounting();
+			submitted += accounting.submitted();
+			terminal += accounting.terminal();
+			inFlight += accounting.inFlight();
+			duplicateTerminal += accounting.duplicateTerminal();
+			maximumInFlight = Math.max(maximumInFlight, accounting.maximumInFlight());
+			for (Status.Code code : Status.Code.values()) {
+				statuses.put(code, statuses.get(code) + accounting.statuses().getOrDefault(code, 0L));
+			}
+		}
+		return new RequestAccounting(submitted,
+				terminal,
+				inFlight,
+				duplicateTerminal,
+				maximumInFlight,
+				Map.copyOf(statuses));
+	}
+
+	private static PoolUtilization combinePoolUtilization(List<PhaseResult> phases, RWScheduler.Pool pool) {
+		int workerCount = -1;
+		long samples = 0L;
+		long eligibleBacklogSamples = 0L;
+		long policyLimitedBacklogSamples = 0L;
+		long saturatingDemandSamples = 0L;
+		long fullyBusySamples = 0L;
+		long idleWorkerSlots = 0L;
+		int maximumActive = 0;
+		int maximumConsecutiveIdle = 0;
+		boolean exactWaitingWorkerEvidence = true;
+		long samplePeriodNanos = -1L;
+		for (PhaseResult phase : phases) {
+			PoolUtilization utilization = phase.admission().poolUtilization().get(pool);
+			if (workerCount < 0) {
+				workerCount = utilization.workerCount();
+			} else if (workerCount != utilization.workerCount()) {
+				throw new IllegalArgumentException("Pool worker count changed between benchmark rounds: " + pool);
+			}
+			samples += utilization.samples();
+			eligibleBacklogSamples += utilization.eligibleBacklogSamples();
+			policyLimitedBacklogSamples += utilization.policyLimitedBacklogSamples();
+			saturatingDemandSamples += utilization.saturatingDemandSamples();
+			fullyBusySamples += utilization.fullyBusySamples();
+			idleWorkerSlots += utilization.idleWorkerSlots();
+			maximumActive = Math.max(maximumActive, utilization.maximumActive());
+			maximumConsecutiveIdle = Math.max(maximumConsecutiveIdle,
+					utilization.maximumConsecutiveAvoidableIdleSamples());
+			exactWaitingWorkerEvidence &= utilization.exactWaitingWorkerEvidence();
+			if (samplePeriodNanos < 0L) {
+				samplePeriodNanos = utilization.samplePeriodNanos();
+			} else if (samplePeriodNanos != utilization.samplePeriodNanos()) {
+				throw new IllegalArgumentException("Admission sampling period changed between benchmark rounds");
+			}
+		}
+		double ratio = saturatingDemandSamples == 0L || workerCount <= 0
+				? 0.0d
+				: 1.0d - idleWorkerSlots / (double) (saturatingDemandSamples * workerCount);
+		return new PoolUtilization(workerCount,
+				samples,
+				eligibleBacklogSamples,
+				policyLimitedBacklogSamples,
+				saturatingDemandSamples,
+				fullyBusySamples,
+				idleWorkerSlots,
+				maximumActive,
+				maximumConsecutiveIdle,
+				Math.max(0.0d, Math.min(1.0d, ratio)),
+				exactWaitingWorkerEvidence,
+				samplePeriodNanos);
+	}
+
+	private static SchedulerConservation aggregateSchedulerConservation(List<PhaseResult> phases) {
+		long accepted = 0L;
+		long started = 0L;
+		long completed = 0L;
+		long terminalOutcomes = 0L;
+		long failures = 0L;
+		var imbalances = new ArrayList<String>();
+		for (PhaseResult phase : phases) {
+			SchedulerConservation conservation = phase.resources().schedulerConservation();
+			accepted = Math.max(accepted, conservation.accepted());
+			started = Math.max(started, conservation.started());
+			completed = Math.max(completed, conservation.completed());
+			terminalOutcomes = Math.max(terminalOutcomes, conservation.terminalOutcomes());
+			failures = Math.max(failures, conservation.failures());
+			if (!conservation.conserved()) {
+				imbalances.add("round=" + phase.round() + ", phase=" + phase.phase().value + ", "
+						+ schedulerConservationDetail(conservation));
+			}
+		}
+		return new SchedulerConservation(accepted,
+				started,
+				completed,
+				terminalOutcomes,
+				failures,
+				List.copyOf(imbalances));
+	}
+
+	private static long maximumSchedulerMetric(List<PhaseResult> phases,
+			WorkloadProfile profile,
+			boolean queue) {
+		long maximum = 0L;
+		for (PhaseResult phase : phases) {
+			var metrics = phase.schedulerMetrics().get(profile);
+			long value = queue ? metrics.queueP99Nanos() : metrics.executionP99Nanos();
+			if (value <= 0L) {
+				return 0L;
+			}
+			maximum = Math.max(maximum, value);
+		}
+		return maximum;
+	}
+
+	private static long medianSchedulerMetric(List<PhaseResult> phases,
+			WorkloadProfile profile,
+			boolean queue) {
+		long[] values = new long[phases.size()];
+		int index = 0;
+		for (PhaseResult phase : phases) {
+			var metrics = phase.schedulerMetrics().get(profile);
+			long value = queue ? metrics.queueP99Nanos() : metrics.executionP99Nanos();
+			if (value <= 0L) {
+				return 0L;
+			}
+			values[index++] = value;
+		}
+		Arrays.sort(values);
+		return values.length == 0 ? 0L : values[(values.length - 1) / 2];
+	}
+
+	private static int orderedSchedulerRounds(List<PhaseResult> phases,
+			WorkloadProfile preferred,
+			WorkloadProfile deferred) {
+		int ordered = 0;
+		for (PhaseResult phase : phases) {
+			long preferredQueue = phase.schedulerMetrics().get(preferred).queueP99Nanos();
+			long deferredQueue = phase.schedulerMetrics().get(deferred).queueP99Nanos();
+			if (preferredQueue > 0L && deferredQueue > 0L && preferredQueue <= deferredQueue) {
+				ordered++;
+			}
+		}
+		return ordered;
+	}
+
+	/** Mean paired ratio and two-sided 95% Student-t confidence interval. */
+	public static RatioConfidenceInterval ratioConfidenceInterval(double[] samples) {
+		if (samples.length == 0) {
+			return new RatioConfidenceInterval(0, Double.NaN, Double.NaN, Double.NaN);
+		}
+		double sum = 0.0d;
+		for (double sample : samples) {
+			if (!Double.isFinite(sample) || sample < 0.0d) {
+				return new RatioConfidenceInterval(samples.length,
+						sample,
+						sample,
+						sample);
+			}
+			sum += sample;
+		}
+		double mean = sum / samples.length;
+		if (samples.length == 1) {
+			return new RatioConfidenceInterval(1, mean, mean, mean);
+		}
+		double squaredDeviations = 0.0d;
+		for (double sample : samples) {
+			double deviation = sample - mean;
+			squaredDeviations += deviation * deviation;
+		}
+		double standardError = Math.sqrt(squaredDeviations / (samples.length - 1L)) / Math.sqrt(samples.length);
+		double margin = studentTCritical95(samples.length - 1) * standardError;
+		return new RatioConfidenceInterval(samples.length,
+				mean,
+				Math.max(0.0d, mean - margin),
+				mean + margin);
+	}
+
+	private static double studentTCritical95(int degreesOfFreedom) {
+		return switch (degreesOfFreedom) {
+			case 1 -> 12.706d;
+			case 2 -> 4.303d;
+			case 3 -> 3.182d;
+			case 4 -> 2.776d;
+			case 5 -> 2.571d;
+			case 6 -> 2.447d;
+			case 7 -> 2.365d;
+			case 8 -> 2.306d;
+			case 9 -> 2.262d;
+			case 10 -> 2.228d;
+			default -> degreesOfFreedom < 30 ? 2.10d : 1.96d;
+		};
 	}
 
 	/** Pure acceptance evaluation used by the opt-in runner and deterministic CI tests. */
@@ -736,14 +1551,45 @@ public final class GrpcOverloadBenchmark {
 				"foreground deadline count=" + input.foregroundDeadlines()));
 		checks.add(new GateCheck("first_last_deadlines", input.firstLastDeadlines() == 0,
 				"first/last deadline count=" + input.firstLastDeadlines()));
-		boolean p99Available = input.foregroundOnlyP99Nanos() > 0 && input.maintenanceFloodP99Nanos() > 0;
-		double p99Ratio = p99Available
-				? (double) input.maintenanceFloodP99Nanos() / input.foregroundOnlyP99Nanos()
-				: Double.POSITIVE_INFINITY;
-		checks.add(new GateCheck("foreground_p99_ratio", p99Available && p99Ratio <= 2.0,
-				"maintenance-flood/foreground-only p99=" + format(p99Ratio) + " (limit=2.000)"));
+		checks.add(new GateCheck("all_operation_deadlines", input.unexpectedDeadlines() == 0,
+				"non-cancellation concrete-operation deadline count=" + input.unexpectedDeadlines()));
+		var p99Ratio = input.foregroundP99Ratio();
+		checks.add(new GateCheck("foreground_p99_ratio",
+				p99Ratio.available() && p99Ratio.upper95() <= 2.0d,
+				"maintenance-flood/foreground-only p99 mean=" + format(p99Ratio.mean())
+						+ ", 95% CI=[" + format(p99Ratio.lower95()) + ',' + format(p99Ratio.upper95())
+						+ "], rounds=" + p99Ratio.samples() + " (upper limit=2.000)"));
+		var throughputRatio = input.foregroundThroughputRatio();
+		checks.add(new GateCheck("foreground_throughput_ratio",
+				throughputRatio.available() && throughputRatio.lower95() >= MIN_FOREGROUND_THROUGHPUT_RATIO,
+				"maintenance-flood/foreground-only throughput mean=" + format(throughputRatio.mean())
+						+ ", 95% CI=[" + format(throughputRatio.lower95()) + ','
+						+ format(throughputRatio.upper95()) + "], rounds=" + throughputRatio.samples()
+						+ " (lower minimum=" + format(MIN_FOREGROUND_THROUGHPUT_RATIO) + ")"));
 		checks.add(new GateCheck("cancellation_progress", input.cancellations() > 0,
 				"cancelled queued calls=" + input.cancellations()));
+		checks.add(new GateCheck("transport_request_conservation",
+				input.foregroundRequests().conserved() && input.mixedRequests().conserved(),
+				"foreground=" + requestAccountingDetail(input.foregroundRequests())
+						+ ", mixed=" + requestAccountingDetail(input.mixedRequests())));
+		checks.add(new GateCheck("round_trip_integrity", input.integrity().passed(),
+				"writes=" + input.integrity().writesAcknowledged() + '/' + input.integrity().writesAttempted()
+						+ ", matched_reads=" + input.integrity().readsMatched() + '/'
+						+ input.integrity().readsAttempted() + ", mismatches=" + input.integrity().mismatches()
+						+ ", errors=" + input.integrity().errors()));
+		checks.add(new GateCheck("all_profiles_progress",
+				input.progressedProfiles().containsAll(EnumSet.allOf(WorkloadProfile.class)),
+				"profiles with successful end-to-end work=" + input.progressedProfiles()));
+		checks.add(new GateCheck("read_pool_work_conserving",
+				input.readPool().saturatedAndWorkConserving(), poolUtilizationDetail(input.readPool())));
+		checks.add(new GateCheck("write_pool_work_conserving",
+				input.writePool().saturatedAndWorkConserving(), poolUtilizationDetail(input.writePool())));
+		checks.add(new GateCheck("scheduler_counter_conservation",
+				input.foregroundScheduler().conserved() && input.mixedScheduler().conserved(),
+				"foreground=" + schedulerConservationDetail(input.foregroundScheduler())
+						+ ", mixed=" + schedulerConservationDetail(input.mixedScheduler())));
+		checks.add(new GateCheck("priority_and_quantum_bound", input.priority().passed(),
+				input.priority().detail()));
 		checks.add(new GateCheck("queues_and_resources_drained", input.resourcesDrained(),
 				"all queues, pending operations, transactions, iterators, and range cursors drained"));
 		checks.add(new GateCheck("unexpected_errors", input.unexpectedErrors() == 0,
@@ -757,12 +1603,37 @@ public final class GrpcOverloadBenchmark {
 		return new Acceptance(List.copyOf(checks));
 	}
 
+	private static String requestAccountingDetail(RequestAccounting accounting) {
+		return "submitted=" + accounting.submitted() + ", terminal=" + accounting.terminal()
+				+ ", in_flight=" + accounting.inFlight() + ", duplicate_terminal="
+				+ accounting.duplicateTerminal();
+	}
+
+	private static String poolUtilizationDetail(PoolUtilization utilization) {
+		return "workers=" + utilization.workerCount() + ", max_active=" + utilization.maximumActive()
+				+ ", backlog_samples=" + utilization.eligibleBacklogSamples()
+				+ ", policy_limited_backlog_samples=" + utilization.policyLimitedBacklogSamples()
+				+ ", saturating_samples=" + utilization.saturatingDemandSamples()
+				+ ", utilization=" + format(utilization.utilizationWhileBacklogged())
+				+ ", max_consecutive_idle_samples=" + utilization.maximumConsecutiveAvoidableIdleSamples()
+				+ ", max_avoidable_idle_ms=" + formatMillis(utilization.maximumAvoidableIdleNanos())
+				+ ", exact_waiting_worker_evidence=" + utilization.exactWaitingWorkerEvidence();
+	}
+
+	private static String schedulerConservationDetail(SchedulerConservation conservation) {
+		return "accepted=" + conservation.accepted() + ", started=" + conservation.started()
+				+ ", completed=" + conservation.completed() + ", outcomes=" + conservation.terminalOutcomes()
+				+ ", failures=" + conservation.failures() + ", imbalances=" + conservation.failuresByPool();
+	}
+
 	private static void printPhase(PhaseResult result) {
 		OperationResult foreground = result.operation(Operation.FOREGROUND);
 		OperationResult maintenance = result.operation(Operation.MAINTENANCE_WRITE);
 		System.out.printf(Locale.ROOT,
-				"%s: foreground=%.1f ops/s p99=%.3fms deadlines=%d; maintenance=%.1f ops/s "
-						+ "progress=%d rejected=%d; queues fg/max=%d maint/max=%d; active total/max=%d maint/max=%d%n",
+				"round %d %s: foreground=%.1f ops/s p99=%.3fms deadlines=%d; maintenance=%.1f ops/s "
+						+ "progress=%d rejected=%d; queues fg/max=%d maint/max=%d; active total/max=%d maint/max=%d; "
+						+ "rpc=%d/%d conserved=%s; read/write backlog-util=%.3f/%.3f%n",
+				result.round(),
 				result.phase().value,
 				foreground.throughput(),
 				foreground.p99Nanos() / 1_000_000d,
@@ -773,7 +1644,12 @@ public final class GrpcOverloadBenchmark {
 				result.admission().maxForegroundQueue(),
 				result.admission().maxMaintenanceQueue(),
 				result.admission().maxTotalActive(),
-				result.admission().maxMaintenanceActive());
+				result.admission().maxMaintenanceActive(),
+				result.requestAccounting().terminal(),
+				result.requestAccounting().submitted(),
+				result.requestAccounting().conserved(),
+				result.admission().poolUtilization().get(RWScheduler.Pool.READ).utilizationWhileBacklogged(),
+				result.admission().poolUtilization().get(RWScheduler.Pool.WRITE).utilizationWhileBacklogged());
 	}
 
 	private static Path writeConfig(Path root, Options options) throws IOException {
@@ -832,16 +1708,37 @@ public final class GrpcOverloadBenchmark {
 		return value.replace("\\", "\\\\").replace("\"", "\\\"");
 	}
 
-	private static void writeMetadata(Path output, Options options, Instant started) throws IOException {
+	private static void writeMetadata(Path output,
+			Options options,
+			RunEnvironment environment,
+			Instant started) throws IOException {
 		List<String> lines = new ArrayList<>();
 		lines.add("schema=" + RESULT_SCHEMA);
 		lines.add("started=" + started);
-		lines.add("java_version=" + System.getProperty("java.version"));
-		lines.add("java_vm=" + System.getProperty("java.vm.name") + " "
-				+ System.getProperty("java.vm.version"));
-		lines.add("os=" + System.getProperty("os.name") + " " + System.getProperty("os.version")
-				+ " " + System.getProperty("os.arch"));
-		lines.add("available_processors=" + Runtime.getRuntime().availableProcessors());
+		lines.add("build_id=" + options.buildId());
+		lines.add("build_state=" + options.buildState());
+		lines.add("storage_label=" + options.storageLabel());
+		lines.add("cache_state=" + options.cacheState());
+		lines.add("host_state=" + options.hostState());
+		lines.add("dataset_fingerprint=" + datasetFingerprint(options));
+		lines.add("comparison_fingerprint=" + comparisonFingerprint(options));
+		lines.add("java_version=" + environment.javaVersion());
+		lines.add("java_vm=" + environment.javaVm());
+		lines.add("jvm_arguments=" + environment.jvmArguments());
+		lines.add("jvm_max_memory_bytes=" + environment.jvmMaxMemoryBytes());
+		lines.add("os=" + environment.os());
+		lines.add("available_processors=" + environment.availableProcessors());
+		lines.add("system_load_average=" + environment.systemLoadAverage());
+		lines.add("host_memory_total_bytes=" + environment.hostMemory().totalBytes());
+		lines.add("host_memory_available_bytes=" + environment.hostMemory().availableBytes());
+		lines.add("host_swap_total_bytes=" + environment.hostMemory().swapTotalBytes());
+		lines.add("host_swap_free_bytes=" + environment.hostMemory().swapFreeBytes());
+		lines.add("storage_mount_point=" + environment.storage().mountPoint());
+		lines.add("storage_source=" + environment.storage().source());
+		lines.add("storage_filesystem=" + environment.storage().filesystem());
+		lines.add("storage_rotational=" + environment.storage().rotational());
+		lines.add("storage_model=" + environment.storage().model());
+		lines.add("competing_benchmark_processes=" + environment.competingBenchmarkProcesses());
 		lines.add("deadline_ms=" + DEADLINE_MILLIS);
 		lines.add("options=" + options);
 		Files.write(output, lines, StandardOpenOption.CREATE_NEW);
@@ -863,6 +1760,12 @@ public final class GrpcOverloadBenchmark {
 		json.append(",\n  \"finished\": ");
 		appendJsonString(json, result.finished().toString());
 		json.append(",\n  \"deadline_ms\": ").append(DEADLINE_MILLIS);
+		json.append(",\n  \"dataset_fingerprint\": ");
+		appendJsonString(json, datasetFingerprint(result.options()));
+		json.append(",\n  \"comparison_fingerprint\": ");
+		appendJsonString(json, comparisonFingerprint(result.options()));
+		json.append(",\n  \"environment\": ");
+		appendEnvironmentJson(json, result.environment());
 		json.append(",\n  \"options\": ");
 		appendOptionsJson(json, result.options());
 		json.append(",\n  \"phases\": [");
@@ -872,7 +1775,9 @@ public final class GrpcOverloadBenchmark {
 			}
 			appendPhaseJson(json, result.phases().get(phaseIndex));
 		}
-		json.append("\n  ],\n  \"shutdown_clean\": ").append(result.shutdownClean());
+		json.append("\n  ],\n  \"integrity\": ");
+		appendIntegrityJson(json, result.integrity());
+		json.append(",\n  \"shutdown_clean\": ").append(result.shutdownClean());
 		json.append(",\n  \"native_handle_leaks_detected\": ").append(result.nativeLeaksDetected());
 		json.append(",\n  \"acceptance\": {\n    \"passed\": ").append(result.acceptance().passed());
 		json.append(",\n    \"checks\": [");
@@ -896,22 +1801,44 @@ public final class GrpcOverloadBenchmark {
 		appendJsonString(json, options.root().toAbsolutePath().normalize().toString());
 		json.append(",\n    \"database_name\": ");
 		appendJsonString(json, options.databaseName());
-		json.append(",\n    \"preload_keys\": ").append(options.preloadKeys())
+		json.append(",\n    \"build_id\": ");
+		appendJsonString(json, options.buildId());
+		json.append(",\n    \"build_state\": ");
+		appendJsonString(json, options.buildState());
+		json.append(",\n    \"storage_label\": ");
+		appendJsonString(json, options.storageLabel());
+		json.append(",\n    \"cache_state\": ");
+		appendJsonString(json, options.cacheState());
+		json.append(",\n    \"host_state\": ");
+		appendJsonString(json, options.hostState());
+		json.append(",\n    \"minimum_host_available_gib\": ")
+				.append(options.minimumHostAvailableGiB())
+				.append(",\n    \"preload_keys\": ").append(options.preloadKeys())
 				.append(",\n    \"preload_flush_keys\": ").append(options.preloadFlushKeys())
 				.append(",\n    \"value_bytes\": ").append(options.valueBytes())
 				.append(",\n    \"warmup_seconds\": ").append(options.warmupSeconds())
 				.append(",\n    \"measure_seconds\": ").append(options.measureSeconds())
+				.append(",\n    \"rounds\": ").append(options.rounds())
 				.append(",\n    \"point_readers\": ").append(options.pointReaders())
 				.append(",\n    \"foreground_writers\": ").append(options.foregroundWriters())
 				.append(",\n    \"maintenance_writers\": ").append(options.maintenanceWriters())
 				.append(",\n    \"first_last_readers\": ").append(options.firstLastReaders())
 				.append(",\n    \"cancellation_workers\": ").append(options.cancellationWorkers())
+				.append(",\n    \"analytical_readers\": ").append(options.analyticalReaders())
+				.append(",\n    \"control_workers\": ").append(options.controlWorkers())
+				.append(",\n    \"cdc_workers\": ").append(options.cdcWorkers())
+				.append(",\n    \"physical_workers\": ").append(options.physicalWorkers())
 				.append(",\n    \"foreground_write_rate\": ").append(options.foregroundWriteRate())
 				.append(",\n    \"maintenance_write_rate\": ").append(options.maintenanceWriteRate())
 				.append(",\n    \"first_last_rate\": ").append(options.firstLastRate())
 				.append(",\n    \"cancellation_rate\": ").append(options.cancellationRate())
+				.append(",\n    \"analytical_rate\": ").append(options.analyticalRate())
+				.append(",\n    \"control_rate\": ").append(options.controlRate())
+				.append(",\n    \"cdc_rate\": ").append(options.cdcRate())
+				.append(",\n    \"physical_rate\": ").append(options.physicalRate())
 				.append(",\n    \"cancellation_delay_ms\": ").append(options.cancellationDelayMillis())
 				.append(",\n    \"cancellation_burst\": ").append(options.cancellationBurst())
+				.append(",\n    \"integrity_requests\": ").append(options.integrityRequests())
 				.append(",\n    \"point_request_count\": ").append(options.pointRequestCount())
 				.append(",\n    \"range_request_count\": ").append(options.rangeRequestCount())
 				.append(",\n    \"range_width\": ").append(options.rangeWidth())
@@ -922,7 +1849,9 @@ public final class GrpcOverloadBenchmark {
 				.append(",\n    \"maintenance_queue_capacity\": ")
 				.append(options.maintenanceQueueCapacity())
 				.append(",\n    \"admission_sample_micros\": ").append(options.admissionSampleMicros())
-				.append(",\n    \"max_latency_samples\": ").append(options.maxLatencySamples())
+				.append(",\n    \"instrumentation_mode\": ");
+		appendJsonString(json, options.instrumentationMode());
+		json.append(",\n    \"max_latency_samples\": ").append(options.maxLatencySamples())
 				.append(",\n    \"write_buffer_size\": ");
 		appendJsonString(json, options.writeBufferSize());
 		json.append(",\n    \"direct_io\": ").append(options.directIo())
@@ -934,9 +1863,51 @@ public final class GrpcOverloadBenchmark {
 				.append("\n  }");
 	}
 
+	private static void appendEnvironmentJson(StringBuilder json, RunEnvironment environment) {
+		json.append("{\"java_version\": ");
+		appendJsonString(json, environment.javaVersion());
+		json.append(", \"java_vm\": ");
+		appendJsonString(json, environment.javaVm());
+		json.append(", \"jvm_arguments\": [");
+		for (int index = 0; index < environment.jvmArguments().size(); index++) {
+			if (index > 0) {
+				json.append(',');
+			}
+			appendJsonString(json, environment.jvmArguments().get(index));
+		}
+		json.append("], \"jvm_max_memory_bytes\": ").append(environment.jvmMaxMemoryBytes())
+				.append(", \"os\": ");
+		appendJsonString(json, environment.os());
+		json.append(", \"available_processors\": ").append(environment.availableProcessors())
+				.append(", \"system_load_average\": ").append(format(environment.systemLoadAverage()))
+				.append(", \"host_memory\": {\"total_bytes\": ")
+				.append(environment.hostMemory().totalBytes())
+				.append(", \"available_bytes\": ").append(environment.hostMemory().availableBytes())
+				.append(", \"swap_total_bytes\": ").append(environment.hostMemory().swapTotalBytes())
+				.append(", \"swap_free_bytes\": ").append(environment.hostMemory().swapFreeBytes())
+				.append("}, \"storage\": {\"mount_point\": ");
+		appendJsonString(json, environment.storage().mountPoint());
+		json.append(", \"source\": ");
+		appendJsonString(json, environment.storage().source());
+		json.append(", \"filesystem\": ");
+		appendJsonString(json, environment.storage().filesystem());
+		json.append(", \"rotational\": ").append(environment.storage().rotational())
+				.append(", \"model\": ");
+		appendJsonString(json, environment.storage().model());
+		json.append("}, \"competing_benchmark_processes\": [");
+		for (int index = 0; index < environment.competingBenchmarkProcesses().size(); index++) {
+			if (index > 0) {
+				json.append(',');
+			}
+			appendJsonString(json, environment.competingBenchmarkProcesses().get(index));
+		}
+		json.append("]}");
+	}
+
 	private static void appendPhaseJson(StringBuilder json, PhaseResult phase) {
 		json.append("\n    {\n      \"phase\": ");
 		appendJsonString(json, phase.phase().value);
+		json.append(",\n      \"round\": ").append(phase.round());
 		json.append(",\n      \"duration_ms\": ").append(phase.durationMillis());
 		json.append(",\n      \"warmup_error_count\": ").append(phase.warmupErrors());
 		json.append(",\n      \"operations\": {");
@@ -954,6 +1925,20 @@ public final class GrpcOverloadBenchmark {
 		appendAdmissionJson(json, phase.admission());
 		json.append(",\n      \"resources_after_drain\": ");
 		appendResourcesJson(json, phase.resources());
+		json.append(",\n      \"request_accounting\": ");
+		appendRequestAccountingJson(json, phase.requestAccounting());
+		json.append(",\n      \"scheduler_profiles\": {");
+		int profileIndex = 0;
+		for (WorkloadProfile profile : WorkloadProfile.values()) {
+			if (profileIndex++ > 0) {
+				json.append(',');
+			}
+			var metrics = phase.schedulerMetrics().get(profile);
+			json.append("\n        \"").append(profile.name().toLowerCase(Locale.ROOT)).append("\": {")
+					.append("\"queue_p99_ns\": ").append(metrics.queueP99Nanos())
+					.append(", \"execution_p99_ns\": ").append(metrics.executionP99Nanos()).append('}');
+		}
+		json.append("\n      }");
 		json.append("\n    }");
 	}
 
@@ -985,7 +1970,17 @@ public final class GrpcOverloadBenchmark {
 				.append(", \"ending_queue_depth\": ").append(admission.endMaintenanceQueue())
 				.append(", \"max_active\": ").append(admission.maxMaintenanceActive())
 				.append(", \"rejected\": ").append(admission.maintenanceRejected())
-				.append("}, \"max_total_active\": ").append(admission.maxTotalActive()).append('}');
+				.append("}, \"max_total_active\": ").append(admission.maxTotalActive())
+				.append(", \"pools\": {");
+		int index = 0;
+		for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
+			if (index++ > 0) {
+				json.append(',');
+			}
+			json.append('"').append(pool.name().toLowerCase(Locale.ROOT)).append("\": ");
+			appendPoolUtilizationJson(json, admission.poolUtilization().get(pool));
+		}
+		json.append("}}");
 	}
 
 	private static void appendResourcesJson(StringBuilder json, ResourceResult resources) {
@@ -993,13 +1988,92 @@ public final class GrpcOverloadBenchmark {
 				.append(", \"maintenance_queued\": ").append(resources.maintenanceQueued())
 				.append(", \"foreground_active\": ").append(resources.foregroundActive())
 				.append(", \"maintenance_active\": ").append(resources.maintenanceActive())
+				.append(", \"total_queued\": ").append(resources.totalQueued())
+				.append(", \"total_active\": ").append(resources.totalActive())
 				.append(", \"pending_operations\": ").append(resources.pendingOperations())
 				.append(", \"open_transactions\": ").append(resources.openTransactions())
 				.append(", \"open_iterators\": ").append(resources.openIterators())
 				.append(", \"active_range_cursors\": ").append(resources.activeRangeCursors())
 				.append(", \"iterator_leases\": ").append(resources.iteratorLeases())
 				.append(", \"drain_ms\": ").append(resources.drainMillis())
-				.append(", \"drained\": ").append(resources.drained()).append('}');
+				.append(", \"drained\": ").append(resources.drained())
+				.append(", \"scheduler_conservation\": ");
+		appendSchedulerConservationJson(json, resources.schedulerConservation());
+		json.append('}');
+	}
+
+	private static void appendRequestAccountingJson(StringBuilder json, RequestAccounting accounting) {
+		json.append("{\"submitted\": ").append(accounting.submitted())
+				.append(", \"terminal\": ").append(accounting.terminal())
+				.append(", \"in_flight\": ").append(accounting.inFlight())
+				.append(", \"duplicate_terminal\": ").append(accounting.duplicateTerminal())
+				.append(", \"maximum_in_flight\": ").append(accounting.maximumInFlight())
+				.append(", \"conserved\": ").append(accounting.conserved())
+				.append(", \"statuses\": {");
+		int index = 0;
+		for (Status.Code code : Status.Code.values()) {
+			long count = accounting.statuses().getOrDefault(code, 0L);
+			if (count == 0L) {
+				continue;
+			}
+			if (index++ > 0) {
+				json.append(',');
+			}
+			json.append('"').append(code.name().toLowerCase(Locale.ROOT)).append("\": ").append(count);
+		}
+		json.append("}}");
+	}
+
+	private static void appendIntegrityJson(StringBuilder json, IntegrityResult integrity) {
+		json.append("{\"writes_attempted\": ").append(integrity.writesAttempted())
+				.append(", \"writes_acknowledged\": ").append(integrity.writesAcknowledged())
+				.append(", \"reads_attempted\": ").append(integrity.readsAttempted())
+				.append(", \"reads_matched\": ").append(integrity.readsMatched())
+				.append(", \"mismatches\": ").append(integrity.mismatches())
+				.append(", \"errors\": ").append(integrity.errors())
+				.append(", \"passed\": ").append(integrity.passed())
+				.append(", \"request_accounting\": ");
+		appendRequestAccountingJson(json, integrity.requestAccounting());
+		json.append('}');
+	}
+
+	private static void appendPoolUtilizationJson(StringBuilder json, PoolUtilization utilization) {
+			json.append("{\"worker_count\": ").append(utilization.workerCount())
+					.append(", \"samples\": ").append(utilization.samples())
+					.append(", \"eligible_backlog_samples\": ").append(utilization.eligibleBacklogSamples())
+					.append(", \"policy_limited_backlog_samples\": ")
+					.append(utilization.policyLimitedBacklogSamples())
+					.append(", \"saturating_demand_samples\": ").append(utilization.saturatingDemandSamples())
+				.append(", \"fully_busy_samples\": ").append(utilization.fullyBusySamples())
+				.append(", \"idle_worker_slots\": ").append(utilization.idleWorkerSlots())
+				.append(", \"maximum_active\": ").append(utilization.maximumActive())
+				.append(", \"maximum_consecutive_avoidable_idle_samples\": ")
+				.append(utilization.maximumConsecutiveAvoidableIdleSamples())
+				.append(", \"utilization_while_backlogged\": ")
+				.append(format(utilization.utilizationWhileBacklogged()))
+				.append(", \"sample_period_ns\": ").append(utilization.samplePeriodNanos())
+				.append(", \"maximum_avoidable_idle_ns\": ").append(utilization.maximumAvoidableIdleNanos())
+				.append(", \"exact_waiting_worker_evidence\": ")
+				.append(utilization.exactWaitingWorkerEvidence())
+				.append(", \"passed\": ").append(utilization.saturatedAndWorkConserving()).append('}');
+	}
+
+	private static void appendSchedulerConservationJson(StringBuilder json,
+			SchedulerConservation conservation) {
+		json.append("{\"accepted\": ").append(conservation.accepted())
+				.append(", \"started\": ").append(conservation.started())
+				.append(", \"completed\": ").append(conservation.completed())
+				.append(", \"terminal_outcomes\": ").append(conservation.terminalOutcomes())
+				.append(", \"failures\": ").append(conservation.failures())
+				.append(", \"conserved\": ").append(conservation.conserved())
+				.append(", \"imbalances\": [");
+		for (int index = 0; index < conservation.failuresByPool().size(); index++) {
+			if (index > 0) {
+				json.append(',');
+			}
+			appendJsonString(json, conservation.failuresByPool().get(index));
+		}
+		json.append("]}");
 	}
 
 	private static void appendJsonString(StringBuilder json, String value) {
@@ -1029,17 +2103,38 @@ public final class GrpcOverloadBenchmark {
 		markdown.append("# Rockserver gRPC overload benchmark\n\n")
 				.append("- Started: `").append(result.started()).append("`\n")
 				.append("- Finished: `").append(result.finished()).append("`\n")
+				.append("- Build: `").append(result.options().buildId()).append("` (`")
+				.append(result.options().buildState()).append("`)\n")
+				.append("- Storage/cache: `").append(result.options().storageLabel()).append("` / `")
+				.append(result.options().cacheState()).append("`\n")
+				.append("- Host isolation assertion: `").append(result.options().hostState()).append("`\n")
+				.append("- Resolved storage: `").append(result.environment().storage().source()).append("` on `")
+				.append(result.environment().storage().filesystem()).append("` at `")
+				.append(result.environment().storage().mountPoint()).append("`, rotational `")
+				.append(result.environment().storage().rotational()).append("`, model `")
+				.append(result.environment().storage().model()).append("`\n")
+				.append("- Dataset fingerprint: `").append(datasetFingerprint(result.options())).append("`\n")
+				.append("- Comparison fingerprint: `").append(comparisonFingerprint(result.options())).append("`\n")
+				.append("- JVM: `").append(result.environment().javaVersion()).append("`, max memory `")
+				.append(result.environment().jvmMaxMemoryBytes()).append(" bytes`\n")
+				.append("- Host memory at preflight: `")
+				.append(result.environment().hostMemory().availableBytes()).append(" / ")
+				.append(result.environment().hostMemory().totalBytes()).append(" bytes available/total`, swap free `")
+				.append(result.environment().hostMemory().swapFreeBytes()).append(" bytes`\n")
+				.append("- Competing benchmark processes at preflight: `")
+				.append(result.environment().competingBenchmarkProcesses()).append("`\n")
 				.append("- Fixed client/range deadline: `").append(DEADLINE_MILLIS).append(" ms`\n")
 				.append("- Preloaded keys: `").append(result.options().preloadKeys()).append("`\n")
 				.append("- Queue capacities: INGEST `").append(result.options().foregroundQueueCapacity())
 				.append("`, BATCH `").append(result.options().maintenanceQueueCapacity()).append("`\n\n")
 				.append("## Operations\n\n")
-				.append("| Phase | Operation | Throughput/s | p50 ms | p95 ms | p99 ms | max ms | Deadlines | Rejected | Cancelled | Errors |\n")
-				.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+				.append("| Round | Phase | Operation | Throughput/s | p50 ms | p95 ms | p99 ms | max ms | Deadlines | Rejected | Cancelled | Errors |\n")
+				.append("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
 		for (PhaseResult phase : result.phases()) {
 			for (Operation operation : Operation.values()) {
 				OperationResult stats = phase.operation(operation);
-				markdown.append('|').append(phase.phase().value)
+				markdown.append('|').append(phase.round())
+						.append('|').append(phase.phase().value)
 						.append('|').append(operation.value)
 						.append('|').append(format(stats.throughput()))
 						.append('|').append(formatMillis(stats.p50Nanos()))
@@ -1053,11 +2148,12 @@ public final class GrpcOverloadBenchmark {
 			}
 		}
 		markdown.append("\n## Admission and drain\n\n")
-				.append("| Phase | FG queue max/end | Maintenance queue max/end | FG active max | Maintenance active max | Total active max | FG rejected | Maintenance rejected | Drain ms | Drained |\n")
-				.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+				.append("| Round | Phase | FG queue max/end | Maintenance queue max/end | FG active max | Maintenance active max | Total active max | FG rejected | Maintenance rejected | Drain ms | Drained |\n")
+				.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
 		for (PhaseResult phase : result.phases()) {
 			AdmissionResult admission = phase.admission();
-			markdown.append('|').append(phase.phase().value)
+			markdown.append('|').append(phase.round())
+					.append('|').append(phase.phase().value)
 					.append('|').append(admission.maxForegroundQueue()).append('/')
 					.append(admission.endForegroundQueue())
 					.append('|').append(admission.maxMaintenanceQueue()).append('/')
@@ -1070,6 +2166,35 @@ public final class GrpcOverloadBenchmark {
 					.append('|').append(phase.resources().drainMillis())
 					.append('|').append(phase.resources().drained()).append("|\n");
 		}
+		markdown.append("\n## Request conservation and scheduler utilization\n\n")
+				.append("| Round | Phase | RPC submitted/terminal | In flight | Duplicate terminal | Pool | Eligible/policy-limited/saturating samples | Max active/workers | Saturating-demand utilization | Max consecutive avoidable-idle samples |\n")
+				.append("|---:|---|---:|---:|---:|---|---:|---:|---:|---:|\n");
+		for (PhaseResult phase : result.phases()) {
+			for (RWScheduler.Pool pool : List.of(RWScheduler.Pool.READ, RWScheduler.Pool.WRITE)) {
+				var accounting = phase.requestAccounting();
+				var utilization = phase.admission().poolUtilization().get(pool);
+				markdown.append('|').append(phase.round())
+						.append('|').append(phase.phase().value)
+						.append('|').append(accounting.submitted()).append('/').append(accounting.terminal())
+						.append('|').append(accounting.inFlight())
+						.append('|').append(accounting.duplicateTerminal())
+						.append('|').append(pool)
+						.append('|').append(utilization.eligibleBacklogSamples()).append('/')
+						.append(utilization.policyLimitedBacklogSamples()).append('/')
+						.append(utilization.saturatingDemandSamples())
+						.append('|').append(utilization.maximumActive()).append('/').append(utilization.workerCount())
+						.append('|').append(format(utilization.utilizationWhileBacklogged()))
+						.append('|').append(utilization.maximumConsecutiveAvoidableIdleSamples()).append("|\n");
+			}
+		}
+		markdown.append("\nUnique integrity probe: **")
+				.append(result.integrity().passed() ? "PASS" : "FAIL")
+				.append("**; acknowledged writes `").append(result.integrity().writesAcknowledged())
+				.append('/').append(result.integrity().writesAttempted())
+				.append("`, matching reads `").append(result.integrity().readsMatched())
+				.append('/').append(result.integrity().readsAttempted())
+				.append("`, mismatches `").append(result.integrity().mismatches())
+				.append("`, errors `").append(result.integrity().errors()).append("`.\n");
 		markdown.append("\n## Acceptance\n\n");
 		for (GateCheck check : result.acceptance().checks()) {
 			markdown.append("- [").append(check.passed() ? 'x' : ' ').append("] `")
@@ -1099,32 +2224,45 @@ public final class GrpcOverloadBenchmark {
 				  mvn -q -DskipTests test-compile dependency:build-classpath \
 				    -Dmdep.outputFile=target/overload-benchmark.classpath
 
-				Run the one-shot gate on a fresh database path:
+				Prepare the one-shot gate on a fresh database path from a clean release-candidate checkout:
 				  java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
 				    -cp "target/test-classes:target/classes:$(<target/overload-benchmark.classpath)" \
 				    it.cavallium.rockserver.core.impl.benchmark.GrpcOverloadBenchmark \
-				    --root=/mnt/rockserver-hdd/overload-2026-07-23
+				    --root=/mnt/rockserver-hdd/grpc-mixed-RC-SHA \
+				    --build-id=<full-lowercase-RC-SHA> --build-state=clean \
+				    --storage-label=hdd-btrfs --cache-state=unknown --host-state=dedicated \
+				    --prepare-only=true
 
-				For a real cold-cache run, first use the same command and full option set with
-				--prepare-only=true. Drop the host page cache after that process closes, then rerun with
-				--reuse-preloaded=true. The second run verifies the marker, preload shape, and exact config.
+				Drop the host page cache after preparation closes, then rerun with identical provenance,
+				workload, and database options plus --cache-state=cold --reuse-preloaded=true. The second
+				process verifies the dataset, build, workload, and exact config, then atomically consumes
+				the root before RocksDB opens. An interrupted or failed measurement cannot be retried on it.
 
-				The five-second deadline and 2x p99 acceptance limit are fixed. Important --name=value options:
-				  preload-keys=1000000  preload-flush-keys=50000  value-bytes=256
-				  warmup-seconds=15  measure-seconds=60
-				  point-readers=8  foreground-writers=4  maintenance-writers=64
-				  first-last-readers=2  cancellation-workers=2
-				  foreground-write-rate=1000  maintenance-write-rate=0
-				  first-last-rate=50  cancellation-rate=100  cancellation-burst=64
+					The five-second deadline, 2x p99, 80% foreground-throughput, eight-millisecond
+					avoidable-idle time, and eight-millisecond-plus-indivisible-call queue bounds are fixed.
+					Important --name=value options:
+					  build-id=<full-lowercase-RC-SHA>  build-state=clean
+					  storage-label=hdd-btrfs  cache-state=cold  host-state=dedicated
+					  minimum-host-available-gib=8
+					  instrumentation-mode=strict
+					  preload-keys=1000000  preload-flush-keys=50000  value-bytes=256
+					  warmup-seconds=15  measure-seconds=60  rounds=5 (alternating phase order)
+					  point-readers=40  foreground-writers=4  maintenance-writers=64
+					  first-last-readers=2  cancellation-workers=2  analytical-readers=4
+					  control-workers=2  cdc-workers=2  physical-workers=1
+					  foreground-write-rate=1000  maintenance-write-rate=0
+					  first-last-rate=50  cancellation-rate=100  analytical-rate=0 (unpaced)
+					  control-rate=50  cdc-rate=100  physical-rate=1  cancellation-burst=64
+					  integrity-requests=1024
 				  read-parallelism=20  write-parallelism=36
 				  foreground-queue-capacity=4096  maintenance-queue-capacity=512
 				  point-request-count=8192  range-request-count=8192  range-width=1024
 				  direct-io=false  spinning=false  enforce=true  smoke=false
-				  prepare-only=false  reuse-preloaded=false
+					  prepare-only=false  reuse-preloaded=true
 
-				Use --smoke=true for a short structural run. It does not enforce performance gates unless
-				--enforce=true is also supplied. Every run refuses an existing root and leaves its database,
-				metadata, results.json, and results.md for inspection.
+				Use --smoke=true --enforce=false for a short structural run. Smoke, dirty/unknown builds,
+				warm cache, tmpfs/CI storage, short runs, and low-memory starts cannot satisfy release
+				acceptance. Every attempt leaves its database, provenance, and reports for inspection.
 				""");
 	}
 
@@ -1167,6 +2305,10 @@ public final class GrpcOverloadBenchmark {
 		FOREGROUND_WRITE("foreground-write"),
 		POINT_READ("point-read"),
 		FIRST_LAST("first-last"),
+		ANALYTICAL_READ("analytical-read"),
+		CONTROL("control"),
+		CDC("cdc"),
+		PHYSICAL("physical"),
 		MAINTENANCE_WRITE("maintenance-write"),
 		CANCELLATION("cancellation");
 
@@ -1189,7 +2331,8 @@ public final class GrpcOverloadBenchmark {
 	}
 
 	private record Requests(GetRequest[] pointReads,
-			RangeCase[] ranges,
+			RangeCase[] latencyRanges,
+			RangeCase[] analyticalRanges,
 			PutRequest[][] foregroundWrites,
 			PutRequest[][] maintenanceWrites,
 			PutRequest[][] cancellationWrites) {
@@ -1197,6 +2340,10 @@ public final class GrpcOverloadBenchmark {
 		private static Requests create(long columnId, Options options) {
 			var latencyContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY)
+					.setDeadlineEpochMillis(Long.MAX_VALUE - 1L)
+					.build();
+			var analyticalContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.ANALYTICAL)
 					.setDeadlineEpochMillis(Long.MAX_VALUE - 1L)
 					.build();
 			GetRequest[] points = new GetRequest[Math.min(options.pointRequestCount(), options.preloadKeys())];
@@ -1212,7 +2359,8 @@ public final class GrpcOverloadBenchmark {
 
 			long rangePositions = options.preloadKeys() - options.rangeWidth() + 1L;
 			int rangeCount = (int) Math.min(options.rangeRequestCount(), rangePositions);
-			RangeCase[] ranges = new RangeCase[rangeCount];
+			RangeCase[] latencyRanges = new RangeCase[rangeCount];
+			RangeCase[] analyticalRanges = new RangeCase[rangeCount];
 			SplittableRandom random = new SplittableRandom(options.seed());
 			for (int index = 0; index < rangeCount; index++) {
 				long bucketStart = (long) index * rangePositions / rangeCount;
@@ -1223,20 +2371,22 @@ public final class GrpcOverloadBenchmark {
 				long end = start + options.rangeWidth();
 				ByteString first = keyByteString(start);
 				ByteString last = keyByteString(end - 1);
-				GetRangeRequest request = GetRangeRequest.newBuilder()
+				var baseRequest = GetRangeRequest.newBuilder()
 						.setTransactionId(0)
 						.setColumnId(columnId)
 						.addStartKeysInclusive(first)
 						.addEndKeysExclusive(keyByteString(end))
 						.setTimeoutMs(DEADLINE_MILLIS)
-						.setContext(latencyContext)
-						.build();
-				ranges[index] = new RangeCase(request, first, last);
+						.setContext(latencyContext);
+				latencyRanges[index] = new RangeCase(baseRequest.build(), first, last);
+				analyticalRanges[index] = new RangeCase(
+						baseRequest.setContext(analyticalContext).build(), first, last);
 			}
 
 			return new Requests(
 					points,
-					ranges,
+					latencyRanges,
+					analyticalRanges,
 					writerRequests(columnId, options.foregroundWriters(), 1L << 60,
 							it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.INGEST,
 							options.valueBytes()),
@@ -1281,13 +2431,17 @@ public final class GrpcOverloadBenchmark {
 		private final AtomicBoolean measuring = new AtomicBoolean();
 		private final ConcurrentLinkedQueue<Throwable> failures = new ConcurrentLinkedQueue<>();
 		private final PhaseMetrics metrics;
-		private final AdmissionTracker admission = new AdmissionTracker();
+		private final AdmissionTracker admission;
 		private volatile long measurementStartedNanos;
 		private volatile long measurementStoppedNanos;
 
-		private PhaseControl(int workerCount, int maxLatencySamples) {
+		private PhaseControl(int workerCount,
+				int maxLatencySamples,
+				boolean exactWaitingWorkerEvidence,
+				long admissionSampleNanos) {
 			this.ready = new CountDownLatch(workerCount);
 			this.metrics = new PhaseMetrics(maxLatencySamples);
+			this.admission = new AdmissionTracker(exactWaitingWorkerEvidence, admissionSampleNanos);
 		}
 
 		private void startMeasurement() {
@@ -1356,21 +2510,27 @@ public final class GrpcOverloadBenchmark {
 			}
 		}
 
-		private PhaseResult snapshot(Phase phase,
+		private PhaseResult snapshot(int round,
+				Phase phase,
 				long durationNanos,
 				AdmissionResult admission,
-				ResourceResult resources) {
+				ResourceResult resources,
+				RequestAccounting requestAccounting,
+				Map<WorkloadProfile, SchedulerProfileMetrics> schedulerMetrics) {
 			EnumMap<Operation, OperationResult> results = new EnumMap<>(Operation.class);
 			for (Operation operation : Operation.values()) {
 				results.put(operation, operations.get(operation).snapshot(durationNanos));
 			}
-			return new PhaseResult(phase,
+			return new PhaseResult(round,
+					phase,
 					TimeUnit.NANOSECONDS.toMillis(durationNanos),
 					Map.copyOf(results),
 					warmupErrors.sum(),
 					List.copyOf(errors),
 					admission,
-					resources);
+					resources,
+					requestAccounting,
+					schedulerMetrics);
 		}
 
 		private long foregroundRejections() {
@@ -1479,6 +2639,55 @@ public final class GrpcOverloadBenchmark {
 		return sorted[Math.max(0, Math.min(index, sorted.length - 1))];
 	}
 
+	private static Map<WorkloadProfile, SchedulerProfileMetrics> snapshotSchedulerMetrics(
+			BenchmarkMeterRegistry registry) {
+		var queue = new EnumMap<WorkloadProfile, Long>(WorkloadProfile.class);
+		var execution = new EnumMap<WorkloadProfile, Long>(WorkloadProfile.class);
+		for (WorkloadProfile profile : WorkloadProfile.values()) {
+			queue.put(profile, 0L);
+			execution.put(profile, 0L);
+		}
+		for (Meter meter : registry.getMeters()) {
+			String profileTag = meter.getId().getTag("profile");
+			if (profileTag == null || !(meter instanceof Timer timer)) {
+				continue;
+			}
+			WorkloadProfile profile;
+			try {
+				profile = WorkloadProfile.valueOf(profileTag.toUpperCase(Locale.ROOT));
+			} catch (IllegalArgumentException unknownProfile) {
+				continue;
+			}
+			long p99 = timerP99(timer);
+			switch (meter.getId().getName()) {
+				case "rockserver.workload.queue.wait" -> queue.put(profile, Math.max(queue.get(profile), p99));
+				case "rockserver.workload.execution" ->
+						execution.put(profile, Math.max(execution.get(profile), p99));
+				default -> {
+				}
+			}
+		}
+		var result = new EnumMap<WorkloadProfile, SchedulerProfileMetrics>(WorkloadProfile.class);
+		for (WorkloadProfile profile : WorkloadProfile.values()) {
+			result.put(profile, new SchedulerProfileMetrics(queue.get(profile), execution.get(profile)));
+		}
+		return Map.copyOf(result);
+	}
+
+	private static long timerP99(Timer timer) {
+		long maximum = 0L;
+		for (var percentile : timer.takeSnapshot().percentileValues()) {
+			if (percentile.percentile() >= 0.99d) {
+				maximum = Math.max(maximum, (long) percentile.value(TimeUnit.NANOSECONDS));
+			}
+		}
+		return maximum;
+	}
+
+	/** Scheduler-internal queue and execution p99 for one profile during one phase. */
+	public record SchedulerProfileMetrics(long queueP99Nanos, long executionP99Nanos) {
+	}
+
 	private static final class AdmissionTracker {
 
 		private final AtomicInteger maxForegroundQueue = new AtomicInteger();
@@ -1486,9 +2695,19 @@ public final class GrpcOverloadBenchmark {
 		private final AtomicInteger maxForegroundActive = new AtomicInteger();
 		private final AtomicInteger maxMaintenanceActive = new AtomicInteger();
 		private final AtomicInteger maxTotalActive = new AtomicInteger();
+		private final EnumMap<RWScheduler.Pool, MutablePoolUtilization> poolUtilization =
+				new EnumMap<>(RWScheduler.Pool.class);
+
+		private AdmissionTracker(boolean exactWaitingWorkerEvidence, long admissionSampleNanos) {
+			for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
+				poolUtilization.put(pool,
+						new MutablePoolUtilization(exactWaitingWorkerEvidence, admissionSampleNanos));
+			}
+		}
 
 		private void sample(EmbeddedConnection embedded) {
-			var snapshot = embedded.getScheduler().admissionSnapshot();
+			var scheduler = embedded.getScheduler();
+			var snapshot = scheduler.admissionSnapshot();
 			int foregroundQueue = snapshot.queued().get(WorkloadProfile.INGEST);
 			int maintenanceQueue = snapshot.queued().get(WorkloadProfile.BATCH);
 			int foregroundActive = snapshot.active().get(WorkloadProfile.INGEST);
@@ -1497,12 +2716,19 @@ public final class GrpcOverloadBenchmark {
 			maxMaintenanceQueue.accumulateAndGet(maintenanceQueue, Math::max);
 			maxForegroundActive.accumulateAndGet(foregroundActive, Math::max);
 			maxMaintenanceActive.accumulateAndGet(maintenanceActive, Math::max);
-			maxTotalActive.accumulateAndGet(foregroundActive + maintenanceActive, Math::max);
+			maxTotalActive.accumulateAndGet(snapshot.totalActive(), Math::max);
+			for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
+				poolUtilization.get(pool).sample(pool, scheduler.poolSnapshot(pool), snapshot.storagePressure());
+			}
 		}
 
 		private AdmissionResult finish(EmbeddedConnection embedded, PhaseMetrics metrics) {
 			sample(embedded);
 			var snapshot = embedded.getScheduler().admissionSnapshot();
+			var utilization = new EnumMap<RWScheduler.Pool, PoolUtilization>(RWScheduler.Pool.class);
+			for (var entry : poolUtilization.entrySet()) {
+				utilization.put(entry.getKey(), entry.getValue().snapshot());
+			}
 			return new AdmissionResult(
 					maxForegroundQueue.get(),
 					maxMaintenanceQueue.get(),
@@ -1512,7 +2738,102 @@ public final class GrpcOverloadBenchmark {
 					maxMaintenanceActive.get(),
 					maxTotalActive.get(),
 					metrics.foregroundRejections(),
-					metrics.maintenanceRejections());
+					metrics.maintenanceRejections(),
+					Map.copyOf(utilization));
+		}
+	}
+
+	private static final class MutablePoolUtilization {
+
+		private final boolean exactWaitingWorkerEvidence;
+		private final long samplePeriodNanos;
+
+		private long samples;
+		private long eligibleBacklogSamples;
+		private long policyLimitedBacklogSamples;
+		private long saturatingDemandSamples;
+		private long fullyBusySamples;
+		private long idleWorkerSlots;
+		private int maximumActive;
+		private int consecutiveAvoidableIdleSamples;
+		private int maximumConsecutiveAvoidableIdleSamples;
+		private int workerCount;
+
+		private MutablePoolUtilization(boolean exactWaitingWorkerEvidence, long samplePeriodNanos) {
+			this.exactWaitingWorkerEvidence = exactWaitingWorkerEvidence;
+			this.samplePeriodNanos = samplePeriodNanos;
+		}
+
+		private void sample(RWScheduler.Pool pool,
+				RWScheduler.PoolSnapshot snapshot,
+				boolean storagePressure) {
+			samples++;
+			workerCount = snapshot.workerCount();
+			maximumActive = Math.max(maximumActive, snapshot.activeTasks());
+			if (snapshot.batchDispatchLimited()
+					&& snapshot.queuedByProfile().getOrDefault(WorkloadProfile.BATCH, 0) > 0) {
+				policyLimitedBacklogSamples++;
+			}
+			int eligibleQueued = eligibleQueued(pool, snapshot, storagePressure);
+			if (eligibleQueued <= 0) {
+				consecutiveAvoidableIdleSamples = 0;
+				return;
+			}
+			eligibleBacklogSamples++;
+			int idleWorkers = exactWaitingWorkerEvidence ? snapshot.waitingWorkers() : 0;
+			int avoidablyIdleWorkers = Math.min(idleWorkers, eligibleQueued);
+			if (avoidablyIdleWorkers == 0) {
+				consecutiveAvoidableIdleSamples = 0;
+			} else {
+				consecutiveAvoidableIdleSamples++;
+				maximumConsecutiveAvoidableIdleSamples = Math.max(
+						maximumConsecutiveAvoidableIdleSamples, consecutiveAvoidableIdleSamples);
+			}
+			if ((long) snapshot.activeTasks() + eligibleQueued >= snapshot.workerCount()) {
+				saturatingDemandSamples++;
+				idleWorkerSlots += idleWorkers;
+				if (idleWorkers == 0) {
+					fullyBusySamples++;
+				}
+			}
+		}
+
+		private static int eligibleQueued(RWScheduler.Pool pool,
+				RWScheduler.PoolSnapshot snapshot,
+				boolean storagePressure) {
+			return switch (pool) {
+				case READ -> snapshot.queuedByProfile().entrySet().stream()
+						.filter(entry -> entry.getKey() != WorkloadProfile.ANALYTICAL)
+						.mapToInt(entry -> entry.getKey() == WorkloadProfile.BATCH
+								? Math.min(entry.getValue(), snapshot.batchStartAllowance())
+								: entry.getValue())
+						.sum();
+				case WRITE -> {
+					int batchQueued = snapshot.queuedByProfile().getOrDefault(WorkloadProfile.BATCH, 0);
+					yield snapshot.queuedTasks() - batchQueued
+							+ Math.min(batchQueued, snapshot.batchStartAllowance());
+				}
+				case CONTROL -> snapshot.queuedTasks();
+				case PHYSICAL -> storagePressure ? 0 : snapshot.queuedTasks();
+			};
+		}
+
+		private PoolUtilization snapshot() {
+			double utilization = saturatingDemandSamples == 0L || workerCount == 0
+					? 0.0d
+					: 1.0d - idleWorkerSlots / (double) (saturatingDemandSamples * workerCount);
+			return new PoolUtilization(workerCount,
+					samples,
+					eligibleBacklogSamples,
+					policyLimitedBacklogSamples,
+					saturatingDemandSamples,
+					fullyBusySamples,
+					idleWorkerSlots,
+					maximumActive,
+					maximumConsecutiveAvoidableIdleSamples,
+					Math.max(0.0d, Math.min(1.0d, utilization)),
+					exactWaitingWorkerEvidence,
+					samplePeriodNanos);
 		}
 	}
 
@@ -1551,9 +2872,137 @@ public final class GrpcOverloadBenchmark {
 		}
 	}
 
+	private static final class BenchmarkMeterRegistry extends SimpleMeterRegistry {
+
+		@Override
+		protected Timer newTimer(Meter.Id id,
+				DistributionStatisticConfig distributionStatisticConfig,
+				PauseDetector pauseDetector) {
+			var benchmarkConfig = DistributionStatisticConfig.builder()
+					.percentiles(0.99d)
+					.percentilePrecision(3)
+					.build()
+					.merge(distributionStatisticConfig);
+			return super.newTimer(id, benchmarkConfig, pauseDetector);
+		}
+	}
+
+	private static final class RequestTracker implements ClientInterceptor {
+
+		private final AtomicBoolean measuring = new AtomicBoolean();
+		private final LongAdder submitted = new LongAdder();
+		private final LongAdder terminal = new LongAdder();
+		private final LongAdder duplicateTerminal = new LongAdder();
+		private final AtomicLong inFlight = new AtomicLong();
+		private final AtomicLong maximumInFlight = new AtomicLong();
+		private final EnumMap<Status.Code, LongAdder> statuses = new EnumMap<>(Status.Code.class);
+
+		private RequestTracker() {
+			for (Status.Code code : Status.Code.values()) {
+				statuses.put(code, new LongAdder());
+			}
+		}
+
+		private void startTracking() {
+			if (inFlight.get() != 0L || measuring.get()) {
+				throw new IllegalStateException("A request-accounting window is already active or has in-flight calls");
+			}
+			submitted.reset();
+			terminal.reset();
+			duplicateTerminal.reset();
+			maximumInFlight.set(0L);
+			for (LongAdder status : statuses.values()) {
+				status.reset();
+			}
+			if (!measuring.compareAndSet(false, true)) {
+				throw new IllegalStateException("A request-accounting window started concurrently");
+			}
+		}
+
+		private void stopTracking() {
+			if (!measuring.compareAndSet(true, false)) {
+				throw new IllegalStateException("No request-accounting window is active");
+			}
+		}
+
+		private void stopTrackingIfActive() {
+			measuring.compareAndSet(true, false);
+		}
+
+		private RequestAccounting awaitSnapshot() throws InterruptedException {
+			long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DEADLINE_MILLIS);
+			while (inFlight.get() != 0L && System.nanoTime() < deadline) {
+				LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1L));
+				if (Thread.interrupted()) {
+					throw new InterruptedException();
+				}
+			}
+			var statusCounts = new EnumMap<Status.Code, Long>(Status.Code.class);
+			for (var entry : statuses.entrySet()) {
+				statusCounts.put(entry.getKey(), entry.getValue().sum());
+			}
+			return new RequestAccounting(submitted.sum(),
+					terminal.sum(),
+					inFlight.get(),
+					duplicateTerminal.sum(),
+					maximumInFlight.get(),
+					Map.copyOf(statusCounts));
+		}
+
+		@Override
+		public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(MethodDescriptor<ReqT, RespT> method,
+				CallOptions callOptions,
+				Channel next) {
+			return new ForwardingClientCall.SimpleForwardingClientCall<>(next.newCall(method, callOptions)) {
+
+				private final AtomicBoolean closed = new AtomicBoolean();
+				private boolean tracked;
+
+				@Override
+				public void start(Listener<RespT> responseListener, Metadata headers) {
+					tracked = measuring.get();
+					if (tracked) {
+						submitted.increment();
+						long active = inFlight.incrementAndGet();
+						maximumInFlight.accumulateAndGet(active, Math::max);
+					}
+					var trackingListener = new ForwardingClientCallListener.SimpleForwardingClientCallListener<>(
+							responseListener) {
+
+						@Override
+						public void onClose(Status status, Metadata trailers) {
+							finish(status.getCode());
+							super.onClose(status, trailers);
+						}
+					};
+					try {
+						super.start(trackingListener, headers);
+					} catch (Throwable failure) {
+						finish(Status.Code.UNKNOWN);
+						throw failure;
+					}
+				}
+
+				private void finish(Status.Code code) {
+					if (!tracked) {
+						return;
+					}
+					if (!closed.compareAndSet(false, true)) {
+						duplicateTerminal.increment();
+						return;
+					}
+					statuses.get(code).increment();
+					terminal.increment();
+					inFlight.decrementAndGet();
+				}
+			};
+		}
+	}
+
 	private record Client(ManagedChannel channel,
 			RocksDBServiceGrpc.RocksDBServiceBlockingStub blocking,
-			RocksDBServiceGrpc.RocksDBServiceFutureStub future) implements AutoCloseable {
+			RocksDBServiceGrpc.RocksDBServiceFutureStub future,
+			RequestTracker requestTracker) implements AutoCloseable {
 
 		private static Client open(int port) {
 			ManagedChannel channel = NettyChannelBuilder.forAddress("127.0.0.1", port)
@@ -1562,9 +3011,12 @@ public final class GrpcOverloadBenchmark {
 					.disableRetry()
 					.maxInboundMessageSize(64 * 1024 * 1024)
 					.build();
+			var requestTracker = new RequestTracker();
+			Channel tracked = ClientInterceptors.intercept(channel, requestTracker);
 			return new Client(channel,
-					RocksDBServiceGrpc.newBlockingStub(channel),
-					RocksDBServiceGrpc.newFutureStub(channel));
+					RocksDBServiceGrpc.newBlockingStub(tracked),
+					RocksDBServiceGrpc.newFutureStub(tracked),
+					requestTracker);
 		}
 
 		private RocksDBServiceGrpc.RocksDBServiceBlockingStub blockingWithDeadline() {
@@ -1584,13 +3036,16 @@ public final class GrpcOverloadBenchmark {
 		}
 	}
 
-	private record PhaseResult(Phase phase,
+	private record PhaseResult(int round,
+			Phase phase,
 			long durationMillis,
 			Map<Operation, OperationResult> operations,
 			long warmupErrors,
 			List<String> errorDetails,
 			AdmissionResult admission,
-			ResourceResult resources) {
+			ResourceResult resources,
+			RequestAccounting requestAccounting,
+			Map<WorkloadProfile, SchedulerProfileMetrics> schedulerMetrics) {
 
 		private OperationResult operation(Operation operation) {
 			return operations.get(operation);
@@ -1600,6 +3055,24 @@ public final class GrpcOverloadBenchmark {
 			long measured = operations.values().stream().mapToLong(OperationResult::errors).sum();
 			// FOREGROUND is an aggregate of three concrete operations; do not count it twice.
 			return measured - operation(Operation.FOREGROUND).errors() + warmupErrors;
+		}
+	}
+
+	/** Client-interceptor proof that every measured RPC reached exactly one terminal status. */
+	public record RequestAccounting(long submitted,
+			long terminal,
+			long inFlight,
+			long duplicateTerminal,
+			long maximumInFlight,
+			Map<Status.Code, Long> statuses) {
+
+		public RequestAccounting {
+			statuses = Map.copyOf(statuses);
+		}
+
+		public boolean conserved() {
+			return submitted > 0L && terminal == submitted && inFlight == 0L && duplicateTerminal == 0L
+					&& statuses.values().stream().mapToLong(Long::longValue).sum() == terminal;
 		}
 	}
 
@@ -1626,43 +3099,475 @@ public final class GrpcOverloadBenchmark {
 			int maxMaintenanceActive,
 			int maxTotalActive,
 			long foregroundRejected,
-			long maintenanceRejected) {
+			long maintenanceRejected,
+			Map<RWScheduler.Pool, PoolUtilization> poolUtilization) {
+	}
+
+	/** Sampled evidence that an eligible backlog did not coexist with avoidably idle workers. */
+	public record PoolUtilization(int workerCount,
+			long samples,
+			long eligibleBacklogSamples,
+			long policyLimitedBacklogSamples,
+			long saturatingDemandSamples,
+			long fullyBusySamples,
+			long idleWorkerSlots,
+			int maximumActive,
+			int maximumConsecutiveAvoidableIdleSamples,
+			double utilizationWhileBacklogged,
+			boolean exactWaitingWorkerEvidence,
+			long samplePeriodNanos) {
+
+		public long maximumAvoidableIdleNanos() {
+			try {
+				return Math.multiplyExact((long) maximumConsecutiveAvoidableIdleSamples, samplePeriodNanos);
+			} catch (ArithmeticException overflow) {
+				return Long.MAX_VALUE;
+			}
+		}
+
+		public boolean saturatedAndWorkConserving() {
+			return exactWaitingWorkerEvidence
+					&& workerCount > 0
+					&& (saturatingDemandSamples > 0L || policyLimitedBacklogSamples > 0L)
+					&& maximumAvoidableIdleNanos() <= COOPERATIVE_QUANTUM_NANOS + samplePeriodNanos;
+		}
 	}
 
 	private record ResourceResult(int foregroundQueued,
 			int maintenanceQueued,
 			int foregroundActive,
 			int maintenanceActive,
+			int totalQueued,
+			int totalActive,
 			long pendingOperations,
 			int openTransactions,
 			int openIterators,
 			int activeRangeCursors,
 			int iteratorLeases,
 			long drainMillis,
-			boolean drained) {
+			boolean drained,
+			SchedulerConservation schedulerConservation) {
+	}
+
+	/** Lifetime scheduler counters must balance after the phase has fully drained. */
+	public record SchedulerConservation(long accepted,
+			long started,
+			long completed,
+			long terminalOutcomes,
+			long failures,
+			List<String> failuresByPool) {
+
+		public SchedulerConservation {
+			failuresByPool = List.copyOf(failuresByPool);
+		}
+
+		public boolean conserved() {
+			return accepted > 0L && started == completed && terminalOutcomes >= accepted
+					&& failures == 0L && failuresByPool.isEmpty();
+		}
+	}
+
+	private static void verifyHostMemory(Options options, HostMemory hostMemory) {
+		long requiredBytes = Math.multiplyExact((long) options.minimumHostAvailableGiB(), GIBIBYTE);
+		if (requiredBytes == 0L) {
+			return;
+		}
+		if (!hostMemory.known()) {
+			throw new IllegalStateException("Host MemAvailable could not be read; refusing to consume a one-shot root");
+		}
+		if (hostMemory.availableBytes() < requiredBytes) {
+			throw new IllegalStateException("Host MemAvailable is " + hostMemory.availableBytes()
+					+ " bytes, below the required " + requiredBytes
+					+ " bytes; refusing to consume a one-shot root");
+		}
+	}
+
+	private static void verifyStorage(Options options, StorageEnvironment storage) {
+		if (options.storageLabel().equals("ci-structural")) {
+			return;
+		}
+		if (!storageMatchesLabelForTesting(storage, options.storageLabel())) {
+			throw new IllegalStateException("Resolved storage does not match --storage-label="
+					+ options.storageLabel() + ": " + storage);
+		}
+	}
+
+	private static void verifyCompetingBenchmarks(Options options, List<String> competingProcesses) {
+		if (options.enforce() && !competingProcesses.isEmpty()) {
+			throw new IllegalStateException("Competing JVM benchmark processes are active; refusing release timing: "
+					+ competingProcesses);
+		}
+	}
+
+	private static List<String> captureCompetingBenchmarkProcesses() {
+		long currentPid = ProcessHandle.current().pid();
+		var competitors = new ArrayList<String>();
+		boolean currentProcessObserved = false;
+		try (var entries = Files.list(Path.of("/proc"))) {
+			for (Path entry : entries.toList()) {
+				long pid;
+				try {
+					pid = Long.parseLong(entry.getFileName().toString());
+				} catch (NumberFormatException ignored) {
+					continue;
+				}
+				if (pid == currentPid) {
+					currentProcessObserved = true;
+					continue;
+				}
+				try {
+					String command = Files.readString(entry.resolve("comm")).trim();
+					String commandLine = Files.readString(entry.resolve("cmdline")).replace('\0', ' ').trim();
+					if (isCompetingBenchmarkCommandForTesting(command, commandLine)) {
+						competitors.add(pid + ":" + sha256(commandLine));
+					}
+				} catch (IOException | RuntimeException ignored) {
+					// A process can exit between directory enumeration and reading its command.
+				}
+			}
+		} catch (IOException | RuntimeException ignored) {
+			return List.of("process-enumeration-unavailable");
+		}
+		if (!currentProcessObserved) {
+			return List.of("process-enumeration-unavailable");
+		}
+		competitors.sort(String::compareTo);
+		return List.copyOf(competitors);
+	}
+
+	/** Pure command classifier used by exclusive-host provenance tests. */
+	public static boolean isCompetingBenchmarkCommandForTesting(String command, String commandLine) {
+		String executable = Path.of(command.isBlank() ? "unknown" : command).getFileName().toString()
+				.toLowerCase(Locale.ROOT);
+		String lower = commandLine.toLowerCase(Locale.ROOT);
+		return executable.startsWith("java")
+				&& (lower.contains("org.openjdk.jmh") || lower.contains("jmh") || lower.contains("benchmark"));
+	}
+
+	/** Resolved Linux mount and block-device evidence for the benchmark root. */
+	public record StorageEnvironment(String mountPoint,
+			String source,
+			String filesystem,
+			int rotational,
+			String model) {
+
+		private static StorageEnvironment capture(Path target) {
+			try {
+				Path probe = target.toAbsolutePath().normalize();
+				while (probe != null && !Files.exists(probe)) {
+					probe = probe.getParent();
+				}
+				if (probe == null) {
+					return unavailable();
+				}
+				String[] best = null;
+				int bestLength = -1;
+				for (String line : Files.readString(Path.of("/proc/self/mountinfo")).lines().toList()) {
+					String[] fields = line.split(" ");
+					int separator = -1;
+					for (int index = 6; index < fields.length; index++) {
+						if (fields[index].equals("-")) {
+							separator = index;
+							break;
+						}
+					}
+					if (separator < 0 || separator + 2 >= fields.length || fields.length < 6) {
+						continue;
+					}
+					String mountPoint = decodeMountInfo(fields[4]);
+					Path mountPath = Path.of(mountPoint).toAbsolutePath().normalize();
+					if (probe.startsWith(mountPath) && mountPoint.length() >= bestLength) {
+						bestLength = mountPoint.length();
+						best = new String[] {mountPoint, decodeMountInfo(fields[separator + 2]),
+								fields[separator + 1]};
+					}
+				}
+				if (best == null) {
+					return unavailable();
+				}
+				BlockDeviceEvidence block = blockDeviceEvidence(best[1]);
+				return new StorageEnvironment(best[0], best[1], best[2], block.rotational(), block.model());
+			} catch (IOException | RuntimeException ignored) {
+				return unavailable();
+			}
+		}
+
+		private static StorageEnvironment unavailable() {
+			return new StorageEnvironment("unknown", "unknown", "unknown", -1, "unknown");
+		}
+	}
+
+	private static String decodeMountInfo(String value) {
+		return value.replace("\\040", " ")
+				.replace("\\011", "\t")
+				.replace("\\012", "\n")
+				.replace("\\134", "\\");
+	}
+
+	private static BlockDeviceEvidence blockDeviceEvidence(String source) {
+		if (!source.startsWith("/dev/")) {
+			return new BlockDeviceEvidence(-1, "unknown");
+		}
+		try {
+			String deviceName = Path.of(source).getFileName().toString();
+			Path sysDevice = Path.of("/sys/class/block", deviceName).toRealPath();
+			Path wholeDevice = Files.isRegularFile(sysDevice.resolve("partition")) ? sysDevice.getParent() : sysDevice;
+			int rotational = Integer.parseInt(Files.readString(wholeDevice.resolve("queue/rotational")).trim());
+			Path modelFile = wholeDevice.resolve("device/model");
+			String model = Files.isRegularFile(modelFile) ? Files.readString(modelFile).trim() : "unknown";
+			return new BlockDeviceEvidence(rotational, model);
+		} catch (IOException | RuntimeException ignored) {
+			return new BlockDeviceEvidence(-1, "unknown");
+		}
+	}
+
+	private record BlockDeviceEvidence(int rotational, String model) {
+	}
+
+	/** Captures storage evidence without creating the target path. */
+	public static StorageEnvironment captureStorageForTesting(Path target) {
+		return StorageEnvironment.capture(target);
+	}
+
+	/** Pure label consistency check used by release-provenance tests. */
+	public static boolean storageMatchesLabelForTesting(StorageEnvironment storage, String label) {
+		return switch (label) {
+			case "ci-structural" -> true;
+			case "hdd-btrfs" -> storage.filesystem().equalsIgnoreCase("btrfs")
+					&& storage.rotational() == 1;
+			case "hdd-zfs" -> storage.filesystem().toLowerCase(Locale.ROOT).contains("zfs")
+					&& storage.rotational() != 0;
+			case "nvme" -> storage.rotational() == 0
+					&& Path.of(storage.source()).getFileName().toString().startsWith("nvme");
+			default -> false;
+		};
+	}
+
+	/** Linux host-memory evidence captured before a prepared root is consumed. */
+	public record HostMemory(long totalBytes,
+			long availableBytes,
+			long swapTotalBytes,
+			long swapFreeBytes) {
+
+		private static HostMemory capture() {
+			Path meminfo = Path.of("/proc/meminfo");
+			if (!Files.isRegularFile(meminfo)) {
+				return unavailable();
+			}
+			try {
+				return parseHostMemory(Files.readString(meminfo));
+			} catch (IOException | RuntimeException ignored) {
+				return unavailable();
+			}
+		}
+
+		private static HostMemory unavailable() {
+			return new HostMemory(-1L, -1L, -1L, -1L);
+		}
+
+		public boolean known() {
+			return totalBytes > 0L && availableBytes >= 0L && swapTotalBytes >= 0L && swapFreeBytes >= 0L;
+		}
+	}
+
+	/** Parses /proc/meminfo text for deterministic preflight tests. */
+	public static HostMemory parseHostMemoryForTesting(String meminfo) {
+		return parseHostMemory(meminfo);
+	}
+
+	private static HostMemory parseHostMemory(String meminfo) {
+		Map<String, Long> values = new LinkedHashMap<>();
+		for (String line : meminfo.lines().toList()) {
+			int colon = line.indexOf(':');
+			if (colon <= 0) {
+				continue;
+			}
+			String[] fields = line.substring(colon + 1).trim().split("\\s+");
+			if (fields.length == 0 || fields[0].isBlank()) {
+				continue;
+			}
+			long value = Long.parseLong(fields[0]);
+			if (fields.length > 1 && fields[1].equalsIgnoreCase("kB")) {
+				value = Math.multiplyExact(value, 1_024L);
+			}
+			values.put(line.substring(0, colon), value);
+		}
+		return new HostMemory(
+				values.getOrDefault("MemTotal", -1L),
+				values.getOrDefault("MemAvailable", -1L),
+				values.getOrDefault("SwapTotal", -1L),
+				values.getOrDefault("SwapFree", -1L));
+	}
+
+	private record RunEnvironment(String javaVersion,
+			String javaVm,
+			List<String> jvmArguments,
+			long jvmMaxMemoryBytes,
+			String os,
+			int availableProcessors,
+			double systemLoadAverage,
+			HostMemory hostMemory,
+			StorageEnvironment storage,
+			List<String> competingBenchmarkProcesses) {
+
+		private static RunEnvironment capture(Path target) {
+			var operatingSystem = ManagementFactory.getOperatingSystemMXBean();
+			return new RunEnvironment(
+					System.getProperty("java.version"),
+					System.getProperty("java.vm.name") + " " + System.getProperty("java.vm.version"),
+					List.copyOf(ManagementFactory.getRuntimeMXBean().getInputArguments()),
+					Runtime.getRuntime().maxMemory(),
+					System.getProperty("os.name") + " " + System.getProperty("os.version")
+							+ " " + System.getProperty("os.arch"),
+					Runtime.getRuntime().availableProcessors(),
+					operatingSystem.getSystemLoadAverage(),
+					HostMemory.capture(),
+					StorageEnvironment.capture(target),
+					captureCompetingBenchmarkProcesses());
+		}
 	}
 
 	private record BenchmarkResult(String schema,
 			Instant started,
 			Instant finished,
 			Options options,
+			RunEnvironment environment,
 			List<PhaseResult> phases,
+			IntegrityResult integrity,
 			boolean shutdownClean,
 			long nativeLeaksDetected,
 			Acceptance acceptance) {
 	}
 
+	/** Unique acknowledged writes read back through the same real gRPC channel. */
+	public record IntegrityResult(long writesAttempted,
+			long writesAcknowledged,
+			long readsAttempted,
+			long readsMatched,
+			long mismatches,
+			long errors,
+			List<String> errorDetails,
+			RequestAccounting requestAccounting) {
+
+		public IntegrityResult {
+			errorDetails = List.copyOf(errorDetails);
+			Objects.requireNonNull(requestAccounting, "requestAccounting");
+		}
+
+		private static IntegrityResult notRun() {
+			return new IntegrityResult(0L,
+					0L,
+					0L,
+					0L,
+					0L,
+					1L,
+					List.of("integrity probe did not run"),
+					new RequestAccounting(0L, 0L, 0L, 0L, 0L, Map.of()));
+		}
+
+		public boolean passed() {
+			return writesAttempted > 0L
+					&& writesAcknowledged == writesAttempted
+					&& readsAttempted == writesAttempted
+					&& readsMatched == writesAcknowledged
+					&& mismatches == 0L
+					&& errors == 0L
+					&& requestAccounting.conserved();
+		}
+	}
+
 	/** Minimal inputs for the pure acceptance gate. */
 	public record GateInput(long foregroundDeadlines,
 			long firstLastDeadlines,
-			long foregroundOnlyP99Nanos,
-			long maintenanceFloodP99Nanos,
+			long unexpectedDeadlines,
+			RatioConfidenceInterval foregroundP99Ratio,
+			RatioConfidenceInterval foregroundThroughputRatio,
 			long cancellations,
 			boolean resourcesDrained,
 			long unexpectedErrors,
 			long foregroundRejections,
+			RequestAccounting foregroundRequests,
+			RequestAccounting mixedRequests,
+			IntegrityResult integrity,
+			Set<WorkloadProfile> progressedProfiles,
+			PoolUtilization readPool,
+			PoolUtilization writePool,
+			SchedulerConservation foregroundScheduler,
+			SchedulerConservation mixedScheduler,
+			PriorityEvidence priority,
 			long nativeLeaksDetected,
 			boolean shutdownClean) {
+
+		public GateInput {
+			Objects.requireNonNull(foregroundP99Ratio, "foregroundP99Ratio");
+			Objects.requireNonNull(foregroundThroughputRatio, "foregroundThroughputRatio");
+			Objects.requireNonNull(foregroundRequests, "foregroundRequests");
+			Objects.requireNonNull(mixedRequests, "mixedRequests");
+			Objects.requireNonNull(integrity, "integrity");
+			progressedProfiles = Set.copyOf(progressedProfiles);
+			Objects.requireNonNull(readPool, "readPool");
+			Objects.requireNonNull(writePool, "writePool");
+			Objects.requireNonNull(foregroundScheduler, "foregroundScheduler");
+			Objects.requireNonNull(mixedScheduler, "mixedScheduler");
+			Objects.requireNonNull(priority, "priority");
+		}
+	}
+
+	/** Paired performance ratio summarized with a two-sided 95% confidence interval. */
+	public record RatioConfidenceInterval(int samples, double mean, double lower95, double upper95) {
+
+		public boolean available() {
+			return samples > 0 && Double.isFinite(mean) && Double.isFinite(lower95) && Double.isFinite(upper95)
+					&& mean >= 0.0d && lower95 >= 0.0d && upper95 >= lower95;
+		}
+	}
+
+	/** Direct scheduler evidence for priority ordering and the eight-millisecond cooperative bound. */
+	public record PriorityEvidence(long foregroundLatencyExecutionP99Nanos,
+			long maximumMixedLatencyQueueP99Nanos,
+			long medianMixedLatencyQueueP99Nanos,
+			long medianMixedAnalyticalQueueP99Nanos,
+			long medianMixedIngestQueueP99Nanos,
+			long medianMixedBatchQueueP99Nanos,
+			int rounds,
+			int latencyBeforeAnalyticalRounds,
+			int ingestBeforeBatchRounds) {
+
+		public boolean passed() {
+			if (foregroundLatencyExecutionP99Nanos <= 0L
+					|| maximumMixedLatencyQueueP99Nanos <= 0L
+					|| medianMixedLatencyQueueP99Nanos <= 0L
+					|| medianMixedAnalyticalQueueP99Nanos <= 0L
+					|| medianMixedIngestQueueP99Nanos <= 0L
+					|| medianMixedBatchQueueP99Nanos <= 0L
+					|| rounds <= 0) {
+				return false;
+			}
+			long latencyBound;
+			try {
+				latencyBound = Math.addExact(foregroundLatencyExecutionP99Nanos, COOPERATIVE_QUANTUM_NANOS);
+			} catch (ArithmeticException overflow) {
+				latencyBound = Long.MAX_VALUE;
+			}
+			int requiredOrderedRounds = Math.max(1, rounds - 1);
+			return maximumMixedLatencyQueueP99Nanos <= latencyBound
+					&& medianMixedLatencyQueueP99Nanos <= medianMixedAnalyticalQueueP99Nanos
+					&& medianMixedIngestQueueP99Nanos <= medianMixedBatchQueueP99Nanos
+					&& latencyBeforeAnalyticalRounds >= requiredOrderedRounds
+					&& ingestBeforeBatchRounds >= requiredOrderedRounds;
+		}
+
+		public String detail() {
+			return "maximum_latency_queue_p99_ms=" + formatMillis(maximumMixedLatencyQueueP99Nanos)
+					+ ", quantum_plus_indivisible_baseline_ms="
+					+ formatMillis(foregroundLatencyExecutionP99Nanos + COOPERATIVE_QUANTUM_NANOS)
+					+ ", median_latency_queue_p99_ms=" + formatMillis(medianMixedLatencyQueueP99Nanos)
+					+ ", median_analytical_queue_p99_ms=" + formatMillis(medianMixedAnalyticalQueueP99Nanos)
+					+ ", latency_before_analytical_rounds=" + latencyBeforeAnalyticalRounds + '/' + rounds
+					+ ", median_ingest_queue_p99_ms=" + formatMillis(medianMixedIngestQueueP99Nanos)
+					+ ", median_batch_queue_p99_ms=" + formatMillis(medianMixedBatchQueueP99Nanos)
+					+ ", ingest_before_batch_rounds=" + ingestBeforeBatchRounds + '/' + rounds;
+		}
 	}
 
 	/** One deterministic acceptance assertion and its measured detail. */
@@ -1695,22 +3600,38 @@ public final class GrpcOverloadBenchmark {
 
 	private record Options(Path root,
 			String databaseName,
+			String buildId,
+			String buildState,
+			String storageLabel,
+			String cacheState,
+			String hostState,
+			int minimumHostAvailableGiB,
 			int preloadKeys,
 			int preloadFlushKeys,
 			int valueBytes,
 			int warmupSeconds,
 			int measureSeconds,
+			int rounds,
 			int pointReaders,
 			int foregroundWriters,
 			int maintenanceWriters,
 			int firstLastReaders,
 			int cancellationWorkers,
+			int analyticalReaders,
+			int controlWorkers,
+			int cdcWorkers,
+			int physicalWorkers,
 			long foregroundWriteRate,
 			long maintenanceWriteRate,
 			long firstLastRate,
 			long cancellationRate,
+			long analyticalRate,
+			long controlRate,
+			long cdcRate,
+			long physicalRate,
 			int cancellationDelayMillis,
 			int cancellationBurst,
+			int integrityRequests,
 			int pointRequestCount,
 			int rangeRequestCount,
 			int rangeWidth,
@@ -1719,6 +3640,7 @@ public final class GrpcOverloadBenchmark {
 			int foregroundQueueCapacity,
 			int maintenanceQueueCapacity,
 			int admissionSampleMicros,
+			String instrumentationMode,
 			int maxLatencySamples,
 			String writeBufferSize,
 			boolean directIo,
@@ -1732,22 +3654,38 @@ public final class GrpcOverloadBenchmark {
 		private static final Set<String> KNOWN_OPTIONS = Set.of(
 				"root",
 				"database-name",
+				"build-id",
+				"build-state",
+				"storage-label",
+				"cache-state",
+				"host-state",
+				"minimum-host-available-gib",
 				"preload-keys",
 				"preload-flush-keys",
 				"value-bytes",
-				"warmup-seconds",
-				"measure-seconds",
+					"warmup-seconds",
+					"measure-seconds",
+					"rounds",
 				"point-readers",
 				"foreground-writers",
-				"maintenance-writers",
-				"first-last-readers",
-				"cancellation-workers",
-				"foreground-write-rate",
-				"maintenance-write-rate",
-				"first-last-rate",
-				"cancellation-rate",
-				"cancellation-delay-ms",
-				"cancellation-burst",
+					"maintenance-writers",
+					"first-last-readers",
+					"cancellation-workers",
+					"analytical-readers",
+					"control-workers",
+					"cdc-workers",
+					"physical-workers",
+					"foreground-write-rate",
+					"maintenance-write-rate",
+					"first-last-rate",
+					"cancellation-rate",
+					"analytical-rate",
+					"control-rate",
+					"cdc-rate",
+					"physical-rate",
+					"cancellation-delay-ms",
+					"cancellation-burst",
+					"integrity-requests",
 				"point-request-count",
 				"range-request-count",
 				"range-width",
@@ -1756,6 +3694,7 @@ public final class GrpcOverloadBenchmark {
 				"foreground-queue-capacity",
 				"maintenance-queue-capacity",
 				"admission-sample-micros",
+				"instrumentation-mode",
 				"max-latency-samples",
 				"write-buffer-size",
 				"direct-io",
@@ -1789,30 +3728,47 @@ public final class GrpcOverloadBenchmark {
 					Path.of(values.getOrDefault("root", Path.of(System.getProperty("java.io.tmpdir"),
 							"rockserver-overload-" + runId).toString())),
 					values.getOrDefault("database-name", "grpc-overload-benchmark"),
+					values.getOrDefault("build-id", "unverified"),
+					values.getOrDefault("build-state", "unknown"),
+					values.getOrDefault("storage-label", "ci-structural"),
+					values.getOrDefault("cache-state", "unknown"),
+					values.getOrDefault("host-state", "shared"),
+					integer(values, "minimum-host-available-gib", smoke ? 0 : MIN_RELEASE_HOST_AVAILABLE_GIB),
 					integer(values, "preload-keys", smoke ? 10_000 : 1_000_000),
 					integer(values, "preload-flush-keys", smoke ? 2_000 : 50_000),
 					integer(values, "value-bytes", 256),
 					integer(values, "warmup-seconds", smoke ? 1 : 15),
 					integer(values, "measure-seconds", smoke ? 2 : 60),
-					integer(values, "point-readers", smoke ? 2 : 8),
+					integer(values, "rounds", smoke ? 1 : 5),
+					integer(values, "point-readers", smoke ? 8 : 40),
 					integer(values, "foreground-writers", smoke ? 2 : 4),
 					integer(values, "maintenance-writers", smoke ? 8 : 64),
 					integer(values, "first-last-readers", smoke ? 1 : 2),
 					integer(values, "cancellation-workers", smoke ? 1 : 2),
+					integer(values, "analytical-readers", smoke ? 3 : 4),
+					integer(values, "control-workers", smoke ? 1 : 2),
+					integer(values, "cdc-workers", smoke ? 1 : 2),
+					integer(values, "physical-workers", 1),
 					longValue(values, "foreground-write-rate", smoke ? 100 : 1_000),
 					longValue(values, "maintenance-write-rate", 0),
 					longValue(values, "first-last-rate", smoke ? 10 : 50),
 					longValue(values, "cancellation-rate", smoke ? 64 : 100),
+					longValue(values, "analytical-rate", 0),
+					longValue(values, "control-rate", smoke ? 10 : 50),
+					longValue(values, "cdc-rate", smoke ? 10 : 100),
+					longValue(values, "physical-rate", 1),
 					integer(values, "cancellation-delay-ms", 1),
 					integer(values, "cancellation-burst", WRITE_REQUEST_VARIANTS),
+					integer(values, "integrity-requests", smoke ? 64 : 1_024),
 					integer(values, "point-request-count", smoke ? 1_024 : 8_192),
 					integer(values, "range-request-count", smoke ? 1_024 : 8_192),
 					integer(values, "range-width", smoke ? 64 : 1_024),
-					integer(values, "read-parallelism", 20),
-					integer(values, "write-parallelism", 36),
+					integer(values, "read-parallelism", smoke ? 4 : 20),
+					integer(values, "write-parallelism", smoke ? 8 : 36),
 					integer(values, "foreground-queue-capacity", 4_096),
 					integer(values, "maintenance-queue-capacity", 512),
 					integer(values, "admission-sample-micros", 250),
+					values.getOrDefault("instrumentation-mode", "strict"),
 					integer(values, "max-latency-samples", smoke ? 100_000 : 1_000_000),
 					values.getOrDefault("write-buffer-size", "64MiB"),
 					bool(values, "direct-io", false),
@@ -1833,18 +3789,42 @@ public final class GrpcOverloadBenchmark {
 			if (databaseName.isBlank()) {
 				throw new IllegalArgumentException("database-name must not be blank");
 			}
+			if (!buildId.matches("[A-Za-z0-9._-]+")) {
+				throw new IllegalArgumentException("build-id must use only letters, digits, dot, underscore, or dash");
+			}
+			if (!List.of("clean", "dirty", "unknown").contains(buildState)) {
+				throw new IllegalArgumentException("build-state must be clean, dirty, or unknown");
+			}
+			if (!List.of("hdd-zfs", "hdd-btrfs", "nvme", "ci-structural").contains(storageLabel)) {
+				throw new IllegalArgumentException(
+						"storage-label must be hdd-zfs, hdd-btrfs, nvme, or ci-structural");
+			}
+			if (!List.of("cold", "warm", "unknown").contains(cacheState)) {
+				throw new IllegalArgumentException("cache-state must be cold, warm, or unknown");
+			}
+			if (!List.of("dedicated", "shared", "unknown").contains(hostState)) {
+				throw new IllegalArgumentException("host-state must be dedicated, shared, or unknown");
+			}
+			if (minimumHostAvailableGiB < 0 || minimumHostAvailableGiB > 1_024) {
+				throw new IllegalArgumentException("minimum-host-available-gib must be between 0 and 1024");
+			}
+			if (cacheState.equals("cold") && !reusePreloaded) {
+				throw new IllegalArgumentException("cache-state=cold requires reuse-preloaded=true");
+			}
 			if (preloadKeys < 2 || preloadFlushKeys < 1 || valueBytes < 1) {
 				throw new IllegalArgumentException("preload and value sizes must be positive");
 			}
-			if (warmupSeconds < 0 || measureSeconds < 1) {
-				throw new IllegalArgumentException("warmup must be non-negative and measurement must be positive");
+			if (warmupSeconds < 0 || measureSeconds < 1 || rounds < 1) {
+				throw new IllegalArgumentException("warmup must be non-negative and measurement/rounds must be positive");
 			}
 			if (pointReaders < 1 || foregroundWriters < 1 || maintenanceWriters < 1
-					|| firstLastReaders < 1 || cancellationWorkers < 0) {
-				throw new IllegalArgumentException("foreground/read/maintenance workers must be positive");
+					|| firstLastReaders < 1 || cancellationWorkers < 0 || analyticalReaders < 1
+					|| controlWorkers < 1 || cdcWorkers < 1 || physicalWorkers < 1) {
+				throw new IllegalArgumentException("all mixed-workload worker counts must be positive");
 			}
 			if (foregroundWriteRate < 0 || maintenanceWriteRate < 0 || firstLastRate < 0
-					|| cancellationRate < 0) {
+					|| cancellationRate < 0 || analyticalRate < 0 || controlRate < 0
+					|| cdcRate < 0 || physicalRate < 0) {
 				throw new IllegalArgumentException("rates must be non-negative; zero means unbounded");
 			}
 			if (cancellationWorkers > 0 && cancellationRate == 0) {
@@ -1856,6 +3836,9 @@ public final class GrpcOverloadBenchmark {
 			if (cancellationBurst < 1 || cancellationBurst > WRITE_REQUEST_VARIANTS) {
 				throw new IllegalArgumentException("cancellation-burst must be between 1 and "
 						+ WRITE_REQUEST_VARIANTS);
+			}
+			if (integrityRequests < 1) {
+				throw new IllegalArgumentException("integrity-requests must be positive");
 			}
 			if ((long) measureSeconds * cancellationRate < (long) cancellationWorkers * cancellationBurst) {
 				throw new IllegalArgumentException("measurement window must contain at least one cancellation burst");
@@ -1872,6 +3855,37 @@ public final class GrpcOverloadBenchmark {
 			if (admissionSampleMicros < 1 || maxLatencySamples < 1) {
 				throw new IllegalArgumentException("sampling settings must be positive");
 			}
+			if (!List.of("strict", "portable").contains(instrumentationMode)) {
+				throw new IllegalArgumentException("instrumentation-mode must be strict or portable");
+			}
+			if (enforce) {
+				if (smoke || !instrumentationMode.equals("strict")
+						|| !isFullGitSha(buildId) || !buildState.equals("clean")
+						|| !hostState.equals("dedicated")
+						|| storageLabel.equals("ci-structural")
+						|| minimumHostAvailableGiB < MIN_RELEASE_HOST_AVAILABLE_GIB) {
+					throw new IllegalArgumentException("enforced release runs require smoke=false, strict instrumentation, "
+							+ "a full lowercase Git SHA, "
+							+ "build-state=clean, host-state=dedicated, a hardware storage label, and at least "
+							+ MIN_RELEASE_HOST_AVAILABLE_GIB + " GiB host MemAvailable");
+				}
+				if (preloadKeys < 1_000_000 || valueBytes < 256 || warmupSeconds < 15 || measureSeconds < 60
+						|| rounds < 5 || pointReaders < readParallelism || maintenanceWriters < writeParallelism
+						|| analyticalReaders < 1 || cancellationWorkers < 2 || integrityRequests < 1_024
+						|| rangeWidth < 1_024 || foregroundQueueCapacity < 4_096
+						|| maintenanceQueueCapacity < 512) {
+					throw new IllegalArgumentException("enforced release runs require the full five-round dataset, "
+							+ "duration, saturation, cancellation, integrity, range, and queue profile");
+				}
+				if (!prepareOnly && (!reusePreloaded || !cacheState.equals("cold"))) {
+					throw new IllegalArgumentException(
+							"enforced measurement requires a reused prepared dataset and cache-state=cold");
+				}
+			}
+		}
+
+		private static boolean isFullGitSha(String value) {
+			return value.matches("[0-9a-f]{40}");
 		}
 
 		private static int integer(Map<String, String> values, String name, int defaultValue) {

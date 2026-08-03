@@ -45,20 +45,39 @@ default, and startup invariant.
 
 ## gRPC overload regression benchmark
 
-`GrpcOverloadBenchmark` is a legacy two-profile, opt-in disk runner separate
-from ordinary CI and the embedded `FastGetBenchmark`. Its foreground and
-maintenance labels now map to `INGEST` and `BATCH`; it is retained as a focused
-gRPC latency/cancellation/drain regression, not as the release workload tuner.
-Each run emits `results.json` and `results.md` and gates foreground deadlines
-and p99 ratio, cancellation, drain, native-handle, error, rejection, and
-shutdown checks. Pressured-BATCH acceptance and release candidate selection
-belong exclusively to `SevenProfileWorkloadBenchmark` and its selector.
+`GrpcOverloadBenchmark` is the opt-in, disk-backed whole-path complement to the
+embedded `SevenProfileWorkloadBenchmark`. It sends real loopback gRPC traffic for
+all seven profiles during a harsh mixed phase. Every measured RPC is counted at
+client-call start and exactly one terminal close; an independent integrity phase
+writes unique INGEST/BATCH values and reads every acknowledged value back through
+LATENCY. Scheduler snapshots prove all four pools drain with balanced
+started/completed counters and no worker failures, while sampled sleeping-worker
+state detects eligible queued work that leaves capacity idle for more than a short
+wake-up streak. The result also gates foreground p99/throughput regression,
+priority ordering, the eight-millisecond cooperative queue bound, cancellation,
+profile progress, resources, native handles, errors, rejections, and shutdown.
 
-Use the prepare/reopen workflow for a real cold page cache. The exact reference
-command, options, acceptance rules, and current local baseline are documented in
-[`benchmarks/grpc-overload-2026-07-23.md`](benchmarks/grpc-overload-2026-07-23.md).
+This gRPC runner does not replace the release tuner: pressured-BATCH acceptance,
+candidate selection, and controlled hardware comparisons still belong to
+`SevenProfileWorkloadBenchmark` and its selector. A smoke run proves structure and
+correctness only; it is not hardware acceptance.
+
+Use the prepare/reopen workflow for a real cold page cache. The current command,
+options, and acceptance rules are documented in
+[`docs/grpc-mixed-workload-benchmark.md`](docs/grpc-mixed-workload-benchmark.md).
+The dated
+[`benchmarks/grpc-overload-2026-07-23.md`](benchmarks/grpc-overload-2026-07-23.md)
+is historical two-profile evidence and is not comparable to the current schema.
 The release hardware workflow and deterministic 5% throughput/10% p99 selector
 are documented in [`docs/workload-tuning.md`](docs/workload-tuning.md).
+
+`GrpcRawScanBenchmark` is the paired whole-gRPC raw-SST gate. It creates one
+explicitly flushed dataset, runs the untouched and candidate production classpaths
+in alternating order, validates every streamed key/value and gRPC terminal, proves
+READ-pool saturation and bounded avoidable idle time, and evaluates paired 95%
+confidence intervals for raw throughput, scheduler queue p99, and complete-scan p99.
+The exact one-shot command and acceptance boundary are documented in
+[`docs/grpc-raw-scan-benchmark.md`](docs/grpc-raw-scan-benchmark.md).
 
 ## Fast unary GET
 
