@@ -269,6 +269,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			64L * SizeUnit.GB));
 	private static final int EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL = 4_096;
 	private static final long EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
+	private static final int EXISTS_MULTI_MAX_VARIABLE_HASH_BYTES = Arrays.stream(ColumnHashType.values())
+			.mapToInt(ColumnHashType::bytesSize)
+			.max()
+			.orElse(0);
 	private static final int WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL = 4_096;
 	private static final long WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
 	private static final int RAW_SCAN_MAX_ENTRIES_PER_CHUNK = 65_536;
@@ -365,6 +369,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private volatile @Nullable Runnable forcedShutdownObserver;
 	private volatile @Nullable Runnable existsMultiChunkObserver;
 	private volatile @Nullable Runnable existsMultiSnapshotObserver;
+	private volatile @Nullable Consumer<Boolean> existsMultiArenaObserver;
 	private volatile @Nullable BiConsumer<Integer, Long> writeElisionMultiGetObserver;
 	private volatile @Nullable Runnable cdcPollTailCapturedObserver;
 	private volatile @Nullable Runnable cdcWalIteratorOpenObserver;
@@ -955,11 +960,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					|| retainedQueryLimiter.activeCount() > 0
 					|| retainedQueryLimiter.waitingCount() > 0
 					|| retainedRangeSnapshots.get() > 0
+					|| !activeExistsMultiRequests.isEmpty()
 					|| !activeCdcPollCursors.isEmpty())) {
 				throw new IllegalStateException("Shutdown left resources open: leases=" + resourceLeases.get()
 						+ ", retainedPermits=" + retainedQueryLimiter.activeCount()
 						+ ", retainedWaiters=" + retainedQueryLimiter.waitingCount()
 						+ ", retainedSnapshots=" + retainedRangeSnapshots.get()
+						+ ", existsMultiRequests=" + activeExistsMultiRequests.size()
 						+ ", cdcCursors=" + activeCdcPollCursors.size());
 			}
 		} catch (TimeoutException e) {
@@ -986,12 +993,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					|| retainedQueryLimiter.activeCount() > 0
 					|| retainedQueryLimiter.waitingCount() > 0
 					|| retainedRangeSnapshots.get() > 0
+					|| !activeExistsMultiRequests.isEmpty()
 					|| !activeCdcPollCursors.isEmpty())) {
 				throw new IllegalStateException("Some active operations lasted more than " + pendingOpsTimeoutMs
 						+ " ms! activeOps=" + ops.getPendingOpsCount() + ", resourceLeases="
 						+ resourceLeases.get() + ", retainedPermits=" + retainedQueryLimiter.activeCount()
 						+ ", retainedWaiters=" + retainedQueryLimiter.waitingCount()
 						+ ", retainedSnapshots=" + retainedRangeSnapshots.get()
+						+ ", existsMultiRequests=" + activeExistsMultiRequests.size()
 						+ ", cdcCursors=" + activeCdcPollCursors.size()
 						+ ", openTxs=" + txs.size() + ", openIterators=" + its.size());
 			}
@@ -1197,13 +1206,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private void closeActiveRangeResources() {
 		var ranges = new ArrayList<>(activeRangeResources);
 		if (!ranges.isEmpty()) {
-			logger.info("Closing {} active range cursors", ranges.size());
+			logger.info("Closing {} active range resources", ranges.size());
 		}
 		for (var range : ranges) {
 			try {
 				range.close();
 			} catch (Throwable error) {
-				logger.error("Error closing active range cursor", error);
+				logger.error("Error closing active range resource", error);
 			}
 		}
 	}
@@ -1838,6 +1847,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setExistsMultiSnapshotObserverForTesting(@Nullable Runnable observer) {
 		this.existsMultiSnapshotObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setExistsMultiArenaObserverForTesting(@Nullable Consumer<Boolean> observer) {
+		this.existsMultiArenaObserver = observer;
 	}
 
 	@VisibleForTesting
@@ -4667,12 +4681,50 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				requestStartNanos,
 				deadlineMicros,
 				workloadProfile,
-				executor);
+				executor,
+				isCooperativeRetainedProfile(workloadProfile)
+						&& !isExistsMultiProvablySingleChunk(requestKeys)
+						&& executor instanceof RWScheduler.WorkloadExecutor workloadExecutor
+						? workloadExecutor
+						: null);
 		request.scheduleInitial();
 		return request;
 	}
 
-	private final class AsyncExistsMultiRequest extends CompletableFuture<List<Boolean>> implements Runnable {
+	/**
+	 * A column-independent upper bound is enough to preserve the ordinary fast path:
+	 * fixed key parts retain their input length and variable-key hashes have a known
+	 * bounded output. A request below both native limits therefore cannot split.
+	 */
+	private static boolean isExistsMultiProvablySingleChunk(List<Keys> keys) {
+		if (keys.size() > EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL) {
+			return false;
+		}
+		long maximumCalculatedBytes = 0L;
+		for (var logicalKeys : keys) {
+			for (var key : logicalKeys.keys()) {
+				if (key == null) {
+					return false;
+				}
+				maximumCalculatedBytes = saturatingAdd(maximumCalculatedBytes,
+						Math.max(EXISTS_MULTI_MAX_VARIABLE_HASH_BYTES, key.size()));
+				if (maximumCalculatedBytes > EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	private static boolean isCooperativeRetainedProfile(WorkloadProfile profile) {
+		return switch (profile) {
+			case ANALYTICAL, INGEST, BATCH -> true;
+			case LATENCY, CONTROL, CDC, PHYSICAL_MAINTENANCE -> false;
+		};
+	}
+
+	private final class AsyncExistsMultiRequest extends CompletableFuture<List<Boolean>>
+			implements Runnable, RWScheduler.CooperativeTask {
 
 		private static final int INITIAL_QUEUED = 0;
 		private static final int CHUNK_RUNNING = 1;
@@ -4687,10 +4739,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final long deadlineMicros;
 		private final WorkloadProfile workloadProfile;
 		private final Executor executor;
+		private final @Nullable RWScheduler.WorkloadExecutor cooperativeExecutor;
 		private final Object lifecycleLock = new Object();
 		private final AtomicBoolean cancelRequested = new AtomicBoolean();
+		private final AtomicBoolean terminalCleaned = new AtomicBoolean();
 		private int state = INITIAL_QUEUED;
 		private @Nullable ExistsMultiCursor cursor;
+		private volatile @Nullable RWScheduler.CooperativeHandle cooperativeHandle;
 		private boolean operationStarted;
 
 		private AsyncExistsMultiRequest(long transactionId,
@@ -4700,7 +4755,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				long requestStartNanos,
 				long deadlineMicros,
 				WorkloadProfile workloadProfile,
-				Executor executor) {
+				Executor executor,
+				@Nullable RWScheduler.WorkloadExecutor cooperativeExecutor) {
 			this.transactionId = transactionId;
 			this.columnId = columnId;
 			this.keys = keys;
@@ -4709,6 +4765,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.deadlineMicros = deadlineMicros;
 			this.workloadProfile = Objects.requireNonNull(workloadProfile, "workloadProfile");
 			this.executor = Objects.requireNonNull(executor, "executor");
+			this.cooperativeExecutor = cooperativeExecutor;
 		}
 
 		private void scheduleInitial() {
@@ -4724,7 +4781,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						ops.beginOp();
 						operationStarted = true;
 						activeExistsMultiRequests.add(this);
-						executor.execute(this);
+						if (cooperativeExecutor == null) {
+							executor.execute(this);
+						} else {
+							cooperativeHandle = cooperativeExecutor.executeCooperatively(this,
+									EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL);
+						}
 					} catch (Throwable error) {
 						state = FINISHED;
 						activeExistsMultiRequests.remove(this);
@@ -4739,6 +4801,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public boolean cancel(boolean mayInterruptIfRunning) {
+			if (cooperativeExecutor != null) {
+				final boolean beforeFirstRun;
+				final RWScheduler.CooperativeHandle handle;
+				synchronized (lifecycleLock) {
+					if (state == FINISHED) {
+						return false;
+					}
+					beforeFirstRun = state == INITIAL_QUEUED;
+					cancelRequested.set(true);
+					handle = cooperativeHandle;
+				}
+				if (handle != null) {
+					handle.dispose();
+				}
+				return beforeFirstRun;
+			}
 			boolean cleanupQueuedRequest = false;
 			boolean initialQueuedCancellation = false;
 			synchronized (lifecycleLock) {
@@ -4770,6 +4848,61 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// Once a native chunk has run, keep the original future observable until
 			// cleanup finishes rather than reporting that cancellation won immediately.
 			return initialQueuedCancellation;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			final boolean initialize;
+			synchronized (lifecycleLock) {
+				if (state == INITIAL_QUEUED) {
+					state = CHUNK_RUNNING;
+					initialize = true;
+				} else if (state == CHUNK_QUEUED) {
+					state = CHUNK_RUNNING;
+					initialize = false;
+				} else {
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+			}
+			if (context.terminationRequested() || cancelRequested.get()) {
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+			if (initialize) {
+				try {
+					initialize();
+				} catch (Throwable error) {
+					finishRunning(null, mapExistsMultiFailure(error));
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+			}
+
+			try {
+				var activeCursor = Objects.requireNonNull(cursor);
+				while (true) {
+					if (context.terminationRequested() || cancelRequested.get()) {
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					boolean exhausted = activeCursor.readChunk();
+					if (context.terminationRequested() || cancelRequested.get()) {
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					if (exhausted) {
+						finishRunning(activeCursor.result(), null);
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					if (context.preemptionRequested()) {
+						synchronized (lifecycleLock) {
+							if (state == CHUNK_RUNNING) {
+								state = CHUNK_QUEUED;
+							}
+						}
+						return RWScheduler.CooperativeResult.YIELD;
+					}
+				}
+			} catch (Throwable error) {
+				finishRunning(null, mapExistsMultiFailure(error));
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
 		}
 
 		@Override
@@ -4805,10 +4938,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			try {
 				var activeCursor = Objects.requireNonNull(cursor);
-				if (activeCursor.readChunk()) {
-					finishRunning(activeCursor.result(), null);
-				} else if (cancelRequested.get()) {
+				boolean exhausted = activeCursor.readChunk();
+				if (cancelRequested.get()) {
 					finishRunning(null, new java.util.concurrent.CancellationException());
+				} else if (exhausted) {
+					finishRunning(activeCursor.result(), null);
 				} else {
 					scheduleNext();
 				}
@@ -4881,6 +5015,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		private void completeTerminal(@Nullable List<Boolean> result, @Nullable Throwable failure) {
+			if (!terminalCleaned.compareAndSet(false, true)) {
+				return;
+			}
 			var terminalFailure = failure;
 			if (cursor != null) {
 				try {
@@ -4913,6 +5050,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private void removeQueuedTask() {
 			scheduler.removeQueuedTask(executor, this);
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			synchronized (lifecycleLock) {
+				if (state == FINISHED) {
+					return;
+				}
+				state = FINISHED;
+			}
+			completeTerminal(null, failure);
 		}
 	}
 
@@ -5105,7 +5253,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private List<Boolean> existsMultiStatusOnly(ColumnInstance col,
 			ReadOptions readOptions,
 			List<Buf> calculatedKeys) throws org.rocksdb.RocksDBException {
-		try (var arena = Arena.ofConfined()) {
+		var arena = Arena.ofConfined();
+		var arenaObserver = existsMultiArenaObserver;
+		try {
+			if (arenaObserver != null) {
+				arenaObserver.accept(true);
+			}
 			var nativeKeys = new MemorySegment[calculatedKeys.size()];
 			var emptyValues = new MemorySegment[calculatedKeys.size()];
 			for (int i = 0; i < calculatedKeys.size(); i++) {
@@ -5123,6 +5276,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				});
 			}
 			return result;
+		} finally {
+			try {
+				arena.close();
+			} finally {
+				if (arenaObserver != null) {
+					arenaObserver.accept(false);
+				}
+			}
 		}
 	}
 
@@ -5974,20 +6135,57 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				timeoutMs,
 				requestType
 		); // todo: log if reversed or not
+		if (!isCooperativeRetainedProfile(workloadProfile)) {
+			return Flux.usingWhen(
+					openOrdinaryRetainedRangeCursorAsync(transactionId,
+							columnId,
+							startKeysInclusive,
+							endKeysExclusive,
+							reverse,
+							deadline.micros(),
+							fillCache,
+							false,
+							totalTime,
+							workloadExecutor),
+					cursor -> Flux.defer(() -> scheduleOrdinaryRangeStep(workloadExecutor,
+								() -> cursor.readChunk(totalTime)))
+							.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
+							.doOnNext(chunk -> {
+								var chunkObserver = rangeReadChunkSizeObserver;
+								if (chunkObserver != null) {
+									chunkObserver.accept(chunk.items().size());
+								}
+								if (!chunk.exhausted()) {
+									notifyRangeContinuation();
+								}
+							})
+							.repeat()
+							.takeUntil(RangeReadChunk::exhausted)
+							.concatMap(chunk -> Flux.fromIterable(EmbeddedDB.<T>castRangeItems(chunk.items())), 0)
+							.takeUntilOther(retainedRangeDeadlineSignal(deadline)),
+					cursor -> closeRangeCursor(cursor, totalTime, getRangeTimer),
+					(cursor, _) -> closeRangeCursor(cursor, totalTime, getRangeTimer),
+					cursor -> closeRangeCursor(cursor, totalTime, getRangeTimer));
+		}
 
-		return Flux.usingWhen(
-				openRetainedRangeCursorAsync(transactionId,
-						columnId,
-						startKeysInclusive,
-						endKeysExclusive,
-						reverse,
-						deadline.micros(),
-						fillCache,
-						false,
-						totalTime,
-						workloadExecutor),
-				cursor -> Flux.defer(() -> scheduleRangeStep(workloadExecutor,
-							() -> cursor.readChunk(totalTime)))
+		return retainedQueryLimiter.acquire(deadline.micros())
+				.flatMapMany(permit -> Flux.<RangeReadChunk>create(sink -> {
+					var state = new RetainedRangeReadTask(transactionId,
+							columnId,
+							startKeysInclusive,
+							endKeysExclusive,
+							reverse,
+							deadline.micros(),
+							fillCache,
+							totalTime,
+							workloadExecutor,
+							permit,
+							sink);
+					sink.onRequest(state);
+					sink.onCancel(state::cancelDelivery);
+					sink.onDispose(state::cancelDelivery);
+					state.start();
+				}, FluxSink.OverflowStrategy.ERROR)
 						.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
 						.doOnNext(chunk -> {
 							var chunkObserver = rangeReadChunkSizeObserver;
@@ -5998,14 +6196,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								notifyRangeContinuation();
 							}
 						})
-						.repeat()
-						.takeUntil(RangeReadChunk::exhausted)
-						// Request the next native quantum only after this decoded page is drained.
+						// A single decoded chunk is in flight. Its items drain before publishOn
+						// requests another chunk and resumes the same parked scheduler node.
 						.concatMap(chunk -> Flux.fromIterable(EmbeddedDB.<T>castRangeItems(chunk.items())), 0)
-						.takeUntilOther(retainedRangeDeadlineSignal(deadline)),
-				cursor -> closeRangeCursor(cursor, totalTime, getRangeTimer),
-				(cursor, _) -> closeRangeCursor(cursor, totalTime, getRangeTimer),
-				cursor -> closeRangeCursor(cursor, totalTime, getRangeTimer));
+						.takeUntilOther(retainedRangeDeadlineSignal(deadline)));
 	}
 
 	@SuppressWarnings("unchecked")
@@ -6054,50 +6248,64 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				timeoutMs,
 				RequestType.entriesCount()
 		); // todo: log if reversed or not
+		if (!isCooperativeRetainedProfile(workloadProfile)) {
+			return Flux.usingWhen(
+					openOrdinaryRetainedRangeCursorAsync(transactionId,
+							columnId,
+							startKeysInclusive,
+							endKeysExclusive,
+							reverse,
+							deadline.micros(),
+							false,
+							true,
+							totalTime,
+							workloadExecutor),
+					cursor -> Flux.defer(() -> scheduleOrdinaryRangeStep(workloadExecutor, () -> {
+						var chunk = cursor.countChunk(totalTime);
+						var chunkObserver = rangeCountChunkObserver;
+						if (chunkObserver != null) {
+							chunkObserver.run();
+						}
+						return chunk;
+					}))
+							.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
+							.doOnNext(chunk -> {
+								var sizeObserver = rangeCountQuantumItemsObserver;
+								if (sizeObserver != null) {
+									sizeObserver.accept(chunk.count());
+								}
+								if (!chunk.exhausted()) {
+									notifyRangeContinuation();
+								}
+							})
+							.repeat()
+							.takeUntil(RangeCountChunk::exhausted)
+							.takeUntilOther(retainedRangeDeadlineSignal(deadline)),
+					cursor -> closeRangeCursor(cursor, totalTime, reduceRangeTimer),
+					(cursor, _) -> closeRangeCursor(cursor, totalTime, reduceRangeTimer),
+					cursor -> closeRangeCursor(cursor, totalTime, reduceRangeTimer))
+					.reduce(0L, (total, chunk) -> total + chunk.count());
+		}
 
-		return Flux.usingWhen(
-				openRetainedRangeCursorAsync(transactionId,
-						columnId,
-						startKeysInclusive,
-						endKeysExclusive,
-						reverse,
-						deadline.micros(),
-						false,
-						true,
-						totalTime,
-						workloadExecutor),
-				cursor -> Flux.defer(() -> scheduleRangeStep(workloadExecutor, () -> {
-					var chunk = cursor.countChunk(totalTime);
-					var chunkObserver = rangeCountChunkObserver;
-					if (chunkObserver != null) {
-						chunkObserver.run();
-					}
-					return chunk;
-				}))
-						.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
-						.doOnNext(chunk -> {
-							var sizeObserver = rangeCountQuantumItemsObserver;
-							if (sizeObserver != null) {
-								sizeObserver.accept(chunk.count());
-							}
-							if (!chunk.exhausted()) {
-								notifyRangeContinuation();
-							}
-						})
-						.repeat()
-						.takeUntil(RangeCountChunk::exhausted)
-						.takeUntilOther(retainedRangeDeadlineSignal(deadline)),
-				cursor -> closeRangeCursor(cursor, totalTime, reduceRangeTimer),
-				(cursor, _) -> closeRangeCursor(cursor, totalTime, reduceRangeTimer),
-				cursor -> closeRangeCursor(cursor, totalTime, reduceRangeTimer))
-				.reduce(0L, (total, chunk) -> total + chunk.count());
+		return retainedQueryLimiter.acquire(deadline.micros())
+				.flatMap(permit -> Mono.create(sink -> {
+					var state = new RetainedRangeCountTask(transactionId,
+							columnId,
+							startKeysInclusive,
+							endKeysExclusive,
+							reverse,
+							deadline.micros(),
+							totalTime,
+							workloadExecutor,
+							permit,
+							sink);
+					sink.onCancel(state::cancelDelivery);
+					sink.onDispose(state::cancelDelivery);
+					state.start();
+				}));
 	}
 
-	/**
-	 * Signal the immutable logical-read deadline independently of downstream
-	 * demand. The cursor sweep remains a native-resource safety net, while this
-	 * signal guarantees that a stalled subscriber observes the terminal error.
-	 */
+	/** Keep the immutable logical-read deadline active while decoded items await demand. */
 	private Mono<Void> retainedRangeDeadlineSignal(ReadDeadline deadline) {
 		return Mono.defer(() -> {
 			long delayMillis = Math.max(0L, deadline.epochMillis() - System.currentTimeMillis());
@@ -6106,7 +6314,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		});
 	}
 
-	private Mono<RangeCursor> openRetainedRangeCursorAsync(long transactionId,
+	private void notifyRangeContinuation() {
+		var observer = rangeContinuationObserver;
+		if (observer != null) {
+			observer.run();
+		}
+	}
+
+	/** Preserve bounded ordinary submissions for profiles that cannot execute cooperatively. */
+	private Mono<RangeCursor> openOrdinaryRetainedRangeCursorAsync(long transactionId,
 			long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
@@ -6117,7 +6333,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			LongAdder totalTime,
 			RWScheduler.WorkloadExecutor workloadExecutor) {
 		return retainedQueryLimiter.acquire(deadlineMicros)
-				.flatMap(permit -> scheduleRangeStep(workloadExecutor,
+				.flatMap(permit -> scheduleOrdinaryRangeStep(workloadExecutor,
 						() -> permit.open(() -> openRangeCursor(transactionId,
 								columnId,
 								startKeysInclusive,
@@ -6129,17 +6345,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								totalTime,
 								null,
 								false,
-								permit)),
+								permit,
+								true)),
 						RangeCursor::close)
 						.doOnError(_ -> permit.close())
 						.doOnCancel(permit::close));
-	}
-
-	private void notifyRangeContinuation() {
-		var observer = rangeContinuationObserver;
-		if (observer != null) {
-			observer.run();
-		}
 	}
 
 	private Mono<Void> closeRangeCursor(RangeCursor cursor, LongAdder totalTime, Timer timer) {
@@ -6154,139 +6364,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		});
 	}
 
-	private RangeCursor openRangeCursor(long transactionId,
-			long columnId,
-			@Nullable Keys startKeysInclusive,
-			@Nullable Keys endKeysExclusive,
-			boolean reverse,
-			long deadlineMicros,
-			boolean fillCache,
-			boolean retainSnapshot,
-			LongAdder totalTime) {
-		return openRangeCursor(transactionId,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				reverse,
-				deadlineMicros,
-				fillCache,
-				retainSnapshot,
-				totalTime,
-				null,
-				false,
-				null);
+	private <T> Mono<T> scheduleOrdinaryRangeStep(RWScheduler.WorkloadExecutor target,
+			Callable<T> callable) {
+		return scheduleOrdinaryRangeStep(target, callable, null);
 	}
 
-	private RangeCursor openRangeCursor(long transactionId,
-			long columnId,
-			@Nullable Keys startKeysInclusive,
-			@Nullable Keys endKeysExclusive,
-			boolean reverse,
-			long deadlineMicros,
-			boolean fillCache,
-			boolean retainSnapshot,
-			LongAdder totalTime,
-			@Nullable Keys resumeAfter,
-			boolean deterministicBucketOrder) {
-		return openRangeCursor(transactionId,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				reverse,
-				deadlineMicros,
-				fillCache,
-				retainSnapshot,
-				totalTime,
-				resumeAfter,
-				deterministicBucketOrder,
-				null);
-	}
-
-	private RangeCursor openRangeCursor(long transactionId,
-			long columnId,
-			@Nullable Keys startKeysInclusive,
-			@Nullable Keys endKeysExclusive,
-			boolean reverse,
-			long deadlineMicros,
-			boolean fillCache,
-			boolean retainSnapshot,
-			LongAdder totalTime,
-			@Nullable Keys resumeAfter,
-			boolean deterministicBucketOrder,
-			@Nullable RetainedQueryPermit retainedPermit) {
-		ops.beginOp();
-		var initializationStart = System.nanoTime();
-		ColumnInstance.ColumnUse columnUse = null;
-		try {
-			columnUse = acquireColumnUse(columnId);
-			var col = columnUse.column();
-			Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0
-					? col.calculateKey(startKeysInclusive.keys())
-					: null;
-			Buf calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0
-					? col.calculateKey(endKeysExclusive.keys())
-					: null;
-			Buf calculatedResumeKey = resumeAfter != null
-					? col.calculateKey(resumeAfter.keys())
-					: null;
-			validateResumeBounds(calculatedStartKey, calculatedEndKey, calculatedResumeKey);
-			var cursor = new RangeCursor(transactionId,
-					columnUse,
-					calculatedStartKey,
-					calculatedEndKey,
-					reverse,
-					deadlineMicros,
-					fillCache,
-					retainSnapshot,
-					calculatedResumeKey,
-					resumeAfter,
-					deterministicBucketOrder,
-					retainedPermit);
-			try {
-				activeRangeResources.add(cursor);
-				return cursor;
-			} catch (Throwable error) {
-				cursor.close();
-				throw error;
-			}
-		} catch (Throwable error) {
-			if (columnUse != null) {
-				columnUse.close();
-			}
-			throw error;
-		} finally {
-			totalTime.add(System.nanoTime() - initializationStart);
-			ops.endOp();
-		}
-	}
-
-	private static void validateResumeBounds(@Nullable Buf startKey,
-			@Nullable Buf endKey,
-			@Nullable Buf resumeKey) {
-		if (resumeKey == null) {
-			return;
-		}
-		var resumeBytes = resumeKey.toByteArray();
-		if (startKey != null && Arrays.compareUnsigned(resumeBytes, startKey.toByteArray()) < 0) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"resumeAfter is before the original inclusive range bound");
-		}
-		if (endKey != null && Arrays.compareUnsigned(resumeBytes, endKey.toByteArray()) >= 0) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"resumeAfter is at or after the original exclusive range bound");
-		}
-	}
-
-	private <T> Mono<T> scheduleRangeStep(RWScheduler.WorkloadExecutor target, Callable<T> callable) {
-		return scheduleRangeStep(target, callable, null);
-	}
-
-	/** Submit one range quantum and retain cleanup ownership if cancellation races JNI completion. */
-	private <T> Mono<T> scheduleRangeStep(RWScheduler.WorkloadExecutor target,
+	private <T> Mono<T> scheduleOrdinaryRangeStep(RWScheduler.WorkloadExecutor target,
 			Callable<T> callable,
 			@Nullable Consumer<? super T> lateSuccessCleanup) {
 		return Mono.create(sink -> {
-			var task = new RetainedRangeTask<>(target, callable, lateSuccessCleanup, sink);
+			var task = new OrdinaryRetainedRangeTask<>(target, callable, lateSuccessCleanup, sink);
 			sink.onCancel(task::cancelDelivery);
 			try {
 				target.execute(task);
@@ -6298,7 +6385,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		});
 	}
 
-	private final class RetainedRangeTask<T> extends CompletableFuture<T>
+	private final class OrdinaryRetainedRangeTask<T> extends CompletableFuture<T>
 			implements Runnable, RWScheduler.RejectionAwareTask {
 
 		private static final int QUEUED = 0;
@@ -6313,7 +6400,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final AtomicInteger state = new AtomicInteger(QUEUED);
 		private final AtomicBoolean deliveryCancelled = new AtomicBoolean();
 
-		private RetainedRangeTask(RWScheduler.WorkloadExecutor target,
+		private OrdinaryRetainedRangeTask(RWScheduler.WorkloadExecutor target,
 				Callable<T> callable,
 				@Nullable Consumer<? super T> lateSuccessCleanup,
 				reactor.core.publisher.MonoSink<T> sink) {
@@ -6375,6 +6462,586 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			completeExceptionally(failure);
 			if (!deliveryCancelled.get()) {
 				sink.error(failure);
+			}
+		}
+	}
+
+	private RangeCursor openRangeCursor(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			long deadlineMicros,
+			boolean fillCache,
+			boolean retainSnapshot,
+			LongAdder totalTime) {
+		return openRangeCursor(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				deadlineMicros,
+				fillCache,
+				retainSnapshot,
+				totalTime,
+				null,
+				false,
+				null,
+				true);
+	}
+
+	private RangeCursor openRangeCursor(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			long deadlineMicros,
+			boolean fillCache,
+			boolean retainSnapshot,
+			LongAdder totalTime,
+			@Nullable Keys resumeAfter,
+			boolean deterministicBucketOrder) {
+		return openRangeCursor(transactionId,
+				columnId,
+				startKeysInclusive,
+				endKeysExclusive,
+				reverse,
+				deadlineMicros,
+				fillCache,
+				retainSnapshot,
+				totalTime,
+				resumeAfter,
+				deterministicBucketOrder,
+				null,
+				true);
+	}
+
+	private RangeCursor openRangeCursor(long transactionId,
+			long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean reverse,
+			long deadlineMicros,
+			boolean fillCache,
+			boolean retainSnapshot,
+			LongAdder totalTime,
+			@Nullable Keys resumeAfter,
+			boolean deterministicBucketOrder,
+			@Nullable RetainedQueryPermit retainedPermit,
+			boolean registerActiveResource) {
+		ops.beginOp();
+		var initializationStart = System.nanoTime();
+		ColumnInstance.ColumnUse columnUse = null;
+		try {
+			columnUse = acquireColumnUse(columnId);
+			var col = columnUse.column();
+			Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0
+					? col.calculateKey(startKeysInclusive.keys())
+					: null;
+			Buf calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0
+					? col.calculateKey(endKeysExclusive.keys())
+					: null;
+			Buf calculatedResumeKey = resumeAfter != null
+					? col.calculateKey(resumeAfter.keys())
+					: null;
+			validateResumeBounds(calculatedStartKey, calculatedEndKey, calculatedResumeKey);
+			var cursor = new RangeCursor(transactionId,
+					columnUse,
+					calculatedStartKey,
+					calculatedEndKey,
+					reverse,
+					deadlineMicros,
+					fillCache,
+					retainSnapshot,
+					calculatedResumeKey,
+					resumeAfter,
+					deterministicBucketOrder,
+					retainedPermit);
+			try {
+				if (registerActiveResource) {
+					activeRangeResources.add(cursor);
+				}
+				return cursor;
+			} catch (Throwable error) {
+				cursor.close();
+				throw error;
+			}
+		} catch (Throwable error) {
+			if (columnUse != null) {
+				columnUse.close();
+			}
+			throw error;
+		} finally {
+			totalTime.add(System.nanoTime() - initializationStart);
+			ops.endOp();
+		}
+	}
+
+	private static void validateResumeBounds(@Nullable Buf startKey,
+			@Nullable Buf endKey,
+			@Nullable Buf resumeKey) {
+		if (resumeKey == null) {
+			return;
+		}
+		var resumeBytes = resumeKey.toByteArray();
+		if (startKey != null && Arrays.compareUnsigned(resumeBytes, startKey.toByteArray()) < 0) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"resumeAfter is before the original inclusive range bound");
+		}
+		if (endKey != null && Arrays.compareUnsigned(resumeBytes, endKey.toByteArray()) >= 0) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"resumeAfter is at or after the original exclusive range bound");
+		}
+	}
+
+	private abstract class RetainedRangeCooperativeTask
+			implements RWScheduler.CooperativeTask, ActiveRangeResource, LongConsumer, reactor.core.Disposable {
+
+		private final long transactionId;
+		private final long columnId;
+		private final @Nullable Keys startKeysInclusive;
+		private final @Nullable Keys endKeysExclusive;
+		private final boolean reverse;
+		private final long deadlineMicros;
+		private final boolean fillCache;
+		private final boolean retainSnapshot;
+		protected final LongAdder totalTime;
+		private final RWScheduler.WorkloadExecutor workloadExecutor;
+		private final RetainedQueryPermit retainedPermit;
+		private final Timer timer;
+		private final Object admissionLock = new Object();
+		private final Object resourceLock = new Object();
+		private final AtomicBoolean terminated = new AtomicBoolean();
+		private volatile boolean deliveryCancelled;
+		private volatile @Nullable RuntimeException closeFailure;
+		protected volatile @Nullable RWScheduler.CooperativeHandle handle;
+		private @Nullable RangeCursor cursor;
+
+		private RetainedRangeCooperativeTask(long transactionId,
+				long columnId,
+				@Nullable Keys startKeysInclusive,
+				@Nullable Keys endKeysExclusive,
+				boolean reverse,
+				long deadlineMicros,
+				boolean fillCache,
+				boolean retainSnapshot,
+				LongAdder totalTime,
+				RWScheduler.WorkloadExecutor workloadExecutor,
+				RetainedQueryPermit retainedPermit,
+				Timer timer) {
+			this.transactionId = transactionId;
+			this.columnId = columnId;
+			this.startKeysInclusive = startKeysInclusive;
+			this.endKeysExclusive = endKeysExclusive;
+			this.reverse = reverse;
+			this.deadlineMicros = deadlineMicros;
+			this.fillCache = fillCache;
+			this.retainSnapshot = retainSnapshot;
+			this.totalTime = totalTime;
+			this.workloadExecutor = workloadExecutor;
+			this.retainedPermit = retainedPermit;
+			this.timer = timer;
+		}
+
+		protected final void start() {
+			if (terminated.get()) {
+				return;
+			}
+			activeRangeResources.add(this);
+			synchronized (admissionLock) {
+				if (terminated.get()) {
+					activeRangeResources.remove(this);
+					return;
+				}
+				try {
+					handle = workloadExecutor.executeCooperatively(this,
+							workloadSettings.rangeQuantumMaxBytes());
+				} catch (RuntimeException admissionFailure) {
+					reject(admissionFailure);
+				}
+			}
+		}
+
+		protected final @Nullable RangeCursor cursor(RWScheduler.CooperativeContext context) {
+			// The worker can dispatch immediately after admission. Waiting for this
+			// short monitor handoff guarantees that the stable handle is installed first.
+			synchronized (admissionLock) {
+				if (terminated.get()) {
+					return null;
+				}
+			}
+			if (context.terminationRequested()) {
+				return null;
+			}
+			synchronized (resourceLock) {
+				if (cursor != null) {
+					return cursor;
+				}
+				RangeCursor created = retainedPermit.open(() -> openRangeCursor(transactionId,
+						columnId,
+						startKeysInclusive,
+						endKeysExclusive,
+						reverse,
+						deadlineMicros,
+						fillCache,
+						retainSnapshot,
+						totalTime,
+						null,
+						false,
+						null,
+						false));
+				if (terminated.get()) {
+					created.close();
+					return null;
+				}
+				cursor = created;
+				return created;
+			}
+		}
+
+		protected final boolean schedulerTerminationRequested(RWScheduler.CooperativeContext context) {
+			return context.terminationRequested();
+		}
+
+		protected final void cancelDelivery() {
+			if (terminated.get()) {
+				return;
+			}
+			deliveryCancelled = true;
+			cancelAndFinish(null, false);
+		}
+
+		@Override
+		public final void dispose() {
+			cancelDelivery();
+		}
+
+		@Override
+		public final boolean isDisposed() {
+			return terminated.get();
+		}
+
+		@Override
+		public final void close() {
+			var failure = new RejectedExecutionException("Database is shutting down");
+			closeFailure = failure;
+			cancelAndFinish(failure, !deliveryCancelled);
+		}
+
+		@Override
+		public final void expireIfDeadlinePassed(long nowMicros) {
+			if (deadlineMicros == Long.MAX_VALUE || nowMicros < deadlineMicros || terminated.get()) {
+				return;
+			}
+			var failure = retainedRangeDeadlineExceeded();
+			closeFailure = failure;
+			cancelAndFinish(failure, !deliveryCancelled);
+		}
+
+		private void cancelAndFinish(@Nullable RuntimeException failure, boolean signalTerminal) {
+			// Serialize cancellation with admission. Otherwise cancellation can observe no
+			// handle, release the permit, and then race a late cooperative submission.
+			synchronized (admissionLock) {
+				var currentHandle = handle;
+				if (currentHandle != null) {
+					currentHandle.dispose();
+				}
+				finish(failure, signalTerminal);
+			}
+		}
+
+		@Override
+		public final void reject(RuntimeException failure) {
+			var override = closeFailure;
+			finish(override != null ? override : failure, !deliveryCancelled);
+		}
+
+		protected final void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
+			if (!terminated.compareAndSet(false, true)) {
+				return;
+			}
+			Throwable failure = originalFailure;
+			RangeCursor localCursor;
+			synchronized (resourceLock) {
+				localCursor = cursor;
+				cursor = null;
+			}
+			var closeStart = System.nanoTime();
+			try {
+				if (localCursor != null) {
+					localCursor.close();
+				}
+			} catch (Throwable closeError) {
+				failure = appendFailure(failure, closeError);
+			} finally {
+				totalTime.add(System.nanoTime() - closeStart);
+				try {
+					retainedPermit.close();
+				} catch (Throwable closeError) {
+					failure = appendFailure(failure, closeError);
+				}
+				activeRangeResources.remove(this);
+				try {
+					timer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
+				} catch (Throwable timerFailure) {
+					failure = appendFailure(failure, timerFailure);
+				}
+			}
+			if (signalTerminal) {
+				signalTerminal(failure);
+			}
+		}
+
+		protected abstract void signalTerminal(@Nullable Throwable failure);
+
+		protected final boolean isTerminated() {
+			return terminated.get();
+		}
+
+		private boolean hasOpenCursor() {
+			synchronized (resourceLock) {
+				return cursor != null;
+			}
+		}
+
+		@Override
+		public abstract void accept(long requested);
+	}
+
+	private final class RetainedRangeReadTask extends RetainedRangeCooperativeTask {
+
+		private final FluxSink<RangeReadChunk> sink;
+		private final AtomicLong demand = new AtomicLong();
+
+		private RetainedRangeReadTask(long transactionId,
+				long columnId,
+				@Nullable Keys startKeysInclusive,
+				@Nullable Keys endKeysExclusive,
+				boolean reverse,
+				long deadlineMicros,
+				boolean fillCache,
+				LongAdder totalTime,
+				RWScheduler.WorkloadExecutor workloadExecutor,
+				RetainedQueryPermit retainedPermit,
+				FluxSink<RangeReadChunk> sink) {
+			super(transactionId,
+					columnId,
+					startKeysInclusive,
+					endKeysExclusive,
+					reverse,
+					deadlineMicros,
+					fillCache,
+					false,
+					totalTime,
+					workloadExecutor,
+					retainedPermit,
+					getRangeTimer);
+			this.sink = sink;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			if (isTerminated()) {
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+			if (schedulerTerminationRequested(context)) {
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+			if (demand.get() == 0L) {
+				return RWScheduler.CooperativeResult.PARK;
+			}
+			try {
+				var activeCursor = cursor(context);
+				if (activeCursor == null) {
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+				var chunk = activeCursor.readChunk(totalTime);
+				if (isTerminated() || schedulerTerminationRequested(context)) {
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+				producedOne();
+				sink.next(chunk);
+				if (chunk.exhausted()) {
+					finish(null, true);
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+				if (schedulerTerminationRequested(context)) {
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+				if (context.preemptionRequested()) {
+					return RWScheduler.CooperativeResult.YIELD;
+				}
+				return demand.get() == 0L
+						? RWScheduler.CooperativeResult.PARK
+						: RWScheduler.CooperativeResult.YIELD;
+			} catch (VirtualMachineError fatal) {
+				throw fatal;
+			} catch (Throwable failure) {
+				finish(failure, !isDisposed());
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+		}
+
+		private void producedOne() {
+			while (true) {
+				long current = demand.get();
+				if (current == Long.MAX_VALUE) {
+					return;
+				}
+				if (current <= 0L) {
+					throw new IllegalStateException("Range chunk produced without downstream demand");
+				}
+				if (demand.compareAndSet(current, current - 1L)) {
+					return;
+				}
+			}
+		}
+
+		@Override
+		public void accept(long requested) {
+			if (requested <= 0L || isTerminated()) {
+				return;
+			}
+			addDemand(demand, requested);
+			var currentHandle = handle;
+			if (currentHandle != null) {
+				currentHandle.resume();
+			}
+		}
+
+		@Override
+		protected void signalTerminal(@Nullable Throwable failure) {
+			if (failure == null) {
+				sink.complete();
+			} else {
+				sink.error(failure);
+			}
+		}
+	}
+
+	private final class RetainedRangeCountTask extends RetainedRangeCooperativeTask {
+
+		private final reactor.core.publisher.MonoSink<Long> sink;
+		private long count;
+
+		private RetainedRangeCountTask(long transactionId,
+				long columnId,
+				@Nullable Keys startKeysInclusive,
+				@Nullable Keys endKeysExclusive,
+				boolean reverse,
+				long deadlineMicros,
+				LongAdder totalTime,
+				RWScheduler.WorkloadExecutor workloadExecutor,
+				RetainedQueryPermit retainedPermit,
+				reactor.core.publisher.MonoSink<Long> sink) {
+			super(transactionId,
+					columnId,
+					startKeysInclusive,
+					endKeysExclusive,
+					reverse,
+					deadlineMicros,
+					false,
+					true,
+					totalTime,
+					workloadExecutor,
+					retainedPermit,
+					reduceRangeTimer);
+			this.sink = sink;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			if (isTerminated()) {
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+			if (schedulerTerminationRequested(context)) {
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+			try {
+				var activeCursor = cursor(context);
+				if (activeCursor == null) {
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+				while (true) {
+					var chunk = activeCursor.countChunk(totalTime);
+					count += chunk.count();
+					var chunkObserver = rangeCountChunkObserver;
+					if (chunkObserver != null) {
+						chunkObserver.run();
+					}
+					var sizeObserver = rangeCountQuantumItemsObserver;
+					if (sizeObserver != null) {
+						sizeObserver.accept(chunk.count());
+					}
+					if (isTerminated() || schedulerTerminationRequested(context)) {
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					if (chunk.exhausted()) {
+						finish(null, true);
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					if (notifyRangeContinuationAndPark()) {
+						return RWScheduler.CooperativeResult.PARK;
+					}
+					if (context.preemptionRequested()) {
+						return RWScheduler.CooperativeResult.YIELD;
+					}
+				}
+			} catch (VirtualMachineError fatal) {
+				throw fatal;
+			} catch (Throwable failure) {
+				finish(failure, !isDisposed());
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+		}
+
+		private boolean notifyRangeContinuationAndPark() {
+			var observer = rangeContinuationObserver;
+			if (observer == null) {
+				return false;
+			}
+			try {
+				reactor.core.scheduler.Schedulers.parallel().schedule(() -> {
+					try {
+						observer.run();
+					} finally {
+						var currentHandle = handle;
+						if (currentHandle != null) {
+							currentHandle.resume();
+						}
+					}
+				});
+				return true;
+			} catch (RuntimeException schedulingFailure) {
+				throw new RejectedExecutionException("Failed to notify a retained count continuation",
+						schedulingFailure);
+			}
+		}
+
+		@Override
+		public void accept(long requested) {
+			// Mono demand is terminal-result demand, not a native-count quantum budget.
+		}
+
+		@Override
+		protected void signalTerminal(@Nullable Throwable failure) {
+			if (failure == null) {
+				sink.success(count);
+			} else {
+				sink.error(failure);
+			}
+		}
+	}
+
+	private static void addDemand(AtomicLong demand, long requested) {
+		while (true) {
+			long current = demand.get();
+			long updated = current + requested;
+			if (updated < 0L) {
+				updated = Long.MAX_VALUE;
+			}
+			if (demand.compareAndSet(current, updated)) {
+				return;
 			}
 		}
 	}
@@ -8023,7 +8690,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@VisibleForTesting
 	public int getActiveRangeCursorCount() {
-		return activeRangeResources.size();
+		int cursors = 0;
+		for (var resource : activeRangeResources) {
+			if (resource instanceof RangeCursor
+					|| resource instanceof RetainedRangeCooperativeTask task && task.hasOpenCursor()) {
+				cursors++;
+			}
+		}
+		return cursors;
 	}
 
 	@VisibleForTesting
@@ -8044,6 +8718,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public int getActiveCdcPollCursorCount() {
 		return activeCdcPollCursors.size();
+	}
+
+	@VisibleForTesting
+	public int getActiveExistsMultiRequestCount() {
+		return activeExistsMultiRequests.size();
 	}
 
 	@VisibleForTesting
