@@ -556,9 +556,19 @@ public final class RWScheduler {
 		/**
 		 * Atomically request scheduler cancellation.
 		 *
-		 * @return {@code true} only when cancellation became the scheduler's terminal cause
+		 * <p>The scheduler-provided handle overrides this default with exact terminal-cause
+		 * arbitration. The default preserves compatibility for pre-existing external and
+		 * test handle implementations that only implemented {@link #dispose()}.</p>
+		 *
+		 * @return {@code true} when this handle was not already disposed
 		 */
-		boolean cancel();
+		default boolean cancel() {
+			if (isDisposed()) {
+				return false;
+			}
+			dispose();
+			return true;
+		}
 	}
 
 	public enum CooperativeResult {

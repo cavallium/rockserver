@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
@@ -27,6 +28,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -121,7 +123,33 @@ class GrpcIteratorLeaseTest {
 				awaitLeaseCount(server, 0);
 				assertTrue(syncApi.subsequent(iteratorId, 0, 1, RequestType.exists()),
 						"the iterator must accept a new operation after the cancelled task really terminates");
-				assertEquals(0, server.getActiveIteratorOperationLeaseCountForTesting());
+				awaitLeaseCount(server, 0);
+			}
+		}
+	}
+
+	@Test
+	void longGrpcMultiContinuationIsForwardedAsOneAsyncLogicalRequest() throws Exception {
+		var backend = new RecordingAsyncSubsequentConnection();
+		try (backend; var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			try (var client = GrpcConnection.forHostAndPort("grpc-one-logical-iterator",
+					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
+				var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+				List<Buf> values = api.subsequent(
+						RecordingAsyncSubsequentConnection.ITERATOR_ID,
+						4_097L,
+						65L,
+						RequestType.multi());
+
+				assertEquals(65, values.size());
+				assertEquals(1, backend.asyncSubsequentCalls.get(),
+						"gRPC must preserve one logical async continuation");
+				assertEquals(0, backend.syncSubsequentCalls.get(),
+						"gRPC must not recreate ordinary per-chunk submissions");
+				assertEquals(4_097L, backend.skipCount);
+				assertEquals(65L, backend.takeCount);
+				awaitLeaseCount(server, 0);
 			}
 		}
 	}
@@ -189,7 +217,39 @@ class GrpcIteratorLeaseTest {
 		private final CountDownLatch release = new CountDownLatch(1);
 		private final CountDownLatch finished = new CountDownLatch(1);
 		private final AtomicInteger subsequentCalls = new AtomicInteger();
-		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {};
+		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+			@Override
+			@SuppressWarnings("unchecked")
+			public <T> CompletableFuture<T> subsequentAsync(long iterationId,
+					long skipCount,
+					long takeCount,
+					RequestType.RequestIterate<? super Buf, T> requestType) {
+				if (subsequentCalls.getAndIncrement() != 0) {
+					return CompletableFuture.completedFuture((T) Boolean.TRUE);
+				}
+				var cancellationRequested = new AtomicBoolean();
+				CompletableFuture<T> result = new CompletableFuture<>() {
+					@Override
+					public boolean cancel(boolean mayInterruptIfRunning) {
+						return !isDone() && cancellationRequested.compareAndSet(false, true);
+					}
+				};
+				Thread.ofPlatform().name("grpc-blocking-subsequent-native").start(() -> {
+					entered.countDown();
+					try {
+						awaitIgnoringInterrupts(release);
+						if (cancellationRequested.get()) {
+							result.completeExceptionally(new CancellationException());
+						} else {
+							result.complete((T) Boolean.TRUE);
+						}
+					} finally {
+						finished.countDown();
+					}
+				});
+				return result;
+			}
+		};
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
 			@Override
 			@SuppressWarnings("unchecked")
@@ -199,17 +259,6 @@ class GrpcIteratorLeaseTest {
 				}
 				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator) {
 					return null;
-				}
-				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<?>) {
-					if (subsequentCalls.getAndIncrement() == 0) {
-						entered.countDown();
-						try {
-							awaitIgnoringInterrupts(release);
-						} finally {
-							finished.countDown();
-						}
-					}
-					return (RS) Boolean.TRUE;
 				}
 				throw new UnsupportedOperationException("Unexpected request: " + request);
 			}
@@ -238,6 +287,72 @@ class GrpcIteratorLeaseTest {
 		@Override
 		public void close() {
 			release.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	private static final class RecordingAsyncSubsequentConnection
+			implements RocksDBConnection, InternalConnection {
+
+		private static final long ITERATOR_ID = 31L;
+
+		private final RWScheduler scheduler = RWScheduler.forTesting(
+				2, 1, 1, 16, 16, "grpc-recording-subsequent");
+		private final AtomicInteger asyncSubsequentCalls = new AtomicInteger();
+		private final AtomicInteger syncSubsequentCalls = new AtomicInteger();
+		private volatile long skipCount;
+		private volatile long takeCount;
+		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+			@Override
+			@SuppressWarnings("unchecked")
+			public <T> CompletableFuture<T> subsequentAsync(long iterationId,
+					long requestedSkipCount,
+					long requestedTakeCount,
+					RequestType.RequestIterate<? super Buf, T> requestType) {
+				assertEquals(ITERATOR_ID, iterationId);
+				assertTrue(requestType instanceof RequestType.RequestMulti<?>);
+				asyncSubsequentCalls.incrementAndGet();
+				skipCount = requestedSkipCount;
+				takeCount = requestedTakeCount;
+				var values = new ArrayList<Buf>(Math.toIntExact(requestedTakeCount));
+				for (int index = 0; index < requestedTakeCount; index++) {
+					values.add(Buf.wrap(new byte[] {(byte) index}));
+				}
+				return CompletableFuture.completedFuture((T) values);
+			}
+		};
+		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
+			@Override
+			public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
+				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<?>) {
+					syncSubsequentCalls.incrementAndGet();
+				}
+				throw new UnsupportedOperationException("Unexpected synchronous request: " + request);
+			}
+		};
+
+		@Override
+		public URI getUrl() {
+			return URI.create("test://grpc-recording-subsequent");
+		}
+
+		@Override
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return syncApi;
+		}
+
+		@Override
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return asyncApi;
+		}
+
+		@Override
+		public RWScheduler getScheduler() {
+			return scheduler;
+		}
+
+		@Override
+		public void close() {
 			scheduler.dispose();
 		}
 	}

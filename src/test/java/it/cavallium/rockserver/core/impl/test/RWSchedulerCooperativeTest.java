@@ -348,6 +348,30 @@ class RWSchedulerCooperativeTest {
 	}
 
 	@Test
+	void cooperativeHandleDefaultCancelPreservesLegacyImplementors() {
+		var disposed = new AtomicBoolean();
+		RWScheduler.CooperativeHandle legacyHandle = new RWScheduler.CooperativeHandle() {
+			@Override
+			public void resume() {
+			}
+
+			@Override
+			public void dispose() {
+				disposed.set(true);
+			}
+
+			@Override
+			public boolean isDisposed() {
+				return disposed.get();
+			}
+		};
+
+		assertTrue(legacyHandle.cancel());
+		assertTrue(disposed.get());
+		assertFalse(legacyHandle.cancel());
+	}
+
+	@Test
 	void completionAwareTaskPublishesOnlyTheSchedulerWinningTerminalCause() throws Exception {
 		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-terminal-authority");
 		try {

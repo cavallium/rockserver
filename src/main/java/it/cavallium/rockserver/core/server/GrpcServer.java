@@ -780,8 +780,6 @@ public class GrpcServer extends Server {
 
 	private final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplBase {
 
-		private static final long ITERATOR_VALUE_PAGE_SIZE = 64L;
-		private static final long ITERATOR_ADVANCE_STEP_SIZE = 4_096L;
 		private static final int WRITE_ELISION_MULTI_STEP_SIZE = 4_096;
 
 		private final RocksDBConnection client;
@@ -1916,7 +1914,11 @@ public class GrpcServer extends Server {
 			return validateIteratorCounts(request)
 					.then(validateSubsequentCommand(request, new RequestExists<>()))
 					.then(withIteratorLease(request.getIterationId(), () ->
-							advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), request.getTakeCount())
+							fromCancellableIteratorFuture(() -> asyncApi(request.getContext()).subsequentAsync(
+									request.getIterationId(),
+									request.getSkipCount(),
+									request.getTakeCount(),
+									RequestType.none()))
 									.thenReturn(Empty.getDefaultInstance())))
 					.transform(this.onErrorMapMonoWithRequestInfo("subsequent", request));
 		}
@@ -1926,12 +1928,11 @@ public class GrpcServer extends Server {
 			return validateIteratorCounts(request)
 					.then(validateSubsequentCommand(request, new RequestExists<>()))
 					.then(withIteratorLease(request.getIterationId(), () ->
-							advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), 0)
-									.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_ADVANCE_STEP_SIZE))
-									.concatMap(take -> executeCompositeRead(request.getContext(), OperationFamily.RANGE_PAGE, contextualApi -> contextualApi.subsequent(
-											request.getIterationId(), 0, take, new RequestExists<>())), 1)
-									.takeUntil(found -> !found)
-									.reduce(false, (found, pageFound) -> found || pageFound)
+							fromCancellableIteratorFuture(() -> asyncApi(request.getContext()).subsequentAsync(
+									request.getIterationId(),
+									request.getSkipCount(),
+									request.getTakeCount(),
+									RequestType.exists()))
 									.map(found -> PreviousPresence.newBuilder().setPresent(found).build())))
 					.transform(this.onErrorMapMonoWithRequestInfo("subsequentExists", request));
 		}
@@ -1941,15 +1942,15 @@ public class GrpcServer extends Server {
 			return validateIteratorCounts(request)
 					.then(validateSubsequentCommand(request, new RequestMulti<>()))
 					.thenMany(withIteratorFluxLease(request.getIterationId(), () ->
-							advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), 0)
-									.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_VALUE_PAGE_SIZE)
-											.concatMap(take -> executeCompositeRead(request.getContext(), OperationFamily.RANGE_PAGE, contextualApi -> contextualApi.subsequent(
-													request.getIterationId(), 0, take, new RequestMulti<>())), 1)
-											.takeUntil(values -> values.size() < ITERATOR_VALUE_PAGE_SIZE)
-											.concatMapIterable(Function.identity(), 1)
+							fromCancellableIteratorFuture(() -> asyncApi(request.getContext()).subsequentAsync(
+									request.getIterationId(),
+									request.getSkipCount(),
+									request.getTakeCount(),
+									RequestType.<Buf>multi()))
+									.flatMapMany(Flux::fromIterable)
 											.map(entry -> KV.newBuilder()
 													.setValue(Utils.toByteString(entry))
-													.build()))))
+													.build())))
 					.transform(this.onErrorMapFluxWithRequestInfo("subsequentMultiGet", request));
 		}
 
@@ -2308,39 +2309,6 @@ public class GrpcServer extends Server {
 			});
 		}
 
-		private Flux<Long> iteratorChunks(long count, long stepSize) {
-			return Flux.generate(() -> count, (remaining, sink) -> {
-				if (remaining <= 0) {
-					sink.complete();
-					return 0L;
-				}
-				long chunk = Math.min(remaining, stepSize);
-				sink.next(chunk);
-				return remaining - chunk;
-			});
-		}
-
-		private Mono<Void> advanceIterator(
-				it.cavallium.rockserver.core.common.api.proto.RequestContext context,
-				long iteratorId,
-				long skipCount,
-				long takeCount) {
-			return advanceIteratorPart(context, iteratorId, skipCount)
-					.then(advanceIteratorPart(context, iteratorId, takeCount));
-		}
-
-		private Mono<Void> advanceIteratorPart(
-				it.cavallium.rockserver.core.common.api.proto.RequestContext context,
-				long iteratorId,
-				long count) {
-			return iteratorChunks(count, ITERATOR_ADVANCE_STEP_SIZE)
-					.concatMap(step -> executeCompositeRead(context, OperationFamily.RANGE_PAGE,
-							contextualApi -> contextualApi.subsequent(
-							iteratorId, 0, step, new RequestExists<>())), 1)
-					.takeUntil(found -> !found)
-					.then();
-		}
-
 		private <T> Mono<T> withIteratorLease(long iteratorId, Supplier<Mono<T>> operation) {
 			return Mono.defer(() -> {
 				var lease = new IteratorOperationLease(iteratorId);
@@ -2491,6 +2459,41 @@ public class GrpcServer extends Server {
 		 * Reactor's global onErrorDropped hook.
 		 */
 		private <T> Mono<T> fromCancellableFuture(CompletableFuture<T> future) {
+			return bridgeCancellableFuture(future, null);
+		}
+
+		/**
+		 * Start one logical iterator continuation only after its server-side lease has
+		 * registered an active task. RPC cancellation releases the subscriber side of the
+		 * lease immediately, but the task side remains registered until the underlying
+		 * future terminates after any in-flight JNI step.
+		 */
+		private <T> Mono<T> fromCancellableIteratorFuture(
+				Supplier<CompletableFuture<T>> futureSupplier) {
+			return Mono.deferContextual(contextView -> {
+				var iteratorLease = contextView.<IteratorOperationLease>getOrDefault(
+						ITERATOR_OPERATION_LEASE_CONTEXT_KEY, null);
+				if (iteratorLease == null) {
+					return Mono.error(new IllegalStateException(
+							"Iterator future was started without an operation lease"));
+				}
+				if (!iteratorLease.registerTask()) {
+					return Mono.error(new java.util.concurrent.CancellationException(
+							"Iterator operation terminated before its continuation could start"));
+				}
+				final CompletableFuture<T> future;
+				try {
+					future = Objects.requireNonNull(futureSupplier.get(), "futureSupplier result");
+				} catch (Throwable failure) {
+					iteratorLease.taskTerminated();
+					return Mono.error(failure);
+				}
+				return bridgeCancellableFuture(future, iteratorLease::taskTerminated);
+			});
+		}
+
+		private <T> Mono<T> bridgeCancellableFuture(CompletableFuture<T> future,
+				@Nullable Runnable terminalAction) {
 			return Mono.create(sink -> {
 				var emissionLock = new Object();
 				var cancelled = new AtomicBoolean();
@@ -2501,23 +2504,30 @@ public class GrpcServer extends Server {
 					future.cancel(true);
 				});
 				future.whenComplete((value, failure) -> {
-					Throwable error = failure instanceof CompletionException completionError
-							&& completionError.getCause() != null
-							? completionError.getCause()
-							: failure;
-					boolean late;
-					synchronized (emissionLock) {
-						late = cancelled.get();
-						if (!late) {
-							if (error != null) {
-								sink.error(error);
-							} else {
-								sink.success(value);
+					try {
+						Throwable error = failure instanceof CompletionException completionError
+								&& completionError.getCause() != null
+								? completionError.getCause()
+								: failure;
+						boolean late;
+						synchronized (emissionLock) {
+							late = cancelled.get();
+							if (!late) {
+								if (error != null) {
+									sink.error(error);
+								} else {
+									sink.success(value);
+								}
 							}
 						}
-					}
-					if (late && error != null && !(error instanceof java.util.concurrent.CancellationException)) {
-						lateErrorHandler(sink.contextView()).accept(error);
+						if (late && error != null
+								&& !(error instanceof java.util.concurrent.CancellationException)) {
+							lateErrorHandler(sink.contextView()).accept(error);
+						}
+					} finally {
+						if (terminalAction != null) {
+							terminalAction.run();
+						}
 					}
 				});
 			});

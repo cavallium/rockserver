@@ -16,6 +16,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -27,7 +28,7 @@ class GrpcIteratorSchedulingTest {
 	Path tempDir;
 
 	@Test
-	void nonMaterializingRemoteAdvanceUsesLargeBoundedSteps() throws Exception {
+	void nonMaterializingRemoteAdvanceUsesOneLogicalTaskWithBoundedNativeSteps() throws Exception {
 		final int entries = 4_200;
 		try (var embedded = new EmbeddedConnection(tempDir.resolve("db"), "grpc-iterator-scheduling", null)) {
 			var backend = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
@@ -46,12 +47,21 @@ class GrpcIteratorSchedulingTest {
 					try {
 						var scheduler = embedded.getInternalDB().getScheduler();
 						long tasksBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
+						var nativeSteps = new AtomicInteger();
+						embedded.getInternalDB()
+								.setIteratorAdvanceStepCompletedObserverForTesting(nativeSteps::incrementAndGet);
 
-						api.subsequent(iteratorId, 0, entries, RequestType.none());
+						try {
+							api.subsequent(iteratorId, 0, entries, RequestType.none());
+						} finally {
+							embedded.getInternalDB().setIteratorAdvanceStepCompletedObserverForTesting(null);
+						}
 
 						long scheduledTasks = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - tasksBefore;
-						assertEquals(2L, scheduledTasks,
-								"4,200 non-materializing entries should use two 4,096-entry read steps");
+						assertEquals(1L, scheduledTasks,
+								"gRPC must preserve one logical iterator continuation");
+						assertEquals(2, nativeSteps.get(),
+								"4,200 entries must still use bounded 4,096-entry native steps");
 					} finally {
 						api.closeIterator(iteratorId);
 					}
