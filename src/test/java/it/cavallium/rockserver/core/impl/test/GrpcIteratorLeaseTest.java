@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -100,7 +101,7 @@ class GrpcIteratorLeaseTest {
 				var asyncApi = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				var syncApi = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				long iteratorId = syncApi.openIterator(0, 0, new Keys(), null, false, 30_000);
-				var running = asyncApi.subsequentAsync(iteratorId, 0, 1, RequestType.exists());
+				var running = asyncApi.subsequentAsync(iteratorId, 4_097, 1, RequestType.exists());
 
 				try {
 					assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
@@ -149,6 +150,41 @@ class GrpcIteratorLeaseTest {
 						"gRPC must not recreate ordinary per-chunk submissions");
 				assertEquals(4_097L, backend.skipCount);
 				assertEquals(65L, backend.takeCount);
+				awaitLeaseCount(server, 0);
+			}
+		}
+	}
+
+	@Test
+	void nonCooperativeAndLatencyGrpcRequestsKeepOriginalChunkedPath() throws Exception {
+		var backend = new RecordingAsyncSubsequentConnection();
+		try (backend; var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			try (var client = GrpcConnection.forHostAndPort("grpc-chunked-iterator-fallback",
+					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
+				var batchApi = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+				var latencyApi = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.latency(
+						java.time.Duration.ofSeconds(30)));
+
+				batchApi.subsequent(RecordingAsyncSubsequentConnection.ITERATOR_ID,
+						0, 1, RequestType.none());
+				assertTrue(batchApi.subsequent(RecordingAsyncSubsequentConnection.ITERATOR_ID,
+						0, 1, RequestType.exists()));
+				assertEquals(65, batchApi.subsequent(RecordingAsyncSubsequentConnection.ITERATOR_ID,
+						0, 65, RequestType.multi()).size());
+				assertEquals(4_096, latencyApi.subsequent(RecordingAsyncSubsequentConnection.ITERATOR_ID,
+						0, 4_096, RequestType.multi()).size());
+
+				assertEquals(0, backend.asyncSubsequentCalls.get(),
+						"bounded and LATENCY requests must not use the cooperative whole-result route");
+				assertEquals(List.of(1L, 1L), backend.syncExistsTakeCounts);
+				assertEquals(List.of(64L, 1L), backend.syncMultiTakeCounts.subList(0, 2),
+						"bounded BATCH MULTI must retain 64-value paging");
+				assertEquals(66, backend.syncMultiTakeCounts.size());
+				assertTrue(backend.syncMultiTakeCounts.subList(2, 66).stream()
+						.allMatch(take -> take == 64L),
+						"the largest admitted LATENCY MULTI must retain 64-value paging");
+				assertEquals(68, backend.syncSubsequentCalls.get());
 				awaitLeaseCount(server, 0);
 			}
 		}
@@ -260,6 +296,10 @@ class GrpcIteratorLeaseTest {
 				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator) {
 					return null;
 				}
+				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<?> subsequent
+						&& subsequent.requestType() instanceof RequestType.RequestExists<?>) {
+					return (RS) Boolean.TRUE;
+				}
 				throw new UnsupportedOperationException("Unexpected request: " + request);
 			}
 		};
@@ -300,6 +340,8 @@ class GrpcIteratorLeaseTest {
 				2, 1, 1, 16, 16, "grpc-recording-subsequent");
 		private final AtomicInteger asyncSubsequentCalls = new AtomicInteger();
 		private final AtomicInteger syncSubsequentCalls = new AtomicInteger();
+		private final List<Long> syncExistsTakeCounts = new CopyOnWriteArrayList<>();
+		private final List<Long> syncMultiTakeCounts = new CopyOnWriteArrayList<>();
 		private volatile long skipCount;
 		private volatile long takeCount;
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
@@ -323,9 +365,23 @@ class GrpcIteratorLeaseTest {
 		};
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
 			@Override
+			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
-				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<?>) {
+				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<?> subsequent) {
+					assertEquals(ITERATOR_ID, subsequent.iterationId());
 					syncSubsequentCalls.incrementAndGet();
+					if (subsequent.requestType() instanceof RequestType.RequestExists<?>) {
+						syncExistsTakeCounts.add(subsequent.takeCount());
+						return (RS) Boolean.TRUE;
+					}
+					if (subsequent.requestType() instanceof RequestType.RequestMulti<?>) {
+						syncMultiTakeCounts.add(subsequent.takeCount());
+						var values = new ArrayList<Buf>(Math.toIntExact(subsequent.takeCount()));
+						for (int index = 0; index < subsequent.takeCount(); index++) {
+							values.add(Buf.wrap(new byte[] {(byte) index}));
+						}
+						return (RS) values;
+					}
 				}
 				throw new UnsupportedOperationException("Unexpected synchronous request: " + request);
 			}
