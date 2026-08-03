@@ -102,6 +102,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private int queuedTotal;
 	private int activeTotal;
 	private int competingTasks;
+	// Written under the scheduler lock after every queue-count mutation and read by running quantums.
+	private volatile boolean localQueuedCompetition;
 	private boolean publishedPreemption;
 	private int latencyBurst;
 	private int guaranteedCursor;
@@ -206,8 +208,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	                                                   long estimatedBytes,
 	                                                   RWScheduler.CooperativeTask command) {
 		Objects.requireNonNull(command, "command");
-		if (profile != WorkloadProfile.BATCH) {
-			throw new IllegalArgumentException("Cooperative execution is reserved for BATCH work");
+		if (profile != WorkloadProfile.ANALYTICAL
+				&& profile != WorkloadProfile.INGEST
+				&& profile != WorkloadProfile.BATCH) {
+			throw new IllegalArgumentException(
+					"Cooperative execution requires ANALYTICAL, INGEST, or BATCH work");
 		}
 		int cost = taskCost(estimatedBytes);
 		var taskMetrics = metrics(profile, family);
@@ -257,6 +262,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						terminalActions);
 			} else {
 				enqueueCooperativeUnsafe(task, true);
+				admitCompetitionUnsafe(task);
 				acceptedTasks++;
 				admissionResult = AdmissionResult.ACCEPTED;
 				ensureWorkersStartedUnsafe();
@@ -645,6 +651,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.finishBatch(batchPermit, resourcePool);
 		}
 		TerminalAction terminalAction = null;
+		boolean terminal = false;
 		lock.lock();
 		try {
 			if (task.state() != TaskState.ACTIVE) {
@@ -682,8 +689,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			refreshPreemptionUnsafe();
 			workAvailable.signal();
+			terminal = task.state() == TaskState.TERMINAL;
 		} finally {
 			lock.unlock();
+		}
+		if (terminal) {
+			pressureController.signalPendingAvailability();
 		}
 		return terminalAction;
 	}
@@ -740,18 +751,27 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} finally {
 			lock.unlock();
 		}
+		pressureController.signalPendingAvailability();
 		if (terminalAction != null) {
 			completeTerminalAction(terminalAction);
 		}
 	}
 
 	private void refreshPreemptionUnsafe() {
-		boolean requested = queuedTotal > 0
+		boolean requested = localQueuedCompetition
 				|| activeTotal > active.get(WorkloadProfile.BATCH);
 		if (requested != publishedPreemption) {
 			publishedPreemption = requested;
 			pressureController.setPoolPreemption(resourcePool, requested);
 		}
+	}
+
+	private boolean cooperativePreemptionRequested(WorkloadProfile profile) {
+		return switch (profile) {
+			case ANALYTICAL, INGEST -> localQueuedCompetition;
+			case BATCH -> localQueuedCompetition || pressureController.preemptionRequested();
+			case LATENCY, CONTROL, CDC, PHYSICAL_MAINTENANCE -> false;
+		};
 	}
 
 	boolean isExecutingTask() {
@@ -1078,6 +1098,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.setBatchQueued(resourcePool, true);
 		}
 		queuedTotal++;
+		refreshLocalQueuedCompetitionUnsafe();
 		task.markQueued();
 	}
 
@@ -1111,6 +1132,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.setBatchQueued(resourcePool, true);
 		}
 		queuedTotal++;
+		refreshLocalQueuedCompetitionUnsafe();
 		task.markQueued();
 	}
 
@@ -1141,6 +1163,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
 		queuedTotal--;
+		refreshLocalQueuedCompetitionUnsafe();
 	}
 
 	private void unlinkCooperativeQueuedUnsafe(WorkloadTask task) {
@@ -1157,6 +1180,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
 		queuedTotal--;
+		refreshLocalQueuedCompetitionUnsafe();
+	}
+
+	private void refreshLocalQueuedCompetitionUnsafe() {
+		localQueuedCompetition = queuedTotal > 0;
 	}
 
 	private boolean terminateUnsafe(WorkloadTask task,
@@ -1213,6 +1241,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (!cooperativeTasks.remove(task)) {
 			throw new IllegalStateException("Cooperative workload task is not admitted");
 		}
+		completeCompetitionUnsafe(task);
 		task.outcome(outcome);
 		task.markTerminal();
 		if (task.hasStarted()) {
@@ -1973,7 +2002,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		@Override
 		public boolean preemptionRequested() {
-			return Objects.requireNonNull(owner).pressureController.preemptionRequested();
+			return Objects.requireNonNull(owner).cooperativePreemptionRequested(profile);
 		}
 
 		@Override

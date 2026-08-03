@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -24,6 +25,107 @@ import static org.junit.jupiter.api.Assertions.*;
 class RWSchedulerCooperativeTest {
 
 	private static final long RANGE_QUANTUM_NANOS = Duration.ofMillis(8).toNanos();
+
+	@Test
+	void cooperativeExecutionAcceptsOnlyAnalyticalIngestAndBatchProfiles() throws Exception {
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-profile-matrix");
+		try {
+			for (var profile : new WorkloadProfile[] {
+					WorkloadProfile.ANALYTICAL,
+					WorkloadProfile.INGEST,
+					WorkloadProfile.BATCH
+			}) {
+				var task = new FixedYieldTask(0);
+				var handle = scheduler.executor(profile,
+						OperationFamily.RANGE_PAGE,
+						RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+				assertTrue(task.completed.await(5, SECONDS), profile + " task did not complete");
+				assertEventually(handle::isDisposed);
+				assertNull(task.failure.get());
+			}
+
+			var rejectedProfiles = new WorkloadProfile[] {
+					WorkloadProfile.LATENCY,
+					WorkloadProfile.CONTROL,
+					WorkloadProfile.CDC,
+					WorkloadProfile.PHYSICAL_MAINTENANCE
+			};
+			var rejectedFamilies = new OperationFamily[] {
+					OperationFamily.POINT_LOOKUP,
+					OperationFamily.CONTROL,
+					OperationFamily.WAL_PAGE,
+					OperationFamily.FLUSH
+			};
+			for (int i = 0; i < rejectedProfiles.length; i++) {
+				var executor = scheduler.executor(rejectedProfiles[i],
+						rejectedFamilies[i],
+						RequestContext.NO_DEADLINE);
+				var failure = assertThrows(IllegalArgumentException.class,
+						() -> executor.executeCooperatively(new FixedYieldTask(0), 1L));
+				assertTrue(failure.getMessage().contains("ANALYTICAL, INGEST, or BATCH"));
+			}
+		} finally {
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void uncontendedCooperativeProfilesFinishAllChunksInOneDispatch() throws Exception {
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-uncontended");
+		try {
+			for (var profile : new WorkloadProfile[] {
+					WorkloadProfile.ANALYTICAL,
+					WorkloadProfile.INGEST,
+					WorkloadProfile.BATCH
+			}) {
+				var task = new UncontendedChunkTask(32);
+				scheduler.executor(profile,
+						OperationFamily.RANGE_PAGE,
+						RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+				assertTrue(task.completed.await(5, SECONDS), profile + " task did not complete");
+				assertEquals(32, task.completedChunks);
+				assertEquals(1, task.invocations,
+						profile + " must continue immediately while its pool has no queued competition");
+				assertEquals(0, task.observedPreemptions);
+				assertNull(task.failure.get());
+			}
+		} finally {
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void analyticalCooperativeWorkDoesNotTreatItselfAsPreemptionPressure() throws Exception {
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-analytical-self");
+		var task = new SelfPreemptionProbeTask(100_000);
+		try {
+			scheduler.executor(WorkloadProfile.ANALYTICAL,
+					OperationFamily.FULL_SCAN_AGGREGATE,
+					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+			assertTrue(task.completed.await(5, SECONDS));
+			assertFalse(task.preemptionObserved,
+					"the active ANALYTICAL task itself must not publish local queued competition");
+			assertNull(task.failure.get());
+		} finally {
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void cooperativeAnalyticalWorkYieldsForSameProfileQueuedWork() throws Exception {
+		assertYieldsForQueuedCompetition(WorkloadProfile.ANALYTICAL,
+				WorkloadProfile.ANALYTICAL,
+				OperationFamily.RANGE_PAGE,
+				"cooperative-same-profile");
+	}
+
+	@Test
+	void cooperativeIngestWorkYieldsForHigherPriorityQueuedWork() throws Exception {
+		assertYieldsForQueuedCompetition(WorkloadProfile.INGEST,
+				WorkloadProfile.LATENCY,
+				OperationFamily.POINT_LOOKUP,
+				"cooperative-higher-priority");
+	}
 
 	@Test
 	void saturatedBatchUsesEveryReadWorkerAndYieldsToEveryCompetingProfile() throws Exception {
@@ -143,6 +245,50 @@ class RWSchedulerCooperativeTest {
 	}
 
 	@Test
+	void cooperativeForegroundCompetitionLimitsCrossPoolBatchUntilTerminal() throws Exception {
+		var scheduler = RWScheduler.forTesting(6, 6, 1, 128, 128, "cooperative-cross-pool-pressure");
+		var releaseForeground = new CountDownLatch(1);
+		var foreground = new BlockingCompleteTask(releaseForeground);
+		var firstBatchStarted = new CountDownLatch(1);
+		var allBatchStarted = new CountDownLatch(6);
+		var releaseBatch = new CountDownLatch(1);
+		var batchStarts = new AtomicInteger();
+		try {
+			var foregroundHandle = scheduler.executor(WorkloadProfile.ANALYTICAL,
+					OperationFamily.FULL_SCAN_AGGREGATE,
+					RequestContext.NO_DEADLINE).executeCooperatively(foreground, 1L);
+			assertTrue(foreground.started.await(5, SECONDS));
+
+			var batch = scheduler.executor(
+					WorkloadProfile.BATCH, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
+			for (int i = 0; i < 6; i++) {
+				batch.execute(() -> {
+					batchStarts.incrementAndGet();
+					firstBatchStarted.countDown();
+					allBatchStarted.countDown();
+					awaitUninterruptibly(releaseBatch);
+				});
+			}
+			assertTrue(firstBatchStarted.await(5, SECONDS));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.WRITE).batchDispatchLimited());
+			assertEquals(1, batchStarts.get(),
+					"cooperative foreground work must retain the existing global BATCH cap");
+
+			releaseForeground.countDown();
+			assertTrue(foreground.completed.await(5, SECONDS));
+			assertEventually(foregroundHandle::isDisposed);
+			assertTrue(allBatchStarted.await(5, SECONDS),
+					"terminal cooperative foreground work must wake cross-pool BATCH waiters");
+			assertEquals(6, batchStarts.get());
+			assertNull(foreground.failure.get());
+		} finally {
+			releaseForeground.countDown();
+			releaseBatch.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void parkedTaskResumesTheSameLogicalSubmissionAndCachesNoDeadlineViews() throws Exception {
 		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-park");
 		var executor = scheduler.executor(
@@ -250,34 +396,41 @@ class RWSchedulerCooperativeTest {
 		var registry = new SimpleMeterRegistry();
 		var scheduler = RWScheduler.forTesting(
 				1, 1, 1, 8, 8, "cooperative-metrics", registry, "cooperative-metrics-db");
-		var task = new FixedYieldTask(7);
 		try {
-			scheduler.executor(WorkloadProfile.BATCH,
-					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 2L * 1024L * 1024L);
-			assertTrue(task.completed.await(5, SECONDS));
-			assertEventually(() -> registry.get("rockserver.workload.quantums")
-					.tags("database", "cooperative-metrics-db",
-							"resource", "read",
-							"profile", "batch",
-							"operation", "range_page")
-					.counter()
-					.count() == 8.0);
-			assertEquals(1L, registry.get("rockserver.workload.queue.wait")
-					.tags("database", "cooperative-metrics-db",
-							"resource", "read",
-							"profile", "batch",
-							"operation", "range_page")
-					.timer()
-					.count());
-			assertEquals(1L, registry.get("rockserver.workload.execution")
-					.tags("database", "cooperative-metrics-db",
-							"resource", "read",
-							"profile", "batch",
-							"operation", "range_page")
-					.timer()
-					.count());
-			assertNull(task.failure.get());
+			for (var profile : new WorkloadProfile[] {
+					WorkloadProfile.ANALYTICAL,
+					WorkloadProfile.INGEST,
+					WorkloadProfile.BATCH
+			}) {
+				var task = new FixedYieldTask(7);
+				scheduler.executor(profile,
+						OperationFamily.RANGE_PAGE,
+						RequestContext.NO_DEADLINE).executeCooperatively(task, 2L * 1024L * 1024L);
+				assertTrue(task.completed.await(5, SECONDS));
+				var profileTag = profile.name().toLowerCase(java.util.Locale.ROOT);
+				assertEventually(() -> registry.get("rockserver.workload.quantums")
+						.tags("database", "cooperative-metrics-db",
+								"resource", "read",
+								"profile", profileTag,
+								"operation", "range_page")
+						.counter()
+						.count() == 8.0);
+				assertEquals(1L, registry.get("rockserver.workload.queue.wait")
+						.tags("database", "cooperative-metrics-db",
+								"resource", "read",
+								"profile", profileTag,
+								"operation", "range_page")
+						.timer()
+						.count());
+				assertEquals(1L, registry.get("rockserver.workload.execution")
+						.tags("database", "cooperative-metrics-db",
+								"resource", "read",
+								"profile", profileTag,
+								"operation", "range_page")
+						.timer()
+						.count());
+				assertNull(task.failure.get());
+			}
 		} finally {
 			scheduler.disposeNow();
 			registry.close();
@@ -333,8 +486,8 @@ class RWSchedulerCooperativeTest {
 		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-deadline");
 		var task = new DeadlineTask();
 		try {
-			scheduler.executor(WorkloadProfile.BATCH,
-					OperationFamily.RANGE_PAGE,
+			scheduler.executor(WorkloadProfile.ANALYTICAL,
+					OperationFamily.FULL_SCAN_AGGREGATE,
 					System.currentTimeMillis() + 1_000L).executeCooperatively(task, 2L * 1024L * 1024L);
 			assertTrue(task.started.await(5, SECONDS));
 			assertTrue(task.completed.await(5, SECONDS));
@@ -360,6 +513,39 @@ class RWSchedulerCooperativeTest {
 		assertTrue(condition.getAsBoolean());
 	}
 
+	private static void assertYieldsForQueuedCompetition(WorkloadProfile cooperativeProfile,
+	                                                     WorkloadProfile contenderProfile,
+	                                                     OperationFamily contenderFamily,
+	                                                     String schedulerName) throws Exception {
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, schedulerName);
+		var contenderRan = new AtomicBoolean();
+		var contenderCompleted = new CountDownLatch(1);
+		var task = new YieldForCompetitionTask(contenderRan);
+		try {
+			scheduler.executor(cooperativeProfile,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+			assertTrue(task.started.await(5, SECONDS));
+
+			scheduler.executor(contenderProfile,
+					contenderFamily,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				contenderRan.set(true);
+				contenderCompleted.countDown();
+			});
+
+			assertTrue(task.completed.await(5, SECONDS));
+			assertTrue(contenderCompleted.await(5, SECONDS));
+			assertTrue(task.preemptionObserved,
+					"the active cooperative task must observe queued pool-local competition");
+			assertTrue(task.contenderRanBeforeRedispatch,
+					"the queued contender must run before the yielded task is redispatched");
+			assertNull(task.failure.get());
+		} finally {
+			scheduler.disposeNow();
+		}
+	}
+
 	private static void awaitUninterruptibly(CountDownLatch latch) {
 		boolean interrupted = false;
 		while (true) {
@@ -372,6 +558,135 @@ class RWSchedulerCooperativeTest {
 		}
 		if (interrupted) {
 			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static final class UncontendedChunkTask implements RWScheduler.CooperativeTask {
+
+		private final CountDownLatch completed = new CountDownLatch(1);
+		private final AtomicReference<RuntimeException> failure = new AtomicReference<>();
+		private int remainingChunks;
+		private int completedChunks;
+		private int invocations;
+		private int observedPreemptions;
+
+		private UncontendedChunkTask(int remainingChunks) {
+			this.remainingChunks = remainingChunks;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			invocations++;
+			while (remainingChunks > 0) {
+				remainingChunks--;
+				completedChunks++;
+				if (context.preemptionRequested()) {
+					observedPreemptions++;
+					return RWScheduler.CooperativeResult.YIELD;
+				}
+			}
+			completed.countDown();
+			return RWScheduler.CooperativeResult.COMPLETE;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			this.failure.compareAndSet(null, failure);
+			completed.countDown();
+		}
+	}
+
+	private static final class BlockingCompleteTask implements RWScheduler.CooperativeTask {
+
+		private final CountDownLatch release;
+		private final CountDownLatch started = new CountDownLatch(1);
+		private final CountDownLatch completed = new CountDownLatch(1);
+		private final AtomicReference<RuntimeException> failure = new AtomicReference<>();
+
+		private BlockingCompleteTask(CountDownLatch release) {
+			this.release = release;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			started.countDown();
+			awaitUninterruptibly(release);
+			completed.countDown();
+			return RWScheduler.CooperativeResult.COMPLETE;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			this.failure.compareAndSet(null, failure);
+			completed.countDown();
+		}
+	}
+
+	private static final class SelfPreemptionProbeTask implements RWScheduler.CooperativeTask {
+
+		private final CountDownLatch completed = new CountDownLatch(1);
+		private final AtomicReference<RuntimeException> failure = new AtomicReference<>();
+		private final int samples;
+		private boolean preemptionObserved;
+
+		private SelfPreemptionProbeTask(int samples) {
+			this.samples = samples;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			for (int i = 0; i < samples; i++) {
+				preemptionObserved |= context.preemptionRequested();
+				Thread.onSpinWait();
+			}
+			completed.countDown();
+			return RWScheduler.CooperativeResult.COMPLETE;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			this.failure.compareAndSet(null, failure);
+			completed.countDown();
+		}
+	}
+
+	private static final class YieldForCompetitionTask implements RWScheduler.CooperativeTask {
+
+		private final AtomicBoolean contenderRan;
+		private final CountDownLatch started = new CountDownLatch(1);
+		private final CountDownLatch completed = new CountDownLatch(1);
+		private final AtomicReference<RuntimeException> failure = new AtomicReference<>();
+		private boolean firstInvocation = true;
+		private boolean preemptionObserved;
+		private boolean contenderRanBeforeRedispatch;
+
+		private YieldForCompetitionTask(AtomicBoolean contenderRan) {
+			this.contenderRan = contenderRan;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			if (firstInvocation) {
+				firstInvocation = false;
+				started.countDown();
+				while (!context.preemptionRequested()) {
+					if (context.terminationRequested()) {
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					Thread.onSpinWait();
+				}
+				preemptionObserved = true;
+				return RWScheduler.CooperativeResult.YIELD;
+			}
+			contenderRanBeforeRedispatch = contenderRan.get();
+			completed.countDown();
+			return RWScheduler.CooperativeResult.COMPLETE;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			this.failure.compareAndSet(null, failure);
+			completed.countDown();
 		}
 	}
 
