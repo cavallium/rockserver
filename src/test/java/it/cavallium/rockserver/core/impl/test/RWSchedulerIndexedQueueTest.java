@@ -581,6 +581,44 @@ class RWSchedulerIndexedQueueTest {
 	}
 
 	@Test
+	void cancellationThatLosesDispatchLeavesRunningOwnershipUnchanged() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-running-cancellation");
+		var started = new CountDownLatch(1);
+		var release = new CountDownLatch(1);
+		var completed = new CountDownLatch(1);
+		var view = scheduler.scheduler(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+		try {
+			var running = view.schedule(() -> {
+				started.countDown();
+				awaitUninterruptibly(release);
+				completed.countDown();
+			});
+			assertTrue(started.await(5, SECONDS));
+
+			running.dispose();
+			assertFalse(running.isDisposed(),
+					"a cancellation that lost dispatch arbitration must not rewrite running ownership");
+			var active = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(1, active.activeTasks());
+			assertEquals(0L, active.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+			assertEquals(0L, active.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+
+			release.countDown();
+			assertTrue(completed.await(5, SECONDS));
+			assertEventually(running::isDisposed);
+			var terminal = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(1L, terminal.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			assertEquals(0L, terminal.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+			assertTrue(terminal.drainedAndConserved());
+		} finally {
+			release.countDown();
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void reactorWorkerDisposalImmediatelyUnlinksEveryQueuedTask() throws Exception {
 		var scheduler = scheduler(1, 8, "indexed-reactor-worker-disposal");
 		var blockerStarted = new CountDownLatch(1);

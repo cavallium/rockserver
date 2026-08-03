@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
+import java.util.function.IntConsumer;
 import org.junit.jupiter.api.Test;
 import reactor.core.Disposable;
 
@@ -669,6 +670,85 @@ class RWSchedulerTest {
 			releaseForeground.countDown();
 			scheduler.disposeNow();
 		}
+	}
+
+	@Test
+	void abortedBatchPermitReopensCapacityWithoutAdvancingPacing() throws Exception {
+		var controllerType = Class.forName(
+				"it.cavallium.rockserver.core.impl.WorkloadPressureController");
+		var constructor = controllerType.getDeclaredConstructor(
+				int.class,
+				int.class,
+				Duration.class,
+				int.class,
+				Duration.class,
+				Duration.class);
+		constructor.setAccessible(true);
+		var controller = constructor.newInstance(
+				1,
+				1,
+				Duration.ofSeconds(10),
+				1,
+				Duration.ofSeconds(10),
+				Duration.ofSeconds(10));
+
+		var setPressured = controllerType.getDeclaredMethod("setPressured", boolean.class);
+		var setNotifier = controllerType.getDeclaredMethod("setNotifier", Runnable.class);
+		var setBatchNotifier = controllerType.getDeclaredMethod("setBatchNotifier", IntConsumer.class);
+		var setBatchQueued = controllerType.getDeclaredMethod(
+				"setBatchQueued", RWScheduler.Pool.class, boolean.class);
+		var signalPendingAvailability = controllerType.getDeclaredMethod("signalPendingAvailability");
+		var tryStartBatch = controllerType.getDeclaredMethod(
+				"tryStartBatch", boolean.class, RWScheduler.Pool.class, long.class);
+		var batchStartAllowance = controllerType.getDeclaredMethod(
+				"batchStartAllowance", boolean.class, RWScheduler.Pool.class, long.class);
+		var permitType = Class.forName(
+				"it.cavallium.rockserver.core.impl.WorkloadPressureController$BatchPermit");
+		var abortBatch = controllerType.getDeclaredMethod(
+				"abortBatch", permitType, RWScheduler.Pool.class);
+		for (var method : List.of(
+				setPressured,
+				setNotifier,
+				setBatchNotifier,
+				setBatchQueued,
+				signalPendingAvailability,
+				tryStartBatch,
+				batchStartAllowance,
+				abortBatch)) {
+			method.setAccessible(true);
+		}
+
+		setPressured.invoke(controller, true);
+		var deferredNotifications = new AtomicInteger();
+		var directBatchNotifications = new AtomicInteger();
+		setNotifier.invoke(controller, (Runnable) deferredNotifications::incrementAndGet);
+		setBatchNotifier.invoke(controller, (IntConsumer) _ -> directBatchNotifications.incrementAndGet());
+		setBatchQueued.invoke(controller, RWScheduler.Pool.WRITE, true);
+		long fixedNow = System.nanoTime();
+		var firstPermit = tryStartBatch.invoke(controller, false, RWScheduler.Pool.READ, fixedNow);
+		assertTrue(firstPermit != null);
+		assertEquals(0,
+				batchStartAllowance.invoke(controller, false, RWScheduler.Pool.READ, fixedNow));
+
+		abortBatch.invoke(controller, firstPermit, RWScheduler.Pool.READ);
+		assertEquals(0, directBatchNotifications.get(),
+				"permit abort must not invoke another pool while the caller holds its scheduler lock");
+		assertEquals(0, deferredNotifications.get());
+		assertEquals(1,
+				batchStartAllowance.invoke(controller, false, RWScheduler.Pool.READ, fixedNow),
+				"a cancelled pre-dispatch permit must not consume the pressure interval");
+		signalPendingAvailability.invoke(controller);
+		assertEquals(1, deferredNotifications.get(),
+				"the other queued pool must be woken only through the post-unlock notifier");
+
+		var replacementPermit = tryStartBatch.invoke(controller, false, RWScheduler.Pool.READ, fixedNow);
+		assertTrue(replacementPermit != null,
+				"capacity must reopen immediately at the same scheduler timestamp");
+		abortBatch.invoke(controller, replacementPermit, RWScheduler.Pool.READ);
+		assertEquals(0, directBatchNotifications.get());
+		assertEquals(1, deferredNotifications.get());
+		signalPendingAvailability.invoke(controller);
+		assertEquals(2, deferredNotifications.get());
 	}
 
 	@Test

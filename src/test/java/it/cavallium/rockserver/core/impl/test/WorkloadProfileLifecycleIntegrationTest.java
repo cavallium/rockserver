@@ -262,6 +262,8 @@ class WorkloadProfileLifecycleIntegrationTest {
 				database.parallelism.workload.control-threads = 1
 				database.parallelism.workload.physical-concurrency = 1
 				database.parallelism.workload.analytical-active-limit = 1
+				database.parallelism.workload.competing-batch-read-maximum-active = 3
+				database.parallelism.workload.competing-batch-write-maximum-active = 3
 				database.parallelism.workload.pressured-batch-maximum-active = 1
 				database.parallelism.workload.pressured-batch-interval = PT0.2S
 				database.global.enable-fast-get = false

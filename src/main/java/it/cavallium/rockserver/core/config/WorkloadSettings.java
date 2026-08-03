@@ -99,11 +99,13 @@ public record WorkloadSettings(
 		if (analyticalActiveLimit > Math.min(readParallelism, writeParallelism)) {
 			throw invalid("analytical-active-limit must not exceed either data-pool capacity");
 		}
-		long combinedDataCapacity = (long) readParallelism + writeParallelism;
-		if (competingBatchReadMaximumActive > combinedDataCapacity
-				|| competingBatchWriteMaximumActive > combinedDataCapacity) {
-			throw invalid("competing BATCH maxima must not exceed combined data-pool capacity");
+		if (competingBatchReadMaximumActive > readParallelism) {
+			throw invalid("competing-batch-read-maximum-active must not exceed read-pool capacity");
 		}
+		if (competingBatchWriteMaximumActive > writeParallelism) {
+			throw invalid("competing-batch-write-maximum-active must not exceed write-pool capacity");
+		}
+		long combinedDataCapacity = (long) readParallelism + writeParallelism;
 		if (pressuredBatchMaximumActive > combinedDataCapacity) {
 			throw invalid("pressured-batch-maximum-active must not exceed combined data-pool capacity");
 		}

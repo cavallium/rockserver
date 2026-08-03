@@ -347,12 +347,18 @@ public final class RWScheduler {
 				snapshot.waitingWorkers(),
 				snapshot.queuedTasks(),
 				snapshot.activeTasks(),
+				snapshot.parkedTasks(),
+				snapshot.outstandingTasks(),
+				snapshot.submissionAttempts(),
 				snapshot.acceptedTasks(),
 				snapshot.startedTasks(),
 				snapshot.completedTasks(),
 				snapshot.failedTasks(),
+				snapshot.submissionAttemptsByProfile(),
 				snapshot.queuedByProfile(),
 				snapshot.activeByProfile(),
+				snapshot.parkedByProfile(),
+				snapshot.outstandingByProfile(),
 				snapshot.outcomes(),
 				snapshot.batchDispatchLimited(),
 				snapshot.batchStartAllowance(),
@@ -629,18 +635,36 @@ public final class RWScheduler {
 			int waitingWorkers,
 			int queuedTasks,
 			int activeTasks,
+			int parkedTasks,
+			int outstandingTasks,
+			long submissionAttempts,
 			long acceptedTasks,
 			long startedTasks,
 			long completedTasks,
 			long failedTasks,
+			Map<WorkloadProfile, Long> submissionAttemptsByProfile,
 			Map<WorkloadProfile, Integer> queuedByProfile,
 			Map<WorkloadProfile, Integer> activeByProfile,
+			Map<WorkloadProfile, Integer> parkedByProfile,
+			Map<WorkloadProfile, Integer> outstandingByProfile,
 			Map<TerminalOutcome, Long> outcomes,
 			boolean batchDispatchLimited,
 			int batchStartAllowance,
 			List<String> workerThreadNames,
 			boolean shutdown,
 			boolean terminated) {
+
+		public long terminalOutcomes() {
+			return outcomes.values().stream().mapToLong(Long::longValue).sum();
+		}
+
+		public boolean drainedAndConserved() {
+			return queuedTasks == 0
+					&& activeTasks == 0
+					&& parkedTasks == 0
+					&& outstandingTasks == 0
+					&& terminalOutcomes() == submissionAttempts;
+		}
 	}
 
 	public record SchedulerSnapshot(Map<Pool, PoolSnapshot> pools, boolean storagePressure) {

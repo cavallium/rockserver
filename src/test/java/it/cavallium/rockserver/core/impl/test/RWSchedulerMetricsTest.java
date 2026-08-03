@@ -99,6 +99,18 @@ class RWSchedulerMetricsTest {
 					Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch"),
 					0.0);
 			assertGauge(registry,
+					"rockserver.workload.parked",
+					Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch"),
+					0.0);
+			assertGauge(registry,
+					"rockserver.workload.outstanding",
+					Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch"),
+					0.0);
+			assertGauge(registry,
+					"rockserver.workload.submission.attempts",
+					Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch"),
+					0.0);
+			assertGauge(registry,
 					"rockserver.workload.worker.limit",
 					Map.of("database", DATABASE, RESOURCE, "read"),
 					1.0);
@@ -106,6 +118,10 @@ class RWSchedulerMetricsTest {
 					"rockserver.workload.queue.capacity",
 					Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch"),
 					1.0);
+			assertGauge(registry,
+					"rockserver.workload.outstanding.limit",
+					Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch"),
+					2.0);
 			assertGauge(registry,
 					"rockserver.workload.storage.pressure",
 					Map.of("database", DATABASE),
@@ -227,6 +243,15 @@ class RWSchedulerMetricsTest {
 							"boundary_seek",
 							"outcome",
 							"deadline"));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
+			assertGauge(registry,
+					"rockserver.workload.submission.attempts",
+					Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch"),
+					6.0);
+			assertGauge(registry,
+					"rockserver.workload.outstanding",
+					Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch"),
+					0.0);
 		} finally {
 			release.countDown();
 			scheduler.dispose();
@@ -335,6 +360,8 @@ class RWSchedulerMetricsTest {
 				new RegistrationFailureTarget("rockserver.workload.outcomes", with(taskTags(), "outcome", "run")),
 				new RegistrationFailureTarget("rockserver.workload.admission", with(taskTags(), "result", "accepted")),
 				new RegistrationFailureTarget("rockserver.workload.queued",
+						Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch")),
+				new RegistrationFailureTarget("rockserver.workload.outstanding",
 						Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch")),
 				new RegistrationFailureTarget("rockserver.workload.worker.limit",
 						Map.of("database", DATABASE, RESOURCE, "read")),

@@ -116,7 +116,6 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		private static final int RUNNING = 1;
 		private static final int FINISHED = 2;
 		private static final int CANCELLED = 3;
-		private static final int CANCELLED_WHILE_RUNNING = 4;
 
 		private final RWScheduler scheduler;
 		private final RWScheduler.WorkloadExecutor executor;
@@ -162,7 +161,7 @@ final class IndexedWorkloadScheduler implements Scheduler {
 					currentState = RUNNING;
 				}
 			}
-			if (currentState != RUNNING && currentState != CANCELLED_WHILE_RUNNING) {
+			if (currentState != RUNNING) {
 				deleteFromParent();
 				return;
 			}
@@ -178,19 +177,19 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		public void dispose() {
 			boolean cancelledBeforeDispatch = cancellationState.cancel();
 			boolean removeQueued = false;
+			boolean cancellationWon = false;
 			synchronized (this) {
 				if (cancelledBeforeDispatch && state.compareAndSet(QUEUED, CANCELLED)) {
 					removeQueued = submitted;
-				} else if (!cancelledBeforeDispatch) {
-					if (!state.compareAndSet(RUNNING, CANCELLED_WHILE_RUNNING)) {
-						state.compareAndSet(QUEUED, CANCELLED_WHILE_RUNNING);
-					}
+					cancellationWon = true;
 				}
 			}
 			if (removeQueued) {
 				scheduler.removeQueuedTask(executor, this);
 			}
-			deleteFromParent();
+			if (cancellationWon) {
+				deleteFromParent();
+			}
 		}
 
 		@Override

@@ -80,6 +80,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final LinkedHashSet<WorkloadTask> cooperativeTasks = new LinkedHashSet<>();
 	private final EnumMap<WorkloadProfile, Integer> queued = new EnumMap<>(WorkloadProfile.class);
 	private final EnumMap<WorkloadProfile, Integer> active = new EnumMap<>(WorkloadProfile.class);
+	private final int[] parked = new int[WorkloadProfile.values().length];
+	private final int[] outstanding = new int[WorkloadProfile.values().length];
+	private final long[] submissionAttemptsByProfile = new long[WorkloadProfile.values().length];
 	private final EnumMap<WorkloadProfile, Integer> deficit = new EnumMap<>(WorkloadProfile.class);
 	private final EnumMap<RWScheduler.TerminalOutcome, Long> outcomes =
 			new EnumMap<>(RWScheduler.TerminalOutcome.class);
@@ -101,6 +104,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private int waitingWorkers;
 	private int queuedTotal;
 	private int activeTotal;
+	private int parkedTotal;
+	private int outstandingTotal;
 	private int competingTasks;
 	// Updated under the scheduler lock on empty/nonempty queue transitions and read by running quantums.
 	private volatile boolean localQueuedCompetition;
@@ -109,6 +114,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private int guaranteedCursor;
 	private boolean guaranteedNeedsQuantum = true;
 	private long acceptedTasks;
+	private long submissionAttempts;
 	private long startedTasks;
 	private long completedTasks;
 	private long failedTasks;
@@ -232,6 +238,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		try {
 			long nowMillis = System.currentTimeMillis();
 			terminalActions = expireDueUnsafe(nowMillis, terminalActions);
+			recordSubmissionAttemptUnsafe(profile);
 			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
 				admissionFailure = deadlineFailure("Workload deadline expired before admission");
 				admissionResult = AdmissionResult.DEADLINE;
@@ -260,8 +267,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						taskMetrics,
 						admissionFailure,
 						terminalActions);
+			} else if (outstandingAtLimitUnsafe(profile)) {
+				admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
+						"Workload outstanding limit is reached for " + profile + " " + family);
+				admissionResult = AdmissionResult.OVERLOAD;
+				terminalActions = recordUnacceptedUnsafe(
+						RWScheduler.TerminalOutcome.OVERLOAD,
+						command,
+						taskMetrics,
+						admissionFailure,
+						terminalActions);
 			} else {
 				enqueueCooperativeUnsafe(task, true);
+				incrementOutstandingUnsafe(profile);
 				admitCompetitionUnsafe(task);
 				acceptedTasks++;
 				admissionResult = AdmissionResult.ACCEPTED;
@@ -300,6 +318,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		try {
 			long nowMillis = System.currentTimeMillis();
 			terminalActions = expireDueUnsafe(nowMillis, terminalActions);
+			recordSubmissionAttemptUnsafe(profile);
 			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
 				admissionFailure = deadlineFailure("Workload deadline expired before admission");
 				admissionResult = AdmissionResult.DEADLINE;
@@ -328,6 +347,16 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						taskMetrics,
 						admissionFailure,
 						terminalActions);
+			} else if (outstandingAtLimitUnsafe(profile)) {
+				admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
+						"Workload outstanding limit is reached for " + profile + " " + family);
+				admissionResult = AdmissionResult.OVERLOAD;
+				terminalActions = recordUnacceptedUnsafe(
+						RWScheduler.TerminalOutcome.OVERLOAD,
+						command,
+						taskMetrics,
+						admissionFailure,
+						terminalActions);
 			} else {
 				var task = WorkloadTask.normal(profile,
 						family,
@@ -341,6 +370,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				boolean becomesDeadlineHead = task.hasDeadline()
 						&& (deadlineQueue.isEmpty() || DEADLINE_ORDER.compare(task, deadlineQueue.first()) < 0);
 				enqueueUnsafe(task);
+				incrementOutstandingUnsafe(profile);
 				admitCompetitionUnsafe(task);
 				acceptedTasks++;
 				admissionResult = AdmissionResult.ACCEPTED;
@@ -500,12 +530,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						terminalActions);
 				continue;
 			}
-			// Atomically claim the internal cancellation state at the last
-			// pre-permit boundary. Once claimed, disposal is a running-task race.
-			if (!task.claimForDispatch()) {
-				cancelSelectedUnsafe(task, terminalActions);
-				continue;
-			}
 			WorkloadPressureController.BatchPermit batchPermit = null;
 			if (task.profile() == WorkloadProfile.BATCH) {
 				batchPermit = pressureController.tryStartBatch(shutdown, resourcePool, System.nanoTime());
@@ -513,6 +537,18 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					advanceGuaranteedCursor();
 					return null;
 				}
+			}
+			// A BATCH permit must exist before the one-shot dispatch claim. Cancellation
+			// can therefore either remove queued ownership or lose to execution ownership;
+			// it can never consume a pacing interval without running a quantum.
+			if (!task.claimForDispatch()) {
+				if (batchPermit != null) {
+					pressureController.abortBatch(batchPermit, resourcePool);
+				}
+				if (!cancelSelectedUnsafe(task, terminalActions)) {
+					throw new IllegalStateException("Dispatch claim failed without cancellation");
+				}
+				continue;
 			}
 			unlinkUnsafe(task);
 			if (batchPermit != null) {
@@ -637,6 +673,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			activeTotal--;
 			completeCompetitionUnsafe(task);
 			task.outcome(outcome);
+			decrementOutstandingUnsafe(task.profile());
 			completedTasks++;
 			task.markTerminal();
 			recordOutcomeUnsafe(outcome);
@@ -684,7 +721,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 							refreshCooperativeSequenceUnsafe(task);
 							enqueueCooperativeUnsafe(task, false);
 						} else {
-							task.markParked();
+							markParkedUnsafe(task);
 						}
 					}
 				}
@@ -713,6 +750,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				case ACTIVE -> task.requestResume();
 				case PARKED -> {
 					if (task.requestedOutcome() == null) {
+						unmarkParkedUnsafe(task);
 						refreshCooperativeSequenceUnsafe(task);
 						enqueueCooperativeUnsafe(task, false);
 						refreshPreemptionUnsafe();
@@ -996,8 +1034,39 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
+	int parked(WorkloadProfile profile) {
+		lock.lock();
+		try {
+			return parked[profile.ordinal()];
+		} finally {
+			lock.unlock();
+		}
+	}
+
+	int outstanding(WorkloadProfile profile) {
+		lock.lock();
+		try {
+			return outstanding[profile.ordinal()];
+		} finally {
+			lock.unlock();
+		}
+	}
+
+	long submissionAttempts(WorkloadProfile profile) {
+		lock.lock();
+		try {
+			return submissionAttemptsByProfile[profile.ordinal()];
+		} finally {
+			lock.unlock();
+		}
+	}
+
 	int capacity(WorkloadProfile profile) {
 		return capacities.get(profile);
+	}
+
+	long outstandingLimit(WorkloadProfile profile) {
+		return (long) capacities.get(profile) + workerCount;
 	}
 
 	int workerCount() {
@@ -1007,6 +1076,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	ExecutorSnapshot snapshot() {
 		lock.lock();
 		try {
+			validateAccountingUnsafe();
 			int batchQueued = queuedUnsafe(WorkloadProfile.BATCH);
 			int batchStartAllowance = pressureController.batchStartAllowance(
 					shutdown, resourcePool, System.nanoTime());
@@ -1015,12 +1085,18 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					waitingWorkers,
 					queuedTotal,
 					activeTotal,
+					parkedTotal,
+					outstandingTotal,
+					submissionAttempts,
 					acceptedTasks,
 					startedTasks,
 					completedTasks,
 					failedTasks,
+					snapshot(submissionAttemptsByProfile),
 					Map.copyOf(queued),
 					Map.copyOf(active),
+					snapshot(parked),
+					snapshot(outstanding),
 					Map.copyOf(outcomes),
 					batchQueued > batchStartAllowance,
 					batchStartAllowance,
@@ -1030,6 +1106,44 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} finally {
 			lock.unlock();
 		}
+	}
+
+	private void validateAccountingUnsafe() {
+		if ((long) queuedTotal + activeTotal + parkedTotal != outstandingTotal) {
+			throw new IllegalStateException("Pool outstanding accounting mismatch in " + poolName);
+		}
+		long terminalOutcomes = 0L;
+		for (var outcome : RWScheduler.TerminalOutcome.values()) {
+			terminalOutcomes += outcomes.get(outcome);
+		}
+		if (terminalOutcomes + outstandingTotal != submissionAttempts) {
+			throw new IllegalStateException("Pool submission conservation mismatch in " + poolName);
+		}
+		for (var profile : WorkloadProfile.values()) {
+			int profileOutstanding = outstanding[profile.ordinal()];
+			if ((long) queued.get(profile) + active.get(profile) + parked[profile.ordinal()] != profileOutstanding) {
+				throw new IllegalStateException("Profile outstanding accounting mismatch for " + profile);
+			}
+			if (profileOutstanding > (long) capacities.get(profile) + workerCount) {
+				throw new IllegalStateException("Profile outstanding limit exceeded for " + profile);
+			}
+		}
+	}
+
+	private static Map<WorkloadProfile, Integer> snapshot(int[] values) {
+		var result = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
+		for (var profile : WorkloadProfile.values()) {
+			result.put(profile, values[profile.ordinal()]);
+		}
+		return Map.copyOf(result);
+	}
+
+	private static Map<WorkloadProfile, Long> snapshot(long[] values) {
+		var result = new EnumMap<WorkloadProfile, Long>(WorkloadProfile.class);
+		for (var profile : WorkloadProfile.values()) {
+			result.put(profile, values[profile.ordinal()]);
+		}
+		return Map.copyOf(result);
 	}
 
 	void signalAvailability() {
@@ -1211,6 +1325,57 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
+	private void recordSubmissionAttemptUnsafe(WorkloadProfile profile) {
+		submissionAttempts++;
+		submissionAttemptsByProfile[profile.ordinal()]++;
+	}
+
+	private boolean outstandingAtLimitUnsafe(WorkloadProfile profile) {
+		return outstanding[profile.ordinal()] >= (long) capacities.get(profile) + workerCount;
+	}
+
+	private void incrementOutstandingUnsafe(WorkloadProfile profile) {
+		int index = profile.ordinal();
+		int next = outstanding[index] + 1;
+		if (next > (long) capacities.get(profile) + workerCount) {
+			throw new IllegalStateException("Outstanding workload limit exceeded for " + profile);
+		}
+		outstanding[index] = next;
+		outstandingTotal++;
+	}
+
+	private void decrementOutstandingUnsafe(WorkloadProfile profile) {
+		int index = profile.ordinal();
+		int current = outstanding[index];
+		if (current <= 0 || outstandingTotal <= 0) {
+			throw new IllegalStateException("Outstanding workload count underflow for " + profile);
+		}
+		outstanding[index] = current - 1;
+		outstandingTotal--;
+	}
+
+	private void markParkedUnsafe(WorkloadTask task) {
+		if (task.state() != TaskState.ACTIVE) {
+			throw new IllegalStateException("Only an active cooperative task can park");
+		}
+		parked[task.profile().ordinal()]++;
+		parkedTotal++;
+		task.markParked();
+	}
+
+	private void unmarkParkedUnsafe(WorkloadTask task) {
+		if (task.state() != TaskState.PARKED) {
+			throw new IllegalStateException("Cooperative task is not parked");
+		}
+		int index = task.profile().ordinal();
+		int current = parked[index];
+		if (current <= 0 || parkedTotal <= 0) {
+			throw new IllegalStateException("Parked workload count underflow for " + task.profile());
+		}
+		parked[index] = current - 1;
+		parkedTotal--;
+	}
+
 	private boolean terminateUnsafe(WorkloadTask task,
 	                                RWScheduler.TerminalOutcome outcome,
 	                                @Nullable RuntimeException failure,
@@ -1228,6 +1393,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		task.outcome(outcome);
 		if (outcome != RWScheduler.TerminalOutcome.RUN) {
 			completeCompetitionUnsafe(task);
+			decrementOutstandingUnsafe(task.profile());
 			task.markTerminal();
 		}
 		recordOutcomeUnsafe(outcome);
@@ -1262,11 +1428,15 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			cancellationIndex.remove(task.cancellationKey());
 		}
 		task.clearCancellationIndex();
+		if (task.state() == TaskState.PARKED) {
+			unmarkParkedUnsafe(task);
+		}
 		if (!cooperativeTasks.remove(task)) {
 			throw new IllegalStateException("Cooperative workload task is not admitted");
 		}
 		completeCompetitionUnsafe(task);
 		task.outcome(outcome);
+		decrementOutstandingUnsafe(task.profile());
 		task.markTerminal();
 		if (task.hasStarted()) {
 			completedTasks++;
@@ -1458,11 +1628,21 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					"resource", resourceKind,
 					"profile", metricName(profile)
 			};
+			registerGauge(registry,
+					"rockserver.workload.submission.attempts",
+					pool -> pool.submissionAttempts(profile),
+					tags);
 			registerGauge(registry, "rockserver.workload.queued", pool -> pool.queued(profile), tags);
 			registerGauge(registry, "rockserver.workload.active", pool -> pool.active(profile), tags);
+			registerGauge(registry, "rockserver.workload.parked", pool -> pool.parked(profile), tags);
+			registerGauge(registry, "rockserver.workload.outstanding", pool -> pool.outstanding(profile), tags);
 			registerGauge(registry,
 					"rockserver.workload.queue.capacity",
 					pool -> pool.capacity(profile),
+					tags);
+			registerGauge(registry,
+					"rockserver.workload.outstanding.limit",
+					pool -> pool.outstandingLimit(profile),
 					tags);
 		}
 	}
@@ -2538,11 +2718,7 @@ final class WorkloadPressureController {
 	void finishBatch(BatchPermit permit, RWScheduler.Pool completedPool) {
 		int otherQueuedBatchPools;
 		synchronized (this) {
-			if (activeBatches <= 0) {
-				throw new IllegalStateException("No active BATCH quantum to finish");
-			}
-			activeBatches--;
-			decrementActiveBatches(resourcePool(completedPool));
+			releaseActiveBatchUnsafe(completedPool);
 			otherQueuedBatchPools = queuedBatchPoolMask & ~poolBit(completedPool);
 			if (completedPool == RWScheduler.Pool.WRITE && permit.startedUnderCompetition()) {
 				nextCompetingWriteNanos = saturatingDeadline(System.nanoTime(), competingWriteIntervalNanos);
@@ -2559,6 +2735,29 @@ final class WorkloadPressureController {
 		if (otherQueuedBatchPools != 0) {
 			batchNotifier.accept(otherQueuedBatchPools);
 		}
+	}
+
+	void abortBatch(BatchPermit permit, RWScheduler.Pool abortedPool) {
+		Objects.requireNonNull(permit, "permit");
+		synchronized (this) {
+			releaseActiveBatchUnsafe(abortedPool);
+			// Aborting a pre-dispatch permit deliberately leaves both pacing clocks
+			// unchanged: no BATCH quantum consumed storage or worker time. The caller
+			// still owns its executor lock here, so defer every external wakeup until
+			// workerLoop calls signalPendingAvailability() after unlocking.
+			if ((queuedBatchPoolMask & ~poolBit(abortedPool)) != 0) {
+				notificationPending = true;
+			}
+		}
+	}
+
+	private void releaseActiveBatchUnsafe(RWScheduler.Pool pool) {
+		var dataPool = resourcePool(pool);
+		if (activeBatches <= 0) {
+			throw new IllegalStateException("No active BATCH permit to release");
+		}
+		activeBatches--;
+		decrementActiveBatches(dataPool);
 	}
 
 	synchronized long nanosUntilBatchEligible(RWScheduler.Pool pool, long nowNanos) {
@@ -2636,12 +2835,18 @@ record ExecutorSnapshot(int workerCount,
 						int waitingWorkers,
                         int queuedTasks,
                         int activeTasks,
+						int parkedTasks,
+						int outstandingTasks,
+						long submissionAttempts,
                         long acceptedTasks,
                         long startedTasks,
                         long completedTasks,
                         long failedTasks,
+						Map<WorkloadProfile, Long> submissionAttemptsByProfile,
                         Map<WorkloadProfile, Integer> queuedByProfile,
                         Map<WorkloadProfile, Integer> activeByProfile,
+						Map<WorkloadProfile, Integer> parkedByProfile,
+						Map<WorkloadProfile, Integer> outstandingByProfile,
                         Map<RWScheduler.TerminalOutcome, Long> outcomes,
 						boolean batchDispatchLimited,
 						int batchStartAllowance,

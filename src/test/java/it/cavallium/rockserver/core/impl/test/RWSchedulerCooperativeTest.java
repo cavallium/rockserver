@@ -4,6 +4,7 @@ import com.sun.management.ThreadMXBean;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import org.junit.jupiter.api.Assumptions;
@@ -345,6 +346,90 @@ class RWSchedulerCooperativeTest {
 		} finally {
 			scheduler.disposeNow();
 		}
+	}
+
+	@Test
+	void parkedBacklogHasAFixedAdmissionBoundAndExactConservation() throws Exception {
+		var registry = new SimpleMeterRegistry();
+		var scheduler = RWScheduler.forTesting(
+				1, 1, 1, 1, 1, "cooperative-parked-bound", registry, "cooperative-parked-bound-db");
+		var tasks = new ArrayList<ParkOnceTask>();
+		var handles = new ArrayList<RWScheduler.CooperativeHandle>();
+		var executor = scheduler.executor(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+		try {
+			for (int i = 0; i < 2; i++) {
+				var task = new ParkOnceTask();
+				tasks.add(task);
+				handles.add(executor.executeCooperatively(task, 1L));
+				assertTrue(task.parked.await(5, SECONDS));
+				int expectedParked = i + 1;
+				assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).parkedTasks()
+						== expectedParked);
+			}
+
+			var saturated = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(0, saturated.queuedTasks());
+			assertEquals(0, saturated.activeTasks());
+			assertEquals(2, saturated.parkedTasks());
+			assertEquals(2, saturated.outstandingTasks());
+			assertEquals(2, saturated.outstandingByProfile().get(WorkloadProfile.BATCH));
+
+			var rejected = new ParkOnceTask();
+			var overload = assertThrows(RocksDBException.class,
+					() -> executor.executeCooperatively(rejected, 1L));
+			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
+					overload.getErrorUniqueId());
+			assertTrue(rejected.completed.await(5, SECONDS));
+			assertSame(overload, rejected.failure.get());
+			assertEquals(3.0, parkedGauge(registry, "rockserver.workload.submission.attempts"));
+			assertEquals(2.0, parkedGauge(registry, "rockserver.workload.parked"));
+			assertEquals(2.0, parkedGauge(registry, "rockserver.workload.outstanding"));
+
+			assertTrue(handles.getFirst().cancel());
+			assertTrue(tasks.getFirst().completed.await(5, SECONDS));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).outstandingTasks() == 1);
+
+			var replacement = new ParkOnceTask();
+			tasks.add(replacement);
+			var replacementHandle = executor.executeCooperatively(replacement, 1L);
+			handles.add(replacementHandle);
+			assertTrue(replacement.parked.await(5, SECONDS));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).parkedTasks() == 2);
+
+			for (int i = 1; i < handles.size(); i++) {
+				assertTrue(handles.get(i).cancel());
+				assertTrue(tasks.get(i).completed.await(5, SECONDS));
+			}
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).outstandingTasks() == 0);
+
+			var drained = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(4L, drained.submissionAttempts());
+			assertEquals(4L, drained.submissionAttemptsByProfile().get(WorkloadProfile.BATCH));
+			assertEquals(3L, drained.acceptedTasks());
+			assertEquals(3L, drained.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+			assertEquals(1L, drained.outcomes().get(RWScheduler.TerminalOutcome.OVERLOAD));
+			assertEquals(4L, drained.terminalOutcomes());
+			assertTrue(drained.drainedAndConserved());
+			assertEquals(4.0, parkedGauge(registry, "rockserver.workload.submission.attempts"));
+			assertEquals(0.0, parkedGauge(registry, "rockserver.workload.parked"));
+			assertEquals(0.0, parkedGauge(registry, "rockserver.workload.outstanding"));
+		} finally {
+			for (var handle : handles) {
+				handle.cancel();
+			}
+			scheduler.disposeNow();
+			registry.close();
+		}
+	}
+
+	private static double parkedGauge(SimpleMeterRegistry registry, String name) {
+		return registry.get(name)
+				.tags("database", "cooperative-parked-bound-db",
+						"resource", "read",
+						"profile", "batch")
+				.gauge()
+				.value();
 	}
 
 	@Test
