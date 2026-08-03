@@ -17,6 +17,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 
@@ -118,6 +119,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	private final EmbeddedDB db;
 	private final Map<Long, AsyncIteratorOperation> asyncIteratorOperations = new ConcurrentHashMap<>();
 	private final Map<Long, CompletableFuture<Void>> closingAsyncIterators = new ConcurrentHashMap<>();
+	private volatile boolean closingConnection;
 	public static final URI PRIVATE_MEMORY_URL = URI.create("memory://private");
 
 	EmbeddedConnectionDelegate(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
@@ -127,14 +129,23 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 	@VisibleForTesting
 	public void closeTesting() throws IOException {
+		beginIteratorShutdown();
 		db.closeTesting();
 		super.close();
 	}
 
 	@Override
 	public void close() throws IOException {
+		beginIteratorShutdown();
 		db.close();
 		super.close();
+	}
+
+	private void beginIteratorShutdown() {
+		closingConnection = true;
+		for (var operation : asyncIteratorOperations.values()) {
+			operation.requestCancellation();
+		}
 	}
 
 	@Override
@@ -529,7 +540,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Iterator skip and take counts must be non-negative"));
 		}
-		db.validateIteratorProfile(iterationId, currentRequestContext().profile());
+		var context = currentRequestContext();
+		db.validateIteratorProfile(iterationId, context.profile());
 		var iteratorOperation = acquireAsyncIteratorOperation(iterationId);
 		if (iteratorOperation == null) {
 			return CompletableFuture.failedFuture(RocksDBException.of(
@@ -537,10 +549,32 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					"Concurrent operation on iterator " + iterationId + " is not supported"));
 		}
 
-		var cancelled = new AtomicBoolean();
 		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<>(
 				iterationId, skipCount, takeCount, requestType);
-		var workloadExecutor = commandExecutor(command);
+		RWScheduler.WorkloadExecutor workloadExecutor;
+		WorkloadProfile profile;
+		try {
+			profile = resolveCommand(context, command);
+			workloadExecutor = db.getScheduler().executor(
+					profile, command.operationFamily(), context.deadlineEpochMillis());
+		} catch (Throwable error) {
+			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
+			return CompletableFuture.failedFuture(error);
+		}
+
+		if (requiresCooperativeIteratorContinuation(profile, skipCount, takeCount)) {
+			var continuation = new CooperativeIteratorContinuation<T>(
+					iterationId, skipCount, takeCount, requestType, iteratorOperation);
+			iteratorOperation.attachCancellation(() -> continuation.cancel(false));
+			try {
+				continuation.attach(workloadExecutor.executeCooperatively(continuation, 0L));
+			} catch (Throwable admissionFailure) {
+				continuation.finish(null, admissionFailure);
+			}
+			return continuation;
+		}
+
+		var cancelled = new AtomicBoolean();
 		CompletableFuture<T> result = new CompletableFuture<>() {
 			@Override
 			public boolean cancel(boolean mayInterruptIfRunning) {
@@ -596,6 +630,15 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			}
 		});
 		return result;
+	}
+
+	private static boolean requiresCooperativeIteratorContinuation(WorkloadProfile profile,
+			long skipCount,
+			long takeCount) {
+		return profile != WorkloadProfile.LATENCY
+				&& (skipCount > ITERATOR_READ_STEP_SIZE
+						|| takeCount > ITERATOR_READ_STEP_SIZE
+						|| skipCount > ITERATOR_READ_STEP_SIZE - takeCount);
 	}
 
 	@Override
@@ -666,14 +709,14 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	}
 
 	private @Nullable AsyncIteratorOperation acquireAsyncIteratorOperation(long iteratorId) {
-		if (closingAsyncIterators.containsKey(iteratorId)) {
+		if (closingConnection || closingAsyncIterators.containsKey(iteratorId)) {
 			return null;
 		}
 		var operation = new AsyncIteratorOperation();
 		if (asyncIteratorOperations.putIfAbsent(iteratorId, operation) != null) {
 			return null;
 		}
-		if (closingAsyncIterators.containsKey(iteratorId)) {
+		if (closingConnection || closingAsyncIterators.containsKey(iteratorId)) {
 			releaseAsyncIteratorOperation(iteratorId, operation);
 			return null;
 		}
@@ -694,6 +737,241 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	private static final class AsyncIteratorOperation {
 
 		private final CompletableFuture<Void> finished = new CompletableFuture<>();
+		private volatile boolean cancellationRequested;
+		private volatile @Nullable Runnable cancellation;
+
+		private void attachCancellation(Runnable cancellation) {
+			this.cancellation = Objects.requireNonNull(cancellation, "cancellation");
+			if (cancellationRequested) {
+				cancellation.run();
+			}
+		}
+
+		private void requestCancellation() {
+			cancellationRequested = true;
+			var currentCancellation = cancellation;
+			if (currentCancellation != null) {
+				currentCancellation.run();
+			}
+		}
+	}
+
+	private enum IteratorContinuationStage {
+		SKIP,
+		TAKE,
+		DONE
+	}
+
+	private enum IteratorRequestMode {
+		NONE,
+		EXISTS,
+		MULTI
+	}
+
+	/**
+	 * One logical iterator request whose scheduler node and bounded native progress survive
+	 * cooperative redispatch. No JNI-owned state is retained here: every native step enters
+	 * and leaves {@link EmbeddedDB} before this state can yield.
+	 */
+	private final class CooperativeIteratorContinuation<T> extends CompletableFuture<T>
+			implements RWScheduler.CooperativeTask, reactor.core.Disposable {
+
+		private final long iterationId;
+		private final AsyncIteratorOperation iteratorOperation;
+		private final IteratorRequestMode mode;
+		private final @Nullable ArrayList<Buf> values;
+		private final AtomicBoolean terminated = new AtomicBoolean();
+		private volatile boolean cancellationRequested;
+		private volatile @Nullable CancellationException cancellationFailure;
+		private volatile @Nullable RWScheduler.CooperativeHandle handle;
+		private IteratorContinuationStage stage;
+		private long remainingSkip;
+		private long remainingTake;
+		private boolean exhausted;
+		private boolean found;
+
+		private CooperativeIteratorContinuation(long iterationId,
+				long skipCount,
+				long takeCount,
+				RequestType.RequestIterate<? super Buf, T> requestType,
+				AsyncIteratorOperation iteratorOperation) {
+			this.iterationId = iterationId;
+			this.iteratorOperation = iteratorOperation;
+			this.mode = switch (requestType) {
+				case RequestType.RequestNothing<?> _ -> IteratorRequestMode.NONE;
+				case RequestType.RequestExists<?> _ -> IteratorRequestMode.EXISTS;
+				case RequestType.RequestMulti<?> _ -> IteratorRequestMode.MULTI;
+			};
+			this.values = mode == IteratorRequestMode.MULTI
+					? new ArrayList<>((int) Math.min(takeCount, 1_024L))
+					: null;
+			this.remainingSkip = skipCount;
+			this.remainingTake = takeCount;
+			this.stage = skipCount == 0L
+					? (takeCount == 0L ? IteratorContinuationStage.DONE : IteratorContinuationStage.TAKE)
+					: IteratorContinuationStage.SKIP;
+		}
+
+		private void attach(RWScheduler.CooperativeHandle handle) {
+			this.handle = Objects.requireNonNull(handle, "handle");
+			if (cancellationRequested) {
+				handle.dispose();
+			}
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			if (terminated.get()) {
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+			try {
+				while (true) {
+					var terminationFailure = requestedTermination(context);
+					if (terminationFailure != null) {
+						finish(null, terminationFailure);
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					if (stage == IteratorContinuationStage.DONE) {
+						finish(completedValue(), null);
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+
+					switch (stage) {
+						case SKIP -> runSkipStep();
+						case TAKE -> runTakeStep();
+						case DONE -> throw new IllegalStateException("Completed iterator stage was dispatched");
+					}
+
+					terminationFailure = requestedTermination(context);
+					if (terminationFailure != null) {
+						finish(null, terminationFailure);
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					if (stage == IteratorContinuationStage.DONE) {
+						finish(completedValue(), null);
+						return RWScheduler.CooperativeResult.COMPLETE;
+					}
+					if (context.preemptionRequested()) {
+						return RWScheduler.CooperativeResult.YIELD;
+					}
+				}
+			} catch (VirtualMachineError fatal) {
+				finish(null, fatal);
+				throw fatal;
+			} catch (Throwable failure) {
+				finish(null, failure);
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+		}
+
+		private @Nullable RuntimeException requestedTermination(RWScheduler.CooperativeContext context) {
+			if (cancellationRequested) {
+				return Objects.requireNonNull(cancellationFailure, "cancellationFailure");
+			}
+			if (!context.terminationRequested()) {
+				return null;
+			}
+			return Objects.requireNonNull(
+					context.terminationFailure(), "Cooperative termination failure");
+		}
+
+		private void runSkipStep() {
+			long step = Math.min(remainingSkip, ITERATOR_READ_STEP_SIZE);
+			long advanced = db.advanceIteratorInternal(iterationId, step);
+			remainingSkip -= advanced;
+			if (advanced < step) {
+				exhausted = true;
+				stage = IteratorContinuationStage.DONE;
+			} else if (remainingSkip == 0L) {
+				stage = remainingTake == 0L
+						? IteratorContinuationStage.DONE
+						: IteratorContinuationStage.TAKE;
+			}
+		}
+
+		private void runTakeStep() {
+			long step = Math.min(remainingTake, ITERATOR_READ_STEP_SIZE);
+			switch (mode) {
+				case NONE, EXISTS -> {
+					long advanced = db.advanceIteratorInternal(iterationId, step);
+					remainingTake -= advanced;
+					if (mode == IteratorRequestMode.EXISTS) {
+						found |= advanced > 0L;
+					}
+					if (advanced < step) {
+						exhausted = true;
+						stage = IteratorContinuationStage.DONE;
+					} else if (remainingTake == 0L) {
+						stage = IteratorContinuationStage.DONE;
+					}
+				}
+				case MULTI -> {
+					List<Buf> page = db.subsequent(iterationId, 0L, step, RequestType.multi());
+					Objects.requireNonNull(values, "values").addAll(page);
+					remainingTake -= page.size();
+					if (page.size() < step) {
+						exhausted = true;
+						stage = IteratorContinuationStage.DONE;
+					} else if (remainingTake == 0L) {
+						stage = IteratorContinuationStage.DONE;
+					}
+				}
+			}
+		}
+
+		private T completedValue() {
+			if (exhausted && stage != IteratorContinuationStage.DONE) {
+				throw new IllegalStateException("Exhausted iterator continuation is not terminal");
+			}
+			Object value = switch (mode) {
+				case NONE -> null;
+				case EXISTS -> found;
+				case MULTI -> Objects.requireNonNull(values, "values");
+			};
+			return RequestType.safeCast(value);
+		}
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			if (!super.cancel(false)) {
+				return false;
+			}
+			cancellationFailure = new CancellationException("Iterator continuation cancelled");
+			cancellationRequested = true;
+			var currentHandle = handle;
+			if (currentHandle != null) {
+				currentHandle.dispose();
+			}
+			return true;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			finish(null, failure);
+		}
+
+		@Override
+		public void dispose() {
+			cancel(false);
+		}
+
+		@Override
+		public boolean isDisposed() {
+			return terminated.get();
+		}
+
+		private void finish(@Nullable T value, @Nullable Throwable failure) {
+			if (!terminated.compareAndSet(false, true)) {
+				return;
+			}
+			// Publish iterator-gate release before success/failure becomes observable.
+			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
+			if (failure == null) {
+				complete(value);
+			} else {
+				completeExceptionally(failure);
+			}
+		}
 	}
 
 	/** @return true when the iterator was exhausted before consuming the requested count. */
