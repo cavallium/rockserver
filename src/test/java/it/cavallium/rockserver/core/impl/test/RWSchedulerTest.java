@@ -416,6 +416,8 @@ class RWSchedulerTest {
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks() == 1L);
 			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			assertEquals(1L, snapshot.failedTasks());
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN));
 			assertEquals(1.0,
 					registry.get("rockserver.workload.failures")
 							.tags("database", "failure-db",

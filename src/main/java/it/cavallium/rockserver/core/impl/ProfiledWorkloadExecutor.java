@@ -527,9 +527,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					startedTasks++;
 				}
 			} else {
-				if (!terminateUnsafe(task, RWScheduler.TerminalOutcome.RUN, null, terminalActions)) {
-					throw new IllegalStateException("Queued workload task already has a terminal outcome");
-				}
 				startedTasks++;
 			}
 			refreshPreemptionUnsafe();
@@ -562,9 +559,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		var metrics = task.metrics();
 		long executionStart = System.nanoTime();
 		var previousPool = EXECUTING_POOL.get();
+		var outcome = RWScheduler.TerminalOutcome.FAILURE;
 		try {
 			EXECUTING_POOL.set(this);
 			task.command().run();
+			outcome = RWScheduler.TerminalOutcome.RUN;
 		} catch (VirtualMachineError fatal) {
 			throw fatal;
 		} catch (Throwable error) {
@@ -576,12 +575,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				EXECUTING_POOL.set(previousPool);
 			}
 			try {
-				metrics.recordOutcome(RWScheduler.TerminalOutcome.RUN);
+				metrics.recordOutcome(outcome);
 				metrics.queueWait().record(executionStart - task.enqueuedNanos());
 				metrics.quantum().increment();
 				metrics.execution().record(System.nanoTime() - executionStart);
 			} finally {
-				finishActive(task);
+				finishActive(task, outcome);
 			}
 		}
 	}
@@ -591,18 +590,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		long executionStart = System.nanoTime();
 		var previousPool = EXECUTING_POOL.get();
 		RWScheduler.CooperativeResult result = RWScheduler.CooperativeResult.COMPLETE;
-		RuntimeException executionFailure = null;
 		try {
 			EXECUTING_POOL.set(this);
 			result = Objects.requireNonNull(task.cooperativeCommand().runCooperatively(task),
 					"Cooperative task returned no result");
 		} catch (VirtualMachineError fatal) {
+			task.fail(new RejectedExecutionException("Cooperative workload quantum failed", fatal));
 			throw fatal;
 		} catch (Throwable error) {
 			recordTaskFailure(task, error);
-			executionFailure = error instanceof RuntimeException runtimeException
+			var failure = error instanceof RuntimeException runtimeException
 					? runtimeException
 					: new RejectedExecutionException("Cooperative workload quantum failed", error);
+			task.fail(failure);
 		} finally {
 			if (previousPool == null) {
 				EXECUTING_POOL.set(null);
@@ -611,7 +611,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			task.recordCooperativeQuantum(executionStart - task.enqueuedNanos(),
 					System.nanoTime() - executionStart);
-			var terminalAction = finishCooperative(task, result, executionFailure);
+			var terminalAction = finishCooperative(task, result);
 			if (task.state() == TaskState.TERMINAL) {
 				task.flushCooperativeMetrics();
 			}
@@ -623,18 +623,23 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
-	private void finishActive(WorkloadTask task) {
+	private void finishActive(WorkloadTask task, RWScheduler.TerminalOutcome outcome) {
 		var batchPermit = task.takeBatchPermit();
 		if (batchPermit != null) {
 			pressureController.finishBatch(batchPermit, resourcePool);
 		}
 		lock.lock();
 		try {
+			if (task.outcome() != null) {
+				throw new IllegalStateException("Active workload task already has a terminal outcome");
+			}
 			active.put(task.profile(), active.get(task.profile()) - 1);
 			activeTotal--;
 			completeCompetitionUnsafe(task);
+			task.outcome(outcome);
 			completedTasks++;
 			task.markTerminal();
+			recordOutcomeUnsafe(outcome);
 			refreshPreemptionUnsafe();
 			workAvailable.signal();
 		} finally {
@@ -644,8 +649,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private @Nullable TerminalAction finishCooperative(WorkloadTask task,
-	                                                   RWScheduler.CooperativeResult result,
-	                                                   @Nullable RuntimeException executionFailure) {
+	                                                   RWScheduler.CooperativeResult result) {
 		var batchPermit = task.takeBatchPermit();
 		if (batchPermit != null) {
 			pressureController.finishBatch(batchPermit, resourcePool);
@@ -659,11 +663,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			active.put(task.profile(), active.get(task.profile()) - 1);
 			activeTotal--;
-			if (executionFailure != null) {
-				terminalAction = terminateCooperativeUnsafe(task,
-						RWScheduler.TerminalOutcome.RUN,
-						executionFailure);
-			} else if (task.requestedOutcome() != null) {
+			if (task.requestedOutcome() != null) {
 				terminalAction = terminateCooperativeUnsafe(task,
 						Objects.requireNonNull(task.requestedOutcome()),
 						Objects.requireNonNull(task.terminationFailure()));
@@ -1538,7 +1538,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			case DEADLINE -> "deadline";
 			case OVERLOAD -> "queue_full";
 			case SHUTDOWN -> "shutdown";
-			case RUN, CANCELLATION -> throw new IllegalArgumentException("Not a rejection outcome: " + outcome);
+			case RUN, FAILURE, CANCELLATION ->
+					throw new IllegalArgumentException("Not a rejection outcome: " + outcome);
 		};
 	}
 
@@ -2055,6 +2056,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		public @Nullable RuntimeException terminationFailure() {
 			var requested = Objects.requireNonNull(requestedTermination, "Non-cooperative workload task").get();
 			return requested == null ? null : requested.failure();
+		}
+
+		@Override
+		public boolean fail(RuntimeException failure) {
+			return requestTermination(RWScheduler.TerminalOutcome.FAILURE,
+					Objects.requireNonNull(failure, "failure"));
 		}
 
 		@Override

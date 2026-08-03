@@ -544,6 +544,14 @@ public final class RWScheduler {
 		boolean terminationRequested();
 
 		@Nullable RuntimeException terminationFailure();
+
+		/**
+		 * Atomically publish a command failure as this submission's terminal cause.
+		 *
+		 * @return {@code true} when this failure won first-cause arbitration against
+		 * cancellation, deadline expiry, or shutdown
+		 */
+		boolean fail(RuntimeException failure);
 	}
 
 	/**
@@ -590,6 +598,7 @@ public final class RWScheduler {
 
 	public enum TerminalOutcome {
 		RUN,
+		FAILURE,
 		DEADLINE,
 		CANCELLATION,
 		OVERLOAD,

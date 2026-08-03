@@ -415,6 +415,35 @@ class RWSchedulerCooperativeTest {
 	}
 
 	@Test
+	void cooperativeFailureUsesDeterministicFirstCauseArbitration() throws Exception {
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-failure-authority");
+		var firstFailure = new IllegalStateException("first cooperative failure");
+		var task = new FirstCauseFailureTask(firstFailure);
+		try {
+			var handle = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+			assertTrue(task.failureSelected.await(5, SECONDS));
+			assertTrue(task.firstFailureSelected);
+			assertFalse(task.laterFailureSelected);
+			assertFalse(handle.cancel(), "the first command failure must beat later cancellation");
+
+			task.release.countDown();
+			assertTrue(task.terminal.await(5, SECONDS));
+			assertSame(firstFailure, task.rejection.get());
+			assertEventually(handle::isDisposed);
+
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+		} finally {
+			task.release.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void cooperativeYieldAllocatesNoSchedulerHeapAfterWarmup() throws Exception {
 		var threads = (ThreadMXBean) ManagementFactory.getThreadMXBean();
 		Assumptions.assumeTrue(threads.isThreadAllocatedMemorySupported());
@@ -755,6 +784,38 @@ class RWSchedulerCooperativeTest {
 		public void reject(RuntimeException failure) {
 			this.failure.compareAndSet(null, failure);
 			completed.countDown();
+		}
+	}
+
+	private static final class FirstCauseFailureTask implements RWScheduler.CooperativeTask {
+
+		private final RuntimeException firstFailure;
+		private final RuntimeException laterFailure = new IllegalArgumentException("later cooperative failure");
+		private final RuntimeException thrownFailure = new IllegalStateException("thrown cooperative failure");
+		private final CountDownLatch failureSelected = new CountDownLatch(1);
+		private final CountDownLatch release = new CountDownLatch(1);
+		private final CountDownLatch terminal = new CountDownLatch(1);
+		private final AtomicReference<RuntimeException> rejection = new AtomicReference<>();
+		private boolean firstFailureSelected;
+		private boolean laterFailureSelected;
+
+		private FirstCauseFailureTask(RuntimeException firstFailure) {
+			this.firstFailure = firstFailure;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			firstFailureSelected = context.fail(firstFailure);
+			laterFailureSelected = context.fail(laterFailure);
+			failureSelected.countDown();
+			awaitUninterruptibly(release);
+			throw thrownFailure;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			rejection.set(failure);
+			terminal.countDown();
 		}
 	}
 
