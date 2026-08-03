@@ -9,6 +9,8 @@ import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -28,8 +30,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.ToDoubleFunction;
@@ -49,6 +49,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private static final int MAX_DEFICIT = MAX_TASK_COST;
 	private static final Logger LOG = LoggerFactory.getLogger(ProfiledWorkloadExecutor.class);
 	private static final ThreadLocal<ProfiledWorkloadExecutor> EXECUTING_POOL = new ThreadLocal<>();
+	private static final WorkloadProfile[] PROFILES = WorkloadProfile.values();
+	private static final RWScheduler.TerminalOutcome[] TERMINAL_OUTCOMES =
+			RWScheduler.TerminalOutcome.values();
 	private static final WorkloadProfile[] GUARANTEED = {
 			WorkloadProfile.INGEST,
 			WorkloadProfile.CDC,
@@ -69,27 +72,24 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final int workerCount;
 	private final int analyticalLimit;
 	private final int maxLatencyBurst;
-	private final EnumMap<WorkloadProfile, Integer> quanta;
-	private final EnumMap<WorkloadProfile, Integer> capacities;
-	private final EnumMap<WorkloadProfile, Integer> reservations;
+	private final int[] quanta = new int[PROFILES.length];
+	private final int[] capacities = new int[PROFILES.length];
+	private final int[] reservations = new int[PROFILES.length];
 	private final NavigableSet<WorkloadTask> latencyQueue = new TreeSet<>(DEADLINE_ORDER);
 	private final EnumMap<WorkloadProfile, LinkedHashSet<WorkloadTask>> queues;
 	private final EnumMap<WorkloadProfile, CooperativeQueue> cooperativeQueues;
 	private final NavigableSet<WorkloadTask> deadlineQueue = new TreeSet<>(DEADLINE_ORDER);
 	private final Map<CancellationKey, CancellationChain> cancellationIndex = new HashMap<>();
-	private final LinkedHashSet<WorkloadTask> cooperativeTasks = new LinkedHashSet<>();
-	private final EnumMap<WorkloadProfile, Integer> queued = new EnumMap<>(WorkloadProfile.class);
-	private final EnumMap<WorkloadProfile, Integer> active = new EnumMap<>(WorkloadProfile.class);
-	private final int[] parked = new int[WorkloadProfile.values().length];
-	private final int[] outstanding = new int[WorkloadProfile.values().length];
-	private final long[] submissionAttemptsByProfile = new long[WorkloadProfile.values().length];
-	private final EnumMap<WorkloadProfile, Integer> deficit = new EnumMap<>(WorkloadProfile.class);
-	private final EnumMap<RWScheduler.TerminalOutcome, Long> outcomes =
-			new EnumMap<>(RWScheduler.TerminalOutcome.class);
+	private final int[] queued = new int[PROFILES.length];
+	private final int[] active = new int[PROFILES.length];
+	private final int[] parked = new int[PROFILES.length];
+	private final int[] outstanding = new int[PROFILES.length];
+	private final long[] submissionAttemptsByProfile = new long[PROFILES.length];
+	private final int[] deficit = new int[PROFILES.length];
+	private final long[] outcomes = new long[TERMINAL_OUTCOMES.length];
 	private final ReentrantLock lock = new ReentrantLock();
 	private final Condition workAvailable = lock.newCondition();
 	private final List<Thread> workers = new ArrayList<>();
-	private final AtomicLong sequence = new AtomicLong();
 	private final WorkloadPressureController pressureController;
 	private final String databaseName;
 	private final String resourceKind;
@@ -100,8 +100,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private volatile boolean shutdown;
 	private volatile boolean terminated;
 	private @Nullable Thread timedWaitLeader;
+	private @Nullable CooperativeWorkloadTask firstCooperativeTask;
+	private @Nullable CooperativeWorkloadTask lastCooperativeTask;
 	private int startedWorkers;
 	private int waitingWorkers;
+	private int cooperativeTaskCount;
 	private int queuedTotal;
 	private int activeTotal;
 	private int parkedTotal;
@@ -118,6 +121,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private long startedTasks;
 	private long completedTasks;
 	private long failedTasks;
+	private long sequence;
 
 	ProfiledWorkloadExecutor(int workerCount,
 	                         int analyticalLimit,
@@ -144,16 +148,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		this.workerCount = workerCount;
 		this.analyticalLimit = analyticalLimit;
 		this.maxLatencyBurst = maxLatencyBurst;
-		this.quanta = new EnumMap<>(WorkloadProfile.class);
 		for (var profile : GUARANTEED) {
 			int quantum = Objects.requireNonNull(quanta.get(profile), "Missing DRR weight for " + profile);
 			if (quantum < 1) {
 				throw new IllegalArgumentException("DRR weight must be positive for " + profile);
 			}
-			this.quanta.put(profile, quantum);
+			this.quanta[profile.ordinal()] = quantum;
 		}
-		this.capacities = new EnumMap<>(WorkloadProfile.class);
-		this.reservations = new EnumMap<>(WorkloadProfile.class);
 		this.queues = new EnumMap<>(WorkloadProfile.class);
 		this.cooperativeQueues = new EnumMap<>(WorkloadProfile.class);
 		this.pressureController = Objects.requireNonNull(pressureController, "pressureController");
@@ -161,7 +162,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		this.resourceKind = Objects.requireNonNull(resourceKind, "resourceKind");
 		this.resourcePool = Objects.requireNonNull(resourcePool, "resourcePool");
 		int reservationTotal = 0;
-		for (var profile : WorkloadProfile.values()) {
+		for (var profile : PROFILES) {
 			int capacity = capacities.getOrDefault(profile, 0);
 			int reservation = reservations.getOrDefault(profile, 0);
 			if (capacity < 0) {
@@ -171,11 +172,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				throw new IllegalArgumentException("Invalid reservation for " + profile);
 			}
 			reservationTotal = Math.addExact(reservationTotal, reservation);
-			this.capacities.put(profile, capacity);
-			this.reservations.put(profile, reservation);
-			this.queued.put(profile, 0);
-			this.active.put(profile, 0);
-			this.deficit.put(profile, 0);
+			this.capacities[profile.ordinal()] = capacity;
+			this.reservations[profile.ordinal()] = reservation;
 			if (profile != WorkloadProfile.LATENCY) {
 				this.queues.put(profile, new LinkedHashSet<>());
 				this.cooperativeQueues.put(profile, new CooperativeQueue());
@@ -183,9 +181,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		if (reservationTotal > workerCount) {
 			throw new IllegalArgumentException("Reservation sum exceeds workerCount");
-		}
-		for (var outcome : RWScheduler.TerminalOutcome.values()) {
-			outcomes.put(outcome, 0L);
 		}
 		this.threadFactory = new ThreadFactoryBuilder()
 				.setDaemon(false)
@@ -222,15 +217,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		int cost = taskCost(estimatedBytes);
 		var taskMetrics = metrics(profile, family);
-		var task = WorkloadTask.cooperative(this,
-				profile,
-				family,
-				deadlineEpochMillis,
-				sequence.getAndIncrement(),
-				System.nanoTime(),
-				cost,
-				command,
-				taskMetrics);
+		WorkloadTask task = null;
 		RuntimeException admissionFailure = null;
 		AdmissionResult admissionResult;
 		List<TerminalAction> terminalActions = null;
@@ -257,7 +244,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						taskMetrics,
 						admissionFailure,
 						terminalActions);
-			} else if (capacities.get(profile) == 0 || queuedUnsafe(profile) >= capacities.get(profile)) {
+			} else if (capacityUnsafe(profile) == 0 || queuedUnsafe(profile) >= capacityUnsafe(profile)) {
 				admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 						"Workload queue is full for " + profile + " " + family);
 				admissionResult = AdmissionResult.OVERLOAD;
@@ -278,6 +265,15 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						admissionFailure,
 						terminalActions);
 			} else {
+				task = WorkloadTask.cooperative(this,
+						profile,
+						family,
+						deadlineEpochMillis,
+						sequence++,
+						System.nanoTime(),
+						cost,
+						command,
+						taskMetrics);
 				enqueueCooperativeUnsafe(task, true);
 				incrementOutstandingUnsafe(profile);
 				admitCompetitionUnsafe(task);
@@ -297,7 +293,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (admissionFailure != null) {
 			throw admissionFailure;
 		}
-		return task;
+		return Objects.requireNonNull(task, "Accepted cooperative task");
 	}
 
 	void execute(WorkloadProfile profile,
@@ -337,7 +333,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						taskMetrics,
 						admissionFailure,
 						terminalActions);
-			} else if (capacities.get(profile) == 0 || queuedUnsafe(profile) >= capacities.get(profile)) {
+			} else if (capacityUnsafe(profile) == 0 || queuedUnsafe(profile) >= capacityUnsafe(profile)) {
 				admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 						"Workload queue is full for " + profile + " " + family);
 				admissionResult = AdmissionResult.OVERLOAD;
@@ -361,7 +357,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				var task = WorkloadTask.normal(profile,
 						family,
 						deadlineEpochMillis,
-						sequence.getAndIncrement(),
+						sequence++,
 						System.nanoTime(),
 						cost,
 						command,
@@ -435,7 +431,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					long nowMillis = System.currentTimeMillis();
 					expireDueUnsafe(nowMillis, terminalActions);
 					task = dispatchUnsafe(nowMillis, terminalActions);
-					if (task == null && shutdown && queuedTotal == 0 && cooperativeTasks.isEmpty()) {
+					if (task == null && shutdown && queuedTotal == 0 && cooperativeTaskCount == 0) {
 						stop = true;
 					} else if (task == null && terminalActions.isEmpty()) {
 						awaitWorkUnsafe();
@@ -555,7 +551,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				task.batchPermit(batchPermit);
 			}
 			commitSelectionUnsafe(task);
-			active.put(task.profile(), active.get(task.profile()) + 1);
+			active[task.profile().ordinal()]++;
 			activeTotal++;
 			task.markActive();
 			if (task.isCooperative()) {
@@ -654,7 +650,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (terminalAction != null) {
 				completeTerminalAction(terminalAction);
 			} else if (task.outcome() == RWScheduler.TerminalOutcome.RUN) {
-				metrics.recordOutcome(RWScheduler.TerminalOutcome.RUN);
+				if (task.command() instanceof RWScheduler.CooperativeCompletionTask) {
+					completeCooperativeSuccess(task);
+				} else {
+					metrics.recordOutcome(RWScheduler.TerminalOutcome.RUN);
+				}
 			}
 		}
 	}
@@ -669,7 +669,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (task.outcome() != null) {
 				throw new IllegalStateException("Active workload task already has a terminal outcome");
 			}
-			active.put(task.profile(), active.get(task.profile()) - 1);
+			active[task.profile().ordinal()]--;
 			activeTotal--;
 			completeCompetitionUnsafe(task);
 			task.outcome(outcome);
@@ -698,7 +698,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (task.state() != TaskState.ACTIVE) {
 				throw new IllegalStateException("Cooperative task is not active");
 			}
-			active.put(task.profile(), active.get(task.profile()) - 1);
+			active[task.profile().ordinal()]--;
 			activeTotal--;
 			if (task.requestedOutcome() != null) {
 				terminalAction = terminateCooperativeUnsafe(task,
@@ -740,7 +740,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void refreshCooperativeSequenceUnsafe(WorkloadTask task) {
-		task.refreshSequence(sequence.getAndIncrement(), System.nanoTime());
+		task.refreshSequence(sequence++, System.nanoTime());
 	}
 
 	private void resumeCooperative(WorkloadTask task) {
@@ -817,7 +817,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private void refreshPreemptionUnsafe() {
 		boolean requested = localQueuedCompetition
-				|| activeTotal > active.get(WorkloadProfile.BATCH);
+				|| activeTotal > activeUnsafe(WorkloadProfile.BATCH);
 		if (requested != publishedPreemption) {
 			publishedPreemption = requested;
 			pressureController.setPoolPreemption(resourcePool, requested);
@@ -898,7 +898,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		for (int attempts = 0; attempts < maxAttempts; attempts++) {
 			var profile = GUARANTEED[guaranteedCursor];
 			if (queuedUnsafe(profile) == 0) {
-				deficit.put(profile, 0);
+				deficit[profile.ordinal()] = 0;
 				advanceGuaranteedCursor();
 				continue;
 			}
@@ -907,11 +907,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				continue;
 			}
 			if (guaranteedNeedsQuantum) {
-				deficit.put(profile, Math.min(MAX_DEFICIT, deficit.get(profile) + quanta.get(profile)));
+				int profileIndex = profile.ordinal();
+				deficit[profileIndex] = Math.min(MAX_DEFICIT,
+						deficit[profileIndex] + quanta[profileIndex]);
 				guaranteedNeedsQuantum = false;
 			}
 			var head = peekUnsafe(profile);
-			if (deficit.get(profile) < head.cost()) {
+			if (deficit[profile.ordinal()] < head.cost()) {
 				advanceGuaranteedCursor();
 				continue;
 			}
@@ -929,11 +931,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			return;
 		}
 		latencyBurst = 0;
-		deficit.put(task.profile(), deficit.get(task.profile()) - task.cost());
+		int profileIndex = task.profile().ordinal();
+		deficit[profileIndex] -= task.cost();
 		if (queuedUnsafe(task.profile()) == 0) {
-			deficit.put(task.profile(), 0);
+			deficit[profileIndex] = 0;
 			advanceGuaranteedCursor();
-		} else if (deficit.get(task.profile()) < peekUnsafe(task.profile()).cost()) {
+		} else if (deficit[profileIndex] < peekUnsafe(task.profile()).cost()) {
 			advanceGuaranteedCursor();
 		}
 	}
@@ -942,10 +945,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (!isGuaranteedProfile(task.profile())) {
 			return;
 		}
+		int profileIndex = task.profile().ordinal();
 		if (queuedUnsafe(task.profile()) == 0) {
-			deficit.put(task.profile(), 0);
+			deficit[profileIndex] = 0;
 			advanceGuaranteedCursor();
-		} else if (deficit.get(task.profile()) < peekUnsafe(task.profile()).cost()) {
+		} else if (deficit[profileIndex] < peekUnsafe(task.profile()).cost()) {
 			advanceGuaranteedCursor();
 		}
 	}
@@ -963,14 +967,15 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private boolean hasReservationDeficitUnsafe(WorkloadProfile profile) {
-		return reservations.get(profile) > active.get(profile) && queuedUnsafe(profile) > 0;
+		int profileIndex = profile.ordinal();
+		return reservations[profileIndex] > active[profileIndex] && queued[profileIndex] > 0;
 	}
 
 	private boolean isEligibleUnsafe(WorkloadProfile profile) {
 		if (queuedUnsafe(profile) == 0 || activeTotal >= workerCount) {
 			return false;
 		}
-		if (profile == WorkloadProfile.ANALYTICAL && active.get(profile) >= analyticalLimit) {
+		if (profile == WorkloadProfile.ANALYTICAL && activeUnsafe(profile) >= analyticalLimit) {
 			return false;
 		}
 		if (!shutdown && profile == WorkloadProfile.PHYSICAL_MAINTENANCE && pressureController.isPressured()) {
@@ -1028,7 +1033,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	int active(WorkloadProfile profile) {
 		lock.lock();
 		try {
-			return active.get(profile);
+			return activeUnsafe(profile);
 		} finally {
 			lock.unlock();
 		}
@@ -1062,11 +1067,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	int capacity(WorkloadProfile profile) {
-		return capacities.get(profile);
+		return capacityUnsafe(profile);
 	}
 
 	long outstandingLimit(WorkloadProfile profile) {
-		return (long) capacities.get(profile) + workerCount;
+		return (long) capacityUnsafe(profile) + workerCount;
 	}
 
 	int workerCount() {
@@ -1093,11 +1098,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					completedTasks,
 					failedTasks,
 					snapshot(submissionAttemptsByProfile),
-					Map.copyOf(queued),
-					Map.copyOf(active),
+					snapshot(queued),
+					snapshot(active),
 					snapshot(parked),
 					snapshot(outstanding),
-					Map.copyOf(outcomes),
+					snapshotOutcomes(outcomes),
 					batchQueued > batchStartAllowance,
 					batchStartAllowance,
 					workers.stream().map(Thread::getName).toList(),
@@ -1113,18 +1118,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			throw new IllegalStateException("Pool outstanding accounting mismatch in " + poolName);
 		}
 		long terminalOutcomes = 0L;
-		for (var outcome : RWScheduler.TerminalOutcome.values()) {
-			terminalOutcomes += outcomes.get(outcome);
+		for (long outcome : outcomes) {
+			terminalOutcomes += outcome;
 		}
 		if (terminalOutcomes + outstandingTotal != submissionAttempts) {
 			throw new IllegalStateException("Pool submission conservation mismatch in " + poolName);
 		}
-		for (var profile : WorkloadProfile.values()) {
-			int profileOutstanding = outstanding[profile.ordinal()];
-			if ((long) queued.get(profile) + active.get(profile) + parked[profile.ordinal()] != profileOutstanding) {
+		for (var profile : PROFILES) {
+			int profileIndex = profile.ordinal();
+			int profileOutstanding = outstanding[profileIndex];
+			if ((long) queued[profileIndex] + active[profileIndex] + parked[profileIndex] != profileOutstanding) {
 				throw new IllegalStateException("Profile outstanding accounting mismatch for " + profile);
 			}
-			if (profileOutstanding > (long) capacities.get(profile) + workerCount) {
+			if (profileOutstanding > (long) capacities[profileIndex] + workerCount) {
 				throw new IllegalStateException("Profile outstanding limit exceeded for " + profile);
 			}
 		}
@@ -1132,7 +1138,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private static Map<WorkloadProfile, Integer> snapshot(int[] values) {
 		var result = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
-		for (var profile : WorkloadProfile.values()) {
+		for (var profile : PROFILES) {
 			result.put(profile, values[profile.ordinal()]);
 		}
 		return Map.copyOf(result);
@@ -1140,8 +1146,16 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private static Map<WorkloadProfile, Long> snapshot(long[] values) {
 		var result = new EnumMap<WorkloadProfile, Long>(WorkloadProfile.class);
-		for (var profile : WorkloadProfile.values()) {
+		for (var profile : PROFILES) {
 			result.put(profile, values[profile.ordinal()]);
+		}
+		return Map.copyOf(result);
+	}
+
+	private static Map<RWScheduler.TerminalOutcome, Long> snapshotOutcomes(long[] values) {
+		var result = new EnumMap<RWScheduler.TerminalOutcome, Long>(RWScheduler.TerminalOutcome.class);
+		for (var outcome : TERMINAL_OUTCOMES) {
+			result.put(outcome, values[outcome.ordinal()]);
 		}
 		return Map.copyOf(result);
 	}
@@ -1167,7 +1181,15 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private int queuedUnsafe(WorkloadProfile profile) {
-		return queued.get(profile);
+		return queued[profile.ordinal()];
+	}
+
+	private int activeUnsafe(WorkloadProfile profile) {
+		return active[profile.ordinal()];
+	}
+
+	private int capacityUnsafe(WorkloadProfile profile) {
+		return capacities[profile.ordinal()];
 	}
 
 	private @Nullable List<TerminalAction> expireDueUnsafe(long nowMillis,
@@ -1226,8 +1248,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				ignored -> new CancellationChain());
 		cancellationChain.addLast(task);
 		task.indexCancellation(cancellationChain);
-		int previousQueued = queued.get(task.profile());
-		queued.put(task.profile(), previousQueued + 1);
+		int profileIndex = task.profile().ordinal();
+		int previousQueued = queued[profileIndex]++;
 		if (task.profile() == WorkloadProfile.BATCH && previousQueued == 0) {
 			pressureController.setBatchQueued(resourcePool, true);
 		}
@@ -1242,9 +1264,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		queue.addLast(task);
 		if (initialAdmission) {
-			if (!cooperativeTasks.add(task)) {
-				throw new IllegalStateException("Cooperative workload task is already admitted");
-			}
+			admitCooperativeTaskUnsafe(task);
 			if (task.hasDeadline()) {
 				if (!deadlineQueue.add(task)) {
 					throw new IllegalStateException("Duplicate cooperative workload deadline sequence "
@@ -1259,8 +1279,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		var cancellationChain = Objects.requireNonNull(task.cancellationChain());
 		cancellationChain.addLast(task);
 		task.markCancellationLinked();
-		int previousQueued = queued.get(task.profile());
-		queued.put(task.profile(), previousQueued + 1);
+		int profileIndex = task.profile().ordinal();
+		int previousQueued = queued[profileIndex]++;
 		if (task.profile() == WorkloadProfile.BATCH && previousQueued == 0) {
 			pressureController.setBatchQueued(resourcePool, true);
 		}
@@ -1289,8 +1309,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			cancellationIndex.remove(task.cancellationKey());
 		}
 		task.clearCancellationIndex();
-		int remainingQueued = queued.get(task.profile()) - 1;
-		queued.put(task.profile(), remainingQueued);
+		int profileIndex = task.profile().ordinal();
+		int remainingQueued = --queued[profileIndex];
 		if (task.profile() == WorkloadProfile.BATCH && remainingQueued == 0) {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
@@ -1305,12 +1325,61 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		var chain = Objects.requireNonNull(task.cancellationChain());
 		chain.unlink(task);
 		task.markCancellationUnlinked();
-		int remainingQueued = queued.get(task.profile()) - 1;
-		queued.put(task.profile(), remainingQueued);
+		int profileIndex = task.profile().ordinal();
+		int remainingQueued = --queued[profileIndex];
 		if (task.profile() == WorkloadProfile.BATCH && remainingQueued == 0) {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
 		decrementQueuedTotalUnsafe();
+	}
+
+	private void admitCooperativeTaskUnsafe(WorkloadTask task) {
+		var cooperativeTask = (CooperativeWorkloadTask) task;
+		if (cooperativeTask.cooperativeAdmitted
+				|| cooperativeTask.previousLifetime != null
+				|| cooperativeTask.nextLifetime != null) {
+			throw new IllegalStateException("Cooperative workload task is already admitted");
+		}
+		if (lastCooperativeTask == null) {
+			firstCooperativeTask = cooperativeTask;
+		} else {
+			lastCooperativeTask.nextLifetime = cooperativeTask;
+			cooperativeTask.previousLifetime = lastCooperativeTask;
+		}
+		lastCooperativeTask = cooperativeTask;
+		cooperativeTask.cooperativeAdmitted = true;
+		cooperativeTaskCount++;
+	}
+
+	private void removeCooperativeTaskUnsafe(WorkloadTask task) {
+		var cooperativeTask = (CooperativeWorkloadTask) task;
+		if (!cooperativeTask.cooperativeAdmitted) {
+			throw new IllegalStateException("Cooperative workload task is not admitted");
+		}
+		var previous = cooperativeTask.previousLifetime;
+		var next = cooperativeTask.nextLifetime;
+		if (previous == null) {
+			if (firstCooperativeTask != cooperativeTask) {
+				throw new IllegalStateException("Cooperative workload task is not lifetime-indexed");
+			}
+			firstCooperativeTask = next;
+		} else {
+			previous.nextLifetime = next;
+		}
+		if (next == null) {
+			if (lastCooperativeTask != cooperativeTask) {
+				throw new IllegalStateException("Cooperative workload task is not lifetime-indexed");
+			}
+			lastCooperativeTask = previous;
+		} else {
+			next.previousLifetime = previous;
+		}
+		cooperativeTask.previousLifetime = null;
+		cooperativeTask.nextLifetime = null;
+		cooperativeTask.cooperativeAdmitted = false;
+		if (--cooperativeTaskCount < 0) {
+			throw new IllegalStateException("Cooperative workload task count underflow");
+		}
 	}
 
 	private void incrementQueuedTotalUnsafe() {
@@ -1331,13 +1400,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private boolean outstandingAtLimitUnsafe(WorkloadProfile profile) {
-		return outstanding[profile.ordinal()] >= (long) capacities.get(profile) + workerCount;
+		int profileIndex = profile.ordinal();
+		return outstanding[profileIndex] >= (long) capacities[profileIndex] + workerCount;
 	}
 
 	private void incrementOutstandingUnsafe(WorkloadProfile profile) {
 		int index = profile.ordinal();
 		int next = outstanding[index] + 1;
-		if (next > (long) capacities.get(profile) + workerCount) {
+		if (next > (long) capacities[index] + workerCount) {
 			throw new IllegalStateException("Outstanding workload limit exceeded for " + profile);
 		}
 		outstanding[index] = next;
@@ -1431,9 +1501,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.state() == TaskState.PARKED) {
 			unmarkParkedUnsafe(task);
 		}
-		if (!cooperativeTasks.remove(task)) {
-			throw new IllegalStateException("Cooperative workload task is not admitted");
-		}
+		removeCooperativeTaskUnsafe(task);
 		completeCompetitionUnsafe(task);
 		task.outcome(outcome);
 		decrementOutstandingUnsafe(task.profile());
@@ -1442,9 +1510,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			completedTasks++;
 		}
 		recordOutcomeUnsafe(outcome);
-		if (outcome == RWScheduler.TerminalOutcome.RUN
-				&& failure == null
-				&& !(task.command() instanceof RWScheduler.CooperativeCompletionTask)) {
+		if (outcome == RWScheduler.TerminalOutcome.RUN && failure == null) {
 			return null;
 		}
 		return new TerminalAction(task.command(),
@@ -1455,7 +1521,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void recordOutcomeUnsafe(RWScheduler.TerminalOutcome outcome) {
-		outcomes.put(outcome, outcomes.get(outcome) + 1L);
+		outcomes[outcome.ordinal()]++;
 	}
 
 	private void admitCompetitionUnsafe(WorkloadTask task) {
@@ -1524,6 +1590,24 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		action.metrics().recordOutcome(action.outcome());
 	}
 
+	private void completeCooperativeSuccess(WorkloadTask task) {
+		try {
+			((RWScheduler.CooperativeCompletionTask) task.command()).completeCooperatively();
+		} catch (Throwable terminalFailure) {
+			recordInfrastructureFailure("Failed to complete RUN workload submission in " + poolName,
+					terminalFailure);
+		}
+		try {
+			if (task.command() instanceof Disposable disposable && !disposable.isDisposed()) {
+				disposable.dispose();
+			}
+		} catch (Throwable disposalFailure) {
+			recordInfrastructureFailure("Failed to dispose RUN workload submission in " + poolName,
+					disposalFailure);
+		}
+		task.metrics().recordOutcome(RWScheduler.TerminalOutcome.RUN);
+	}
+
 	private Collection<WorkloadTask> normalQueueUnsafe(WorkloadProfile profile) {
 		return profile == WorkloadProfile.LATENCY ? latencyQueue : queues.get(profile);
 	}
@@ -1556,8 +1640,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private EnumMap<WorkloadProfile, EnumMap<OperationFamily, TaskMetrics>> registerTaskMetrics(
 			@Nullable MeterRegistry registry) {
 		var result = new EnumMap<WorkloadProfile, EnumMap<OperationFamily, TaskMetrics>>(WorkloadProfile.class);
-		for (var profile : WorkloadProfile.values()) {
-			if (capacities.get(profile) == 0) {
+		for (var profile : PROFILES) {
+			if (capacityUnsafe(profile) == 0) {
 				continue;
 			}
 			var byFamily = new EnumMap<OperationFamily, TaskMetrics>(OperationFamily.class);
@@ -1622,7 +1706,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				ProfiledWorkloadExecutor::workerCount,
 				"database", databaseName,
 				"resource", resourceKind);
-		for (var profile : WorkloadProfile.values()) {
+		for (var profile : PROFILES) {
 			String[] tags = {
 					"database", databaseName,
 					"resource", resourceKind,
@@ -1790,7 +1874,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		try {
 			shutdown = true;
 			timedWaitLeader = null;
-			for (var profile : WorkloadProfile.values()) {
+			for (var profile : PROFILES) {
 				while (queuedUnsafe(profile) > 0) {
 					var task = peekUnsafe(profile);
 					unlinkUnsafe(task);
@@ -1801,7 +1885,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 							terminalActions);
 				}
 			}
-			for (var task : new ArrayList<>(cooperativeTasks)) {
+			WorkloadTask task = firstCooperativeTask;
+			while (task != null) {
+				var nextTask = ((CooperativeWorkloadTask) task).nextLifetime;
 				if (task.state() == TaskState.PARKED) {
 					remaining.add(task.command());
 					terminateUnsafe(task,
@@ -1812,6 +1898,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					task.requestTermination(RWScheduler.TerminalOutcome.SHUTDOWN,
 							new RejectedExecutionException(poolName + " was forced to shut down"));
 				}
+				task = nextTask;
 			}
 			for (var worker : workers) {
 				worker.interrupt();
@@ -1891,8 +1978,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
-	private static final class WorkloadTask implements CooperativeTerminationHandle,
+	private static class WorkloadTask implements CooperativeTerminationHandle,
 			RWScheduler.CooperativeContext {
+
+		private static final VarHandle REQUESTED_TERMINATION;
+
+		static {
+			try {
+				REQUESTED_TERMINATION = MethodHandles.lookup().findVarHandle(
+						WorkloadTask.class, "requestedTermination", RequestedTermination.class);
+			} catch (NoSuchFieldException | IllegalAccessException failure) {
+				throw new ExceptionInInitializerError(failure);
+			}
+		}
 
 		private final @Nullable ProfiledWorkloadExecutor owner;
 		private final WorkloadProfile profile;
@@ -1914,7 +2012,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private @Nullable CancellationChain cancellationChain;
 		private @Nullable WorkloadPressureController.BatchPermit batchPermit;
 		private volatile @Nullable RWScheduler.TerminalOutcome outcome;
-		private final @Nullable AtomicReference<RequestedTermination> requestedTermination;
+		private volatile @Nullable RequestedTermination requestedTermination;
 		private volatile TaskState state = TaskState.QUEUED;
 		private boolean cancellationLinked;
 		private boolean deadlineIndexed;
@@ -1950,7 +2048,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			this.cancellationState = cancellationState;
 			this.metrics = metrics;
 			this.cooperative = cooperative;
-			this.requestedTermination = cooperative ? new AtomicReference<>() : null;
 		}
 
 		private static WorkloadTask normal(WorkloadProfile profile,
@@ -1984,7 +2081,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                                        int cost,
 		                                        RWScheduler.CooperativeTask command,
 		                                        TaskMetrics metrics) {
-			return new WorkloadTask(owner,
+			return new CooperativeWorkloadTask(owner,
 					profile,
 					family,
 					deadlineEpochMillis,
@@ -1992,9 +2089,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					enqueuedNanos,
 					cost,
 					command,
-					null,
-					metrics,
-					true);
+					metrics);
 		}
 
 		private WorkloadProfile profile() {
@@ -2203,12 +2298,18 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		private boolean requestTermination(RWScheduler.TerminalOutcome outcome, RuntimeException failure) {
-			return Objects.requireNonNull(requestedTermination, "Non-cooperative workload task")
-					.compareAndSet(null, new RequestedTermination(outcome, failure));
+			if (!cooperative) {
+				throw new IllegalStateException("Non-cooperative workload task");
+			}
+			return REQUESTED_TERMINATION.compareAndSet(
+					this, null, new RequestedTermination(outcome, failure));
 		}
 
 		private @Nullable RWScheduler.TerminalOutcome requestedOutcome() {
-			var requested = Objects.requireNonNull(requestedTermination, "Non-cooperative workload task").get();
+			if (!cooperative) {
+				throw new IllegalStateException("Non-cooperative workload task");
+			}
+			var requested = requestedTermination;
 			return requested == null ? null : requested.outcome();
 		}
 
@@ -2219,12 +2320,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		@Override
 		public boolean terminationRequested() {
-			var termination = Objects.requireNonNull(requestedTermination, "Non-cooperative workload task");
-			if (termination.get() != null) {
+			if (!cooperative) {
+				throw new IllegalStateException("Non-cooperative workload task");
+			}
+			if (requestedTermination != null) {
 				return true;
 			}
 			if (hasDeadline() && System.currentTimeMillis() >= deadlineEpochMillis) {
-				termination.compareAndSet(null, new RequestedTermination(
+				REQUESTED_TERMINATION.compareAndSet(this, null, new RequestedTermination(
 						RWScheduler.TerminalOutcome.DEADLINE,
 						deadlineFailure("Cooperative workload deadline expired while active")));
 				return true;
@@ -2234,7 +2337,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		@Override
 		public @Nullable RuntimeException terminationFailure() {
-			var requested = Objects.requireNonNull(requestedTermination, "Non-cooperative workload task").get();
+			if (!cooperative) {
+				throw new IllegalStateException("Non-cooperative workload task");
+			}
+			var requested = requestedTermination;
 			return requested == null ? null : requested.failure();
 		}
 
@@ -2268,7 +2374,36 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		@Override
 		public boolean isDisposed() {
 			return state == TaskState.TERMINAL
-					|| Objects.requireNonNull(requestedTermination, "Non-cooperative workload task").get() != null;
+					|| requestedTermination != null;
+		}
+	}
+
+	private static final class CooperativeWorkloadTask extends WorkloadTask {
+
+		private @Nullable CooperativeWorkloadTask previousLifetime;
+		private @Nullable CooperativeWorkloadTask nextLifetime;
+		private boolean cooperativeAdmitted;
+
+		private CooperativeWorkloadTask(ProfiledWorkloadExecutor owner,
+		                                WorkloadProfile profile,
+		                                OperationFamily family,
+		                                long deadlineEpochMillis,
+		                                long sequence,
+		                                long enqueuedNanos,
+		                                int cost,
+		                                Runnable command,
+		                                TaskMetrics metrics) {
+			super(owner,
+					profile,
+					family,
+					deadlineEpochMillis,
+					sequence,
+					enqueuedNanos,
+					cost,
+					command,
+					null,
+					metrics,
+					true);
 		}
 	}
 
@@ -2285,19 +2420,28 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private static final int PENDING = 0;
 		private static final int CLAIMED = 1;
 		private static final int CANCELLED = 2;
-		private final java.util.concurrent.atomic.AtomicInteger state =
-				new java.util.concurrent.atomic.AtomicInteger(PENDING);
+		private static final VarHandle STATE;
+
+		static {
+			try {
+				STATE = MethodHandles.lookup().findVarHandle(CancellationState.class, "state", int.class);
+			} catch (NoSuchFieldException | IllegalAccessException failure) {
+				throw new ExceptionInInitializerError(failure);
+			}
+		}
+
+		private volatile int state = PENDING;
 
 		boolean cancel() {
-			return state.compareAndSet(PENDING, CANCELLED);
+			return STATE.compareAndSet(this, PENDING, CANCELLED);
 		}
 
 		boolean isCancellationRequested() {
-			return state.get() == CANCELLED;
+			return state == CANCELLED;
 		}
 
 		boolean claimForDispatch() {
-			return state.compareAndSet(PENDING, CLAIMED) || state.get() == CLAIMED;
+			return STATE.compareAndSet(this, PENDING, CLAIMED) || state == CLAIMED;
 		}
 	}
 

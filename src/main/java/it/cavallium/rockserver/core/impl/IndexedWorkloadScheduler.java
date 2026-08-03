@@ -1,8 +1,9 @@
 package it.cavallium.rockserver.core.impl;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.jetbrains.annotations.Nullable;
 import reactor.core.Disposable;
 import reactor.core.Disposables;
@@ -116,12 +117,21 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		private static final int RUNNING = 1;
 		private static final int FINISHED = 2;
 		private static final int CANCELLED = 3;
+		private static final VarHandle STATE;
+
+		static {
+			try {
+				STATE = MethodHandles.lookup().findVarHandle(IndexedScheduledTask.class, "state", int.class);
+			} catch (NoSuchFieldException | IllegalAccessException failure) {
+				throw new ExceptionInInitializerError(failure);
+			}
+		}
 
 		private final RWScheduler scheduler;
 		private final RWScheduler.WorkloadExecutor executor;
 		private final Runnable task;
 		private final @Nullable IndexedWorker parent;
-		private final AtomicInteger state = new AtomicInteger(QUEUED);
+		private volatile int state = QUEUED;
 		private final ProfiledWorkloadExecutor.CancellationState cancellationState =
 				new ProfiledWorkloadExecutor.CancellationState();
 		private boolean submitted;
@@ -137,14 +147,14 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		}
 
 		private synchronized void submit() {
-			if (state.get() != QUEUED) {
+			if (state != QUEUED) {
 				return;
 			}
 			try {
 				executor.execute(this);
 				submitted = true;
 			} catch (Throwable failure) {
-				state.set(FINISHED);
+				state = FINISHED;
 				deleteFromParent();
 				Exceptions.throwIfFatal(failure);
 				throw Exceptions.failWithRejected(failure);
@@ -153,10 +163,10 @@ final class IndexedWorkloadScheduler implements Scheduler {
 
 		@Override
 		public void run() {
-			int currentState = state.get();
+			int currentState = state;
 			if (currentState == QUEUED) {
-				if (!state.compareAndSet(QUEUED, RUNNING)) {
-					currentState = state.get();
+				if (!STATE.compareAndSet(this, QUEUED, RUNNING)) {
+					currentState = state;
 				} else {
 					currentState = RUNNING;
 				}
@@ -168,7 +178,7 @@ final class IndexedWorkloadScheduler implements Scheduler {
 			try {
 				task.run();
 			} finally {
-				state.set(FINISHED);
+				state = FINISHED;
 				deleteFromParent();
 			}
 		}
@@ -179,7 +189,7 @@ final class IndexedWorkloadScheduler implements Scheduler {
 			boolean removeQueued = false;
 			boolean cancellationWon = false;
 			synchronized (this) {
-				if (cancelledBeforeDispatch && state.compareAndSet(QUEUED, CANCELLED)) {
+				if (cancelledBeforeDispatch && STATE.compareAndSet(this, QUEUED, CANCELLED)) {
 					removeQueued = submitted;
 					cancellationWon = true;
 				}
@@ -194,7 +204,7 @@ final class IndexedWorkloadScheduler implements Scheduler {
 
 		@Override
 		public boolean isDisposed() {
-			return state.get() >= FINISHED;
+			return state >= FINISHED;
 		}
 
 		@Override

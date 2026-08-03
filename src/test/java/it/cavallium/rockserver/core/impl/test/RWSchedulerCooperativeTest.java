@@ -433,6 +433,34 @@ class RWSchedulerCooperativeTest {
 	}
 
 	@Test
+	void forcedShutdownDrainsActiveAndParkedIntrusiveLifetimeEntries() throws Exception {
+		var scheduler = RWScheduler.forTesting(2, 2, 2, 8, 8, "cooperative-intrusive-shutdown");
+		var active = new DeadlineTask();
+		var parked = new ParkOnceTask();
+		try {
+			var executor = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE);
+			executor.executeCooperatively(active, 1L);
+			assertTrue(active.started.await(5, SECONDS));
+			executor.executeCooperatively(parked, 1L);
+			assertTrue(parked.parked.await(5, SECONDS));
+
+			scheduler.disposeNow();
+
+			assertTrue(active.completed.await(5, SECONDS));
+			assertTrue(parked.completed.await(5, SECONDS));
+			assertTrue(active.failure.get() instanceof java.util.concurrent.RejectedExecutionException);
+			assertTrue(parked.failure.get() instanceof java.util.concurrent.RejectedExecutionException);
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(2L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
+			assertTrue(snapshot.drainedAndConserved());
+		} finally {
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void cooperativeHandleDefaultCancelPreservesLegacyImplementors() {
 		var disposed = new AtomicBoolean();
 		RWScheduler.CooperativeHandle legacyHandle = new RWScheduler.CooperativeHandle() {
