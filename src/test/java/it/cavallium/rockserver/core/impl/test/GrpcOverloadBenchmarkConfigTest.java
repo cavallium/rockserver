@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.config.WorkloadSettings;
@@ -26,6 +27,8 @@ class GrpcOverloadBenchmarkConfigTest {
 		var settings = WorkloadSettings.resolve(parsed);
 		assertEquals(4_096, settings.ingestQueueCapacity());
 		assertEquals(512, settings.batchQueueCapacity());
+		assertTrue(settings.competingBatchReadMaximumActive() <= settings.readParallelism());
+		assertTrue(settings.competingBatchWriteMaximumActive() <= settings.writeParallelism());
 		assertFalse(generated.contains("maintenance-write"));
 		assertFalse(generated.contains("foreground-write-queue-capacity"));
 		assertFalse(generated.contains("maintenance-write-queue-capacity"));

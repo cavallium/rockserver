@@ -9,11 +9,12 @@ generated gRPC client -> Netty server -> workload admission/scheduler -> RocksDB
 It complements `SevenProfileWorkloadBenchmark`, which has broader release-tuning
 and storage-pressure coverage but uses the embedded API. Together with the
 deterministic scheduler tests and the
-[`GrpcRawScanBenchmark`](grpc-raw-scan-benchmark.md), a passing run is
-the release-level optimality claim for the declared hardware, release SHA, dataset,
-and workload envelope: request loss, wrong priority, latency or throughput
-regression, avoidable worker idleness, scheduler imbalance, resource leaks, and
-corrupt or missing acknowledged writes are all explicit failures.
+[`GrpcRawScanBenchmark`](grpc-raw-scan-benchmark.md), a passing run supplies the
+correctness half of the release gate. Release-level optimality additionally requires
+the strict `GrpcOverloadComparison` result against immutable v1.3.11
+`bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e`. Request loss, wrong priority,
+avoidable worker idleness, scheduler imbalance, resource leaks, and corrupt or
+missing acknowledged writes remain explicit failures in every measured subprocess.
 
 ## Mixed workload
 
@@ -92,10 +93,19 @@ attached only during each measured window. Acceptance requires:
 - successful end-to-end progress for all seven profiles.
 
 For each paired round, the runner computes mixed/foreground-only throughput and
-p99 ratios. A two-sided 95% Student-t confidence interval is computed over the
-paired ratios. The upper p99 bound must be at most `2.0`, and the lower throughput
-bound must be at least `0.80`. With one smoke round the interval is the point
-estimate and is not hardware evidence.
+p99 ratios with a two-sided 95% Student-t confidence interval. These within-build
+ratios are availability and diagnostic evidence only. The former `2.0` p99 and
+`0.80` throughput margins are not acceptance gates and cannot hide a cross-build
+regression. With one smoke round the interval is only the point estimate and is
+not hardware evidence.
+
+The existing admission-monitor thread also samples process resources every 100 ms;
+it adds no scheduler lock acquisition, queue scan, registry lookup, or request-path
+work. Each phase reports process CPU nanoseconds and allocated bytes per useful
+successful operation, peak post-collection live heap, peak direct memory, peak RSS,
+GC collections/time, peak JVM threads, and peak native handles. Strict runs fail if
+the HotSpot CPU/allocation counters, Linux RSS evidence, or Unix handle counter are
+unavailable.
 
 Cancellation must be observed. No concrete non-cancellation operation may exceed
 its deadline, foreground rejections must remain zero, no unexpected error or
@@ -111,9 +121,10 @@ five paired rounds, and a prepared dataset reopened under an operator-asserted
 cold cache. Before creating or consuming the root, the runner resolves its actual
 mount from `/proc/self/mountinfo`; Btrfs HDD and NVMe labels must also match Linux
 block-device rotational evidence. The runner records that mount, source,
-filesystem, rotational bit and model alongside `/proc/meminfo`, JVM arguments and
-maximum heap, OS/CPU data, fingerprints, and exact options. It also enumerates
-other JVMs and refuses enforced timing when a JMH or benchmark command is active;
+filesystem, rotational bit and model alongside `/proc/meminfo`, JVM vendor/home,
+arguments, library path and maximum heap, CPU model, RocksDB native version,
+dependency and benchmark-harness hashes, fingerprints, and exact options. It also
+enumerates other JVMs and refuses enforced timing when a JMH or benchmark command is active;
 only PID plus a SHA-256 command hash is recorded, so command-line contents are not
 copied into artifacts.
 
@@ -171,6 +182,110 @@ java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
 root is consumed even if the JVM is interrupted, killed, or the benchmark fails;
 prepare a new root instead of retrying biased cache or database state.
 
+## Paired baseline/candidate Pareto gate
+
+Compile the final candidate benchmark harness once, compile the baseline and
+candidate production classes in their isolated worktrees, and use the same candidate
+`target/test-classes` and dependency jars for both builds. Put the selected
+production `target/classes` directory second on the classpath:
+
+```bash
+candidate_root=/tmp/rockserver-v131-scheduler-integration
+baseline_root=/tmp/rockserver-v131-perf-baseline
+deps="$(<"${candidate_root}/target/overload-benchmark.classpath")"
+harness="${candidate_root}/target/test-classes"
+
+baseline_cp="${harness}:${baseline_root}/target/classes:${deps}"
+candidate_cp="${harness}:${candidate_root}/target/classes:${deps}"
+```
+
+Do not rebuild or alter the harness between measurements. Its content hash is part
+of the environment fingerprint, while `--build-id` identifies the production
+classes selected by the second classpath entry. The comparator requires every run
+to have the same logical dataset, workload/config/cache fingerprint, JDK, native
+libraries, dependency jars, harness, CPU, memory, and storage evidence.
+
+Before the first measurement, create a manifest and predeclare one or more material
+primary metrics. Use at least ten fresh-subprocess pairs and alternate which build
+runs first. Every run needs a separately prepared, one-use root; execute all
+preparation, cache eviction, and measurement commands serially with no benchmark,
+build, validator, or workload running at the same time.
+
+```properties
+schema=rockserver-grpc-overload-comparison-manifest-v1
+declared-at=2026-08-03T18:00:00Z
+baseline-build=bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e
+candidate-build=0123456789abcdef0123456789abcdef01234567
+primary-metrics=mixed.useful-throughput,mixed.cpu-nanos-per-operation
+pairs=10
+pair.1.order=baseline-first
+pair.1.baseline=/results/pair-01-baseline/comparison-input.properties
+pair.1.candidate=/results/pair-01-candidate/comparison-input.properties
+pair.2.order=candidate-first
+pair.2.baseline=/results/pair-02-baseline/comparison-input.properties
+pair.2.candidate=/results/pair-02-candidate/comparison-input.properties
+pair.3.order=baseline-first
+pair.3.baseline=/results/pair-03-baseline/comparison-input.properties
+pair.3.candidate=/results/pair-03-candidate/comparison-input.properties
+pair.4.order=candidate-first
+pair.4.baseline=/results/pair-04-baseline/comparison-input.properties
+pair.4.candidate=/results/pair-04-candidate/comparison-input.properties
+pair.5.order=baseline-first
+pair.5.baseline=/results/pair-05-baseline/comparison-input.properties
+pair.5.candidate=/results/pair-05-candidate/comparison-input.properties
+pair.6.order=candidate-first
+pair.6.baseline=/results/pair-06-baseline/comparison-input.properties
+pair.6.candidate=/results/pair-06-candidate/comparison-input.properties
+pair.7.order=baseline-first
+pair.7.baseline=/results/pair-07-baseline/comparison-input.properties
+pair.7.candidate=/results/pair-07-candidate/comparison-input.properties
+pair.8.order=candidate-first
+pair.8.baseline=/results/pair-08-baseline/comparison-input.properties
+pair.8.candidate=/results/pair-08-candidate/comparison-input.properties
+pair.9.order=baseline-first
+pair.9.baseline=/results/pair-09-baseline/comparison-input.properties
+pair.9.candidate=/results/pair-09-candidate/comparison-input.properties
+pair.10.order=candidate-first
+pair.10.baseline=/results/pair-10-baseline/comparison-input.properties
+pair.10.candidate=/results/pair-10-candidate/comparison-input.properties
+```
+
+`comparison-input.properties` is emitted only after both phases complete in every
+round. It records correctness, integrity, conservation, drain, shutdown,
+cancellation and telemetry gates; full run/process intervals; exact fingerprints;
+and all absolute metric inputs. The comparator checks that the manifest predates
+measurement, process identities are unique, declared order matches the timestamps,
+and no measured subprocesses overlap.
+
+Run the comparator from the unchanged candidate harness:
+
+```bash
+comparison_main="it.cavallium.rockserver.core.impl.benchmark.GrpcOverloadComparison"
+
+java -cp "${candidate_cp}" "${comparison_main}" \
+  --manifest=/results/overload-comparison.properties \
+  --output=/results/overload-comparison --enforce=true
+```
+
+For throughput, latency, CPU, allocation, live heap, direct memory, RSS, and the
+mixed/foreground degradation ratios, the paired candidate/baseline geometric-mean
+estimate must be no worse and the 95% interval must not demonstrate a regression.
+GC time/count, peak threads, and peak native handles may not increase in any pair.
+At least one predeclared primary metric must demonstrate a material bound:
+throughput lower 95% bound at least `1.02`, or a latency/CPU/allocation/memory upper
+95% bound at most `0.98`. Exception ceilings are reported as diagnostics only and
+never convert a failed automatic gate into acceptance.
+
+`comparison.json` and `comparison.md` contain absolute paired values, ratios,
+confidence intervals, environment evidence, exception-ceiling diagnostics, and
+every failure. Any exception still requires separate ablation, profiles, bounded
+causal explanation, compensating gain, and explicit approval outside this tool.
+
+The deterministic `GrpcBatchCancellationIntegrationTest` supplies the cancellation
+proof: it occupies every WRITE worker with latch-controlled INGEST work, queues
+unique BATCH puts over loopback gRPC, cancels them, observes exact server-side
+terminal removal and drain, then proves that none of their keys was written.
+
 Use `--help` for the complete defaults. Important full-run defaults are five
 alternating rounds, 15 seconds of warmup and 60 seconds of measurement per phase,
 40 point readers, four analytical readers, 64 BATCH writers, 20 READ workers, 36
@@ -178,12 +293,13 @@ WRITE workers, a 250 microsecond scheduler sample interval, and 1,024 unique
 integrity writes plus 1,024 matching reads.
 
 `results.json` is the machine-readable source of truth. `results.md` contains the
-same provenance plus per-round operation, request-conservation, scheduler,
-utilization, integrity, drain, and acceptance evidence. `--smoke=true
+same provenance plus per-round operation, CPU/allocation/resource, latency,
+request-conservation, scheduler, utilization, integrity, drain, and acceptance
+evidence. The result schema is `rockserver-grpc-overload-v5`. `--smoke=true
 --enforce=false` shortens the dataset and run to verify structure; tmpfs, CI, one
 round, warm cache, a dirty build, low-memory startup, or uncontrolled hardware
 cannot be reported as release acceptance.
 
 The dated `benchmarks/grpc-overload-2026-07-23.md` file is historical evidence for
-the original two-profile runner. Its measurements are not comparable to schema v4
+the original two-profile runner. Its measurements are not comparable to schema v5
 and must not be used as a current baseline.

@@ -1,5 +1,8 @@
 package it.cavallium.rockserver.core.impl.benchmark;
 
+import com.sun.management.OperatingSystemMXBean;
+import com.sun.management.ThreadMXBean;
+import com.sun.management.UnixOperatingSystemMXBean;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
@@ -49,7 +52,12 @@ import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
+import java.io.InputStream;
+import java.lang.management.BufferPoolMXBean;
+import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryPoolMXBean;
+import java.lang.management.MemoryType;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -84,6 +92,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.ToDoubleFunction;
+import org.rocksdb.RocksDB;
 
 /**
  * Opt-in, disk-backed gRPC overload regression benchmark.
@@ -102,12 +112,12 @@ public final class GrpcOverloadBenchmark {
 	private static final long RESOURCE_DRAIN_TIMEOUT_SECONDS = 30;
 	private static final int WRITE_REQUEST_VARIANTS = 64;
 	private static final int MAX_RECORDED_ERRORS = 20;
-	private static final double MIN_FOREGROUND_THROUGHPUT_RATIO = 0.80d;
 	private static final long COOPERATIVE_QUANTUM_NANOS = TimeUnit.MILLISECONDS.toNanos(8L);
+	private static final long RUNTIME_RESOURCE_SAMPLE_NANOS = TimeUnit.MILLISECONDS.toNanos(100L);
 	private static final String CDC_SUBSCRIPTION_PREFIX = "grpc-overload-cdc-";
-	private static final String RESULT_SCHEMA = "rockserver-grpc-overload-v4";
-	private static final String DATASET_SCHEMA = "rockserver-grpc-overload-dataset-v3";
-	private static final String RUN_ATTEMPT_SCHEMA = "rockserver-grpc-overload-run-attempt-v1";
+	private static final String RESULT_SCHEMA = "rockserver-grpc-overload-v5";
+	private static final String DATASET_SCHEMA = "rockserver-grpc-overload-dataset-v4";
+	private static final String RUN_ATTEMPT_SCHEMA = "rockserver-grpc-overload-run-attempt-v2";
 	private static final String DATASET_MARKER_FILE = ".rockserver-overload-benchmark";
 	private static final String RUN_ATTEMPT_FILE = "run-attempt.properties";
 	private static final long GIBIBYTE = 1L << 30;
@@ -127,6 +137,7 @@ public final class GrpcOverloadBenchmark {
 		System.setProperty("it.cavallium.rockserver.leakdetection", "true");
 		Instant started = Instant.now();
 		RunEnvironment environment = RunEnvironment.capture(options.root());
+		verifyEnvironment(options, environment);
 		verifyHostMemory(options, environment.hostMemory());
 		verifyStorage(options, environment.storage());
 		verifyCompetingBenchmarks(options, environment.competingBenchmarkProcesses());
@@ -218,6 +229,10 @@ public final class GrpcOverloadBenchmark {
 		System.out.println(toMarkdown(result));
 		System.out.println("Machine-readable results: " + root.resolve("results.json").toAbsolutePath());
 		System.out.println("Human-readable results: " + root.resolve("results.md").toAbsolutePath());
+		if (phases.size() == options.rounds() * 2) {
+			System.out.println("Paired comparison input: "
+					+ root.resolve(GrpcOverloadComparison.RUN_INPUT_FILE).toAbsolutePath());
+		}
 
 		if (runFailure != null) {
 			if (closeFailure != null) {
@@ -318,11 +333,9 @@ public final class GrpcOverloadBenchmark {
 	}
 
 	private static String workloadFingerprint(Options options) {
-		return sha256("rockserver-grpc-overload-workload-v3"
+		return sha256("rockserver-grpc-overload-workload-v4"
 				+ "\ndataset=" + datasetFingerprint(options)
 				+ "\ndatabase-name=" + options.databaseName()
-				+ "\nbuild-id=" + options.buildId()
-				+ "\nbuild-state=" + options.buildState()
 				+ "\nstorage-label=" + options.storageLabel()
 				+ "\nhost-state=" + options.hostState()
 				+ "\ndeadline-ms=" + DEADLINE_MILLIS
@@ -364,6 +377,111 @@ public final class GrpcOverloadBenchmark {
 		}
 	}
 
+	private static String dependencyClasspathSha256() {
+		try {
+			MessageDigest digest = MessageDigest.getInstance("SHA-256");
+			int files = 0;
+			for (String value : System.getProperty("java.class.path", "")
+					.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
+				Path entry = Path.of(value).toAbsolutePath().normalize();
+				if (!Files.isRegularFile(entry)) {
+					continue;
+				}
+				files++;
+				digest.update(entry.getFileName().toString().getBytes(StandardCharsets.UTF_8));
+				digest.update((byte) 0);
+				try (InputStream input = Files.newInputStream(entry)) {
+					byte[] buffer = new byte[64 * 1_024];
+					int read;
+					while ((read = input.read(buffer)) >= 0) {
+						if (read > 0) {
+							digest.update(buffer, 0, read);
+						}
+					}
+				}
+				digest.update((byte) 0xff);
+			}
+			return files == 0 ? "unavailable" : HexFormat.of().formatHex(digest.digest());
+		} catch (IOException | NoSuchAlgorithmException | RuntimeException failure) {
+			return "unavailable";
+		}
+	}
+
+	private static String codeSourceSha256(Class<?> type) {
+		try {
+			var codeSource = type.getProtectionDomain().getCodeSource();
+			if (codeSource == null) return "unavailable";
+			Path location = Path.of(codeSource.getLocation().toURI()).toAbsolutePath().normalize();
+			MessageDigest digest = MessageDigest.getInstance("SHA-256");
+			byte[] buffer = new byte[64 * 1_024];
+			List<Path> files;
+			if (Files.isRegularFile(location)) {
+				files = List.of(location);
+			} else if (Files.isDirectory(location)) {
+				try (var walked = Files.walk(location)) {
+					files = walked.filter(Files::isRegularFile)
+							.sorted(java.util.Comparator.comparing(path -> location.relativize(path).toString()))
+							.toList();
+				}
+			} else {
+				return "unavailable";
+			}
+			for (Path file : files) {
+				String name = Files.isDirectory(location)
+						? location.relativize(file).toString() : file.getFileName().toString();
+				digest.update(name.getBytes(StandardCharsets.UTF_8));
+				digest.update((byte) 0);
+				try (InputStream input = Files.newInputStream(file)) {
+					int read;
+					while ((read = input.read(buffer)) >= 0) {
+						if (read > 0) digest.update(buffer, 0, read);
+					}
+				}
+				digest.update((byte) 0xff);
+			}
+			return files.isEmpty() ? "unavailable" : HexFormat.of().formatHex(digest.digest());
+		} catch (Exception failure) {
+			return "unavailable";
+		}
+	}
+
+	private static String cpuModel() {
+		try {
+			for (String line : Files.readAllLines(Path.of("/proc/cpuinfo"))) {
+				int colon = line.indexOf(':');
+				if (colon > 0) {
+					String key = line.substring(0, colon).trim();
+					if (key.equalsIgnoreCase("model name") || key.equalsIgnoreCase("hardware")) {
+						return line.substring(colon + 1).trim();
+					}
+				}
+			}
+		} catch (IOException ignored) {
+			// Report the missing evidence through the enforced environment gate.
+		}
+		return "unavailable";
+	}
+
+	private static String environmentFingerprint(RunEnvironment environment) {
+		return sha256("rockserver-grpc-overload-environment-v1"
+				+ "\njava-version=" + environment.javaVersion()
+				+ "\njava-vm=" + environment.javaVm()
+				+ "\njava-vendor=" + environment.javaVendor()
+				+ "\njava-home=" + environment.javaHome()
+				+ "\njava-library-path=" + environment.javaLibraryPath()
+				+ "\njvm-arguments=" + environment.jvmArguments()
+				+ "\njvm-max-memory=" + environment.jvmMaxMemoryBytes()
+				+ "\nos=" + environment.os()
+				+ "\nprocessors=" + environment.availableProcessors()
+				+ "\ncpu-model=" + environment.cpuModel()
+				+ "\nphysical-memory=" + environment.hostMemory().totalBytes()
+				+ "\nstorage=" + environment.storage()
+				+ "\nrocksdb-version=" + environment.rocksdbVersion()
+				+ "\ndependency-classpath-sha256=" + environment.dependencyClasspathSha256()
+				+ "\nharness-classpath-sha256=" + environment.harnessClasspathSha256()
+				+ "\nresource-sample-nanos=" + RUNTIME_RESOURCE_SAMPLE_NANOS);
+	}
+
 	private static void writeRunAttempt(Path root, Options options, RunEnvironment environment) throws IOException {
 		writeRunAttempt(root, "schema=" + RUN_ATTEMPT_SCHEMA + "\n"
 				+ "started=" + Instant.now() + "\n"
@@ -374,6 +492,9 @@ public final class GrpcOverloadBenchmark {
 				+ "cache-state=" + options.cacheState() + "\n"
 				+ "dataset-fingerprint=" + datasetFingerprint(options) + "\n"
 				+ "comparison-fingerprint=" + comparisonFingerprint(options) + "\n"
+				+ "environment-fingerprint=" + environmentFingerprint(environment) + "\n"
+				+ "process-id=" + environment.processId() + "\n"
+				+ "process-start=" + environment.processStart() + "\n"
 				+ "host-memory-total-bytes=" + environment.hostMemory().totalBytes() + "\n"
 				+ "host-memory-available-bytes=" + environment.hostMemory().availableBytes() + "\n"
 				+ "host-swap-free-bytes=" + environment.hostMemory().swapFreeBytes() + "\n"
@@ -498,10 +619,13 @@ public final class GrpcOverloadBenchmark {
 				+ cdcWorkers
 				+ physicalWorkers
 				+ 1;
+		var runtimeTelemetry = new RuntimeTelemetryTracker(
+				options.instrumentationMode().equals("strict"));
 		PhaseControl control = new PhaseControl(workerCount,
 				options.maxLatencySamples(),
 				options.instrumentationMode().equals("strict"),
-				TimeUnit.MICROSECONDS.toNanos(options.admissionSampleMicros()));
+				TimeUnit.MICROSECONDS.toNanos(options.admissionSampleMicros()),
+				runtimeTelemetry);
 		var meterRegistry = new BenchmarkMeterRegistry();
 		var composite = (CompositeMeterRegistry) embedded.getEmbeddedDB().getMetricsRegistry();
 		boolean registryAdded = false;
@@ -590,10 +714,12 @@ public final class GrpcOverloadBenchmark {
 			composite.add(meterRegistry);
 			registryAdded = true;
 			client.requestTracker().startTracking();
+			runtimeTelemetry.start();
 			control.startMeasurement();
 			sleepPhase(options.measureSeconds(), control.stop);
 			client.requestTracker().stopTracking();
 			long durationNanos = control.stopMeasurement();
+			RuntimeTelemetry telemetry = runtimeTelemetry.stop();
 			control.stop.set(true);
 			executor.shutdown();
 			long shutdownWait = DEADLINE_MILLIS + TimeUnit.SECONDS.toMillis(WORKER_SHUTDOWN_GRACE_SECONDS);
@@ -616,7 +742,8 @@ public final class GrpcOverloadBenchmark {
 			Map<WorkloadProfile, SchedulerProfileMetrics> schedulerMetrics =
 					snapshotSchedulerMetrics(meterRegistry);
 			PhaseResult result = control.metrics.snapshot(
-					round, phase, durationNanos, admission, resources, requestAccounting, schedulerMetrics);
+					round, phase, durationNanos, admission, resources, requestAccounting, schedulerMetrics,
+					telemetry);
 			printPhase(result);
 			return result;
 		} finally {
@@ -947,6 +1074,7 @@ public final class GrpcOverloadBenchmark {
 		while (!control.stop.get()) {
 			if (control.measuring.get()) {
 				control.admission.sample(embedded);
+				control.runtimeTelemetry.sampleIfDue();
 			}
 			LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(options.admissionSampleMicros()));
 			if (Thread.interrupted()) {
@@ -1313,6 +1441,7 @@ public final class GrpcOverloadBenchmark {
 							flood.size(),
 							orderedSchedulerRounds(flood, WorkloadProfile.LATENCY, WorkloadProfile.ANALYTICAL),
 							orderedSchedulerRounds(flood, WorkloadProfile.INGEST, WorkloadProfile.BATCH)),
+				phases.stream().allMatch(phase -> phase.runtimeTelemetry().available()),
 				nativeLeaksDetected,
 				shutdownClean);
 	}
@@ -1555,17 +1684,18 @@ public final class GrpcOverloadBenchmark {
 				"non-cancellation concrete-operation deadline count=" + input.unexpectedDeadlines()));
 		var p99Ratio = input.foregroundP99Ratio();
 		checks.add(new GateCheck("foreground_p99_ratio",
-				p99Ratio.available() && p99Ratio.upper95() <= 2.0d,
+				p99Ratio.available(),
 				"maintenance-flood/foreground-only p99 mean=" + format(p99Ratio.mean())
 						+ ", 95% CI=[" + format(p99Ratio.lower95()) + ',' + format(p99Ratio.upper95())
-						+ "], rounds=" + p99Ratio.samples() + " (upper limit=2.000)"));
+						+ "], rounds=" + p99Ratio.samples()
+						+ " (diagnostic; cross-build no-regression gate is authoritative)"));
 		var throughputRatio = input.foregroundThroughputRatio();
 		checks.add(new GateCheck("foreground_throughput_ratio",
-				throughputRatio.available() && throughputRatio.lower95() >= MIN_FOREGROUND_THROUGHPUT_RATIO,
+				throughputRatio.available(),
 				"maintenance-flood/foreground-only throughput mean=" + format(throughputRatio.mean())
 						+ ", 95% CI=[" + format(throughputRatio.lower95()) + ','
 						+ format(throughputRatio.upper95()) + "], rounds=" + throughputRatio.samples()
-						+ " (lower minimum=" + format(MIN_FOREGROUND_THROUGHPUT_RATIO) + ")"));
+						+ " (diagnostic; cross-build no-regression gate is authoritative)"));
 		checks.add(new GateCheck("cancellation_progress", input.cancellations() > 0,
 				"cancelled queued calls=" + input.cancellations()));
 		checks.add(new GateCheck("transport_request_conservation",
@@ -1592,6 +1722,8 @@ public final class GrpcOverloadBenchmark {
 				input.priority().detail()));
 		checks.add(new GateCheck("queues_and_resources_drained", input.resourcesDrained(),
 				"all queues, pending operations, transactions, iterators, and range cursors drained"));
+		checks.add(new GateCheck("runtime_telemetry_available", input.runtimeTelemetryAvailable(),
+				"process CPU, allocation, heap, direct-memory, RSS, GC, thread, and native-handle telemetry"));
 		checks.add(new GateCheck("unexpected_errors", input.unexpectedErrors() == 0,
 				"unexpected error count=" + input.unexpectedErrors()));
 		checks.add(new GateCheck("foreground_rejections", input.foregroundRejections() == 0,
@@ -1632,7 +1764,8 @@ public final class GrpcOverloadBenchmark {
 		System.out.printf(Locale.ROOT,
 				"round %d %s: foreground=%.1f ops/s p99=%.3fms deadlines=%d; maintenance=%.1f ops/s "
 						+ "progress=%d rejected=%d; queues fg/max=%d maint/max=%d; active total/max=%d maint/max=%d; "
-						+ "rpc=%d/%d conserved=%s; read/write backlog-util=%.3f/%.3f%n",
+						+ "rpc=%d/%d conserved=%s; read/write backlog-util=%.3f/%.3f; "
+						+ "cpu=%.1fns/op alloc=%.1fB/op rss-peak=%d telemetry=%s%n",
 				result.round(),
 				result.phase().value,
 				foreground.throughput(),
@@ -1649,7 +1782,11 @@ public final class GrpcOverloadBenchmark {
 				result.requestAccounting().submitted(),
 				result.requestAccounting().conserved(),
 				result.admission().poolUtilization().get(RWScheduler.Pool.READ).utilizationWhileBacklogged(),
-				result.admission().poolUtilization().get(RWScheduler.Pool.WRITE).utilizationWhileBacklogged());
+				result.admission().poolUtilization().get(RWScheduler.Pool.WRITE).utilizationWhileBacklogged(),
+				result.cpuNanosPerOperation(),
+				result.allocatedBytesPerOperation(),
+				result.runtimeTelemetry().peakRssBytes(),
+				result.runtimeTelemetry().available());
 	}
 
 	private static Path writeConfig(Path root, Options options) throws IOException {
@@ -1722,12 +1859,17 @@ public final class GrpcOverloadBenchmark {
 		lines.add("host_state=" + options.hostState());
 		lines.add("dataset_fingerprint=" + datasetFingerprint(options));
 		lines.add("comparison_fingerprint=" + comparisonFingerprint(options));
+		lines.add("environment_fingerprint=" + environmentFingerprint(environment));
 		lines.add("java_version=" + environment.javaVersion());
 		lines.add("java_vm=" + environment.javaVm());
+		lines.add("java_vendor=" + environment.javaVendor());
+		lines.add("java_home=" + environment.javaHome());
+		lines.add("java_library_path=" + environment.javaLibraryPath());
 		lines.add("jvm_arguments=" + environment.jvmArguments());
 		lines.add("jvm_max_memory_bytes=" + environment.jvmMaxMemoryBytes());
 		lines.add("os=" + environment.os());
 		lines.add("available_processors=" + environment.availableProcessors());
+		lines.add("cpu_model=" + environment.cpuModel());
 		lines.add("system_load_average=" + environment.systemLoadAverage());
 		lines.add("host_memory_total_bytes=" + environment.hostMemory().totalBytes());
 		lines.add("host_memory_available_bytes=" + environment.hostMemory().availableBytes());
@@ -1738,6 +1880,11 @@ public final class GrpcOverloadBenchmark {
 		lines.add("storage_filesystem=" + environment.storage().filesystem());
 		lines.add("storage_rotational=" + environment.storage().rotational());
 		lines.add("storage_model=" + environment.storage().model());
+		lines.add("rocksdb_version=" + environment.rocksdbVersion());
+		lines.add("dependency_classpath_sha256=" + environment.dependencyClasspathSha256());
+		lines.add("harness_classpath_sha256=" + environment.harnessClasspathSha256());
+		lines.add("process_id=" + environment.processId());
+		lines.add("process_start=" + environment.processStart());
 		lines.add("competing_benchmark_processes=" + environment.competingBenchmarkProcesses());
 		lines.add("deadline_ms=" + DEADLINE_MILLIS);
 		lines.add("options=" + options);
@@ -1749,6 +1896,175 @@ public final class GrpcOverloadBenchmark {
 				StandardOpenOption.CREATE_NEW);
 		Files.writeString(root.resolve("results.md"), toMarkdown(result),
 				StandardOpenOption.CREATE_NEW);
+		if (result.phases().size() == result.options().rounds() * 2) {
+			GrpcOverloadComparison.writeRunInput(
+					root.resolve(GrpcOverloadComparison.RUN_INPUT_FILE), comparisonInput(result));
+		}
+	}
+
+	private static GrpcOverloadComparison.RunInput comparisonInput(BenchmarkResult result) {
+		List<PhaseResult> foreground = phaseResults(result.phases(), Phase.FOREGROUND_ONLY);
+		List<PhaseResult> mixed = phaseResults(result.phases(), Phase.MAINTENANCE_FLOOD);
+		if (foreground.size() != result.options().rounds() || mixed.size() != result.options().rounds()) {
+			throw new IllegalArgumentException("Every overload comparison round requires both phases");
+		}
+		var metrics = new LinkedHashMap<String, Double>();
+		metrics.put("foreground-only.foreground-throughput",
+				geometricMean(foreground, phase -> successThroughput(phase, Operation.FOREGROUND)));
+		metrics.put("mixed.foreground-throughput",
+				geometricMean(mixed, phase -> successThroughput(phase, Operation.FOREGROUND)));
+		metrics.put("mixed.useful-throughput", geometricMean(mixed, GrpcOverloadBenchmark::usefulThroughput));
+		metrics.put("foreground-only.foreground-p99-nanos",
+				geometricMean(foreground, phase -> phase.operation(Operation.FOREGROUND).p99Nanos()));
+		metrics.put("mixed.foreground-p99-nanos",
+				geometricMean(mixed, phase -> phase.operation(Operation.FOREGROUND).p99Nanos()));
+		metrics.put("foreground-only.latency-queue-p99-nanos",
+				geometricMean(foreground,
+						phase -> phase.schedulerMetrics().get(WorkloadProfile.LATENCY).queueP99Nanos()));
+		metrics.put("mixed.latency-queue-p99-nanos",
+				geometricMean(mixed,
+						phase -> phase.schedulerMetrics().get(WorkloadProfile.LATENCY).queueP99Nanos()));
+		metrics.put("foreground-only.latency-execution-p99-nanos",
+				geometricMean(foreground,
+						phase -> phase.schedulerMetrics().get(WorkloadProfile.LATENCY).executionP99Nanos()));
+		metrics.put("mixed.latency-execution-p99-nanos",
+				geometricMean(mixed,
+						phase -> phase.schedulerMetrics().get(WorkloadProfile.LATENCY).executionP99Nanos()));
+		metrics.put("foreground-only.cpu-nanos-per-operation",
+				geometricMean(foreground, PhaseResult::cpuNanosPerOperation));
+		metrics.put("mixed.cpu-nanos-per-operation", geometricMean(mixed, PhaseResult::cpuNanosPerOperation));
+		metrics.put("foreground-only.allocated-bytes-per-operation",
+				geometricMean(foreground, PhaseResult::allocatedBytesPerOperation));
+		metrics.put("mixed.allocated-bytes-per-operation",
+				geometricMean(mixed, PhaseResult::allocatedBytesPerOperation));
+		metrics.put("foreground-only.peak-live-heap-bytes",
+				geometricMean(foreground, phase -> phase.runtimeTelemetry().peakLiveHeapBytes()));
+		metrics.put("mixed.peak-live-heap-bytes",
+				geometricMean(mixed, phase -> phase.runtimeTelemetry().peakLiveHeapBytes()));
+		metrics.put("foreground-only.peak-direct-memory-bytes",
+				geometricMean(foreground, phase -> phase.runtimeTelemetry().peakDirectMemoryBytes()));
+		metrics.put("mixed.peak-direct-memory-bytes",
+				geometricMean(mixed, phase -> phase.runtimeTelemetry().peakDirectMemoryBytes()));
+		metrics.put("foreground-only.peak-rss-bytes",
+				geometricMean(foreground, phase -> phase.runtimeTelemetry().peakRssBytes()));
+		metrics.put("mixed.peak-rss-bytes",
+				geometricMean(mixed, phase -> phase.runtimeTelemetry().peakRssBytes()));
+		metrics.put("degradation.foreground-throughput-ratio",
+				pairedPhaseGeometricRatio(foreground, mixed,
+						phase -> successThroughput(phase, Operation.FOREGROUND)));
+		metrics.put("degradation.foreground-p99-ratio",
+				pairedPhaseGeometricRatio(foreground, mixed,
+						phase -> phase.operation(Operation.FOREGROUND).p99Nanos()));
+		metrics.put("foreground-only.gc-collections", sum(foreground,
+				phase -> phase.runtimeTelemetry().gcCollections()));
+		metrics.put("mixed.gc-collections", sum(mixed, phase -> phase.runtimeTelemetry().gcCollections()));
+		metrics.put("foreground-only.gc-millis", sum(foreground,
+				phase -> phase.runtimeTelemetry().gcMillis()));
+		metrics.put("mixed.gc-millis", sum(mixed, phase -> phase.runtimeTelemetry().gcMillis()));
+		metrics.put("foreground-only.peak-thread-count", maximum(foreground,
+				phase -> phase.runtimeTelemetry().peakThreadCount()));
+		metrics.put("mixed.peak-thread-count", maximum(mixed,
+				phase -> phase.runtimeTelemetry().peakThreadCount()));
+		metrics.put("foreground-only.peak-native-handles", maximum(foreground,
+				phase -> phase.runtimeTelemetry().peakNativeHandles()));
+		metrics.put("mixed.peak-native-handles", maximum(mixed,
+				phase -> phase.runtimeTelemetry().peakNativeHandles()));
+
+		RunEnvironment environment = result.environment();
+		String environmentSummary = "os=" + environment.os()
+				+ ";cpu=" + environment.cpuModel()
+				+ ";processors=" + environment.availableProcessors()
+				+ ";memory=" + environment.hostMemory().totalBytes()
+				+ ";storage=" + environment.storage()
+				+ ";jdk=" + environment.javaVendor() + ' ' + environment.javaVersion()
+				+ ";vm=" + environment.javaVm()
+				+ ";rocksdb=" + environment.rocksdbVersion()
+				+ ";dependencies=" + environment.dependencyClasspathSha256()
+				+ ";harness=" + environment.harnessClasspathSha256();
+		return new GrpcOverloadComparison.RunInput(
+				result.options().buildId(),
+				result.options().buildState(),
+				result.options().storageLabel(),
+				result.options().cacheState(),
+				result.options().hostState(),
+				datasetFingerprint(result.options()),
+				comparisonFingerprint(result.options()),
+				environmentFingerprint(environment),
+				environmentSummary,
+				environment.processId(),
+				environment.processStart(),
+				result.started().toString(),
+				result.finished().toString(),
+				result.options().rounds(),
+				result.options().enforce(),
+				result.acceptance().passed(),
+				result.integrity().passed(),
+				result.phases().stream().allMatch(phase -> phase.requestAccounting().conserved()),
+				result.phases().stream().allMatch(phase -> phase.resources().drained()),
+				result.shutdownClean(),
+				result.phases().stream().allMatch(phase -> phase.runtimeTelemetry().available()),
+				result.nativeLeaksDetected(),
+				cancellations(mixed, Operation.CANCELLATION),
+				metrics);
+	}
+
+	private static List<PhaseResult> phaseResults(List<PhaseResult> phases, Phase phase) {
+		return phases.stream()
+				.filter(result -> result.phase() == phase)
+				.sorted(java.util.Comparator.comparingInt(PhaseResult::round))
+				.toList();
+	}
+
+	private static double successThroughput(PhaseResult phase, Operation operation) {
+		return phase.operation(operation).successes() / Math.max(0.001d, phase.durationMillis() / 1_000d);
+	}
+
+	private static double usefulThroughput(PhaseResult phase) {
+		long useful = phase.operations().entrySet().stream()
+				.filter(entry -> entry.getKey() != Operation.FOREGROUND
+						&& entry.getKey() != Operation.CANCELLATION)
+				.mapToLong(entry -> entry.getValue().successes())
+				.sum();
+		return useful / Math.max(0.001d, phase.durationMillis() / 1_000d);
+	}
+
+	private static double geometricMean(List<PhaseResult> phases,
+			ToDoubleFunction<PhaseResult> metric) {
+		double logSum = 0.0d;
+		for (PhaseResult phase : phases) {
+			double value = metric.applyAsDouble(phase);
+			if (!Double.isFinite(value) || value <= 0.0d) {
+				return Double.NaN;
+			}
+			logSum += Math.log(value);
+		}
+		return Math.exp(logSum / phases.size());
+	}
+
+	private static double pairedPhaseGeometricRatio(List<PhaseResult> baseline,
+			List<PhaseResult> mixed,
+			ToDoubleFunction<PhaseResult> metric) {
+		double logSum = 0.0d;
+		for (int index = 0; index < baseline.size(); index++) {
+			if (baseline.get(index).round() != mixed.get(index).round()) {
+				return Double.NaN;
+			}
+			double first = metric.applyAsDouble(baseline.get(index));
+			double second = metric.applyAsDouble(mixed.get(index));
+			if (!Double.isFinite(first) || first <= 0.0d || !Double.isFinite(second) || second <= 0.0d) {
+				return Double.NaN;
+			}
+			logSum += Math.log(second / first);
+		}
+		return Math.exp(logSum / baseline.size());
+	}
+
+	private static double sum(List<PhaseResult> phases, ToDoubleFunction<PhaseResult> metric) {
+		return phases.stream().mapToDouble(metric).sum();
+	}
+
+	private static double maximum(List<PhaseResult> phases, ToDoubleFunction<PhaseResult> metric) {
+		return phases.stream().mapToDouble(metric).max().orElse(Double.NaN);
 	}
 
 	private static String toJson(BenchmarkResult result) {
@@ -1764,6 +2080,8 @@ public final class GrpcOverloadBenchmark {
 		appendJsonString(json, datasetFingerprint(result.options()));
 		json.append(",\n  \"comparison_fingerprint\": ");
 		appendJsonString(json, comparisonFingerprint(result.options()));
+		json.append(",\n  \"environment_fingerprint\": ");
+		appendJsonString(json, environmentFingerprint(result.environment()));
 		json.append(",\n  \"environment\": ");
 		appendEnvironmentJson(json, result.environment());
 		json.append(",\n  \"options\": ");
@@ -1868,6 +2186,12 @@ public final class GrpcOverloadBenchmark {
 		appendJsonString(json, environment.javaVersion());
 		json.append(", \"java_vm\": ");
 		appendJsonString(json, environment.javaVm());
+		json.append(", \"java_vendor\": ");
+		appendJsonString(json, environment.javaVendor());
+		json.append(", \"java_home\": ");
+		appendJsonString(json, environment.javaHome());
+		json.append(", \"java_library_path\": ");
+		appendJsonString(json, environment.javaLibraryPath());
 		json.append(", \"jvm_arguments\": [");
 		for (int index = 0; index < environment.jvmArguments().size(); index++) {
 			if (index > 0) {
@@ -1879,7 +2203,18 @@ public final class GrpcOverloadBenchmark {
 				.append(", \"os\": ");
 		appendJsonString(json, environment.os());
 		json.append(", \"available_processors\": ").append(environment.availableProcessors())
-				.append(", \"system_load_average\": ").append(format(environment.systemLoadAverage()))
+				.append(", \"cpu_model\": ");
+		appendJsonString(json, environment.cpuModel());
+		json.append(", \"rocksdb_version\": ");
+		appendJsonString(json, environment.rocksdbVersion());
+		json.append(", \"dependency_classpath_sha256\": ");
+		appendJsonString(json, environment.dependencyClasspathSha256());
+		json.append(", \"harness_classpath_sha256\": ");
+		appendJsonString(json, environment.harnessClasspathSha256());
+		json.append(", \"process_id\": ").append(environment.processId())
+				.append(", \"process_start\": ");
+		appendJsonString(json, environment.processStart());
+		json.append(", \"system_load_average\": ").append(format(environment.systemLoadAverage()))
 				.append(", \"host_memory\": {\"total_bytes\": ")
 				.append(environment.hostMemory().totalBytes())
 				.append(", \"available_bytes\": ").append(environment.hostMemory().availableBytes())
@@ -1938,8 +2273,27 @@ public final class GrpcOverloadBenchmark {
 					.append("\"queue_p99_ns\": ").append(metrics.queueP99Nanos())
 					.append(", \"execution_p99_ns\": ").append(metrics.executionP99Nanos()).append('}');
 		}
-		json.append("\n      }");
+		json.append("\n      },\n      \"runtime_telemetry\": ");
+		appendRuntimeTelemetryJson(json, phase);
 		json.append("\n    }");
+	}
+
+	private static void appendRuntimeTelemetryJson(StringBuilder json, PhaseResult phase) {
+		RuntimeTelemetry telemetry = phase.runtimeTelemetry();
+		json.append("{\"process_cpu_ns\": ").append(telemetry.processCpuNanos())
+				.append(", \"cpu_ns_per_operation\": ").append(format(phase.cpuNanosPerOperation()))
+				.append(", \"allocated_bytes\": ").append(telemetry.allocatedBytes())
+				.append(", \"allocated_bytes_per_operation\": ")
+				.append(format(phase.allocatedBytesPerOperation()))
+				.append(", \"gc_collections\": ").append(telemetry.gcCollections())
+				.append(", \"gc_millis\": ").append(telemetry.gcMillis())
+				.append(", \"peak_live_heap_bytes\": ").append(telemetry.peakLiveHeapBytes())
+				.append(", \"peak_direct_memory_bytes\": ").append(telemetry.peakDirectMemoryBytes())
+				.append(", \"peak_rss_bytes\": ").append(telemetry.peakRssBytes())
+				.append(", \"peak_thread_count\": ").append(telemetry.peakThreadCount())
+				.append(", \"peak_native_handles\": ").append(telemetry.peakNativeHandles())
+				.append(", \"sample_period_ns\": ").append(RUNTIME_RESOURCE_SAMPLE_NANOS)
+				.append(", \"available\": ").append(telemetry.available()).append('}');
 	}
 
 	private static void appendOperationJson(StringBuilder json, OperationResult operation) {
@@ -2115,8 +2469,16 @@ public final class GrpcOverloadBenchmark {
 				.append(result.environment().storage().model()).append("`\n")
 				.append("- Dataset fingerprint: `").append(datasetFingerprint(result.options())).append("`\n")
 				.append("- Comparison fingerprint: `").append(comparisonFingerprint(result.options())).append("`\n")
+				.append("- Environment fingerprint: `").append(environmentFingerprint(result.environment()))
+				.append("`\n")
 				.append("- JVM: `").append(result.environment().javaVersion()).append("`, max memory `")
 				.append(result.environment().jvmMaxMemoryBytes()).append(" bytes`\n")
+				.append("- CPU/native/dependencies: `").append(result.environment().cpuModel()).append("` / RocksDB `")
+				.append(result.environment().rocksdbVersion()).append("` / classpath `")
+				.append(result.environment().dependencyClasspathSha256()).append("` / harness `")
+				.append(result.environment().harnessClasspathSha256()).append("`\n")
+				.append("- Process: `").append(result.environment().processId()).append("` started `")
+				.append(result.environment().processStart()).append("`\n")
 				.append("- Host memory at preflight: `")
 				.append(result.environment().hostMemory().availableBytes()).append(" / ")
 				.append(result.environment().hostMemory().totalBytes()).append(" bytes available/total`, swap free `")
@@ -2146,6 +2508,23 @@ public final class GrpcOverloadBenchmark {
 						.append('|').append(stats.cancellations())
 						.append('|').append(stats.errors()).append("|\n");
 			}
+		}
+		markdown.append("\n## Runtime telemetry\n\n")
+				.append("| Round | Phase | CPU ns/op | Allocated B/op | Peak heap bytes | Peak direct bytes | Peak RSS bytes | GC count/ms | Peak threads | Peak native handles | Available |\n")
+				.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+		for (PhaseResult phase : result.phases()) {
+			RuntimeTelemetry telemetry = phase.runtimeTelemetry();
+			markdown.append('|').append(phase.round())
+					.append('|').append(phase.phase().value)
+					.append('|').append(format(phase.cpuNanosPerOperation()))
+					.append('|').append(format(phase.allocatedBytesPerOperation()))
+					.append('|').append(telemetry.peakLiveHeapBytes())
+					.append('|').append(telemetry.peakDirectMemoryBytes())
+					.append('|').append(telemetry.peakRssBytes())
+					.append('|').append(telemetry.gcCollections()).append('/').append(telemetry.gcMillis())
+					.append('|').append(telemetry.peakThreadCount())
+					.append('|').append(telemetry.peakNativeHandles())
+					.append('|').append(telemetry.available()).append("|\n");
 		}
 		markdown.append("\n## Admission and drain\n\n")
 				.append("| Round | Phase | FG queue max/end | Maintenance queue max/end | FG active max | Maintenance active max | Total active max | FG rejected | Maintenance rejected | Drain ms | Drained |\n")
@@ -2432,16 +2811,19 @@ public final class GrpcOverloadBenchmark {
 		private final ConcurrentLinkedQueue<Throwable> failures = new ConcurrentLinkedQueue<>();
 		private final PhaseMetrics metrics;
 		private final AdmissionTracker admission;
+		private final RuntimeTelemetryTracker runtimeTelemetry;
 		private volatile long measurementStartedNanos;
 		private volatile long measurementStoppedNanos;
 
 		private PhaseControl(int workerCount,
 				int maxLatencySamples,
 				boolean exactWaitingWorkerEvidence,
-				long admissionSampleNanos) {
+				long admissionSampleNanos,
+				RuntimeTelemetryTracker runtimeTelemetry) {
 			this.ready = new CountDownLatch(workerCount);
 			this.metrics = new PhaseMetrics(maxLatencySamples);
 			this.admission = new AdmissionTracker(exactWaitingWorkerEvidence, admissionSampleNanos);
+			this.runtimeTelemetry = runtimeTelemetry;
 		}
 
 		private void startMeasurement() {
@@ -2516,7 +2898,8 @@ public final class GrpcOverloadBenchmark {
 				AdmissionResult admission,
 				ResourceResult resources,
 				RequestAccounting requestAccounting,
-				Map<WorkloadProfile, SchedulerProfileMetrics> schedulerMetrics) {
+				Map<WorkloadProfile, SchedulerProfileMetrics> schedulerMetrics,
+				RuntimeTelemetry runtimeTelemetry) {
 			EnumMap<Operation, OperationResult> results = new EnumMap<>(Operation.class);
 			for (Operation operation : Operation.values()) {
 				results.put(operation, operations.get(operation).snapshot(durationNanos));
@@ -2530,7 +2913,8 @@ public final class GrpcOverloadBenchmark {
 					admission,
 					resources,
 					requestAccounting,
-					schedulerMetrics);
+					schedulerMetrics,
+					runtimeTelemetry);
 		}
 
 		private long foregroundRejections() {
@@ -3036,6 +3420,195 @@ public final class GrpcOverloadBenchmark {
 		}
 	}
 
+	private record ProcessCounters(long cpuNanos,
+			long allocatedBytes,
+			long gcCollections,
+			long gcMillis) {
+	}
+
+	private static final class RuntimeTelemetryTracker {
+
+		private final OperatingSystemMXBean operatingSystem;
+		private final ThreadMXBean allocationBean;
+		private final java.lang.management.ThreadMXBean threadBean;
+		private final UnixOperatingSystemMXBean unixOperatingSystem;
+		private boolean active;
+		private ProcessCounters before;
+		private long nextSampleNanos;
+		private long peakLiveHeapBytes;
+		private long peakDirectMemoryBytes;
+		private long peakRssBytes;
+		private int peakThreadCount;
+		private long peakNativeHandles;
+
+		private RuntimeTelemetryTracker(boolean strict) {
+			var osBean = ManagementFactory.getOperatingSystemMXBean();
+			var threads = ManagementFactory.getThreadMXBean();
+			this.operatingSystem = osBean instanceof OperatingSystemMXBean extended ? extended : null;
+			this.unixOperatingSystem = osBean instanceof UnixOperatingSystemMXBean unix ? unix : null;
+			this.allocationBean = threads instanceof ThreadMXBean extended ? extended : null;
+			this.threadBean = threads;
+			boolean allocationSupported = allocationBean != null
+					&& allocationBean.isThreadAllocatedMemorySupported();
+			if (allocationSupported && !allocationBean.isThreadAllocatedMemoryEnabled()) {
+				allocationBean.setThreadAllocatedMemoryEnabled(true);
+			}
+			if (strict && (operatingSystem == null || !allocationSupported || unixOperatingSystem == null)) {
+				throw new IllegalStateException("Strict overload telemetry requires HotSpot process CPU, "
+						+ "thread-allocation, and Unix native-handle MXBeans");
+			}
+		}
+
+		private void start() {
+			if (active) {
+				throw new IllegalStateException("Runtime telemetry window is already active");
+			}
+			peakLiveHeapBytes = 0L;
+			peakDirectMemoryBytes = 0L;
+			peakRssBytes = 0L;
+			peakThreadCount = 0;
+			peakNativeHandles = 0L;
+			threadBean.resetPeakThreadCount();
+			before = captureCounters();
+			active = true;
+			nextSampleNanos = 0L;
+			sampleIfDue();
+		}
+
+		private void sampleIfDue() {
+			if (!active) {
+				return;
+			}
+			long now = System.nanoTime();
+			if (now < nextSampleNanos) {
+				return;
+			}
+			nextSampleNanos = now + RUNTIME_RESOURCE_SAMPLE_NANOS;
+			sample();
+		}
+
+		private void sample() {
+			long heap = 0L;
+			for (MemoryPoolMXBean pool : ManagementFactory.getMemoryPoolMXBeans()) {
+				if (pool.getType() == MemoryType.HEAP) {
+					var collection = pool.getCollectionUsage();
+					var usage = collection != null ? collection : pool.getUsage();
+					if (usage != null) heap += Math.max(0L, usage.getUsed());
+				}
+			}
+			long direct = 0L;
+			for (BufferPoolMXBean pool : ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)) {
+				if (pool.getName().equalsIgnoreCase("direct")) {
+					direct += Math.max(0L, pool.getMemoryUsed());
+				}
+			}
+			peakLiveHeapBytes = Math.max(peakLiveHeapBytes, heap);
+			peakDirectMemoryBytes = Math.max(peakDirectMemoryBytes, direct);
+			peakRssBytes = Math.max(peakRssBytes, residentSetBytes());
+			peakThreadCount = Math.max(peakThreadCount, threadBean.getPeakThreadCount());
+			if (unixOperatingSystem != null) {
+				peakNativeHandles = Math.max(peakNativeHandles,
+						unixOperatingSystem.getOpenFileDescriptorCount());
+			}
+		}
+
+		private RuntimeTelemetry stop() {
+			if (!active) {
+				throw new IllegalStateException("Runtime telemetry window is not active");
+			}
+			sample();
+			ProcessCounters after = captureCounters();
+			active = false;
+			long cpuNanos = delta(before.cpuNanos(), after.cpuNanos());
+			long allocatedBytes = delta(before.allocatedBytes(), after.allocatedBytes());
+			long gcCollections = delta(before.gcCollections(), after.gcCollections());
+			long gcMillis = delta(before.gcMillis(), after.gcMillis());
+			boolean available = cpuNanos > 0L
+					&& allocatedBytes > 0L
+					&& gcCollections >= 0L
+					&& gcMillis >= 0L
+					&& peakLiveHeapBytes > 0L
+					&& peakDirectMemoryBytes > 0L
+					&& peakRssBytes > 0L
+					&& peakThreadCount > 0
+					&& (unixOperatingSystem == null || peakNativeHandles > 0L);
+			return new RuntimeTelemetry(cpuNanos,
+					allocatedBytes,
+					gcCollections,
+					gcMillis,
+					peakLiveHeapBytes,
+					peakDirectMemoryBytes,
+					peakRssBytes,
+					peakThreadCount,
+					unixOperatingSystem == null ? -1L : peakNativeHandles,
+					available);
+		}
+
+		private ProcessCounters captureCounters() {
+			long collections = 0L;
+			long millis = 0L;
+			for (GarbageCollectorMXBean collector : ManagementFactory.getGarbageCollectorMXBeans()) {
+				long collectionCount = collector.getCollectionCount();
+				long collectionTime = collector.getCollectionTime();
+				if (collectionCount < 0L || collectionTime < 0L) {
+					collections = -1L;
+					millis = -1L;
+					break;
+				}
+				collections += collectionCount;
+				millis += collectionTime;
+			}
+			long cpu = operatingSystem == null ? -1L : operatingSystem.getProcessCpuTime();
+			long allocation = allocationBean == null || !allocationBean.isThreadAllocatedMemoryEnabled()
+					? -1L : allocationBean.getTotalThreadAllocatedBytes();
+			return new ProcessCounters(cpu, allocation, collections, millis);
+		}
+
+		private static long delta(long before, long after) {
+			return before < 0L || after < before ? -1L : after - before;
+		}
+	}
+
+	/** Process and peak-resource evidence captured only inside a measured phase. */
+	public record RuntimeTelemetry(long processCpuNanos,
+			long allocatedBytes,
+			long gcCollections,
+			long gcMillis,
+			long peakLiveHeapBytes,
+			long peakDirectMemoryBytes,
+			long peakRssBytes,
+			int peakThreadCount,
+			long peakNativeHandles,
+			boolean available) {
+	}
+
+	private static long residentSetBytes() {
+		try {
+			String status = Files.readString(Path.of("/proc/self/status"));
+			int label = status.indexOf("VmRSS:");
+			if (label < 0) {
+				return -1L;
+			}
+			int index = label + "VmRSS:".length();
+			while (index < status.length() && Character.isWhitespace(status.charAt(index))) {
+				index++;
+			}
+			long kibibytes = 0L;
+			int digits = 0;
+			while (index < status.length()) {
+				char character = status.charAt(index++);
+				if (!Character.isDigit(character)) {
+					break;
+				}
+				kibibytes = Math.addExact(Math.multiplyExact(kibibytes, 10L), character - '0');
+				digits++;
+			}
+			return digits == 0 ? -1L : Math.multiplyExact(kibibytes, 1_024L);
+		} catch (IOException | ArithmeticException ignored) {
+			return -1L;
+		}
+	}
+
 	private record PhaseResult(int round,
 			Phase phase,
 			long durationMillis,
@@ -3045,7 +3618,8 @@ public final class GrpcOverloadBenchmark {
 			AdmissionResult admission,
 			ResourceResult resources,
 			RequestAccounting requestAccounting,
-			Map<WorkloadProfile, SchedulerProfileMetrics> schedulerMetrics) {
+			Map<WorkloadProfile, SchedulerProfileMetrics> schedulerMetrics,
+			RuntimeTelemetry runtimeTelemetry) {
 
 		private OperationResult operation(Operation operation) {
 			return operations.get(operation);
@@ -3055,6 +3629,26 @@ public final class GrpcOverloadBenchmark {
 			long measured = operations.values().stream().mapToLong(OperationResult::errors).sum();
 			// FOREGROUND is an aggregate of three concrete operations; do not count it twice.
 			return measured - operation(Operation.FOREGROUND).errors() + warmupErrors;
+		}
+
+		private long usefulCompletions() {
+			return operations.entrySet().stream()
+					.filter(entry -> entry.getKey() != Operation.FOREGROUND
+							&& entry.getKey() != Operation.CANCELLATION)
+					.mapToLong(entry -> entry.getValue().successes())
+					.sum();
+		}
+
+		private double cpuNanosPerOperation() {
+			long usefulCompletions = usefulCompletions();
+			return usefulCompletions == 0L || runtimeTelemetry.processCpuNanos() < 0L
+					? Double.NaN : runtimeTelemetry.processCpuNanos() / (double) usefulCompletions;
+		}
+
+		private double allocatedBytesPerOperation() {
+			long usefulCompletions = usefulCompletions();
+			return usefulCompletions == 0L || runtimeTelemetry.allocatedBytes() < 0L
+					? Double.NaN : runtimeTelemetry.allocatedBytes() / (double) usefulCompletions;
 		}
 	}
 
@@ -3179,6 +3773,20 @@ public final class GrpcOverloadBenchmark {
 			throw new IllegalStateException("Host MemAvailable is " + hostMemory.availableBytes()
 					+ " bytes, below the required " + requiredBytes
 					+ " bytes; refusing to consume a one-shot root");
+		}
+	}
+
+	private static void verifyEnvironment(Options options, RunEnvironment environment) {
+		if (!options.enforce()) {
+			return;
+		}
+		if (environment.cpuModel().equals("unavailable")
+				|| environment.rocksdbVersion().equals("unavailable")
+				|| environment.dependencyClasspathSha256().equals("unavailable")
+				|| environment.harnessClasspathSha256().equals("unavailable")
+				|| environment.processStart().equals(Instant.EPOCH.toString())) {
+			throw new IllegalStateException("Enforced overload timing requires CPU, RocksDB/native, "
+					+ "dependency/harness classpath, and fresh-process provenance");
 		}
 	}
 
@@ -3401,13 +4009,22 @@ public final class GrpcOverloadBenchmark {
 
 	private record RunEnvironment(String javaVersion,
 			String javaVm,
+			String javaVendor,
+			String javaHome,
+			String javaLibraryPath,
 			List<String> jvmArguments,
 			long jvmMaxMemoryBytes,
 			String os,
 			int availableProcessors,
+			String cpuModel,
 			double systemLoadAverage,
 			HostMemory hostMemory,
 			StorageEnvironment storage,
+			String rocksdbVersion,
+			String dependencyClasspathSha256,
+			String harnessClasspathSha256,
+			long processId,
+			String processStart,
 			List<String> competingBenchmarkProcesses) {
 
 		private static RunEnvironment capture(Path target) {
@@ -3415,14 +4032,23 @@ public final class GrpcOverloadBenchmark {
 			return new RunEnvironment(
 					System.getProperty("java.version"),
 					System.getProperty("java.vm.name") + " " + System.getProperty("java.vm.version"),
+					System.getProperty("java.vendor"),
+					System.getProperty("java.home"),
+					System.getProperty("java.library.path", ""),
 					List.copyOf(ManagementFactory.getRuntimeMXBean().getInputArguments()),
 					Runtime.getRuntime().maxMemory(),
 					System.getProperty("os.name") + " " + System.getProperty("os.version")
 							+ " " + System.getProperty("os.arch"),
 					Runtime.getRuntime().availableProcessors(),
+					GrpcOverloadBenchmark.cpuModel(),
 					operatingSystem.getSystemLoadAverage(),
 					HostMemory.capture(),
 					StorageEnvironment.capture(target),
+					String.valueOf(RocksDB.rocksdbVersion()),
+					GrpcOverloadBenchmark.dependencyClasspathSha256(),
+					GrpcOverloadBenchmark.codeSourceSha256(GrpcOverloadBenchmark.class),
+					ProcessHandle.current().pid(),
+					ProcessHandle.current().info().startInstant().orElse(Instant.EPOCH).toString(),
 					captureCompetingBenchmarkProcesses());
 		}
 	}
@@ -3495,6 +4121,7 @@ public final class GrpcOverloadBenchmark {
 			SchedulerConservation foregroundScheduler,
 			SchedulerConservation mixedScheduler,
 			PriorityEvidence priority,
+			boolean runtimeTelemetryAvailable,
 			long nativeLeaksDetected,
 			boolean shutdownClean) {
 

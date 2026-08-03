@@ -26,7 +26,7 @@ class GrpcOverloadBenchmarkTest {
 	Path tempDir;
 
 	@Test
-	void acceptancePassesAtEveryBoundary() {
+	void correctnessAcceptanceDoesNotTreatOldPerformanceCeilingsAsCrossBuildGates() {
 		var report = GrpcOverloadBenchmark.evaluateAcceptance(passingInput(100, 200));
 
 		assertTrue(report.passed());
@@ -61,6 +61,7 @@ class GrpcOverloadBenchmarkTest {
 				new GrpcOverloadBenchmark.SchedulerConservation(10, 10, 9, 9, 0,
 						List.of("write imbalance")),
 				new GrpcOverloadBenchmark.PriorityEvidence(0, 0, 0, 0, 0, 0, 0, 0, 0),
+				false,
 				5,
 				false));
 
@@ -73,8 +74,6 @@ class GrpcOverloadBenchmarkTest {
 				"foreground_deadlines",
 				"first_last_deadlines",
 				"all_operation_deadlines",
-				"foreground_p99_ratio",
-				"foreground_throughput_ratio",
 				"cancellation_progress",
 				"transport_request_conservation",
 				"round_trip_integrity",
@@ -84,6 +83,7 @@ class GrpcOverloadBenchmarkTest {
 				"scheduler_counter_conservation",
 				"priority_and_quantum_bound",
 				"queues_and_resources_drained",
+				"runtime_telemetry_available",
 				"unexpected_errors",
 				"foreground_rejections",
 				"native_handle_leaks",
@@ -186,6 +186,10 @@ class GrpcOverloadBenchmarkTest {
 		String fingerprint = GrpcOverloadBenchmark.comparisonFingerprintForTesting(base);
 
 		assertEquals(fingerprint, GrpcOverloadBenchmark.comparisonFingerprintForTesting(base));
+		assertEquals(fingerprint, GrpcOverloadBenchmark.comparisonFingerprintForTesting(
+				"--smoke=true", "--enforce=false", "--build-id=another-build",
+				"--build-state=clean", "--storage-label=nvme", "--cache-state=warm"),
+				"build provenance must not prevent baseline/candidate workload identity matching");
 		assertNotEquals(fingerprint, GrpcOverloadBenchmark.comparisonFingerprintForTesting(
 				"--smoke=true", "--enforce=false", "--build-id=diagnostic-dirty",
 				"--build-state=dirty", "--storage-label=nvme", "--cache-state=warm",
@@ -339,6 +343,7 @@ class GrpcOverloadBenchmarkTest {
 						5,
 						4,
 						4),
+				true,
 				0,
 				true);
 	}
