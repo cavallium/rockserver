@@ -9,6 +9,7 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.SafeShutdown;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -22,9 +23,11 @@ import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -92,6 +95,132 @@ class ScanRawCompactionSafetyTest {
 			} finally {
 				releaseForeground.countDown();
 			}
+		}
+	}
+
+	@Test
+	void nativeCleanupFailureIsASchedulerFailureAndDrainsTheScan(@TempDir Path tempDir) throws Exception {
+		String databaseName = "scan-raw-cleanup-failure";
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), databaseName, null)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = api.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			api.put(0, columnId, key(1), value(0, 1), RequestType.none());
+			api.flush();
+
+			internal.setRawScanCleanupObserverForTesting(() -> {
+				throw new IllegalStateException("synthetic raw scan cleanup failure");
+			});
+			var scheduler = internal.getScheduler();
+			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			try {
+				var failure = assertThrows(IllegalStateException.class,
+						() -> internal.scanRawAsyncInternal(
+								columnId,
+								0,
+								1,
+								reactor.core.scheduler.Schedulers.immediate(),
+								scheduler.readExecutor())
+								.collectList()
+								.block(Duration.ofSeconds(10)));
+				assertEquals("synthetic raw scan cleanup failure", failure.getMessage());
+				assertEquals(0L, internal.getPendingOpsCount());
+
+				var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
+				assertEquals(1L, after.outcomes().get(RWScheduler.TerminalOutcome.FAILURE)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+				assertEquals(0L, after.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+				assertEquals(0, after.activeTasks());
+				assertEquals(0, after.queuedTasks());
+			} finally {
+				internal.setRawScanCleanupObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void firstDispatchParksUntilTheSchedulerHandleIsAttached(@TempDir Path tempDir) throws Exception {
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "scan-raw-attach", null)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = api.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			api.put(0, columnId, key(1), value(0, 1), RequestType.none());
+			api.flush();
+
+			var firstDispatch = new AtomicReference<RWScheduler.CooperativeResult>();
+			RWScheduler.WorkloadExecutor immediateExecutor = new RWScheduler.WorkloadExecutor() {
+				@Override
+				public void execute(Runnable command) {
+					command.run();
+				}
+
+				@Override
+				public void execute(Runnable command, long estimatedBytes) {
+					command.run();
+				}
+
+				@Override
+				public RWScheduler.CooperativeHandle executeCooperatively(
+						RWScheduler.CooperativeTask command,
+						long estimatedBytes) {
+					firstDispatch.set(command.runCooperatively(new RWScheduler.CooperativeContext() {
+						@Override
+						public boolean preemptionRequested() {
+							return false;
+						}
+
+						@Override
+						public boolean terminationRequested() {
+							return false;
+						}
+
+						@Override
+						public RuntimeException terminationFailure() {
+							return null;
+						}
+
+						@Override
+						public boolean fail(RuntimeException failure) {
+							return true;
+						}
+					}));
+					return new RWScheduler.CooperativeHandle() {
+						private boolean disposed;
+
+						@Override
+						public void resume() {
+							command.reject(new RejectedExecutionException("stop after attach proof"));
+						}
+
+						@Override
+						public void dispose() {
+							disposed = true;
+						}
+
+						@Override
+						public boolean isDisposed() {
+							return disposed;
+						}
+					};
+				}
+			};
+
+			assertThrows(RejectedExecutionException.class,
+					() -> internal.scanRawAsyncInternal(
+							columnId,
+							0,
+							1,
+							reactor.core.scheduler.Schedulers.immediate(),
+							immediateExecutor)
+							.collectList()
+							.block(Duration.ofSeconds(10)));
+			assertEquals(RWScheduler.CooperativeResult.PARK, firstDispatch.get(),
+					"the first dispatch must not open native state before attach returns the handle");
+			assertEquals(0L, internal.getPendingOpsCount());
 		}
 	}
 

@@ -174,7 +174,7 @@ class RetainedRangeCooperativeTest {
 	}
 
 	@Test
-	void shutdownWaitsForWinningRetainedRangeCleanupBeforeClosingNativeResources() throws Exception {
+	void shutdownWinsWhileSuccessfulRetainedRangeCleanupIsStillFallible() throws Exception {
 		var cleanupEntered = new CountDownLatch(1);
 		var releaseCleanup = new CountDownLatch(1);
 		EmbeddedConnection connection = null;
@@ -189,7 +189,8 @@ class RetainedRangeCooperativeTest {
 			});
 			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
 			var scheduler = connection.getScheduler();
-			var outcomesBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
+			awaitReadPoolDrained(scheduler);
+			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
 					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
 			assertTrue(cleanupEntered.await(5, TimeUnit.SECONDS));
@@ -210,17 +211,20 @@ class RetainedRangeCooperativeTest {
 					"shutdown advanced while the winning task still owned native range cleanup");
 
 			releaseCleanup.countDown();
-			assertEquals(33L, count.get(5, TimeUnit.SECONDS));
+			var failure = assertThrows(ExecutionException.class, () -> count.get(5, TimeUnit.SECONDS));
+			assertTrue(failure.getCause() instanceof java.util.concurrent.RejectedExecutionException);
 			close.get(10, TimeUnit.SECONDS);
 			assertRetainedResourcesDrained(connection);
-			var outcomesAfter = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
-			assertEquals(1L, outcomesAfter.get(RWScheduler.TerminalOutcome.RUN)
-					- outcomesBefore.get(RWScheduler.TerminalOutcome.RUN),
-					"scheduler RUN must win before the completion callback begins cleanup");
-			assertEquals(0L, outcomesAfter.get(RWScheduler.TerminalOutcome.SHUTDOWN)
-					- outcomesBefore.get(RWScheduler.TerminalOutcome.SHUTDOWN));
-			assertEquals(0L, outcomesAfter.get(RWScheduler.TerminalOutcome.CANCELLATION)
-					- outcomesBefore.get(RWScheduler.TerminalOutcome.CANCELLATION),
+			var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
+			assertEquals(0L, after.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+					- before.outcomes().get(RWScheduler.TerminalOutcome.RUN),
+					"RUN cannot be selected until fallible native cleanup succeeds");
+			assertEquals(1L, after.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN)
+					- before.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN),
+					"shutdown must win while successful completion is not yet prepared");
+			assertEquals(0L, after.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION)
+					- before.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION),
 					"database shutdown must not be recorded as cooperative cancellation");
 		} finally {
 			releaseCleanup.countDown();
@@ -235,6 +239,104 @@ class RetainedRangeCooperativeTest {
 						// Preserve the primary assertion failure; the close future carries shutdown diagnostics.
 					}
 				}
+			}
+		}
+	}
+
+	@Test
+	void retainedCleanupFailureIsASchedulerFailureAndDrainsResources() throws Exception {
+		String databaseName = "retained-count-cleanup-failure";
+		try (var connection = populatedConnection(databaseName, 33, "")) {
+			var db = connection.getInternalDB();
+			db.setRetainedRangeCleanupObserverForTesting(() -> {
+				throw new IllegalStateException("synthetic retained cleanup failure");
+			});
+			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
+			var scheduler = connection.getScheduler();
+			awaitReadPoolDrained(scheduler);
+			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			try {
+				var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+				var failure = assertThrows(ExecutionException.class, () -> count.get(5, TimeUnit.SECONDS));
+				assertTrue(failure.getCause() instanceof IllegalStateException);
+				assertEquals("synthetic retained cleanup failure", failure.getCause().getMessage());
+				assertRetainedResourcesDrained(connection);
+
+				var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
+				assertEquals(1L, after.outcomes().get(RWScheduler.TerminalOutcome.FAILURE)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+				assertEquals(0L, after.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			} finally {
+				db.setRetainedRangeCleanupObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void retainedStreamCleanupFailureIsASchedulerFailureAndDrainsResources() throws Exception {
+		String databaseName = "retained-stream-cleanup-failure";
+		try (var connection = populatedConnection(databaseName, 33, "")) {
+			var db = connection.getInternalDB();
+			db.setRetainedRangeCleanupObserverForTesting(() -> {
+				throw new IllegalStateException("synthetic retained stream cleanup failure");
+			});
+			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
+			var scheduler = connection.getScheduler();
+			awaitReadPoolDrained(scheduler);
+			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			try {
+				var range = Flux.from(connection.getAsyncApi(RequestContext.batch()).getRangeAsync(
+						0, columnId, null, null, false, RequestType.allInRange(), 30_000))
+						.collectList()
+						.toFuture();
+				var failure = assertThrows(ExecutionException.class, () -> range.get(5, TimeUnit.SECONDS));
+				assertTrue(failure.getCause() instanceof IllegalStateException);
+				assertEquals("synthetic retained stream cleanup failure", failure.getCause().getMessage());
+				assertRetainedResourcesDrained(connection);
+
+				var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
+				assertEquals(1L, after.outcomes().get(RWScheduler.TerminalOutcome.FAILURE)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+				assertEquals(0L, after.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			} finally {
+				db.setRetainedRangeCleanupObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void retainedNativeOpenFailureIsASchedulerFailureAndDrainsResources() throws Exception {
+		String databaseName = "retained-count-open-failure";
+		try (var connection = populatedConnection(databaseName, 33, "")) {
+			var db = connection.getInternalDB();
+			db.setRangeIteratorOpenObserverForTesting(() -> {
+				throw new IllegalStateException("synthetic retained iterator-open failure");
+			});
+			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
+			var scheduler = connection.getScheduler();
+			awaitReadPoolDrained(scheduler);
+			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			try {
+				var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+				var failure = assertThrows(ExecutionException.class, () -> count.get(5, TimeUnit.SECONDS));
+				assertTrue(failure.getCause() instanceof IllegalStateException);
+				assertEquals("synthetic retained iterator-open failure", failure.getCause().getMessage());
+				assertRetainedResourcesDrained(connection);
+
+				var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
+				assertEquals(1L, after.outcomes().get(RWScheduler.TerminalOutcome.FAILURE)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+				assertEquals(0L, after.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			} finally {
+				db.setRangeIteratorOpenObserverForTesting(null);
 			}
 		}
 	}
@@ -520,6 +622,13 @@ class RetainedRangeCooperativeTest {
 				&& connection.getInternalDB().getRetainedRangeSnapshotCount() == 0
 				&& connection.getInternalDB().getRetainedRangePermitCount() == 0
 				&& connection.getInternalDB().getRetainedRangeWaiterCount() == 0, 5_000));
+	}
+
+	private static void awaitReadPoolDrained(RWScheduler scheduler) throws InterruptedException {
+		assertTrue(awaitCondition(() -> {
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			return snapshot.activeTasks() == 0 && snapshot.queuedTasks() == 0;
+		}, 5_000));
 	}
 
 	private static boolean awaitCondition(java.util.function.BooleanSupplier condition,

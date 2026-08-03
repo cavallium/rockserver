@@ -383,6 +383,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private volatile @Nullable BiConsumer<String, String> cdcMetadataOperationObserver;
 	private volatile @Nullable BiConsumer<String, String> cdcMetadataLoadedObserver;
 	private volatile @Nullable Runnable rawScanFilesCapturedObserver;
+	private volatile @Nullable Runnable rawScanCleanupObserver;
 	private volatile @Nullable Runnable columnMaintenanceObserver;
 	private volatile @Nullable LongConsumer columnUseAcquiredObserver;
 	private Path tempSSTsPath;
@@ -1931,6 +1932,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setRawScanFilesCapturedObserverForTesting(@Nullable Runnable observer) {
 		this.rawScanFilesCapturedObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setRawScanCleanupObserverForTesting(@Nullable Runnable observer) {
+		this.rawScanCleanupObserver = observer;
 	}
 
 	@VisibleForTesting
@@ -4774,14 +4780,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final @Nullable RWScheduler.WorkloadExecutor cooperativeExecutor;
 		private final Object lifecycleLock = new Object();
 		private final AtomicBoolean cancelRequested = new AtomicBoolean();
-		private final AtomicBoolean terminalCleaned = new AtomicBoolean();
+		private final AtomicBoolean resourcesCleaned = new AtomicBoolean();
 		private int state = INITIAL_QUEUED;
 		private @Nullable ExistsMultiCursor cursor;
 		private volatile @Nullable RWScheduler.CooperativeHandle cooperativeHandle;
 		private boolean operationStarted;
 		private boolean cooperativeCompletionPrepared;
 		private @Nullable List<Boolean> cooperativeResult;
-		private @Nullable Throwable cooperativeFailure;
+		private @Nullable Throwable resourceCleanupFailure;
 
 		private AsyncExistsMultiRequest(long transactionId,
 				long columnId,
@@ -4906,10 +4912,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (initialize) {
 				try {
 					initialize();
+				} catch (VirtualMachineError fatal) {
+					throw fatal;
 				} catch (Throwable error) {
-					if (!context.terminationRequested()) {
-						prepareCooperativeCompletion(null, mapExistsMultiFailure(error));
-					}
+					context.fail(cooperativeFailure(mapExistsMultiFailure(error),
+							"Cooperative existsMulti initialization failed"));
 					return RWScheduler.CooperativeResult.COMPLETE;
 				}
 			}
@@ -4925,7 +4932,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (exhausted) {
-						prepareCooperativeCompletion(activeCursor.result(), null);
+						prepareCooperativeCompletion(context, activeCursor.result());
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (context.preemptionRequested()) {
@@ -4937,16 +4944,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						return RWScheduler.CooperativeResult.YIELD;
 					}
 				}
+			} catch (VirtualMachineError fatal) {
+				throw fatal;
 			} catch (Throwable error) {
-				if (!context.terminationRequested()) {
-					prepareCooperativeCompletion(null, mapExistsMultiFailure(error));
-				}
+				context.fail(cooperativeFailure(mapExistsMultiFailure(error),
+						"Cooperative existsMulti native read failed"));
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 		}
 
-		private void prepareCooperativeCompletion(@Nullable List<Boolean> result,
-				@Nullable Throwable failure) {
+		private void prepareCooperativeCompletion(RWScheduler.CooperativeContext context,
+				List<Boolean> result) {
+			var cleanupFailure = cleanupTerminalResources(null);
+			if (cleanupFailure != null) {
+				if (cleanupFailure instanceof VirtualMachineError fatal) {
+					throw fatal;
+				}
+				context.fail(cooperativeFailure(cleanupFailure,
+						"Cooperative existsMulti cleanup failed"));
+				return;
+			}
 			synchronized (lifecycleLock) {
 				if (state != CHUNK_RUNNING) {
 					return;
@@ -4955,7 +4972,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					throw new IllegalStateException("existsMulti completion was prepared twice");
 				}
 				cooperativeResult = result;
-				cooperativeFailure = failure;
 				cooperativeCompletionPrepared = true;
 			}
 		}
@@ -4963,7 +4979,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		@Override
 		public void completeCooperatively() {
 			final List<Boolean> result;
-			final Throwable failure;
 			synchronized (lifecycleLock) {
 				if (state == FINISHED) {
 					return;
@@ -4972,10 +4987,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					throw new IllegalStateException("Scheduler selected RUN without an existsMulti result");
 				}
 				state = FINISHED;
-				result = cooperativeResult;
-				failure = cooperativeFailure;
+				result = Objects.requireNonNull(cooperativeResult,
+						"Prepared existsMulti result");
 			}
-			completeTerminal(result, failure);
+			complete(result);
 		}
 
 		@Override
@@ -5088,22 +5103,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		private void completeTerminal(@Nullable List<Boolean> result, @Nullable Throwable failure) {
-			if (!terminalCleaned.compareAndSet(false, true)) {
-				return;
+			var terminalFailure = cleanupTerminalResources(failure);
+			if (terminalFailure != null) {
+				completeExceptionally(terminalFailure);
+			} else {
+				complete(Objects.requireNonNull(result));
 			}
-			var terminalFailure = failure;
+		}
+
+		private @Nullable Throwable cleanupTerminalResources(@Nullable Throwable originalFailure) {
+			if (!resourcesCleaned.compareAndSet(false, true)) {
+				var existingCleanupFailure = resourceCleanupFailure;
+				return existingCleanupFailure == null
+						? originalFailure
+						: appendFailure(originalFailure, existingCleanupFailure);
+			}
+			Throwable cleanupFailure = null;
 			if (cursor != null) {
 				try {
 					cursor.close();
 				} catch (Throwable closeFailure) {
-					terminalFailure = appendFailure(terminalFailure, closeFailure);
+					cleanupFailure = appendFailure(cleanupFailure, closeFailure);
 				}
 			}
 			if (operationStarted) {
 				try {
 					existsMultiTimer.record(System.nanoTime() - requestStartNanos, TimeUnit.NANOSECONDS);
 				} catch (Throwable timerFailure) {
-					terminalFailure = appendFailure(terminalFailure, timerFailure);
+					cleanupFailure = appendFailure(cleanupFailure, timerFailure);
 				}
 				activeExistsMultiRequests.remove(this);
 				try {
@@ -5112,16 +5139,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					// no longer be visible as active before publishing that final release.
 					ops.endOp();
 				} catch (Throwable endFailure) {
-					terminalFailure = appendFailure(terminalFailure, endFailure);
+					cleanupFailure = appendFailure(cleanupFailure, endFailure);
 				}
 			} else {
 				activeExistsMultiRequests.remove(this);
 			}
-			if (terminalFailure != null) {
-				completeExceptionally(terminalFailure);
-			} else {
-				complete(Objects.requireNonNull(result));
-			}
+			resourceCleanupFailure = cleanupFailure;
+			return cleanupFailure == null
+					? originalFailure
+					: appendFailure(originalFailure, cleanupFailure);
 		}
 
 		private void removeQueuedTask() {
@@ -5293,6 +5319,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return error instanceof Exception
 				? RocksDBException.of(RocksDBErrorType.GET_1, error)
 				: error;
+	}
+
+	private static RuntimeException cooperativeFailure(Throwable failure, String message) {
+		if (failure instanceof RuntimeException runtimeException) {
+			return runtimeException;
+		}
+		if (failure instanceof org.rocksdb.RocksDBException rocksDBException) {
+			return mapIteratorStatusException(rocksDBException);
+		}
+		return new RejectedExecutionException(message, failure);
 	}
 
 	private static Throwable appendFailure(@Nullable Throwable current, Throwable next) {
@@ -6700,8 +6736,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		protected volatile @Nullable RWScheduler.CooperativeHandle handle;
 		private @Nullable RangeCursor cursor;
 		private boolean completionPrepared;
-		private @Nullable Throwable preparedFailure;
-		private boolean preparedSignalTerminal;
+		private boolean cleanupStarted;
+		private @Nullable Throwable cleanupFailure;
 
 		private RetainedRangeCooperativeTask(long transactionId,
 				long columnId,
@@ -6789,10 +6825,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return context.terminationRequested();
 		}
 
-		protected final boolean deliveryCancelled() {
-			return deliveryCancelled;
-		}
-
 		protected final void cancelDelivery() {
 			if (terminated.get()) {
 				return;
@@ -6866,7 +6898,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			finish(failure, !deliveryCancelled);
 		}
 
-		protected final void prepareCompletion(@Nullable Throwable failure, boolean signalTerminal) {
+		protected final void prepareCompletion(RWScheduler.CooperativeContext context) {
+			var failure = cleanupResources(null);
+			if (failure != null) {
+				if (failure instanceof VirtualMachineError fatal) {
+					throw fatal;
+				}
+				context.fail(cooperativeFailure(failure,
+						"Cooperative retained range cleanup failed"));
+				return;
+			}
 			synchronized (admissionLock) {
 				if (terminated.get()) {
 					return;
@@ -6874,16 +6915,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (completionPrepared) {
 					throw new IllegalStateException("Retained range completion was prepared twice");
 				}
-				preparedFailure = failure;
-				preparedSignalTerminal = signalTerminal;
 				completionPrepared = true;
 			}
 		}
 
 		@Override
 		public final void completeCooperatively() {
-			final Throwable failure;
-			final boolean signalTerminal;
 			synchronized (admissionLock) {
 				if (terminated.get()) {
 					return;
@@ -6891,24 +6928,40 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (!completionPrepared) {
 					throw new IllegalStateException("Scheduler selected RUN without a retained range result");
 				}
-				failure = preparedFailure;
-				signalTerminal = preparedSignalTerminal;
 			}
-			finish(failure, signalTerminal);
+			if (!terminated.compareAndSet(false, true)) {
+				return;
+			}
+			signalTerminal(null);
 		}
 
 		protected final void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
 			if (!terminated.compareAndSet(false, true)) {
 				return;
 			}
-			Throwable failure = originalFailure;
+			var failure = cleanupResources(originalFailure);
+			if (signalTerminal) {
+				signalTerminal(failure);
+			}
+		}
+
+		private @Nullable Throwable cleanupResources(@Nullable Throwable originalFailure) {
+			if (cleanupStarted) {
+				awaitCleanupFinished();
+				var existingCleanupFailure = cleanupFailure;
+				return existingCleanupFailure == null
+						? originalFailure
+						: appendFailure(originalFailure, existingCleanupFailure);
+			}
+			cleanupStarted = true;
+			Throwable currentCleanupFailure = null;
 			try {
 				var cleanupObserver = retainedRangeCleanupObserver;
 				if (cleanupObserver != null) {
 					try {
 						cleanupObserver.run();
 					} catch (Throwable observerFailure) {
-						failure = appendFailure(failure, observerFailure);
+						currentCleanupFailure = appendFailure(currentCleanupFailure, observerFailure);
 					}
 				}
 				RangeCursor localCursor;
@@ -6922,27 +6975,28 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						localCursor.close();
 					}
 				} catch (Throwable closeError) {
-					failure = appendFailure(failure, closeError);
+					currentCleanupFailure = appendFailure(currentCleanupFailure, closeError);
 				} finally {
 					totalTime.add(System.nanoTime() - closeStart);
 					try {
 						retainedPermit.close();
 					} catch (Throwable closeError) {
-						failure = appendFailure(failure, closeError);
+						currentCleanupFailure = appendFailure(currentCleanupFailure, closeError);
 					}
 					activeRangeResources.remove(this);
 					try {
 						timer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
 					} catch (Throwable timerFailure) {
-						failure = appendFailure(failure, timerFailure);
+						currentCleanupFailure = appendFailure(currentCleanupFailure, timerFailure);
 					}
 				}
 			} finally {
+				cleanupFailure = currentCleanupFailure;
 				cleanupFinished.countDown();
 			}
-			if (signalTerminal) {
-				signalTerminal(failure);
-			}
+			return currentCleanupFailure == null
+					? originalFailure
+					: appendFailure(originalFailure, currentCleanupFailure);
 		}
 
 		private void awaitCleanupFinished() {
@@ -7030,7 +7084,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				producedOne();
 				sink.next(chunk);
 				if (chunk.exhausted()) {
-					prepareCompletion(null, true);
+					prepareCompletion(context);
 					return RWScheduler.CooperativeResult.COMPLETE;
 				}
 				if (schedulerTerminationRequested(context)) {
@@ -7045,14 +7099,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						? RWScheduler.CooperativeResult.PARK
 						: RWScheduler.CooperativeResult.YIELD;
 			} catch (VirtualMachineError fatal) {
-				if (!schedulerTerminationRequested(context)) {
-					prepareCompletion(fatal, !deliveryCancelled());
-				}
 				throw fatal;
 			} catch (Throwable failure) {
-				if (!schedulerTerminationRequested(context)) {
-					prepareCompletion(failure, !deliveryCancelled());
-				}
+				context.fail(cooperativeFailure(failure,
+						"Cooperative retained range read failed"));
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 		}
@@ -7152,7 +7202,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (chunk.exhausted()) {
-						prepareCompletion(null, true);
+						prepareCompletion(context);
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (notifyRangeContinuationAndPark()) {
@@ -7163,14 +7213,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				}
 			} catch (VirtualMachineError fatal) {
-				if (!schedulerTerminationRequested(context)) {
-					prepareCompletion(fatal, !deliveryCancelled());
-				}
 				throw fatal;
 			} catch (Throwable failure) {
-				if (!schedulerTerminationRequested(context)) {
-					prepareCompletion(failure, !deliveryCancelled());
-				}
+				context.fail(cooperativeFailure(failure,
+						"Cooperative retained range count failed"));
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 		}
@@ -8093,7 +8139,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private final class ScanState implements RWScheduler.CooperativeTask, LongConsumer, reactor.core.Disposable {
+	private final class ScanState implements RWScheduler.CooperativeCompletionTask,
+			LongConsumer,
+			reactor.core.Disposable {
 		private final ColumnInstance col;
 		private final String cfName;
 		private final LiveFileMetaData file;
@@ -8111,6 +8159,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private int batchSize;
 		private int currentBatchBytes;
 		private int currentSerializedBatchBytes = Integer.BYTES;
+		private boolean completionPrepared;
+		private boolean resourcesCleaned;
+		private @Nullable Throwable resourceCleanupFailure;
 
 		private ScanState(ColumnInstance col,
 		                  String cfName,
@@ -8199,12 +8250,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (terminated.get()) {
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
-			if (cancellationRequested) {
-				finish(null, false);
-				return RWScheduler.CooperativeResult.COMPLETE;
+			// executeCooperatively may dispatch before it returns the stable handle. Park
+			// that first quantum so cancellation and demand can only act through the
+			// scheduler-owned logical submission before any native handle is opened.
+			if (handle == null) {
+				return RWScheduler.CooperativeResult.PARK;
 			}
 			if (context.terminationRequested()) {
-				finish(context.terminationFailure(), true);
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 			if (demand.get() == 0L) {
@@ -8214,12 +8266,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				open();
 				long preemptionStartNanos = 0L;
 				while (true) {
-					if (cancellationRequested) {
-						finish(null, false);
-						return RWScheduler.CooperativeResult.COMPLETE;
-					}
 					if (context.terminationRequested()) {
-						finish(context.terminationFailure(), true);
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					var iterator = Objects.requireNonNull(it, "Raw scan iterator");
@@ -8228,7 +8275,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						if (batchSize > 0) {
 							emitBatch();
 						}
-						finish(null, true);
+						if (context.terminationRequested()) {
+							return RWScheduler.CooperativeResult.COMPLETE;
+						}
+						prepareSuccessfulCompletion(context);
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 
@@ -8281,8 +8331,32 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			} catch (VirtualMachineError fatal) {
 				throw fatal;
 			} catch (Throwable failure) {
-				finish(failure, true);
+				context.fail(cooperativeFailure(failure,
+						"Cooperative raw scan failed"));
 				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+		}
+
+		private void prepareSuccessfulCompletion(RWScheduler.CooperativeContext context) {
+			var failure = cleanupNativeResources(null);
+			if (failure != null) {
+				if (failure instanceof VirtualMachineError fatal) {
+					throw fatal;
+				}
+				context.fail(cooperativeFailure(failure,
+						"Cooperative raw scan cleanup failed"));
+				return;
+			}
+			completionPrepared = true;
+		}
+
+		@Override
+		public void completeCooperatively() {
+			if (!completionPrepared) {
+				throw new IllegalStateException("Scheduler selected RUN before raw scan cleanup completed");
+			}
+			if (terminated.compareAndSet(false, true)) {
+				sink.complete();
 			}
 		}
 
@@ -8359,12 +8433,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (!terminated.compareAndSet(false, true)) {
 				return;
 			}
-			Throwable failure = originalFailure;
-			try {
-				closeNativeResources();
-			} catch (Throwable closeFailure) {
-				failure = appendFailure(failure, closeFailure);
-			}
+			var failure = cleanupNativeResources(originalFailure);
 			if (!signalTerminal) {
 				return;
 			}
@@ -8373,6 +8442,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			} else {
 				sink.error(failure);
 			}
+		}
+
+		private @Nullable Throwable cleanupNativeResources(@Nullable Throwable originalFailure) {
+			if (resourcesCleaned) {
+				return resourceCleanupFailure == null
+						? originalFailure
+						: appendFailure(originalFailure, resourceCleanupFailure);
+			}
+			resourcesCleaned = true;
+			Throwable cleanupFailure = null;
+			try {
+				closeNativeResources();
+			} catch (Throwable closeFailure) {
+				cleanupFailure = appendFailure(cleanupFailure, closeFailure);
+			}
+			resourceCleanupFailure = cleanupFailure;
+			return cleanupFailure == null
+					? originalFailure
+					: appendFailure(originalFailure, cleanupFailure);
 		}
 
 		private void closeNativeResources() {
@@ -8409,6 +8497,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (localOptions != null) {
 				try {
 					localOptions.close();
+				} catch (Throwable error) {
+					failure = appendFailure(failure, error);
+				}
+			}
+			var cleanupObserver = rawScanCleanupObserver;
+			if (cleanupObserver != null) {
+				try {
+					cleanupObserver.run();
 				} catch (Throwable error) {
 					failure = appendFailure(failure, error);
 				}

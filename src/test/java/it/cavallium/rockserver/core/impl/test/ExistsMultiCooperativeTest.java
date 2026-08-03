@@ -12,6 +12,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -156,6 +157,7 @@ class ExistsMultiCooperativeTest {
 				nativeCalls.incrementAndGet();
 				firstNativeCall.countDown();
 				await(releaseNativeCall);
+				throw new IllegalStateException("late existsMulti failure after cancellation");
 			});
 			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			try {
@@ -188,6 +190,43 @@ class ExistsMultiCooperativeTest {
 			} finally {
 				releaseNativeCall.countDown();
 				connection.getInternalDB().setExistsMultiChunkObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void nativeArenaCleanupFailureIsASchedulerFailureAndDrainsTheRequest() throws Exception {
+		String databaseName = "exists-cooperative-native-cleanup-failure";
+		try (var connection = openConnection(databaseName, "")) {
+			var api = connection.getSyncApi(RequestContext.batch());
+			long columnId = api.createColumn("entries",
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			var keys = integerKeys(4_097);
+			var cleanupFailed = new AtomicBoolean();
+			connection.getInternalDB().setExistsMultiArenaObserverForTesting(open -> {
+				if (!open && cleanupFailed.compareAndSet(false, true)) {
+					throw new IllegalStateException("synthetic existsMulti arena cleanup failure");
+				}
+			});
+			var scheduler = connection.getScheduler();
+			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			try {
+				var request = connection.getAsyncApi(RequestContext.batch())
+						.existsMultiAsync(0, columnId, keys, 30_000);
+				var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+						() -> request.get(5, TimeUnit.SECONDS));
+				assertTrue(failure.getCause() instanceof RocksDBException);
+				assertTrue(cleanupFailed.get());
+				assertExistsResourcesDrained(connection);
+
+				var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
+				assertEquals(1L, after.outcomes().get(RWScheduler.TerminalOutcome.FAILURE)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+				assertEquals(0L, after.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			} finally {
+				connection.getInternalDB().setExistsMultiArenaObserverForTesting(null);
 			}
 		}
 	}
