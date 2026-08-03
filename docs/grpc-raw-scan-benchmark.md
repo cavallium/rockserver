@@ -31,12 +31,19 @@ call left behind. Scheduler accepted/started/completed/outcome counters, queues,
 active work, database resources, native handles, and client/server shutdown must all
 balance. At least one ordinary full-sized wire batch must be observed in a full run.
 
-The controller computes paired candidate/baseline ratios and two-sided 95% Student-t
-confidence intervals for serialized-byte throughput, scheduler BATCH/READ queue p99,
-and complete-stream p99. It rejects the candidate when the complete throughput
+The original v1 controller computes paired candidate/baseline ratios and two-sided 95%
+Student-t confidence intervals for serialized-byte throughput, scheduler BATCH/READ
+queue p99, and complete-stream p99. It rejects only when the complete throughput
 interval is below 1.0 or the complete latency interval is above 1.0. An interval that
-crosses equality is reported as inconclusive rather than mislabeled as a regression;
-use longer runs when a release decision needs a narrower interval.
+crosses equality is reported as inconclusive rather than mislabeled as a demonstrated
+regression. This remains the default so older saved artifacts retain their original
+schema and interpretation.
+
+Release Plan P must enable `--strict-non-inferiority=true`. Strict mode writes the v2
+comparison schema, fixes exactly ten paired rounds, uses geometric ratios with Student-t
+intervals in log space, and requires throughput lower 95% >= 0.99 plus scheduler queue
+and complete-scan p99 upper 95% <= 1.02. A bound crossing its threshold fails strict
+acceptance as inconclusive; there is no adaptive stopping.
 
 ## Run the release comparison
 
@@ -60,18 +67,20 @@ java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
   --candidate-classes=target/classes \
   "--build-baseline=${baseline_sha}" "--build-candidate=${candidate_sha}" \
   --build-state-baseline=clean --build-state-candidate=clean \
-  --storage-label=hdd-btrfs --host-state=dedicated --enforce=true
+  --storage-label=hdd-btrfs --host-state=dedicated \
+  --strict-non-inferiority=true --enforce=true
 ```
 
 The default full shape is 1,000,000 256-byte values, flushes every 125,000 keys,
-five scan clients, 20 READ workers, five paired rounds, one complete warmup pass per
-client, and at least 15 measured seconds per child. `--enforce=true` requires clean
-full Git SHAs, dedicated non-CI hardware, and those minimum dimensions. The root is
-one-shot and is never overwritten. Preserve `results.json`, `results.md`, metadata,
-the immutable dataset, and every per-round worker file.
+five scan clients, 20 READ workers, one complete warmup pass per client, and at least
+15 measured seconds per child. Legacy mode defaults to five paired rounds; strict mode
+defaults to and requires exactly ten. `--enforce=true` requires clean full Git SHAs,
+dedicated non-CI hardware, and those dimensions. The root is one-shot and is never
+overwritten. Preserve `results.json`, `results.md`, metadata, the immutable dataset,
+and every per-round worker file.
 
 Use `--smoke=true --enforce=false` only to validate structure and binary compatibility.
-A tmpfs/shared-host smoke result, a dirty build, a short interval, or an inconclusive
-confidence interval is not release evidence. This warmed raw-only gate complements,
-but does not replace, the cold-cache mixed gRPC gate, seven-profile hardware selector,
-full Maven validation, or the Yotsuba production canary.
+A tmpfs/shared-host smoke result, a dirty build, a short interval, or a legacy
+inconclusive confidence interval is not release evidence. This warmed raw-only gate
+complements, but does not replace, the cold-cache mixed gRPC gate, seven-profile
+hardware selector, full Maven validation, or the Yotsuba production canary.

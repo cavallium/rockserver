@@ -78,7 +78,8 @@ import reactor.core.publisher.Flux;
  */
 public final class GrpcRawScanBenchmark {
 
-	private static final String RESULT_SCHEMA = "rockserver-grpc-raw-scan-comparison-v1";
+	private static final String LEGACY_RESULT_SCHEMA = "rockserver-grpc-raw-scan-comparison-v1";
+	private static final String STRICT_RESULT_SCHEMA = "rockserver-grpc-raw-scan-comparison-v2";
 	private static final String WORKER_SCHEMA = "rockserver-grpc-raw-scan-worker-v1";
 	private static final String DATASET_SCHEMA = "rockserver-grpc-raw-scan-dataset-v1";
 	private static final String COLUMN_NAME = "grpc-raw-scan-benchmark";
@@ -562,7 +563,8 @@ public final class GrpcRawScanBenchmark {
 				result -> result.scanP99Nanos());
 		return evaluateComparison(throughputRatios, queueRatios, scanRatios,
 				results.stream().allMatch(WorkerResult::passed), options.minimumThroughputRatio(),
-				options.maximumQueueP99Ratio(), options.maximumScanP99Ratio());
+				options.maximumQueueP99Ratio(), options.maximumScanP99Ratio(),
+				options.strictNonInferiority());
 	}
 
 	private static List<WorkerResult> byImplementation(List<WorkerResult> results,
@@ -611,7 +613,39 @@ public final class GrpcRawScanBenchmark {
 			scan[index] = candidateScanP99[index] / baselineScanP99[index];
 		}
 		return evaluateComparison(throughput, queue, scan, true, minimumThroughputRatio,
-				maximumQueueP99Ratio, maximumScanP99Ratio);
+				maximumQueueP99Ratio, maximumScanP99Ratio, false);
+	}
+
+	/** Pure strict non-inferiority helper used by deterministic tests. */
+	public static Comparison evaluateStrictForTesting(double[] baselineThroughput,
+			double[] candidateThroughput,
+			double[] baselineQueueP99,
+			double[] candidateQueueP99,
+			double[] baselineScanP99,
+			double[] candidateScanP99,
+			double minimumThroughputRatio,
+			double maximumQueueP99Ratio,
+			double maximumScanP99Ratio) {
+		if (baselineThroughput.length != 10) {
+			throw new IllegalArgumentException("Strict raw-SST comparison requires exactly ten pairs");
+		}
+		if (baselineThroughput.length != candidateThroughput.length
+				|| baselineQueueP99.length != candidateQueueP99.length
+				|| baselineScanP99.length != candidateScanP99.length
+				|| baselineThroughput.length != baselineQueueP99.length
+				|| baselineThroughput.length != baselineScanP99.length) {
+			throw new IllegalArgumentException("All paired samples must have the same length");
+		}
+		double[] throughput = new double[baselineThroughput.length];
+		double[] queue = new double[baselineThroughput.length];
+		double[] scan = new double[baselineThroughput.length];
+		for (int index = 0; index < throughput.length; index++) {
+			throughput[index] = candidateThroughput[index] / baselineThroughput[index];
+			queue[index] = candidateQueueP99[index] / baselineQueueP99[index];
+			scan[index] = candidateScanP99[index] / baselineScanP99[index];
+		}
+		return evaluateComparison(throughput, queue, scan, true, minimumThroughputRatio,
+				maximumQueueP99Ratio, maximumScanP99Ratio, true);
 	}
 
 	private static Comparison evaluateComparison(double[] throughputRatios,
@@ -620,26 +654,50 @@ public final class GrpcRawScanBenchmark {
 			boolean workersPassed,
 			double minimumThroughputRatio,
 			double maximumQueueP99Ratio,
-			double maximumScanP99Ratio) {
-		var throughput = GrpcOverloadBenchmark.ratioConfidenceInterval(throughputRatios);
-		var queue = GrpcOverloadBenchmark.ratioConfidenceInterval(queueRatios);
-		var scan = GrpcOverloadBenchmark.ratioConfidenceInterval(scanRatios);
+			double maximumScanP99Ratio,
+			boolean strictNonInferiority) {
+		var throughput = ratioConfidenceInterval(throughputRatios, strictNonInferiority);
+		var queue = ratioConfidenceInterval(queueRatios, strictNonInferiority);
+		var scan = ratioConfidenceInterval(scanRatios, strictNonInferiority);
 		List<String> failures = new ArrayList<>();
 		if (!workersPassed) {
 			failures.add("one or more worker correctness/work-conservation gates failed");
 		}
-		// Reject only when the entire confidence interval demonstrates a regression. An interval
-		// crossing the equality boundary is inconclusive, not evidence that one build is worse.
-		if (!throughput.available() || throughput.upper95() < minimumThroughputRatio) {
-			failures.add("candidate raw throughput upper 95% bound is below " + minimumThroughputRatio);
-		}
-		if (!queue.available() || queue.lower95() > maximumQueueP99Ratio) {
-			failures.add("candidate scheduler queue-p99 lower 95% bound exceeds " + maximumQueueP99Ratio);
-		}
-		if (!scan.available() || scan.lower95() > maximumScanP99Ratio) {
-			failures.add("candidate end-to-end scan-p99 lower 95% bound exceeds " + maximumScanP99Ratio);
+		if (strictNonInferiority) {
+			if (!throughput.available() || throughput.lower95() < minimumThroughputRatio) {
+				failures.add("candidate raw throughput lower 95% bound is below " + minimumThroughputRatio);
+			}
+			if (!queue.available() || queue.upper95() > maximumQueueP99Ratio) {
+				failures.add("candidate scheduler queue-p99 upper 95% bound exceeds " + maximumQueueP99Ratio);
+			}
+			if (!scan.available() || scan.upper95() > maximumScanP99Ratio) {
+				failures.add("candidate end-to-end scan-p99 upper 95% bound exceeds " + maximumScanP99Ratio);
+			}
+		} else {
+			// Preserve v1 semantics: reject only a confidence interval that demonstrates a regression.
+			// An interval crossing equality remains inconclusive rather than a demonstrated loss.
+			if (!throughput.available() || throughput.upper95() < minimumThroughputRatio) {
+				failures.add("candidate raw throughput upper 95% bound is below " + minimumThroughputRatio);
+			}
+			if (!queue.available() || queue.lower95() > maximumQueueP99Ratio) {
+				failures.add("candidate scheduler queue-p99 lower 95% bound exceeds " + maximumQueueP99Ratio);
+			}
+			if (!scan.available() || scan.lower95() > maximumScanP99Ratio) {
+				failures.add("candidate end-to-end scan-p99 lower 95% bound exceeds " + maximumScanP99Ratio);
+			}
 		}
 		return new Comparison(throughput, queue, scan, List.copyOf(failures));
+	}
+
+	private static GrpcOverloadBenchmark.RatioConfidenceInterval ratioConfidenceInterval(
+			double[] ratios,
+			boolean strictNonInferiority) {
+		if (!strictNonInferiority) {
+			return GrpcOverloadBenchmark.ratioConfidenceInterval(ratios);
+		}
+		var interval = PairedBenchmarkStatistics.logRatioConfidenceInterval(ratios);
+		return new GrpcOverloadBenchmark.RatioConfidenceInterval(interval.samples(), interval.mean(),
+				interval.lower95(), interval.upper95());
 	}
 
 	private static String replaceProductionClasses(String classPath,
@@ -730,7 +788,8 @@ public final class GrpcRawScanBenchmark {
 			FileStore store,
 			Instant started) throws IOException {
 		Files.writeString(root.resolve("metadata.properties"),
-				"schema=" + RESULT_SCHEMA + "\n"
+				"schema=" + resultSchema(options) + "\n"
+						+ "comparison-mode=" + comparisonMode(options) + "\n"
 						+ "started=" + started + "\n"
 						+ "build-baseline=" + options.buildBaseline() + "\n"
 						+ "build-candidate=" + options.buildCandidate() + "\n"
@@ -753,6 +812,7 @@ public final class GrpcRawScanBenchmark {
 						+ "measure-seconds=" + options.measureSeconds() + "\n"
 						+ "rounds=" + options.rounds() + "\n"
 						+ "sample-micros=" + options.sampleMicros() + "\n"
+						+ "strict-non-inferiority=" + options.strictNonInferiority() + "\n"
 						+ "minimum-throughput-ratio=" + options.minimumThroughputRatio() + "\n"
 						+ "maximum-queue-p99-ratio=" + options.maximumQueueP99Ratio() + "\n"
 						+ "maximum-scan-p99-ratio=" + options.maximumScanP99Ratio() + "\n"
@@ -784,7 +844,8 @@ public final class GrpcRawScanBenchmark {
 			List<WorkerResult> results,
 			Comparison comparison) {
 		StringBuilder out = new StringBuilder("# Paired whole-path raw-scan comparison\n\n");
-		out.append("- Schema: `").append(RESULT_SCHEMA).append("`\n")
+		out.append("- Schema: `").append(resultSchema(options)).append("`\n")
+				.append("- Comparison mode: `").append(comparisonMode(options)).append("`\n")
 				.append("- Started / finished: `").append(started).append("` / `").append(finished).append("`\n")
 				.append("- Baseline / candidate: `").append(options.buildBaseline()).append("` / `")
 				.append(options.buildCandidate()).append("`\n")
@@ -806,12 +867,17 @@ public final class GrpcRawScanBenchmark {
 					.append('|').append(result.terminalRequests()).append('/').append(result.submittedRequests())
 					.append('|').append(result.passed() ? "PASS" : "FAIL").append("|\n");
 		}
+		String throughputBound = options.strictNonInferiority() ? "lower" : "upper";
+		String latencyBound = options.strictNonInferiority() ? "upper" : "lower";
 		out.append("\n- Candidate/baseline throughput ratio: ").append(interval(comparison.throughput()))
-				.append(" (reject if upper bound < ").append(format(options.minimumThroughputRatio())).append(")\n")
+				.append(" (reject if ").append(throughputBound).append(" bound < ")
+				.append(format(options.minimumThroughputRatio())).append(")\n")
 				.append("- Candidate/baseline scheduler queue-p99 ratio: ").append(interval(comparison.queueP99()))
-				.append(" (reject if lower bound > ").append(format(options.maximumQueueP99Ratio())).append(")\n")
+				.append(" (reject if ").append(latencyBound).append(" bound > ")
+				.append(format(options.maximumQueueP99Ratio())).append(")\n")
 				.append("- Candidate/baseline end-to-end scan-p99 ratio: ").append(interval(comparison.scanP99()))
-				.append(" (reject if lower bound > ").append(format(options.maximumScanP99Ratio())).append(")\n");
+				.append(" (reject if ").append(latencyBound).append(" bound > ")
+				.append(format(options.maximumScanP99Ratio())).append(")\n");
 		if (!comparison.failures().isEmpty()) {
 			out.append("\nFailures:\n\n");
 			for (String failure : comparison.failures()) {
@@ -827,7 +893,8 @@ public final class GrpcRawScanBenchmark {
 			Instant finished,
 			List<WorkerResult> results,
 			Comparison comparison) {
-		StringBuilder out = new StringBuilder("{\n  \"schema\": \"").append(RESULT_SCHEMA)
+		StringBuilder out = new StringBuilder("{\n  \"schema\": \"").append(resultSchema(options))
+				.append("\",\n  \"comparison_mode\": \"").append(comparisonMode(options))
 				.append("\",\n  \"started\": \"").append(started)
 				.append("\",\n  \"finished\": \"").append(finished)
 				.append("\",\n  \"build_baseline\": \"").append(json(options.buildBaseline()))
@@ -902,6 +969,14 @@ public final class GrpcRawScanBenchmark {
 				.replace("\n", "\\n").replace("\r", "\\r");
 	}
 
+	private static String resultSchema(Options options) {
+		return options.strictNonInferiority() ? STRICT_RESULT_SCHEMA : LEGACY_RESULT_SCHEMA;
+	}
+
+	private static String comparisonMode(Options options) {
+		return options.strictNonInferiority() ? "strict-non-inferiority" : "legacy-demonstrated-regression";
+	}
+
 	private static void printUsage() {
 		System.out.println("""
 				Paired whole-gRPC raw-SST comparison. Compile tests and build the untouched baseline first:
@@ -914,12 +989,15 @@ public final class GrpcRawScanBenchmark {
 				    --candidate-classes=target/classes \\
 				    --build-baseline=<full-baseline-sha> --build-candidate=<full-candidate-sha> \\
 				    --build-state-baseline=clean --build-state-candidate=clean \\
-				    --storage-label=hdd-btrfs --host-state=dedicated --enforce=true
+					--storage-label=hdd-btrfs --host-state=dedicated \\
+					--strict-non-inferiority=true --enforce=true
 
 				Full defaults: 1,000,000 keys, eight explicit SST flushes, five scan clients,
-				20 READ workers, one complete warmup scan/client, 15 measured seconds, five paired
-				rounds, alternating implementation order, strict candidate idle instrumentation,
-				and no statistically significant throughput, scheduler queue-p99, or scan-p99 loss.
+				20 READ workers, one complete warmup scan/client, 15 measured seconds, alternating
+				implementation order, and strict candidate idle instrumentation. Strict mode fixes ten
+				paired rounds and requires throughput lower 95% >= 0.99 plus queue/scan p99 upper 95%
+				<= 1.02. Without --strict-non-inferiority, the v1 five-round demonstrated-regression
+				semantics and artifact schema remain unchanged.
 				Use --smoke=true --enforce=false for structural validation only.
 				""");
 	}
@@ -1348,6 +1426,7 @@ public final class GrpcRawScanBenchmark {
 			int rounds,
 			int sampleMicros,
 			String instrumentationMode,
+			boolean strictNonInferiority,
 			double minimumThroughputRatio,
 			double maximumQueueP99Ratio,
 			double maximumScanP99Ratio,
@@ -1361,6 +1440,7 @@ public final class GrpcRawScanBenchmark {
 				"build-state-candidate", "storage-label", "host-state", "preload-keys", "flush-keys",
 				"value-bytes", "batch-entries", "scan-clients", "read-parallelism", "write-parallelism",
 				"warmup-passes", "measure-seconds", "rounds", "sample-micros", "instrumentation-mode",
+				"strict-non-inferiority",
 				"minimum-throughput-ratio", "maximum-queue-p99-ratio", "maximum-scan-p99-ratio",
 				"child-heap", "enforce", "smoke");
 
@@ -1379,6 +1459,7 @@ public final class GrpcRawScanBenchmark {
 			}
 			boolean worker = bool(values, "worker", false);
 			boolean smoke = bool(values, "smoke", false);
+			boolean strictNonInferiority = bool(values, "strict-non-inferiority", false);
 			Path root = Path.of(values.getOrDefault("root", Path.of(System.getProperty("java.io.tmpdir"),
 					"rockserver-raw-scan-" + System.currentTimeMillis()).toString()));
 			Options options = new Options(worker, root,
@@ -1400,11 +1481,13 @@ public final class GrpcRawScanBenchmark {
 					integer(values, "read-parallelism", smoke ? 4 : 20),
 					integer(values, "write-parallelism", smoke ? 4 : 8),
 					integer(values, "warmup-passes", 1), integer(values, "measure-seconds", smoke ? 2 : 15),
-					integer(values, "rounds", smoke ? 1 : 5), integer(values, "sample-micros", 250),
+					integer(values, "rounds", smoke ? 1 : strictNonInferiority ? 10 : 5),
+					integer(values, "sample-micros", 250),
 					values.getOrDefault("instrumentation-mode", worker ? "strict" : "controller"),
-					decimal(values, "minimum-throughput-ratio", 1.0d),
-					decimal(values, "maximum-queue-p99-ratio", 1.0d),
-					decimal(values, "maximum-scan-p99-ratio", 1.0d),
+					strictNonInferiority,
+					decimal(values, "minimum-throughput-ratio", strictNonInferiority ? 0.99d : 1.0d),
+					decimal(values, "maximum-queue-p99-ratio", strictNonInferiority ? 1.02d : 1.0d),
+					decimal(values, "maximum-scan-p99-ratio", strictNonInferiority ? 1.02d : 1.0d),
 					values.getOrDefault("child-heap", smoke ? "1g" : "4g"),
 					bool(values, "enforce", !smoke), smoke);
 			options.validate();
@@ -1426,6 +1509,9 @@ public final class GrpcRawScanBenchmark {
 			if (worker && instrumentationMode.equals("controller")) {
 				throw new IllegalArgumentException("workers require strict or portable instrumentation");
 			}
+			if (strictNonInferiority && !worker && rounds != 10) {
+				throw new IllegalArgumentException("strict raw-SST comparison requires exactly ten paired rounds");
+			}
 			if (!Double.isFinite(minimumThroughputRatio) || minimumThroughputRatio <= 0.0d
 					|| !Double.isFinite(maximumQueueP99Ratio) || maximumQueueP99Ratio <= 0.0d
 					|| !Double.isFinite(maximumScanP99Ratio) || maximumScanP99Ratio <= 0.0d) {
@@ -1440,13 +1526,14 @@ public final class GrpcRawScanBenchmark {
 				}
 			}
 			if (enforce) {
-				if (smoke || worker || rounds < 5 || preloadKeys < 1_000_000 || flushKeys > 125_000
+				if (smoke || worker || rounds < (strictNonInferiority ? 10 : 5)
+						|| preloadKeys < 1_000_000 || flushKeys > 125_000
 						|| scanClients * 4 < readParallelism || readParallelism < 20 || measureSeconds < 15
 						|| !buildBaseline.matches("[0-9a-f]{40}") || !buildCandidate.matches("[0-9a-f]{40}")
 						|| !buildStateBaseline.equals("clean") || !buildStateCandidate.equals("clean")
 						|| !hostState.equals("dedicated") || storageLabel.equals("ci-structural")) {
 					throw new IllegalArgumentException("enforced raw-scan comparison requires clean full SHAs, "
-							+ "dedicated hardware, five full paired rounds, and saturating 20-worker dimensions");
+							+ "dedicated hardware, the required paired rounds, and saturating 20-worker dimensions");
 				}
 			}
 		}

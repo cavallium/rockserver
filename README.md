@@ -79,6 +79,14 @@ confidence intervals for raw throughput, scheduler queue p99, and complete-scan 
 The exact one-shot command and acceptance boundary are documented in
 [`docs/grpc-raw-scan-benchmark.md`](docs/grpc-raw-scan-benchmark.md).
 
+`GrpcRetainedReadBenchmark` is the paired whole-gRPC non-regression gate for exact
+counts, streamed ranges, split `existsMulti`, and long explicit-iterator continuations.
+It runs ten predetermined baseline/candidate pairs for isolated and foreground-mixed
+scenarios, validates every result and terminal resource count, and applies strict
+log-space confidence bounds to throughput, latency, CPU, allocation, and memory.
+The release-only workflow is documented in
+[`docs/grpc-retained-read-benchmark.md`](docs/grpc-retained-read-benchmark.md).
+
 ## Fast unary GET
 
 Embedded databases with `database.global.enable-fast-get=true` use the owned

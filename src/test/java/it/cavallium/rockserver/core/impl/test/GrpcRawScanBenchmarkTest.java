@@ -74,11 +74,43 @@ class GrpcRawScanBenchmarkTest {
 	}
 
 	@Test
+	void strictNonInferiorityGateAcceptsConclusiveBounds() {
+		var result = GrpcRawScanBenchmark.evaluateStrictForTesting(
+				constant(100.0d), constant(101.0d),
+				constant(100.0d), constant(100.0d),
+				constant(1_000.0d), constant(1_000.0d),
+				0.99d, 1.02d, 1.02d);
+
+		assertTrue(result.passed());
+		assertTrue(result.throughput().lower95() >= 0.99d);
+		assertTrue(result.queueP99().upper95() <= 1.02d);
+		assertTrue(result.scanP99().upper95() <= 1.02d);
+	}
+
+	@Test
+	void strictNonInferiorityGateRejectsInconclusiveBounds() {
+		var result = GrpcRawScanBenchmark.evaluateStrictForTesting(
+				constant(100.0d), new double[] {96, 104, 97, 103, 98, 102, 99, 101, 96, 104},
+				constant(100.0d), constant(100.0d),
+				constant(1_000.0d), constant(1_000.0d),
+				0.99d, 1.02d, 1.02d);
+
+		assertFalse(result.passed());
+		assertTrue(result.throughput().lower95() < 0.99d
+				&& result.throughput().upper95() > 0.99d);
+		assertTrue(result.failures().stream().anyMatch(failure -> failure.contains("lower 95% bound")));
+	}
+
+	@Test
 	void comparisonRequiresCompletePairedVectors() {
 		assertThrows(IllegalArgumentException.class, () -> GrpcRawScanBenchmark.evaluateForTesting(
 				new double[] {100, 100}, new double[] {100},
 				new double[] {100, 100}, new double[] {100, 100},
 				new double[] {100, 100}, new double[] {100, 100},
 				1.0d, 1.0d, 1.0d));
+	}
+
+	private static double[] constant(double value) {
+		return new double[] {value, value, value, value, value, value, value, value, value, value};
 	}
 }
