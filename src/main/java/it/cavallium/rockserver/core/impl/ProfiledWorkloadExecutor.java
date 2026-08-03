@@ -670,7 +670,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			} else {
 				switch (result) {
 					case COMPLETE -> {
-						terminateCooperativeUnsafe(task, RWScheduler.TerminalOutcome.RUN, null);
+						terminalAction = terminateCooperativeUnsafe(task,
+								RWScheduler.TerminalOutcome.RUN,
+								null);
 					}
 					case YIELD -> {
 						task.clearResumeRequested();
@@ -724,25 +726,39 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
-	private void cancelCooperative(WorkloadTask task) {
+	private boolean cancelCooperative(WorkloadTask task) {
+		return requestCooperativeTermination(task,
+				RWScheduler.TerminalOutcome.CANCELLATION,
+				new CancellationException("Cooperative workload submission cancelled"));
+	}
+
+	private boolean requestCooperativeTermination(WorkloadTask task,
+	                                              RWScheduler.TerminalOutcome outcome,
+	                                              RuntimeException failure) {
+		if (outcome == RWScheduler.TerminalOutcome.RUN
+				|| outcome == RWScheduler.TerminalOutcome.OVERLOAD) {
+			throw new IllegalArgumentException("Invalid admitted cooperative terminal outcome: " + outcome);
+		}
 		TerminalAction terminalAction = null;
+		boolean selected = false;
 		lock.lock();
 		try {
 			if (task.state() == TaskState.TERMINAL || task.requestedOutcome() != null) {
-				return;
+				return false;
 			}
-			var failure = new CancellationException("Cooperative workload submission cancelled");
 			switch (task.state()) {
 				case QUEUED -> {
 					unlinkUnsafe(task);
 					terminalAction = terminateCooperativeUnsafe(task,
-							RWScheduler.TerminalOutcome.CANCELLATION,
+							outcome,
 							failure);
+					selected = terminalAction != null;
 				}
-				case PARKED -> terminalAction = terminateCooperativeUnsafe(task,
-						RWScheduler.TerminalOutcome.CANCELLATION,
-						failure);
-				case ACTIVE -> task.requestTermination(RWScheduler.TerminalOutcome.CANCELLATION, failure);
+				case PARKED -> {
+					terminalAction = terminateCooperativeUnsafe(task, outcome, failure);
+					selected = terminalAction != null;
+				}
+				case ACTIVE -> selected = task.requestTermination(outcome, failure);
 				case TERMINAL -> {
 				}
 			}
@@ -755,6 +771,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (terminalAction != null) {
 			completeTerminalAction(terminalAction);
 		}
+		return selected;
 	}
 
 	private void refreshPreemptionUnsafe() {
@@ -1248,13 +1265,15 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			completedTasks++;
 		}
 		recordOutcomeUnsafe(outcome);
-		if (outcome == RWScheduler.TerminalOutcome.RUN && failure == null) {
+		if (outcome == RWScheduler.TerminalOutcome.RUN
+				&& failure == null
+				&& !(task.command() instanceof RWScheduler.CooperativeCompletionTask)) {
 			return null;
 		}
 		return new TerminalAction(task.command(),
 				task,
 				task.metrics(),
-				Objects.requireNonNull(failure),
+				failure,
 				outcome);
 	}
 
@@ -1298,12 +1317,17 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private void completeTerminalAction(TerminalAction action) {
 		try {
-			if (action.command() instanceof RWScheduler.RejectionAwareTask rejectionAwareTask) {
-				rejectionAwareTask.reject(action.failure());
-			} else if (action.command() instanceof CompletableFuture<?> future) {
-				future.completeExceptionally(action.failure());
-			} else if (action.command() instanceof Future<?> future) {
-				future.cancel(false);
+			if (action.outcome() == RWScheduler.TerminalOutcome.RUN && action.failure() == null) {
+				((RWScheduler.CooperativeCompletionTask) action.command()).completeCooperatively();
+			} else {
+				var failure = Objects.requireNonNull(action.failure(), "Non-RUN terminal failure");
+				if (action.command() instanceof RWScheduler.RejectionAwareTask rejectionAwareTask) {
+					rejectionAwareTask.reject(failure);
+				} else if (action.command() instanceof CompletableFuture<?> future) {
+					future.completeExceptionally(failure);
+				} else if (action.command() instanceof Future<?> future) {
+					future.cancel(false);
+				}
 			}
 		} catch (Throwable terminalFailure) {
 			recordInfrastructureFailure("Failed to complete " + action.outcome()
@@ -1679,7 +1703,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
-	private static final class WorkloadTask implements RWScheduler.CooperativeHandle,
+	private static final class WorkloadTask implements CooperativeTerminationHandle,
 			RWScheduler.CooperativeContext {
 
 		private final @Nullable ProfiledWorkloadExecutor owner;
@@ -1990,8 +2014,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			return result;
 		}
 
-		private void requestTermination(RWScheduler.TerminalOutcome outcome, RuntimeException failure) {
-			Objects.requireNonNull(requestedTermination, "Non-cooperative workload task")
+		private boolean requestTermination(RWScheduler.TerminalOutcome outcome, RuntimeException failure) {
+			return Objects.requireNonNull(requestedTermination, "Non-cooperative workload task")
 					.compareAndSet(null, new RequestedTermination(outcome, failure));
 		}
 
@@ -2032,8 +2056,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		@Override
+		public boolean cancel() {
+			return Objects.requireNonNull(owner).cancelCooperative(this);
+		}
+
+		@Override
 		public void dispose() {
-			Objects.requireNonNull(owner).cancelCooperative(this);
+			cancel();
+		}
+
+		@Override
+		public void terminate(RWScheduler.TerminalOutcome outcome, RuntimeException failure) {
+			Objects.requireNonNull(owner).requestCooperativeTermination(
+					this, Objects.requireNonNull(outcome), Objects.requireNonNull(failure));
 		}
 
 		@Override
@@ -2214,7 +2249,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private record TerminalAction(Runnable command,
 	                              @Nullable WorkloadTask cooperativeTask,
 	                              TaskMetrics metrics,
-	                              RuntimeException failure,
+	                              @Nullable RuntimeException failure,
 	                              RWScheduler.TerminalOutcome outcome) {
 	}
 
@@ -2290,6 +2325,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			admissions.get(result).increment();
 		}
 	}
+}
+
+/** Internal classified termination path for retained cooperative resources. */
+interface CooperativeTerminationHandle extends RWScheduler.CooperativeHandle {
+
+	void terminate(RWScheduler.TerminalOutcome outcome, RuntimeException failure);
 }
 
 final class WorkloadPressureController {

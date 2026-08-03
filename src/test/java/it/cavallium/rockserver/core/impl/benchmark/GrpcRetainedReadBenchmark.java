@@ -23,6 +23,7 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
 import it.cavallium.rockserver.core.server.GrpcServer;
@@ -30,11 +31,16 @@ import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.lang.management.BufferPoolMXBean;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryPoolMXBean;
 import java.lang.management.MemoryType;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -59,14 +65,25 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.ToDoubleFunction;
 import java.util.stream.Collectors;
 
+import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.agent.ByteBuddyAgent;
+import net.bytebuddy.asm.MemberSubstitution;
+import net.bytebuddy.dynamic.loading.ClassReloadingStrategy;
+import net.bytebuddy.jar.asm.ClassReader;
+import net.bytebuddy.jar.asm.ClassVisitor;
+import net.bytebuddy.jar.asm.MethodVisitor;
+import net.bytebuddy.jar.asm.Opcodes;
+import net.bytebuddy.matcher.ElementMatchers;
 import org.rocksdb.RocksDB;
 import reactor.core.publisher.Flux;
 
@@ -87,6 +104,7 @@ public final class GrpcRetainedReadBenchmark {
 	private static final String SCHEDULE_SCHEMA = "rockserver-grpc-retained-read-schedule-v1";
 	private static final String COLUMN_NAME = "grpc-retained-read-benchmark";
 	private static final long VALUE_MAGIC = 0x525441494e454431L;
+	private static final String RAW_CHECKPOINT_SHA = "7d9c02c090e71df78cdca24d29335b38147b3cfb";
 	private static final int FIXED_PAIRED_ROUNDS = 10;
 	private static final long READ_TIMEOUT_MILLIS = TimeUnit.MINUTES.toMillis(10L);
 	private static final double MINIMUM_THROUGHPUT_RATIO = 0.99d;
@@ -96,6 +114,7 @@ public final class GrpcRetainedReadBenchmark {
 	private static final double MAXIMUM_MEMORY_RATIO = 1.02d;
 	private static final Set<String> WORKER_KEYS = Set.of(
 			"schema", "implementation", "scenario", "round", "build-sha", "classpath-sha256",
+			"arena-instrumentation-sha256",
 			"dataset-id", "cold-completion-nanos", "cold-first-item-nanos", "elapsed-nanos",
 			"operations", "items", "logical-bytes", "checksum", "entries-per-second",
 			"mib-per-second", "completion-p99-nanos", "first-item-p99-nanos",
@@ -106,10 +125,14 @@ public final class GrpcRetainedReadBenchmark {
 			"scheduler-failures", "scheduler-rejections", "scheduler-cancellations",
 			"peak-queued", "peak-active", "peak-pending", "peak-iterators",
 			"peak-range-cursors", "peak-retained-snapshots", "peak-retained-permits",
-			"peak-retained-waiters", "peak-iterator-leases", "final-queued", "final-active",
+			"peak-retained-waiters", "peak-iterator-leases", "peak-exists-multi-requests",
+			"peak-exists-multi-snapshots", "peak-exists-multi-read-options", "peak-exists-multi-arenas",
+			"final-queued", "final-active",
 			"final-pending", "final-transactions", "final-iterators", "final-range-cursors",
 			"final-retained-snapshots", "final-retained-permits", "final-retained-waiters",
-			"final-iterator-leases", "native-leaks", "correctness", "resources-drained",
+			"final-iterator-leases", "final-exists-multi-requests", "final-exists-multi-snapshots",
+			"final-exists-multi-read-options", "final-exists-multi-arenas",
+			"native-leaks", "correctness", "resources-drained",
 			"accounting-valid", "configured-retained-limit");
 
 	private GrpcRetainedReadBenchmark() {
@@ -144,12 +167,14 @@ public final class GrpcRetainedReadBenchmark {
 		writeDatasetMetadata(shared.resolve("dataset.properties"), options, datasetId);
 
 		String currentClassPath = normalizedClassPath(System.getProperty("java.class.path"));
+		verifyBuildCheckout(options.baselineClasses(), options.buildBaseline(), options.buildStateBaseline());
+		verifyBuildCheckout(options.candidateClasses(), options.buildCandidate(), options.buildStateCandidate());
 		String baselineClassPath = replaceProductionClasses(currentClassPath,
 				options.candidateClasses(), options.baselineClasses());
 		String candidateClassPath = replaceProductionClasses(currentClassPath,
 				options.candidateClasses(), options.candidateClasses());
-		String baselineClassPathHash = sha256(baselineClassPath);
-		String candidateClassPathHash = sha256(candidateClassPath);
+		String baselineClassPathHash = classPathContentSha256(baselineClassPath);
+		String candidateClassPathHash = classPathContentSha256(candidateClassPath);
 		List<ScheduledRun> schedule = fixedSchedule();
 		writeSchedule(root.resolve("schedule.tsv"), schedule, options,
 				baselineClassPathHash, candidateClassPathHash, datasetId);
@@ -208,9 +233,12 @@ public final class GrpcRetainedReadBenchmark {
 	                             String classPath,
 	                             String classPathHash,
 	                             String datasetId) throws Exception {
+		String byteBuddyAgent = Path.of(ByteBuddyAgent.class.getProtectionDomain()
+				.getCodeSource().getLocation().toURI()).toString();
 		List<String> command = new ArrayList<>(List.of(
 				Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 				"--enable-native-access=ALL-UNNAMED",
+				"-javaagent:" + byteBuddyAgent,
 				"-Xms" + options.childHeap(),
 				"-Xmx" + options.childHeap(),
 				"-cp", classPath,
@@ -416,6 +444,149 @@ public final class GrpcRetainedReadBenchmark {
 		}
 	}
 
+	private static String sha256(byte[]... values) {
+		try {
+			var digest = MessageDigest.getInstance("SHA-256");
+			for (byte[] value : values) {
+				updateDigest(digest, value.length);
+				digest.update(value);
+			}
+			return java.util.HexFormat.of().formatHex(digest.digest());
+		} catch (java.security.NoSuchAlgorithmException impossible) {
+			throw new IllegalStateException(impossible);
+		}
+	}
+
+	private static String classPathContentSha256(String classPath) throws IOException {
+		final MessageDigest digest;
+		try {
+			digest = MessageDigest.getInstance("SHA-256");
+		} catch (java.security.NoSuchAlgorithmException impossible) {
+			throw new IllegalStateException(impossible);
+		}
+		for (String value : classPath.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
+			Path entry = Path.of(value).toAbsolutePath().normalize();
+			if (!Files.exists(entry)) {
+				throw new IOException("Classpath entry does not exist: " + entry);
+			}
+			updateDigest(digest, "entry");
+			updateDigest(digest, entry.toString());
+			if (Files.isSymbolicLink(entry)) {
+				throw new IOException("Symbolic classpath entries are not accepted: " + entry);
+			}
+			if (Files.isRegularFile(entry)) {
+				updateDigest(digest, "file");
+				hashFile(digest, entry, entry.getFileName().toString());
+			} else if (Files.isDirectory(entry)) {
+				updateDigest(digest, "directory");
+				final List<Path> files;
+				try (var paths = Files.walk(entry)) {
+					files = paths.sorted(Comparator.comparing(path -> normalizedRelativePath(entry, path))).toList();
+				}
+				for (Path file : files) {
+					if (file.equals(entry)) {
+						continue;
+					}
+					if (Files.isSymbolicLink(file)) {
+						throw new IOException("Symbolic classpath content is not accepted: " + file);
+					}
+					if (Files.isRegularFile(file)) {
+						hashFile(digest, file, normalizedRelativePath(entry, file));
+					}
+				}
+			} else {
+				throw new IOException("Unsupported classpath entry: " + entry);
+			}
+		}
+		return java.util.HexFormat.of().formatHex(digest.digest());
+	}
+
+	private static String normalizedRelativePath(Path root, Path path) {
+		return root.relativize(path).toString().replace(java.io.File.separatorChar, '/');
+	}
+
+	private static void hashFile(MessageDigest digest, Path file, String relativePath) throws IOException {
+		updateDigest(digest, relativePath);
+		updateDigest(digest, Files.size(file));
+		byte[] buffer = new byte[64 * 1024];
+		try (InputStream input = Files.newInputStream(file)) {
+			int read;
+			while ((read = input.read(buffer)) >= 0) {
+				if (read > 0) {
+					digest.update(buffer, 0, read);
+				}
+			}
+		}
+	}
+
+	private static void updateDigest(MessageDigest digest, String value) {
+		byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+		updateDigest(digest, bytes.length);
+		digest.update(bytes);
+	}
+
+	private static void updateDigest(MessageDigest digest, long value) {
+		for (int shift = Long.SIZE - Byte.SIZE; shift >= 0; shift -= Byte.SIZE) {
+			digest.update((byte) (value >>> shift));
+		}
+	}
+
+	private static String verifyBuildCheckout(Path classes,
+	                                          String expectedSha,
+	                                          String declaredState) throws Exception {
+		Path location = classes.toAbsolutePath().normalize();
+		if (!Files.isDirectory(location)) {
+			throw new IllegalArgumentException("Classes directory does not exist: " + location);
+		}
+		String actualSha = gitOutput(location, "rev-parse", "--verify", "HEAD").trim();
+		if (!actualSha.equals(expectedSha)) {
+			throw new IllegalArgumentException("Classes checkout SHA mismatch for " + location
+					+ ": expected=" + expectedSha + " actual=" + actualSha);
+		}
+		if (declaredState.equals("clean")) {
+			String status = gitOutput(location, "status", "--porcelain=v1", "--untracked-files=normal");
+			if (!status.isBlank()) {
+				throw new IllegalArgumentException("Classes checkout was declared clean but is dirty: " + location);
+			}
+		}
+		return actualSha;
+	}
+
+	private static String gitOutput(Path location, String... arguments) throws Exception {
+		List<String> command = new ArrayList<>(arguments.length + 3);
+		command.add("git");
+		command.add("-C");
+		command.add(location.toString());
+		command.addAll(List.of(arguments));
+		Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+		var outputTask = new FutureTask<byte[]>(() -> process.getInputStream().readAllBytes());
+		Thread.ofVirtual().name("retained-provenance-output").start(outputTask);
+		final byte[] output;
+		try {
+			if (!process.waitFor(30, TimeUnit.SECONDS)) {
+				process.destroyForcibly();
+				outputTask.cancel(true);
+				throw new IllegalStateException("Git provenance command timed out for " + location);
+			}
+			output = outputTask.get(30, TimeUnit.SECONDS);
+		} catch (InterruptedException interrupted) {
+			process.destroyForcibly();
+			outputTask.cancel(true);
+			Thread.currentThread().interrupt();
+			throw interrupted;
+		} catch (java.util.concurrent.TimeoutException outputTimeout) {
+			process.destroyForcibly();
+			outputTask.cancel(true);
+			throw new IllegalStateException("Git provenance output drain timed out for " + location,
+					outputTimeout);
+		}
+		String text = new String(output, StandardCharsets.UTF_8);
+		if (process.exitValue() != 0) {
+			throw new IllegalArgumentException("Git provenance command failed for " + location + ": " + text.trim());
+		}
+		return text;
+	}
+
 	private enum Implementation {
 		BASELINE("baseline"), CANDIDATE("candidate");
 
@@ -488,12 +659,22 @@ public final class GrpcRetainedReadBenchmark {
 	}
 
 	private static void runWorker(Options options) throws Exception {
-		String actualClassPathHash = sha256(normalizedClassPath(System.getProperty("java.class.path")));
+		Path selectedClasses = options.implementation() == Implementation.BASELINE
+				? options.baselineClasses() : options.candidateClasses();
+		String expectedBuildSha = options.implementation() == Implementation.BASELINE
+				? options.buildBaseline() : options.buildCandidate();
+		String declaredBuildState = options.implementation() == Implementation.BASELINE
+				? options.buildStateBaseline() : options.buildStateCandidate();
+		String actualBuildSha = verifyBuildCheckout(selectedClasses, expectedBuildSha, declaredBuildState);
+		String actualClassPathHash = classPathContentSha256(
+				normalizedClassPath(System.getProperty("java.class.path")));
 		if (!actualClassPathHash.equals(options.expectedClassPathSha256())) {
 			throw new IllegalArgumentException("Worker classpath fingerprint mismatch: expected="
 					+ options.expectedClassPathSha256() + " actual=" + actualClassPathHash);
 		}
 		validateDatasetMetadata(options);
+		String arenaInstrumentationSha256 = ExactArenaTracking.install(EmbeddedDB.class,
+				"existsMultiStatusOnly");
 		ProcessSnapshot.enableAllocationMeasurement();
 		long leaksBefore = RocksLeakDetector.detectedLeakCount();
 		EmbeddedConnection embedded = null;
@@ -551,10 +732,8 @@ public final class GrpcRetainedReadBenchmark {
 			throw rethrow(closeFailure);
 		}
 		long nativeLeaks = awaitNativeLeakDetection(leaksBefore);
-		String buildSha = options.implementation() == Implementation.BASELINE
-				? options.buildBaseline() : options.buildCandidate();
-		WorkerResult result = WorkerResult.from(options, buildSha, actualClassPathHash,
-				measurement, nativeLeaks);
+		WorkerResult result = WorkerResult.from(options, actualBuildSha, actualClassPathHash,
+				arenaInstrumentationSha256, measurement, nativeLeaks);
 		result.write(options.output());
 		System.out.printf(Locale.ROOT,
 				"RETAINED_RESULT scenario=%s implementation=%s round=%d entries=%.3f/s "
@@ -661,7 +840,7 @@ public final class GrpcRetainedReadBenchmark {
 				future.get();
 			}
 			ProcessSnapshot processAfter = ProcessSnapshot.capture();
-			ResourceSnapshot resources = awaitDrain(embedded, server);
+			ResourceSnapshot resources = awaitDrain(embedded, server, sampler);
 			MetricSnapshot schedulerAfter = MetricSnapshot.capture(meterRegistry,
 					WorkloadProfile.BATCH, scenario.operation.family);
 			MetricSnapshot scheduler = schedulerAfter.minus(schedulerBefore);
@@ -691,8 +870,12 @@ public final class GrpcRetainedReadBenchmark {
 			done.set(true);
 			start.countDown();
 			executor.shutdownNow();
-			if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
-				throw new IllegalStateException("Measurement workers did not terminate");
+			try {
+				if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+					throw new IllegalStateException("Measurement workers did not terminate");
+				}
+			} finally {
+				sampler.close();
 			}
 		}
 	}
@@ -871,10 +1054,16 @@ public final class GrpcRetainedReadBenchmark {
 
 	private static ResourceSnapshot awaitDrain(EmbeddedConnection embedded, GrpcServer server)
 			throws InterruptedException {
+		return awaitDrain(embedded, server, null);
+	}
+
+	private static ResourceSnapshot awaitDrain(EmbeddedConnection embedded,
+	                                           GrpcServer server,
+	                                           ResourceSampler sampler) throws InterruptedException {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20L);
 		ResourceSnapshot snapshot;
 		do {
-			snapshot = ResourceSnapshot.capture(embedded, server);
+			snapshot = ResourceSnapshot.capture(embedded, server, sampler);
 			if (snapshot.drained()) {
 				return snapshot;
 			}
@@ -990,20 +1179,25 @@ public final class GrpcRetainedReadBenchmark {
 		private final EmbeddedConnection embedded;
 		private final GrpcServer server;
 		private final long sampleNanos;
+		private final ExistsMultiResourceProbe existsMultiProbe;
 		private long peakLiveHeapBytes;
 		private long peakDirectMemoryBytes;
 		private ResourcePeaks peaks = ResourcePeaks.empty();
 
-		private ResourceSampler(EmbeddedConnection embedded, GrpcServer server, long sampleNanos) {
+		private ResourceSampler(EmbeddedConnection embedded,
+		                        GrpcServer server,
+		                        long sampleNanos) {
 			this.embedded = embedded;
 			this.server = server;
 			this.sampleNanos = sampleNanos;
+			this.existsMultiProbe = new ExistsMultiResourceProbe(embedded.getInternalDB());
 		}
 
 		private void resetPeaks() {
 			peakLiveHeapBytes = 0L;
 			peakDirectMemoryBytes = 0L;
 			peaks = ResourcePeaks.empty();
+			existsMultiProbe.resetObservedPeaks();
 		}
 
 		private void run(AtomicBoolean done) throws InterruptedException {
@@ -1031,7 +1225,7 @@ public final class GrpcRetainedReadBenchmark {
 			}
 			peakLiveHeapBytes = Math.max(peakLiveHeapBytes, liveHeap);
 			peakDirectMemoryBytes = Math.max(peakDirectMemoryBytes, direct);
-			peaks = peaks.max(ResourceSnapshot.capture(embedded, server));
+			peaks = peaks.max(ResourceSnapshot.capture(embedded, server, this));
 		}
 
 		private long peakLiveHeapBytes() {
@@ -1043,7 +1237,294 @@ public final class GrpcRetainedReadBenchmark {
 		}
 
 		private ResourcePeaks peaks() {
-			return peaks;
+			return peaks.withExistsMultiPeaks(existsMultiProbe.observedPeaks());
+		}
+
+		private ExistsMultiResources existsMultiResources() {
+			return existsMultiProbe.capture();
+		}
+
+		private void close() {
+			existsMultiProbe.close();
+		}
+	}
+
+	private static final class ExistsMultiResourceProbe {
+
+		private final EmbeddedDB database;
+		private final Field activeRequestsField;
+		private final Field cursorField;
+		private final Field snapshotField;
+		private final Field readOptionsField;
+		private final AtomicInteger snapshotObserved = new AtomicInteger();
+		private final AtomicInteger chunkObserved = new AtomicInteger();
+
+		private ExistsMultiResourceProbe(EmbeddedDB database) {
+			this.database = database;
+			try {
+				Class<?> databaseType = database.getClass();
+				activeRequestsField = accessible(databaseType.getDeclaredField("activeExistsMultiRequests"));
+				Class<?> requestType = nestedClass(databaseType, "AsyncExistsMultiRequest");
+				Class<?> cursorType = nestedClass(databaseType, "ExistsMultiCursor");
+				cursorField = accessible(requestType.getDeclaredField("cursor"));
+				snapshotField = accessible(cursorType.getDeclaredField("snapshot"));
+				readOptionsField = accessible(cursorType.getDeclaredField("readOptions"));
+			} catch (ReflectiveOperationException failure) {
+				throw new IllegalStateException("Retained benchmark cannot inspect existsMulti resources", failure);
+			}
+			database.setExistsMultiSnapshotObserverForTesting(() -> snapshotObserved.set(1));
+			database.setExistsMultiChunkObserverForTesting(() -> chunkObserved.set(1));
+		}
+
+		private static Class<?> nestedClass(Class<?> owner, String simpleName) {
+			return Arrays.stream(owner.getDeclaredClasses())
+					.filter(candidate -> candidate.getSimpleName().equals(simpleName))
+					.findFirst()
+					.orElseThrow(() -> new IllegalStateException("Missing nested resource type " + simpleName));
+		}
+
+		private static Field accessible(Field field) {
+			field.setAccessible(true);
+			return field;
+		}
+
+		private ExistsMultiResources capture() {
+			try {
+				int requests = 0;
+				int snapshots = 0;
+				int readOptions = 0;
+				for (Object request : (Set<?>) activeRequestsField.get(database)) {
+					requests++;
+					Object cursor = cursorField.get(request);
+					if (cursor != null) {
+						if (snapshotField.get(cursor) != null) snapshots++;
+						if (readOptionsField.get(cursor) != null) readOptions++;
+					}
+				}
+				ExactArenaTracking.assertValid();
+				return new ExistsMultiResources(requests, snapshots, readOptions,
+						ExactArenaTracking.activeArenas());
+			} catch (IllegalAccessException impossible) {
+				throw new IllegalStateException("Cannot inspect existsMulti retained resources", impossible);
+			}
+		}
+
+		private void resetObservedPeaks() {
+			ExactArenaTracking.resetPeakAfterDrain();
+			snapshotObserved.set(0);
+			chunkObserved.set(0);
+		}
+
+		private ExistsMultiResources observedPeaks() {
+			ExactArenaTracking.assertValid();
+			int snapshot = snapshotObserved.get();
+			int chunk = chunkObserved.get();
+			return new ExistsMultiResources(Math.max(snapshot, chunk), snapshot, chunk,
+					ExactArenaTracking.peakArenas());
+		}
+
+		private void close() {
+			try {
+				database.setExistsMultiSnapshotObserverForTesting(null);
+				database.setExistsMultiChunkObserverForTesting(null);
+			} finally {
+				ExactArenaTracking.assertDrained();
+			}
+		}
+	}
+
+	/**
+	 * Exact per-call Arena tracking injected into the selected production EmbeddedDB bytecode.
+	 * Both baseline and candidate receive the same substitution, so measurement overhead and
+	 * lifecycle evidence are symmetric. Installation fails unless the target contains exactly
+	 * one expected Arena.ofConfined call and the transformed bytes contain exactly one tracker call.
+	 */
+	private static final class ExactArenaTracking {
+
+		private static final String ARENA_OWNER = "java/lang/foreign/Arena";
+		private static final String TRACKER_OWNER = GrpcRetainedReadBenchmark.class.getName().replace('.', '/');
+		private static final AtomicInteger ACTIVE = new AtomicInteger();
+		private static final AtomicInteger PEAK = new AtomicInteger();
+		private static volatile RuntimeException lifecycleFailure;
+
+		private static String install(Class<?> target, String targetMethod) throws Exception {
+			var transformation = transform(target, targetMethod);
+			var instrumentation = ByteBuddyAgent.getInstrumentation();
+			transformation.unloaded().load(target.getClassLoader(), ClassReloadingStrategy.of(instrumentation));
+			resetPeakAfterDrain();
+			return fingerprint(transformation.bytes());
+		}
+
+		private static ArenaTransformation transform(Class<?> target, String targetMethod) throws Exception {
+			byte[] original = classBytes(target);
+			if (countCalls(original, targetMethod, ARENA_OWNER, "ofConfined") != 1) {
+				throw new IllegalStateException("Expected exactly one Arena.ofConfined call in "
+						+ target.getName() + '.' + targetMethod);
+			}
+			Method replacement = GrpcRetainedReadBenchmark.class.getMethod("openTrackedArena");
+			var transformed = new ByteBuddy()
+					.redefine(target)
+					.visit(MemberSubstitution.strict()
+							.method(ElementMatchers.isDeclaredBy(Arena.class)
+									.and(ElementMatchers.named("ofConfined")))
+							.replaceWith(replacement)
+							.on(ElementMatchers.named(targetMethod)))
+					.make();
+			byte[] transformedBytes = transformed.getBytes();
+			if (countCalls(transformedBytes, targetMethod, ARENA_OWNER, "ofConfined") != 0
+					|| countCalls(transformedBytes, targetMethod, TRACKER_OWNER, "openTrackedArena") != 1) {
+				throw new IllegalStateException("Exact Arena substitution did not match the expected call site");
+			}
+			return new ArenaTransformation(transformed, transformedBytes);
+		}
+
+		private static String fingerprint(byte[] transformedBytes) throws Exception {
+			String agentHash = classPathContentSha256(Path.of(ByteBuddyAgent.class.getProtectionDomain()
+					.getCodeSource().getLocation().toURI()).toString());
+			return sha256(transformedBytes, classBytes(GrpcRetainedReadBenchmark.class),
+					agentHash.getBytes(StandardCharsets.UTF_8));
+		}
+
+		private record ArenaTransformation(net.bytebuddy.dynamic.DynamicType.Unloaded<?> unloaded,
+		                                   byte[] bytes) {
+		}
+
+		private static int countCalls(byte[] classBytes,
+		                              String targetMethod,
+		                              String owner,
+		                              String method) {
+			var count = new AtomicInteger();
+			new ClassReader(classBytes).accept(new ClassVisitor(Opcodes.ASM9) {
+				@Override
+				public MethodVisitor visitMethod(int access,
+				                                 String name,
+				                                 String descriptor,
+				                                 String signature,
+				                                 String[] exceptions) {
+					MethodVisitor delegate = super.visitMethod(access, name, descriptor, signature, exceptions);
+					if (!name.equals(targetMethod)) {
+						return delegate;
+					}
+					return new MethodVisitor(Opcodes.ASM9, delegate) {
+						@Override
+						public void visitMethodInsn(int opcode,
+						                            String actualOwner,
+						                            String actualName,
+						                            String actualDescriptor,
+						                            boolean isInterface) {
+							if (actualOwner.equals(owner) && actualName.equals(method)) {
+								count.incrementAndGet();
+							}
+							super.visitMethodInsn(opcode, actualOwner, actualName, actualDescriptor, isInterface);
+						}
+					};
+				}
+			}, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+			return count.get();
+		}
+
+		private static byte[] classBytes(Class<?> type) throws IOException {
+			String resource = '/' + type.getName().replace('.', '/') + ".class";
+			try (InputStream input = type.getResourceAsStream(resource)) {
+				if (input == null) {
+					throw new IOException("Cannot read class bytes for " + type.getName());
+				}
+				return input.readAllBytes();
+			}
+		}
+
+		private static Arena open() {
+			assertValid();
+			Arena delegate = Arena.ofConfined();
+			int active = ACTIVE.incrementAndGet();
+			PEAK.accumulateAndGet(active, Math::max);
+			return new TrackedArena(delegate);
+		}
+
+		private static int activeArenas() {
+			assertValid();
+			return ACTIVE.get();
+		}
+
+		private static int peakArenas() {
+			assertValid();
+			return PEAK.get();
+		}
+
+		private static void resetPeakAfterDrain() {
+			assertDrained();
+			PEAK.set(0);
+		}
+
+		private static void assertDrained() {
+			assertValid();
+			int active = ACTIVE.get();
+			if (active != 0) {
+				throw new IllegalStateException("existsMulti Arena lifetime did not drain: active=" + active);
+			}
+		}
+
+		private static void assertValid() {
+			var failure = lifecycleFailure;
+			if (failure != null) {
+				throw failure;
+			}
+		}
+
+		private static final class TrackedArena implements Arena {
+
+			private final Arena delegate;
+			private final AtomicBoolean closed = new AtomicBoolean();
+
+			private TrackedArena(Arena delegate) {
+				this.delegate = delegate;
+			}
+
+			@Override
+			public MemorySegment allocate(long byteSize, long byteAlignment) {
+				return delegate.allocate(byteSize, byteAlignment);
+			}
+
+			@Override
+			public MemorySegment.Scope scope() {
+				return delegate.scope();
+			}
+
+			@Override
+			public void close() {
+				if (!closed.compareAndSet(false, true)) {
+					var failure = new IllegalStateException("Tracked existsMulti Arena closed more than once");
+					lifecycleFailure = failure;
+					throw failure;
+				}
+				try {
+					delegate.close();
+				} catch (RuntimeException | Error failure) {
+					lifecycleFailure = new IllegalStateException("Tracked existsMulti Arena close failed", failure);
+					throw failure;
+				}
+				int active = ACTIVE.decrementAndGet();
+				if (active < 0) {
+					lifecycleFailure = new IllegalStateException(
+							"Tracked existsMulti Arena close had no matching open");
+					throw lifecycleFailure;
+				}
+			}
+		}
+	}
+
+	/** Replacement target used by exact baseline/candidate bytecode instrumentation. */
+	public static Arena openTrackedArena() {
+		return ExactArenaTracking.open();
+	}
+
+	private record ExistsMultiResources(int requests,
+	                                    int snapshots,
+	                                    int readOptions,
+	                                    int arenas) {
+
+		private static ExistsMultiResources empty() {
+			return new ExistsMultiResources(0, 0, 0, 0);
 		}
 	}
 
@@ -1055,10 +1536,14 @@ public final class GrpcRetainedReadBenchmark {
 	                             int retainedSnapshots,
 	                             int retainedPermits,
 	                             int retainedWaiters,
-	                             int iteratorLeases) {
+	                             int iteratorLeases,
+	                             int existsMultiRequests,
+	                             int existsMultiSnapshots,
+	                             int existsMultiReadOptions,
+	                             int existsMultiArenas) {
 
 		private static ResourcePeaks empty() {
-			return new ResourcePeaks(0, 0, 0L, 0, 0, 0, 0, 0, 0);
+			return new ResourcePeaks(0, 0, 0L, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 		}
 
 		private ResourcePeaks max(ResourceSnapshot snapshot) {
@@ -1069,7 +1554,20 @@ public final class GrpcRetainedReadBenchmark {
 					Math.max(retainedSnapshots, snapshot.retainedSnapshots()),
 					Math.max(retainedPermits, snapshot.retainedPermits()),
 					Math.max(retainedWaiters, snapshot.retainedWaiters()),
-					Math.max(iteratorLeases, snapshot.iteratorLeases()));
+					Math.max(iteratorLeases, snapshot.iteratorLeases()),
+					Math.max(existsMultiRequests, snapshot.existsMultiRequests()),
+					Math.max(existsMultiSnapshots, snapshot.existsMultiSnapshots()),
+					Math.max(existsMultiReadOptions, snapshot.existsMultiReadOptions()),
+					Math.max(existsMultiArenas, snapshot.existsMultiArenas()));
+		}
+
+		private ResourcePeaks withExistsMultiPeaks(ExistsMultiResources observed) {
+			return new ResourcePeaks(queued, active, pending, iterators, rangeCursors,
+					retainedSnapshots, retainedPermits, retainedWaiters, iteratorLeases,
+					Math.max(existsMultiRequests, observed.requests()),
+					Math.max(existsMultiSnapshots, observed.snapshots()),
+					Math.max(existsMultiReadOptions, observed.readOptions()),
+					Math.max(existsMultiArenas, observed.arenas()));
 		}
 	}
 
@@ -1082,9 +1580,15 @@ public final class GrpcRetainedReadBenchmark {
 	                                int retainedSnapshots,
 	                                int retainedPermits,
 	                                int retainedWaiters,
-	                                int iteratorLeases) {
+	                                int iteratorLeases,
+	                                int existsMultiRequests,
+	                                int existsMultiSnapshots,
+	                                int existsMultiReadOptions,
+	                                int existsMultiArenas) {
 
-		private static ResourceSnapshot capture(EmbeddedConnection embedded, GrpcServer server) {
+		private static ResourceSnapshot capture(EmbeddedConnection embedded,
+		                                        GrpcServer server,
+		                                        ResourceSampler sampler) {
 			RWScheduler scheduler = embedded.getScheduler();
 			int queued = 0;
 			int active = 0;
@@ -1094,17 +1598,21 @@ public final class GrpcRetainedReadBenchmark {
 				active += snapshot.activeTasks();
 			}
 			var database = embedded.getInternalDB();
+			var existsMulti = sampler == null ? ExistsMultiResources.empty() : sampler.existsMultiResources();
 			return new ResourceSnapshot(queued, active, database.getPendingOpsCount(),
 					database.getOpenTransactionsCount(), database.getOpenIteratorsCount(),
 					database.getActiveRangeCursorCount(), database.getRetainedRangeSnapshotCount(),
 					database.getRetainedRangePermitCount(), database.getRetainedRangeWaiterCount(),
-					server.getActiveIteratorOperationLeaseCountForTesting());
+					server.getActiveIteratorOperationLeaseCountForTesting(), existsMulti.requests(),
+					existsMulti.snapshots(), existsMulti.readOptions(), existsMulti.arenas());
 		}
 
 		private boolean drained() {
 			return queued == 0 && active == 0 && pending == 0L && transactions == 0
 					&& iterators == 0 && rangeCursors == 0 && retainedSnapshots == 0
-					&& retainedPermits == 0 && retainedWaiters == 0 && iteratorLeases == 0;
+					&& retainedPermits == 0 && retainedWaiters == 0 && iteratorLeases == 0
+					&& existsMultiRequests == 0 && existsMultiSnapshots == 0
+					&& existsMultiReadOptions == 0 && existsMultiArenas == 0;
 		}
 	}
 
@@ -1225,6 +1733,7 @@ public final class GrpcRetainedReadBenchmark {
 	                            int round,
 	                            String buildSha,
 	                            String classPathSha256,
+	                            String arenaInstrumentationSha256,
 	                            String datasetId,
 	                            long coldCompletionNanos,
 	                            long coldFirstItemNanos,
@@ -1257,10 +1766,12 @@ public final class GrpcRetainedReadBenchmark {
 		private static WorkerResult from(Options options,
 		                                 String buildSha,
 		                                 String classPathSha256,
+		                                 String arenaInstrumentationSha256,
 		                                 WorkerMeasurement measurement,
 		                                 long nativeLeaks) {
 			return new WorkerResult(options.implementation(), options.scenario(), options.round(), buildSha,
-					classPathSha256, options.datasetId(), measurement.coldCompletionNanos(),
+					classPathSha256, arenaInstrumentationSha256, options.datasetId(),
+					measurement.coldCompletionNanos(),
 					measurement.coldFirstItemNanos(), measurement.elapsedNanos(), measurement.operations(),
 					measurement.items(), measurement.logicalBytes(), measurement.checksum(),
 					measurement.entriesPerSecond(), measurement.mibPerSecond(),
@@ -1291,6 +1802,7 @@ public final class GrpcRetainedReadBenchmark {
 			values.put("round", Integer.toString(round));
 			values.put("build-sha", buildSha);
 			values.put("classpath-sha256", classPathSha256);
+			values.put("arena-instrumentation-sha256", arenaInstrumentationSha256);
 			values.put("dataset-id", datasetId);
 			values.put("cold-completion-nanos", Long.toString(coldCompletionNanos));
 			values.put("cold-first-item-nanos", Long.toString(coldFirstItemNanos));
@@ -1328,6 +1840,10 @@ public final class GrpcRetainedReadBenchmark {
 			values.put("peak-retained-permits", Integer.toString(resourcePeaks.retainedPermits()));
 			values.put("peak-retained-waiters", Integer.toString(resourcePeaks.retainedWaiters()));
 			values.put("peak-iterator-leases", Integer.toString(resourcePeaks.iteratorLeases()));
+			values.put("peak-exists-multi-requests", Integer.toString(resourcePeaks.existsMultiRequests()));
+			values.put("peak-exists-multi-snapshots", Integer.toString(resourcePeaks.existsMultiSnapshots()));
+			values.put("peak-exists-multi-read-options", Integer.toString(resourcePeaks.existsMultiReadOptions()));
+			values.put("peak-exists-multi-arenas", Integer.toString(resourcePeaks.existsMultiArenas()));
 			values.put("final-queued", Integer.toString(finalResources.queued()));
 			values.put("final-active", Integer.toString(finalResources.active()));
 			values.put("final-pending", Long.toString(finalResources.pending()));
@@ -1338,6 +1854,10 @@ public final class GrpcRetainedReadBenchmark {
 			values.put("final-retained-permits", Integer.toString(finalResources.retainedPermits()));
 			values.put("final-retained-waiters", Integer.toString(finalResources.retainedWaiters()));
 			values.put("final-iterator-leases", Integer.toString(finalResources.iteratorLeases()));
+			values.put("final-exists-multi-requests", Integer.toString(finalResources.existsMultiRequests()));
+			values.put("final-exists-multi-snapshots", Integer.toString(finalResources.existsMultiSnapshots()));
+			values.put("final-exists-multi-read-options", Integer.toString(finalResources.existsMultiReadOptions()));
+			values.put("final-exists-multi-arenas", Integer.toString(finalResources.existsMultiArenas()));
 			values.put("native-leaks", Long.toString(nativeLeaks));
 			values.put("correctness", Boolean.toString(correctness));
 			values.put("resources-drained", Boolean.toString(resourcesDrained));
@@ -1361,7 +1881,8 @@ public final class GrpcRetainedReadBenchmark {
 			requireEqual(values, "dataset-id", expected.datasetId());
 			WorkerResult result = new WorkerResult(Implementation.parse(values.get("implementation")),
 					Scenario.parse(values.get("scenario")), integer(values, "round"), values.get("build-sha"),
-					values.get("classpath-sha256"), values.get("dataset-id"),
+					values.get("classpath-sha256"), values.get("arena-instrumentation-sha256"),
+					values.get("dataset-id"),
 					number(values, "cold-completion-nanos"), number(values, "cold-first-item-nanos"),
 					number(values, "elapsed-nanos"), number(values, "operations"), number(values, "items"),
 					number(values, "logical-bytes"), unsignedNumber(values, "checksum"),
@@ -1380,13 +1901,19 @@ public final class GrpcRetainedReadBenchmark {
 							number(values, "peak-pending"), integer(values, "peak-iterators"),
 							integer(values, "peak-range-cursors"), integer(values, "peak-retained-snapshots"),
 							integer(values, "peak-retained-permits"), integer(values, "peak-retained-waiters"),
-							integer(values, "peak-iterator-leases")),
+							integer(values, "peak-iterator-leases"), integer(values, "peak-exists-multi-requests"),
+							integer(values, "peak-exists-multi-snapshots"),
+							integer(values, "peak-exists-multi-read-options"),
+							integer(values, "peak-exists-multi-arenas")),
 					new ResourceSnapshot(integer(values, "final-queued"), integer(values, "final-active"),
 							number(values, "final-pending"), integer(values, "final-transactions"),
 							integer(values, "final-iterators"), integer(values, "final-range-cursors"),
 							integer(values, "final-retained-snapshots"),
 							integer(values, "final-retained-permits"), integer(values, "final-retained-waiters"),
-							integer(values, "final-iterator-leases")), number(values, "native-leaks"),
+							integer(values, "final-iterator-leases"), integer(values, "final-exists-multi-requests"),
+							integer(values, "final-exists-multi-snapshots"),
+							integer(values, "final-exists-multi-read-options"),
+							integer(values, "final-exists-multi-arenas")), number(values, "native-leaks"),
 					bool(values, "correctness"), bool(values, "resources-drained"),
 					bool(values, "accounting-valid"), integer(values, "configured-retained-limit"));
 			result.validateMetrics();
@@ -1400,7 +1927,8 @@ public final class GrpcRetainedReadBenchmark {
 					|| !positiveFinite(cpuNanosPerItem) || !positiveFinite(allocatedBytesPerItem)
 					|| peakLiveHeapBytes <= 0L || peakDirectMemoryBytes <= 0L
 					|| gcCollections < 0L || gcMillis < 0L || nativeLeaks < 0L
-					|| configuredRetainedLimit <= 0) {
+					|| configuredRetainedLimit <= 0
+					|| !arenaInstrumentationSha256.matches("[0-9a-f]{64}")) {
 				throw new IllegalArgumentException("Worker artifact contains missing, non-positive, or invalid metrics");
 			}
 			if (scenario.hasFirstItem() != (coldFirstItemNanos > 0L && firstItemP99Nanos > 0L)) {
@@ -1428,6 +1956,18 @@ public final class GrpcRetainedReadBenchmark {
 					|| resourcePeaks.retainedSnapshots() > configuredRetainedLimit) {
 				failures.add("configured retained-resource limit was exceeded");
 			}
+			if (resourcePeaks.existsMultiSnapshots() > resourcePeaks.existsMultiRequests()
+					|| resourcePeaks.existsMultiReadOptions() > resourcePeaks.existsMultiRequests()
+					|| resourcePeaks.existsMultiArenas() > resourcePeaks.existsMultiRequests()) {
+				failures.add("existsMulti native-resource peak exceeded its logical-request peak");
+			}
+			if (scenario.operation == Operation.EXISTS_MULTI
+					&& (resourcePeaks.existsMultiRequests() <= 0
+							|| resourcePeaks.existsMultiSnapshots() <= 0
+							|| resourcePeaks.existsMultiReadOptions() <= 0
+							|| resourcePeaks.existsMultiArenas() <= 0)) {
+				failures.add("existsMulti exact native-resource peaks were not observed");
+			}
 			return List.copyOf(failures);
 		}
 
@@ -1443,19 +1983,33 @@ public final class GrpcRetainedReadBenchmark {
 	private static boolean nonNegative(ResourcePeaks value) {
 		return value.queued() >= 0 && value.active() >= 0 && value.pending() >= 0L
 				&& value.iterators() >= 0 && value.rangeCursors() >= 0 && value.retainedSnapshots() >= 0
-				&& value.retainedPermits() >= 0 && value.retainedWaiters() >= 0 && value.iteratorLeases() >= 0;
+				&& value.retainedPermits() >= 0 && value.retainedWaiters() >= 0 && value.iteratorLeases() >= 0
+				&& value.existsMultiRequests() >= 0 && value.existsMultiSnapshots() >= 0
+				&& value.existsMultiReadOptions() >= 0 && value.existsMultiArenas() >= 0;
 	}
 
 	private static boolean nonNegative(ResourceSnapshot value) {
 		return value.queued() >= 0 && value.active() >= 0 && value.pending() >= 0L
 				&& value.transactions() >= 0 && value.iterators() >= 0 && value.rangeCursors() >= 0
 				&& value.retainedSnapshots() >= 0 && value.retainedPermits() >= 0
-				&& value.retainedWaiters() >= 0 && value.iteratorLeases() >= 0;
+				&& value.retainedWaiters() >= 0 && value.iteratorLeases() >= 0
+				&& value.existsMultiRequests() >= 0 && value.existsMultiSnapshots() >= 0
+				&& value.existsMultiReadOptions() >= 0 && value.existsMultiArenas() >= 0;
 	}
 
 	private static Comparison compare(List<WorkerResult> results) {
 		Map<Scenario, ScenarioComparison> scenarios = new EnumMap<>(Scenario.class);
 		List<String> failures = new ArrayList<>();
+		for (Implementation implementation : Implementation.values()) {
+			var instrumentationHashes = results.stream()
+					.filter(result -> result.implementation() == implementation)
+					.map(WorkerResult::arenaInstrumentationSha256)
+					.collect(Collectors.toSet());
+			if (instrumentationHashes.size() != 1) {
+				failures.add(implementation.value
+						+ ": arena instrumentation provenance changed across fixed runs");
+			}
+		}
 		for (Scenario scenario : Scenario.values()) {
 			List<WorkerResult> baseline = resultsFor(results, scenario, Implementation.BASELINE);
 			List<WorkerResult> candidate = resultsFor(results, scenario, Implementation.CANDIDATE);
@@ -1520,7 +2074,11 @@ public final class GrpcRetainedReadBenchmark {
 				"retained waiters", (long) peaks.retainedWaiters(),
 				"range cursors", (long) peaks.rangeCursors(),
 				"iterators", (long) peaks.iterators(),
-				"iterator leases", (long) peaks.iteratorLeases());
+				"iterator leases", (long) peaks.iteratorLeases(),
+				"existsMulti requests", (long) peaks.existsMultiRequests(),
+				"existsMulti snapshots", (long) peaks.existsMultiSnapshots(),
+				"existsMulti read options", (long) peaks.existsMultiReadOptions(),
+				"existsMulti arenas", (long) peaks.existsMultiArenas());
 	}
 
 	private static String gcSummary(List<WorkerResult> baseline, List<WorkerResult> candidate) {
@@ -1635,15 +2193,48 @@ public final class GrpcRetainedReadBenchmark {
 		String sha = "0123456789abcdef0123456789abcdef01234567";
 		String digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 		WorkerResult result = new WorkerResult(Implementation.CANDIDATE, Scenario.EXACT_COUNT, 1,
-				sha, digest, digest, 100L, 0L, 1_000L, 2L, 200L, 20_000L, 1L,
+				sha, digest, digest, digest, 100L, 0L, 1_000L, 2L, 200L, 20_000L, 1L,
 				200_000_000.0d, 20_000.0d, 100L, 0L, 0L, 0L, 5.0d, 10.0d, 0L, 0L,
 				1_000_000L, 1_000L, new MetricSnapshot(2L, 2L, 2L, 2L, 2L, 0L, 0L, 0L),
-				new ResourcePeaks(1, 1, 1L, 0, 1, 1, 1, 0, 0),
-				new ResourceSnapshot(0, 0, 0L, 0, 0, 0, 0, 0, 0, 0),
+				new ResourcePeaks(1, 1, 1L, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0),
+				new ResourceSnapshot(0, 0, 0L, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
 				0L, true, true, true, 1);
 		StringBuilder artifact = new StringBuilder();
 		result.toProperties().forEach((key, value) -> artifact.append(key).append('=').append(value).append('\n'));
 		return artifact.toString();
+	}
+
+	/** Content-bound fingerprint helper for deterministic provenance tests. */
+	public static String classPathContentSha256ForTesting(String classPath) throws IOException {
+		return classPathContentSha256(normalizedClassPath(classPath));
+	}
+
+	/** Exact bytecode-substitution smoke proof used by the parser/gate test suite. */
+	public static String exactArenaInstrumentationForTesting() throws Exception {
+		var transformation = ExactArenaTracking.transform(ArenaTrackingFixture.class, "exercise");
+		ExactArenaTracking.resetPeakAfterDrain();
+		try (var arena = openTrackedArena()) {
+			arena.allocate(1L);
+		}
+		ExactArenaTracking.assertDrained();
+		if (ExactArenaTracking.peakArenas() != 1) {
+			throw new IllegalStateException("Exact Arena instrumentation did not observe one live Arena");
+		}
+		return ExactArenaTracking.fingerprint(transformation.bytes());
+	}
+
+	/** Frozen-baseline provenance check used by deterministic gate tests. */
+	public static void validateRawBaselineForTesting(String buildBaseline) {
+		requireRawBaseline(buildBaseline);
+	}
+
+	private static final class ArenaTrackingFixture {
+
+		private static void exercise() {
+			try (var arena = Arena.ofConfined()) {
+				arena.allocate(1L);
+			}
+		}
 	}
 
 	/**
@@ -1889,8 +2480,9 @@ public final class GrpcRetainedReadBenchmark {
 				.append("terminal drains, and native leak count.\n");
 		out.append("\n## Worker accounting and resources\n\n")
 				.append("|Round|Scenario|Build|accepted/started/terminal/execution|quantums|")
-				.append("snapshots/permits/waiters/cursors/iterators/leases|final drain|native leaks|gate|\n")
-				.append("|---:|---|---|---:|---:|---:|---|---:|---|\n");
+				.append("range snap/permits/waiters/cursors/iterators/leases|")
+				.append("exists req/snap/read-options/arenas|final drain|native leaks|gate|\n")
+				.append("|---:|---|---|---:|---:|---:|---:|---|---:|---|\n");
 		for (WorkerResult result : results) {
 			MetricSnapshot scheduler = result.scheduler();
 			ResourcePeaks peaks = result.resourcePeaks();
@@ -1901,7 +2493,9 @@ public final class GrpcRetainedReadBenchmark {
 					.append(scheduler.quantums()).append('|').append(peaks.retainedSnapshots()).append('/')
 					.append(peaks.retainedPermits()).append('/').append(peaks.retainedWaiters()).append('/')
 					.append(peaks.rangeCursors()).append('/').append(peaks.iterators()).append('/')
-					.append(peaks.iteratorLeases()).append('|').append(result.finalResources().drained())
+					.append(peaks.iteratorLeases()).append('|').append(peaks.existsMultiRequests()).append('/')
+					.append(peaks.existsMultiSnapshots()).append('/').append(peaks.existsMultiReadOptions()).append('/')
+					.append(peaks.existsMultiArenas()).append('|').append(result.finalResources().drained())
 					.append('|').append(result.nativeLeaks()).append('|')
 					.append(result.structurallyPassed() ? "PASS" : "FAIL").append("|\n");
 		}
@@ -2016,7 +2610,10 @@ public final class GrpcRetainedReadBenchmark {
 				+ ",\"range_cursors\":" + peaks.rangeCursors() + ",\"retained_snapshots\":"
 				+ peaks.retainedSnapshots() + ",\"retained_permits\":" + peaks.retainedPermits()
 				+ ",\"retained_waiters\":" + peaks.retainedWaiters() + ",\"iterator_leases\":"
-				+ peaks.iteratorLeases() + '}';
+				+ peaks.iteratorLeases() + ",\"exists_multi_requests\":" + peaks.existsMultiRequests()
+				+ ",\"exists_multi_snapshots\":" + peaks.existsMultiSnapshots()
+				+ ",\"exists_multi_read_options\":" + peaks.existsMultiReadOptions()
+				+ ",\"exists_multi_arenas\":" + peaks.existsMultiArenas() + '}';
 	}
 
 	private static String resourceSnapshotJson(ResourceSnapshot resources) {
@@ -2025,7 +2622,11 @@ public final class GrpcRetainedReadBenchmark {
 				+ ",\"iterators\":" + resources.iterators() + ",\"range_cursors\":"
 				+ resources.rangeCursors() + ",\"retained_snapshots\":" + resources.retainedSnapshots()
 				+ ",\"retained_permits\":" + resources.retainedPermits() + ",\"retained_waiters\":"
-				+ resources.retainedWaiters() + ",\"iterator_leases\":" + resources.iteratorLeases() + '}';
+				+ resources.retainedWaiters() + ",\"iterator_leases\":" + resources.iteratorLeases()
+				+ ",\"exists_multi_requests\":" + resources.existsMultiRequests()
+				+ ",\"exists_multi_snapshots\":" + resources.existsMultiSnapshots()
+				+ ",\"exists_multi_read_options\":" + resources.existsMultiReadOptions()
+				+ ",\"exists_multi_arenas\":" + resources.existsMultiArenas() + '}';
 	}
 
 	private static String format(double value) {
@@ -2176,6 +2777,7 @@ public final class GrpcRetainedReadBenchmark {
 			if (!buildBaseline.matches("[0-9a-f]{40}") || !buildCandidate.matches("[0-9a-f]{40}")) {
 				throw new IllegalArgumentException("Baseline and candidate must be exact 40-character Git SHAs");
 			}
+			requireRawBaseline(buildBaseline);
 			if (worker) {
 				if (!expectedClassPathSha256.matches("[0-9a-f]{64}") || !datasetId.matches("[0-9a-f]{64}")) {
 					throw new IllegalArgumentException("Workers require exact classpath and dataset SHA-256 values");
@@ -2201,6 +2803,13 @@ public final class GrpcRetainedReadBenchmark {
 
 		private long sampleNanos() {
 			return TimeUnit.MICROSECONDS.toNanos(sampleMicros);
+		}
+	}
+
+	private static void requireRawBaseline(String buildBaseline) {
+		if (!buildBaseline.equals(RAW_CHECKPOINT_SHA)) {
+			throw new IllegalArgumentException("Retained-read baseline must be the frozen raw checkpoint "
+					+ RAW_CHECKPOINT_SHA + ", not " + buildBaseline);
 		}
 	}
 

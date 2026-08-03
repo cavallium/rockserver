@@ -250,17 +250,21 @@ class RangePerformanceRegressionTest {
 		final int entries = 5_000;
 		var config = Files.writeString(tempDir.resolve("expired-snapshot.conf"), """
 				database.parallelism.workload.retained-snapshot-maximum-age = PT10S
+				database.parallelism.workload.range-quantum-max-items = 16
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("expired-snapshot-db"),
 				"range-expired-snapshot", config)) {
 			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 			var internal = connection.getInternalDB();
+			var scheduler = connection.getScheduler();
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			for (int i = 0; i < entries; i++) {
 				api.put(0, columnId, key(i), value(i), RequestType.none());
 			}
 
+			var outcomesBefore = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ)
+					.outcomes();
 			var range = Flux.from(connection.getAsyncApi(
 					RequestContext.batch(Instant.now().plusMillis(500))).getRangeAsync(0,
 					columnId,
@@ -271,6 +275,8 @@ class RangePerformanceRegressionTest {
 					Long.MAX_VALUE));
 			StepVerifier.create(range, 1)
 					.assertNext(first -> assertEquals(key(0), first.keys()))
+					.then(() -> assertEquals(1, internal.getActiveRangeCursorCount(),
+							"the deadline probe must expire a still-retained scheduler task"))
 					.thenAwait(Duration.ofMillis(600))
 					.then(internal::cleanupExpiredRangesNow)
 					.then(() -> assertEquals(0, internal.getActiveRangeCursorCount()))
@@ -282,6 +288,14 @@ class RangePerformanceRegressionTest {
 						assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocksError.getErrorUniqueId());
 					})
 					.verify(Duration.ofSeconds(10));
+			var outcomesAfter = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ)
+					.outcomes();
+			assertEquals(1L, outcomesAfter.get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.DEADLINE)
+					- outcomesBefore.get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.DEADLINE));
+			assertEquals(0L,
+					outcomesAfter.get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.CANCELLATION)
+							- outcomesBefore.get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.CANCELLATION),
+					"a retained-range deadline must not be recorded as subscriber cancellation");
 		}
 	}
 

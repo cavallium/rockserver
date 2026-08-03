@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -21,6 +22,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -132,6 +134,60 @@ class ExistsMultiCooperativeTest {
 				connection.getInternalDB().setExistsMultiChunkObserverForTesting(null);
 				connection.getInternalDB().setExistsMultiSnapshotObserverForTesting(null);
 				connection.getInternalDB().setExistsMultiArenaObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void activeCancellationUsesTheSchedulerCauseAndDrainsTheRetainedRequest() throws Exception {
+		String databaseName = "exists-cooperative-active-cancel";
+		try (var connection = openConnection(databaseName, "")) {
+			var api = connection.getSyncApi(RequestContext.batch());
+			long columnId = api.createColumn("entries",
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			var keys = integerKeys(4_097);
+			api.put(0, columnId, keys.get(0), value(0), RequestType.none());
+
+			var scheduler = connection.getScheduler();
+			var firstNativeCall = new CountDownLatch(1);
+			var releaseNativeCall = new CountDownLatch(1);
+			var nativeCalls = new AtomicInteger();
+			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
+				nativeCalls.incrementAndGet();
+				firstNativeCall.countDown();
+				await(releaseNativeCall);
+			});
+			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			try {
+				var request = connection.getAsyncApi(RequestContext.batch())
+						.existsMultiAsync(0, columnId, keys, 30_000);
+				assertTrue(firstNativeCall.await(5, TimeUnit.SECONDS));
+				assertEquals(1, connection.getInternalDB().getActiveExistsMultiRequestCount());
+
+				assertFalse(request.cancel(true),
+						"active cancellation is published only after the current JNI call returns");
+				assertFalse(request.isDone());
+				releaseNativeCall.countDown();
+
+				assertThrows(CancellationException.class, () -> request.get(5, TimeUnit.SECONDS));
+				assertTrue(request.isCancelled());
+				assertEquals(1, nativeCalls.get(),
+						"cancellation must stop before a second native MultiGet");
+				assertExistsResourcesDrained(connection);
+
+				var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
+				assertEquals(1L, after.startedTasks() - before.startedTasks());
+				assertEquals(1L, after.completedTasks() - before.completedTasks());
+				assertEquals(1L,
+						after.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION)
+								- before.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+				assertEquals(0L,
+						after.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+								- before.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			} finally {
+				releaseNativeCall.countDown();
+				connection.getInternalDB().setExistsMultiChunkObserverForTesting(null);
 			}
 		}
 	}

@@ -183,15 +183,16 @@ class EmbeddedRangeSchedulingTest {
 				assertEquals(intValue(0), values.getFirst());
 				assertEquals(intValue(entries - 1), values.getLast());
 				long continuationTasks = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - tasksBefore;
-				assertTrue(continuationTasks >= 2 && continuationTasks <= 3,
-						"large iterator reads should use a few bounded tasks, got " + continuationTasks);
+				assertEquals(1, continuationTasks,
+						"all bounded iterator steps must share one scheduler admission");
 
 				long exhaustedTasksBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 				connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
 						.subsequentAsync(iteratorId, 0, Long.MAX_VALUE, RequestType.none())
 						.get(5, TimeUnit.SECONDS);
-				assertTrue(scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - exhaustedTasksBefore <= 2,
-						"an exhausted iterator must not schedule work proportional to the requested count");
+				assertEquals(1,
+						scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - exhaustedTasksBefore,
+						"an exhausted iterator must retain one bounded logical task");
 			} finally {
 				api.closeIterator(iteratorId);
 			}
@@ -255,41 +256,64 @@ class EmbeddedRangeSchedulingTest {
 			var pendingOpsBetweenChunks = new java.util.concurrent.atomic.AtomicLong(-1L);
 			var scheduler = connection.getInternalDB().getScheduler();
 			var readExecutor = scheduler.readExecutor();
+			var occupiedWorkersEntered = new CountDownLatch(DATA_WORKERS - 1);
+			var releaseOccupiedWorkers = new CountDownLatch(1);
+			occupyWorkers(readExecutor,
+					DATA_WORKERS - 1,
+					occupiedWorkersEntered,
+					releaseOccupiedWorkers);
+			assertTrue(occupiedWorkersEntered.await(5, TimeUnit.SECONDS));
+			var quantumCounter = connection.getInternalDB().getMetricsRegistry()
+					.get("rockserver.workload.quantums")
+					.tags("database", "multi-read-scheduling",
+							"resource", "read",
+							"profile", "batch",
+							"operation", "bounded_fan_out")
+					.counter();
+			double quantumsBefore = quantumCounter.count();
 			long tasksBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
-			connection.getInternalDB()
-					.setExistsMultiSnapshotObserverForTesting(snapshotAcquisitions::incrementAndGet);
-			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
-				int chunk = nativeChunks.incrementAndGet();
-				if (chunk == 1) {
-					api.put(0, columnId, intKey(existingKeys), intValue(existingKeys), RequestType.none());
-					readExecutor.execute(() -> {
-						pendingOpsBetweenChunks.set(connection.getInternalDB().getPendingOpsCount());
-						competingCompositeRan.countDown();
-					});
-				} else if (chunk == 2) {
-					secondChunkSawCompetingComposite.set(competingCompositeRan.getCount() == 0L);
-				}
-			});
+			try {
+				connection.getInternalDB()
+						.setExistsMultiSnapshotObserverForTesting(snapshotAcquisitions::incrementAndGet);
+				connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
+					int chunk = nativeChunks.incrementAndGet();
+					if (chunk == 1) {
+						api.put(0, columnId, intKey(existingKeys), intValue(existingKeys), RequestType.none());
+						readExecutor.execute(() -> {
+							pendingOpsBetweenChunks.set(connection.getInternalDB().getPendingOpsCount());
+							competingCompositeRan.countDown();
+						});
+					} else if (chunk == 2) {
+						secondChunkSawCompetingComposite.set(competingCompositeRan.getCount() == 0L);
+					}
+				});
 
-			var existence = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
-					.existsMultiAsync(0, columnId, keys, 10_000)
-					.get(5, TimeUnit.SECONDS);
+				var existence = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
+						.existsMultiAsync(0, columnId, keys, 10_000)
+						.get(5, TimeUnit.SECONDS);
 
-			assertEquals(existingKeys + 1, existence.size());
-			assertTrue(existence.subList(0, existingKeys).stream().allMatch(Boolean.TRUE::equals));
-			assertFalse(existence.getLast(),
-					"native chunks must share the snapshot captured before the concurrent insert");
-			assertEquals(2, nativeChunks.get());
-			assertEquals(1, snapshotAcquisitions.get(),
-					"a split logical MultiGet must acquire exactly one shared snapshot");
-			assertTrue(competingCompositeRan.await(5, TimeUnit.SECONDS));
-			assertTrue(secondChunkSawCompetingComposite.get(),
-					"a queued composite task must run before the next native MultiGet chunk");
-			assertEquals(1L, pendingOpsBetweenChunks.get(),
-					"the yielded request must retain one active logical operation between chunks");
-			long tasks = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - tasksBefore;
-			assertEquals(3, tasks,
-					"two MultiGet chunks plus the competing composite should require three tasks, got " + tasks);
+				assertEquals(existingKeys + 1, existence.size());
+				assertTrue(existence.subList(0, existingKeys).stream().allMatch(Boolean.TRUE::equals));
+				assertFalse(existence.getLast(),
+						"native chunks must share the snapshot captured before the concurrent insert");
+				assertEquals(2, nativeChunks.get());
+				assertEquals(1, snapshotAcquisitions.get(),
+						"a split logical MultiGet must acquire exactly one shared snapshot");
+				assertTrue(competingCompositeRan.await(5, TimeUnit.SECONDS));
+				assertTrue(secondChunkSawCompetingComposite.get(),
+						"a queued composite task must run before the next native MultiGet chunk");
+				assertEquals(1L, pendingOpsBetweenChunks.get(),
+						"the yielded request must retain one active logical operation between chunks");
+				long tasks = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - tasksBefore;
+				assertEquals(2, tasks,
+						"one split MultiGet plus the competing composite should require two logical tasks, got " + tasks);
+				assertTrue(quantumCounter.count() - quantumsBefore >= 2.0d,
+						"the split MultiGet should record one scheduler quantum per native-call dispatch");
+			} finally {
+				releaseOccupiedWorkers.countDown();
+				connection.getInternalDB().setExistsMultiChunkObserverForTesting(null);
+				connection.getInternalDB().setExistsMultiSnapshotObserverForTesting(null);
+			}
 		}
 	}
 

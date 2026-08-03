@@ -19,9 +19,12 @@ Each child records a process-first cold probe separately, completes a fixed warm
 then enters the steady-state window. Results are accepted only after exact count, order,
 hit/miss, value, and checksum validation. Worker files use a strict property schema:
 unknown, duplicate, missing, empty, non-finite, or provenance-mismatched fields fail the
-run. The controller records the exact 40-character Git SHAs, normalized classpaths and
-their SHA-256 digests, dataset digest, JVM, RocksDB version, OS, hardware, storage, cache
-state, execution order, and command-relevant dimensions.
+run. The controller derives each 40-character Git SHA from the checkout that owns the
+selected production-classes directory and rejects a mismatch or a checkout declared
+clean that is dirty. Its classpath SHA-256 covers the normalized entry order, paths,
+relative file names, sizes, and every file byte; each child recomputes it before loading
+the database. The report also records the dataset digest, JVM, RocksDB version, OS,
+hardware, storage, cache state, execution order, and command-relevant dimensions.
 
 ## Metrics and acceptance
 
@@ -48,13 +51,31 @@ Every optimized candidate request must record exactly one accepted, one started,
 terminal scheduler task. Mixed scenarios must force more quantums than logical tasks.
 Scheduler failures, rejections, cancellations, duplicate terminals, native leaks, or a
 nonzero final queue/resource count fail the worker. Retained snapshots, permits, waiters,
-range cursors, iterators, and iterator leases must not peak above the paired baseline,
-and the configured retained-resource limit must not change.
+range cursors, iterators, iterator leases, and `existsMulti` logical requests, snapshots,
+read options, and per-call arenas must not peak above the paired baseline. Every one of
+those resources must drain to zero, and the configured retained-resource limit must not
+change.
+
+Every worker instruments the selected `EmbeddedDB.existsMultiStatusOnly` bytecode before
+opening the database. The harness requires exactly one `Arena.ofConfined` call in that
+method, replaces that exact call with a tracked wrapper, and then requires zero original
+calls and exactly one replacement call in the transformed bytes. Baseline and candidate
+therefore measure the same real arena opens and successful closes with symmetric overhead;
+double-close, close failure, underflow, or a nonzero final count fails the run. Each worker
+is launched with the pinned Byte Buddy artifact as a startup agent (no dynamic attach) and
+records a SHA-256 over the transformed bytecode, harness bytecode, and Byte Buddy agent
+artifact, and all fixed rounds for an implementation must report the same digest. The
+controller accepts only the frozen raw checkpoint
+`7d9c02c090e71df78cdca24d29335b38147b3cfb` as the baseline SHA; there is no inferred or
+hookless fallback.
 
 ## Run the release comparison
 
-Build the exact baseline and candidate commits in separate clean worktrees. Compile the
-candidate test harness and capture its dependency classpath:
+Build the exact baseline and candidate commits in separate clean worktrees. Keep each
+`target/classes` directory inside its owning worktree: the controller and every worker
+verify its checkout `HEAD`, and enforced runs verify the worktree is still clean.
+Classpath entries and their contents must not be symbolic links. Compile the candidate
+test harness and capture its dependency classpath:
 
 ```bash
 mvn -q -DskipTests test-compile dependency:build-classpath \

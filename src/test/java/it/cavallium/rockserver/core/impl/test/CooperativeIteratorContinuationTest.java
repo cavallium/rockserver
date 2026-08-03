@@ -231,6 +231,57 @@ class CooperativeIteratorContinuationTest {
 	}
 
 	@Test
+	void cancellationCompletesOnlyAfterTheCurrentNativeStepAndGateRelease() throws Exception {
+		final int entries = ITERATOR_STEP * 2 + 1;
+		try (var connection = connection("iterator-cancel-active-step")) {
+			var sync = connection.getSyncApi(RequestContext.batch());
+			var async = connection.getAsyncApi(RequestContext.batch());
+			long columnId = populateFixedColumn(sync, "entries", entries);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			var stepCompleted = new CountDownLatch(1);
+			var releaseStep = new CountDownLatch(1);
+			var scheduler = connection.getScheduler();
+			connection.getInternalDB().setIteratorAdvanceStepCompletedObserverForTesting(() -> {
+				stepCompleted.countDown();
+				awaitUninterruptibly(releaseStep);
+			});
+			try {
+				var before = readSnapshot(scheduler);
+				var continuation = async.subsequentAsync(
+						iteratorId, 0L, entries, RequestType.none());
+				assertTrue(stepCompleted.await(5, SECONDS));
+				assertConcurrentIteratorOperation(async.seekToAsync(iteratorId, key(0)));
+
+				assertTrue(continuation.cancel(true));
+				assertFalse(continuation.isDone(),
+						"cancellation became observable before the bounded iterator step returned");
+				assertFalse(continuation.isCancelled());
+				assertConcurrentIteratorOperation(async.seekToAsync(iteratorId, key(0)));
+
+				releaseStep.countDown();
+				assertThrows(CancellationException.class, () -> continuation.get(5, SECONDS));
+				assertTrue(continuation.isCancelled());
+				var after = readSnapshot(scheduler);
+				assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
+				assertEquals(1L, after.startedTasks() - before.startedTasks());
+				assertEquals(1L, after.completedTasks() - before.completedTasks());
+				assertEquals(1L,
+						after.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION)
+								- before.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+				assertEquals(0L,
+						after.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+								- before.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+				awaitSuccessfulSeek(async, iteratorId, key(0));
+				assertTrue(async.subsequentAsync(iteratorId, 0L, 1L, RequestType.exists()).get(5, SECONDS));
+			} finally {
+				releaseStep.countDown();
+				connection.getInternalDB().setIteratorAdvanceStepCompletedObserverForTesting(null);
+				sync.closeIterator(iteratorId);
+			}
+		}
+	}
+
+	@Test
 	void batchDeadlineWhileQueuedReleasesTheGateWithoutAdvancing() throws Exception {
 		try (var connection = connection("iterator-deadline")) {
 			var sync = connection.getSyncApi(RequestContext.batch());

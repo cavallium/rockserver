@@ -348,6 +348,49 @@ class RWSchedulerCooperativeTest {
 	}
 
 	@Test
+	void completionAwareTaskPublishesOnlyTheSchedulerWinningTerminalCause() throws Exception {
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-terminal-authority");
+		try {
+			var cancelled = new TerminalAuthorityTask(false);
+			var cancelledHandle = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).executeCooperatively(cancelled, 1L);
+			assertTrue(cancelled.entered.await(5, SECONDS));
+			assertTrue(cancelledHandle.cancel());
+			cancelled.release.countDown();
+			assertTrue(cancelled.terminal.await(5, SECONDS));
+			assertEquals(0, cancelled.successes.get());
+			assertEquals(1, cancelled.rejections.get());
+			assertTrue(cancelled.failure.get() instanceof java.util.concurrent.CancellationException);
+
+			var completed = new TerminalAuthorityTask(true);
+			var completedHandle = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).executeCooperatively(completed, 1L);
+			assertTrue(completed.entered.await(5, SECONDS));
+			completed.release.countDown();
+			assertTrue(completed.completionEntered.await(5, SECONDS));
+			try {
+				assertFalse(completedHandle.cancel(),
+						"cancellation must report that the scheduler already selected RUN");
+			} finally {
+				completed.releaseCompletion.countDown();
+			}
+			assertTrue(completed.terminal.await(5, SECONDS));
+			assertEquals(1, completed.successes.get());
+			assertEquals(0, completed.rejections.get());
+			assertNull(completed.failure.get());
+
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks() == 2L);
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+		} finally {
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void cooperativeYieldAllocatesNoSchedulerHeapAfterWarmup() throws Exception {
 		var threads = (ThreadMXBean) ManagementFactory.getThreadMXBean();
 		Assumptions.assumeTrue(threads.isThreadAllocatedMemorySupported());
@@ -619,6 +662,47 @@ class RWSchedulerCooperativeTest {
 		public void reject(RuntimeException failure) {
 			this.failure.compareAndSet(null, failure);
 			completed.countDown();
+		}
+	}
+
+	private static final class TerminalAuthorityTask implements RWScheduler.CooperativeCompletionTask {
+
+		private final boolean blockCompletion;
+		private final CountDownLatch entered = new CountDownLatch(1);
+		private final CountDownLatch release = new CountDownLatch(1);
+		private final CountDownLatch completionEntered = new CountDownLatch(1);
+		private final CountDownLatch releaseCompletion = new CountDownLatch(1);
+		private final CountDownLatch terminal = new CountDownLatch(1);
+		private final AtomicInteger successes = new AtomicInteger();
+		private final AtomicInteger rejections = new AtomicInteger();
+		private final AtomicReference<RuntimeException> failure = new AtomicReference<>();
+
+		private TerminalAuthorityTask(boolean blockCompletion) {
+			this.blockCompletion = blockCompletion;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			entered.countDown();
+			awaitUninterruptibly(release);
+			return RWScheduler.CooperativeResult.COMPLETE;
+		}
+
+		@Override
+		public void completeCooperatively() {
+			completionEntered.countDown();
+			if (blockCompletion) {
+				awaitUninterruptibly(releaseCompletion);
+			}
+			successes.incrementAndGet();
+			terminal.countDown();
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			this.failure.set(failure);
+			rejections.incrementAndGet();
+			terminal.countDown();
 		}
 	}
 

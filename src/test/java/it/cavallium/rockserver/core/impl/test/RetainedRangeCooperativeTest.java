@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -10,6 +12,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -18,9 +21,11 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -169,13 +174,226 @@ class RetainedRangeCooperativeTest {
 	}
 
 	@Test
+	void shutdownWaitsForWinningRetainedRangeCleanupBeforeClosingNativeResources() throws Exception {
+		var cleanupEntered = new CountDownLatch(1);
+		var releaseCleanup = new CountDownLatch(1);
+		EmbeddedConnection connection = null;
+		java.util.concurrent.CompletableFuture<Void> close = null;
+		try {
+			connection = populatedConnection("retained-count-shutdown-cleanup", 33, ""
+			);
+			var db = connection.getInternalDB();
+			db.setRetainedRangeCleanupObserverForTesting(() -> {
+				cleanupEntered.countDown();
+				await(releaseCleanup);
+			});
+			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
+			var scheduler = connection.getScheduler();
+			var outcomesBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
+			var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
+					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+			assertTrue(cleanupEntered.await(5, TimeUnit.SECONDS));
+			assertEquals(1, db.getActiveRangeCursorCount());
+			assertEquals(1, db.getRetainedRangeSnapshotCount());
+			assertEquals(1, db.getRetainedRangePermitCount());
+
+			var connectionToClose = connection;
+			close = java.util.concurrent.CompletableFuture.runAsync(() -> {
+				try {
+					connectionToClose.closeTesting();
+				} catch (Exception failure) {
+					throw new java.util.concurrent.CompletionException(failure);
+				}
+			});
+			Thread.sleep(100L);
+			assertFalse(close.isDone(),
+					"shutdown advanced while the winning task still owned native range cleanup");
+
+			releaseCleanup.countDown();
+			assertEquals(33L, count.get(5, TimeUnit.SECONDS));
+			close.get(10, TimeUnit.SECONDS);
+			assertRetainedResourcesDrained(connection);
+			var outcomesAfter = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
+			assertEquals(1L, outcomesAfter.get(RWScheduler.TerminalOutcome.RUN)
+					- outcomesBefore.get(RWScheduler.TerminalOutcome.RUN),
+					"scheduler RUN must win before the completion callback begins cleanup");
+			assertEquals(0L, outcomesAfter.get(RWScheduler.TerminalOutcome.SHUTDOWN)
+					- outcomesBefore.get(RWScheduler.TerminalOutcome.SHUTDOWN));
+			assertEquals(0L, outcomesAfter.get(RWScheduler.TerminalOutcome.CANCELLATION)
+					- outcomesBefore.get(RWScheduler.TerminalOutcome.CANCELLATION),
+					"database shutdown must not be recorded as cooperative cancellation");
+		} finally {
+			releaseCleanup.countDown();
+			if (connection != null) {
+				connection.getInternalDB().setRetainedRangeCleanupObserverForTesting(null);
+				if (close == null) {
+					connection.closeTesting();
+				} else {
+					try {
+						close.get(10, TimeUnit.SECONDS);
+					} catch (Exception ignored) {
+						// Preserve the primary assertion failure; the close future carries shutdown diagnostics.
+					}
+				}
+			}
+		}
+	}
+
+	@Test
+	void shutdownDefersRetainedRangeCleanupUntilTheActiveQuantumReturns() throws Exception {
+		var quantumEntered = new CountDownLatch(1);
+		var releaseQuantum = new CountDownLatch(1);
+		EmbeddedConnection connection = null;
+		java.util.concurrent.CompletableFuture<Void> close = null;
+		try {
+			connection = populatedConnection("retained-count-active-shutdown", 64, """
+					database.parallelism.workload.range-quantum-max-items = 8
+					database.parallelism.workload.range-quantum-max-bytes = 1MiB
+					database.parallelism.workload.range-quantum-max-duration = PT1S
+					""");
+			var db = connection.getInternalDB();
+			db.setRangeCountChunkObserverForTesting(() -> {
+				quantumEntered.countDown();
+				await(releaseQuantum);
+			});
+			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
+			var scheduler = connection.getScheduler();
+			var outcomesBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
+			var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
+					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+			assertTrue(quantumEntered.await(5, TimeUnit.SECONDS));
+
+			var connectionToClose = connection;
+			close = java.util.concurrent.CompletableFuture.runAsync(() -> {
+				try {
+					connectionToClose.closeTesting();
+				} catch (Exception failure) {
+					throw new java.util.concurrent.CompletionException(failure);
+				}
+			});
+			Thread.sleep(100L);
+			assertFalse(close.isDone(), "shutdown completed while a retained range quantum was active");
+			assertEquals(1, db.getActiveRangeCursorCount(),
+					"shutdown must not close a cursor owned by an active scheduler quantum");
+			assertEquals(1, db.getRetainedRangeSnapshotCount());
+
+			releaseQuantum.countDown();
+			var failure = assertThrows(ExecutionException.class, () -> count.get(5, TimeUnit.SECONDS));
+			assertTrue(failure.getCause() instanceof java.util.concurrent.RejectedExecutionException);
+			close.get(10, TimeUnit.SECONDS);
+			assertRetainedResourcesDrained(connection);
+			var outcomesAfter = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
+			assertEquals(1L, outcomesAfter.get(RWScheduler.TerminalOutcome.SHUTDOWN)
+					- outcomesBefore.get(RWScheduler.TerminalOutcome.SHUTDOWN));
+			assertEquals(0L, outcomesAfter.get(RWScheduler.TerminalOutcome.CANCELLATION)
+					- outcomesBefore.get(RWScheduler.TerminalOutcome.CANCELLATION));
+		} finally {
+			releaseQuantum.countDown();
+			if (connection != null) {
+				connection.getInternalDB().setRangeCountChunkObserverForTesting(null);
+				if (close == null) {
+					connection.closeTesting();
+				} else {
+					try {
+						close.get(10, TimeUnit.SECONDS);
+					} catch (Exception ignored) {
+						// Preserve the primary assertion failure; the close future carries shutdown diagnostics.
+					}
+				}
+			}
+		}
+	}
+
+	@Test
+	void deadlineRemainsFirstCauseWhenShutdownRacesAnActiveQuantum() throws Exception {
+		var quantumEntered = new CountDownLatch(1);
+		var releaseQuantum = new CountDownLatch(1);
+		EmbeddedConnection connection = null;
+		java.util.concurrent.CompletableFuture<Void> close = null;
+		try {
+			connection = populatedConnection("retained-count-deadline-shutdown-race", 64, """
+					database.parallelism.workload.range-quantum-max-items = 8
+					database.parallelism.workload.range-quantum-max-bytes = 1MiB
+					database.parallelism.workload.range-quantum-max-duration = PT1S
+					""");
+			var db = connection.getInternalDB();
+			db.setRangeCountChunkObserverForTesting(() -> {
+				quantumEntered.countDown();
+				await(releaseQuantum);
+				throw new IllegalStateException("late range observer failure");
+			});
+			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
+			var scheduler = connection.getScheduler();
+			var outcomesBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
+			var count = connection.getAsyncApi(RequestContext.batch(Instant.now().plusMillis(250)))
+					.reduceRangeAsync(0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+			assertTrue(quantumEntered.await(5, TimeUnit.SECONDS));
+			Thread.sleep(300L);
+			db.cleanupExpiredRangesNow();
+
+			var connectionToClose = connection;
+			close = java.util.concurrent.CompletableFuture.runAsync(() -> {
+				try {
+					connectionToClose.closeTesting();
+				} catch (Exception failure) {
+					throw new java.util.concurrent.CompletionException(failure);
+				}
+			});
+			Thread.sleep(100L);
+			assertFalse(close.isDone());
+			assertEquals(1, db.getActiveRangeCursorCount());
+
+			releaseQuantum.countDown();
+			var failure = assertThrows(ExecutionException.class, () -> count.get(5, TimeUnit.SECONDS));
+			assertTrue(failure.getCause() instanceof RocksDBException rocksFailure
+					&& rocksFailure.getErrorUniqueId() == RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					"shutdown replaced the scheduler's winning deadline failure: " + failure.getCause());
+			close.get(10, TimeUnit.SECONDS);
+			assertRetainedResourcesDrained(connection);
+			var outcomesAfter = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
+			assertEquals(1L, outcomesAfter.get(RWScheduler.TerminalOutcome.DEADLINE)
+					- outcomesBefore.get(RWScheduler.TerminalOutcome.DEADLINE));
+			assertEquals(0L, outcomesAfter.get(RWScheduler.TerminalOutcome.SHUTDOWN)
+					- outcomesBefore.get(RWScheduler.TerminalOutcome.SHUTDOWN));
+			assertEquals(0L, outcomesAfter.get(RWScheduler.TerminalOutcome.CANCELLATION)
+					- outcomesBefore.get(RWScheduler.TerminalOutcome.CANCELLATION));
+		} finally {
+			releaseQuantum.countDown();
+			if (connection != null) {
+				connection.getInternalDB().setRangeCountChunkObserverForTesting(null);
+				if (close == null) {
+					connection.closeTesting();
+				} else {
+					try {
+						close.get(10, TimeUnit.SECONDS);
+					} catch (Exception ignored) {
+						// Preserve the primary assertion failure; the close future carries shutdown diagnostics.
+					}
+				}
+			}
+		}
+	}
+
+	@Test
 	void analyticalCountUsesTheCooperativeRuntimeAfterSchedulerIntegration() throws Exception {
 		assertUncontendedCountProfile(WorkloadProfile.ANALYTICAL, RequestContext.analytical());
 	}
 
 	@Test
-	void ingestCountUsesTheCooperativeRuntimeAfterSchedulerIntegration() throws Exception {
-		assertUncontendedCountProfile(WorkloadProfile.INGEST, RequestContext.ingest());
+	void ingestCountRemainsRejectedByTheWorkloadContract() throws Exception {
+		try (var connection = populatedConnection("retained-count-ingest", 33, "")) {
+			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
+			var scheduler = connection.getScheduler();
+			long acceptedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
+
+			var failure = assertThrows(RocksDBException.class,
+					() -> connection.getAsyncApi(RequestContext.ingest()).reduceRangeAsync(
+							0, columnId, null, null, false, RequestType.entriesCount(), 30_000));
+			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, failure.getErrorUniqueId());
+			assertEquals(acceptedBefore, scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks(),
+					"rejected INGEST aggregates must not reach scheduler admission");
+			assertRetainedResourcesDrained(connection);
+		}
 	}
 
 	private void assertUncontendedCountProfile(WorkloadProfile profile, RequestContext context) throws Exception {

@@ -565,9 +565,13 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		if (requiresCooperativeIteratorContinuation(profile, skipCount, takeCount)) {
 			var continuation = new CooperativeIteratorContinuation<T>(
 					iterationId, skipCount, takeCount, requestType, iteratorOperation);
-			iteratorOperation.attachCancellation(() -> continuation.cancel(false));
 			try {
 				continuation.attach(workloadExecutor.executeCooperatively(continuation, 0L));
+				// A first dispatch parks until both the scheduler handle and the connection-
+				// shutdown cancellation bridge are installed. This closes the admission race
+				// where shutdown was pending before the handle became cancellable.
+				iteratorOperation.attachCancellation(() -> continuation.cancel(false));
+				continuation.start();
 			} catch (Throwable admissionFailure) {
 				continuation.finish(null, admissionFailure);
 			}
@@ -774,21 +778,25 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	 * and leaves {@link EmbeddedDB} before this state can yield.
 	 */
 	private final class CooperativeIteratorContinuation<T> extends CompletableFuture<T>
-			implements RWScheduler.CooperativeTask, reactor.core.Disposable {
+			implements RWScheduler.CooperativeCompletionTask, reactor.core.Disposable {
 
 		private final long iterationId;
 		private final AsyncIteratorOperation iteratorOperation;
 		private final IteratorRequestMode mode;
 		private final @Nullable ArrayList<Buf> values;
+		private final Object completionLock = new Object();
 		private final AtomicBoolean terminated = new AtomicBoolean();
 		private volatile boolean cancellationRequested;
-		private volatile @Nullable CancellationException cancellationFailure;
 		private volatile @Nullable RWScheduler.CooperativeHandle handle;
+		private volatile boolean ready;
 		private IteratorContinuationStage stage;
 		private long remainingSkip;
 		private long remainingTake;
 		private boolean exhausted;
 		private boolean found;
+		private boolean completionPrepared;
+		private @Nullable T preparedValue;
+		private @Nullable Throwable preparedFailure;
 
 		private CooperativeIteratorContinuation(long iterationId,
 				long skipCount,
@@ -813,10 +821,21 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		}
 
 		private void attach(RWScheduler.CooperativeHandle handle) {
-			this.handle = Objects.requireNonNull(handle, "handle");
-			if (cancellationRequested) {
-				handle.dispose();
+			synchronized (completionLock) {
+				this.handle = Objects.requireNonNull(handle, "handle");
 			}
+		}
+
+		private void start() {
+			RWScheduler.CooperativeHandle currentHandle;
+			synchronized (completionLock) {
+				if (terminated.get()) {
+					return;
+				}
+				ready = true;
+				currentHandle = Objects.requireNonNull(handle, "handle");
+			}
+			currentHandle.resume();
 		}
 
 		@Override
@@ -824,15 +843,16 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			if (terminated.get()) {
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
+			if (!ready) {
+				return RWScheduler.CooperativeResult.PARK;
+			}
 			try {
 				while (true) {
-					var terminationFailure = requestedTermination(context);
-					if (terminationFailure != null) {
-						finish(null, terminationFailure);
+					if (context.terminationRequested()) {
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (stage == IteratorContinuationStage.DONE) {
-						finish(completedValue(), null);
+						prepareCompletion(completedValue(), null);
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 
@@ -842,13 +862,11 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 						case DONE -> throw new IllegalStateException("Completed iterator stage was dispatched");
 					}
 
-					terminationFailure = requestedTermination(context);
-					if (terminationFailure != null) {
-						finish(null, terminationFailure);
+					if (context.terminationRequested()) {
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (stage == IteratorContinuationStage.DONE) {
-						finish(completedValue(), null);
+						prepareCompletion(completedValue(), null);
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (context.preemptionRequested()) {
@@ -856,23 +874,16 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					}
 				}
 			} catch (VirtualMachineError fatal) {
-				finish(null, fatal);
+				if (!context.terminationRequested()) {
+					prepareCompletion(null, fatal);
+				}
 				throw fatal;
 			} catch (Throwable failure) {
-				finish(null, failure);
+				if (!context.terminationRequested()) {
+					prepareCompletion(null, failure);
+				}
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
-		}
-
-		private @Nullable RuntimeException requestedTermination(RWScheduler.CooperativeContext context) {
-			if (cancellationRequested) {
-				return Objects.requireNonNull(cancellationFailure, "cancellationFailure");
-			}
-			if (!context.terminationRequested()) {
-				return null;
-			}
-			return Objects.requireNonNull(
-					context.terminationFailure(), "Cooperative termination failure");
 		}
 
 		private void runSkipStep() {
@@ -933,16 +944,22 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 		@Override
 		public boolean cancel(boolean mayInterruptIfRunning) {
-			if (!super.cancel(false)) {
-				return false;
+			synchronized (completionLock) {
+				if (cancellationRequested) {
+					return true;
+				}
+				if (terminated.get()) {
+					return false;
+				}
+				var currentHandle = Objects.requireNonNull(handle, "handle");
+				// The scheduler selects CANCELLATION, DEADLINE, SHUTDOWN, or an already
+				// completed RUN before local cancellation becomes observable to this task.
+				boolean cancellationWon = currentHandle.cancel();
+				if (cancellationWon) {
+					cancellationRequested = true;
+				}
+				return cancellationWon;
 			}
-			cancellationFailure = new CancellationException("Iterator continuation cancelled");
-			cancellationRequested = true;
-			var currentHandle = handle;
-			if (currentHandle != null) {
-				currentHandle.dispose();
-			}
-			return true;
 		}
 
 		@Override
@@ -960,9 +977,42 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			return terminated.get();
 		}
 
+		private void prepareCompletion(@Nullable T value, @Nullable Throwable failure) {
+			synchronized (completionLock) {
+				if (terminated.get()) {
+					return;
+				}
+				if (completionPrepared) {
+					throw new IllegalStateException("Iterator continuation completion was prepared twice");
+				}
+				preparedValue = value;
+				preparedFailure = failure;
+				completionPrepared = true;
+			}
+		}
+
+		@Override
+		public void completeCooperatively() {
+			final T value;
+			final Throwable failure;
+			synchronized (completionLock) {
+				if (terminated.get()) {
+					return;
+				}
+				if (!completionPrepared) {
+					throw new IllegalStateException("Scheduler selected RUN without an iterator result");
+				}
+				value = preparedValue;
+				failure = preparedFailure;
+			}
+			finish(value, failure);
+		}
+
 		private void finish(@Nullable T value, @Nullable Throwable failure) {
-			if (!terminated.compareAndSet(false, true)) {
-				return;
+			synchronized (completionLock) {
+				if (!terminated.compareAndSet(false, true)) {
+					return;
+				}
 			}
 			// Publish iterator-gate release before success/failure becomes observable.
 			releaseAsyncIteratorOperation(iterationId, iteratorOperation);

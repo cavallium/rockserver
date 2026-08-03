@@ -14,11 +14,16 @@ import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class GrpcRetainedReadBenchmarkTest {
 
+	@TempDir
+	java.nio.file.Path tempDir;
+
 	private static final String SCENARIO = "stream-range-with-latency-gets";
 	private static final String BUILD_SHA = "0123456789abcdef0123456789abcdef01234567";
+	private static final String RAW_CHECKPOINT_SHA = "7d9c02c090e71df78cdca24d29335b38147b3cfb";
 	private static final String DIGEST =
 			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -122,11 +127,20 @@ class GrpcRetainedReadBenchmarkTest {
 		var incorrect = parse(valid.replace("correctness=true", "correctness=false"));
 		var undrained = parse(valid.replace("resources-drained=true", "resources-drained=false")
 				.replace("final-pending=0", "final-pending=1"));
+		var existsMultiUndrained = parse(valid.replace(
+				"final-exists-multi-requests=0", "final-exists-multi-requests=1"));
+		var existsMultiArenaUndrained = parse(valid.replace(
+				"final-exists-multi-arenas=0", "final-exists-multi-arenas=1"));
+		var impossibleExistsMultiPeak = parse(valid.replace(
+				"peak-exists-multi-snapshots=0", "peak-exists-multi-snapshots=1"));
 		var leaked = parse(valid.replace("native-leaks=0", "native-leaks=1"));
 		var badAccounting = parse(valid.replace("accounting-valid=true", "accounting-valid=false"));
 
 		assertFalse(incorrect.passed());
 		assertFalse(undrained.passed());
+		assertFalse(existsMultiUndrained.passed());
+		assertFalse(existsMultiArenaUndrained.passed());
+		assertFalse(impossibleExistsMultiPeak.passed());
 		assertFalse(leaked.passed());
 		assertFalse(badAccounting.passed());
 	}
@@ -140,6 +154,9 @@ class GrpcRetainedReadBenchmarkTest {
 		assertThrows(IllegalArgumentException.class, () -> parse(valid + "unknown=value\n"));
 		assertThrows(IllegalArgumentException.class,
 				() -> parse(valid.replaceFirst("(?m)^mib-per-second=.*\\R", "")));
+		assertThrows(IllegalArgumentException.class,
+				() -> parse(valid.replace("arena-instrumentation-sha256=" + DIGEST,
+						"arena-instrumentation-sha256=unverified")));
 		assertThrows(IllegalArgumentException.class,
 				() -> parse(valid + "round=1\n"));
 		assertThrows(IllegalArgumentException.class,
@@ -159,6 +176,32 @@ class GrpcRetainedReadBenchmarkTest {
 		assertThrows(IllegalArgumentException.class, () ->
 				GrpcRetainedReadBenchmark.parseWorkerForTesting(valid, BUILD_SHA, DIGEST,
 						"e".repeat(64)));
+	}
+
+	@Test
+	void classpathFingerprintIsBoundToExecutableContents() throws Exception {
+		var classes = java.nio.file.Files.createDirectories(tempDir.resolve("classes"));
+		var classFile = classes.resolve("Example.class");
+		java.nio.file.Files.write(classFile, new byte[] {1, 2, 3, 4});
+		String before = GrpcRetainedReadBenchmark.classPathContentSha256ForTesting(classes.toString());
+
+		java.nio.file.Files.write(classFile, new byte[] {4, 3, 2, 1});
+		String after = GrpcRetainedReadBenchmark.classPathContentSha256ForTesting(classes.toString());
+
+		assertFalse(before.equals(after), "modified class bytes retained the same provenance fingerprint");
+	}
+
+	@Test
+	void exactArenaInstrumentationObservesTheActualSuccessfulClose() throws Exception {
+		String digest = GrpcRetainedReadBenchmark.exactArenaInstrumentationForTesting();
+		assertTrue(digest.matches("[0-9a-f]{64}"));
+	}
+
+	@Test
+	void retainedComparisonRejectsAnyBaselineOtherThanTheFrozenCheckpoint() {
+		GrpcRetainedReadBenchmark.validateRawBaselineForTesting(RAW_CHECKPOINT_SHA);
+		assertThrows(IllegalArgumentException.class,
+				() -> GrpcRetainedReadBenchmark.validateRawBaselineForTesting(BUILD_SHA));
 	}
 
 	@Test

@@ -72,6 +72,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -366,6 +367,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private volatile @Nullable LongConsumer rangeCountQuantumItemsObserver;
 	private volatile @Nullable Runnable rangeContinuationObserver;
 	private volatile @Nullable LongConsumer retainedQueryPermitGrantedObserver;
+	private volatile @Nullable Runnable retainedRangeCleanupObserver;
+	private volatile @Nullable Runnable iteratorAdvanceStepCompletedObserver;
 	private volatile @Nullable Runnable forcedShutdownObserver;
 	private volatile @Nullable Runnable existsMultiChunkObserver;
 	private volatile @Nullable Runnable existsMultiSnapshotObserver;
@@ -953,16 +956,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			closeActiveRangeResources();
 			logger.info("Waiting for active operations");
 			ops.waitForExit(pendingOpsTimeoutMs);
+			// Cooperative tasks can release their SafeShutdown operation before their
+			// worker publishes terminal scheduler metrics. Join the scheduler before
+			// closeResources tears down meters or other observability state.
+			if (scheduler != null) {
+				scheduler.dispose();
+			}
 			// Normal shutdown path
 			logger.info("Ops finished, closing resources");
 			closeResources(false);
 			if (testing && (resourceLeases.get() > 0
+					|| (scheduler != null && !scheduler.isFullyTerminated())
 					|| retainedQueryLimiter.activeCount() > 0
 					|| retainedQueryLimiter.waitingCount() > 0
 					|| retainedRangeSnapshots.get() > 0
 					|| !activeExistsMultiRequests.isEmpty()
 					|| !activeCdcPollCursors.isEmpty())) {
-				throw new IllegalStateException("Shutdown left resources open: leases=" + resourceLeases.get()
+				throw new IllegalStateException("Shutdown left resources open: schedulerTerminated="
+						+ (scheduler == null || scheduler.isFullyTerminated())
+						+ ", leases=" + resourceLeases.get()
 						+ ", retainedPermits=" + retainedQueryLimiter.activeCount()
 						+ ", retainedWaiters=" + retainedQueryLimiter.waitingCount()
 						+ ", retainedSnapshots=" + retainedRangeSnapshots.get()
@@ -985,10 +997,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			logger.warn("Timeout! Forcing shutdown");
 			// Best-effort forced cleanup of leaked resources to avoid native memory retention
 			forceCloseLeakedResources();
+			if (scheduler != null) {
+				scheduler.disposeNow();
+			}
 			// After forcing close of leaked resources, proceed to close DB/native resources defensively
 			closeResources(true);
 
 			if (testing && (ops.getPendingOpsCount() > 0
+					|| (scheduler != null && !scheduler.isFullyTerminated())
 					|| resourceLeases.get() > 0
 					|| retainedQueryLimiter.activeCount() > 0
 					|| retainedQueryLimiter.waitingCount() > 0
@@ -996,7 +1012,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					|| !activeExistsMultiRequests.isEmpty()
 					|| !activeCdcPollCursors.isEmpty())) {
 				throw new IllegalStateException("Some active operations lasted more than " + pendingOpsTimeoutMs
-						+ " ms! activeOps=" + ops.getPendingOpsCount() + ", resourceLeases="
+						+ " ms! schedulerTerminated=" + (scheduler == null || scheduler.isFullyTerminated())
+						+ ", activeOps=" + ops.getPendingOpsCount() + ", resourceLeases="
 						+ resourceLeases.get() + ", retainedPermits=" + retainedQueryLimiter.activeCount()
 						+ ", retainedWaiters=" + retainedQueryLimiter.waitingCount()
 						+ ", retainedSnapshots=" + retainedRangeSnapshots.get()
@@ -1041,6 +1058,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * wrapped and exceptions are logged.
 	 */
 	private void closeResources(boolean forced) {
+		if (scheduler != null && !scheduler.isFullyTerminated()) {
+			logger.error("Leaving database resources allocated because workload pools are still live; "
+					+ "terminal callbacks may still need native state and metrics");
+			return;
+		}
 		// Logical range reads, CDC polls, and existsMulti requests keep native read
 		// state between bounded scheduler slices. SafeShutdown has already excluded new
 		// requests, so close those idle resources before column handles or the database.
@@ -1832,6 +1854,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setRetainedQueryPermitGrantedObserverForTesting(@Nullable LongConsumer observer) {
 		this.retainedQueryPermitGrantedObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setRetainedRangeCleanupObserverForTesting(@Nullable Runnable observer) {
+		this.retainedRangeCleanupObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setIteratorAdvanceStepCompletedObserverForTesting(@Nullable Runnable observer) {
+		this.iteratorAdvanceStepCompletedObserver = observer;
 	}
 
 	@VisibleForTesting
@@ -4724,7 +4756,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private final class AsyncExistsMultiRequest extends CompletableFuture<List<Boolean>>
-			implements Runnable, RWScheduler.CooperativeTask {
+			implements Runnable, RWScheduler.CooperativeCompletionTask {
 
 		private static final int INITIAL_QUEUED = 0;
 		private static final int CHUNK_RUNNING = 1;
@@ -4747,6 +4779,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private @Nullable ExistsMultiCursor cursor;
 		private volatile @Nullable RWScheduler.CooperativeHandle cooperativeHandle;
 		private boolean operationStarted;
+		private boolean cooperativeCompletionPrepared;
+		private @Nullable List<Boolean> cooperativeResult;
+		private @Nullable Throwable cooperativeFailure;
 
 		private AsyncExistsMultiRequest(long transactionId,
 				long columnId,
@@ -4802,20 +4837,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		@Override
 		public boolean cancel(boolean mayInterruptIfRunning) {
 			if (cooperativeExecutor != null) {
-				final boolean beforeFirstRun;
-				final RWScheduler.CooperativeHandle handle;
 				synchronized (lifecycleLock) {
 					if (state == FINISHED) {
 						return false;
 					}
-					beforeFirstRun = state == INITIAL_QUEUED;
-					cancelRequested.set(true);
-					handle = cooperativeHandle;
+					boolean beforeFirstRun = state == INITIAL_QUEUED;
+					var handle = Objects.requireNonNull(cooperativeHandle, "cooperativeHandle");
+					// Let the scheduler's terminal CAS choose between cancellation,
+					// deadline, shutdown, and a concurrently completed RUN before the
+					// local flag is published for idempotency.
+					boolean cancellationWon = handle.cancel();
+					if (cancellationWon) {
+						cancelRequested.set(true);
+					}
+					return beforeFirstRun && cancellationWon;
 				}
-				if (handle != null) {
-					handle.dispose();
-				}
-				return beforeFirstRun;
 			}
 			boolean cleanupQueuedRequest = false;
 			boolean initialQueuedCancellation = false;
@@ -4864,14 +4900,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					return RWScheduler.CooperativeResult.COMPLETE;
 				}
 			}
-			if (context.terminationRequested() || cancelRequested.get()) {
+			if (context.terminationRequested()) {
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 			if (initialize) {
 				try {
 					initialize();
 				} catch (Throwable error) {
-					finishRunning(null, mapExistsMultiFailure(error));
+					if (!context.terminationRequested()) {
+						prepareCooperativeCompletion(null, mapExistsMultiFailure(error));
+					}
 					return RWScheduler.CooperativeResult.COMPLETE;
 				}
 			}
@@ -4879,15 +4917,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			try {
 				var activeCursor = Objects.requireNonNull(cursor);
 				while (true) {
-					if (context.terminationRequested() || cancelRequested.get()) {
+					if (context.terminationRequested()) {
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					boolean exhausted = activeCursor.readChunk();
-					if (context.terminationRequested() || cancelRequested.get()) {
+					if (context.terminationRequested()) {
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (exhausted) {
-						finishRunning(activeCursor.result(), null);
+						prepareCooperativeCompletion(activeCursor.result(), null);
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (context.preemptionRequested()) {
@@ -4900,9 +4938,44 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				}
 			} catch (Throwable error) {
-				finishRunning(null, mapExistsMultiFailure(error));
+				if (!context.terminationRequested()) {
+					prepareCooperativeCompletion(null, mapExistsMultiFailure(error));
+				}
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
+		}
+
+		private void prepareCooperativeCompletion(@Nullable List<Boolean> result,
+				@Nullable Throwable failure) {
+			synchronized (lifecycleLock) {
+				if (state != CHUNK_RUNNING) {
+					return;
+				}
+				if (cooperativeCompletionPrepared) {
+					throw new IllegalStateException("existsMulti completion was prepared twice");
+				}
+				cooperativeResult = result;
+				cooperativeFailure = failure;
+				cooperativeCompletionPrepared = true;
+			}
+		}
+
+		@Override
+		public void completeCooperatively() {
+			final List<Boolean> result;
+			final Throwable failure;
+			synchronized (lifecycleLock) {
+				if (state == FINISHED) {
+					return;
+				}
+				if (state != CHUNK_RUNNING || !cooperativeCompletionPrepared) {
+					throw new IllegalStateException("Scheduler selected RUN without an existsMulti result");
+				}
+				state = FINISHED;
+				result = cooperativeResult;
+				failure = cooperativeFailure;
+			}
+			completeTerminal(result, failure);
 		}
 
 		@Override
@@ -5032,15 +5105,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				} catch (Throwable timerFailure) {
 					terminalFailure = appendFailure(terminalFailure, timerFailure);
 				}
+				activeExistsMultiRequests.remove(this);
 				try {
 					// End last: close() may release meters and native handles as soon as
-					// this request is the final SafeShutdown operation.
+					// this request is the final SafeShutdown operation. The request must
+					// no longer be visible as active before publishing that final release.
 					ops.endOp();
 				} catch (Throwable endFailure) {
 					terminalFailure = appendFailure(terminalFailure, endFailure);
 				}
+			} else {
+				activeExistsMultiRequests.remove(this);
 			}
-			activeExistsMultiRequests.remove(this);
 			if (terminalFailure != null) {
 				completeExceptionally(terminalFailure);
 			} else {
@@ -5736,6 +5812,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				long advanced = 0L;
 				while (advanced < maxCount && advanceIterator(state, false).present()) {
 					advanced++;
+				}
+				var observer = iteratorAdvanceStepCompletedObserver;
+				if (observer != null) {
+					observer.run();
 				}
 				return advanced;
 			});
@@ -6595,7 +6675,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private abstract class RetainedRangeCooperativeTask
-			implements RWScheduler.CooperativeTask, ActiveRangeResource, LongConsumer, reactor.core.Disposable {
+			implements RWScheduler.CooperativeCompletionTask,
+			ActiveRangeResource,
+			LongConsumer,
+			reactor.core.Disposable {
 
 		private final long transactionId;
 		private final long columnId;
@@ -6612,10 +6695,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final Object admissionLock = new Object();
 		private final Object resourceLock = new Object();
 		private final AtomicBoolean terminated = new AtomicBoolean();
+		private final CountDownLatch cleanupFinished = new CountDownLatch(1);
 		private volatile boolean deliveryCancelled;
-		private volatile @Nullable RuntimeException closeFailure;
 		protected volatile @Nullable RWScheduler.CooperativeHandle handle;
 		private @Nullable RangeCursor cursor;
+		private boolean completionPrepared;
+		private @Nullable Throwable preparedFailure;
+		private boolean preparedSignalTerminal;
 
 		private RetainedRangeCooperativeTask(long transactionId,
 				long columnId,
@@ -6703,12 +6789,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return context.terminationRequested();
 		}
 
+		protected final boolean deliveryCancelled() {
+			return deliveryCancelled;
+		}
+
 		protected final void cancelDelivery() {
 			if (terminated.get()) {
 				return;
 			}
 			deliveryCancelled = true;
-			cancelAndFinish(null, false);
+			if (deadlineMicros != Long.MAX_VALUE
+					&& TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis()) >= deadlineMicros) {
+				var failure = retainedRangeDeadlineExceeded();
+				cancelAndFinish(failure, false, RWScheduler.TerminalOutcome.DEADLINE);
+			} else {
+				cancelAndFinish(null, false, null);
+			}
 		}
 
 		@Override
@@ -6724,8 +6820,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		@Override
 		public final void close() {
 			var failure = new RejectedExecutionException("Database is shutting down");
-			closeFailure = failure;
-			cancelAndFinish(failure, !deliveryCancelled);
+			cancelAndFinish(failure, !deliveryCancelled, RWScheduler.TerminalOutcome.SHUTDOWN);
+			awaitCleanupFinished();
 		}
 
 		@Override
@@ -6734,17 +6830,29 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return;
 			}
 			var failure = retainedRangeDeadlineExceeded();
-			closeFailure = failure;
-			cancelAndFinish(failure, !deliveryCancelled);
+			cancelAndFinish(failure, !deliveryCancelled, RWScheduler.TerminalOutcome.DEADLINE);
 		}
 
-		private void cancelAndFinish(@Nullable RuntimeException failure, boolean signalTerminal) {
+		private void cancelAndFinish(@Nullable RuntimeException failure,
+				boolean signalTerminal,
+				@Nullable RWScheduler.TerminalOutcome outcome) {
 			// Serialize cancellation with admission. Otherwise cancellation can observe no
 			// handle, release the permit, and then race a late cooperative submission.
 			synchronized (admissionLock) {
+				if (terminated.get()) {
+					return;
+				}
 				var currentHandle = handle;
 				if (currentHandle != null) {
-					currentHandle.dispose();
+					if (outcome != null && currentHandle instanceof CooperativeTerminationHandle classifiedHandle) {
+						classifiedHandle.terminate(outcome, Objects.requireNonNull(failure));
+					} else {
+						currentHandle.dispose();
+					}
+					// A queued or parked task is rejected synchronously by the scheduler. An active
+					// task is rejected only after its current quantum returns, which keeps cursor
+					// cleanup from racing an in-flight JNI call.
+					return;
 				}
 				finish(failure, signalTerminal);
 			}
@@ -6752,8 +6860,41 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public final void reject(RuntimeException failure) {
-			var override = closeFailure;
-			finish(override != null ? override : failure, !deliveryCancelled);
+			// The scheduler owns first-cause arbitration for admitted tasks. A later
+			// deadline, shutdown, or cancellation request must not change the public
+			// failure after the scheduler has already selected a terminal outcome.
+			finish(failure, !deliveryCancelled);
+		}
+
+		protected final void prepareCompletion(@Nullable Throwable failure, boolean signalTerminal) {
+			synchronized (admissionLock) {
+				if (terminated.get()) {
+					return;
+				}
+				if (completionPrepared) {
+					throw new IllegalStateException("Retained range completion was prepared twice");
+				}
+				preparedFailure = failure;
+				preparedSignalTerminal = signalTerminal;
+				completionPrepared = true;
+			}
+		}
+
+		@Override
+		public final void completeCooperatively() {
+			final Throwable failure;
+			final boolean signalTerminal;
+			synchronized (admissionLock) {
+				if (terminated.get()) {
+					return;
+				}
+				if (!completionPrepared) {
+					throw new IllegalStateException("Scheduler selected RUN without a retained range result");
+				}
+				failure = preparedFailure;
+				signalTerminal = preparedSignalTerminal;
+			}
+			finish(failure, signalTerminal);
 		}
 
 		protected final void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
@@ -6761,34 +6902,61 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return;
 			}
 			Throwable failure = originalFailure;
-			RangeCursor localCursor;
-			synchronized (resourceLock) {
-				localCursor = cursor;
-				cursor = null;
-			}
-			var closeStart = System.nanoTime();
 			try {
-				if (localCursor != null) {
-					localCursor.close();
+				var cleanupObserver = retainedRangeCleanupObserver;
+				if (cleanupObserver != null) {
+					try {
+						cleanupObserver.run();
+					} catch (Throwable observerFailure) {
+						failure = appendFailure(failure, observerFailure);
+					}
 				}
-			} catch (Throwable closeError) {
-				failure = appendFailure(failure, closeError);
-			} finally {
-				totalTime.add(System.nanoTime() - closeStart);
+				RangeCursor localCursor;
+				synchronized (resourceLock) {
+					localCursor = cursor;
+					cursor = null;
+				}
+				var closeStart = System.nanoTime();
 				try {
-					retainedPermit.close();
+					if (localCursor != null) {
+						localCursor.close();
+					}
 				} catch (Throwable closeError) {
 					failure = appendFailure(failure, closeError);
+				} finally {
+					totalTime.add(System.nanoTime() - closeStart);
+					try {
+						retainedPermit.close();
+					} catch (Throwable closeError) {
+						failure = appendFailure(failure, closeError);
+					}
+					activeRangeResources.remove(this);
+					try {
+						timer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
+					} catch (Throwable timerFailure) {
+						failure = appendFailure(failure, timerFailure);
+					}
 				}
-				activeRangeResources.remove(this);
-				try {
-					timer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
-				} catch (Throwable timerFailure) {
-					failure = appendFailure(failure, timerFailure);
-				}
+			} finally {
+				cleanupFinished.countDown();
 			}
 			if (signalTerminal) {
 				signalTerminal(failure);
+			}
+		}
+
+		private void awaitCleanupFinished() {
+			boolean interrupted = false;
+			while (true) {
+				try {
+					cleanupFinished.await();
+					break;
+				} catch (InterruptedException ignored) {
+					interrupted = true;
+				}
+			}
+			if (interrupted) {
+				Thread.currentThread().interrupt();
 			}
 		}
 
@@ -6862,7 +7030,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				producedOne();
 				sink.next(chunk);
 				if (chunk.exhausted()) {
-					finish(null, true);
+					prepareCompletion(null, true);
 					return RWScheduler.CooperativeResult.COMPLETE;
 				}
 				if (schedulerTerminationRequested(context)) {
@@ -6875,9 +7043,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						? RWScheduler.CooperativeResult.PARK
 						: RWScheduler.CooperativeResult.YIELD;
 			} catch (VirtualMachineError fatal) {
+				if (!schedulerTerminationRequested(context)) {
+					prepareCompletion(fatal, !deliveryCancelled());
+				}
 				throw fatal;
 			} catch (Throwable failure) {
-				finish(failure, !isDisposed());
+				if (!schedulerTerminationRequested(context)) {
+					prepareCompletion(failure, !deliveryCancelled());
+				}
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 		}
@@ -6977,7 +7150,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (chunk.exhausted()) {
-						finish(null, true);
+						prepareCompletion(null, true);
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (notifyRangeContinuationAndPark()) {
@@ -6988,9 +7161,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				}
 			} catch (VirtualMachineError fatal) {
+				if (!schedulerTerminationRequested(context)) {
+					prepareCompletion(fatal, !deliveryCancelled());
+				}
 				throw fatal;
 			} catch (Throwable failure) {
-				finish(failure, !isDisposed());
+				if (!schedulerTerminationRequested(context)) {
+					prepareCompletion(failure, !deliveryCancelled());
+				}
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 		}

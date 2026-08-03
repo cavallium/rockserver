@@ -479,6 +479,10 @@ public final class RWScheduler {
 		}
 	}
 
+	boolean isFullyTerminated() {
+		return pools().stream().allMatch(ProfiledWorkloadExecutor::isTerminated);
+	}
+
 	private static boolean awaitUntil(ProfiledWorkloadExecutor pool,
 			long deadlineNanos) throws InterruptedException {
 		long remaining = deadlineNanos - System.nanoTime();
@@ -518,6 +522,19 @@ public final class RWScheduler {
 	}
 
 	/**
+	 * Cooperative task whose successful logical completion is published only after the
+	 * scheduler has atomically selected {@link TerminalOutcome#RUN}. Failure outcomes
+	 * continue to arrive through {@link RejectionAwareTask#reject(RuntimeException)}.
+	 *
+	 * <p>This keeps the scheduler as the single terminal authority when a completed
+	 * quantum races cancellation, deadline expiry, or shutdown.</p>
+	 */
+	public interface CooperativeCompletionTask extends CooperativeTask {
+
+		void completeCooperatively();
+	}
+
+	/**
 	 * Lock-free state exposed to the currently running cooperative quantum.
 	 */
 	public interface CooperativeContext {
@@ -535,6 +552,13 @@ public final class RWScheduler {
 	public interface CooperativeHandle extends reactor.core.Disposable {
 
 		void resume();
+
+		/**
+		 * Atomically request scheduler cancellation.
+		 *
+		 * @return {@code true} only when cancellation became the scheduler's terminal cause
+		 */
+		boolean cancel();
 	}
 
 	public enum CooperativeResult {
