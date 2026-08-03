@@ -7036,9 +7036,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (schedulerTerminationRequested(context)) {
 					return RWScheduler.CooperativeResult.COMPLETE;
 				}
-				if (context.preemptionRequested()) {
-					return RWScheduler.CooperativeResult.YIELD;
-				}
+				// Backpressure is stronger than scheduler competition here. If delivery has
+				// not requested another decoded chunk, queueing this node for a competitive
+				// redispatch only makes it run once more to discover zero demand and park.
+				// A concurrent request records resume while this quantum is active, so the
+				// scheduler still requeues the node atomically when PARK is committed.
 				return demand.get() == 0L
 						? RWScheduler.CooperativeResult.PARK
 						: RWScheduler.CooperativeResult.YIELD;

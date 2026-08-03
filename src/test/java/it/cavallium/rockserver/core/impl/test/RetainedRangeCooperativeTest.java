@@ -375,6 +375,75 @@ class RetainedRangeCooperativeTest {
 	}
 
 	@Test
+	void backpressuredStreamParksWithoutACompetitiveZeroDemandRedispatch() throws Exception {
+		String databaseName = "retained-stream-competitive-park";
+		try (var connection = populatedConnection(databaseName, 17, """
+				database.parallelism.read = 3
+				database.parallelism.write = 3
+				database.parallelism.workload.range-quantum-max-items = 16
+				database.parallelism.workload.range-quantum-max-bytes = 1MiB
+				database.parallelism.workload.range-quantum-max-duration = PT1S
+				""")) {
+			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
+			var scheduler = connection.getScheduler();
+			var releaseBlockers = new CountDownLatch(1);
+			var blockersStarted = new CountDownLatch(2);
+			occupyReadWorkers(scheduler.readExecutor(), 2, blockersStarted, releaseBlockers);
+			assertTrue(blockersStarted.await(5, TimeUnit.SECONDS));
+
+			var cursorOpening = new CountDownLatch(1);
+			var releaseCursorOpen = new CountDownLatch(1);
+			var foregroundRan = new CountDownLatch(1);
+			connection.getInternalDB().setRangeIteratorOpenObserverForTesting(() -> {
+				cursorOpening.countDown();
+				await(releaseCursorOpen);
+			});
+
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE);
+			var quantumCounter = connection.getInternalDB().getMetricsRegistry()
+					.get("rockserver.workload.quantums")
+					.tags("database", databaseName,
+							"resource", "read",
+							"profile", "batch",
+							"operation", "range_page")
+					.counter();
+			double quantumsBefore = quantumCounter.count();
+			long acceptedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
+			try {
+				var range = Flux.from(connection.getAsyncApi(RequestContext.batch()).getRangeAsync(
+						0, columnId, null, null, false, RequestType.allInRange(), 30_000));
+				StepVerifier.create(range, 1)
+						.then(() -> {
+							assertTrue(await(cursorOpening, 5, TimeUnit.SECONDS));
+							scheduler.executor(WorkloadProfile.LATENCY,
+									OperationFamily.POINT_LOOKUP,
+									System.currentTimeMillis() + 5_000L).execute(foregroundRan::countDown);
+							releaseCursorOpen.countDown();
+						})
+						.assertNext(first -> assertEquals(key(0), first.keys()))
+						.thenAwait(Duration.ofMillis(200))
+						.then(() -> assertTrue(await(foregroundRan, 5, TimeUnit.SECONDS)))
+						.thenRequest(Long.MAX_VALUE)
+						.expectNextCount(16)
+						.verifyComplete();
+
+				assertEquals(2L,
+						scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - acceptedBefore,
+						"one retained stream plus one foreground task are two logical submissions");
+				assertTrue(awaitCondition(() -> quantumCounter.count() - quantumsBefore == 2.0d, 5_000),
+						"two native chunks must use two quantums without a zero-demand redispatch");
+				assertRetainedResourcesDrained(connection);
+			} finally {
+				releaseCursorOpen.countDown();
+				releaseBlockers.countDown();
+				connection.getInternalDB().setRangeIteratorOpenObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
 	void analyticalCountUsesTheCooperativeRuntimeAfterSchedulerIntegration() throws Exception {
 		assertUncontendedCountProfile(WorkloadProfile.ANALYTICAL, RequestContext.analytical());
 	}
@@ -474,6 +543,15 @@ class RetainedRangeCooperativeTest {
 		}
 		if (interrupted) {
 			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static boolean await(CountDownLatch latch, long timeout, TimeUnit unit) {
+		try {
+			return latch.await(timeout, unit);
+		} catch (InterruptedException interrupted) {
+			Thread.currentThread().interrupt();
+			return false;
 		}
 	}
 
