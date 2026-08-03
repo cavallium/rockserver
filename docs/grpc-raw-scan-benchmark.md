@@ -28,22 +28,35 @@ key set and deterministic value. A missing, duplicate, corrupt, out-of-range, or
 malformed entry fails immediately. The gRPC interceptor independently requires every
 measured `ClientCall.start` to receive exactly one `onClose(OK)`, with no in-flight
 call left behind. Scheduler accepted/started/completed/outcome counters, queues,
-active work, database resources, native handles, and client/server shutdown must all
-balance. At least one ordinary full-sized wire batch must be observed in a full run.
+active/parked/outstanding work, database resources, native handles, and client/server
+shutdown must all balance. At least one ordinary full-sized wire batch must be observed
+in a full run.
 
-The original v1 controller computes paired candidate/baseline ratios and two-sided 95%
-Student-t confidence intervals for serialized-byte throughput, scheduler BATCH/READ
-queue p99, and complete-stream p99. It rejects only when the complete throughput
-interval is below 1.0 or the complete latency interval is above 1.0. An interval that
-crosses equality is reported as inconclusive rather than mislabeled as a demonstrated
-regression. This remains the default so older saved artifacts retain their original
-schema and interpretation.
+The controller verifies both production-class directories against their declared Git
+SHAs and clean-state declarations before creating the dataset. It fingerprints the
+complete classpath contents and deterministic dataset, passes those fingerprints into
+every child, and rejects any worker artifact with missing, extra, or mismatched
+provenance fields. The candidate must expose Wave 1's exact submission-attempt
+accounting. For immutable `bb4f1a7`, which predates those snapshot accessors, the
+benchmark derives aggregate outstanding as accepted minus terminal outcomes and parked
+as outstanding minus queued minus active; the artifact marks that accounting as legacy
+rather than claiming the new exact API.
 
-Release Plan P must enable `--strict-non-inferiority=true`. Strict mode writes the v2
-comparison schema, fixes exactly ten paired rounds, uses geometric ratios with Student-t
-intervals in log space, and requires throughput lower 95% >= 0.99 plus scheduler queue
-and complete-scan p99 upper 95% <= 1.02. A bound crossing its threshold fails strict
-acceptance as inconclusive; there is no adaptive stopping.
+The v3 controller fixes exactly ten paired rounds and computes geometric
+candidate/baseline ratios with two-sided Student-t 95% intervals in log space. It gates
+MiB/s, entries/s, scheduler queue/execution p99, complete-stream p99, CPU ns/entry,
+allocated bytes/entry, peak live heap/direct memory/RSS, GC, thread count, native handles,
+and peak parked/outstanding work. Automatic acceptance requires every geometric mean to
+be no worse than 1.0 and no confidence interval to demonstrate a regression. GC,
+threads, native handles, parked work, and outstanding work allow no increase in any pair;
+allocation and those exact resource gates have no exception path.
+
+The candidate must also prove at least one predeclared material improvement: throughput
+lower 95% at least 1.02, or latency/CPU/allocation/memory upper 95% at most 0.98. Ratios
+inside 0.99 throughput or 1.02 latency/CPU/memory are reported only as exception
+candidates. They still fail automatically and require commit ablation, bounded causal
+proof, profiles showing no lower-cost implementation, a compensating gain, and explicit
+user approval. There is no adaptive stopping.
 
 ## Run the release comparison
 
@@ -56,7 +69,7 @@ mvn -q -DskipTests test-compile dependency:build-classpath \
 
 raw_classpath="target/test-classes:target/classes:$(<target/raw-scan-benchmark.classpath)"
 raw_main="it.cavallium.rockserver.core.impl.benchmark.GrpcRawScanBenchmark"
-baseline_sha="REPLACE_WITH_UNTOUCHED_FULL_SHA"
+baseline_sha="bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e"
 candidate_sha="REPLACE_WITH_CLEAN_CANDIDATE_FULL_SHA"
 raw_root="/mnt/rockserver-hdd/raw-scan-${candidate_sha}"
 
@@ -67,20 +80,19 @@ java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
   --candidate-classes=target/classes \
   "--build-baseline=${baseline_sha}" "--build-candidate=${candidate_sha}" \
   --build-state-baseline=clean --build-state-candidate=clean \
-  --storage-label=hdd-btrfs --host-state=dedicated \
-  --strict-non-inferiority=true --enforce=true
+  --storage-label=hdd-btrfs --host-state=dedicated --enforce=true
 ```
 
 The default full shape is 1,000,000 256-byte values, flushes every 125,000 keys,
 five scan clients, 20 READ workers, one complete warmup pass per client, and at least
-15 measured seconds per child. Legacy mode defaults to five paired rounds; strict mode
-defaults to and requires exactly ten. `--enforce=true` requires clean full Git SHAs,
+15 measured seconds per child. Pareto mode defaults to and requires exactly ten pairs.
+`--enforce=true` requires the immutable v1.3.11 baseline and clean full Git SHAs,
 dedicated non-CI hardware, and those dimensions. The root is one-shot and is never
 overwritten. Preserve `results.json`, `results.md`, metadata, the immutable dataset,
 and every per-round worker file.
 
 Use `--smoke=true --enforce=false` only to validate structure and binary compatibility.
-A tmpfs/shared-host smoke result, a dirty build, a short interval, or a legacy
-inconclusive confidence interval is not release evidence. This warmed raw-only gate
+A tmpfs/shared-host smoke result, a dirty build, a short interval, or an incomplete
+metric set is not release evidence. This warmed raw-only gate
 complements, but does not replace, the cold-cache mixed gRPC gate, seven-profile
 hardware selector, full Maven validation, or the Yotsuba production canary.

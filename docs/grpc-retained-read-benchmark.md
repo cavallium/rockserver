@@ -30,31 +30,42 @@ hardware, storage, cache state, execution order, and command-relevant dimensions
 
 For each scenario, the controller computes the candidate/baseline paired log-ratio. It
 forms a two-sided Student-t 95% confidence interval in log space and exponentiates the
-three reported bounds. Every scenario must satisfy all applicable limits:
+three reported bounds. Every geometric-mean estimate must be no worse than equality,
+and its interval must not demonstrate a regression:
 
-| Metric | Required candidate / baseline bound |
-|---|---:|
-| entries/s and MiB/s | lower 95% >= 0.99 |
-| completion p99 | upper 95% <= 1.02 |
-| streamed first-item p99 | upper 95% <= 1.02 |
-| mixed foreground p99 | upper 95% <= 1.02 |
-| cold completion and streamed cold first item | upper 95% <= 1.02 |
-| process CPU ns/item | upper 95% <= 1.02 |
-| allocated bytes/item | upper 95% <= 1.00 |
-| peak live heap and direct memory | upper 95% <= 1.02 |
+| Metric | Automatic gate | Exception ceiling |
+|---|---:|---:|
+| entries/s and MiB/s | ratio >= 1.00 | ratio >= 0.99 |
+| queue, execution, completion, first-item, foreground, and cold p99 | ratio <= 1.00 | ratio <= 1.02 |
+| process CPU ns/item | ratio <= 1.00 | ratio <= 1.02 |
+| allocated bytes/item | ratio <= 1.00 | none |
+| peak live heap, direct memory, and RSS | ratio <= 1.00 | ratio <= 1.02 |
+| GC collections/time, peak threads, and peak native handles | no increase in any pair | none |
+| parked/outstanding and retained/native lifetime peaks | no increase in any pair | none |
 
-An interval crossing its threshold is inconclusive and therefore fails. Missing or
-malformed samples also fail; there is no adaptive extension of the ten rounds. GC counts
-and time are reported alongside the gated metrics.
+At least one predeclared primary metric must also demonstrate a material improvement:
+throughput lower 95% at least 1.02, or latency/CPU/allocation/memory upper 95% at most
+0.98. An exception-ceiling result is never an automatic pass; the report only identifies
+it for the separate ablation, profiling, compensating-gain, and explicit-approval process.
+Missing or malformed samples fail, and there is no adaptive extension of the ten rounds.
 
 Every optimized candidate request must record exactly one accepted, one started, and one
 terminal scheduler task. Mixed scenarios must force more quantums than logical tasks.
 Scheduler failures, rejections, cancellations, duplicate terminals, native leaks, or a
-nonzero final queue/resource count fail the worker. Retained snapshots, permits, waiters,
+nonzero final queue/resource count fail the worker. Candidate workers must expose the
+Wave 1 exact scheduler accounting, and after drain submission attempts must equal terminal
+outcomes; the immutable baseline is explicitly reported with the conservative legacy
+fallback used by the binary-compatible harness. Parked and outstanding scheduler tasks,
+retained snapshots, permits, waiters,
 range cursors, iterators, iterator leases, and `existsMulti` logical requests, snapshots,
 read options, and per-call arenas must not peak above the paired baseline. Every one of
 those resources must drain to zero, and the configured retained-resource limit must not
 change.
+
+The measurement-only sampler also records scheduler queue/execution p99 and process CPU,
+allocation, live heap, direct memory, Linux RSS, live threads, open native descriptors,
+and GC deltas. It runs on the benchmark sampler thread and never adds a scheduler lock,
+registry lookup, queue scan, or per-yield callback to production hot paths.
 
 Every worker instruments the selected `EmbeddedDB.existsMultiStatusOnly` bytecode before
 opening the database. The harness requires exactly one `Arena.ofConfined` call in that
@@ -65,8 +76,8 @@ double-close, close failure, underflow, or a nonzero final count fails the run. 
 is launched with the pinned Byte Buddy artifact as a startup agent (no dynamic attach) and
 records a SHA-256 over the transformed bytecode, harness bytecode, and Byte Buddy agent
 artifact, and all fixed rounds for an implementation must report the same digest. The
-controller accepts only the frozen raw checkpoint
-`7d9c02c090e71df78cdca24d29335b38147b3cfb` as the baseline SHA; there is no inferred or
+controller accepts only immutable v1.3.11
+`bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e` as the baseline SHA; there is no inferred or
 hookless fallback.
 
 ## Run the release comparison
@@ -83,7 +94,7 @@ mvn -q -DskipTests test-compile dependency:build-classpath \
 
 retained_classpath="target/test-classes:target/classes:$(<target/retained-read-benchmark.classpath)"
 retained_main="it.cavallium.rockserver.core.impl.benchmark.GrpcRetainedReadBenchmark"
-baseline_sha="REPLACE_WITH_RAW_CHECKPOINT_SHA"
+baseline_sha="bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e"
 candidate_sha="REPLACE_WITH_FINAL_RC_SHA"
 retained_root="/mnt/rockserver-hdd/retained-read-${candidate_sha}"
 

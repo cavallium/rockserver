@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-grpc-retained-read-comparison-v2",
+  "title": "Rockserver paired retained read comparison v2",
+  "type": "object",
+  "required": [
+    "schema", "started", "finished", "build_baseline", "build_candidate",
+    "classpath_baseline_sha256", "classpath_candidate_sha256", "dataset_id", "host_state",
+    "cache_state", "storage_label", "storage_name", "storage_type", "fixed_paired_rounds",
+    "adaptive_stopping", "passed",
+    "scenarios", "workers", "failures"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-grpc-retained-read-comparison-v2" },
+    "started": { "type": "string", "format": "date-time" },
+    "finished": { "type": "string", "format": "date-time" },
+    "build_baseline": { "const": "bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e" },
+    "build_candidate": { "$ref": "#/$defs/gitSha" },
+    "classpath_baseline_sha256": { "$ref": "#/$defs/sha256" },
+    "classpath_candidate_sha256": { "$ref": "#/$defs/sha256" },
+    "dataset_id": { "$ref": "#/$defs/sha256" },
+    "host_state": { "const": "dedicated" },
+    "cache_state": { "type": "string", "minLength": 1 },
+    "storage_label": { "type": "string", "minLength": 1 },
+    "storage_name": { "type": "string" },
+    "storage_type": { "type": "string" },
+    "fixed_paired_rounds": { "const": 10 },
+    "adaptive_stopping": { "const": false },
+    "passed": { "type": "boolean" },
+    "scenarios": {
+      "type": "object",
+      "required": [
+        "exact-count-isolated", "exact-count-with-latency-gets",
+        "stream-range-isolated", "stream-range-with-latency-gets",
+        "exists-multi-isolated", "exists-multi-with-latency-gets",
+        "iterator-skip-take-isolated", "iterator-skip-take-with-latency-gets"
+      ],
+      "properties": {
+        "exact-count-isolated": { "$ref": "#/$defs/scenario" },
+        "exact-count-with-latency-gets": { "$ref": "#/$defs/scenario" },
+        "stream-range-isolated": { "$ref": "#/$defs/scenario" },
+        "stream-range-with-latency-gets": { "$ref": "#/$defs/scenario" },
+        "exists-multi-isolated": { "$ref": "#/$defs/scenario" },
+        "exists-multi-with-latency-gets": { "$ref": "#/$defs/scenario" },
+        "iterator-skip-take-isolated": { "$ref": "#/$defs/scenario" },
+        "iterator-skip-take-with-latency-gets": { "$ref": "#/$defs/scenario" }
+      },
+      "additionalProperties": false
+    },
+    "workers": {
+      "type": "array", "minItems": 160, "maxItems": 160,
+      "items": { "$ref": "#/$defs/worker" }
+    },
+    "failures": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "scenario": {
+      "type": "object",
+      "required": ["passed", "metrics", "material_improvements", "exception_candidates", "gc"],
+      "properties": {
+        "passed": { "type": "boolean" },
+        "metrics": {
+          "type": "object", "minProperties": 27, "maxProperties": 30,
+          "propertyNames": {
+            "enum": [
+              "entries-per-second", "mib-per-second", "queue-p99", "execution-p99",
+              "completion-p99", "cold-completion", "cpu-nanos-per-item",
+              "allocated-bytes-per-item", "peak-live-heap", "peak-direct-memory",
+              "peak-resident-set", "peak-thread-count", "peak-native-handles",
+              "gc-collections", "gc-millis", "peak-parked", "peak-outstanding",
+              "peak-retained-snapshots", "peak-retained-permits", "peak-retained-waiters",
+              "peak-range-cursors", "peak-iterators", "peak-iterator-leases",
+              "peak-exists-multi-requests", "peak-exists-multi-snapshots",
+              "peak-exists-multi-read-options", "peak-exists-multi-arenas",
+              "first-item-p99", "cold-first-item", "foreground-p99"
+            ]
+          },
+          "additionalProperties": { "$ref": "#/$defs/interval" }
+        },
+        "material_improvements": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+        "exception_candidates": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+        "gc": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "interval": {
+      "type": "object",
+      "required": ["samples", "mean", "lower_95", "upper_95"],
+      "properties": {
+        "samples": { "type": "integer", "minimum": 0 },
+        "mean": { "type": ["number", "null"] },
+        "lower_95": { "type": ["number", "null"] },
+        "upper_95": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "worker": {
+      "type": "object",
+      "required": [
+        "round", "scenario", "implementation", "build_sha", "classpath_sha256",
+        "arena_instrumentation_sha256", "dataset_id",
+        "operations", "items", "logical_bytes", "checksum", "elapsed_nanos", "entries_per_second",
+        "mib_per_second", "completion_p99_nanos", "cold_completion_nanos",
+        "first_item_p99_nanos", "cold_first_item_nanos", "foreground_p99_nanos",
+        "foreground_operations", "cpu_nanos_per_item",
+        "allocated_bytes_per_item", "peak_live_heap_bytes", "peak_direct_memory_bytes",
+        "peak_resident_set_bytes", "peak_thread_count", "peak_native_handles", "gc_collections",
+        "gc_millis", "scheduler_accepted", "scheduler_started", "scheduler_terminal",
+        "scheduler_execution_terminal", "scheduler_quantums", "scheduler_failures",
+        "scheduler_rejections", "scheduler_cancellations", "scheduler_queue_p99_nanos",
+        "scheduler_execution_p99_nanos", "resource_peaks", "final_resources",
+        "native_leaks", "correctness",
+        "resources_drained", "accounting_valid", "configured_retained_limit", "passed"
+      ],
+      "properties": {
+        "round": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "scenario": { "type": "string", "minLength": 1 },
+        "implementation": { "enum": ["baseline", "candidate"] },
+        "build_sha": { "$ref": "#/$defs/gitSha" },
+        "classpath_sha256": { "$ref": "#/$defs/sha256" },
+        "arena_instrumentation_sha256": { "$ref": "#/$defs/sha256" },
+        "dataset_id": { "$ref": "#/$defs/sha256" },
+        "operations": { "type": "integer", "minimum": 0 },
+        "items": { "type": "integer", "minimum": 0 },
+        "logical_bytes": { "type": "integer", "minimum": 0 },
+        "checksum": { "type": "string", "pattern": "^[0-9]+$" },
+        "elapsed_nanos": { "type": "integer", "minimum": 1 },
+        "entries_per_second": { "type": "number", "minimum": 0 },
+        "mib_per_second": { "type": "number", "minimum": 0 },
+        "completion_p99_nanos": { "type": "integer", "minimum": 0 },
+        "cold_completion_nanos": { "type": "integer", "minimum": 0 },
+        "first_item_p99_nanos": { "type": "integer", "minimum": 0 },
+        "cold_first_item_nanos": { "type": "integer", "minimum": 0 },
+        "foreground_p99_nanos": { "type": "integer", "minimum": 0 },
+        "foreground_operations": { "type": "integer", "minimum": 0 },
+        "cpu_nanos_per_item": { "type": "number", "minimum": 0 },
+        "allocated_bytes_per_item": { "type": "number", "minimum": 0 },
+        "peak_live_heap_bytes": { "type": "integer", "minimum": 0 },
+        "peak_direct_memory_bytes": { "type": "integer", "minimum": 0 },
+        "peak_resident_set_bytes": { "type": "integer", "minimum": 0 },
+        "peak_thread_count": { "type": "integer", "minimum": 0 },
+        "peak_native_handles": { "type": "integer", "minimum": 0 },
+        "gc_collections": { "type": "integer", "minimum": 0 },
+        "gc_millis": { "type": "integer", "minimum": 0 },
+        "scheduler_accepted": { "type": "integer", "minimum": 0 },
+        "scheduler_started": { "type": "integer", "minimum": 0 },
+        "scheduler_terminal": { "type": "integer", "minimum": 0 },
+        "scheduler_execution_terminal": { "type": "integer", "minimum": 0 },
+        "scheduler_quantums": { "type": "integer", "minimum": 0 },
+        "scheduler_failures": { "type": "integer", "minimum": 0 },
+        "scheduler_rejections": { "type": "integer", "minimum": 0 },
+        "scheduler_cancellations": { "type": "integer", "minimum": 0 },
+        "scheduler_queue_p99_nanos": { "type": "integer", "minimum": 0 },
+        "scheduler_execution_p99_nanos": { "type": "integer", "minimum": 0 },
+        "resource_peaks": { "$ref": "#/$defs/resourcePeaks" },
+        "final_resources": { "$ref": "#/$defs/finalResources" },
+        "native_leaks": { "type": "integer", "minimum": 0 },
+        "correctness": { "type": "boolean" },
+        "resources_drained": { "type": "boolean" },
+        "accounting_valid": { "type": "boolean" },
+        "configured_retained_limit": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "resourcePeaks": {
+      "type": "object",
+      "required": [
+        "queued", "active", "parked", "outstanding", "pending", "iterators",
+        "range_cursors", "retained_snapshots", "retained_permits", "retained_waiters",
+        "iterator_leases", "exists_multi_requests", "exists_multi_snapshots",
+        "exists_multi_read_options", "exists_multi_arenas"
+      ],
+      "properties": {
+        "queued": { "$ref": "#/$defs/nonNegativeInteger" },
+        "active": { "$ref": "#/$defs/nonNegativeInteger" },
+        "parked": { "$ref": "#/$defs/nonNegativeInteger" },
+        "outstanding": { "$ref": "#/$defs/nonNegativeInteger" },
+        "pending": { "$ref": "#/$defs/nonNegativeInteger" },
+        "iterators": { "$ref": "#/$defs/nonNegativeInteger" },
+        "range_cursors": { "$ref": "#/$defs/nonNegativeInteger" },
+        "retained_snapshots": { "$ref": "#/$defs/nonNegativeInteger" },
+        "retained_permits": { "$ref": "#/$defs/nonNegativeInteger" },
+        "retained_waiters": { "$ref": "#/$defs/nonNegativeInteger" },
+        "iterator_leases": { "$ref": "#/$defs/nonNegativeInteger" },
+        "exists_multi_requests": { "$ref": "#/$defs/nonNegativeInteger" },
+        "exists_multi_snapshots": { "$ref": "#/$defs/nonNegativeInteger" },
+        "exists_multi_read_options": { "$ref": "#/$defs/nonNegativeInteger" },
+        "exists_multi_arenas": { "$ref": "#/$defs/nonNegativeInteger" }
+      },
+      "additionalProperties": false
+    },
+    "finalResources": {
+      "type": "object",
+      "required": [
+        "queued", "active", "parked", "outstanding", "submission_attempts",
+        "terminal_outcomes", "scheduler_accounting_exact", "pending", "transactions",
+        "iterators", "range_cursors", "retained_snapshots", "retained_permits",
+        "retained_waiters", "iterator_leases", "exists_multi_requests",
+        "exists_multi_snapshots", "exists_multi_read_options", "exists_multi_arenas"
+      ],
+      "properties": {
+        "queued": { "$ref": "#/$defs/nonNegativeInteger" },
+        "active": { "$ref": "#/$defs/nonNegativeInteger" },
+        "parked": { "$ref": "#/$defs/nonNegativeInteger" },
+        "outstanding": { "$ref": "#/$defs/nonNegativeInteger" },
+        "submission_attempts": { "$ref": "#/$defs/nonNegativeInteger" },
+        "terminal_outcomes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "scheduler_accounting_exact": { "type": "boolean" },
+        "pending": { "$ref": "#/$defs/nonNegativeInteger" },
+        "transactions": { "$ref": "#/$defs/nonNegativeInteger" },
+        "iterators": { "$ref": "#/$defs/nonNegativeInteger" },
+        "range_cursors": { "$ref": "#/$defs/nonNegativeInteger" },
+        "retained_snapshots": { "$ref": "#/$defs/nonNegativeInteger" },
+        "retained_permits": { "$ref": "#/$defs/nonNegativeInteger" },
+        "retained_waiters": { "$ref": "#/$defs/nonNegativeInteger" },
+        "iterator_leases": { "$ref": "#/$defs/nonNegativeInteger" },
+        "exists_multi_requests": { "$ref": "#/$defs/nonNegativeInteger" },
+        "exists_multi_snapshots": { "$ref": "#/$defs/nonNegativeInteger" },
+        "exists_multi_read_options": { "$ref": "#/$defs/nonNegativeInteger" },
+        "exists_multi_arenas": { "$ref": "#/$defs/nonNegativeInteger" }
+      },
+      "additionalProperties": false
+    },
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

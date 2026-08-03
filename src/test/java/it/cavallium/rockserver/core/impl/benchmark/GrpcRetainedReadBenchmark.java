@@ -88,7 +88,7 @@ import org.rocksdb.RocksDB;
 import reactor.core.publisher.Flux;
 
 /**
- * Opt-in paired whole-gRPC non-inferiority gate for retained range, count, fan-out and
+ * Opt-in paired whole-gRPC Pareto gate for retained range, count, fan-out and
  * explicit-iterator reads.
  *
  * <p>The controller writes a fixed ten-pair schedule before execution. Every scheduled scenario
@@ -98,20 +98,15 @@ import reactor.core.publisher.Flux;
  */
 public final class GrpcRetainedReadBenchmark {
 
-	private static final String RESULT_SCHEMA = "rockserver-grpc-retained-read-comparison-v1";
-	private static final String WORKER_SCHEMA = "rockserver-grpc-retained-read-worker-v1";
+	private static final String RESULT_SCHEMA = "rockserver-grpc-retained-read-comparison-v2";
+	private static final String WORKER_SCHEMA = "rockserver-grpc-retained-read-worker-v2";
 	private static final String DATASET_SCHEMA = "rockserver-grpc-retained-read-dataset-v1";
 	private static final String SCHEDULE_SCHEMA = "rockserver-grpc-retained-read-schedule-v1";
 	private static final String COLUMN_NAME = "grpc-retained-read-benchmark";
 	private static final long VALUE_MAGIC = 0x525441494e454431L;
-	private static final String RAW_CHECKPOINT_SHA = "7d9c02c090e71df78cdca24d29335b38147b3cfb";
+	private static final String PERFORMANCE_BASELINE_SHA = "bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e";
 	private static final int FIXED_PAIRED_ROUNDS = 10;
 	private static final long READ_TIMEOUT_MILLIS = TimeUnit.MINUTES.toMillis(10L);
-	private static final double MINIMUM_THROUGHPUT_RATIO = 0.99d;
-	private static final double MAXIMUM_LATENCY_RATIO = 1.02d;
-	private static final double MAXIMUM_CPU_RATIO = 1.02d;
-	private static final double MAXIMUM_ALLOCATION_RATIO = 1.00d;
-	private static final double MAXIMUM_MEMORY_RATIO = 1.02d;
 	private static final Set<String> WORKER_KEYS = Set.of(
 			"schema", "implementation", "scenario", "round", "build-sha", "classpath-sha256",
 			"arena-instrumentation-sha256",
@@ -120,14 +115,17 @@ public final class GrpcRetainedReadBenchmark {
 			"mib-per-second", "completion-p99-nanos", "first-item-p99-nanos",
 			"foreground-p99-nanos", "foreground-operations", "cpu-nanos-per-item",
 			"allocated-bytes-per-item", "gc-collections", "gc-millis", "peak-live-heap-bytes",
-			"peak-direct-memory-bytes", "scheduler-accepted", "scheduler-started",
+			"peak-direct-memory-bytes", "peak-resident-set-bytes", "peak-thread-count",
+			"peak-native-handles", "scheduler-accepted", "scheduler-started",
 			"scheduler-terminal", "scheduler-execution-terminal", "scheduler-quantums",
+			"scheduler-queue-p99-nanos", "scheduler-execution-p99-nanos",
 			"scheduler-failures", "scheduler-rejections", "scheduler-cancellations",
-			"peak-queued", "peak-active", "peak-pending", "peak-iterators",
+			"peak-queued", "peak-active", "peak-parked", "peak-outstanding", "peak-pending", "peak-iterators",
 			"peak-range-cursors", "peak-retained-snapshots", "peak-retained-permits",
 			"peak-retained-waiters", "peak-iterator-leases", "peak-exists-multi-requests",
 			"peak-exists-multi-snapshots", "peak-exists-multi-read-options", "peak-exists-multi-arenas",
-			"final-queued", "final-active",
+			"final-queued", "final-active", "final-parked", "final-outstanding",
+			"submission-attempts", "terminal-outcomes", "scheduler-accounting-exact",
 			"final-pending", "final-transactions", "final-iterators", "final-range-cursors",
 			"final-retained-snapshots", "final-retained-permits", "final-retained-waiters",
 			"final-iterator-leases", "final-exists-multi-requests", "final-exists-multi-snapshots",
@@ -531,7 +529,7 @@ public final class GrpcRetainedReadBenchmark {
 		}
 	}
 
-	private static String verifyBuildCheckout(Path classes,
+	static String verifyBuildCheckout(Path classes,
 	                                          String expectedSha,
 	                                          String declaredState) throws Exception {
 		Path location = classes.toAbsolutePath().normalize();
@@ -688,7 +686,6 @@ public final class GrpcRetainedReadBenchmark {
 			embedded = new EmbeddedConnection(shared.resolve("db"), COLUMN_NAME,
 					shared.resolve("rockserver.conf"));
 			meterRegistry = new BenchmarkMeterRegistry();
-			((CompositeMeterRegistry) embedded.getEmbeddedDB().getMetricsRegistry()).add(meterRegistry);
 			server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0));
 			server.start();
 			client = GrpcConnection.forHostAndPort("grpc-retained-read-client",
@@ -772,10 +769,8 @@ public final class GrpcRetainedReadBenchmark {
 		awaitDrain(embedded, server);
 		System.gc();
 		Thread.sleep(options.smoke() ? 10L : 100L);
+		((CompositeMeterRegistry) embedded.getEmbeddedDB().getMetricsRegistry()).add(meterRegistry);
 
-		MetricSnapshot schedulerBefore = MetricSnapshot.capture(meterRegistry,
-				WorkloadProfile.BATCH, scenario.operation.family);
-		ProcessSnapshot processBefore = ProcessSnapshot.capture();
 		LatencyRecorder completions = new LatencyRecorder(options.maxLatencySamples());
 		LatencyRecorder firstItems = new LatencyRecorder(options.maxLatencySamples());
 		LatencyRecorder foregroundLatencies = new LatencyRecorder(options.maxLatencySamples());
@@ -812,6 +807,9 @@ public final class GrpcRetainedReadBenchmark {
 				throw new IllegalStateException("Measurement workers did not become ready");
 			}
 			sampler.resetPeaks();
+			MetricSnapshot schedulerBefore = MetricSnapshot.capture(meterRegistry,
+					WorkloadProfile.BATCH, scenario.operation.family);
+			ProcessSnapshot processBefore = ProcessSnapshot.capture();
 			long started = System.nanoTime();
 			long deadline = started + TimeUnit.SECONDS.toNanos(options.measureSeconds());
 			start.countDown();
@@ -854,6 +852,7 @@ public final class GrpcRetainedReadBenchmark {
 					&& completions.samples() > 0L
 					&& (!scenario.hasFirstItem() || firstItems.samples() == completions.samples());
 			long elapsedNanos = finished - started;
+			BenchmarkProcessTelemetry.Peaks processPeaks = sampler.processPeaks();
 			return new WorkerMeasurement(coldCompletionNanos, cold.firstItemNanos(), elapsedNanos,
 					operations, items, logicalBytes, checksum,
 					items * 1_000_000_000.0d / elapsedNanos,
@@ -863,8 +862,9 @@ public final class GrpcRetainedReadBenchmark {
 					(processAfter.cpuNanos() - processBefore.cpuNanos()) / (double) normalizedItems,
 					(processAfter.allocatedBytes() - processBefore.allocatedBytes()) / (double) normalizedItems,
 					processAfter.gcCollections() - processBefore.gcCollections(),
-					processAfter.gcMillis() - processBefore.gcMillis(), sampler.peakLiveHeapBytes(),
-					sampler.peakDirectMemoryBytes(), scheduler, sampler.peaks(), resources,
+					processAfter.gcMillis() - processBefore.gcMillis(), processPeaks.liveHeapBytes(),
+					processPeaks.directMemoryBytes(), processPeaks.residentSetBytes(),
+					processPeaks.threadCount(), processPeaks.nativeHandles(), scheduler, sampler.peaks(), resources,
 					correctness, accountingValid, options.configuredRetainedLimit());
 		} finally {
 			done.set(true);
@@ -1180,8 +1180,8 @@ public final class GrpcRetainedReadBenchmark {
 		private final GrpcServer server;
 		private final long sampleNanos;
 		private final ExistsMultiResourceProbe existsMultiProbe;
-		private long peakLiveHeapBytes;
-		private long peakDirectMemoryBytes;
+		private final BenchmarkProcessTelemetry.PeakSampler processPeaks =
+				new BenchmarkProcessTelemetry.PeakSampler();
 		private ResourcePeaks peaks = ResourcePeaks.empty();
 
 		private ResourceSampler(EmbeddedConnection embedded,
@@ -1194,8 +1194,7 @@ public final class GrpcRetainedReadBenchmark {
 		}
 
 		private void resetPeaks() {
-			peakLiveHeapBytes = 0L;
-			peakDirectMemoryBytes = 0L;
+			processPeaks.reset();
 			peaks = ResourcePeaks.empty();
 			existsMultiProbe.resetObservedPeaks();
 		}
@@ -1210,30 +1209,12 @@ public final class GrpcRetainedReadBenchmark {
 		}
 
 		private void sample() {
-			long liveHeap = 0L;
-			for (MemoryPoolMXBean pool : ManagementFactory.getMemoryPoolMXBeans()) {
-				if (pool.getType() != MemoryType.HEAP) continue;
-				var collection = pool.getCollectionUsage();
-				var usage = collection != null ? collection : pool.getUsage();
-				if (usage != null) liveHeap += Math.max(0L, usage.getUsed());
-			}
-			long direct = 0L;
-			for (BufferPoolMXBean pool : ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)) {
-				if (pool.getName().equalsIgnoreCase("direct")) {
-					direct += Math.max(0L, pool.getMemoryUsed());
-				}
-			}
-			peakLiveHeapBytes = Math.max(peakLiveHeapBytes, liveHeap);
-			peakDirectMemoryBytes = Math.max(peakDirectMemoryBytes, direct);
+			processPeaks.sample();
 			peaks = peaks.max(ResourceSnapshot.capture(embedded, server, this));
 		}
 
-		private long peakLiveHeapBytes() {
-			return peakLiveHeapBytes;
-		}
-
-		private long peakDirectMemoryBytes() {
-			return peakDirectMemoryBytes;
+		private BenchmarkProcessTelemetry.Peaks processPeaks() {
+			return processPeaks.peaks();
 		}
 
 		private ResourcePeaks peaks() {
@@ -1245,7 +1226,11 @@ public final class GrpcRetainedReadBenchmark {
 		}
 
 		private void close() {
-			existsMultiProbe.close();
+			try {
+				existsMultiProbe.close();
+			} finally {
+				processPeaks.close();
+			}
 		}
 	}
 
@@ -1530,6 +1515,8 @@ public final class GrpcRetainedReadBenchmark {
 
 	private record ResourcePeaks(int queued,
 	                             int active,
+	                             int parked,
+	                             int outstanding,
 	                             long pending,
 	                             int iterators,
 	                             int rangeCursors,
@@ -1543,12 +1530,13 @@ public final class GrpcRetainedReadBenchmark {
 	                             int existsMultiArenas) {
 
 		private static ResourcePeaks empty() {
-			return new ResourcePeaks(0, 0, 0L, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+			return new ResourcePeaks(0, 0, 0, 0, 0L, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 		}
 
 		private ResourcePeaks max(ResourceSnapshot snapshot) {
 			return new ResourcePeaks(Math.max(queued, snapshot.queued()),
-					Math.max(active, snapshot.active()), Math.max(pending, snapshot.pending()),
+					Math.max(active, snapshot.active()), Math.max(parked, snapshot.parked()),
+					Math.max(outstanding, snapshot.outstanding()), Math.max(pending, snapshot.pending()),
 					Math.max(iterators, snapshot.iterators()),
 					Math.max(rangeCursors, snapshot.rangeCursors()),
 					Math.max(retainedSnapshots, snapshot.retainedSnapshots()),
@@ -1562,7 +1550,7 @@ public final class GrpcRetainedReadBenchmark {
 		}
 
 		private ResourcePeaks withExistsMultiPeaks(ExistsMultiResources observed) {
-			return new ResourcePeaks(queued, active, pending, iterators, rangeCursors,
+			return new ResourcePeaks(queued, active, parked, outstanding, pending, iterators, rangeCursors,
 					retainedSnapshots, retainedPermits, retainedWaiters, iteratorLeases,
 					Math.max(existsMultiRequests, observed.requests()),
 					Math.max(existsMultiSnapshots, observed.snapshots()),
@@ -1573,6 +1561,11 @@ public final class GrpcRetainedReadBenchmark {
 
 	private record ResourceSnapshot(int queued,
 	                                int active,
+	                                int parked,
+	                                int outstanding,
+	                                long submissionAttempts,
+	                                long terminalOutcomes,
+	                                boolean exactSchedulerAccounting,
 	                                long pending,
 	                                int transactions,
 	                                int iterators,
@@ -1592,14 +1585,24 @@ public final class GrpcRetainedReadBenchmark {
 			RWScheduler scheduler = embedded.getScheduler();
 			int queued = 0;
 			int active = 0;
+			int parked = 0;
+			int outstanding = 0;
+			long submissionAttempts = 0L;
+			long terminalOutcomes = 0L;
 			for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
 				var snapshot = scheduler.poolSnapshot(pool);
 				queued += snapshot.queuedTasks();
 				active += snapshot.activeTasks();
+				int poolOutstanding = BenchmarkSchedulerTelemetry.outstandingTasks(snapshot);
+				parked += BenchmarkSchedulerTelemetry.parkedTasks(snapshot, poolOutstanding);
+				outstanding += poolOutstanding;
+				submissionAttempts += BenchmarkSchedulerTelemetry.submissionAttempts(snapshot);
+				terminalOutcomes += BenchmarkSchedulerTelemetry.terminalOutcomes(snapshot);
 			}
 			var database = embedded.getInternalDB();
 			var existsMulti = sampler == null ? ExistsMultiResources.empty() : sampler.existsMultiResources();
-			return new ResourceSnapshot(queued, active, database.getPendingOpsCount(),
+			return new ResourceSnapshot(queued, active, parked, outstanding, submissionAttempts,
+					terminalOutcomes, BenchmarkSchedulerTelemetry.exactAccounting(), database.getPendingOpsCount(),
 					database.getOpenTransactionsCount(), database.getOpenIteratorsCount(),
 					database.getActiveRangeCursorCount(), database.getRetainedRangeSnapshotCount(),
 					database.getRetainedRangePermitCount(), database.getRetainedRangeWaiterCount(),
@@ -1608,7 +1611,8 @@ public final class GrpcRetainedReadBenchmark {
 		}
 
 		private boolean drained() {
-			return queued == 0 && active == 0 && pending == 0L && transactions == 0
+			return queued == 0 && active == 0 && parked == 0 && outstanding == 0
+					&& submissionAttempts == terminalOutcomes && pending == 0L && transactions == 0
 					&& iterators == 0 && rangeCursors == 0 && retainedSnapshots == 0
 					&& retainedPermits == 0 && retainedWaiters == 0 && iteratorLeases == 0
 					&& existsMultiRequests == 0 && existsMultiSnapshots == 0
@@ -1623,7 +1627,9 @@ public final class GrpcRetainedReadBenchmark {
 	                              long quantums,
 	                              long failures,
 	                              long rejections,
-	                              long cancellations) {
+	                              long cancellations,
+	                              long queueP99Nanos,
+	                              long executionP99Nanos) {
 
 		private static MetricSnapshot capture(BenchmarkMeterRegistry registry,
 		                                      WorkloadProfile profile,
@@ -1636,6 +1642,8 @@ public final class GrpcRetainedReadBenchmark {
 			long failures = 0L;
 			long rejections = 0L;
 			long cancellations = 0L;
+			long queueP99Nanos = 0L;
+			long executionP99Nanos = 0L;
 			String profileTag = profile.name().toLowerCase(Locale.ROOT);
 			String operationTag = family.name().toLowerCase(Locale.ROOT);
 			for (Meter meter : registry.getMeters()) {
@@ -1651,10 +1659,16 @@ public final class GrpcRetainedReadBenchmark {
 						}
 					}
 					case "rockserver.workload.queue.wait" -> {
-						if (meter instanceof Timer timer) started += timer.count();
+						if (meter instanceof Timer timer) {
+							started += timer.count();
+							queueP99Nanos = Math.max(queueP99Nanos, timerP99(timer));
+						}
 					}
 					case "rockserver.workload.execution" -> {
-						if (meter instanceof Timer timer) executionTerminal += timer.count();
+						if (meter instanceof Timer timer) {
+							executionTerminal += timer.count();
+							executionP99Nanos = Math.max(executionP99Nanos, timerP99(timer));
+						}
 					}
 					case "rockserver.workload.outcomes" -> {
 						if (meter instanceof Counter counter) terminal += Math.round(counter.count());
@@ -1676,15 +1690,25 @@ public final class GrpcRetainedReadBenchmark {
 				}
 			}
 			return new MetricSnapshot(accepted, started, terminal, executionTerminal, quantums,
-					failures, rejections, cancellations);
+					failures, rejections, cancellations, queueP99Nanos, executionP99Nanos);
 		}
 
 		private MetricSnapshot minus(MetricSnapshot before) {
 			return new MetricSnapshot(accepted - before.accepted, started - before.started,
 					terminal - before.terminal, executionTerminal - before.executionTerminal,
 					quantums - before.quantums, failures - before.failures,
-					rejections - before.rejections, cancellations - before.cancellations);
+					rejections - before.rejections, cancellations - before.cancellations,
+					queueP99Nanos, executionP99Nanos);
 		}
+	}
+
+	private static long timerP99(Timer timer) {
+		for (var percentile : timer.takeSnapshot().percentileValues()) {
+			if (Math.abs(percentile.percentile() - 0.99d) < 0.000_001d) {
+				return Math.max(1L, (long) percentile.value(TimeUnit.NANOSECONDS));
+			}
+		}
+		return 0L;
 	}
 
 	private static final class BenchmarkMeterRegistry extends SimpleMeterRegistry {
@@ -1720,6 +1744,9 @@ public final class GrpcRetainedReadBenchmark {
 	                                 long gcMillis,
 	                                 long peakLiveHeapBytes,
 	                                 long peakDirectMemoryBytes,
+	                                 long peakResidentSetBytes,
+	                                 int peakThreadCount,
+	                                 long peakNativeHandles,
 	                                 MetricSnapshot scheduler,
 	                                 ResourcePeaks resourcePeaks,
 	                                 ResourceSnapshot finalResources,
@@ -1754,6 +1781,9 @@ public final class GrpcRetainedReadBenchmark {
 	                            long gcMillis,
 	                            long peakLiveHeapBytes,
 	                            long peakDirectMemoryBytes,
+	                            long peakResidentSetBytes,
+	                            int peakThreadCount,
+	                            long peakNativeHandles,
 	                            MetricSnapshot scheduler,
 	                            ResourcePeaks resourcePeaks,
 	                            ResourceSnapshot finalResources,
@@ -1779,7 +1809,8 @@ public final class GrpcRetainedReadBenchmark {
 					measurement.foregroundP99Nanos(), measurement.foregroundOperations(),
 					measurement.cpuNanosPerItem(), measurement.allocatedBytesPerItem(),
 					measurement.gcCollections(), measurement.gcMillis(), measurement.peakLiveHeapBytes(),
-					measurement.peakDirectMemoryBytes(), measurement.scheduler(),
+					measurement.peakDirectMemoryBytes(), measurement.peakResidentSetBytes(),
+					measurement.peakThreadCount(), measurement.peakNativeHandles(), measurement.scheduler(),
 					measurement.resourcePeaks(), measurement.finalResources(), nativeLeaks,
 					measurement.correctness(), measurement.finalResources().drained(),
 					measurement.accountingValid(), measurement.configuredRetainedLimit());
@@ -1823,6 +1854,9 @@ public final class GrpcRetainedReadBenchmark {
 			values.put("gc-millis", Long.toString(gcMillis));
 			values.put("peak-live-heap-bytes", Long.toString(peakLiveHeapBytes));
 			values.put("peak-direct-memory-bytes", Long.toString(peakDirectMemoryBytes));
+			values.put("peak-resident-set-bytes", Long.toString(peakResidentSetBytes));
+			values.put("peak-thread-count", Integer.toString(peakThreadCount));
+			values.put("peak-native-handles", Long.toString(peakNativeHandles));
 			values.put("scheduler-accepted", Long.toString(scheduler.accepted()));
 			values.put("scheduler-started", Long.toString(scheduler.started()));
 			values.put("scheduler-terminal", Long.toString(scheduler.terminal()));
@@ -1831,8 +1865,12 @@ public final class GrpcRetainedReadBenchmark {
 			values.put("scheduler-failures", Long.toString(scheduler.failures()));
 			values.put("scheduler-rejections", Long.toString(scheduler.rejections()));
 			values.put("scheduler-cancellations", Long.toString(scheduler.cancellations()));
+			values.put("scheduler-queue-p99-nanos", Long.toString(scheduler.queueP99Nanos()));
+			values.put("scheduler-execution-p99-nanos", Long.toString(scheduler.executionP99Nanos()));
 			values.put("peak-queued", Integer.toString(resourcePeaks.queued()));
 			values.put("peak-active", Integer.toString(resourcePeaks.active()));
+			values.put("peak-parked", Integer.toString(resourcePeaks.parked()));
+			values.put("peak-outstanding", Integer.toString(resourcePeaks.outstanding()));
 			values.put("peak-pending", Long.toString(resourcePeaks.pending()));
 			values.put("peak-iterators", Integer.toString(resourcePeaks.iterators()));
 			values.put("peak-range-cursors", Integer.toString(resourcePeaks.rangeCursors()));
@@ -1846,6 +1884,12 @@ public final class GrpcRetainedReadBenchmark {
 			values.put("peak-exists-multi-arenas", Integer.toString(resourcePeaks.existsMultiArenas()));
 			values.put("final-queued", Integer.toString(finalResources.queued()));
 			values.put("final-active", Integer.toString(finalResources.active()));
+			values.put("final-parked", Integer.toString(finalResources.parked()));
+			values.put("final-outstanding", Integer.toString(finalResources.outstanding()));
+			values.put("submission-attempts", Long.toString(finalResources.submissionAttempts()));
+			values.put("terminal-outcomes", Long.toString(finalResources.terminalOutcomes()));
+			values.put("scheduler-accounting-exact",
+					Boolean.toString(finalResources.exactSchedulerAccounting()));
 			values.put("final-pending", Long.toString(finalResources.pending()));
 			values.put("final-transactions", Integer.toString(finalResources.transactions()));
 			values.put("final-iterators", Integer.toString(finalResources.iterators()));
@@ -1892,12 +1936,17 @@ public final class GrpcRetainedReadBenchmark {
 					decimal(values, "cpu-nanos-per-item"), decimal(values, "allocated-bytes-per-item"),
 					number(values, "gc-collections"), number(values, "gc-millis"),
 					number(values, "peak-live-heap-bytes"), number(values, "peak-direct-memory-bytes"),
+					number(values, "peak-resident-set-bytes"), integer(values, "peak-thread-count"),
+					number(values, "peak-native-handles"),
 					new MetricSnapshot(number(values, "scheduler-accepted"),
 							number(values, "scheduler-started"), number(values, "scheduler-terminal"),
 							number(values, "scheduler-execution-terminal"),
 							number(values, "scheduler-quantums"), number(values, "scheduler-failures"),
-							number(values, "scheduler-rejections"), number(values, "scheduler-cancellations")),
+							number(values, "scheduler-rejections"), number(values, "scheduler-cancellations"),
+							number(values, "scheduler-queue-p99-nanos"),
+							number(values, "scheduler-execution-p99-nanos")),
 					new ResourcePeaks(integer(values, "peak-queued"), integer(values, "peak-active"),
+							integer(values, "peak-parked"), integer(values, "peak-outstanding"),
 							number(values, "peak-pending"), integer(values, "peak-iterators"),
 							integer(values, "peak-range-cursors"), integer(values, "peak-retained-snapshots"),
 							integer(values, "peak-retained-permits"), integer(values, "peak-retained-waiters"),
@@ -1906,7 +1955,10 @@ public final class GrpcRetainedReadBenchmark {
 							integer(values, "peak-exists-multi-read-options"),
 							integer(values, "peak-exists-multi-arenas")),
 					new ResourceSnapshot(integer(values, "final-queued"), integer(values, "final-active"),
-							number(values, "final-pending"), integer(values, "final-transactions"),
+							integer(values, "final-parked"), integer(values, "final-outstanding"),
+							number(values, "submission-attempts"), number(values, "terminal-outcomes"),
+							bool(values, "scheduler-accounting-exact"), number(values, "final-pending"),
+							integer(values, "final-transactions"),
 							integer(values, "final-iterators"), integer(values, "final-range-cursors"),
 							integer(values, "final-retained-snapshots"),
 							integer(values, "final-retained-permits"), integer(values, "final-retained-waiters"),
@@ -1925,7 +1977,8 @@ public final class GrpcRetainedReadBenchmark {
 					|| items <= 0L || logicalBytes <= 0L || completionP99Nanos <= 0L
 					|| !positiveFinite(entriesPerSecond) || !positiveFinite(mibPerSecond)
 					|| !positiveFinite(cpuNanosPerItem) || !positiveFinite(allocatedBytesPerItem)
-					|| peakLiveHeapBytes <= 0L || peakDirectMemoryBytes <= 0L
+					|| peakLiveHeapBytes <= 0L || peakDirectMemoryBytes < 0L
+					|| peakResidentSetBytes <= 0L || peakThreadCount <= 0 || peakNativeHandles <= 0L
 					|| gcCollections < 0L || gcMillis < 0L || nativeLeaks < 0L
 					|| configuredRetainedLimit <= 0
 					|| !arenaInstrumentationSha256.matches("[0-9a-f]{64}")) {
@@ -1940,7 +1993,8 @@ public final class GrpcRetainedReadBenchmark {
 			if (scheduler.accepted() < 0L || scheduler.started() < 0L || scheduler.terminal() < 0L
 					|| scheduler.executionTerminal() < 0L || scheduler.quantums() < 0L
 					|| scheduler.failures() < 0L || scheduler.rejections() < 0L
-					|| scheduler.cancellations() < 0L || !nonNegative(resourcePeaks)
+					|| scheduler.cancellations() < 0L || scheduler.queueP99Nanos() <= 0L
+					|| scheduler.executionP99Nanos() <= 0L || !nonNegative(resourcePeaks)
 					|| !nonNegative(finalResources)) {
 				throw new IllegalArgumentException("Worker artifact contains negative counters");
 			}
@@ -1952,6 +2006,9 @@ public final class GrpcRetainedReadBenchmark {
 			if (!resourcesDrained || !finalResources.drained()) failures.add("resources did not drain");
 			if (nativeLeaks != 0L) failures.add("native leak count=" + nativeLeaks);
 			if (!accountingValid) failures.add("logical scheduler accounting is invalid");
+			if (implementation == Implementation.CANDIDATE && !finalResources.exactSchedulerAccounting()) {
+				failures.add("candidate did not expose exact scheduler accounting");
+			}
 			if (resourcePeaks.retainedPermits() > configuredRetainedLimit
 					|| resourcePeaks.retainedSnapshots() > configuredRetainedLimit) {
 				failures.add("configured retained-resource limit was exceeded");
@@ -1981,7 +2038,8 @@ public final class GrpcRetainedReadBenchmark {
 	}
 
 	private static boolean nonNegative(ResourcePeaks value) {
-		return value.queued() >= 0 && value.active() >= 0 && value.pending() >= 0L
+		return value.queued() >= 0 && value.active() >= 0 && value.parked() >= 0
+				&& value.outstanding() >= 0 && value.pending() >= 0L
 				&& value.iterators() >= 0 && value.rangeCursors() >= 0 && value.retainedSnapshots() >= 0
 				&& value.retainedPermits() >= 0 && value.retainedWaiters() >= 0 && value.iteratorLeases() >= 0
 				&& value.existsMultiRequests() >= 0 && value.existsMultiSnapshots() >= 0
@@ -1989,7 +2047,9 @@ public final class GrpcRetainedReadBenchmark {
 	}
 
 	private static boolean nonNegative(ResourceSnapshot value) {
-		return value.queued() >= 0 && value.active() >= 0 && value.pending() >= 0L
+		return value.queued() >= 0 && value.active() >= 0 && value.parked() >= 0
+				&& value.outstanding() >= 0 && value.submissionAttempts() >= 0L
+				&& value.terminalOutcomes() >= 0L && value.pending() >= 0L
 				&& value.transactions() >= 0 && value.iterators() >= 0 && value.rangeCursors() >= 0
 				&& value.retainedSnapshots() >= 0 && value.retainedPermits() >= 0
 				&& value.retainedWaiters() >= 0 && value.iteratorLeases() >= 0
@@ -2032,12 +2092,19 @@ public final class GrpcRetainedReadBenchmark {
 				for (String failure : next.structuralFailures()) {
 					structural.add("candidate round " + expectedRound + ": " + failure);
 				}
-				compareResourcePeaks(base, next, expectedRound, structural);
+				if (next.configuredRetainedLimit() != base.configuredRetainedLimit()) {
+					structural.add("configured retained-resource limit changed in round " + expectedRound);
+				}
 			}
 			Map<String, MetricSamples> samples = metricSamples(scenario, baseline, candidate);
-			GateResult gate = evaluateGate(scenario, samples, structural);
+			GateResult gate = evaluateGate(scenario, samples, structural, false);
 			scenarios.put(scenario, new ScenarioComparison(gate, gcSummary(baseline, candidate)));
 			for (String failure : gate.failures()) failures.add(scenario.value + ": " + failure);
+		}
+		if (scenarios.values().stream()
+				.flatMap(result -> result.gate().materialImprovements().stream())
+				.findAny().isEmpty()) {
+			failures.add("no predeclared retained-read primary metric demonstrates a material improvement");
 		}
 		return new Comparison(Map.copyOf(scenarios), List.copyOf(failures));
 	}
@@ -2049,36 +2116,6 @@ public final class GrpcRetainedReadBenchmark {
 				.filter(result -> result.scenario() == scenario && result.implementation() == implementation)
 				.sorted(Comparator.comparingInt(WorkerResult::round))
 				.toList();
-	}
-
-	private static void compareResourcePeaks(WorkerResult baseline,
-	                                         WorkerResult candidate,
-	                                         int round,
-	                                         List<String> failures) {
-		if (candidate.configuredRetainedLimit() != baseline.configuredRetainedLimit()) {
-			failures.add("configured retained-resource limit changed in round " + round);
-		}
-		Map<String, Long> base = peakMap(baseline.resourcePeaks());
-		Map<String, Long> next = peakMap(candidate.resourcePeaks());
-		for (String name : base.keySet()) {
-			if (next.get(name) > base.get(name)) {
-				failures.add(name + " peak increased in round " + round + ": baseline="
-						+ base.get(name) + " candidate=" + next.get(name));
-			}
-		}
-	}
-
-	private static Map<String, Long> peakMap(ResourcePeaks peaks) {
-		return Map.of("retained snapshots", (long) peaks.retainedSnapshots(),
-				"retained permits", (long) peaks.retainedPermits(),
-				"retained waiters", (long) peaks.retainedWaiters(),
-				"range cursors", (long) peaks.rangeCursors(),
-				"iterators", (long) peaks.iterators(),
-				"iterator leases", (long) peaks.iteratorLeases(),
-				"existsMulti requests", (long) peaks.existsMultiRequests(),
-				"existsMulti snapshots", (long) peaks.existsMultiSnapshots(),
-				"existsMulti read options", (long) peaks.existsMultiReadOptions(),
-				"existsMulti arenas", (long) peaks.existsMultiArenas());
 	}
 
 	private static String gcSummary(List<WorkerResult> baseline, List<WorkerResult> candidate) {
@@ -2104,6 +2141,40 @@ public final class GrpcRetainedReadBenchmark {
 		putMetric(metrics, "peak-live-heap", baseline, candidate, WorkerResult::peakLiveHeapBytes);
 		putMetric(metrics, "peak-direct-memory", baseline, candidate,
 				WorkerResult::peakDirectMemoryBytes);
+		putMetric(metrics, "peak-resident-set", baseline, candidate,
+				WorkerResult::peakResidentSetBytes);
+		putMetric(metrics, "peak-thread-count", baseline, candidate, WorkerResult::peakThreadCount);
+		putMetric(metrics, "peak-native-handles", baseline, candidate, WorkerResult::peakNativeHandles);
+		putMetric(metrics, "gc-collections", baseline, candidate, WorkerResult::gcCollections);
+		putMetric(metrics, "gc-millis", baseline, candidate, WorkerResult::gcMillis);
+		putMetric(metrics, "peak-parked", baseline, candidate,
+				result -> result.resourcePeaks().parked());
+		putMetric(metrics, "peak-outstanding", baseline, candidate,
+				result -> result.resourcePeaks().outstanding());
+		putMetric(metrics, "peak-retained-snapshots", baseline, candidate,
+				result -> result.resourcePeaks().retainedSnapshots());
+		putMetric(metrics, "peak-retained-permits", baseline, candidate,
+				result -> result.resourcePeaks().retainedPermits());
+		putMetric(metrics, "peak-retained-waiters", baseline, candidate,
+				result -> result.resourcePeaks().retainedWaiters());
+		putMetric(metrics, "peak-range-cursors", baseline, candidate,
+				result -> result.resourcePeaks().rangeCursors());
+		putMetric(metrics, "peak-iterators", baseline, candidate,
+				result -> result.resourcePeaks().iterators());
+		putMetric(metrics, "peak-iterator-leases", baseline, candidate,
+				result -> result.resourcePeaks().iteratorLeases());
+		putMetric(metrics, "peak-exists-multi-requests", baseline, candidate,
+				result -> result.resourcePeaks().existsMultiRequests());
+		putMetric(metrics, "peak-exists-multi-snapshots", baseline, candidate,
+				result -> result.resourcePeaks().existsMultiSnapshots());
+		putMetric(metrics, "peak-exists-multi-read-options", baseline, candidate,
+				result -> result.resourcePeaks().existsMultiReadOptions());
+		putMetric(metrics, "peak-exists-multi-arenas", baseline, candidate,
+				result -> result.resourcePeaks().existsMultiArenas());
+		putMetric(metrics, "queue-p99", baseline, candidate,
+				result -> result.scheduler().queueP99Nanos());
+		putMetric(metrics, "execution-p99", baseline, candidate,
+				result -> result.scheduler().executionP99Nanos());
 		if (scenario.hasFirstItem()) {
 			putMetric(metrics, "first-item-p99", baseline, candidate, WorkerResult::firstItemP99Nanos);
 			putMetric(metrics, "cold-first-item", baseline, candidate, WorkerResult::coldFirstItemNanos);
@@ -2126,39 +2197,21 @@ public final class GrpcRetainedReadBenchmark {
 
 	private static GateResult evaluateGate(Scenario scenario,
 	                                       Map<String, MetricSamples> samples,
-	                                       List<String> structuralFailures) {
-		Map<String, PairedBenchmarkStatistics.RatioConfidenceInterval> intervals = new LinkedHashMap<>();
-		List<String> failures = new ArrayList<>(structuralFailures);
-		for (MetricSpec spec : MetricSpec.forScenario(scenario)) {
-			MetricSamples metric = samples.get(spec.name());
-			if (metric == null) {
-				failures.add("missing metric " + spec.name());
-				continue;
-			}
-			if (metric.baseline().length != FIXED_PAIRED_ROUNDS
-					|| metric.candidate().length != FIXED_PAIRED_ROUNDS) {
-				failures.add(spec.name() + " requires exactly " + FIXED_PAIRED_ROUNDS + " pairs");
-				continue;
-			}
-			final PairedBenchmarkStatistics.RatioConfidenceInterval interval;
-			try {
-				interval = PairedBenchmarkStatistics.pairedLogRatio(metric.baseline(), metric.candidate());
-			} catch (IllegalArgumentException malformed) {
-				failures.add(spec.name() + " has invalid samples: " + malformed.getMessage());
-				continue;
-			}
-			intervals.put(spec.name(), interval);
-			if (!interval.available()) {
-				failures.add(spec.name() + " confidence interval is unavailable");
-			} else if (spec.lowerBound() && interval.lower95() < spec.threshold()) {
-				failures.add(spec.name() + " lower 95% bound " + format(interval.lower95())
-						+ " is below " + format(spec.threshold()));
-			} else if (!spec.lowerBound() && interval.upper95() > spec.threshold()) {
-				failures.add(spec.name() + " upper 95% bound " + format(interval.upper95())
-						+ " exceeds " + format(spec.threshold()));
-			}
+	                                       List<String> structuralFailures,
+	                                       boolean requireMaterialImprovement) {
+		Map<String, PairedPerformanceContract.MetricSamples> contractSamples = new LinkedHashMap<>();
+		for (Map.Entry<String, MetricSamples> entry : samples.entrySet()) {
+			contractSamples.put(entry.getKey(), new PairedPerformanceContract.MetricSamples(
+					entry.getValue().baseline(), entry.getValue().candidate()));
 		}
-		return new GateResult(Map.copyOf(intervals), List.copyOf(failures));
+		List<MetricSpec> specifications = MetricSpec.forScenario(scenario);
+		PairedPerformanceContract.Evaluation evaluation = PairedPerformanceContract.evaluate(
+				specifications.stream().map(MetricSpec::contract).toList(), contractSamples,
+				structuralFailures, requireMaterialImprovement);
+		Map<String, PairedBenchmarkStatistics.RatioConfidenceInterval> intervals = new LinkedHashMap<>();
+		evaluation.metrics().forEach((name, result) -> intervals.put(name, result.interval()));
+		return new GateResult(intervals, evaluation.failures(), evaluation.materialImprovements(),
+				evaluation.exceptionCandidates());
 	}
 
 	/**
@@ -2167,7 +2220,8 @@ public final class GrpcRetainedReadBenchmark {
 	public static GateResult evaluateForTesting(String scenario,
 	                                            Map<String, MetricSamples> samples,
 	                                            List<String> structuralFailures) {
-		return evaluateGate(Scenario.parse(scenario), Map.copyOf(samples), List.copyOf(structuralFailures));
+		return evaluateGate(Scenario.parse(scenario), Map.copyOf(samples),
+				List.copyOf(structuralFailures), true);
 	}
 
 	/**
@@ -2183,6 +2237,13 @@ public final class GrpcRetainedReadBenchmark {
 		for (MetricSpec spec : MetricSpec.forScenario(parsed)) {
 			values.put(spec.name(), new MetricSamples(baseline, candidate));
 		}
+		MetricSpec primary = MetricSpec.forScenario(parsed).stream()
+				.filter(spec -> spec.contract().primary())
+				.findFirst().orElseThrow();
+		double[] improved = candidate.clone();
+		Arrays.fill(improved, primary.contract().direction()
+				== PairedPerformanceContract.Direction.HIGHER_IS_BETTER ? 103.0d : 97.0d);
+		values.put(primary.name(), new MetricSamples(baseline, improved));
 		return Map.copyOf(values);
 	}
 
@@ -2195,9 +2256,11 @@ public final class GrpcRetainedReadBenchmark {
 		WorkerResult result = new WorkerResult(Implementation.CANDIDATE, Scenario.EXACT_COUNT, 1,
 				sha, digest, digest, digest, 100L, 0L, 1_000L, 2L, 200L, 20_000L, 1L,
 				200_000_000.0d, 20_000.0d, 100L, 0L, 0L, 0L, 5.0d, 10.0d, 0L, 0L,
-				1_000_000L, 1_000L, new MetricSnapshot(2L, 2L, 2L, 2L, 2L, 0L, 0L, 0L),
-				new ResourcePeaks(1, 1, 1L, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0),
-				new ResourceSnapshot(0, 0, 0L, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+				1_000_000L, 1_000L, 2_000_000L, 20, 50L,
+				new MetricSnapshot(2L, 2L, 2L, 2L, 2L, 0L, 0L, 0L, 10L, 20L),
+				new ResourcePeaks(1, 1, 0, 1, 1L, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0),
+				new ResourceSnapshot(0, 0, 0, 0, 2L, 2L, true,
+						0L, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
 				0L, true, true, true, 1);
 		StringBuilder artifact = new StringBuilder();
 		result.toProperties().forEach((key, value) -> artifact.append(key).append('=').append(value).append('\n'));
@@ -2270,11 +2333,15 @@ public final class GrpcRetainedReadBenchmark {
 
 	public record GateResult(
 			Map<String, PairedBenchmarkStatistics.RatioConfidenceInterval> intervals,
-			List<String> failures) {
+			List<String> failures,
+			List<String> materialImprovements,
+			List<String> exceptionCandidates) {
 
 		public GateResult {
 			intervals = Map.copyOf(intervals);
 			failures = List.copyOf(failures);
+			materialImprovements = List.copyOf(materialImprovements);
+			exceptionCandidates = List.copyOf(exceptionCandidates);
 		}
 
 		public boolean passed() {
@@ -2289,24 +2356,48 @@ public final class GrpcRetainedReadBenchmark {
 		}
 	}
 
-	private record MetricSpec(String name, boolean lowerBound, double threshold) {
+	private record MetricSpec(PairedPerformanceContract.MetricSpec contract) {
+
+		private String name() {
+			return contract.name();
+		}
 
 		private static List<MetricSpec> forScenario(Scenario scenario) {
 			List<MetricSpec> specs = new ArrayList<>(List.of(
-					new MetricSpec("entries-per-second", true, MINIMUM_THROUGHPUT_RATIO),
-					new MetricSpec("mib-per-second", true, MINIMUM_THROUGHPUT_RATIO),
-					new MetricSpec("completion-p99", false, MAXIMUM_LATENCY_RATIO),
-					new MetricSpec("cold-completion", false, MAXIMUM_LATENCY_RATIO),
-					new MetricSpec("cpu-nanos-per-item", false, MAXIMUM_CPU_RATIO),
-					new MetricSpec("allocated-bytes-per-item", false, MAXIMUM_ALLOCATION_RATIO),
-					new MetricSpec("peak-live-heap", false, MAXIMUM_MEMORY_RATIO),
-					new MetricSpec("peak-direct-memory", false, MAXIMUM_MEMORY_RATIO)));
+					new MetricSpec(PairedPerformanceContract.MetricSpec.throughput("entries-per-second", true)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.throughput("mib-per-second", true)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.cost("queue-p99", false)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.cost("execution-p99", false)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.cost("completion-p99", true)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.cost("cold-completion", true)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.cost("cpu-nanos-per-item", true)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.allocation(
+							"allocated-bytes-per-item", true)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.cost("peak-live-heap", true)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.cost("peak-direct-memory", true)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.cost("peak-resident-set", true)),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-thread-count")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-native-handles")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("gc-collections")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("gc-millis")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-parked")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-outstanding")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-retained-snapshots")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-retained-permits")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-retained-waiters")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-range-cursors")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-iterators")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-iterator-leases")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-exists-multi-requests")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-exists-multi-snapshots")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-exists-multi-read-options")),
+					new MetricSpec(PairedPerformanceContract.MetricSpec.noIncrease("peak-exists-multi-arenas"))));
 			if (scenario.hasFirstItem()) {
-				specs.add(new MetricSpec("first-item-p99", false, MAXIMUM_LATENCY_RATIO));
-				specs.add(new MetricSpec("cold-first-item", false, MAXIMUM_LATENCY_RATIO));
+				specs.add(new MetricSpec(PairedPerformanceContract.MetricSpec.cost("first-item-p99", true)));
+				specs.add(new MetricSpec(PairedPerformanceContract.MetricSpec.cost("cold-first-item", true)));
 			}
 			if (scenario.mixed) {
-				specs.add(new MetricSpec("foreground-p99", false, MAXIMUM_LATENCY_RATIO));
+				specs.add(new MetricSpec(PairedPerformanceContract.MetricSpec.cost("foreground-p99", true)));
 			}
 			return List.copyOf(specs);
 		}
@@ -2466,23 +2557,29 @@ public final class GrpcRetainedReadBenchmark {
 							.append("|n/a|n/a|FAIL|\n");
 					continue;
 				}
-				boolean passed = spec.lowerBound() ? interval.lower95() >= spec.threshold()
-						: interval.upper95() <= spec.threshold();
+				boolean passed = scenarioResult.gate().failures().stream()
+						.noneMatch(failure -> failure.startsWith(spec.name()));
 				out.append('|').append(scenario.value).append('|').append(spec.name()).append('|')
-						.append(format(interval.mean())).append("|[").append(format(interval.lower95()))
-						.append(", ").append(format(interval.upper95())).append("]|")
+						.append(interval.available() ? format(interval.mean()) : "n/a").append('|')
+						.append(interval.available() ? "[" + format(interval.lower95()) + ", "
+								+ format(interval.upper95()) + "]" : "exact no-increase").append('|')
 						.append(passed ? "PASS" : "FAIL").append("|\n");
 			}
+			out.append("\nMaterial improvements: `")
+					.append(String.join(", ", scenarioResult.gate().materialImprovements()))
+					.append("`; exception candidates (still FAIL, approval required): `")
+					.append(String.join(", ", scenarioResult.gate().exceptionCandidates())).append("`.\n");
 			out.append("\nGC: ").append(scenarioResult.gcSummary()).append(".\n\n");
 		}
 		out.append("Worker artifacts: ").append(results.size()).append(". All workers must validate exact ")
 				.append("counts/order/hit-miss/checksums, logical scheduler accounting, retained limits, ")
-				.append("terminal drains, and native leak count.\n");
+				.append("parked/outstanding bounds, attempt conservation, terminal drains, and native leak count.\n");
 		out.append("\n## Worker accounting and resources\n\n")
 				.append("|Round|Scenario|Build|accepted/started/terminal/execution|quantums|")
+				.append("parked/outstanding|attempts/outcomes/exact|")
 				.append("range snap/permits/waiters/cursors/iterators/leases|")
 				.append("exists req/snap/read-options/arenas|final drain|native leaks|gate|\n")
-				.append("|---:|---|---|---:|---:|---:|---:|---|---:|---|\n");
+				.append("|---:|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|\n");
 		for (WorkerResult result : results) {
 			MetricSnapshot scheduler = result.scheduler();
 			ResourcePeaks peaks = result.resourcePeaks();
@@ -2490,7 +2587,12 @@ public final class GrpcRetainedReadBenchmark {
 					.append('|').append(result.implementation().value).append('|')
 					.append(scheduler.accepted()).append('/').append(scheduler.started()).append('/')
 					.append(scheduler.terminal()).append('/').append(scheduler.executionTerminal()).append('|')
-					.append(scheduler.quantums()).append('|').append(peaks.retainedSnapshots()).append('/')
+					.append(scheduler.quantums()).append('|').append(peaks.parked()).append('/')
+					.append(peaks.outstanding()).append('|')
+					.append(result.finalResources().submissionAttempts()).append('/')
+					.append(result.finalResources().terminalOutcomes()).append('/')
+					.append(result.finalResources().exactSchedulerAccounting()).append('|')
+					.append(peaks.retainedSnapshots()).append('/')
 					.append(peaks.retainedPermits()).append('/').append(peaks.retainedWaiters()).append('/')
 					.append(peaks.rangeCursors()).append('/').append(peaks.iterators()).append('/')
 					.append(peaks.iteratorLeases()).append('|').append(peaks.existsMultiRequests()).append('/')
@@ -2524,6 +2626,8 @@ public final class GrpcRetainedReadBenchmark {
 				.append("  \"classpath_baseline_sha256\": \"").append(baselineClassPathHash).append("\",\n")
 				.append("  \"classpath_candidate_sha256\": \"").append(candidateClassPathHash).append("\",\n")
 				.append("  \"dataset_id\": \"").append(datasetId).append("\",\n")
+				.append("  \"host_state\": \"").append(json(options.hostState())).append("\",\n")
+				.append("  \"cache_state\": \"").append(json(options.cacheState())).append("\",\n")
 				.append("  \"storage_label\": \"").append(json(options.storageLabel())).append("\",\n")
 				.append("  \"storage_name\": \"").append(json(store.name())).append("\",\n")
 				.append("  \"storage_type\": \"").append(json(store.type())).append("\",\n")
@@ -2544,11 +2648,24 @@ public final class GrpcRetainedReadBenchmark {
 				if (metricIndex++ > 0) out.append(',');
 				var interval = entry.getValue();
 				out.append("\"").append(json(entry.getKey())).append("\":{\"samples\":")
-						.append(interval.samples()).append(",\"mean\":").append(format(interval.mean()))
-						.append(",\"lower_95\":").append(format(interval.lower95()))
-						.append(",\"upper_95\":").append(format(interval.upper95())).append('}');
+						.append(interval.samples()).append(",\"mean\":")
+						.append(interval.available() ? format(interval.mean()) : "null")
+						.append(",\"lower_95\":")
+						.append(interval.available() ? format(interval.lower95()) : "null")
+						.append(",\"upper_95\":")
+						.append(interval.available() ? format(interval.upper95()) : "null").append('}');
 			}
-			out.append("}, \"gc\": \"").append(json(scenarioResult.gcSummary())).append("\"}");
+			out.append("}, \"material_improvements\": [");
+			for (int index = 0; index < scenarioResult.gate().materialImprovements().size(); index++) {
+				if (index > 0) out.append(',');
+				out.append('"').append(json(scenarioResult.gate().materialImprovements().get(index))).append('"');
+			}
+			out.append("], \"exception_candidates\": [");
+			for (int index = 0; index < scenarioResult.gate().exceptionCandidates().size(); index++) {
+				if (index > 0) out.append(',');
+				out.append('"').append(json(scenarioResult.gate().exceptionCandidates().get(index))).append('"');
+			}
+			out.append("], \"gc\": \"").append(json(scenarioResult.gcSummary())).append("\"}");
 		}
 		out.append("\n  },\n  \"workers\": [\n");
 		for (int index = 0; index < results.size(); index++) {
@@ -2557,7 +2674,8 @@ public final class GrpcRetainedReadBenchmark {
 					.append(result.scenario().value).append("\",\"implementation\":\"")
 					.append(result.implementation().value).append("\",\"build_sha\":\"")
 					.append(result.buildSha()).append("\",\"classpath_sha256\":\"")
-					.append(result.classPathSha256()).append("\",\"dataset_id\":\"")
+					.append(result.classPathSha256()).append("\",\"arena_instrumentation_sha256\":\"")
+					.append(result.arenaInstrumentationSha256()).append("\",\"dataset_id\":\"")
 					.append(result.datasetId()).append("\",\"operations\":")
 					.append(result.operations()).append(",\"items\":").append(result.items())
 					.append(",\"logical_bytes\":").append(result.logicalBytes())
@@ -2575,7 +2693,10 @@ public final class GrpcRetainedReadBenchmark {
 					.append(format(result.cpuNanosPerItem())).append(",\"allocated_bytes_per_item\":")
 					.append(format(result.allocatedBytesPerItem())).append(",\"peak_live_heap_bytes\":")
 					.append(result.peakLiveHeapBytes()).append(",\"peak_direct_memory_bytes\":")
-					.append(result.peakDirectMemoryBytes()).append(",\"gc_collections\":")
+					.append(result.peakDirectMemoryBytes()).append(",\"peak_resident_set_bytes\":")
+					.append(result.peakResidentSetBytes()).append(",\"peak_thread_count\":")
+					.append(result.peakThreadCount()).append(",\"peak_native_handles\":")
+					.append(result.peakNativeHandles()).append(",\"gc_collections\":")
 					.append(result.gcCollections()).append(",\"gc_millis\":").append(result.gcMillis())
 					.append(",\"scheduler_accepted\":").append(result.scheduler().accepted())
 					.append(",\"scheduler_started\":").append(result.scheduler().started())
@@ -2585,7 +2706,10 @@ public final class GrpcRetainedReadBenchmark {
 					.append(result.scheduler().quantums()).append(",\"scheduler_failures\":")
 					.append(result.scheduler().failures()).append(",\"scheduler_rejections\":")
 					.append(result.scheduler().rejections()).append(",\"scheduler_cancellations\":")
-					.append(result.scheduler().cancellations()).append(",\"resource_peaks\":")
+					.append(result.scheduler().cancellations()).append(",\"scheduler_queue_p99_nanos\":")
+					.append(result.scheduler().queueP99Nanos())
+					.append(",\"scheduler_execution_p99_nanos\":")
+					.append(result.scheduler().executionP99Nanos()).append(",\"resource_peaks\":")
 					.append(resourcePeaksJson(result.resourcePeaks())).append(",\"final_resources\":")
 					.append(resourceSnapshotJson(result.finalResources())).append(",\"native_leaks\":")
 					.append(result.nativeLeaks()).append(",\"correctness\":").append(result.correctness())
@@ -2606,6 +2730,7 @@ public final class GrpcRetainedReadBenchmark {
 
 	private static String resourcePeaksJson(ResourcePeaks peaks) {
 		return "{\"queued\":" + peaks.queued() + ",\"active\":" + peaks.active()
+				+ ",\"parked\":" + peaks.parked() + ",\"outstanding\":" + peaks.outstanding()
 				+ ",\"pending\":" + peaks.pending() + ",\"iterators\":" + peaks.iterators()
 				+ ",\"range_cursors\":" + peaks.rangeCursors() + ",\"retained_snapshots\":"
 				+ peaks.retainedSnapshots() + ",\"retained_permits\":" + peaks.retainedPermits()
@@ -2618,6 +2743,10 @@ public final class GrpcRetainedReadBenchmark {
 
 	private static String resourceSnapshotJson(ResourceSnapshot resources) {
 		return "{\"queued\":" + resources.queued() + ",\"active\":" + resources.active()
+				+ ",\"parked\":" + resources.parked() + ",\"outstanding\":" + resources.outstanding()
+				+ ",\"submission_attempts\":" + resources.submissionAttempts()
+				+ ",\"terminal_outcomes\":" + resources.terminalOutcomes()
+				+ ",\"scheduler_accounting_exact\":" + resources.exactSchedulerAccounting()
 				+ ",\"pending\":" + resources.pending() + ",\"transactions\":" + resources.transactions()
 				+ ",\"iterators\":" + resources.iterators() + ",\"range_cursors\":"
 				+ resources.rangeCursors() + ",\"retained_snapshots\":" + resources.retainedSnapshots()
@@ -2807,9 +2936,9 @@ public final class GrpcRetainedReadBenchmark {
 	}
 
 	private static void requireRawBaseline(String buildBaseline) {
-		if (!buildBaseline.equals(RAW_CHECKPOINT_SHA)) {
-			throw new IllegalArgumentException("Retained-read baseline must be the frozen raw checkpoint "
-					+ RAW_CHECKPOINT_SHA + ", not " + buildBaseline);
+		if (!buildBaseline.equals(PERFORMANCE_BASELINE_SHA)) {
+			throw new IllegalArgumentException("Retained-read baseline must be the immutable v1.3.11 checkpoint "
+					+ PERFORMANCE_BASELINE_SHA + ", not " + buildBaseline);
 		}
 	}
 
@@ -2922,7 +3051,7 @@ public final class GrpcRetainedReadBenchmark {
 
 	private static void printUsage() {
 		System.out.println("""
-				Paired whole-gRPC retained-read non-inferiority gate:
+				Paired whole-gRPC retained-read Pareto gate:
 
 				  java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \\
 				    -cp target/test-classes:target/classes:<test-dependencies> \\
@@ -2938,7 +3067,8 @@ public final class GrpcRetainedReadBenchmark {
 				The controller predetermines ten paired rounds and alternates build order. Each of
 				eight isolated or foreground-mixed scenarios records a process-first cold probe followed by
 				a warmed steady window. Strict gates use exponentiated paired log-ratio Student-t
-				95% confidence intervals; missing or inconclusive bounds fail. Use --smoke=true
+				95% confidence intervals, automatic 1.0 gates, and one material primary gain;
+				missing or malformed evidence fails. Use --smoke=true
 				--enforce=false only for structural validation; the ten-pair schedule is unchanged.
 				""");
 	}

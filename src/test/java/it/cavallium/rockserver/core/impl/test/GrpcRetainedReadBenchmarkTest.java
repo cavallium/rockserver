@@ -23,7 +23,7 @@ class GrpcRetainedReadBenchmarkTest {
 
 	private static final String SCENARIO = "stream-range-with-latency-gets";
 	private static final String BUILD_SHA = "0123456789abcdef0123456789abcdef01234567";
-	private static final String RAW_CHECKPOINT_SHA = "7d9c02c090e71df78cdca24d29335b38147b3cfb";
+	private static final String PERFORMANCE_BASELINE_SHA = "bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e";
 	private static final String DIGEST =
 			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -46,7 +46,7 @@ class GrpcRetainedReadBenchmarkTest {
 		var result = GrpcRetainedReadBenchmark.evaluateForTesting(SCENARIO, samples, List.of());
 
 		assertFalse(result.passed());
-		assertTrue(hasFailure(result.failures(), "entries-per-second lower 95% bound"));
+		assertTrue(hasFailure(result.failures(), "entries-per-second geometric-mean ratio"));
 	}
 
 	@Test
@@ -59,7 +59,7 @@ class GrpcRetainedReadBenchmarkTest {
 			var result = GrpcRetainedReadBenchmark.evaluateForTesting(SCENARIO, samples, List.of());
 
 			assertFalse(result.passed(), metric);
-			assertTrue(hasFailure(result.failures(), metric + " upper 95% bound"), metric);
+			assertTrue(hasFailure(result.failures(), metric + " geometric-mean ratio"), metric);
 		}
 	}
 
@@ -69,7 +69,8 @@ class GrpcRetainedReadBenchmarkTest {
 				"cpu-nanos-per-item", 103.0d,
 				"allocated-bytes-per-item", 101.0d,
 				"peak-live-heap", 103.0d,
-				"peak-direct-memory", 103.0d);
+				"peak-direct-memory", 103.0d,
+				"peak-resident-set", 103.0d);
 		for (Map.Entry<String, Double> regression : regressions.entrySet()) {
 			var samples = passingSamples();
 			replaceCandidate(samples, regression.getKey(), regression.getValue());
@@ -77,9 +78,36 @@ class GrpcRetainedReadBenchmarkTest {
 			var result = GrpcRetainedReadBenchmark.evaluateForTesting(SCENARIO, samples, List.of());
 
 			assertFalse(result.passed(), regression.getKey());
-			assertTrue(hasFailure(result.failures(), regression.getKey() + " upper 95% bound"),
+			assertTrue(hasFailure(result.failures(), regression.getKey() + " geometric-mean ratio"),
 					regression.getKey());
 		}
+	}
+
+	@Test
+	void gcThreadsAndNativeHandlesAllowNoIncreaseInAnyPair() {
+		for (String metric : List.of("gc-collections", "gc-millis", "peak-thread-count",
+				"peak-native-handles", "peak-parked", "peak-outstanding",
+				"peak-retained-snapshots", "peak-exists-multi-arenas")) {
+			var samples = passingSamples();
+			replaceCandidate(samples, metric, 101.0d);
+
+			var result = GrpcRetainedReadBenchmark.evaluateForTesting(SCENARIO, samples, List.of());
+
+			assertFalse(result.passed(), metric);
+			assertTrue(hasFailure(result.failures(), metric + " geometric-mean ratio"), metric);
+			assertFalse(result.exceptionCandidates().contains(metric), metric);
+		}
+	}
+
+	@Test
+	void exceptionCeilingsAreReportedButNeverAutomaticallyAccepted() {
+		var samples = passingSamples();
+		replaceCandidate(samples, "completion-p99", 101.0d);
+
+		var result = GrpcRetainedReadBenchmark.evaluateForTesting(SCENARIO, samples, List.of());
+
+		assertFalse(result.passed());
+		assertTrue(result.exceptionCandidates().contains("completion-p99"));
 	}
 
 	@Test
@@ -92,7 +120,7 @@ class GrpcRetainedReadBenchmarkTest {
 		var interval = result.intervals().get("entries-per-second");
 
 		assertFalse(result.passed());
-		assertTrue(interval.lower95() < 0.99d && interval.upper95() > 0.99d);
+		assertTrue(interval.lower95() < 1.0d && interval.upper95() > 1.0d);
 	}
 
 	@Test
@@ -135,6 +163,10 @@ class GrpcRetainedReadBenchmarkTest {
 				"peak-exists-multi-snapshots=0", "peak-exists-multi-snapshots=1"));
 		var leaked = parse(valid.replace("native-leaks=0", "native-leaks=1"));
 		var badAccounting = parse(valid.replace("accounting-valid=true", "accounting-valid=false"));
+		var parked = parse(valid.replace("final-parked=0", "final-parked=1"));
+		var unconserved = parse(valid.replace("terminal-outcomes=2", "terminal-outcomes=1"));
+		var inexactCandidate = parse(valid.replace("scheduler-accounting-exact=true",
+				"scheduler-accounting-exact=false"));
 
 		assertFalse(incorrect.passed());
 		assertFalse(undrained.passed());
@@ -143,6 +175,9 @@ class GrpcRetainedReadBenchmarkTest {
 		assertFalse(impossibleExistsMultiPeak.passed());
 		assertFalse(leaked.passed());
 		assertFalse(badAccounting.passed());
+		assertFalse(parked.passed());
+		assertFalse(unconserved.passed());
+		assertFalse(inexactCandidate.passed());
 	}
 
 	@Test
@@ -199,7 +234,7 @@ class GrpcRetainedReadBenchmarkTest {
 
 	@Test
 	void retainedComparisonRejectsAnyBaselineOtherThanTheFrozenCheckpoint() {
-		GrpcRetainedReadBenchmark.validateRawBaselineForTesting(RAW_CHECKPOINT_SHA);
+		GrpcRetainedReadBenchmark.validateRawBaselineForTesting(PERFORMANCE_BASELINE_SHA);
 		assertThrows(IllegalArgumentException.class,
 				() -> GrpcRetainedReadBenchmark.validateRawBaselineForTesting(BUILD_SHA));
 	}

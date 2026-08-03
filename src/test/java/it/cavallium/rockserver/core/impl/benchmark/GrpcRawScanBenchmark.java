@@ -37,6 +37,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -52,7 +53,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -78,16 +78,30 @@ import reactor.core.publisher.Flux;
  */
 public final class GrpcRawScanBenchmark {
 
-	private static final String LEGACY_RESULT_SCHEMA = "rockserver-grpc-raw-scan-comparison-v1";
-	private static final String STRICT_RESULT_SCHEMA = "rockserver-grpc-raw-scan-comparison-v2";
-	private static final String WORKER_SCHEMA = "rockserver-grpc-raw-scan-worker-v1";
-	private static final String DATASET_SCHEMA = "rockserver-grpc-raw-scan-dataset-v1";
+	private static final String RESULT_SCHEMA = "rockserver-grpc-raw-scan-comparison-v3";
+	private static final String WORKER_SCHEMA = "rockserver-grpc-raw-scan-worker-v2";
+	private static final String DATASET_SCHEMA = "rockserver-grpc-raw-scan-dataset-v2";
 	private static final String COLUMN_NAME = "grpc-raw-scan-benchmark";
 	private static final long VALUE_SEED = 0x5241575343414e31L;
 	private static final long COOPERATIVE_QUANTUM_NANOS = TimeUnit.MILLISECONDS.toNanos(8L);
 	private static final long STREAM_DEADLINE_MINUTES = 15L;
 	private static final int RAW_MAX_ENTRIES = 65_536;
 	private static final int RAW_MAX_SERIALIZED_BYTES = 3 * 1024 * 1024;
+	private static final String PERFORMANCE_BASELINE_SHA =
+			"bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e";
+	private static final Set<String> WORKER_KEYS = Set.of(
+			"schema", "implementation", "round", "build-sha", "classpath-sha256", "dataset-id",
+			"bytes-per-second", "entries-per-second", "scans", "entries", "batches", "full-batches",
+			"maximum-batch-bytes", "scan-p99-nanos", "queue-p99-nanos", "execution-p99-nanos",
+			"cpu-nanos-per-entry", "allocated-bytes-per-entry", "gc-collections", "gc-millis",
+			"peak-live-heap-bytes", "peak-direct-memory-bytes", "peak-resident-set-bytes",
+			"peak-thread-count", "peak-native-handles", "submitted-requests", "terminal-requests",
+			"duplicate-terminals", "in-flight-requests", "non-ok-requests", "scheduler-accepted",
+			"scheduler-submission-attempts", "scheduler-accounting-exact", "scheduler-started",
+			"scheduler-completed", "scheduler-outcomes", "scheduler-failures",
+			"sampler-samples", "saturating-demand-samples", "maximum-active", "worker-count",
+			"maximum-parked", "maximum-outstanding", "maximum-avoidable-idle-nanos",
+			"exact-waiting-workers", "resources-drained", "native-leaks", "passed");
 
 	private GrpcRawScanBenchmark() {
 	}
@@ -108,6 +122,10 @@ public final class GrpcRawScanBenchmark {
 	}
 
 	private static void runController(Options options) throws Exception {
+		GrpcRetainedReadBenchmark.verifyBuildCheckout(options.baselineClasses(),
+				options.buildBaseline(), options.buildStateBaseline());
+		GrpcRetainedReadBenchmark.verifyBuildCheckout(options.candidateClasses(),
+				options.buildCandidate(), options.buildStateCandidate());
 		Path root = options.root().toAbsolutePath().normalize();
 		if (Files.exists(root)) {
 			throw new IllegalArgumentException("Benchmark root already exists; refusing to reuse state: " + root);
@@ -117,26 +135,37 @@ public final class GrpcRawScanBenchmark {
 		Files.createDirectories(shared);
 		Path config = shared.resolve("rockserver.conf");
 		Files.writeString(config, configText(options), StandardOpenOption.CREATE_NEW);
-
-		Instant started = Instant.now();
-		FileStore store = Files.getFileStore(root);
-		writeControllerMetadata(root, options, store, started);
-		prepareDataset(shared.resolve("db"), config, options);
+		String datasetId = datasetId(options, Files.readString(config));
 
 		String currentClassPath = System.getProperty("java.class.path");
 		String baselineClassPath = replaceProductionClasses(currentClassPath,
 				options.candidateClasses(), options.baselineClasses());
 		String candidateClassPath = replaceProductionClasses(currentClassPath,
 				options.candidateClasses(), options.candidateClasses());
+		String baselineClassPathHash = GrpcRetainedReadBenchmark
+				.classPathContentSha256ForTesting(baselineClassPath);
+		String candidateClassPathHash = GrpcRetainedReadBenchmark
+				.classPathContentSha256ForTesting(candidateClassPath);
+
+		Instant started = Instant.now();
+		FileStore store = Files.getFileStore(root);
+		writeControllerMetadata(root, options, store, started, datasetId,
+				baselineClassPathHash, candidateClassPathHash);
+		prepareDataset(shared.resolve("db"), config, options, datasetId);
+
 		List<WorkerResult> results = new ArrayList<>(options.rounds() * 2);
 		for (int round = 1; round <= options.rounds(); round++) {
 			boolean baselineFirst = (round & 1) == 1;
 			if (baselineFirst) {
-				results.add(runChild(options, shared, root, round, Implementation.BASELINE, baselineClassPath));
-				results.add(runChild(options, shared, root, round, Implementation.CANDIDATE, candidateClassPath));
+				results.add(runChild(options, shared, root, round, Implementation.BASELINE,
+						baselineClassPath, baselineClassPathHash, datasetId));
+				results.add(runChild(options, shared, root, round, Implementation.CANDIDATE,
+						candidateClassPath, candidateClassPathHash, datasetId));
 			} else {
-				results.add(runChild(options, shared, root, round, Implementation.CANDIDATE, candidateClassPath));
-				results.add(runChild(options, shared, root, round, Implementation.BASELINE, baselineClassPath));
+				results.add(runChild(options, shared, root, round, Implementation.CANDIDATE,
+						candidateClassPath, candidateClassPathHash, datasetId));
+				results.add(runChild(options, shared, root, round, Implementation.BASELINE,
+						baselineClassPath, baselineClassPathHash, datasetId));
 			}
 		}
 
@@ -155,11 +184,15 @@ public final class GrpcRawScanBenchmark {
 			Path root,
 			int round,
 			Implementation implementation,
-			String classPath) throws Exception {
+			String classPath,
+			String classPathHash,
+			String datasetId) throws Exception {
 		Path output = root.resolve("round-%02d-%s.properties".formatted(round, implementation.value));
 		List<String> command = new ArrayList<>(List.of(
 				Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 				"--enable-native-access=ALL-UNNAMED",
+				"-Drockserver.raw.expected-classpath-sha256=" + classPathHash,
+				"-Drockserver.raw.dataset-id=" + datasetId,
 				"-Xms" + options.childHeap(),
 				"-Xmx" + options.childHeap(),
 				"-cp", classPath,
@@ -200,10 +233,22 @@ public final class GrpcRawScanBenchmark {
 			throw new IllegalStateException("Raw-scan child failed with exit " + process.exitValue()
 					+ ": round=" + round + " implementation=" + implementation.value);
 		}
-		return WorkerResult.read(output);
+		return WorkerResult.read(output, implementation, round,
+				implementation == Implementation.BASELINE ? options.buildBaseline() : options.buildCandidate(),
+				classPathHash, datasetId);
 	}
 
 	private static void runWorker(Options options) throws Exception {
+		BenchmarkProcessTelemetry.enableAllocationMeasurement();
+		String expectedClassPathHash = System.getProperty("rockserver.raw.expected-classpath-sha256", "");
+		String expectedDatasetId = System.getProperty("rockserver.raw.dataset-id", "");
+		String actualClassPathHash = GrpcRetainedReadBenchmark.classPathContentSha256ForTesting(
+				System.getProperty("java.class.path"));
+		if (!expectedClassPathHash.matches("[0-9a-f]{64}")
+				|| !expectedClassPathHash.equals(actualClassPathHash)) {
+			throw new IllegalArgumentException("Raw worker classpath fingerprint mismatch");
+		}
+		validateDatasetMetadata(options, expectedDatasetId);
 		long leaksBefore = RocksLeakDetector.detectedLeakCount();
 		EmbeddedConnection embedded = null;
 		GrpcServer server = null;
@@ -267,7 +312,10 @@ public final class GrpcRawScanBenchmark {
 			}
 		}
 		long leaks = awaitNativeLeakDetection(leaksBefore);
-		WorkerResult result = WorkerResult.from(options, measurement, leaks);
+		String buildSha = options.implementation() == Implementation.BASELINE
+				? options.buildBaseline() : options.buildCandidate();
+		WorkerResult result = WorkerResult.from(options, buildSha, actualClassPathHash,
+				expectedDatasetId, measurement, leaks);
 		result.write(options.output());
 		System.out.printf(Locale.ROOT,
 				"RAW_RESULT implementation=%s round=%d throughput=%.3f MiB/s entries=%.0f/s "
@@ -278,7 +326,10 @@ public final class GrpcRawScanBenchmark {
 				result.submittedRequests(), result.passed());
 	}
 
-	private static void prepareDataset(Path database, Path config, Options options) throws Exception {
+	private static void prepareDataset(Path database,
+			Path config,
+			Options options,
+			String datasetId) throws Exception {
 		System.out.printf(Locale.ROOT, "Preparing %,d raw-scan keys with a flush every %,d keys%n",
 				options.preloadKeys(), options.flushKeys());
 		long leaksBefore = RocksLeakDetector.detectedLeakCount();
@@ -314,9 +365,11 @@ public final class GrpcRawScanBenchmark {
 		}
 		Files.writeString(database.getParent().resolve("dataset.properties"),
 				"schema=" + DATASET_SCHEMA + "\n"
+						+ "dataset-id=" + datasetId + "\n"
 						+ "preload-keys=" + options.preloadKeys() + "\n"
 						+ "flush-keys=" + options.flushKeys() + "\n"
-						+ "value-bytes=" + options.valueBytes() + "\n",
+						+ "value-bytes=" + options.valueBytes() + "\n"
+						+ "value-seed=" + Long.toUnsignedString(VALUE_SEED) + "\n",
 				StandardOpenOption.CREATE_NEW);
 	}
 
@@ -367,7 +420,8 @@ public final class GrpcRawScanBenchmark {
 		LongAdder batches = new LongAdder();
 		LongAdder fullBatches = new LongAdder();
 		AtomicInteger maximumBatchBytes = new AtomicInteger();
-		ConcurrentLinkedQueue<Long> scanLatencies = new ConcurrentLinkedQueue<>();
+		ScanLatencyRecorder scanLatencies = new ScanLatencyRecorder(
+				Math.max(1_024, options.scanClients() * 1_024));
 		PoolSampler sampler = new PoolSampler(options);
 		List<Future<?>> futures = new ArrayList<>();
 		long[] deadline = new long[1];
@@ -381,7 +435,7 @@ public final class GrpcRawScanBenchmark {
 						first = false;
 						long scanStarted = System.nanoTime();
 						ScanResult result = scanOnce(stub, request, options.preloadKeys(), expectedValue);
-						scanLatencies.add(System.nanoTime() - scanStarted);
+						scanLatencies.record(System.nanoTime() - scanStarted);
 						scans.increment();
 						entries.add(result.entries());
 						bytes.add(result.serializedBytes());
@@ -408,7 +462,10 @@ public final class GrpcRawScanBenchmark {
 			if (!ready.await(30, TimeUnit.SECONDS)) {
 				throw new IllegalStateException("Raw-scan measurement workers did not become ready");
 			}
+			sampler.resetMeasurementPeaks();
 			PoolCounters before = PoolCounters.capture(embedded);
+			BenchmarkProcessTelemetry.ProcessSnapshot processBefore =
+					BenchmarkProcessTelemetry.processSnapshot();
 			tracker.startTracking();
 			long started = System.nanoTime();
 			deadline[0] = started + TimeUnit.SECONDS.toNanos(options.measureSeconds());
@@ -417,24 +474,32 @@ public final class GrpcRawScanBenchmark {
 				future.get();
 			}
 			long finished = System.nanoTime();
+			BenchmarkProcessTelemetry.ProcessSnapshot processAfter =
+					BenchmarkProcessTelemetry.processSnapshot();
 			done.set(true);
 			samplerFuture.get();
 			tracker.stopTracking();
 			RequestAccounting accounting = tracker.awaitSnapshot();
 			awaitDrain(embedded);
 			PoolCounters after = PoolCounters.capture(embedded);
+			BenchmarkProcessTelemetry.ProcessDelta process = processAfter.minus(processBefore);
 			SchedulerMetrics schedulerMetrics = schedulerMetrics(meterRegistry);
-			long[] sortedLatencies = scanLatencies.stream().mapToLong(Long::longValue).sorted().toArray();
+			long[] sortedLatencies = scanLatencies.sorted();
+			long measuredEntries = entries.sum();
 			return new WorkerMeasurement(finished - started,
-					scans.sum(), entries.sum(), bytes.sum(), batches.sum(), fullBatches.sum(),
+					scans.sum(), measuredEntries, bytes.sum(), batches.sum(), fullBatches.sum(),
 					maximumBatchBytes.get(), GrpcOverloadBenchmark.percentile(sortedLatencies, 0.99d),
-					schedulerMetrics, accounting, sampler.snapshot(), after.minus(before), true);
+					process.cpuNanos() / (double) measuredEntries,
+					process.allocatedBytes() / (double) measuredEntries,
+					process.gcCollections(), process.gcMillis(), schedulerMetrics, accounting,
+					sampler.snapshot(), after.minus(before), true);
 		} finally {
 			done.set(true);
 			start.countDown();
 			tracker.stopTrackingIfActive();
 			executor.shutdownNow();
 			executor.awaitTermination(10, TimeUnit.SECONDS);
+			sampler.close();
 			composite.remove(meterRegistry);
 			meterRegistry.close();
 		}
@@ -535,9 +600,15 @@ public final class GrpcRawScanBenchmark {
 	private static void awaitDrain(EmbeddedConnection embedded) throws InterruptedException {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30L);
 		do {
-			var admission = embedded.getScheduler().admissionSnapshot();
+			var read = embedded.getScheduler().poolSnapshot(RWScheduler.Pool.READ);
+			int outstanding = BenchmarkSchedulerTelemetry.outstandingTasks(read);
+			int parked = BenchmarkSchedulerTelemetry.parkedTasks(read, outstanding);
+			long attempts = BenchmarkSchedulerTelemetry.submissionAttempts(read);
+			long expectedOutcomes = BenchmarkSchedulerTelemetry.exactAccounting()
+					? attempts : read.acceptedTasks();
 			var db = embedded.getInternalDB();
-			if (admission.totalQueued() == 0 && admission.totalActive() == 0
+			if (read.queuedTasks() == 0 && read.activeTasks() == 0 && parked == 0 && outstanding == 0
+					&& BenchmarkSchedulerTelemetry.terminalOutcomes(read) == expectedOutcomes
 					&& db.getPendingOpsCount() == 0L
 					&& db.getOpenTransactionsCount() == 0
 					&& db.getOpenIteratorsCount() == 0
@@ -555,16 +626,85 @@ public final class GrpcRawScanBenchmark {
 		if (baseline.size() != options.rounds() || candidate.size() != options.rounds()) {
 			return Comparison.failed("Every round must contain one baseline and one candidate result");
 		}
-		double[] throughputRatios = pairedRatios(baseline, candidate,
-				WorkerResult::bytesPerSecond);
-		double[] queueRatios = pairedRatios(baseline, candidate,
-				result -> result.queueP99Nanos());
-		double[] scanRatios = pairedRatios(baseline, candidate,
-				result -> result.scanP99Nanos());
-		return evaluateComparison(throughputRatios, queueRatios, scanRatios,
-				results.stream().allMatch(WorkerResult::passed), options.minimumThroughputRatio(),
-				options.maximumQueueP99Ratio(), options.maximumScanP99Ratio(),
-				options.strictNonInferiority());
+		List<String> structuralFailures = new ArrayList<>();
+		if (!results.stream().allMatch(WorkerResult::passed)) {
+			structuralFailures.add("one or more worker correctness/work-conservation gates failed");
+		}
+		for (int index = 0; index < baseline.size(); index++) {
+			if (baseline.get(index).round() != index + 1 || candidate.get(index).round() != index + 1) {
+				structuralFailures.add("round pairing mismatch at pair " + (index + 1));
+			}
+		}
+		Map<String, PairedPerformanceContract.MetricSamples> samples = new LinkedHashMap<>();
+		putSamples(samples, "mib-per-second", baseline, candidate,
+				result -> result.bytesPerSecond() / (1024.0d * 1024.0d));
+		putSamples(samples, "entries-per-second", baseline, candidate, WorkerResult::entriesPerSecond);
+		putSamples(samples, "queue-p99", baseline, candidate, WorkerResult::queueP99Nanos);
+		putSamples(samples, "execution-p99", baseline, candidate, WorkerResult::executionP99Nanos);
+		putSamples(samples, "scan-p99", baseline, candidate, WorkerResult::scanP99Nanos);
+		putSamples(samples, "cpu-nanos-per-entry", baseline, candidate, WorkerResult::cpuNanosPerEntry);
+		putSamples(samples, "allocated-bytes-per-entry", baseline, candidate,
+				WorkerResult::allocatedBytesPerEntry);
+		putSamples(samples, "peak-live-heap", baseline, candidate, WorkerResult::peakLiveHeapBytes);
+		putSamples(samples, "peak-direct-memory", baseline, candidate, WorkerResult::peakDirectMemoryBytes);
+		putSamples(samples, "peak-resident-set", baseline, candidate, WorkerResult::peakResidentSetBytes);
+		putSamples(samples, "gc-collections", baseline, candidate, WorkerResult::gcCollections);
+		putSamples(samples, "gc-millis", baseline, candidate, WorkerResult::gcMillis);
+		putSamples(samples, "peak-thread-count", baseline, candidate, WorkerResult::peakThreadCount);
+		putSamples(samples, "peak-native-handles", baseline, candidate, WorkerResult::peakNativeHandles);
+		putSamples(samples, "peak-parked", baseline, candidate, WorkerResult::maximumParked);
+		putSamples(samples, "peak-outstanding", baseline, candidate, WorkerResult::maximumOutstanding);
+		var evaluation = PairedPerformanceContract.evaluate(rawMetricSpecifications(), samples,
+				structuralFailures, true);
+		Map<String, GrpcOverloadBenchmark.RatioConfidenceInterval> intervals = new LinkedHashMap<>();
+		evaluation.metrics().forEach((name, result) -> intervals.put(name, toLegacyInterval(result.interval())));
+		return new Comparison(intervals, evaluation.materialImprovements(),
+				evaluation.exceptionCandidates(), evaluation.failures());
+	}
+
+	private static List<PairedPerformanceContract.MetricSpec> rawMetricSpecifications() {
+		return List.of(
+				PairedPerformanceContract.MetricSpec.throughput("mib-per-second", true),
+				PairedPerformanceContract.MetricSpec.throughput("entries-per-second", true),
+				PairedPerformanceContract.MetricSpec.cost("queue-p99", false),
+				PairedPerformanceContract.MetricSpec.cost("execution-p99", false),
+				PairedPerformanceContract.MetricSpec.cost("scan-p99", true),
+				PairedPerformanceContract.MetricSpec.cost("cpu-nanos-per-entry", true),
+				PairedPerformanceContract.MetricSpec.allocation("allocated-bytes-per-entry", true),
+				PairedPerformanceContract.MetricSpec.cost("peak-live-heap", true),
+				PairedPerformanceContract.MetricSpec.cost("peak-direct-memory", true),
+				PairedPerformanceContract.MetricSpec.cost("peak-resident-set", true),
+				PairedPerformanceContract.MetricSpec.noIncrease("gc-collections"),
+				PairedPerformanceContract.MetricSpec.noIncrease("gc-millis"),
+				PairedPerformanceContract.MetricSpec.noIncrease("peak-thread-count"),
+				PairedPerformanceContract.MetricSpec.noIncrease("peak-native-handles"),
+				PairedPerformanceContract.MetricSpec.noIncrease("peak-parked"),
+				PairedPerformanceContract.MetricSpec.noIncrease("peak-outstanding"));
+	}
+
+	/** Pure v1.3.11 Pareto helper for deterministic raw-suite contract tests. */
+	public static PairedPerformanceContract.Evaluation evaluateParetoForTesting(
+			Map<String, PairedPerformanceContract.MetricSamples> samples,
+			List<String> structuralFailures,
+			boolean requireMaterialImprovement) {
+		return PairedPerformanceContract.evaluate(rawMetricSpecifications(), samples,
+				structuralFailures, requireMaterialImprovement);
+	}
+
+	private static void putSamples(Map<String, PairedPerformanceContract.MetricSamples> target,
+	                               String name,
+	                               List<WorkerResult> baseline,
+	                               List<WorkerResult> candidate,
+	                               java.util.function.ToDoubleFunction<WorkerResult> metric) {
+		target.put(name, new PairedPerformanceContract.MetricSamples(
+				baseline.stream().mapToDouble(metric).toArray(),
+				candidate.stream().mapToDouble(metric).toArray()));
+	}
+
+	private static GrpcOverloadBenchmark.RatioConfidenceInterval toLegacyInterval(
+			PairedBenchmarkStatistics.RatioConfidenceInterval interval) {
+		return new GrpcOverloadBenchmark.RatioConfidenceInterval(interval.samples(), interval.mean(),
+				interval.lower95(), interval.upper95());
 	}
 
 	private static List<WorkerResult> byImplementation(List<WorkerResult> results,
@@ -573,131 +713,6 @@ public final class GrpcRawScanBenchmark {
 				.filter(result -> result.implementation() == implementation)
 				.sorted(java.util.Comparator.comparingInt(WorkerResult::round))
 				.toList();
-	}
-
-	private static double[] pairedRatios(List<WorkerResult> baseline,
-			List<WorkerResult> candidate,
-			java.util.function.ToDoubleFunction<WorkerResult> metric) {
-		double[] ratios = new double[baseline.size()];
-		for (int index = 0; index < ratios.length; index++) {
-			double base = metric.applyAsDouble(baseline.get(index));
-			double next = metric.applyAsDouble(candidate.get(index));
-			ratios[index] = base > 0.0d && next > 0.0d ? next / base : Double.POSITIVE_INFINITY;
-		}
-		return ratios;
-	}
-
-	/** Pure acceptance helper used by deterministic tests. */
-	public static Comparison evaluateForTesting(double[] baselineThroughput,
-			double[] candidateThroughput,
-			double[] baselineQueueP99,
-			double[] candidateQueueP99,
-			double[] baselineScanP99,
-			double[] candidateScanP99,
-			double minimumThroughputRatio,
-			double maximumQueueP99Ratio,
-			double maximumScanP99Ratio) {
-		if (baselineThroughput.length != candidateThroughput.length
-				|| baselineQueueP99.length != candidateQueueP99.length
-				|| baselineScanP99.length != candidateScanP99.length
-				|| baselineThroughput.length != baselineQueueP99.length
-				|| baselineThroughput.length != baselineScanP99.length) {
-			throw new IllegalArgumentException("All paired samples must have the same length");
-		}
-		double[] throughput = new double[baselineThroughput.length];
-		double[] queue = new double[baselineThroughput.length];
-		double[] scan = new double[baselineThroughput.length];
-		for (int index = 0; index < throughput.length; index++) {
-			throughput[index] = candidateThroughput[index] / baselineThroughput[index];
-			queue[index] = candidateQueueP99[index] / baselineQueueP99[index];
-			scan[index] = candidateScanP99[index] / baselineScanP99[index];
-		}
-		return evaluateComparison(throughput, queue, scan, true, minimumThroughputRatio,
-				maximumQueueP99Ratio, maximumScanP99Ratio, false);
-	}
-
-	/** Pure strict non-inferiority helper used by deterministic tests. */
-	public static Comparison evaluateStrictForTesting(double[] baselineThroughput,
-			double[] candidateThroughput,
-			double[] baselineQueueP99,
-			double[] candidateQueueP99,
-			double[] baselineScanP99,
-			double[] candidateScanP99,
-			double minimumThroughputRatio,
-			double maximumQueueP99Ratio,
-			double maximumScanP99Ratio) {
-		if (baselineThroughput.length != 10) {
-			throw new IllegalArgumentException("Strict raw-SST comparison requires exactly ten pairs");
-		}
-		if (baselineThroughput.length != candidateThroughput.length
-				|| baselineQueueP99.length != candidateQueueP99.length
-				|| baselineScanP99.length != candidateScanP99.length
-				|| baselineThroughput.length != baselineQueueP99.length
-				|| baselineThroughput.length != baselineScanP99.length) {
-			throw new IllegalArgumentException("All paired samples must have the same length");
-		}
-		double[] throughput = new double[baselineThroughput.length];
-		double[] queue = new double[baselineThroughput.length];
-		double[] scan = new double[baselineThroughput.length];
-		for (int index = 0; index < throughput.length; index++) {
-			throughput[index] = candidateThroughput[index] / baselineThroughput[index];
-			queue[index] = candidateQueueP99[index] / baselineQueueP99[index];
-			scan[index] = candidateScanP99[index] / baselineScanP99[index];
-		}
-		return evaluateComparison(throughput, queue, scan, true, minimumThroughputRatio,
-				maximumQueueP99Ratio, maximumScanP99Ratio, true);
-	}
-
-	private static Comparison evaluateComparison(double[] throughputRatios,
-			double[] queueRatios,
-			double[] scanRatios,
-			boolean workersPassed,
-			double minimumThroughputRatio,
-			double maximumQueueP99Ratio,
-			double maximumScanP99Ratio,
-			boolean strictNonInferiority) {
-		var throughput = ratioConfidenceInterval(throughputRatios, strictNonInferiority);
-		var queue = ratioConfidenceInterval(queueRatios, strictNonInferiority);
-		var scan = ratioConfidenceInterval(scanRatios, strictNonInferiority);
-		List<String> failures = new ArrayList<>();
-		if (!workersPassed) {
-			failures.add("one or more worker correctness/work-conservation gates failed");
-		}
-		if (strictNonInferiority) {
-			if (!throughput.available() || throughput.lower95() < minimumThroughputRatio) {
-				failures.add("candidate raw throughput lower 95% bound is below " + minimumThroughputRatio);
-			}
-			if (!queue.available() || queue.upper95() > maximumQueueP99Ratio) {
-				failures.add("candidate scheduler queue-p99 upper 95% bound exceeds " + maximumQueueP99Ratio);
-			}
-			if (!scan.available() || scan.upper95() > maximumScanP99Ratio) {
-				failures.add("candidate end-to-end scan-p99 upper 95% bound exceeds " + maximumScanP99Ratio);
-			}
-		} else {
-			// Preserve v1 semantics: reject only a confidence interval that demonstrates a regression.
-			// An interval crossing equality remains inconclusive rather than a demonstrated loss.
-			if (!throughput.available() || throughput.upper95() < minimumThroughputRatio) {
-				failures.add("candidate raw throughput upper 95% bound is below " + minimumThroughputRatio);
-			}
-			if (!queue.available() || queue.lower95() > maximumQueueP99Ratio) {
-				failures.add("candidate scheduler queue-p99 lower 95% bound exceeds " + maximumQueueP99Ratio);
-			}
-			if (!scan.available() || scan.lower95() > maximumScanP99Ratio) {
-				failures.add("candidate end-to-end scan-p99 lower 95% bound exceeds " + maximumScanP99Ratio);
-			}
-		}
-		return new Comparison(throughput, queue, scan, List.copyOf(failures));
-	}
-
-	private static GrpcOverloadBenchmark.RatioConfidenceInterval ratioConfidenceInterval(
-			double[] ratios,
-			boolean strictNonInferiority) {
-		if (!strictNonInferiority) {
-			return GrpcOverloadBenchmark.ratioConfidenceInterval(ratios);
-		}
-		var interval = PairedBenchmarkStatistics.logRatioConfidenceInterval(ratios);
-		return new GrpcOverloadBenchmark.RatioConfidenceInterval(interval.samples(), interval.mean(),
-				interval.lower95(), interval.upper95());
 	}
 
 	private static String replaceProductionClasses(String classPath,
@@ -747,6 +762,47 @@ public final class GrpcRawScanBenchmark {
 				""".formatted(options.readParallelism(), options.writeParallelism());
 	}
 
+	private static String datasetId(Options options, String config) {
+		String identity = DATASET_SCHEMA + '\n' + options.preloadKeys() + '\n' + options.flushKeys()
+				+ '\n' + options.valueBytes() + '\n' + Long.toUnsignedString(VALUE_SEED) + '\n' + config;
+		try {
+			byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+					.digest(identity.getBytes(StandardCharsets.UTF_8));
+			return java.util.HexFormat.of().formatHex(digest);
+		} catch (java.security.NoSuchAlgorithmException impossible) {
+			throw new IllegalStateException(impossible);
+		}
+	}
+
+	private static void validateDatasetMetadata(Options options, String expectedDatasetId) throws IOException {
+		if (!expectedDatasetId.matches("[0-9a-f]{64}")) {
+			throw new IllegalArgumentException("Raw worker requires a valid dataset identity");
+		}
+		Path metadata = options.datasetRoot().toAbsolutePath().normalize().resolve("dataset.properties");
+		Properties values = new Properties();
+		try (InputStream stream = Files.newInputStream(metadata)) {
+			values.load(stream);
+		}
+		Set<String> expectedKeys = Set.of("schema", "dataset-id", "preload-keys", "flush-keys",
+				"value-bytes", "value-seed");
+		if (!values.stringPropertyNames().equals(expectedKeys)) {
+			throw new IllegalArgumentException("Raw dataset metadata schema mismatch: " + metadata);
+		}
+		if (!required(values, "schema").equals(DATASET_SCHEMA)
+				|| !required(values, "dataset-id").equals(expectedDatasetId)
+				|| integer(values, "preload-keys") != options.preloadKeys()
+				|| integer(values, "flush-keys") != options.flushKeys()
+				|| integer(values, "value-bytes") != options.valueBytes()
+				|| !required(values, "value-seed").equals(Long.toUnsignedString(VALUE_SEED))) {
+			throw new IllegalArgumentException("Raw dataset provenance mismatch: " + metadata);
+		}
+		String actualDatasetId = datasetId(options,
+				Files.readString(options.datasetRoot().resolve("rockserver.conf")));
+		if (!actualDatasetId.equals(expectedDatasetId)) {
+			throw new IllegalArgumentException("Raw dataset configuration fingerprint mismatch");
+		}
+	}
+
 	private static Keys key(long value) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(value).array()));
 	}
@@ -786,15 +842,21 @@ public final class GrpcRawScanBenchmark {
 	private static void writeControllerMetadata(Path root,
 			Options options,
 			FileStore store,
-			Instant started) throws IOException {
+			Instant started,
+			String datasetId,
+			String baselineClassPathHash,
+			String candidateClassPathHash) throws IOException {
 		Files.writeString(root.resolve("metadata.properties"),
-				"schema=" + resultSchema(options) + "\n"
-						+ "comparison-mode=" + comparisonMode(options) + "\n"
+				"schema=" + RESULT_SCHEMA + "\n"
+						+ "comparison-mode=v1.3.11-pareto\n"
 						+ "started=" + started + "\n"
 						+ "build-baseline=" + options.buildBaseline() + "\n"
 						+ "build-candidate=" + options.buildCandidate() + "\n"
 						+ "build-state-baseline=" + options.buildStateBaseline() + "\n"
 						+ "build-state-candidate=" + options.buildStateCandidate() + "\n"
+						+ "dataset-id=" + datasetId + "\n"
+						+ "baseline-classpath-sha256=" + baselineClassPathHash + "\n"
+						+ "candidate-classpath-sha256=" + candidateClassPathHash + "\n"
 						+ "storage-label=" + options.storageLabel() + "\n"
 						+ "storage-name=" + store.name() + "\n"
 						+ "storage-type=" + store.type() + "\n"
@@ -812,10 +874,6 @@ public final class GrpcRawScanBenchmark {
 						+ "measure-seconds=" + options.measureSeconds() + "\n"
 						+ "rounds=" + options.rounds() + "\n"
 						+ "sample-micros=" + options.sampleMicros() + "\n"
-						+ "strict-non-inferiority=" + options.strictNonInferiority() + "\n"
-						+ "minimum-throughput-ratio=" + options.minimumThroughputRatio() + "\n"
-						+ "maximum-queue-p99-ratio=" + options.maximumQueueP99Ratio() + "\n"
-						+ "maximum-scan-p99-ratio=" + options.maximumScanP99Ratio() + "\n"
 						+ "java=" + System.getProperty("java.runtime.version") + "\n"
 						+ "os=" + System.getProperty("os.name") + ' ' + System.getProperty("os.version")
 						+ ' ' + System.getProperty("os.arch") + "\n"
@@ -843,12 +901,18 @@ public final class GrpcRawScanBenchmark {
 			Instant finished,
 			List<WorkerResult> results,
 			Comparison comparison) {
+		WorkerResult baselineProvenance = firstResult(results, Implementation.BASELINE);
+		WorkerResult candidateProvenance = firstResult(results, Implementation.CANDIDATE);
 		StringBuilder out = new StringBuilder("# Paired whole-path raw-scan comparison\n\n");
-		out.append("- Schema: `").append(resultSchema(options)).append("`\n")
-				.append("- Comparison mode: `").append(comparisonMode(options)).append("`\n")
+		out.append("- Schema: `").append(RESULT_SCHEMA).append("`\n")
+				.append("- Comparison mode: `v1.3.11-pareto`\n")
 				.append("- Started / finished: `").append(started).append("` / `").append(finished).append("`\n")
 				.append("- Baseline / candidate: `").append(options.buildBaseline()).append("` / `")
 				.append(options.buildCandidate()).append("`\n")
+				.append("- Dataset: `").append(baselineProvenance.datasetId()).append("`\n")
+				.append("- Baseline / candidate classpath SHA-256: `")
+				.append(baselineProvenance.classPathSha256()).append("` / `")
+				.append(candidateProvenance.classPathSha256()).append("`\n")
 				.append("- Storage: `").append(options.storageLabel()).append("`, `")
 				.append(store.name()).append("`, `").append(store.type()).append("`\n")
 				.append("- Host/build state: `").append(options.hostState()).append("`, `")
@@ -867,17 +931,25 @@ public final class GrpcRawScanBenchmark {
 					.append('|').append(result.terminalRequests()).append('/').append(result.submittedRequests())
 					.append('|').append(result.passed() ? "PASS" : "FAIL").append("|\n");
 		}
-		String throughputBound = options.strictNonInferiority() ? "lower" : "upper";
-		String latencyBound = options.strictNonInferiority() ? "upper" : "lower";
-		out.append("\n- Candidate/baseline throughput ratio: ").append(interval(comparison.throughput()))
-				.append(" (reject if ").append(throughputBound).append(" bound < ")
-				.append(format(options.minimumThroughputRatio())).append(")\n")
-				.append("- Candidate/baseline scheduler queue-p99 ratio: ").append(interval(comparison.queueP99()))
-				.append(" (reject if ").append(latencyBound).append(" bound > ")
-				.append(format(options.maximumQueueP99Ratio())).append(")\n")
-				.append("- Candidate/baseline end-to-end scan-p99 ratio: ").append(interval(comparison.scanP99()))
-				.append(" (reject if ").append(latencyBound).append(" bound > ")
-				.append(format(options.maximumScanP99Ratio())).append(")\n");
+		out.append("\n| Pareto metric | Geometric ratio | 95% confidence interval | Automatic gate | Material |\n")
+				.append("|---|---:|---:|---|---|\n");
+		for (PairedPerformanceContract.MetricSpec specification : rawMetricSpecifications()) {
+			var value = comparison.metrics().get(specification.name());
+			boolean passed = comparison.failures().stream()
+					.noneMatch(failure -> failure.startsWith(specification.name()));
+			boolean material = comparison.materialImprovements().contains(specification.name());
+			out.append('|').append(specification.name()).append('|')
+					.append(value != null && value.available() ? format(value.mean()) : "n/a").append('|')
+					.append(value != null && value.available()
+							? "[" + format(value.lower95()) + ", " + format(value.upper95()) + "]"
+							: "exact no-increase")
+					.append('|').append(passed ? "PASS" : "FAIL").append('|')
+					.append(material ? "YES" : "NO").append("|\n");
+		}
+		out.append("\n- Material improvements: `")
+				.append(String.join(", ", comparison.materialImprovements())).append("`\n")
+				.append("- Exception candidates (still FAIL; ablation, profiles, and explicit approval required): `")
+				.append(String.join(", ", comparison.exceptionCandidates())).append("`\n");
 		if (!comparison.failures().isEmpty()) {
 			out.append("\nFailures:\n\n");
 			for (String failure : comparison.failures()) {
@@ -893,12 +965,20 @@ public final class GrpcRawScanBenchmark {
 			Instant finished,
 			List<WorkerResult> results,
 			Comparison comparison) {
-		StringBuilder out = new StringBuilder("{\n  \"schema\": \"").append(resultSchema(options))
-				.append("\",\n  \"comparison_mode\": \"").append(comparisonMode(options))
+		WorkerResult baselineProvenance = firstResult(results, Implementation.BASELINE);
+		WorkerResult candidateProvenance = firstResult(results, Implementation.CANDIDATE);
+		StringBuilder out = new StringBuilder("{\n  \"schema\": \"").append(RESULT_SCHEMA)
+				.append("\",\n  \"comparison_mode\": \"v1.3.11-pareto")
 				.append("\",\n  \"started\": \"").append(started)
 				.append("\",\n  \"finished\": \"").append(finished)
 				.append("\",\n  \"build_baseline\": \"").append(json(options.buildBaseline()))
 				.append("\",\n  \"build_candidate\": \"").append(json(options.buildCandidate()))
+				.append("\",\n  \"dataset_id\": \"").append(baselineProvenance.datasetId())
+				.append("\",\n  \"classpath_baseline_sha256\": \"")
+				.append(baselineProvenance.classPathSha256())
+				.append("\",\n  \"classpath_candidate_sha256\": \"")
+				.append(candidateProvenance.classPathSha256())
+				.append("\",\n  \"host_state\": \"").append(json(options.hostState()))
 				.append("\",\n  \"storage_label\": \"").append(json(options.storageLabel()))
 				.append("\",\n  \"storage_name\": \"").append(json(store.name()))
 				.append("\",\n  \"storage_type\": \"").append(json(store.type()))
@@ -906,16 +986,48 @@ public final class GrpcRawScanBenchmark {
 				.append(",\n  \"throughput_ratio\": ").append(intervalJson(comparison.throughput()))
 				.append(",\n  \"scheduler_queue_p99_ratio\": ").append(intervalJson(comparison.queueP99()))
 				.append(",\n  \"scan_p99_ratio\": ").append(intervalJson(comparison.scanP99()))
+				.append(",\n  \"pareto_metrics\": {");
+		int metricIndex = 0;
+		for (Map.Entry<String, GrpcOverloadBenchmark.RatioConfidenceInterval> entry
+				: comparison.metrics().entrySet()) {
+			if (metricIndex++ > 0) out.append(',');
+			out.append("\n    \"").append(json(entry.getKey())).append("\": ")
+					.append(intervalJson(entry.getValue()));
+		}
+		out.append("\n  },\n  \"material_improvements\": [");
+		for (int index = 0; index < comparison.materialImprovements().size(); index++) {
+			if (index > 0) out.append(',');
+			out.append('"').append(json(comparison.materialImprovements().get(index))).append('"');
+		}
+		out.append("],\n  \"exception_candidates\": [");
+		for (int index = 0; index < comparison.exceptionCandidates().size(); index++) {
+			if (index > 0) out.append(',');
+			out.append('"').append(json(comparison.exceptionCandidates().get(index))).append('"');
+		}
+		out.append(']')
 				.append(",\n  \"rounds\": [\n");
 		for (int index = 0; index < results.size(); index++) {
 			WorkerResult result = results.get(index);
 			out.append("    {\"round\": ").append(result.round())
 					.append(", \"implementation\": \"").append(result.implementation().value)
+					.append("\", \"build_sha\": \"").append(result.buildSha())
+					.append("\", \"classpath_sha256\": \"").append(result.classPathSha256())
+					.append("\", \"dataset_id\": \"").append(result.datasetId())
 					.append("\", \"bytes_per_second\": ").append(format(result.bytesPerSecond()))
 					.append(", \"entries_per_second\": ").append(format(result.entriesPerSecond()))
 					.append(", \"scan_p99_nanos\": ").append(result.scanP99Nanos())
 					.append(", \"scheduler_queue_p99_nanos\": ").append(result.queueP99Nanos())
 					.append(", \"scheduler_execution_p99_nanos\": ").append(result.executionP99Nanos())
+					.append(", \"cpu_nanos_per_entry\": ").append(format(result.cpuNanosPerEntry()))
+					.append(", \"allocated_bytes_per_entry\": ")
+					.append(format(result.allocatedBytesPerEntry()))
+					.append(", \"gc_collections\": ").append(result.gcCollections())
+					.append(", \"gc_millis\": ").append(result.gcMillis())
+					.append(", \"peak_live_heap_bytes\": ").append(result.peakLiveHeapBytes())
+					.append(", \"peak_direct_memory_bytes\": ").append(result.peakDirectMemoryBytes())
+					.append(", \"peak_resident_set_bytes\": ").append(result.peakResidentSetBytes())
+					.append(", \"peak_thread_count\": ").append(result.peakThreadCount())
+					.append(", \"peak_native_handles\": ").append(result.peakNativeHandles())
 					.append(", \"maximum_read_active\": ").append(result.maximumActive())
 					.append(", \"submitted_requests\": ").append(result.submittedRequests())
 					.append(", \"terminal_requests\": ").append(result.terminalRequests())
@@ -928,6 +1040,10 @@ public final class GrpcRawScanBenchmark {
 					.append(", \"full_batches\": ").append(result.fullBatches())
 					.append(", \"maximum_batch_bytes\": ").append(result.maximumBatchBytes())
 					.append(", \"scheduler_accepted\": ").append(result.schedulerAccepted())
+					.append(", \"scheduler_submission_attempts\": ")
+					.append(result.schedulerSubmissionAttempts())
+					.append(", \"scheduler_accounting_exact\": ")
+					.append(result.schedulerAccountingExact())
 					.append(", \"scheduler_started\": ").append(result.schedulerStarted())
 					.append(", \"scheduler_completed\": ").append(result.schedulerCompleted())
 					.append(", \"scheduler_outcomes\": ").append(result.schedulerOutcomes())
@@ -935,6 +1051,8 @@ public final class GrpcRawScanBenchmark {
 					.append(", \"sampler_samples\": ").append(result.samplerSamples())
 					.append(", \"saturating_demand_samples\": ").append(result.saturatingDemandSamples())
 					.append(", \"maximum_avoidable_idle_nanos\": ").append(result.maximumAvoidableIdleNanos())
+					.append(", \"maximum_parked\": ").append(result.maximumParked())
+					.append(", \"maximum_outstanding\": ").append(result.maximumOutstanding())
 					.append(", \"exact_waiting_workers\": ").append(result.exactWaitingWorkers())
 					.append(", \"resources_drained\": ").append(result.resourcesDrained())
 					.append(", \"native_leaks\": ").append(result.nativeLeaks())
@@ -949,15 +1067,22 @@ public final class GrpcRawScanBenchmark {
 		return out.append("]\n}\n").toString();
 	}
 
+	private static WorkerResult firstResult(List<WorkerResult> results, Implementation implementation) {
+		return results.stream().filter(result -> result.implementation() == implementation)
+				.findFirst().orElseThrow(() -> new IllegalStateException(
+						"Missing raw-scan provenance for " + implementation.value));
+	}
+
 	private static String interval(GrpcOverloadBenchmark.RatioConfidenceInterval interval) {
 		return "mean=" + format(interval.mean()) + ", 95% CI=[" + format(interval.lower95())
 				+ ", " + format(interval.upper95()) + ']';
 	}
 
 	private static String intervalJson(GrpcOverloadBenchmark.RatioConfidenceInterval interval) {
-		return "{\"samples\": " + interval.samples() + ", \"mean\": " + format(interval.mean())
-				+ ", \"lower_95\": " + format(interval.lower95()) + ", \"upper_95\": "
-				+ format(interval.upper95()) + '}';
+		return "{\"samples\": " + interval.samples() + ", \"mean\": "
+				+ (interval.available() ? format(interval.mean()) : "null")
+				+ ", \"lower_95\": " + (interval.available() ? format(interval.lower95()) : "null")
+				+ ", \"upper_95\": " + (interval.available() ? format(interval.upper95()) : "null") + '}';
 	}
 
 	private static String format(double value) {
@@ -967,14 +1092,6 @@ public final class GrpcRawScanBenchmark {
 	private static String json(String value) {
 		return value.replace("\\", "\\\\").replace("\"", "\\\"")
 				.replace("\n", "\\n").replace("\r", "\\r");
-	}
-
-	private static String resultSchema(Options options) {
-		return options.strictNonInferiority() ? STRICT_RESULT_SCHEMA : LEGACY_RESULT_SCHEMA;
-	}
-
-	private static String comparisonMode(Options options) {
-		return options.strictNonInferiority() ? "strict-non-inferiority" : "legacy-demonstrated-regression";
 	}
 
 	private static void printUsage() {
@@ -989,15 +1106,14 @@ public final class GrpcRawScanBenchmark {
 				    --candidate-classes=target/classes \\
 				    --build-baseline=<full-baseline-sha> --build-candidate=<full-candidate-sha> \\
 				    --build-state-baseline=clean --build-state-candidate=clean \\
-					--storage-label=hdd-btrfs --host-state=dedicated \\
-					--strict-non-inferiority=true --enforce=true
+					--storage-label=hdd-btrfs --host-state=dedicated --enforce=true
 
 				Full defaults: 1,000,000 keys, eight explicit SST flushes, five scan clients,
 				20 READ workers, one complete warmup scan/client, 15 measured seconds, alternating
-				implementation order, and strict candidate idle instrumentation. Strict mode fixes ten
-				paired rounds and requires throughput lower 95% >= 0.99 plus queue/scan p99 upper 95%
-				<= 1.02. Without --strict-non-inferiority, the v1 five-round demonstrated-regression
-				semantics and artifact schema remain unchanged.
+				implementation order, and strict candidate idle instrumentation. Pareto mode fixes ten
+				paired rounds, requires every point estimate to be no worse than equality, rejects a
+				confidence interval that demonstrates regression, and requires one material primary gain.
+				The 0.99/1.02 ceilings are report-only exception candidates, never automatic passes.
 				Use --smoke=true --enforce=false for structural validation only.
 				""");
 	}
@@ -1027,6 +1143,28 @@ public final class GrpcRawScanBenchmark {
 	private record SchedulerMetrics(long queueP99Nanos, long executionP99Nanos) {
 	}
 
+	private static final class ScanLatencyRecorder {
+
+		private final long[] samples;
+		private final AtomicLong sequence = new AtomicLong();
+
+		private ScanLatencyRecorder(int capacity) {
+			samples = new long[capacity];
+		}
+
+		private void record(long nanos) {
+			long ordinal = sequence.getAndIncrement();
+			samples[(int) Math.floorMod(ordinal, samples.length)] = Math.max(1L, nanos);
+		}
+
+		private long[] sorted() {
+			int count = Math.toIntExact(Math.min(sequence.get(), samples.length));
+			long[] result = Arrays.copyOf(samples, count);
+			Arrays.sort(result);
+			return result;
+		}
+	}
+
 	private record RequestAccounting(long submitted,
 			long terminal,
 			long duplicateTerminal,
@@ -1046,7 +1184,10 @@ public final class GrpcRawScanBenchmark {
 			int workerCount,
 			int maximumConsecutiveAvoidableIdleSamples,
 			long sampleNanos,
-			boolean exactWaitingWorkers) {
+			boolean exactWaitingWorkers,
+			int maximumParked,
+			int maximumOutstanding,
+			BenchmarkProcessTelemetry.Peaks processPeaks) {
 
 		private long maximumAvoidableIdleNanos() {
 			return maximumConsecutiveAvoidableIdleSamples * sampleNanos;
@@ -1068,9 +1209,17 @@ public final class GrpcRawScanBenchmark {
 		private int workerCount;
 		private int consecutiveAvoidableIdleSamples;
 		private int maximumConsecutiveAvoidableIdleSamples;
+		private int maximumParked;
+		private int maximumOutstanding;
+		private final BenchmarkProcessTelemetry.PeakSampler processPeaks =
+				new BenchmarkProcessTelemetry.PeakSampler();
 
 		private PoolSampler(Options options) {
 			this.options = options;
+		}
+
+		private void resetMeasurementPeaks() {
+			processPeaks.reset();
 		}
 
 		private void sample(EmbeddedConnection embedded) {
@@ -1078,6 +1227,11 @@ public final class GrpcRawScanBenchmark {
 			samples++;
 			workerCount = snapshot.workerCount();
 			maximumActive = Math.max(maximumActive, snapshot.activeTasks());
+			int outstanding = BenchmarkSchedulerTelemetry.outstandingTasks(snapshot);
+			maximumParked = Math.max(maximumParked,
+					BenchmarkSchedulerTelemetry.parkedTasks(snapshot, outstanding));
+			maximumOutstanding = Math.max(maximumOutstanding, outstanding);
+			processPeaks.sample();
 			boolean saturating = snapshot.activeTasks() >= snapshot.workerCount()
 					|| (snapshot.queuedTasks() > 0
 					&& snapshot.activeTasks() + snapshot.queuedTasks() >= snapshot.workerCount());
@@ -1100,29 +1254,42 @@ public final class GrpcRawScanBenchmark {
 		private PoolUtilization snapshot() {
 			return new PoolUtilization(samples, saturatingDemandSamples, maximumActive, workerCount,
 					maximumConsecutiveAvoidableIdleSamples, options.sampleNanos(),
-					options.instrumentationMode().equals("strict"));
+					options.instrumentationMode().equals("strict"), maximumParked, maximumOutstanding,
+					processPeaks.peaks());
+		}
+
+		private void close() {
+			processPeaks.close();
 		}
 	}
 
-	private record PoolCounters(long accepted,
+	private record PoolCounters(long submissionAttempts,
+			long accepted,
 			long started,
 			long completed,
 			long failed,
-			long outcomes) {
+			long outcomes,
+			boolean exactAccounting) {
 
 		private static PoolCounters capture(EmbeddedConnection embedded) {
 			var snapshot = embedded.getScheduler().poolSnapshot(RWScheduler.Pool.READ);
-			return new PoolCounters(snapshot.acceptedTasks(), snapshot.startedTasks(), snapshot.completedTasks(),
-					snapshot.failedTasks(), snapshot.outcomes().values().stream().mapToLong(Long::longValue).sum());
+			return new PoolCounters(BenchmarkSchedulerTelemetry.submissionAttempts(snapshot),
+					snapshot.acceptedTasks(), snapshot.startedTasks(), snapshot.completedTasks(),
+					snapshot.failedTasks(), BenchmarkSchedulerTelemetry.terminalOutcomes(snapshot),
+					BenchmarkSchedulerTelemetry.exactAccounting());
 		}
 
 		private PoolCounters minus(PoolCounters before) {
-			return new PoolCounters(accepted - before.accepted, started - before.started,
-					completed - before.completed, failed - before.failed, outcomes - before.outcomes);
+			return new PoolCounters(submissionAttempts - before.submissionAttempts,
+					accepted - before.accepted, started - before.started,
+					completed - before.completed, failed - before.failed, outcomes - before.outcomes,
+					exactAccounting && before.exactAccounting);
 		}
 
 		private boolean conserved() {
-			return accepted > 0L && started == completed && failed == 0L && outcomes == accepted;
+			long expectedOutcomes = exactAccounting ? submissionAttempts : accepted;
+			return expectedOutcomes > 0L && started == completed && failed == 0L
+					&& outcomes == expectedOutcomes;
 		}
 	}
 
@@ -1134,6 +1301,10 @@ public final class GrpcRawScanBenchmark {
 			long fullBatches,
 			int maximumBatchBytes,
 			long scanP99Nanos,
+			double cpuNanosPerEntry,
+			double allocatedBytesPerEntry,
+			long gcCollections,
+			long gcMillis,
 			SchedulerMetrics schedulerMetrics,
 			RequestAccounting requests,
 			PoolUtilization utilization,
@@ -1143,6 +1314,9 @@ public final class GrpcRawScanBenchmark {
 
 	private record WorkerResult(Implementation implementation,
 			int round,
+			String buildSha,
+			String classPathSha256,
+			String datasetId,
 			double bytesPerSecond,
 			double entriesPerSecond,
 			long scans,
@@ -1153,12 +1327,23 @@ public final class GrpcRawScanBenchmark {
 			long scanP99Nanos,
 			long queueP99Nanos,
 			long executionP99Nanos,
+			double cpuNanosPerEntry,
+			double allocatedBytesPerEntry,
+			long gcCollections,
+			long gcMillis,
+			long peakLiveHeapBytes,
+			long peakDirectMemoryBytes,
+			long peakResidentSetBytes,
+			int peakThreadCount,
+			long peakNativeHandles,
 			long submittedRequests,
 			long terminalRequests,
 			long duplicateTerminals,
 			long inFlightRequests,
 			long nonOkRequests,
 			long schedulerAccepted,
+			long schedulerSubmissionAttempts,
+			boolean schedulerAccountingExact,
 			long schedulerStarted,
 			long schedulerCompleted,
 			long schedulerOutcomes,
@@ -1167,15 +1352,23 @@ public final class GrpcRawScanBenchmark {
 			long saturatingDemandSamples,
 			int maximumActive,
 			int workerCount,
+			int maximumParked,
+			int maximumOutstanding,
 			long maximumAvoidableIdleNanos,
 			boolean exactWaitingWorkers,
 			boolean resourcesDrained,
 			long nativeLeaks,
 			boolean passed) {
 
-		private static WorkerResult from(Options options, WorkerMeasurement measurement, long nativeLeaks) {
+		private static WorkerResult from(Options options,
+				String buildSha,
+				String classPathSha256,
+				String datasetId,
+				WorkerMeasurement measurement,
+				long nativeLeaks) {
 			double seconds = measurement.elapsedNanos() / 1_000_000_000.0d;
 			boolean hasFullBatch = options.smoke() || measurement.fullBatches() > 0L;
+			BenchmarkProcessTelemetry.Peaks processPeaks = measurement.utilization().processPeaks();
 			boolean passed = measurement.scans() > 0L
 					&& measurement.entries() == measurement.scans() * options.preloadKeys()
 					&& measurement.batches() > 0L
@@ -1184,24 +1377,39 @@ public final class GrpcRawScanBenchmark {
 					&& measurement.scanP99Nanos() > 0L
 					&& measurement.schedulerMetrics().queueP99Nanos() > 0L
 					&& measurement.schedulerMetrics().executionP99Nanos() > 0L
+					&& Double.isFinite(measurement.cpuNanosPerEntry())
+					&& measurement.cpuNanosPerEntry() > 0.0d
+					&& Double.isFinite(measurement.allocatedBytesPerEntry())
+					&& measurement.allocatedBytesPerEntry() > 0.0d
+					&& measurement.gcCollections() >= 0L && measurement.gcMillis() >= 0L
+					&& processPeaks.complete()
 					&& measurement.requests().conserved()
 					&& measurement.utilization().passed()
 					&& measurement.counters().conserved()
+					&& (options.implementation() == Implementation.BASELINE
+							|| measurement.counters().exactAccounting())
 					&& measurement.resourcesDrained()
 					&& nativeLeaks == 0L;
-			return new WorkerResult(options.implementation(), options.round(),
+			return new WorkerResult(options.implementation(), options.round(), buildSha,
+					classPathSha256, datasetId,
 					measurement.serializedBytes() / seconds, measurement.entries() / seconds,
 					measurement.scans(), measurement.entries(), measurement.batches(), measurement.fullBatches(),
 					measurement.maximumBatchBytes(), measurement.scanP99Nanos(),
 					measurement.schedulerMetrics().queueP99Nanos(),
 					measurement.schedulerMetrics().executionP99Nanos(),
+					measurement.cpuNanosPerEntry(), measurement.allocatedBytesPerEntry(),
+					measurement.gcCollections(), measurement.gcMillis(), processPeaks.liveHeapBytes(),
+					processPeaks.directMemoryBytes(), processPeaks.residentSetBytes(),
+					processPeaks.threadCount(), processPeaks.nativeHandles(),
 					measurement.requests().submitted(), measurement.requests().terminal(),
 					measurement.requests().duplicateTerminal(), measurement.requests().inFlight(),
 					measurement.requests().nonOk(), measurement.counters().accepted(),
+					measurement.counters().submissionAttempts(), measurement.counters().exactAccounting(),
 					measurement.counters().started(), measurement.counters().completed(),
 					measurement.counters().outcomes(), measurement.counters().failed(),
 					measurement.utilization().samples(), measurement.utilization().saturatingDemandSamples(),
 					measurement.utilization().maximumActive(), measurement.utilization().workerCount(),
+					measurement.utilization().maximumParked(), measurement.utilization().maximumOutstanding(),
 					measurement.utilization().maximumAvoidableIdleNanos(),
 					measurement.utilization().exactWaitingWorkers(), measurement.resourcesDrained(), nativeLeaks, passed);
 		}
@@ -1211,6 +1419,9 @@ public final class GrpcRawScanBenchmark {
 			properties.setProperty("schema", WORKER_SCHEMA);
 			properties.setProperty("implementation", implementation.value);
 			properties.setProperty("round", Integer.toString(round));
+			properties.setProperty("build-sha", buildSha);
+			properties.setProperty("classpath-sha256", classPathSha256);
+			properties.setProperty("dataset-id", datasetId);
 			properties.setProperty("bytes-per-second", Double.toString(bytesPerSecond));
 			properties.setProperty("entries-per-second", Double.toString(entriesPerSecond));
 			properties.setProperty("scans", Long.toString(scans));
@@ -1221,12 +1432,23 @@ public final class GrpcRawScanBenchmark {
 			properties.setProperty("scan-p99-nanos", Long.toString(scanP99Nanos));
 			properties.setProperty("queue-p99-nanos", Long.toString(queueP99Nanos));
 			properties.setProperty("execution-p99-nanos", Long.toString(executionP99Nanos));
+			properties.setProperty("cpu-nanos-per-entry", Double.toString(cpuNanosPerEntry));
+			properties.setProperty("allocated-bytes-per-entry", Double.toString(allocatedBytesPerEntry));
+			properties.setProperty("gc-collections", Long.toString(gcCollections));
+			properties.setProperty("gc-millis", Long.toString(gcMillis));
+			properties.setProperty("peak-live-heap-bytes", Long.toString(peakLiveHeapBytes));
+			properties.setProperty("peak-direct-memory-bytes", Long.toString(peakDirectMemoryBytes));
+			properties.setProperty("peak-resident-set-bytes", Long.toString(peakResidentSetBytes));
+			properties.setProperty("peak-thread-count", Integer.toString(peakThreadCount));
+			properties.setProperty("peak-native-handles", Long.toString(peakNativeHandles));
 			properties.setProperty("submitted-requests", Long.toString(submittedRequests));
 			properties.setProperty("terminal-requests", Long.toString(terminalRequests));
 			properties.setProperty("duplicate-terminals", Long.toString(duplicateTerminals));
 			properties.setProperty("in-flight-requests", Long.toString(inFlightRequests));
 			properties.setProperty("non-ok-requests", Long.toString(nonOkRequests));
 			properties.setProperty("scheduler-accepted", Long.toString(schedulerAccepted));
+			properties.setProperty("scheduler-submission-attempts", Long.toString(schedulerSubmissionAttempts));
+			properties.setProperty("scheduler-accounting-exact", Boolean.toString(schedulerAccountingExact));
 			properties.setProperty("scheduler-started", Long.toString(schedulerStarted));
 			properties.setProperty("scheduler-completed", Long.toString(schedulerCompleted));
 			properties.setProperty("scheduler-outcomes", Long.toString(schedulerOutcomes));
@@ -1235,6 +1457,8 @@ public final class GrpcRawScanBenchmark {
 			properties.setProperty("saturating-demand-samples", Long.toString(saturatingDemandSamples));
 			properties.setProperty("maximum-active", Integer.toString(maximumActive));
 			properties.setProperty("worker-count", Integer.toString(workerCount));
+			properties.setProperty("maximum-parked", Integer.toString(maximumParked));
+			properties.setProperty("maximum-outstanding", Integer.toString(maximumOutstanding));
 			properties.setProperty("maximum-avoidable-idle-nanos", Long.toString(maximumAvoidableIdleNanos));
 			properties.setProperty("exact-waiting-workers", Boolean.toString(exactWaitingWorkers));
 			properties.setProperty("resources-drained", Boolean.toString(resourcesDrained));
@@ -1245,7 +1469,12 @@ public final class GrpcRawScanBenchmark {
 			}
 		}
 
-		private static WorkerResult read(Path input) throws IOException {
+		private static WorkerResult read(Path input,
+				Implementation expectedImplementation,
+				int expectedRound,
+				String expectedBuildSha,
+				String expectedClassPathSha256,
+				String expectedDatasetId) throws IOException {
 			Properties values = new Properties();
 			try (InputStream stream = Files.newInputStream(input)) {
 				values.load(stream);
@@ -1253,37 +1482,76 @@ public final class GrpcRawScanBenchmark {
 			if (!WORKER_SCHEMA.equals(required(values, "schema"))) {
 				throw new IllegalArgumentException("Unknown raw-scan worker schema: " + input);
 			}
-			return new WorkerResult(Implementation.parse(required(values, "implementation")),
-					integer(values, "round"), decimal(values, "bytes-per-second"),
+			if (!values.stringPropertyNames().equals(WORKER_KEYS)) {
+				throw new IllegalArgumentException("Raw-scan worker property set does not match "
+						+ WORKER_SCHEMA + ": " + input);
+			}
+			WorkerResult result = new WorkerResult(Implementation.parse(required(values, "implementation")),
+					integer(values, "round"), required(values, "build-sha"),
+					required(values, "classpath-sha256"), required(values, "dataset-id"),
+					decimal(values, "bytes-per-second"),
 					decimal(values, "entries-per-second"), number(values, "scans"),
 					number(values, "entries"), number(values, "batches"), number(values, "full-batches"),
 					integer(values, "maximum-batch-bytes"), number(values, "scan-p99-nanos"),
 					number(values, "queue-p99-nanos"), number(values, "execution-p99-nanos"),
+					decimal(values, "cpu-nanos-per-entry"), decimal(values, "allocated-bytes-per-entry"),
+					number(values, "gc-collections"), number(values, "gc-millis"),
+					number(values, "peak-live-heap-bytes"), number(values, "peak-direct-memory-bytes"),
+					number(values, "peak-resident-set-bytes"), integer(values, "peak-thread-count"),
+					number(values, "peak-native-handles"),
 					number(values, "submitted-requests"), number(values, "terminal-requests"),
 					number(values, "duplicate-terminals"), number(values, "in-flight-requests"),
 					number(values, "non-ok-requests"), number(values, "scheduler-accepted"),
+					number(values, "scheduler-submission-attempts"),
+					bool(values, "scheduler-accounting-exact"),
 					number(values, "scheduler-started"), number(values, "scheduler-completed"),
 					number(values, "scheduler-outcomes"), number(values, "scheduler-failures"),
 					number(values, "sampler-samples"), number(values, "saturating-demand-samples"),
 					integer(values, "maximum-active"), integer(values, "worker-count"),
+					integer(values, "maximum-parked"), integer(values, "maximum-outstanding"),
 					number(values, "maximum-avoidable-idle-nanos"), bool(values, "exact-waiting-workers"),
 					bool(values, "resources-drained"), number(values, "native-leaks"), bool(values, "passed"));
+			if (result.implementation() != expectedImplementation || result.round() != expectedRound
+					|| !result.buildSha().equals(expectedBuildSha)
+					|| !result.classPathSha256().equals(expectedClassPathSha256)
+					|| !result.datasetId().equals(expectedDatasetId)) {
+				throw new IllegalArgumentException("Raw-scan worker provenance mismatch: " + input);
+			}
+			return result;
 		}
 	}
 
-	public record Comparison(GrpcOverloadBenchmark.RatioConfidenceInterval throughput,
-			GrpcOverloadBenchmark.RatioConfidenceInterval queueP99,
-			GrpcOverloadBenchmark.RatioConfidenceInterval scanP99,
+	public record Comparison(Map<String, GrpcOverloadBenchmark.RatioConfidenceInterval> metrics,
+			List<String> materialImprovements,
+			List<String> exceptionCandidates,
 			List<String> failures) {
 
 		public Comparison {
+			metrics = java.util.Collections.unmodifiableMap(new LinkedHashMap<>(metrics));
+			materialImprovements = List.copyOf(materialImprovements);
+			exceptionCandidates = List.copyOf(exceptionCandidates);
 			failures = List.copyOf(failures);
 		}
 
 		private static Comparison failed(String failure) {
-			var unavailable = new GrpcOverloadBenchmark.RatioConfidenceInterval(0,
-					Double.NaN, Double.NaN, Double.NaN);
-			return new Comparison(unavailable, unavailable, unavailable, List.of(failure));
+			return new Comparison(Map.of(), List.of(), List.of(), List.of(failure));
+		}
+
+		public GrpcOverloadBenchmark.RatioConfidenceInterval throughput() {
+			return metric("mib-per-second");
+		}
+
+		public GrpcOverloadBenchmark.RatioConfidenceInterval queueP99() {
+			return metric("queue-p99");
+		}
+
+		public GrpcOverloadBenchmark.RatioConfidenceInterval scanP99() {
+			return metric("scan-p99");
+		}
+
+		private GrpcOverloadBenchmark.RatioConfidenceInterval metric(String name) {
+			return metrics.getOrDefault(name, new GrpcOverloadBenchmark.RatioConfidenceInterval(
+					0, Double.NaN, Double.NaN, Double.NaN));
 		}
 
 		public boolean passed() {
@@ -1426,10 +1694,6 @@ public final class GrpcRawScanBenchmark {
 			int rounds,
 			int sampleMicros,
 			String instrumentationMode,
-			boolean strictNonInferiority,
-			double minimumThroughputRatio,
-			double maximumQueueP99Ratio,
-			double maximumScanP99Ratio,
 			String childHeap,
 			boolean enforce,
 			boolean smoke) {
@@ -1440,8 +1704,6 @@ public final class GrpcRawScanBenchmark {
 				"build-state-candidate", "storage-label", "host-state", "preload-keys", "flush-keys",
 				"value-bytes", "batch-entries", "scan-clients", "read-parallelism", "write-parallelism",
 				"warmup-passes", "measure-seconds", "rounds", "sample-micros", "instrumentation-mode",
-				"strict-non-inferiority",
-				"minimum-throughput-ratio", "maximum-queue-p99-ratio", "maximum-scan-p99-ratio",
 				"child-heap", "enforce", "smoke");
 
 		private static Options parse(String[] args) {
@@ -1459,7 +1721,6 @@ public final class GrpcRawScanBenchmark {
 			}
 			boolean worker = bool(values, "worker", false);
 			boolean smoke = bool(values, "smoke", false);
-			boolean strictNonInferiority = bool(values, "strict-non-inferiority", false);
 			Path root = Path.of(values.getOrDefault("root", Path.of(System.getProperty("java.io.tmpdir"),
 					"rockserver-raw-scan-" + System.currentTimeMillis()).toString()));
 			Options options = new Options(worker, root,
@@ -1481,13 +1742,9 @@ public final class GrpcRawScanBenchmark {
 					integer(values, "read-parallelism", smoke ? 4 : 20),
 					integer(values, "write-parallelism", smoke ? 4 : 8),
 					integer(values, "warmup-passes", 1), integer(values, "measure-seconds", smoke ? 2 : 15),
-					integer(values, "rounds", smoke ? 1 : strictNonInferiority ? 10 : 5),
+					integer(values, "rounds", smoke ? 1 : 10),
 					integer(values, "sample-micros", 250),
 					values.getOrDefault("instrumentation-mode", worker ? "strict" : "controller"),
-					strictNonInferiority,
-					decimal(values, "minimum-throughput-ratio", strictNonInferiority ? 0.99d : 1.0d),
-					decimal(values, "maximum-queue-p99-ratio", strictNonInferiority ? 1.02d : 1.0d),
-					decimal(values, "maximum-scan-p99-ratio", strictNonInferiority ? 1.02d : 1.0d),
 					values.getOrDefault("child-heap", smoke ? "1g" : "4g"),
 					bool(values, "enforce", !smoke), smoke);
 			options.validate();
@@ -1509,13 +1766,8 @@ public final class GrpcRawScanBenchmark {
 			if (worker && instrumentationMode.equals("controller")) {
 				throw new IllegalArgumentException("workers require strict or portable instrumentation");
 			}
-			if (strictNonInferiority && !worker && rounds != 10) {
-				throw new IllegalArgumentException("strict raw-SST comparison requires exactly ten paired rounds");
-			}
-			if (!Double.isFinite(minimumThroughputRatio) || minimumThroughputRatio <= 0.0d
-					|| !Double.isFinite(maximumQueueP99Ratio) || maximumQueueP99Ratio <= 0.0d
-					|| !Double.isFinite(maximumScanP99Ratio) || maximumScanP99Ratio <= 0.0d) {
-				throw new IllegalArgumentException("comparison ratios must be finite and positive");
+			if (!worker && !smoke && rounds != PairedPerformanceContract.REQUIRED_PAIRS) {
+				throw new IllegalArgumentException("raw-SST comparison requires exactly ten paired rounds");
 			}
 			if (!worker) {
 				if (!Files.isDirectory(baselineClasses) || !Files.isDirectory(candidateClasses)) {
@@ -1526,10 +1778,11 @@ public final class GrpcRawScanBenchmark {
 				}
 			}
 			if (enforce) {
-				if (smoke || worker || rounds < (strictNonInferiority ? 10 : 5)
+				if (smoke || worker || rounds != PairedPerformanceContract.REQUIRED_PAIRS
 						|| preloadKeys < 1_000_000 || flushKeys > 125_000
 						|| scanClients * 4 < readParallelism || readParallelism < 20 || measureSeconds < 15
 						|| !buildBaseline.matches("[0-9a-f]{40}") || !buildCandidate.matches("[0-9a-f]{40}")
+						|| !buildBaseline.equals(PERFORMANCE_BASELINE_SHA)
 						|| !buildStateBaseline.equals("clean") || !buildStateCandidate.equals("clean")
 						|| !hostState.equals("dedicated") || storageLabel.equals("ci-structural")) {
 					throw new IllegalArgumentException("enforced raw-scan comparison requires clean full SHAs, "
@@ -1566,22 +1819,30 @@ public final class GrpcRawScanBenchmark {
 	}
 
 	private static double decimal(Properties values, String key) {
-		return Double.parseDouble(required(values, key));
+		double value = Double.parseDouble(required(values, key));
+		if (!Double.isFinite(value)) {
+			throw new IllegalArgumentException("Non-finite decimal property: " + key);
+		}
+		return value;
 	}
 
 	private static boolean bool(Properties values, String key) {
-		return Boolean.parseBoolean(required(values, key));
+		String value = required(values, key);
+		if (!value.equals("true") && !value.equals("false")) {
+			throw new IllegalArgumentException("Invalid boolean property: " + key);
+		}
+		return Boolean.parseBoolean(value);
 	}
 
 	private static int integer(Map<String, String> values, String key, int fallback) {
 		return Integer.parseInt(values.getOrDefault(key, Integer.toString(fallback)));
 	}
 
-	private static double decimal(Map<String, String> values, String key, double fallback) {
-		return Double.parseDouble(values.getOrDefault(key, Double.toString(fallback)));
-	}
-
 	private static boolean bool(Map<String, String> values, String key, boolean fallback) {
-		return Boolean.parseBoolean(values.getOrDefault(key, Boolean.toString(fallback)));
+		String value = values.getOrDefault(key, Boolean.toString(fallback));
+		if (!value.equals("true") && !value.equals("false")) {
+			throw new IllegalArgumentException("Invalid boolean option: --" + key);
+		}
+		return Boolean.parseBoolean(value);
 	}
 }

@@ -17,6 +17,7 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -56,6 +57,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Stream;
+import org.rocksdb.RocksDB;
 
 /**
  * Opt-in, disk-backed workload benchmark that keeps all seven scheduler profiles active.
@@ -63,7 +65,8 @@ import java.util.stream.Stream;
  */
 public final class SevenProfileWorkloadBenchmark {
 
-	private static final String RESULT_SCHEMA = "rockserver-seven-profile-workload-v3";
+	private static final String RESULT_SCHEMA = "rockserver-seven-profile-workload-v4";
+	static final String PARETO_WORKER_SCHEMA = "rockserver-seven-profile-pareto-worker-v1";
 	private static final String DATASET_SCHEMA = "rockserver-seven-profile-dataset-v3";
 	private static final String RUN_ATTEMPT_SCHEMA = "rockserver-seven-profile-run-attempt-v1";
 	private static final String RUN_ATTEMPT_FILE = "run-attempt.properties";
@@ -109,8 +112,13 @@ public final class SevenProfileWorkloadBenchmark {
 
 		validateOptionNames(raw, RUN_OPTIONS);
 		Options options = Options.parse(raw);
+		if (options.enforce()) {
+			GrpcRetainedReadBenchmark.verifyBuildCheckout(productionClassesLocation(),
+					options.buildId(), "clean");
+		}
 		System.setProperty("rockserver.core.print-config", "false");
 		System.setProperty("it.cavallium.rockserver.leakdetection", "true");
+		BenchmarkProcessTelemetry.enableAllocationMeasurement();
 		Instant started = Instant.now();
 		long nativeLeaksBefore = RocksLeakDetector.detectedLeakCount();
 		double ingestIsolatedBaseline = options.prepareOnly() || options.ingestBaselineOnly()
@@ -410,11 +418,16 @@ public final class SevenProfileWorkloadBenchmark {
 		sleepPhase(options.warmupSeconds(), control.stop());
 		composite.add(meterRegistry);
 		registryAdded = true;
+		observation.resetMeasurementPeaks();
+		BenchmarkProcessTelemetry.ProcessSnapshot processBefore =
+				BenchmarkProcessTelemetry.processSnapshot();
 		control.startMeasurement();
 		pressureThread = Thread.ofPlatform().name("seven-profile-pressure").start(
 				() -> pressureLoop(connection, control, pressure, options));
 		sleepPhase(options.measureSeconds(), control.stop());
 		long durationNanos = control.stopMeasurement();
+		BenchmarkProcessTelemetry.ProcessDelta processDelta =
+				BenchmarkProcessTelemetry.processSnapshot().minus(processBefore);
 		stopHarnessWorkers(connection, control, workers, futures, pressureThread);
 		workersStopped = true;
 		ResourceSnapshot resources = awaitDrain(connection);
@@ -424,7 +437,7 @@ public final class SevenProfileWorkloadBenchmark {
 				pressure.snapshot(),
 				resources,
 				snapshotSchedulerMetrics(meterRegistry),
-				stats.errors());
+				stats.errors(), processDelta);
 		} catch (Throwable caught) {
 			failure = caught;
 			throw rethrow(caught);
@@ -437,6 +450,7 @@ public final class SevenProfileWorkloadBenchmark {
 					composite.remove(meterRegistry);
 				}
 				meterRegistry.close();
+				observation.close();
 			} catch (Throwable cleanupFailure) {
 				if (failure != null) {
 					failure.addSuppressed(cleanupFailure);
@@ -721,6 +735,22 @@ public final class SevenProfileWorkloadBenchmark {
 		checks.add(new Check("shutdown_clean", shutdownClean, "shutdown_clean=" + shutdownClean));
 		checks.add(new Check("unexpected_errors", run.errors().isEmpty(),
 				"unexpected_error_count=" + run.errors().size()));
+		long completedOperations = run.operations().values().stream()
+				.mapToLong(OperationMeasurement::completed).sum();
+		if (completedOperations <= 0L) {
+			throw new IllegalStateException("Seven-profile run completed no measured operations");
+		}
+		var process = new ProcessMeasurement(
+				run.processDelta().cpuNanos() / (double) completedOperations,
+				run.processDelta().allocatedBytes() / (double) completedOperations,
+				run.processDelta().gcCollections(), run.processDelta().gcMillis(),
+				run.observation().processPeaks());
+		checks.add(new Check("process_telemetry_complete", process.valid(),
+				"cpu_ns_per_op=" + format(process.cpuNanosPerOperation())
+						+ ", allocation_bytes_per_op=" + format(process.allocatedBytesPerOperation())
+						+ ", rss=" + process.peaks().residentSetBytes()
+						+ ", threads=" + process.peaks().threadCount()
+						+ ", native_handles=" + process.peaks().nativeHandles()));
 		boolean runChecksPassed = checks.stream().allMatch(Check::passed);
 		var measurement = new WorkloadBenchmarkSelector.CandidateMeasurement(
 				options.candidate(), fingerprint, comparisonFingerprint(options), options.buildId(), options.storageLabel(),
@@ -728,7 +758,7 @@ public final class SevenProfileWorkloadBenchmark {
 				run.observation().maximumCdcLag(), run.observation().maximumRetainedSnapshots(),
 				run.observation().maximumStoragePressure(), leakedResources);
 		return new Result(RESULT_SCHEMA, started, finished, options, fingerprint, ingestIsolatedBaseline, run, measurement,
-				List.copyOf(checks), shutdownClean, nativeLeaks);
+				process, List.copyOf(checks), shutdownClean, nativeLeaks);
 	}
 
 	private static boolean profileSlo(WorkloadProfile profile,
@@ -853,12 +883,27 @@ public final class SevenProfileWorkloadBenchmark {
 		var database = connection.getInternalDB();
 		int queued = 0;
 		int active = 0;
-		for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
-			queued += scheduler.queuedTasks(profile);
-			active += scheduler.activeTasks(profile);
+		int parked = 0;
+		int outstanding = 0;
+		long submissionAttempts = 0L;
+		long terminalOutcomes = 0L;
+		for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
+			var poolSnapshot = scheduler.poolSnapshot(pool);
+			queued += poolSnapshot.queuedTasks();
+			active += poolSnapshot.activeTasks();
+			int poolOutstanding = BenchmarkSchedulerTelemetry.outstandingTasks(poolSnapshot);
+			parked += BenchmarkSchedulerTelemetry.parkedTasks(poolSnapshot, poolOutstanding);
+			outstanding += poolOutstanding;
+			submissionAttempts += BenchmarkSchedulerTelemetry.submissionAttempts(poolSnapshot);
+			terminalOutcomes += BenchmarkSchedulerTelemetry.terminalOutcomes(poolSnapshot);
 		}
 		return new ResourceSnapshot(queued,
 				active,
+				parked,
+				outstanding,
+				submissionAttempts,
+				terminalOutcomes,
+				BenchmarkSchedulerTelemetry.exactAccounting(),
 				database.getPendingOpsCount(),
 				database.getOpenTransactionsCount(),
 				database.getOpenIteratorsCount(),
@@ -874,6 +919,118 @@ public final class SevenProfileWorkloadBenchmark {
 				StandardOpenOption.CREATE_NEW);
 		WorkloadBenchmarkSelection.writeSelectionInput(root.resolve("selection-input.properties"),
 				result.measurement());
+		Files.writeString(root.resolve("pareto-worker.properties"), toParetoProperties(result),
+				StandardOpenOption.CREATE_NEW);
+	}
+
+	private static String toParetoProperties(Result result) throws IOException {
+		StringBuilder out = new StringBuilder(8_192);
+		appendProperty(out, "schema", PARETO_WORKER_SCHEMA);
+		appendProperty(out, "build-sha", result.options().buildId());
+		appendProperty(out, "started-epoch-millis", result.started().toEpochMilli());
+		appendProperty(out, "finished-epoch-millis", result.finished().toEpochMilli());
+		appendProperty(out, "process-id", ProcessHandle.current().pid());
+		appendProperty(out, "java-runtime", System.getProperty("java.runtime.version"));
+		appendProperty(out, "java-home", System.getProperty("java.home"));
+		appendProperty(out, "rocksdb-version", RocksDB.rocksdbVersion());
+		appendProperty(out, "production-classes-sha256", GrpcRetainedReadBenchmark
+				.classPathContentSha256ForTesting(productionClassesLocation().toString()));
+		appendProperty(out, "classpath-sha256", GrpcRetainedReadBenchmark
+				.classPathContentSha256ForTesting(System.getProperty("java.class.path")));
+		appendProperty(out, "rocksdb-artifact-sha256", GrpcRetainedReadBenchmark
+				.classPathContentSha256ForTesting(codeSourceLocation(RocksDB.class).toString()));
+		appendProperty(out, "hardware-description", hardwareDescription());
+		appendProperty(out, "dataset-fingerprint", result.datasetFingerprint());
+		appendProperty(out, "configuration-fingerprint", paretoConfigurationFingerprint(result.options()));
+		appendProperty(out, "storage-label", result.options().storageLabel());
+		appendProperty(out, "cache-state", result.options().cacheState());
+		appendProperty(out, "enforced-hardware-run", result.options().enforce());
+		appendProperty(out, "candidate", result.options().candidate());
+		appendProperty(out, "duration-nanos", result.run().durationNanos());
+		appendProperty(out, "workload-checks-passed", result.acceptancePassed());
+		appendProperty(out, "resources-drained", result.run().resources().leakedResources() == 0L);
+		appendProperty(out, "native-leaks", result.nativeLeaks());
+		appendProperty(out, "cpu-nanos-per-operation", result.processMeasurement().cpuNanosPerOperation());
+		appendProperty(out, "allocated-bytes-per-operation",
+				result.processMeasurement().allocatedBytesPerOperation());
+		appendProperty(out, "gc-collections", result.processMeasurement().gcCollections());
+		appendProperty(out, "gc-millis", result.processMeasurement().gcMillis());
+		var peaks = result.processMeasurement().peaks();
+		appendProperty(out, "peak-live-heap-bytes", peaks.liveHeapBytes());
+		appendProperty(out, "peak-direct-memory-bytes", peaks.directMemoryBytes());
+		appendProperty(out, "peak-resident-set-bytes", peaks.residentSetBytes());
+		appendProperty(out, "peak-thread-count", peaks.threadCount());
+		appendProperty(out, "peak-native-handles", peaks.nativeHandles());
+		appendProperty(out, "maximum-retained-snapshots", result.measurement().maximumRetainedSnapshots());
+		var resources = result.run().resources();
+		appendProperty(out, "final-queued", resources.queued());
+		appendProperty(out, "final-active", resources.active());
+		appendProperty(out, "final-parked", resources.parked());
+		appendProperty(out, "final-outstanding", resources.outstanding());
+		appendProperty(out, "submission-attempts", resources.submissionAttempts());
+		appendProperty(out, "terminal-outcomes", resources.terminalOutcomes());
+		appendProperty(out, "scheduler-accounting-exact", resources.exactSchedulerAccounting());
+		appendProperty(out, "final-pending", resources.pending());
+		appendProperty(out, "final-transactions", resources.transactions());
+		appendProperty(out, "final-iterators", resources.iterators());
+		appendProperty(out, "final-range-cursors", resources.rangeCursors());
+		appendProperty(out, "final-retained-snapshots", resources.retainedSnapshots());
+		appendProperty(out, "maximum-parked", result.run().observation().maximumParked());
+		appendProperty(out, "maximum-outstanding", result.run().observation().maximumOutstanding());
+		for (WorkloadProfile profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
+			String prefix = "profile." + metricName(profile) + '.';
+			var value = result.measurement().profiles().get(profile);
+			appendProperty(out, prefix + "throughput", value.throughput());
+			appendProperty(out, prefix + "queue-p99-nanos", value.queueP99Nanos());
+			appendProperty(out, prefix + "execution-p99-nanos", value.executionP99Nanos());
+			appendProperty(out, prefix + "end-to-end-p99-nanos", value.endToEndP99Nanos());
+			appendProperty(out, prefix + "maximum-queued",
+					result.run().observation().maximumQueued().get(profile));
+			appendProperty(out, prefix + "maximum-active",
+					result.run().observation().maximumActive().get(profile));
+		}
+		return out.toString();
+	}
+
+	private static void appendProperty(StringBuilder target, String key, Object value) {
+		target.append(key).append('=').append(value).append('\n');
+	}
+
+	private static Path productionClassesLocation() {
+		return codeSourceLocation(RWScheduler.class);
+	}
+
+	private static Path codeSourceLocation(Class<?> type) {
+		try {
+			return Path.of(type.getProtectionDomain().getCodeSource().getLocation().toURI())
+					.toAbsolutePath().normalize();
+		} catch (java.net.URISyntaxException | NullPointerException invalid) {
+			throw new IllegalStateException("Unable to resolve code source for " + type.getName(), invalid);
+		}
+	}
+
+	private static String hardwareDescription() {
+		var os = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+		long memory = os instanceof com.sun.management.OperatingSystemMXBean extended
+				? extended.getTotalMemorySize() : -1L;
+		String cpu = System.getProperty("os.arch", "unknown");
+		Path cpuInfo = Path.of("/proc/cpuinfo");
+		if (Files.isReadable(cpuInfo)) {
+			try {
+				for (String line : Files.readAllLines(cpuInfo)) {
+					int separator = line.indexOf(':');
+					if (separator > 0 && line.substring(0, separator).trim().equalsIgnoreCase("model name")) {
+						cpu = line.substring(separator + 1).trim();
+						break;
+					}
+				}
+			} catch (IOException ignored) {
+				// Architecture remains an explicit portable fallback.
+			}
+		}
+		return (os.getName() + '|' + os.getVersion() + '|' + os.getArch() + '|'
+				+ os.getAvailableProcessors() + '|' + memory + '|' + cpu)
+				.replace('=', ':').replace('\n', ' ').replace('\r', ' ');
 	}
 
 	private static long profileAttemptRejections(RunSnapshot run, WorkloadProfile profile) {
@@ -970,14 +1127,35 @@ public final class SevenProfileWorkloadBenchmark {
 					.append(", \"quantum_count\": ").append(scheduler.quantums())
 					.append(", \"errors\": ").append(operation.errors()).append('}');
 		}
-		json.append("\n  ],\n  \"maximum_cdc_lag\": ").append(result.measurement().maximumCdcLag())
+		var process = result.processMeasurement();
+		json.append("\n  ],\n  \"process_telemetry\": {\"cpu_nanos_per_operation\": ")
+				.append(format(process.cpuNanosPerOperation()))
+				.append(", \"allocated_bytes_per_operation\": ")
+				.append(format(process.allocatedBytesPerOperation()))
+				.append(", \"gc_collections\": ").append(process.gcCollections())
+				.append(", \"gc_millis\": ").append(process.gcMillis())
+				.append(", \"peak_live_heap_bytes\": ").append(process.peaks().liveHeapBytes())
+				.append(", \"peak_direct_memory_bytes\": ").append(process.peaks().directMemoryBytes())
+				.append(", \"peak_resident_set_bytes\": ").append(process.peaks().residentSetBytes())
+				.append(", \"peak_thread_count\": ").append(process.peaks().threadCount())
+				.append(", \"peak_native_handles\": ").append(process.peaks().nativeHandles())
+				.append("},\n  \"maximum_cdc_lag\": ").append(result.measurement().maximumCdcLag())
 				.append(",\n  \"cdc_lag_observed\": ").append(result.run().observation().cdcLagObserved())
 				.append(",\n  \"maximum_retained_snapshots\": ").append(result.measurement().maximumRetainedSnapshots())
+				.append(",\n  \"maximum_parked\": ").append(result.run().observation().maximumParked())
+				.append(",\n  \"maximum_outstanding\": ").append(result.run().observation().maximumOutstanding())
 				.append(",\n  \"maximum_storage_pressure\": ").append(result.measurement().maximumStoragePressure())
 				.append(",\n  \"batch_after_pressure\": ").append(result.run().pressure().batchAfterPressure())
 				.append(",\n  \"physical_during_pressure\": ").append(result.run().pressure().physicalDuringPressure())
 				.append(",\n  \"resources_after_drain\": {\"queued\": ").append(result.run().resources().queued())
 				.append(", \"active\": ").append(result.run().resources().active())
+				.append(", \"parked\": ").append(result.run().resources().parked())
+				.append(", \"outstanding\": ").append(result.run().resources().outstanding())
+				.append(", \"submission_attempts\": ")
+				.append(result.run().resources().submissionAttempts())
+				.append(", \"terminal_outcomes\": ").append(result.run().resources().terminalOutcomes())
+				.append(", \"scheduler_accounting_exact\": ")
+				.append(result.run().resources().exactSchedulerAccounting())
 				.append(", \"pending\": ").append(result.run().resources().pending())
 				.append(", \"transactions\": ").append(result.run().resources().transactions())
 				.append(", \"iterators\": ").append(result.run().resources().iterators())
@@ -1118,11 +1296,23 @@ public final class SevenProfileWorkloadBenchmark {
 	}
 
 	private static String comparisonFingerprint(Options options) {
-		return sha256("rockserver-seven-profile-comparison-v2"
+		return sha256("rockserver-seven-profile-comparison-v3"
+				+ "\nbuild-id=" + options.buildId()
+				+ paretoConfigurationShape(options));
+	}
+
+	private static String paretoConfigurationFingerprint(Options options) {
+		return sha256("rockserver-seven-profile-pareto-configuration-v1"
+				+ paretoConfigurationShape(options));
+	}
+
+	private static String paretoConfigurationShape(Options options) {
+		return ""
 				+ "\ndataset=" + datasetFingerprint(options)
 				+ "\ndatabase-name=" + options.databaseName()
-				+ "\nbuild-id=" + options.buildId()
 				+ "\ncache-state=" + options.cacheState()
+				+ "\ncandidate=" + options.candidate()
+				+ "\nstorage-label=" + options.storageLabel()
 				+ "\nrange-width=" + options.rangeWidth()
 				+ "\nwrite-key-space=" + options.writeKeySpace()
 				+ "\nwarmup-seconds=" + options.warmupSeconds()
@@ -1140,7 +1330,7 @@ public final class SevenProfileWorkloadBenchmark {
 				+ "\nmax-latency-samples=" + options.maxLatencySamples()
 				+ "\nwrite-buffer-size=" + options.writeBufferSize()
 				+ "\ndirect-io=" + options.directIo()
-				+ "\nspinning=" + options.spinning());
+				+ "\nspinning=" + options.spinning();
 	}
 
 	private static double loadIngestBaseline(Options options, String datasetFingerprint) throws IOException {
@@ -1449,10 +1639,13 @@ public final class SevenProfileWorkloadBenchmark {
 
 	private record ObservationSnapshot(Map<WorkloadProfile, Integer> maximumQueued,
 			Map<WorkloadProfile, Integer> maximumActive,
+			int maximumParked,
+			int maximumOutstanding,
 			long maximumCdcLag,
 			boolean cdcLagObserved,
 			long maximumRetainedSnapshots,
-			long maximumStoragePressure) {
+			long maximumStoragePressure,
+			BenchmarkProcessTelemetry.Peaks processPeaks) {
 	}
 
 	private record PressureSnapshot(boolean injected,
@@ -1464,6 +1657,11 @@ public final class SevenProfileWorkloadBenchmark {
 
 	private record ResourceSnapshot(int queued,
 			int active,
+			int parked,
+			int outstanding,
+			long submissionAttempts,
+			long terminalOutcomes,
+			boolean exactSchedulerAccounting,
 			long pending,
 			int transactions,
 			int iterators,
@@ -1473,6 +1671,9 @@ public final class SevenProfileWorkloadBenchmark {
 
 		long leakedResources() {
 			long total = saturatingAdd(queued, active);
+			total = saturatingAdd(total, parked);
+			total = saturatingAdd(total, outstanding);
+			if (submissionAttempts != terminalOutcomes) total = saturatingAdd(total, 1L);
 			total = saturatingAdd(total, pending);
 			total = saturatingAdd(total, transactions);
 			total = saturatingAdd(total, iterators);
@@ -1487,10 +1688,24 @@ public final class SevenProfileWorkloadBenchmark {
 			PressureSnapshot pressure,
 			ResourceSnapshot resources,
 			Map<WorkloadKey, SchedulerMetricValues> schedulerMetrics,
-			List<String> errors) {
+			List<String> errors,
+			BenchmarkProcessTelemetry.ProcessDelta processDelta) {
 	}
 
 	private record Check(String name, boolean passed, String detail) {
+	}
+
+	private record ProcessMeasurement(double cpuNanosPerOperation,
+	                                  double allocatedBytesPerOperation,
+	                                  long gcCollections,
+	                                  long gcMillis,
+	                                  BenchmarkProcessTelemetry.Peaks peaks) {
+
+		private boolean valid() {
+			return Double.isFinite(cpuNanosPerOperation) && cpuNanosPerOperation > 0.0d
+					&& Double.isFinite(allocatedBytesPerOperation) && allocatedBytesPerOperation > 0.0d
+					&& gcCollections >= 0L && gcMillis >= 0L && peaks.complete();
+		}
 	}
 
 	private record Result(String schema,
@@ -1501,6 +1716,7 @@ public final class SevenProfileWorkloadBenchmark {
 			double ingestIsolatedBaseline,
 			RunSnapshot run,
 			WorkloadBenchmarkSelector.CandidateMeasurement measurement,
+			ProcessMeasurement processMeasurement,
 			List<Check> checks,
 			boolean shutdownClean,
 			long nativeLeaks) {
@@ -1720,10 +1936,14 @@ public final class SevenProfileWorkloadBenchmark {
 
 		private final EnumMap<WorkloadProfile, AtomicInteger> maximumQueued = new EnumMap<>(WorkloadProfile.class);
 		private final EnumMap<WorkloadProfile, AtomicInteger> maximumActive = new EnumMap<>(WorkloadProfile.class);
+		private final AtomicInteger maximumParked = new AtomicInteger();
+		private final AtomicInteger maximumOutstanding = new AtomicInteger();
 		private final AtomicLong maximumCdcLag = new AtomicLong();
 		private final AtomicBoolean cdcLagObserved = new AtomicBoolean();
 		private final AtomicLong maximumRetainedSnapshots = new AtomicLong();
 		private final AtomicLong maximumStoragePressure = new AtomicLong();
+		private final BenchmarkProcessTelemetry.PeakSampler processPeaks =
+				new BenchmarkProcessTelemetry.PeakSampler();
 
 		private Observation() {
 			for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
@@ -1732,14 +1952,40 @@ public final class SevenProfileWorkloadBenchmark {
 			}
 		}
 
+		private void resetMeasurementPeaks() {
+			for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
+				maximumQueued.get(profile).set(0);
+				maximumActive.get(profile).set(0);
+			}
+			maximumParked.set(0);
+			maximumOutstanding.set(0);
+			maximumCdcLag.set(0L);
+			cdcLagObserved.set(false);
+			maximumRetainedSnapshots.set(0L);
+			maximumStoragePressure.set(0L);
+			processPeaks.reset();
+		}
+
 		private void sample(EmbeddedConnection connection,
 				BenchmarkMeterRegistry meterRegistry,
 				String databaseName) {
 			var admission = connection.getScheduler().admissionSnapshot();
+			var scheduler = connection.getScheduler();
 			for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
 				maximumQueued.get(profile).accumulateAndGet(admission.queued().get(profile), Math::max);
 				maximumActive.get(profile).accumulateAndGet(admission.active().get(profile), Math::max);
 			}
+			int parked = 0;
+			int outstanding = 0;
+			for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
+				var poolSnapshot = scheduler.poolSnapshot(pool);
+				int poolOutstanding = BenchmarkSchedulerTelemetry.outstandingTasks(poolSnapshot);
+				parked += BenchmarkSchedulerTelemetry.parkedTasks(poolSnapshot, poolOutstanding);
+				outstanding += poolOutstanding;
+			}
+			maximumParked.accumulateAndGet(parked, Math::max);
+			maximumOutstanding.accumulateAndGet(outstanding, Math::max);
+			processPeaks.sample();
 			maximumRetainedSnapshots.accumulateAndGet(
 					connection.getInternalDB().getRetainedRangeSnapshotCount(), Math::max);
 			maximumStoragePressure.accumulateAndGet(admission.storagePressure() ? 1L : 0L, Math::max);
@@ -1758,9 +2004,14 @@ public final class SevenProfileWorkloadBenchmark {
 				queued.put(profile, maximumQueued.get(profile).get());
 				active.put(profile, maximumActive.get(profile).get());
 			}
-			return new ObservationSnapshot(Map.copyOf(queued), Map.copyOf(active), maximumCdcLag.get(),
+			return new ObservationSnapshot(Map.copyOf(queued), Map.copyOf(active), maximumParked.get(),
+					maximumOutstanding.get(), maximumCdcLag.get(),
 					cdcLagObserved.get(),
-					maximumRetainedSnapshots.get(), maximumStoragePressure.get());
+					maximumRetainedSnapshots.get(), maximumStoragePressure.get(), processPeaks.peaks());
+		}
+
+		private void close() {
+			processPeaks.close();
 		}
 	}
 

@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-grpc-raw-scan-comparison-v3",
+  "title": "Rockserver paired raw scan comparison v3",
+  "type": "object",
+  "required": [
+    "schema", "comparison_mode", "started", "finished", "build_baseline", "build_candidate",
+    "dataset_id", "classpath_baseline_sha256", "classpath_candidate_sha256", "host_state",
+    "storage_label", "storage_name", "storage_type", "passed", "throughput_ratio",
+    "scheduler_queue_p99_ratio", "scan_p99_ratio", "pareto_metrics", "material_improvements",
+    "exception_candidates", "rounds", "failures"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-grpc-raw-scan-comparison-v3" },
+    "comparison_mode": { "const": "v1.3.11-pareto" },
+    "started": { "type": "string", "format": "date-time" },
+    "finished": { "type": "string", "format": "date-time" },
+    "build_baseline": { "const": "bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e" },
+    "build_candidate": { "$ref": "#/$defs/gitSha" },
+    "dataset_id": { "$ref": "#/$defs/sha256" },
+    "classpath_baseline_sha256": { "$ref": "#/$defs/sha256" },
+    "classpath_candidate_sha256": { "$ref": "#/$defs/sha256" },
+    "host_state": { "const": "dedicated" },
+    "storage_label": { "type": "string", "minLength": 1 },
+    "storage_name": { "type": "string" },
+    "storage_type": { "type": "string" },
+    "passed": { "type": "boolean" },
+    "throughput_ratio": { "$ref": "#/$defs/interval" },
+    "scheduler_queue_p99_ratio": { "$ref": "#/$defs/interval" },
+    "scan_p99_ratio": { "$ref": "#/$defs/interval" },
+    "pareto_metrics": {
+      "type": "object",
+      "required": [
+        "mib-per-second", "entries-per-second", "queue-p99", "execution-p99", "scan-p99",
+        "cpu-nanos-per-entry", "allocated-bytes-per-entry", "peak-live-heap",
+        "peak-direct-memory", "peak-resident-set", "gc-collections", "gc-millis",
+        "peak-thread-count", "peak-native-handles", "peak-parked", "peak-outstanding"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "mib-per-second": { "$ref": "#/$defs/interval" },
+        "entries-per-second": { "$ref": "#/$defs/interval" },
+        "queue-p99": { "$ref": "#/$defs/interval" },
+        "execution-p99": { "$ref": "#/$defs/interval" },
+        "scan-p99": { "$ref": "#/$defs/interval" },
+        "cpu-nanos-per-entry": { "$ref": "#/$defs/interval" },
+        "allocated-bytes-per-entry": { "$ref": "#/$defs/interval" },
+        "peak-live-heap": { "$ref": "#/$defs/interval" },
+        "peak-direct-memory": { "$ref": "#/$defs/interval" },
+        "peak-resident-set": { "$ref": "#/$defs/interval" },
+        "gc-collections": { "$ref": "#/$defs/interval" },
+        "gc-millis": { "$ref": "#/$defs/interval" },
+        "peak-thread-count": { "$ref": "#/$defs/interval" },
+        "peak-native-handles": { "$ref": "#/$defs/interval" },
+        "peak-parked": { "$ref": "#/$defs/interval" },
+        "peak-outstanding": { "$ref": "#/$defs/interval" }
+      }
+    },
+    "material_improvements": {
+      "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 }
+    },
+    "exception_candidates": {
+      "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 }
+    },
+    "rounds": {
+      "type": "array", "minItems": 20, "maxItems": 20,
+      "items": { "$ref": "#/$defs/worker" }
+    },
+    "failures": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "interval": {
+      "type": "object",
+      "required": ["samples", "mean", "lower_95", "upper_95"],
+      "properties": {
+        "samples": { "type": "integer", "minimum": 0 },
+        "mean": { "type": ["number", "null"] },
+        "lower_95": { "type": ["number", "null"] },
+        "upper_95": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "worker": {
+      "type": "object",
+      "required": [
+        "round", "implementation", "build_sha", "classpath_sha256", "dataset_id",
+        "bytes_per_second", "entries_per_second", "scan_p99_nanos",
+        "scheduler_queue_p99_nanos", "scheduler_execution_p99_nanos", "cpu_nanos_per_entry",
+        "allocated_bytes_per_entry", "gc_collections", "gc_millis", "peak_live_heap_bytes",
+        "peak_direct_memory_bytes", "peak_resident_set_bytes", "peak_thread_count",
+        "peak_native_handles", "maximum_read_active", "submitted_requests", "terminal_requests",
+        "duplicate_terminals", "in_flight_requests", "non_ok_requests", "scans", "entries",
+        "batches", "full_batches", "maximum_batch_bytes", "scheduler_accepted",
+        "scheduler_submission_attempts", "scheduler_accounting_exact", "scheduler_started",
+        "scheduler_completed", "scheduler_outcomes", "scheduler_failures", "sampler_samples",
+        "saturating_demand_samples", "maximum_avoidable_idle_nanos", "maximum_parked",
+        "maximum_outstanding", "exact_waiting_workers", "resources_drained", "native_leaks", "passed"
+      ],
+      "properties": {
+        "round": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "implementation": { "enum": ["baseline", "candidate"] },
+        "build_sha": { "$ref": "#/$defs/gitSha" },
+        "classpath_sha256": { "$ref": "#/$defs/sha256" },
+        "dataset_id": { "$ref": "#/$defs/sha256" },
+        "bytes_per_second": { "type": "number", "exclusiveMinimum": 0 },
+        "entries_per_second": { "type": "number", "exclusiveMinimum": 0 },
+        "scan_p99_nanos": { "$ref": "#/$defs/positiveInteger" },
+        "scheduler_queue_p99_nanos": { "$ref": "#/$defs/positiveInteger" },
+        "scheduler_execution_p99_nanos": { "$ref": "#/$defs/positiveInteger" },
+        "cpu_nanos_per_entry": { "type": "number", "exclusiveMinimum": 0 },
+        "allocated_bytes_per_entry": { "type": "number", "exclusiveMinimum": 0 },
+        "gc_collections": { "$ref": "#/$defs/nonNegativeInteger" },
+        "gc_millis": { "$ref": "#/$defs/nonNegativeInteger" },
+        "peak_live_heap_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "peak_direct_memory_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "peak_resident_set_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "peak_thread_count": { "$ref": "#/$defs/positiveInteger" },
+        "peak_native_handles": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_read_active": { "$ref": "#/$defs/positiveInteger" },
+        "submitted_requests": { "$ref": "#/$defs/positiveInteger" },
+        "terminal_requests": { "$ref": "#/$defs/positiveInteger" },
+        "duplicate_terminals": { "$ref": "#/$defs/nonNegativeInteger" },
+        "in_flight_requests": { "$ref": "#/$defs/nonNegativeInteger" },
+        "non_ok_requests": { "$ref": "#/$defs/nonNegativeInteger" },
+        "scans": { "$ref": "#/$defs/positiveInteger" },
+        "entries": { "$ref": "#/$defs/positiveInteger" },
+        "batches": { "$ref": "#/$defs/positiveInteger" },
+        "full_batches": { "$ref": "#/$defs/nonNegativeInteger" },
+        "maximum_batch_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "scheduler_accepted": { "$ref": "#/$defs/positiveInteger" },
+        "scheduler_submission_attempts": { "$ref": "#/$defs/positiveInteger" },
+        "scheduler_accounting_exact": { "type": "boolean" },
+        "scheduler_started": { "$ref": "#/$defs/positiveInteger" },
+        "scheduler_completed": { "$ref": "#/$defs/positiveInteger" },
+        "scheduler_outcomes": { "$ref": "#/$defs/positiveInteger" },
+        "scheduler_failures": { "$ref": "#/$defs/nonNegativeInteger" },
+        "sampler_samples": { "$ref": "#/$defs/positiveInteger" },
+        "saturating_demand_samples": { "$ref": "#/$defs/positiveInteger" },
+        "maximum_avoidable_idle_nanos": { "$ref": "#/$defs/nonNegativeInteger" },
+        "maximum_parked": { "$ref": "#/$defs/nonNegativeInteger" },
+        "maximum_outstanding": { "$ref": "#/$defs/nonNegativeInteger" },
+        "exact_waiting_workers": { "type": "boolean" },
+        "resources_drained": { "type": "boolean" },
+        "native_leaks": { "$ref": "#/$defs/nonNegativeInteger" },
+        "passed": { "type": "boolean" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "implementation": { "const": "candidate" } } },
+          "then": { "properties": { "scheduler_accounting_exact": { "const": true } } }
+        }
+      ]
+    },
+    "positiveInteger": { "type": "integer", "minimum": 1 },
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 }
+  }
+}

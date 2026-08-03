@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:performance-exception-v1",
+  "title": "Rockserver v1.3.11 performance exception evidence",
+  "description": "A separate, explicitly approved record. It never changes an automatic benchmark failure into a pass by itself.",
+  "type": "object",
+  "required": [
+    "schema", "automatic_result", "metric", "direction", "baseline_absolute",
+    "candidate_absolute", "ratio_mean", "lower_95", "upper_95", "exception_ceiling",
+    "causal_commit", "ablation", "required_change", "bounded_impact", "alternatives_profiled",
+    "profiles", "compensating_gain", "hardware_metadata", "approval"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-performance-exception-v1" },
+    "automatic_result": {
+      "type": "object",
+      "required": ["path", "sha256", "schema", "passed"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "schema": { "type": "string", "minLength": 1 },
+        "passed": { "const": false }
+      },
+      "additionalProperties": false
+    },
+    "metric": { "type": "string", "minLength": 1 },
+    "direction": { "enum": ["higher-is-better", "lower-is-better"] },
+    "baseline_absolute": { "type": "number", "minimum": 0 },
+    "candidate_absolute": { "type": "number", "minimum": 0 },
+    "ratio_mean": { "type": "number", "exclusiveMinimum": 0 },
+    "lower_95": { "type": "number", "exclusiveMinimum": 0 },
+    "upper_95": { "type": "number", "exclusiveMinimum": 0 },
+    "exception_ceiling": { "enum": [0.99, 1.02] },
+    "causal_commit": { "$ref": "#/$defs/gitSha" },
+    "ablation": {
+      "type": "object",
+      "required": ["without_commit_sha", "with_commit_sha", "result_paths", "finding"],
+      "properties": {
+        "without_commit_sha": { "$ref": "#/$defs/gitSha" },
+        "with_commit_sha": { "$ref": "#/$defs/gitSha" },
+        "result_paths": { "type": "array", "minItems": 2, "items": { "type": "string", "minLength": 1 } },
+        "finding": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "required_change": { "type": "string", "minLength": 1 },
+    "bounded_impact": { "type": "string", "minLength": 1 },
+    "alternatives_profiled": { "type": "string", "minLength": 1 },
+    "profiles": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256", "tool", "finding"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "tool": { "type": "string", "minLength": 1 },
+          "finding": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "compensating_gain": {
+      "type": "object",
+      "required": ["workload", "metric", "ratio_mean", "lower_95", "upper_95", "result_path"],
+      "properties": {
+        "workload": { "type": "string", "minLength": 1 },
+        "metric": { "type": "string", "minLength": 1 },
+        "ratio_mean": { "type": "number", "exclusiveMinimum": 0 },
+        "lower_95": { "type": "number", "exclusiveMinimum": 0 },
+        "upper_95": { "type": "number", "exclusiveMinimum": 0 },
+        "result_path": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "hardware_metadata": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "approval": {
+      "type": "object",
+      "required": ["approved_by", "approved_at", "scope", "evidence_reference"],
+      "properties": {
+        "approved_by": { "type": "string", "minLength": 1 },
+        "approved_at": { "type": "string", "format": "date-time" },
+        "scope": { "type": "string", "minLength": 1 },
+        "evidence_reference": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

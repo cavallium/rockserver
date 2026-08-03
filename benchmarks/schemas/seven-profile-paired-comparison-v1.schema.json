@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-seven-profile-paired-comparison-v1",
+  "title": "Rockserver paired seven-profile comparison v1",
+  "type": "object",
+  "required": [
+    "schema", "finished", "baseline_sha", "candidate_sha", "dataset_fingerprint",
+    "configuration_fingerprint", "scheduler_candidate", "host_state", "storage_label",
+    "cache_state", "runtime_fingerprint", "hardware_description",
+    "baseline_classpath_sha256", "candidate_classpath_sha256",
+    "baseline_production_sha256", "candidate_production_sha256", "workers_enforced", "fixed_pairs",
+    "adaptive_stopping", "passed", "metrics", "material_improvements",
+    "exception_candidates", "failures"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-seven-profile-paired-comparison-v1" },
+    "finished": { "type": "string", "format": "date-time" },
+    "baseline_sha": { "const": "bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e" },
+    "candidate_sha": { "$ref": "#/$defs/gitSha" },
+    "dataset_fingerprint": { "$ref": "#/$defs/sha256" },
+    "configuration_fingerprint": { "$ref": "#/$defs/sha256" },
+    "scheduler_candidate": { "type": "integer", "minimum": 4 },
+    "host_state": { "const": "dedicated" },
+    "storage_label": { "type": "string", "minLength": 1 },
+    "cache_state": { "type": "string", "minLength": 1 },
+    "runtime_fingerprint": { "type": "string", "minLength": 1 },
+    "hardware_description": { "type": "string", "minLength": 1 },
+    "baseline_classpath_sha256": { "$ref": "#/$defs/sha256" },
+    "candidate_classpath_sha256": { "$ref": "#/$defs/sha256" },
+    "baseline_production_sha256": { "$ref": "#/$defs/sha256" },
+    "candidate_production_sha256": { "$ref": "#/$defs/sha256" },
+    "workers_enforced": { "type": "boolean" },
+    "fixed_pairs": { "const": 10 },
+    "adaptive_stopping": { "const": false },
+    "passed": { "type": "boolean" },
+    "metrics": {
+      "type": "object",
+      "minProperties": 54,
+      "maxProperties": 54,
+      "additionalProperties": { "$ref": "#/$defs/metric" }
+    },
+    "material_improvements": {
+      "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 }
+    },
+    "exception_candidates": {
+      "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 }
+    },
+    "failures": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "metric": {
+      "type": "object",
+      "required": [
+        "baseline", "candidate", "ratio_mean", "lower_95", "upper_95",
+        "automatic_passed", "material_improvement", "exception_candidate"
+      ],
+      "properties": {
+        "baseline": { "$ref": "#/$defs/vector" },
+        "candidate": { "$ref": "#/$defs/vector" },
+        "ratio_mean": { "type": ["number", "null"] },
+        "lower_95": { "type": ["number", "null"] },
+        "upper_95": { "type": ["number", "null"] },
+        "automatic_passed": { "type": "boolean" },
+        "material_improvement": { "type": "boolean" },
+        "exception_candidate": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "vector": {
+      "type": "array", "minItems": 10, "maxItems": 10,
+      "items": { "type": "number", "minimum": 0 }
+    }
+  }
+}

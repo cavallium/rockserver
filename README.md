@@ -75,7 +75,8 @@ are documented in [`docs/workload-tuning.md`](docs/workload-tuning.md).
 explicitly flushed dataset, runs the untouched and candidate production classpaths
 in alternating order, validates every streamed key/value and gRPC terminal, proves
 READ-pool saturation and bounded avoidable idle time, and evaluates paired 95%
-confidence intervals for raw throughput, scheduler queue p99, and complete-scan p99.
+confidence intervals for throughput, latency, CPU, allocation, memory, and exact
+resource non-increase.
 The exact one-shot command and acceptance boundary are documented in
 [`docs/grpc-raw-scan-benchmark.md`](docs/grpc-raw-scan-benchmark.md).
 
@@ -86,6 +87,10 @@ scenarios, validates every result and terminal resource count, and applies stric
 log-space confidence bounds to throughput, latency, CPU, allocation, and memory.
 The release-only workflow is documented in
 [`docs/grpc-retained-read-benchmark.md`](docs/grpc-retained-read-benchmark.md).
+
+Both read gates and the paired seven-profile gate share the v1.3.11 Pareto rules and
+versioned result schemas documented in
+[`docs/v1.3.11-performance-contract.md`](docs/v1.3.11-performance-contract.md).
 
 ## Fast unary GET
 

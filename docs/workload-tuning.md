@@ -30,13 +30,17 @@ clears.
 
 ## What every result records
 
-`results.json`, `results.md`, and `selection-input.properties` contain or reference:
+`results.json`, `results.md`, `selection-input.properties`, and
+`pareto-worker.properties` contain or reference:
 
 - throughput by profile and by profile/family;
 - queue, execution, and end-to-end p99;
 - scheduler rejection/cancellation counters, client-observed rejected/cancelled
   attempts, deadlines, and scheduler quantum counts;
-- maximum retained snapshots, CDC lag, observed pressure, and queue/active depths;
+- maximum retained snapshots, CDC lag, observed pressure, and
+  queue/active/parked/outstanding depths;
+- process CPU ns/operation, allocated bytes/operation, GC collections/time, peak live
+  heap, direct memory, RSS, thread count, and native handles;
 - post-run pending operations, transactions, iterators, range cursors, snapshots,
   native-handle leaks, and shutdown status;
 - the deterministic seed, exact build ID, dataset and comparison-shape fingerprints,
@@ -92,6 +96,52 @@ The Java command for every step is:
 java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
   -cp "${workload_classpath}" "${workload_main}" ...
 ```
+
+## Paired v1.3.11 Pareto gate
+
+Candidate selection and code-regression acceptance are separate decisions. After the
+scheduler candidate/configuration is fixed, `SevenProfilePairedBenchmark` compares that
+same shape at immutable v1.3.11
+`bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e` and the final candidate. It writes the
+ten-pair schedule before measurement; odd pairs run baseline first and even pairs run
+candidate first. Every listed measurement must be a fresh JVM, and no other benchmark,
+build, validator, IDE indexer, or workload may overlap it.
+
+Prepare the one-shot schedule:
+
+```bash
+paired_main="it.cavallium.rockserver.core.impl.benchmark.SevenProfilePairedBenchmark"
+candidate_sha="REPLACE_WITH_FINAL_CANDIDATE_SHA"
+paired_root="/mnt/rockserver-hdd/seven-profile-paired-${candidate_sha}"
+
+java -cp "${workload_classpath}" "${paired_main}" \
+  --mode=prepare "--root=${paired_root}" "--candidate-sha=${candidate_sha}" \
+  --host-state=dedicated --storage-label=hdd-btrfs --cache-state=cold --enforce=true
+```
+
+Follow `schedule.tsv` exactly. For each row, prepare a deterministic fresh dataset and
+run `SevenProfileWorkloadBenchmark` once with the fixed options from this document and
+the row's build classpath/SHA. Place its generated `pareto-worker.properties` at the
+scheduled relative path. Cache eviction and hardware-state verification remain explicit
+operator steps; the Java harness does not claim to perform them.
+
+After all 20 artifacts exist, run the same command with `--mode=evaluate`. The strict
+parser rejects missing/extra/duplicate fields, build or configuration drift, failed
+workload checks, leaks, nonzero final resources, or submission-attempt/outcome mismatch.
+It gates every profile's throughput and queue/execution/end-to-end p99 plus global
+CPU/allocation/heap/direct/RSS metrics. GC, thread/native-handle counts, retained
+snapshots, per-profile queue/active peaks, and aggregate parked/outstanding peaks allow
+no increase. The candidate artifact must expose exact Wave 1 scheduler accounting; the
+immutable baseline is explicitly marked as using the legacy accepted/outcome fallback.
+Enforced workers verify the production classes against their clean Git checkout and
+record stable full-classpath, production-bytecode, RocksDB artifact, JDK, and hardware
+fingerprints. An enforced paired evaluation rejects any artifact not produced with the
+worker's own `--enforce=true` validation. The evaluator also rejects reused process IDs or any overlap/reordering in
+the predeclared 20-process schedule.
+Automatic acceptance requires every point estimate to be no worse, no interval to
+demonstrate regression, and at least one predeclared primary metric to meet the 2%
+material-improvement confidence bound. Reported exception candidates remain failures
+until the user explicitly approves the documented ablation/profiling case.
 
 ## Generate candidates
 
