@@ -102,7 +102,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private int queuedTotal;
 	private int activeTotal;
 	private int competingTasks;
-	// Written under the scheduler lock after every queue-count mutation and read by running quantums.
+	// Updated under the scheduler lock on empty/nonempty queue transitions and read by running quantums.
 	private volatile boolean localQueuedCompetition;
 	private boolean publishedPreemption;
 	private int latencyBurst;
@@ -651,7 +651,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.finishBatch(batchPermit, resourcePool);
 		}
 		TerminalAction terminalAction = null;
-		boolean terminal = false;
+		boolean notifyCompetitionEnded = false;
 		lock.lock();
 		try {
 			if (task.state() != TaskState.ACTIVE) {
@@ -691,11 +691,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			refreshPreemptionUnsafe();
 			workAvailable.signal();
-			terminal = task.state() == TaskState.TERMINAL;
+			notifyCompetitionEnded = task.profile() != WorkloadProfile.BATCH
+					&& task.state() == TaskState.TERMINAL;
 		} finally {
 			lock.unlock();
 		}
-		if (terminal) {
+		if (notifyCompetitionEnded) {
 			pressureController.signalPendingAvailability();
 		}
 		return terminalAction;
@@ -767,7 +768,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} finally {
 			lock.unlock();
 		}
-		pressureController.signalPendingAvailability();
+		if (terminalAction != null && task.profile() != WorkloadProfile.BATCH) {
+			pressureController.signalPendingAvailability();
+		}
 		if (terminalAction != null) {
 			completeTerminalAction(terminalAction);
 		}
@@ -784,11 +787,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private boolean cooperativePreemptionRequested(WorkloadProfile profile) {
-		return switch (profile) {
-			case ANALYTICAL, INGEST -> localQueuedCompetition;
-			case BATCH -> localQueuedCompetition || pressureController.preemptionRequested();
-			case LATENCY, CONTROL, CDC, PHYSICAL_MAINTENANCE -> false;
-		};
+		// The controller's aggregate BATCH signal already includes this pool's published
+		// queued-contention bit, so the raw-scan hot path needs only one volatile read.
+		return profile == WorkloadProfile.BATCH
+				? pressureController.preemptionRequested()
+				: localQueuedCompetition;
 	}
 
 	boolean isExecutingTask() {
@@ -1114,8 +1117,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.profile() == WorkloadProfile.BATCH && previousQueued == 0) {
 			pressureController.setBatchQueued(resourcePool, true);
 		}
-		queuedTotal++;
-		refreshLocalQueuedCompetitionUnsafe();
+		incrementQueuedTotalUnsafe();
 		task.markQueued();
 	}
 
@@ -1148,8 +1150,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.profile() == WorkloadProfile.BATCH && previousQueued == 0) {
 			pressureController.setBatchQueued(resourcePool, true);
 		}
-		queuedTotal++;
-		refreshLocalQueuedCompetitionUnsafe();
+		incrementQueuedTotalUnsafe();
 		task.markQueued();
 	}
 
@@ -1179,8 +1180,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.profile() == WorkloadProfile.BATCH && remainingQueued == 0) {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
-		queuedTotal--;
-		refreshLocalQueuedCompetitionUnsafe();
+		decrementQueuedTotalUnsafe();
 	}
 
 	private void unlinkCooperativeQueuedUnsafe(WorkloadTask task) {
@@ -1196,12 +1196,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.profile() == WorkloadProfile.BATCH && remainingQueued == 0) {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
-		queuedTotal--;
-		refreshLocalQueuedCompetitionUnsafe();
+		decrementQueuedTotalUnsafe();
 	}
 
-	private void refreshLocalQueuedCompetitionUnsafe() {
-		localQueuedCompetition = queuedTotal > 0;
+	private void incrementQueuedTotalUnsafe() {
+		if (queuedTotal++ == 0) {
+			localQueuedCompetition = true;
+		}
+	}
+
+	private void decrementQueuedTotalUnsafe() {
+		if (--queuedTotal == 0) {
+			localQueuedCompetition = false;
+		}
 	}
 
 	private boolean terminateUnsafe(WorkloadTask task,
