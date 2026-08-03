@@ -44,6 +44,7 @@ class ExistsMultiCooperativeTest {
 		try (var connection = openConnection(databaseName, """
 				database.parallelism.read = 3
 				database.parallelism.write = 3
+				database.parallelism.workload.competing-batch-read-maximum-active = 3
 				""")) {
 			var api = connection.getSyncApi(RequestContext.batch());
 			long columnId = api.createColumn("entries",

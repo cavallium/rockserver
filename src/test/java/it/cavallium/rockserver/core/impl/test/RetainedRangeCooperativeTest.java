@@ -47,6 +47,7 @@ class RetainedRangeCooperativeTest {
 		try (var connection = populatedConnection(databaseName, 128, """
 				database.parallelism.read = 3
 				database.parallelism.write = 3
+				database.parallelism.workload.competing-batch-read-maximum-active = 3
 				database.parallelism.workload.range-quantum-max-items = 8
 				database.parallelism.workload.range-quantum-max-bytes = 1MiB
 				database.parallelism.workload.range-quantum-max-duration = PT1S
@@ -482,6 +483,7 @@ class RetainedRangeCooperativeTest {
 		try (var connection = populatedConnection(databaseName, 17, """
 				database.parallelism.read = 3
 				database.parallelism.write = 3
+				database.parallelism.workload.competing-batch-read-maximum-active = 3
 				database.parallelism.workload.range-quantum-max-items = 16
 				database.parallelism.workload.range-quantum-max-bytes = 1MiB
 				database.parallelism.workload.range-quantum-max-duration = PT1S
