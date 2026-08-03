@@ -796,7 +796,6 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		private boolean found;
 		private boolean completionPrepared;
 		private @Nullable T preparedValue;
-		private @Nullable Throwable preparedFailure;
 
 		private CooperativeIteratorContinuation(long iterationId,
 				long skipCount,
@@ -852,7 +851,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (stage == IteratorContinuationStage.DONE) {
-						prepareCompletion(completedValue(), null);
+						prepareCompletion(completedValue());
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 
@@ -866,22 +865,17 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (stage == IteratorContinuationStage.DONE) {
-						prepareCompletion(completedValue(), null);
+						prepareCompletion(completedValue());
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 					if (context.preemptionRequested()) {
 						return RWScheduler.CooperativeResult.YIELD;
 					}
 				}
-			} catch (VirtualMachineError fatal) {
-				if (!context.terminationRequested()) {
-					prepareCompletion(null, fatal);
-				}
-				throw fatal;
-			} catch (Throwable failure) {
-				if (!context.terminationRequested()) {
-					prepareCompletion(null, failure);
-				}
+			} catch (RuntimeException failure) {
+				// The scheduler arbitrates this failure against cancellation, deadline, and
+				// shutdown, then invokes reject with the selected first terminal cause.
+				context.fail(failure);
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 		}
@@ -977,7 +971,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			return terminated.get();
 		}
 
-		private void prepareCompletion(@Nullable T value, @Nullable Throwable failure) {
+		private void prepareCompletion(@Nullable T value) {
 			synchronized (completionLock) {
 				if (terminated.get()) {
 					return;
@@ -986,7 +980,6 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					throw new IllegalStateException("Iterator continuation completion was prepared twice");
 				}
 				preparedValue = value;
-				preparedFailure = failure;
 				completionPrepared = true;
 			}
 		}
@@ -994,7 +987,6 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		@Override
 		public void completeCooperatively() {
 			final T value;
-			final Throwable failure;
 			synchronized (completionLock) {
 				if (terminated.get()) {
 					return;
@@ -1003,9 +995,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					throw new IllegalStateException("Scheduler selected RUN without an iterator result");
 				}
 				value = preparedValue;
-				failure = preparedFailure;
 			}
-			finish(value, failure);
+			finish(value, null);
 		}
 
 		private void finish(@Nullable T value, @Nullable Throwable failure) {

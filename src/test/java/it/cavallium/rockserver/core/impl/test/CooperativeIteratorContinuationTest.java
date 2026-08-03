@@ -4,6 +4,8 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -37,6 +39,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -275,6 +278,50 @@ class CooperativeIteratorContinuationTest {
 				assertTrue(async.subsequentAsync(iteratorId, 0L, 1L, RequestType.exists()).get(5, SECONDS));
 			} finally {
 				releaseStep.countDown();
+				connection.getInternalDB().setIteratorAdvanceStepCompletedObserverForTesting(null);
+				sync.closeIterator(iteratorId);
+			}
+		}
+	}
+
+	@Test
+	void nativeFailureIsSchedulerAuthoritativeAndGateReleasePrecedesPublication() throws Exception {
+		final int entries = ITERATOR_STEP + 1;
+		try (var connection = connection("iterator-native-failure")) {
+			var sync = connection.getSyncApi(RequestContext.batch());
+			var async = connection.getAsyncApi(RequestContext.batch());
+			long columnId = populateFixedColumn(sync, "entries", entries);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			var scheduler = connection.getScheduler();
+			var nativeFailure = RocksDBException.of(RocksDBErrorType.GET_1,
+					"forced iterator continuation failure");
+			var snapshotAtPublication = new AtomicReference<RWScheduler.PoolSnapshot>();
+			connection.getInternalDB().setIteratorAdvanceStepCompletedObserverForTesting(() -> {
+				throw nativeFailure;
+			});
+			try {
+				var before = readSnapshot(scheduler);
+				var continuation = async.subsequentAsync(
+						iteratorId, 0L, entries, RequestType.none());
+				var gateProbe = continuation.handle((_, _) -> {
+					snapshotAtPublication.set(readSnapshot(scheduler));
+					return async.seekToAsync(iteratorId, key(0));
+				}).thenCompose(future -> future);
+
+				var completion = assertThrows(ExecutionException.class,
+						() -> continuation.get(5, SECONDS));
+				assertSame(nativeFailure, completion.getCause());
+				gateProbe.get(5, SECONDS);
+
+				var published = snapshotAtPublication.get();
+				assertNotNull(published);
+				assertEquals(1L,
+						published.outcomes().get(RWScheduler.TerminalOutcome.FAILURE)
+								- before.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+				assertEquals(0L,
+						published.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+								- before.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			} finally {
 				connection.getInternalDB().setIteratorAdvanceStepCompletedObserverForTesting(null);
 				sync.closeIterator(iteratorId);
 			}

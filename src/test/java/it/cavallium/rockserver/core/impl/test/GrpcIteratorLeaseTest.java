@@ -41,6 +41,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -145,6 +146,7 @@ class GrpcIteratorLeaseTest {
 			var scheduler = backend.scheduler;
 			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			var observed = new AtomicInteger();
+			var leaseCountAtCompletion = new AtomicInteger(-1);
 			var request = SubsequentRequest.newBuilder()
 					.setIterationId(RecordingAsyncSubsequentConnection.ITERATOR_ID)
 					.setSkipCount(4_097L)
@@ -156,7 +158,9 @@ class GrpcIteratorLeaseTest {
 
 			var values = grpcService(server).subsequentMultiGet(request)
 					.doOnNext(value -> assertEquals((byte) observed.getAndIncrement(),
-							value.getValue().byteAt(0)));
+							value.getValue().byteAt(0)))
+					.doOnComplete(() -> leaseCountAtCompletion.set(
+							server.getActiveIteratorOperationLeaseCountForTesting()));
 			StepVerifier.create(values, 0)
 					.then(() -> {
 						assertEquals(0, backend.syncSubsequentCalls.get(),
@@ -179,6 +183,8 @@ class GrpcIteratorLeaseTest {
 			awaitLeaseCount(server, 0);
 			var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			assertEquals(128, observed.get());
+			assertEquals(0, leaseCountAtCompletion.get(),
+					"the iterator lease must be released before stream completion is published");
 			assertEquals(List.of(4_096L, 1L), backend.syncExistsTakeCounts);
 			assertEquals(List.of(64L, 64L), backend.syncMultiTakeCounts);
 			assertEquals(4, backend.syncSubsequentCalls.get());
@@ -199,6 +205,44 @@ class GrpcIteratorLeaseTest {
 			assertTrue(backend.counter(
 					"rockserver.workload.quantums", "batch", "range_page") >= 2.0d,
 					"demand parking must redispatch the same logical scheduler node");
+		}
+	}
+
+	@Test
+	void cooperativeGrpcFailureIsSchedulerAuthoritativeAndPrecedesErrorPublication() throws Exception {
+		var backend = new RecordingAsyncSubsequentConnection();
+		try (backend; var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			var nativeFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.GET_1,
+					"forced gRPC iterator page failure");
+			backend.firstMultiFailure.set(nativeFailure);
+			var before = backend.scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			var leaseCountAtFailure = new AtomicInteger(-1);
+			var request = SubsequentRequest.newBuilder()
+					.setIterationId(RecordingAsyncSubsequentConnection.ITERATOR_ID)
+					.setTakeCount(4_097L)
+					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+							.setDeadlineEpochMillis(Long.MAX_VALUE))
+					.build();
+
+			StepVerifier.create(grpcService(server).subsequentMultiGet(request)
+						.doOnError(_ -> leaseCountAtFailure.set(
+								server.getActiveIteratorOperationLeaseCountForTesting())), 0)
+					.thenRequest(1)
+					.expectError()
+					.verify(Duration.ofSeconds(5));
+
+			var after = backend.scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(0, leaseCountAtFailure.get(),
+					"the iterator lease must be released before stream failure is published");
+			assertEquals(1L,
+					after.outcomes().get(RWScheduler.TerminalOutcome.FAILURE)
+							- before.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+			assertEquals(0L,
+					after.outcomes().get(RWScheduler.TerminalOutcome.RUN)
+							- before.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			assertEquals(List.of(64L), backend.syncMultiTakeCounts);
+			assertEquals(0, server.getActiveIteratorOperationLeaseCountForTesting());
 		}
 	}
 
@@ -436,6 +480,7 @@ class GrpcIteratorLeaseTest {
 		private final AtomicInteger nextMultiValue = new AtomicInteger();
 		private final AtomicBoolean queueForegroundAfterFirstMulti = new AtomicBoolean();
 		private final AtomicBoolean blockFirstMulti = new AtomicBoolean();
+		private final AtomicReference<RuntimeException> firstMultiFailure = new AtomicReference<>();
 		private final CountDownLatch foregroundRan = new CountDownLatch(1);
 		private final CountDownLatch multiEntered = new CountDownLatch(1);
 		private final CountDownLatch releaseMulti = new CountDownLatch(1);
@@ -471,6 +516,10 @@ class GrpcIteratorLeaseTest {
 					}
 					if (subsequent.requestType() instanceof RequestType.RequestMulti<?>) {
 						syncMultiTakeCounts.add(subsequent.takeCount());
+						var forcedFailure = firstMultiFailure.getAndSet(null);
+						if (forcedFailure != null) {
+							throw forcedFailure;
+						}
 						int pageNumber = syncMultiTakeCounts.size();
 						if (pageNumber == 1 && blockFirstMulti.get()) {
 							multiEntered.countDown();

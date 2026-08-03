@@ -2374,11 +2374,13 @@ public class GrpcServer extends Server {
 					workloadExecutor = scheduler.executor(
 							profile, command.operationFamily(), requestContext.deadlineEpochMillis());
 				} catch (Throwable failure) {
+					iteratorLease.operationTerminated();
 					return Flux.error(failure);
 				}
 
 				return Flux.<KV>create(sink -> {
 					if (!iteratorLease.registerTask()) {
+						iteratorLease.operationTerminated();
 						sink.error(new java.util.concurrent.CancellationException(
 								"Iterator operation terminated before its stream could start"));
 						return;
@@ -2396,11 +2398,8 @@ public class GrpcServer extends Server {
 						sink.onRequest(state::request);
 						sink.onCancel(state::cancel);
 					} catch (Throwable initializationFailure) {
-						try {
-							sink.error(initializationFailure);
-						} finally {
-							iteratorLease.taskTerminated();
-						}
+						iteratorLease.taskAndOperationTerminated();
+						sink.error(initializationFailure);
 						return;
 					}
 					try {
@@ -2546,6 +2545,16 @@ public class GrpcServer extends Server {
 					}
 				}
 			}
+
+			private void taskAndOperationTerminated() {
+				// Both dimensions must be released before a cooperative stream publishes
+				// completion or failure; the outer doFinally remains an idempotent cancel guard.
+				try {
+					taskTerminated();
+				} finally {
+					operationTerminated();
+				}
+			}
 		}
 
 		/**
@@ -2573,7 +2582,6 @@ public class GrpcServer extends Server {
 			private int pageIndex;
 			private boolean sourceExhausted;
 			private boolean completionPrepared;
-			private @Nullable Throwable preparedFailure;
 
 			private CooperativeIteratorMultiStream(long iteratorId,
 					long skipCount,
@@ -2649,7 +2657,7 @@ public class GrpcServer extends Server {
 								return RWScheduler.CooperativeResult.PARK;
 							}
 							if (sourceExhausted || remainingTake == 0L) {
-								prepareCompletion(null);
+								prepareCompletion();
 								return RWScheduler.CooperativeResult.COMPLETE;
 							}
 							if (demand.get() == 0L) {
@@ -2662,7 +2670,7 @@ public class GrpcServer extends Server {
 						}
 
 						if (remainingSkip == 0L && remainingTake == 0L) {
-							prepareCompletion(null);
+							prepareCompletion();
 							return RWScheduler.CooperativeResult.COMPLETE;
 						}
 						if (remainingTake > 0L && demand.get() == 0L) {
@@ -2678,7 +2686,7 @@ public class GrpcServer extends Server {
 								sourceExhausted = true;
 								remainingSkip = 0L;
 								remainingTake = 0L;
-								prepareCompletion(null);
+								prepareCompletion();
 								return RWScheduler.CooperativeResult.COMPLETE;
 							}
 							if (cancellationRequested || context.terminationRequested()) {
@@ -2700,21 +2708,15 @@ public class GrpcServer extends Server {
 						remainingTake -= values.size();
 						sourceExhausted = values.size() < step;
 						if (values.isEmpty()) {
-							prepareCompletion(null);
+							prepareCompletion();
 							return RWScheduler.CooperativeResult.COMPLETE;
 						}
 						page = values;
 						pageIndex = 0;
 					}
-				} catch (VirtualMachineError fatal) {
-					if (!context.terminationRequested()) {
-						prepareCompletion(fatal);
-					}
-					throw fatal;
-				} catch (Throwable failure) {
-					if (!context.terminationRequested()) {
-						prepareCompletion(failure);
-					}
+				} catch (RuntimeException failure) {
+					// Keep terminal attribution and first-cause arbitration scheduler-authoritative.
+					context.fail(failure);
 					return RWScheduler.CooperativeResult.COMPLETE;
 				}
 			}
@@ -2786,7 +2788,7 @@ public class GrpcServer extends Server {
 				finish(failure);
 			}
 
-			private void prepareCompletion(@Nullable Throwable failure) {
+			private void prepareCompletion() {
 				synchronized (completionLock) {
 					if (terminated.get()) {
 						return;
@@ -2794,14 +2796,12 @@ public class GrpcServer extends Server {
 					if (completionPrepared) {
 						throw new IllegalStateException("Iterator stream completion was prepared twice");
 					}
-					preparedFailure = failure;
 					completionPrepared = true;
 				}
 			}
 
 			@Override
 			public void completeCooperatively() {
-				final Throwable failure;
 				synchronized (completionLock) {
 					if (terminated.get()) {
 						return;
@@ -2810,9 +2810,8 @@ public class GrpcServer extends Server {
 						throw new IllegalStateException(
 								"Scheduler selected RUN without an iterator stream result");
 					}
-					failure = preparedFailure;
 				}
-				finish(failure);
+				finish(null);
 			}
 
 			@Override
@@ -2825,19 +2824,16 @@ public class GrpcServer extends Server {
 					return;
 				}
 				page = null;
-				try {
-					if (cancellationRequested || sink.isCancelled()) {
-						if (failure != null
-								&& !(failure instanceof java.util.concurrent.CancellationException)) {
-							lateErrors.accept(failure);
-						}
-					} else if (failure == null) {
-						sink.complete();
-					} else {
-						sink.error(failure);
+				iteratorLease.taskAndOperationTerminated();
+				if (cancellationRequested || sink.isCancelled()) {
+					if (failure != null
+							&& !(failure instanceof java.util.concurrent.CancellationException)) {
+						lateErrors.accept(failure);
 					}
-				} finally {
-					iteratorLease.taskTerminated();
+				} else if (failure == null) {
+					sink.complete();
+				} else {
+					sink.error(failure);
 				}
 			}
 
