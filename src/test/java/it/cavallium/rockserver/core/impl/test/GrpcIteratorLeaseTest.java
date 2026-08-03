@@ -5,26 +5,33 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
+import it.cavallium.rockserver.core.common.api.proto.SubsequentRequest;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -37,6 +44,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import reactor.test.StepVerifier;
 
 @Timeout(60)
 class GrpcIteratorLeaseTest {
@@ -130,29 +138,110 @@ class GrpcIteratorLeaseTest {
 	}
 
 	@Test
-	void longGrpcMultiContinuationIsForwardedAsOneAsyncLogicalRequest() throws Exception {
+	void longGrpcMultiContinuationStreamsPagesFromOneCooperativeLogicalRequest() throws Exception {
 		var backend = new RecordingAsyncSubsequentConnection();
 		try (backend; var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
-			server.start();
-			try (var client = GrpcConnection.forHostAndPort("grpc-one-logical-iterator",
-					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-				List<Buf> values = api.subsequent(
-						RecordingAsyncSubsequentConnection.ITERATOR_ID,
-						4_097L,
-						65L,
-						RequestType.multi());
+			backend.queueForegroundAfterFirstMulti.set(true);
+			var scheduler = backend.scheduler;
+			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			var observed = new AtomicInteger();
+			var request = SubsequentRequest.newBuilder()
+					.setIterationId(RecordingAsyncSubsequentConnection.ITERATOR_ID)
+					.setSkipCount(4_097L)
+					.setTakeCount(128L)
+					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+							.setDeadlineEpochMillis(Long.MAX_VALUE))
+					.build();
 
-				assertEquals(65, values.size());
-				assertEquals(1, backend.asyncSubsequentCalls.get(),
-						"gRPC must preserve one logical async continuation");
-				assertEquals(0, backend.syncSubsequentCalls.get(),
-						"gRPC must not recreate ordinary per-chunk submissions");
-				assertEquals(4_097L, backend.skipCount);
-				assertEquals(65L, backend.takeCount);
-				awaitLeaseCount(server, 0);
-			}
+			var values = grpcService(server).subsequentMultiGet(request)
+					.doOnNext(value -> assertEquals((byte) observed.getAndIncrement(),
+							value.getValue().byteAt(0)));
+			StepVerifier.create(values, 0)
+					.then(() -> {
+						assertEquals(0, backend.syncSubsequentCalls.get(),
+								"zero downstream demand must park before native iterator work");
+						assertEquals(1, server.getActiveIteratorOperationLeaseCountForTesting());
+					})
+					.thenRequest(64)
+					.expectNextCount(64)
+					.then(() -> {
+						backend.awaitForeground();
+						assertEquals(List.of(4_096L, 1L), backend.syncExistsTakeCounts);
+						assertEquals(List.of(64L), backend.syncMultiTakeCounts,
+								"the second native page must wait for downstream demand");
+					})
+					.thenRequest(64)
+					.expectNextCount(64)
+					.expectComplete()
+					.verify(Duration.ofSeconds(5));
+
+			awaitLeaseCount(server, 0);
+			var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(128, observed.get());
+			assertEquals(List.of(4_096L, 1L), backend.syncExistsTakeCounts);
+			assertEquals(List.of(64L, 64L), backend.syncMultiTakeCounts);
+			assertEquals(4, backend.syncSubsequentCalls.get());
+			assertEquals(0, backend.asyncSubsequentCalls.get(),
+					"gRPC must not materialize the full iterator result through a future");
+			assertFalse(backend.secondPageBeforeForeground.get(),
+					"foreground work must run before the second native value page");
+			assertEquals(2L, after.acceptedTasks() - before.acceptedTasks(),
+					"one retained request plus one foreground task must be admitted");
+			assertEquals(2L, after.startedTasks() - before.startedTasks());
+			assertEquals(2L, after.completedTasks() - before.completedTasks());
+			assertEquals(1.0d, backend.counter(
+					"rockserver.workload.admission", "batch", "range_page", "result", "accepted"));
+			assertEquals(1L, backend.timerCount(
+					"rockserver.workload.queue.wait", "batch", "range_page"));
+			assertEquals(1L, backend.timerCount(
+					"rockserver.workload.execution", "batch", "range_page"));
+			assertTrue(backend.counter(
+					"rockserver.workload.quantums", "batch", "range_page") >= 2.0d,
+					"demand parking must redispatch the same logical scheduler node");
 		}
+	}
+
+	@Test
+	void cancellationKeepsCooperativeMultiLeaseUntilNativePageReturns() throws Exception {
+		var backend = new RecordingAsyncSubsequentConnection();
+		try (backend; var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			backend.blockFirstMulti.set(true);
+			var request = SubsequentRequest.newBuilder()
+					.setIterationId(RecordingAsyncSubsequentConnection.ITERATOR_ID)
+					.setTakeCount(4_097L)
+					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+							.setDeadlineEpochMillis(Long.MAX_VALUE))
+					.build();
+
+			StepVerifier.create(grpcService(server).subsequentMultiGet(request), 0)
+					.thenRequest(1)
+					.then(backend::awaitMultiEntered)
+					.thenCancel()
+					.verify(Duration.ofSeconds(5));
+
+			try {
+				assertEquals(1, server.getActiveIteratorOperationLeaseCountForTesting(),
+						"cancellation must retain the operation gate until the native call returns");
+				assertEquals(List.of(64L), backend.syncMultiTakeCounts);
+			} finally {
+				backend.releaseMulti.countDown();
+			}
+			assertTrue(backend.multiReturned.await(5, TimeUnit.SECONDS));
+			awaitLeaseCount(server, 0);
+			var snapshot = backend.scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(0, snapshot.queuedTasks());
+			assertEquals(0, snapshot.activeTasks());
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+		}
+	}
+
+	private static ReactorRocksDBServiceGrpc.RocksDBServiceImplBase grpcService(GrpcServer server)
+			throws ReflectiveOperationException {
+		Field serviceField = GrpcServer.class.getDeclaredField("grpc");
+		serviceField.setAccessible(true);
+		return (ReactorRocksDBServiceGrpc.RocksDBServiceImplBase) serviceField.get(server);
 	}
 
 	@Test
@@ -335,15 +424,23 @@ class GrpcIteratorLeaseTest {
 			implements RocksDBConnection, InternalConnection {
 
 		private static final long ITERATOR_ID = 31L;
+		private static final String METRIC_DATABASE = "grpc-recording-subsequent";
 
+		private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
 		private final RWScheduler scheduler = RWScheduler.forTesting(
-				2, 1, 1, 16, 16, "grpc-recording-subsequent");
+				1, 1, 1, 16, 16, "grpc-recording-subsequent", registry, METRIC_DATABASE);
 		private final AtomicInteger asyncSubsequentCalls = new AtomicInteger();
 		private final AtomicInteger syncSubsequentCalls = new AtomicInteger();
 		private final List<Long> syncExistsTakeCounts = new CopyOnWriteArrayList<>();
 		private final List<Long> syncMultiTakeCounts = new CopyOnWriteArrayList<>();
-		private volatile long skipCount;
-		private volatile long takeCount;
+		private final AtomicInteger nextMultiValue = new AtomicInteger();
+		private final AtomicBoolean queueForegroundAfterFirstMulti = new AtomicBoolean();
+		private final AtomicBoolean blockFirstMulti = new AtomicBoolean();
+		private final CountDownLatch foregroundRan = new CountDownLatch(1);
+		private final CountDownLatch multiEntered = new CountDownLatch(1);
+		private final CountDownLatch releaseMulti = new CountDownLatch(1);
+		private final CountDownLatch multiReturned = new CountDownLatch(1);
+		private final AtomicBoolean secondPageBeforeForeground = new AtomicBoolean();
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
 			@Override
 			@SuppressWarnings("unchecked")
@@ -354,8 +451,6 @@ class GrpcIteratorLeaseTest {
 				assertEquals(ITERATOR_ID, iterationId);
 				assertTrue(requestType instanceof RequestType.RequestMulti<?>);
 				asyncSubsequentCalls.incrementAndGet();
-				skipCount = requestedSkipCount;
-				takeCount = requestedTakeCount;
 				var values = new ArrayList<Buf>(Math.toIntExact(requestedTakeCount));
 				for (int index = 0; index < requestedTakeCount; index++) {
 					values.add(Buf.wrap(new byte[] {(byte) index}));
@@ -376,9 +471,25 @@ class GrpcIteratorLeaseTest {
 					}
 					if (subsequent.requestType() instanceof RequestType.RequestMulti<?>) {
 						syncMultiTakeCounts.add(subsequent.takeCount());
+						int pageNumber = syncMultiTakeCounts.size();
+						if (pageNumber == 1 && blockFirstMulti.get()) {
+							multiEntered.countDown();
+							try {
+								awaitIgnoringInterrupts(releaseMulti);
+							} finally {
+								multiReturned.countDown();
+							}
+						}
+						if (pageNumber == 1 && queueForegroundAfterFirstMulti.get()) {
+							scheduler.executor(WorkloadProfile.LATENCY,
+									OperationFamily.POINT_LOOKUP,
+									Long.MAX_VALUE).execute(foregroundRan::countDown, 0L);
+						} else if (pageNumber > 1 && foregroundRan.getCount() != 0L) {
+							secondPageBeforeForeground.set(true);
+						}
 						var values = new ArrayList<Buf>(Math.toIntExact(subsequent.takeCount()));
 						for (int index = 0; index < subsequent.takeCount(); index++) {
-							values.add(Buf.wrap(new byte[] {(byte) index}));
+							values.add(Buf.wrap(new byte[] {(byte) nextMultiValue.getAndIncrement()}));
 						}
 						return (RS) values;
 					}
@@ -409,7 +520,56 @@ class GrpcIteratorLeaseTest {
 
 		@Override
 		public void close() {
+			releaseMulti.countDown();
 			scheduler.dispose();
+			registry.close();
+		}
+
+		private void awaitForeground() {
+			try {
+				assertTrue(foregroundRan.await(5, TimeUnit.SECONDS),
+						"foreground task did not run while the retained stream was parked");
+			} catch (InterruptedException interrupted) {
+				Thread.currentThread().interrupt();
+				throw new AssertionError("Interrupted while waiting for foreground progress", interrupted);
+			}
+		}
+
+		private void awaitMultiEntered() {
+			try {
+				assertTrue(multiEntered.await(5, TimeUnit.SECONDS),
+						"cooperative iterator task did not enter its native value page");
+			} catch (InterruptedException interrupted) {
+				Thread.currentThread().interrupt();
+				throw new AssertionError("Interrupted while waiting for the native value page", interrupted);
+			}
+		}
+
+		private double counter(String name,
+				String profile,
+				String operation,
+				String... extraTags) {
+			var tags = new ArrayList<String>();
+			tags.add("database");
+			tags.add(METRIC_DATABASE);
+			tags.add("resource");
+			tags.add("read");
+			tags.add("profile");
+			tags.add(profile);
+			tags.add("operation");
+			tags.add(operation);
+			tags.addAll(List.of(extraTags));
+			return registry.get(name).tags(tags.toArray(String[]::new)).counter().count();
+		}
+
+		private long timerCount(String name, String profile, String operation) {
+			return registry.get(name)
+					.tags("database", METRIC_DATABASE,
+							"resource", "read",
+							"profile", profile,
+							"operation", operation)
+					.timer()
+					.count();
 		}
 	}
 

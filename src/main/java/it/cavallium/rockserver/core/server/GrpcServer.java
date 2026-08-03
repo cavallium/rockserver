@@ -113,6 +113,7 @@ import org.slf4j.LoggerFactory;
 import reactor.core.Disposables;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.util.context.ContextView;
 
@@ -1962,15 +1963,7 @@ public class GrpcServer extends Server {
 					.then(validateSubsequentCommand(request, new RequestMulti<>()))
 					.thenMany(withIteratorFluxLease(request.getIterationId(), () -> {
 						if (requiresCooperativeIteratorContinuation(request)) {
-							return fromCancellableIteratorFuture(() -> asyncApi(request.getContext()).subsequentAsync(
-									request.getIterationId(),
-									request.getSkipCount(),
-									request.getTakeCount(),
-									RequestType.<Buf>multi()))
-									.flatMapMany(Flux::fromIterable)
-									.map(entry -> KV.newBuilder()
-											.setValue(Utils.toByteString(entry))
-											.build());
+							return cooperativeIteratorMulti(request);
 						}
 						return advanceIterator(request.getContext(), request.getIterationId(), request.getSkipCount(), 0)
 								.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_VALUE_PAGE_SIZE)
@@ -2350,6 +2343,76 @@ public class GrpcServer extends Server {
 							|| skipCount > ITERATOR_ADVANCE_STEP_SIZE - takeCount);
 		}
 
+		/**
+		 * Preserve one logical scheduler node for a long MULTI continuation while keeping
+		 * gRPC delivery incremental. Native skip calls remain bounded to 4,096 entries and
+		 * value calls to 64 entries; only heap-backed values survive a cooperative park.
+		 */
+		private Flux<KV> cooperativeIteratorMulti(SubsequentRequest request) {
+			return Flux.deferContextual(contextView -> {
+				var iteratorLease = contextView.<IteratorOperationLease>getOrDefault(
+						ITERATOR_OPERATION_LEASE_CONTEXT_KEY, null);
+				if (iteratorLease == null) {
+					return Flux.error(new IllegalStateException(
+							"Cooperative iterator stream was started without an operation lease"));
+				}
+
+				final it.cavallium.rockserver.core.common.RequestContext requestContext;
+				final RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<List<Buf>> command;
+				final WorkloadProfile profile;
+				final RocksDBSyncAPI contextualApi;
+				final RWScheduler.WorkloadExecutor workloadExecutor;
+				try {
+					requestContext = mapRequestContext(request.getContext());
+					command = new RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<>(
+							request.getIterationId(),
+							request.getSkipCount(),
+							request.getTakeCount(),
+							RequestType.multi());
+					profile = preAdmit(requestContext, OperationFamily.RANGE_PAGE, command);
+					contextualApi = client.getSyncApi(requestContext);
+					workloadExecutor = scheduler.executor(
+							profile, command.operationFamily(), requestContext.deadlineEpochMillis());
+				} catch (Throwable failure) {
+					return Flux.error(failure);
+				}
+
+				return Flux.<KV>create(sink -> {
+					if (!iteratorLease.registerTask()) {
+						sink.error(new java.util.concurrent.CancellationException(
+								"Iterator operation terminated before its stream could start"));
+						return;
+					}
+					final CooperativeIteratorMultiStream state;
+					try {
+						state = new CooperativeIteratorMultiStream(
+								request.getIterationId(),
+								request.getSkipCount(),
+								request.getTakeCount(),
+								contextualApi,
+								iteratorLease,
+								sink,
+								lateErrorHandler(contextView));
+						sink.onRequest(state::request);
+						sink.onCancel(state::cancel);
+					} catch (Throwable initializationFailure) {
+						try {
+							sink.error(initializationFailure);
+						} finally {
+							iteratorLease.taskTerminated();
+						}
+						return;
+					}
+					try {
+						state.attach(workloadExecutor.executeCooperatively(state, 0L));
+						state.start();
+					} catch (Throwable admissionFailure) {
+						state.admissionFailed(admissionFailure);
+					}
+				}, FluxSink.OverflowStrategy.ERROR);
+			});
+		}
+
 		private Flux<Long> iteratorChunks(long count, long stepSize) {
 			return Flux.generate(() -> count, (remaining, sink) -> {
 				if (remaining <= 0) {
@@ -2482,6 +2545,310 @@ public class GrpcServer extends Server {
 						return;
 					}
 				}
+			}
+		}
+
+		/**
+		 * Server-side streaming counterpart to the embedded iterator continuation. It
+		 * retains only logical counters and one 64-value heap page across redispatches;
+		 * every native call returns before this task can yield or park.
+		 */
+		private final class CooperativeIteratorMultiStream
+				implements RWScheduler.CooperativeCompletionTask, Disposable {
+
+			private final long iteratorId;
+			private final RocksDBSyncAPI contextualApi;
+			private final IteratorOperationLease iteratorLease;
+			private final FluxSink<KV> sink;
+			private final Consumer<Throwable> lateErrors;
+			private final AtomicLong demand = new AtomicLong();
+			private final AtomicBoolean terminated = new AtomicBoolean();
+			private final Object completionLock = new Object();
+			private volatile boolean ready;
+			private volatile boolean cancellationRequested;
+			private volatile @Nullable RWScheduler.CooperativeHandle handle;
+			private long remainingSkip;
+			private long remainingTake;
+			private @Nullable List<Buf> page;
+			private int pageIndex;
+			private boolean sourceExhausted;
+			private boolean completionPrepared;
+			private @Nullable Throwable preparedFailure;
+
+			private CooperativeIteratorMultiStream(long iteratorId,
+					long skipCount,
+					long takeCount,
+					RocksDBSyncAPI contextualApi,
+					IteratorOperationLease iteratorLease,
+					FluxSink<KV> sink,
+					Consumer<Throwable> lateErrors) {
+				this.iteratorId = iteratorId;
+				this.remainingSkip = skipCount;
+				this.remainingTake = takeCount;
+				this.contextualApi = contextualApi;
+				this.iteratorLease = iteratorLease;
+				this.sink = sink;
+				this.lateErrors = lateErrors;
+			}
+
+			private void attach(RWScheduler.CooperativeHandle handle) {
+				boolean cancel;
+				boolean resume;
+				synchronized (completionLock) {
+					this.handle = Objects.requireNonNull(handle, "handle");
+					cancel = cancellationRequested || terminated.get();
+					resume = ready && (remainingTake == 0L || demand.get() > 0L);
+				}
+				if (cancel) {
+					handle.cancel();
+				} else if (resume) {
+					handle.resume();
+				}
+			}
+
+			private void start() {
+				RWScheduler.CooperativeHandle currentHandle;
+				boolean cancel;
+				boolean resume;
+				synchronized (completionLock) {
+					if (terminated.get()) {
+						return;
+					}
+					ready = true;
+					currentHandle = Objects.requireNonNull(handle, "handle");
+					cancel = cancellationRequested;
+					resume = remainingTake == 0L || demand.get() > 0L;
+				}
+				if (cancel) {
+					currentHandle.cancel();
+				} else if (resume) {
+					currentHandle.resume();
+				}
+			}
+
+			@Override
+			public RWScheduler.CooperativeResult runCooperatively(
+					RWScheduler.CooperativeContext context) {
+				if (terminated.get()) {
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+				if (!ready) {
+					return RWScheduler.CooperativeResult.PARK;
+				}
+				if (cancellationRequested || context.terminationRequested()) {
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+
+				try {
+					while (true) {
+						if (cancellationRequested || context.terminationRequested()) {
+							return RWScheduler.CooperativeResult.COMPLETE;
+						}
+						if (page != null) {
+							if (!emitPage()) {
+								return RWScheduler.CooperativeResult.PARK;
+							}
+							if (sourceExhausted || remainingTake == 0L) {
+								prepareCompletion(null);
+								return RWScheduler.CooperativeResult.COMPLETE;
+							}
+							if (demand.get() == 0L) {
+								return RWScheduler.CooperativeResult.PARK;
+							}
+							if (context.preemptionRequested()) {
+								return RWScheduler.CooperativeResult.YIELD;
+							}
+							continue;
+						}
+
+						if (remainingSkip == 0L && remainingTake == 0L) {
+							prepareCompletion(null);
+							return RWScheduler.CooperativeResult.COMPLETE;
+						}
+						if (remainingTake > 0L && demand.get() == 0L) {
+							return RWScheduler.CooperativeResult.PARK;
+						}
+
+						if (remainingSkip > 0L) {
+							long step = Math.min(remainingSkip, ITERATOR_ADVANCE_STEP_SIZE);
+							boolean advanced = contextualApi.subsequent(
+									iteratorId, 0L, step, RequestType.exists());
+							remainingSkip -= step;
+							if (!advanced) {
+								sourceExhausted = true;
+								remainingSkip = 0L;
+								remainingTake = 0L;
+								prepareCompletion(null);
+								return RWScheduler.CooperativeResult.COMPLETE;
+							}
+							if (cancellationRequested || context.terminationRequested()) {
+								return RWScheduler.CooperativeResult.COMPLETE;
+							}
+							if (context.preemptionRequested()) {
+								return RWScheduler.CooperativeResult.YIELD;
+							}
+							continue;
+						}
+
+						long step = Math.min(remainingTake, ITERATOR_VALUE_PAGE_SIZE);
+						var values = Objects.requireNonNull(contextualApi.subsequent(
+								iteratorId, 0L, step, RequestType.<Buf>multi()),
+								"Iterator MULTI page");
+						if (values.size() > step) {
+							throw new IllegalStateException("Iterator MULTI page exceeded its requested size");
+						}
+						remainingTake -= values.size();
+						sourceExhausted = values.size() < step;
+						if (values.isEmpty()) {
+							prepareCompletion(null);
+							return RWScheduler.CooperativeResult.COMPLETE;
+						}
+						page = values;
+						pageIndex = 0;
+					}
+				} catch (VirtualMachineError fatal) {
+					if (!context.terminationRequested()) {
+						prepareCompletion(fatal);
+					}
+					throw fatal;
+				} catch (Throwable failure) {
+					if (!context.terminationRequested()) {
+						prepareCompletion(failure);
+					}
+					return RWScheduler.CooperativeResult.COMPLETE;
+				}
+			}
+
+			private boolean emitPage() {
+				var currentPage = Objects.requireNonNull(page, "page");
+				while (pageIndex < currentPage.size()) {
+					if (cancellationRequested || demand.get() == 0L) {
+						return false;
+					}
+					var value = currentPage.get(pageIndex++);
+					producedOne();
+					sink.next(KV.newBuilder()
+							.setValue(Utils.toByteString(value))
+							.build());
+				}
+				page = null;
+				pageIndex = 0;
+				return true;
+			}
+
+			private void producedOne() {
+				while (true) {
+					long current = demand.get();
+					if (current == Long.MAX_VALUE) {
+						return;
+					}
+					if (current <= 0L) {
+						throw new IllegalStateException("Iterator value produced without downstream demand");
+					}
+					if (demand.compareAndSet(current, current - 1L)) {
+						return;
+					}
+				}
+			}
+
+			private void request(long requested) {
+				if (requested <= 0L || terminated.get()) {
+					return;
+				}
+				while (true) {
+					long current = demand.get();
+					long updated = current + requested;
+					if (updated < 0L) {
+						updated = Long.MAX_VALUE;
+					}
+					if (demand.compareAndSet(current, updated)) {
+						break;
+					}
+				}
+				var currentHandle = handle;
+				if (currentHandle != null) {
+					currentHandle.resume();
+				}
+			}
+
+			private void cancel() {
+				if (terminated.get()) {
+					return;
+				}
+				cancellationRequested = true;
+				var currentHandle = handle;
+				if (currentHandle != null) {
+					currentHandle.cancel();
+				}
+			}
+
+			private void admissionFailed(Throwable failure) {
+				finish(failure);
+			}
+
+			private void prepareCompletion(@Nullable Throwable failure) {
+				synchronized (completionLock) {
+					if (terminated.get()) {
+						return;
+					}
+					if (completionPrepared) {
+						throw new IllegalStateException("Iterator stream completion was prepared twice");
+					}
+					preparedFailure = failure;
+					completionPrepared = true;
+				}
+			}
+
+			@Override
+			public void completeCooperatively() {
+				final Throwable failure;
+				synchronized (completionLock) {
+					if (terminated.get()) {
+						return;
+					}
+					if (!completionPrepared) {
+						throw new IllegalStateException(
+								"Scheduler selected RUN without an iterator stream result");
+					}
+					failure = preparedFailure;
+				}
+				finish(failure);
+			}
+
+			@Override
+			public void reject(RuntimeException failure) {
+				finish(failure);
+			}
+
+			private void finish(@Nullable Throwable failure) {
+				if (!terminated.compareAndSet(false, true)) {
+					return;
+				}
+				page = null;
+				try {
+					if (cancellationRequested || sink.isCancelled()) {
+						if (failure != null
+								&& !(failure instanceof java.util.concurrent.CancellationException)) {
+							lateErrors.accept(failure);
+						}
+					} else if (failure == null) {
+						sink.complete();
+					} else {
+						sink.error(failure);
+					}
+				} finally {
+					iteratorLease.taskTerminated();
+				}
+			}
+
+			@Override
+			public void dispose() {
+				cancel();
+			}
+
+			@Override
+			public boolean isDisposed() {
+				return terminated.get();
 			}
 		}
 
