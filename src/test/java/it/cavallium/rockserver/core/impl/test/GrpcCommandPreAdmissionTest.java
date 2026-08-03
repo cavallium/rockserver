@@ -41,7 +41,11 @@ class GrpcCommandPreAdmissionTest {
 		Path config = Files.createTempFile("rockserver-grpc-pre-admission", ".conf");
 		Files.writeString(config, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: { ingest-behind: false, optimistic: false }
 				}
 				""");

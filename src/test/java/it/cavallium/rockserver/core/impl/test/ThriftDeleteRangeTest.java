@@ -46,6 +46,7 @@ class ThriftDeleteRangeTest {
 				    read: 3
 				    write: 3
 				    workload: {
+				      competing-batch-read-maximum-active: 3
 				      latency-queue-capacity: 1
 				      ingest-queue-capacity: 1
 				      batch-queue-capacity: 1

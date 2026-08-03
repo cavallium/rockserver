@@ -133,7 +133,11 @@ public class MainShutdownTest {
 				    database-name: "main-shutdown-test"
 				    jmx: { enabled: false }
 				  }
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: {
 				    enable-fast-get: false
 				    ingest-behind: false

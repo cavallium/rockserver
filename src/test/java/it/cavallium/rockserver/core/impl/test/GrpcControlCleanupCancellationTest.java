@@ -86,7 +86,11 @@ class GrpcControlCleanupCancellationTest {
 		configFile = Files.createTempFile("rockserver-grpc-control-cancellation", ".conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: { ingest-behind: false, optimistic: false }
 				}
 				""");

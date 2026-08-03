@@ -54,7 +54,11 @@ class EmbeddedReduceRangeSchedulingTest {
 		var configFile = tempDir.resolve("range-async-io.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -79,7 +83,11 @@ class EmbeddedReduceRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -123,7 +131,11 @@ class EmbeddedReduceRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader-cancellation.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");

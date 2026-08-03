@@ -188,7 +188,11 @@ class ThriftAsyncDispatchRegressionTest {
 		var config = tempDir.resolve("single-writer.conf");
 		Files.writeString(config, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: {
 				    enable-fast-get: false
 				    ingest-behind: false

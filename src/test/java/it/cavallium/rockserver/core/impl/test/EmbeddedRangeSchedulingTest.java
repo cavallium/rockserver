@@ -39,7 +39,11 @@ class EmbeddedRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-writer-cleanup.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -80,7 +84,11 @@ class EmbeddedRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -157,7 +165,11 @@ class EmbeddedRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader-iterator.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
@@ -231,7 +243,11 @@ class EmbeddedRangeSchedulingTest {
 		var configFile = tempDir.resolve("single-reader-multi.conf");
 		Files.writeString(configFile, """
 				database: {
-				  parallelism: { read: 3, write: 3 }
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
 				""");
