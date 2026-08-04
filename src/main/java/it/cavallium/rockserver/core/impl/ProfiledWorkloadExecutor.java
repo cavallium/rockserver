@@ -1115,6 +1115,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
+	private static final class CancellationEntry {
+
+		private @Nullable Runnable command;
+		private byte profile;
+		private byte family;
+		private int hash;
+		private int mappedCount;
+		private @Nullable WorkloadTask firstQueued;
+		private @Nullable WorkloadTask lastQueued;
+		private @Nullable CancellationEntry bucketNext;
+		private @Nullable CancellationEntry freeNext;
+	}
+
 	/**
 	 * Copy the high-frequency scheduler counters used by benchmark and diagnostic samplers into a
 	 * caller-owned primitive buffer. The full immutable {@link ExecutorSnapshot} remains the
@@ -2051,7 +2064,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private long cooperativeExecutionNanos;
 		private long cooperativeQuantumCount;
 		private boolean cooperativeMetricsFlushed;
-		private int cancellationEntry = CancellationIndex.NO_ENTRY;
+		private @Nullable CancellationEntry cancellationEntry;
 
 		private WorkloadTask(@Nullable ProfiledWorkloadExecutor owner,
 		                     WorkloadProfile profile,
@@ -2194,17 +2207,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			return cancellationState == null || cancellationState.claimForDispatch();
 		}
 
-		private int cancellationEntry() {
-			if (cancellationEntry == CancellationIndex.NO_ENTRY) {
-				throw new IllegalStateException("Workload task is not cancellation-indexed: " + sequence);
-			}
+		private @Nullable CancellationEntry cancellationEntry() {
 			return cancellationEntry;
 		}
 
-		private void mapCancellation(int cancellationEntry) {
-			if (this.cancellationEntry != CancellationIndex.NO_ENTRY) {
-				throw new IllegalStateException("Workload task is already cancellation-indexed: " + sequence);
-			}
+		private void mapCancellation(CancellationEntry cancellationEntry) {
 			this.cancellationEntry = cancellationEntry;
 		}
 
@@ -2213,28 +2220,16 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		private void markCancellationLinked() {
-			if (cancellationEntry == CancellationIndex.NO_ENTRY || cancellationLinked) {
-				throw new IllegalStateException("Invalid cancellation link transition for task " + sequence);
-			}
 			cancellationLinked = true;
 		}
 
 		private void markCancellationUnlinked() {
-			if (!cancellationLinked) {
-				throw new IllegalStateException("Workload task is not cancellation-linked: " + sequence);
-			}
 			cancellationLinked = false;
 		}
 
 		private void clearCancellationIndex() {
-			if (cancellationLinked
-					|| previousCancellation != null
-					|| nextCancellation != null
-					|| cancellationEntry == CancellationIndex.NO_ENTRY) {
-				throw new IllegalStateException("Invalid cancellation unmap transition for task " + sequence);
-			}
 			cancellationLinked = false;
-			cancellationEntry = CancellationIndex.NO_ENTRY;
+			cancellationEntry = null;
 		}
 
 		private boolean deadlineIndexed() {
@@ -2542,109 +2537,96 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	/**
-	 * Allocation-free identity index for queued cancellation. Table slots contain stable primitive
-	 * entry ids, while duplicate submissions reuse the intrusive links already present on each task.
-	 * Cooperative tasks remain mapped while active or parked, but only linked while queued.
+	 * Pooled identity index for queued cancellation. Entries stay stable for each task lifetime and
+	 * are reused after drain, avoiding per-submission index allocation once the concurrent high-water
+	 * mark is warm. Duplicate submissions use intrusive task links. Cooperative tasks remain mapped
+	 * while active or parked, but only linked while queued.
 	 */
 	private static final class CancellationIndex {
 
-		private static final int NO_ENTRY = -1;
-		private static final int EMPTY_SLOT = 0;
 		private static final int INITIAL_CAPACITY = 16;
 		private static final int LOAD_NUMERATOR = 3;
 		private static final int LOAD_DENOMINATOR = 4;
 
-		private int[] table = new int[INITIAL_CAPACITY];
-		private Runnable[] commands = new Runnable[INITIAL_CAPACITY];
-		private byte[] profiles = new byte[INITIAL_CAPACITY];
-		private byte[] families = new byte[INITIAL_CAPACITY];
-		private WorkloadTask[] firstQueued = new WorkloadTask[INITIAL_CAPACITY];
-		private WorkloadTask[] lastQueued = new WorkloadTask[INITIAL_CAPACITY];
-		private int[] mappedCounts = new int[INITIAL_CAPACITY];
-		private int[] freeNext = new int[INITIAL_CAPACITY];
+		private CancellationEntry[] buckets = new CancellationEntry[INITIAL_CAPACITY];
 		private int resizeThreshold = resizeThreshold(INITIAL_CAPACITY);
 		private int size;
-		private int nextUnused;
-		private int freeHead = NO_ENTRY;
+		private @Nullable CancellationEntry freeHead;
 
 		private @Nullable WorkloadTask first(Runnable command,
 		                                             WorkloadProfile profile,
 		                                             OperationFamily family) {
-			int slot = findSlot(command, profile.ordinal(), family.ordinal());
-			return slot < 0 ? null : firstQueued[decodeEntry(table[slot])];
+			var entry = findEntry(command, profile.ordinal(), family.ordinal());
+			return entry == null ? null : entry.firstQueued;
 		}
 
 		private void map(WorkloadTask task) {
-			if (task.cancellationEntry != NO_ENTRY) {
+			if (task.cancellationEntry != null) {
 				throw new IllegalStateException("Workload task is already cancellation-indexed: "
 						+ task.sequence());
 			}
 			int profile = task.profile().ordinal();
 			int family = task.family().ordinal();
-			int slot = findSlot(task.command(), profile, family);
-			final int entry;
-			if (slot >= 0) {
-				entry = decodeEntry(table[slot]);
-			} else {
+			int hash = hash(task.command(), profile, family);
+			var entry = findEntry(task.command(), profile, family, hash);
+			if (entry == null) {
 				ensureInsertCapacity();
-				slot = insertionSlot(task.command(), profile, family);
 				entry = allocateEntry();
-				commands[entry] = task.command();
-				profiles[entry] = checkedOrdinal(profile);
-				families[entry] = checkedOrdinal(family);
-				table[slot] = encodeEntry(entry);
+				entry.command = task.command();
+				entry.profile = checkedOrdinal(profile);
+				entry.family = checkedOrdinal(family);
+				entry.hash = hash;
+				int bucket = hash & (buckets.length - 1);
+				entry.bucketNext = buckets[bucket];
+				buckets[bucket] = entry;
 				size++;
 			}
-			int mapped = mappedCounts[entry];
+			int mapped = entry.mappedCount;
 			if (mapped == Integer.MAX_VALUE) {
 				throw new IllegalStateException("Cancellation mapping count overflow");
 			}
-			mappedCounts[entry] = mapped + 1;
+			entry.mappedCount = mapped + 1;
 			task.mapCancellation(entry);
 		}
 
 		private void link(WorkloadTask task) {
-			int entry = validatedEntry(task);
+			var entry = task.cancellationEntry;
 			if (task.cancellationLinked
 					|| task.previousCancellation != null
 					|| task.nextCancellation != null) {
 				throw new IllegalStateException("Workload task is already cancellation-linked: "
 						+ task.sequence());
 			}
-			var previous = lastQueued[entry];
+			var previous = entry.lastQueued;
 			if (previous == null) {
-				firstQueued[entry] = task;
+				entry.firstQueued = task;
 			} else {
 				previous.nextCancellation = task;
 				task.previousCancellation = previous;
 			}
-			lastQueued[entry] = task;
+			entry.lastQueued = task;
 			task.markCancellationLinked();
 		}
 
 		private void unlink(WorkloadTask task) {
-			int entry = validatedEntry(task);
-			if (!task.cancellationLinked) {
-				throw new IllegalStateException("Workload task is not cancellation-linked: "
-						+ task.sequence());
-			}
+			var entry = task.cancellationEntry;
 			var previous = task.previousCancellation;
 			var next = task.nextCancellation;
 			if (previous == null) {
-				if (firstQueued[entry] != task) {
+				if (entry.firstQueued != task) {
 					throw new IllegalStateException("Workload task is not the cancellation head: "
 							+ task.sequence());
 				}
-				firstQueued[entry] = next;
+				entry.firstQueued = next;
 			} else {
 				previous.nextCancellation = next;
 			}
 			if (next == null) {
-				if (lastQueued[entry] != task) {
+				if (entry.lastQueued != task) {
 					throw new IllegalStateException("Workload task is not the cancellation tail: "
 							+ task.sequence());
 				}
-				lastQueued[entry] = previous;
+				entry.lastQueued = previous;
 			} else {
 				next.previousCancellation = previous;
 			}
@@ -2654,149 +2636,105 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		private void unmap(WorkloadTask task) {
-			int entry = validatedEntry(task);
+			var entry = Objects.requireNonNull(task.cancellationEntry(),
+					"Workload task is not cancellation-indexed");
 			if (task.cancellationLinked) {
 				throw new IllegalStateException("Linked workload task cannot be unmapped: " + task.sequence());
 			}
-			int remaining = mappedCounts[entry] - 1;
+			int remaining = entry.mappedCount - 1;
 			if (remaining < 0) {
 				throw new IllegalStateException("Cancellation mapping count underflow");
 			}
-			mappedCounts[entry] = remaining;
+			entry.mappedCount = remaining;
 			task.clearCancellationIndex();
 			if (remaining == 0) {
-				if (firstQueued[entry] != null || lastQueued[entry] != null) {
+				if (entry.firstQueued != null || entry.lastQueued != null) {
 					throw new IllegalStateException("Empty cancellation mapping still has queued tasks");
 				}
 				removeEntry(entry);
 			}
 		}
 
-		private int validatedEntry(WorkloadTask task) {
-			int entry = task.cancellationEntry();
-			if (entry >= nextUnused
-					|| commands[entry] != task.command()
-					|| Byte.toUnsignedInt(profiles[entry]) != task.profile().ordinal()
-					|| Byte.toUnsignedInt(families[entry]) != task.family().ordinal()
-					|| mappedCounts[entry] <= 0) {
-				throw new IllegalStateException("Workload task has a stale cancellation entry: "
-						+ task.sequence());
+		private void removeEntry(CancellationEntry entry) {
+			int bucket = entry.hash & (buckets.length - 1);
+			var cursor = buckets[bucket];
+			CancellationEntry previous = null;
+			while (cursor != null && cursor != entry) {
+				previous = cursor;
+				cursor = cursor.bucketNext;
 			}
-			return entry;
-		}
-
-		private void removeEntry(int entry) {
-			int slot = findSlot(commands[entry],
-					Byte.toUnsignedInt(profiles[entry]),
-					Byte.toUnsignedInt(families[entry]));
-			if (slot < 0 || decodeEntry(table[slot]) != entry) {
+			if (cursor == null) {
 				throw new IllegalStateException("Cancellation entry is not hash-indexed");
 			}
-			deleteSlot(slot);
-			commands[entry] = null;
-			firstQueued[entry] = null;
-			lastQueued[entry] = null;
-			mappedCounts[entry] = 0;
-			freeNext[entry] = freeHead;
+			if (previous == null) {
+				buckets[bucket] = entry.bucketNext;
+			} else {
+				previous.bucketNext = entry.bucketNext;
+			}
+			entry.command = null;
+			entry.profile = 0;
+			entry.family = 0;
+			entry.hash = 0;
+			entry.mappedCount = 0;
+			entry.firstQueued = null;
+			entry.lastQueued = null;
+			entry.bucketNext = null;
+			entry.freeNext = freeHead;
 			freeHead = entry;
 			size--;
 		}
 
-		private int allocateEntry() {
-			if (freeHead != NO_ENTRY) {
-				int entry = freeHead;
-				freeHead = freeNext[entry];
-				freeNext[entry] = NO_ENTRY;
-				return entry;
+		private CancellationEntry allocateEntry() {
+			var entry = freeHead;
+			if (entry == null) {
+				return new CancellationEntry();
 			}
-			if (nextUnused == commands.length) {
-				growEntries();
-			}
-			return nextUnused++;
+			freeHead = entry.freeNext;
+			entry.freeNext = null;
+			return entry;
 		}
 
 		private void ensureInsertCapacity() {
 			if (size + 1 <= resizeThreshold) {
 				return;
 			}
-			rehash(Math.multiplyExact(table.length, 2));
-		}
-
-		private void growEntries() {
-			int newCapacity = Math.multiplyExact(commands.length, 2);
-			commands = java.util.Arrays.copyOf(commands, newCapacity);
-			profiles = java.util.Arrays.copyOf(profiles, newCapacity);
-			families = java.util.Arrays.copyOf(families, newCapacity);
-			firstQueued = java.util.Arrays.copyOf(firstQueued, newCapacity);
-			lastQueued = java.util.Arrays.copyOf(lastQueued, newCapacity);
-			mappedCounts = java.util.Arrays.copyOf(mappedCounts, newCapacity);
-			freeNext = java.util.Arrays.copyOf(freeNext, newCapacity);
+			rehash(Math.multiplyExact(buckets.length, 2));
 		}
 
 		private void rehash(int newCapacity) {
-			var replacement = new int[newCapacity];
-			for (int entry = 0; entry < nextUnused; entry++) {
-				var command = commands[entry];
-				if (command == null) {
-					continue;
+			var replacement = new CancellationEntry[newCapacity];
+			for (var head : buckets) {
+				var entry = head;
+				while (entry != null) {
+					var next = entry.bucketNext;
+					int bucket = entry.hash & (newCapacity - 1);
+					entry.bucketNext = replacement[bucket];
+					replacement[bucket] = entry;
+					entry = next;
 				}
-				int slot = insertionSlot(replacement,
-						command,
-						Byte.toUnsignedInt(profiles[entry]),
-						Byte.toUnsignedInt(families[entry]));
-				replacement[slot] = encodeEntry(entry);
 			}
-			table = replacement;
+			buckets = replacement;
 			resizeThreshold = resizeThreshold(newCapacity);
 		}
 
-		private int findSlot(Runnable command, int profile, int family) {
-			int mask = table.length - 1;
-			int slot = hash(command, profile, family) & mask;
-			while (true) {
-				int encoded = table[slot];
-				if (encoded == EMPTY_SLOT) {
-					return NO_ENTRY;
-				}
-				int entry = decodeEntry(encoded);
-				if (commands[entry] == command
-						&& Byte.toUnsignedInt(profiles[entry]) == profile
-						&& Byte.toUnsignedInt(families[entry]) == family) {
-					return slot;
-				}
-				slot = (slot + 1) & mask;
-			}
+		private @Nullable CancellationEntry findEntry(Runnable command, int profile, int family) {
+			return findEntry(command, profile, family, hash(command, profile, family));
 		}
 
-		private int insertionSlot(Runnable command, int profile, int family) {
-			return insertionSlot(table, command, profile, family);
-		}
-
-		private static int insertionSlot(int[] target, Runnable command, int profile, int family) {
-			int mask = target.length - 1;
-			int slot = hash(command, profile, family) & mask;
-			while (target[slot] != EMPTY_SLOT) {
-				slot = (slot + 1) & mask;
-			}
-			return slot;
-		}
-
-		private void deleteSlot(int removedSlot) {
-			int mask = table.length - 1;
-			int hole = removedSlot;
-			int cursor = (hole + 1) & mask;
-			while (table[cursor] != EMPTY_SLOT) {
-				int entry = decodeEntry(table[cursor]);
-				int ideal = hash(commands[entry],
-						Byte.toUnsignedInt(profiles[entry]),
-						Byte.toUnsignedInt(families[entry])) & mask;
-				if (((hole - ideal) & mask) < ((cursor - ideal) & mask)) {
-					table[hole] = table[cursor];
-					hole = cursor;
+		private @Nullable CancellationEntry findEntry(Runnable command,
+		                                                       int profile,
+		                                                       int family,
+		                                                       int hash) {
+			var entry = buckets[hash & (buckets.length - 1)];
+			while (entry != null) {
+				if (entry.command == command
+						&& Byte.toUnsignedInt(entry.profile) == profile
+						&& Byte.toUnsignedInt(entry.family) == family) {
+					return entry;
 				}
-				cursor = (cursor + 1) & mask;
+				entry = entry.bucketNext;
 			}
-			table[hole] = EMPTY_SLOT;
+			return null;
 		}
 
 		private static int hash(Runnable command, int profile, int family) {
@@ -2809,14 +2747,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				throw new IllegalArgumentException("Enum ordinal does not fit in one byte: " + ordinal);
 			}
 			return (byte) ordinal;
-		}
-
-		private static int encodeEntry(int entry) {
-			return entry + 1;
-		}
-
-		private static int decodeEntry(int encoded) {
-			return encoded - 1;
 		}
 
 		private static int resizeThreshold(int capacity) {
