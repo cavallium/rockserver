@@ -94,7 +94,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final String resourceKind;
 	private final RWScheduler.Pool resourcePool;
 	private final ThreadFactory threadFactory;
-	private final TaskMetrics[][] taskMetrics;
+	private final @Nullable TaskMetrics[][] taskMetrics;
 	private final CounterHandle workerFailureMetric;
 	private volatile boolean shutdown;
 	private volatile boolean terminated;
@@ -184,7 +184,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				.setNameFormat(poolName + "-%d")
 				.setUncaughtExceptionHandler(this::uncaughtWorkerFailure)
 				.build();
-		this.taskMetrics = registerTaskMetrics(registry);
+		this.taskMetrics = registry == null ? null : registerTaskMetrics(registry);
 		this.workerFailureMetric = registerCounter(registry,
 				"rockserver.workload.worker.failures",
 				"database", databaseName,
@@ -257,7 +257,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						family,
 						deadlineEpochMillis,
 						sequence++,
-						System.nanoTime(),
+						metricsTimestamp(taskMetrics),
 						cost,
 						command,
 						taskMetrics);
@@ -283,7 +283,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					admissionFailure,
 					Objects.requireNonNull(admissionOutcome));
 		}
-		taskMetrics.recordAdmission(admissionResult);
+		if (taskMetrics != INERT_TASK_METRICS) {
+			taskMetrics.recordAdmission(admissionResult);
+		}
 		if (admissionFailure != null) {
 			throw admissionFailure;
 		}
@@ -342,7 +344,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						family,
 						deadlineEpochMillis,
 						sequence++,
-						System.nanoTime(),
+						metricsTimestamp(taskMetrics),
 						cost,
 						command,
 						cancellationTask,
@@ -373,7 +375,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					admissionFailure,
 					Objects.requireNonNull(admissionOutcome));
 		}
-		taskMetrics.recordAdmission(admissionResult);
+		if (taskMetrics != INERT_TASK_METRICS) {
+			taskMetrics.recordAdmission(admissionResult);
+		}
 		if (admissionFailure != null) {
 			throw admissionFailure;
 		}
@@ -580,6 +584,31 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			runCooperativeDispatched(task);
 			return;
 		}
+		if (task.metrics() == INERT_TASK_METRICS) {
+			runInertDispatched(task);
+			return;
+		}
+		runInstrumentedDispatched(task);
+	}
+
+	private void runInertDispatched(WorkloadTask task) {
+		var outcome = RWScheduler.TerminalOutcome.FAILURE;
+		try {
+			assert EXECUTING_POOL.get() == null : "Scheduler worker is already executing a task";
+			EXECUTING_POOL.set(this);
+			task.command().run();
+			outcome = RWScheduler.TerminalOutcome.RUN;
+		} catch (VirtualMachineError fatal) {
+			throw fatal;
+		} catch (Throwable error) {
+			recordTaskFailure(task, error);
+		} finally {
+			EXECUTING_POOL.set(null);
+			finishActive(task, outcome);
+		}
+	}
+
+	private void runInstrumentedDispatched(WorkloadTask task) {
 		var metrics = task.metrics();
 		long executionStart = System.nanoTime();
 		var outcome = RWScheduler.TerminalOutcome.FAILURE;
@@ -610,6 +639,42 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void runCooperativeDispatched(WorkloadTask task) {
+		if (task.metrics() == INERT_TASK_METRICS) {
+			runInertCooperativeDispatched(task);
+			return;
+		}
+		runInstrumentedCooperativeDispatched(task);
+	}
+
+	private void runInertCooperativeDispatched(WorkloadTask task) {
+		RWScheduler.CooperativeResult result = RWScheduler.CooperativeResult.COMPLETE;
+		try {
+			assert EXECUTING_POOL.get() == null : "Scheduler worker is already executing a task";
+			EXECUTING_POOL.set(this);
+			result = Objects.requireNonNull(task.cooperativeCommand().runCooperatively(task),
+					"Cooperative task returned no result");
+		} catch (VirtualMachineError fatal) {
+			task.fail(new RejectedExecutionException("Cooperative workload quantum failed", fatal));
+			throw fatal;
+		} catch (Throwable error) {
+			recordTaskFailure(task, error);
+			var failure = error instanceof RuntimeException runtimeException
+					? runtimeException
+					: new RejectedExecutionException("Cooperative workload quantum failed", error);
+			task.fail(failure);
+		} finally {
+			EXECUTING_POOL.set(null);
+			var terminalAction = finishCooperative(task, result);
+			if (terminalAction != null) {
+				completeTerminalAction(terminalAction);
+			} else if (task.outcome() == RWScheduler.TerminalOutcome.RUN
+					&& task.command() instanceof RWScheduler.CooperativeCompletionTask) {
+				completeCooperativeSuccess(task);
+			}
+		}
+	}
+
+	private void runInstrumentedCooperativeDispatched(WorkloadTask task) {
 		var metrics = task.metrics();
 		long executionStart = System.nanoTime();
 		RWScheduler.CooperativeResult result = RWScheduler.CooperativeResult.COMPLETE;
@@ -1639,7 +1704,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (cooperativeTask != null) {
 			cooperativeTask.flushCooperativeMetrics();
 		}
-		metrics.recordOutcome(outcome);
+		if (metrics != INERT_TASK_METRICS) {
+			metrics.recordOutcome(outcome);
+		}
 	}
 
 	private void completeCooperativeSuccess(WorkloadTask task) {
@@ -1657,7 +1724,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			recordInfrastructureFailure("Failed to dispose RUN workload submission in " + poolName,
 					disposalFailure);
 		}
-		task.metrics().recordRunOutcome();
+		var metrics = task.metrics();
+		if (metrics != INERT_TASK_METRICS) {
+			metrics.recordRunOutcome();
+		}
 	}
 
 	private WorkloadTask peekUnsafe(WorkloadProfile profile) {
@@ -1682,12 +1752,20 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private TaskMetrics metrics(WorkloadProfile profile, OperationFamily family) {
-		var result = taskMetrics[profile.ordinal()][family.ordinal()];
+		var registeredMetrics = taskMetrics;
+		if (registeredMetrics == null) {
+			return INERT_TASK_METRICS;
+		}
+		var result = registeredMetrics[profile.ordinal()][family.ordinal()];
 		return result == null ? INERT_TASK_METRICS : result;
 	}
 
+	private static long metricsTimestamp(TaskMetrics metrics) {
+		return metrics == INERT_TASK_METRICS ? 0L : System.nanoTime();
+	}
+
 	private TaskMetrics[][] registerTaskMetrics(
-			@Nullable MeterRegistry registry) {
+			MeterRegistry registry) {
 		var result = new TaskMetrics[PROFILES.length][FAMILIES.length];
 		for (var profile : PROFILES) {
 			if (capacityUnsafe(profile) == 0) {
@@ -1862,7 +1940,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} finally {
 			lock.unlock();
 		}
-		task.metrics().failure().increment();
+		var metrics = task.metrics();
+		if (metrics != INERT_TASK_METRICS) {
+			metrics.failure().increment();
+		}
 		LOG.error("Workload task failed: pool={}, profile={}, operation={}",
 				poolName,
 				task.profile(),
@@ -2033,7 +2114,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private static final int DISPATCH_CANCELLATION = 0b100;
 		private final long deadlineEpochMillis;
 		private final long deadlineSequence;
-		private long sequence;
 		private final long enqueuedNanos;
 		private final int cost;
 		private final byte profile;
@@ -2065,7 +2145,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			this.family = (byte) family.ordinal();
 			this.deadlineEpochMillis = deadlineEpochMillis;
 			this.deadlineSequence = sequence;
-			this.sequence = sequence;
 			this.enqueuedNanos = enqueuedNanos;
 			this.cost = cost;
 			this.command = command;
@@ -2147,7 +2226,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		private long sequence() {
-			return sequence;
+			return this instanceof CooperativeWorkloadTask cooperativeTask
+					? cooperativeTask.sequence
+					: deadlineSequence;
 		}
 
 		private long enqueuedNanos() {
@@ -2287,7 +2368,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		private void refreshSequence(long sequence) {
-			this.sequence = sequence;
+			cooperativeTask().sequence = sequence;
 		}
 
 		private void recordCooperativeQuantum(long executionStartNanos, long executionNanos) {
@@ -2310,7 +2391,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				return;
 			}
 			cooperativeTask.setFlag(CooperativeWorkloadTask.METRICS_FLUSHED);
-			if (cooperativeTask.cooperativeQuantumCount == 0L) {
+			if (metrics == INERT_TASK_METRICS || cooperativeTask.cooperativeQuantumCount == 0L) {
 				return;
 			}
 			// Micrometer's contention-adaptive adders can allocate cells while growing. Keep
@@ -2435,6 +2516,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private volatile @Nullable RequestedTermination requestedTermination;
 		private volatile boolean terminalPublished;
 		private byte flags;
+		private long sequence;
 		private long cooperativeQueueWaitNanos;
 		private long cooperativeExecutionNanos;
 		private long cooperativeQuantumCount;
@@ -2458,6 +2540,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					null,
 					metrics);
 			this.owner = owner;
+			this.sequence = sequence;
 		}
 
 		private boolean flag(int flag) {

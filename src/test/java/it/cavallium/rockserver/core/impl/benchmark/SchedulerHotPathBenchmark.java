@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.benchmark;
 
 import com.sun.management.ThreadMXBean;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBException;
@@ -15,7 +16,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Fresh-process scheduler microbenchmark for admission, dispatch, cooperative transitions, and cancellation.
  *
  * <p>This deliberately reuses commands and keeps coordination outside the measured scheduler
- * allocation. Select {@code normal}, {@code indexed}, {@code cooperative},
+	 * allocation. Select {@code normal}, {@code normal-metrics}, {@code indexed}, {@code cooperative},
  * {@code cooperative-yield}, {@code cooperative-park-resume}, or
  * {@code cooperative-cancel}, or {@code saturated-rejection} as the first argument. Repeated
  * YIELD and PARK/resume measure a
@@ -34,6 +35,8 @@ public final class SchedulerHotPathBenchmark {
 
 	public static void main(String[] args) {
 		String scenario = args.length > 0 ? args[0] : "cooperative";
+		boolean metricsEnabled = scenario.equals("normal-metrics");
+		String executionScenario = metricsEnabled ? "normal" : scenario;
 		int warmupOperations = integerArgument(args, 1, DEFAULT_WARMUP_OPERATIONS);
 		int measuredOperations = integerArgument(args, 2, DEFAULT_MEASURED_OPERATIONS);
 		if (warmupOperations < 1 || measuredOperations < 1) {
@@ -48,31 +51,39 @@ public final class SchedulerHotPathBenchmark {
 			threadMetrics.setThreadAllocatedMemoryEnabled(true);
 		}
 
-		int queueCapacity = scenario.equals("saturated-rejection") ? 1 : SUBMISSION_BATCH * 2;
-		var scheduler = RWScheduler.forTesting(
-				1, 1, 1,
-				queueCapacity,
-				queueCapacity,
-				"scheduler-hot-path");
+		int queueCapacity = executionScenario.equals("saturated-rejection") ? 1 : SUBMISSION_BATCH * 2;
+		var registry = metricsEnabled ? new SimpleMeterRegistry() : null;
+		var scheduler = metricsEnabled
+				? RWScheduler.forTesting(1, 1, 1,
+						queueCapacity,
+						queueCapacity,
+						"scheduler-hot-path",
+						registry,
+						"scheduler-hot-path")
+				: RWScheduler.forTesting(1, 1, 1,
+						queueCapacity,
+						queueCapacity,
+						"scheduler-hot-path");
 		var cooperativeTask = new ImmediateCompletionTask();
 		var normalTask = new ImmediateRunnable();
 		try {
-			if (scenario.equals("cooperative-yield") || scenario.equals("cooperative-park-resume")) {
+			if (executionScenario.equals("cooperative-yield")
+					|| executionScenario.equals("cooperative-park-resume")) {
 				runRepeatedCooperativeTransitions(scheduler,
 						threadMetrics,
-						scenario,
+						executionScenario,
 						warmupOperations,
 						measuredOperations);
 				return;
 			}
-			if (scenario.equals("cooperative-cancel")) {
+			if (executionScenario.equals("cooperative-cancel")) {
 				runCooperativeCancellation(scheduler,
 						threadMetrics,
 						warmupOperations,
 						measuredOperations);
 				return;
 			}
-			if (scenario.equals("saturated-rejection")) {
+			if (executionScenario.equals("saturated-rejection")) {
 				runSaturatedRejection(scheduler,
 						threadMetrics,
 						warmupOperations,
@@ -83,7 +94,7 @@ public final class SchedulerHotPathBenchmark {
 			AtomicInteger completed;
 			AtomicReference<RuntimeException> failure;
 			WorkloadProfile profile;
-			switch (scenario) {
+			switch (executionScenario) {
 				case "cooperative" -> {
 					profile = WorkloadProfile.BATCH;
 					var executor = scheduler.executor(WorkloadProfile.BATCH,
@@ -150,6 +161,9 @@ public final class SchedulerHotPathBenchmark {
 					allocatedBytesPerOperation);
 		} finally {
 			scheduler.disposeNow();
+			if (registry != null) {
+				registry.close();
+			}
 		}
 	}
 
