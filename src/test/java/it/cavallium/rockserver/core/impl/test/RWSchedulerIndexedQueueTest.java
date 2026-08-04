@@ -248,6 +248,50 @@ class RWSchedulerIndexedQueueTest {
 	}
 
 	@Test
+	void latencyAndNonLatencyIndexesShareEarliestDeadlineExpiry() throws Exception {
+		var scheduler = scheduler(1, 16, "indexed-mixed-deadline-expiry");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var later = new TerminalTask(() -> {});
+		var earlier = new TerminalTask(() -> {});
+		try {
+			scheduler.executor(
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+					.execute(() -> {
+						blockerStarted.countDown();
+						awaitUninterruptibly(releaseBlocker);
+					});
+			assertTrue(blockerStarted.await(5, SECONDS));
+
+			long nowMillis = System.currentTimeMillis();
+			scheduler.executor(
+						WorkloadProfile.ANALYTICAL,
+						OperationFamily.FULL_SCAN_AGGREGATE,
+						nowMillis + SECONDS.toMillis(4))
+					.execute(later);
+			scheduler.executor(
+						WorkloadProfile.LATENCY,
+						OperationFamily.POINT_LOOKUP,
+						nowMillis + 250L)
+					.execute(earlier);
+
+			Thread.sleep(350L);
+			scheduler.executor(
+						WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, RequestContext.NO_DEADLINE)
+					.execute(() -> {});
+
+			assertDeadlineFailure(earlier);
+			assertFalse(earlier.ran());
+			assertFalse(later.isDone(), "the later non-latency deadline must remain indexed");
+			assertEquals(1, earlier.rejectionCount());
+			assertEquals(1, earlier.disposeCount());
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void earlierDeadlineReplacesTheCurrentTimedWaitLeader() throws Exception {
 		var scheduler = RWScheduler.forTesting(2, 1, 1, 16, 16, "indexed-deadline-leader");
 		var blockerStarted = new CountDownLatch(1);

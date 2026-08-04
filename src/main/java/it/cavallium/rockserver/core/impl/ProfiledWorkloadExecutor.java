@@ -78,6 +78,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final TaskQueue[] cooperativeQueues = new TaskQueue[PROFILES.length];
 	private final TaskHeap deadlineQueue = new TaskHeap(true);
 	private final CancellationIndex cancellationIndex = new CancellationIndex();
+	private int indexedDeadlineCount;
 	private final int[] queued = new int[PROFILES.length];
 	private final int[] active = new int[PROFILES.length];
 	private final int[] parked = new int[PROFILES.length];
@@ -220,7 +221,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		List<TerminalAction> terminalActions = null;
 		lock.lock();
 		try {
-			boolean hasQueuedDeadlines = !deadlineQueue.isEmpty();
+			boolean hasQueuedDeadlines = indexedDeadlineCount != 0;
 			long nowMillis = deadlineEpochMillis != RequestContext.NO_DEADLINE || hasQueuedDeadlines
 					? System.currentTimeMillis()
 					: 0L;
@@ -308,7 +309,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		AdmissionResult admissionResult;
 		lock.lock();
 		try {
-			boolean hasQueuedDeadlines = !deadlineQueue.isEmpty();
+			boolean hasQueuedDeadlines = indexedDeadlineCount != 0;
 			long nowMillis = deadlineEpochMillis != RequestContext.NO_DEADLINE || hasQueuedDeadlines
 					? System.currentTimeMillis()
 					: 0L;
@@ -349,7 +350,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						cancellationTask,
 						taskMetrics);
 				boolean becomesDeadlineHead = task.hasDeadline()
-						&& (deadlineQueue.isEmpty() || DEADLINE_ORDER.compare(task, deadlineQueue.first()) < 0);
+						&& (indexedDeadlineCount == 0
+						|| DEADLINE_ORDER.compare(task, earliestDeadlineUnsafe()) < 0);
 				enqueueUnsafe(task);
 				incrementOutstandingUnsafe(profile);
 				admitCompetitionUnsafe(task);
@@ -418,7 +420,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				lock.lock();
 				try {
 					long nowMillis = 0L;
-					if (!deadlineQueue.isEmpty()) {
+					if (indexedDeadlineCount != 0) {
 						nowMillis = System.currentTimeMillis();
 						expireDueUnsafe(nowMillis, terminalActions);
 					}
@@ -491,12 +493,41 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private long deadlineWaitNanosUnsafe() {
-		if (deadlineQueue.isEmpty()) {
+		if (indexedDeadlineCount == 0) {
 			return Long.MAX_VALUE;
 		}
-		long earliestDeadlineMillis = deadlineQueue.first().deadlineEpochMillis();
+		long earliestDeadlineMillis = earliestDeadlineUnsafe().deadlineEpochMillis();
 		long remainingMillis = earliestDeadlineMillis - System.currentTimeMillis();
 		return remainingMillis <= 0L ? 0L : TimeUnit.MILLISECONDS.toNanos(remainingMillis);
+	}
+
+	private WorkloadTask earliestDeadlineUnsafe() {
+		if (indexedDeadlineCount == 0) {
+			throw new IllegalStateException("No indexed workload deadline");
+		}
+		var latencyTask = latencyQueue.isEmpty() ? null : latencyQueue.first();
+		var otherTask = deadlineQueue.isEmpty() ? null : deadlineQueue.first();
+		if (latencyTask == null) {
+			return Objects.requireNonNull(otherTask, "Missing indexed workload deadline");
+		}
+		if (otherTask == null) {
+			return latencyTask;
+		}
+		return DEADLINE_ORDER.compare(latencyTask, otherTask) < 0 ? latencyTask : otherTask;
+	}
+
+	private void incrementIndexedDeadlineCountUnsafe() {
+		if (indexedDeadlineCount == Integer.MAX_VALUE) {
+			throw new IllegalStateException("Indexed workload deadline count overflow");
+		}
+		indexedDeadlineCount++;
+	}
+
+	private void decrementIndexedDeadlineCountUnsafe() {
+		if (indexedDeadlineCount == 0) {
+			throw new IllegalStateException("Indexed workload deadline count underflow");
+		}
+		indexedDeadlineCount--;
 	}
 
 	private @Nullable WorkloadTask dispatchUnsafe(long nowMillis,
@@ -1052,7 +1083,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			var task = cancellationIndex.first(command, profile, family);
 			if (task != null) {
 				terminalActions = new ArrayList<>(1);
-				boolean wasDeadlineHead = task.hasDeadline() && deadlineQueue.first() == task;
+				boolean wasDeadlineHead = task.hasDeadline() && earliestDeadlineUnsafe() == task;
 				unlinkUnsafe(task);
 				removed = terminateUnsafe(task,
 						RWScheduler.TerminalOutcome.CANCELLATION,
@@ -1307,8 +1338,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private @Nullable List<TerminalAction> expireDueUnsafe(long nowMillis,
 	                                                       @Nullable List<TerminalAction> terminalActions) {
 		boolean expired = false;
-		while (!deadlineQueue.isEmpty()) {
-			var task = deadlineQueue.first();
+		while (indexedDeadlineCount != 0) {
+			var task = earliestDeadlineUnsafe();
 			if (nowMillis < task.deadlineEpochMillis()) {
 				if (expired) {
 					refreshPreemptionUnsafe();
@@ -1321,6 +1352,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				if (!deadlineQueue.remove(task)) {
 					throw new IllegalStateException("Cooperative deadline task is not indexed");
 				}
+				decrementIndexedDeadlineCountUnsafe();
 				task.markDeadlineUnindexed();
 				if (task.state() == TaskState.ACTIVE) {
 					task.requestTermination(RWScheduler.TerminalOutcome.DEADLINE, failure);
@@ -1364,8 +1396,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} else {
 			Objects.requireNonNull(queues[profileIndex], "Missing workload queue").addLast(task);
 		}
-		if (task.hasDeadline() && !deadlineQueue.add(task)) {
-			throw new IllegalStateException("Duplicate workload deadline sequence " + task.sequence());
+		if (task.hasDeadline()) {
+			if (!task.hasProfile(WorkloadProfile.LATENCY) && !deadlineQueue.add(task)) {
+				throw new IllegalStateException("Duplicate workload deadline sequence " + task.sequence());
+			}
+			incrementIndexedDeadlineCountUnsafe();
 		}
 		cancellationIndex.map(task);
 		cancellationIndex.link(task);
@@ -1391,6 +1426,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					throw new IllegalStateException("Duplicate cooperative workload deadline sequence "
 							+ task.sequence());
 				}
+				incrementIndexedDeadlineCountUnsafe();
 				task.markDeadlineIndexed();
 			}
 			cancellationIndex.map(task);
@@ -1416,9 +1452,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (!removed) {
 			throw new IllegalStateException("Workload task is not queued: " + task.sequence());
 		}
-		if (task.hasDeadline() && !deadlineQueue.remove(task)) {
-			throw new IllegalStateException("Finite-deadline workload task is not deadline-indexed: "
-					+ task.sequence());
+		if (task.hasDeadline()) {
+			if (!task.hasProfile(WorkloadProfile.LATENCY) && !deadlineQueue.remove(task)) {
+				throw new IllegalStateException("Finite-deadline workload task is not deadline-indexed: "
+						+ task.sequence());
+			}
+			decrementIndexedDeadlineCountUnsafe();
 		}
 		cancellationIndex.unlink(task);
 		cancellationIndex.unmap(task);
@@ -1596,6 +1635,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (!deadlineQueue.remove(task)) {
 				throw new IllegalStateException("Cooperative workload deadline task is not indexed");
 			}
+			decrementIndexedDeadlineCountUnsafe();
 			task.markDeadlineUnindexed();
 		}
 		if (task.cancellationLinked()) {
@@ -2159,8 +2199,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                                   Runnable command,
 		                                   @Nullable CancellationTrackedTask cancellationTask,
 		                                   TaskMetrics metrics) {
-			if (profile == WorkloadProfile.LATENCY || deadlineEpochMillis != RequestContext.NO_DEADLINE) {
-				return new OrderedWorkloadTask(profile,
+			if (profile == WorkloadProfile.LATENCY) {
+				return new LatencyWorkloadTask(profile,
+						family,
+						deadlineEpochMillis,
+						sequence,
+						enqueuedNanos,
+						cost,
+						command,
+						cancellationTask,
+						metrics);
+			}
+			if (deadlineEpochMillis != RequestContext.NO_DEADLINE) {
+				return new DeadlineWorkloadTask(profile,
 						family,
 						deadlineEpochMillis,
 						sequence,
@@ -2530,13 +2581,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
-	private static final class OrderedWorkloadTask extends WorkloadTask {
+	private static final class LatencyWorkloadTask extends WorkloadTask {
 
 		private final long deadlineEpochMillis;
 		private int latencyHeapIndex = -1;
-		private int deadlineHeapIndex = -1;
 
-		private OrderedWorkloadTask(WorkloadProfile profile,
+		private LatencyWorkloadTask(WorkloadProfile profile,
 		                                OperationFamily family,
 		                                long deadlineEpochMillis,
 		                                long sequence,
@@ -2572,6 +2622,39 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		@Override
 		void latencyHeapIndex(int index) {
 			latencyHeapIndex = index;
+		}
+
+	}
+
+	private static final class DeadlineWorkloadTask extends WorkloadTask {
+
+		private final long deadlineEpochMillis;
+		private int deadlineHeapIndex = -1;
+
+		private DeadlineWorkloadTask(WorkloadProfile profile,
+		                                 OperationFamily family,
+		                                 long deadlineEpochMillis,
+		                                 long sequence,
+		                                 long enqueuedNanos,
+		                                 int cost,
+		                                 Runnable command,
+		                                 @Nullable CancellationTrackedTask cancellationTask,
+		                                 TaskMetrics metrics) {
+			super(profile,
+					family,
+					sequence,
+					enqueuedNanos,
+					cost,
+					command,
+					cancellationTask,
+					metrics);
+			this.deadlineEpochMillis = deadlineEpochMillis;
+			markHasDeadline();
+		}
+
+		@Override
+		long deadlineEpochMillis() {
+			return deadlineEpochMillis;
 		}
 
 		@Override
@@ -2649,7 +2732,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private static final class OrderedCooperativeWorkloadTask extends CooperativeWorkloadTask {
 
 		private final long deadlineEpochMillis;
-		private int latencyHeapIndex = -1;
 		private int deadlineHeapIndex = -1;
 
 		private OrderedCooperativeWorkloadTask(ProfiledWorkloadExecutor owner,
@@ -2678,16 +2760,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		@Override
 		long deadlineEpochMillis() {
 			return deadlineEpochMillis;
-		}
-
-		@Override
-		int latencyHeapIndex() {
-			return latencyHeapIndex;
-		}
-
-		@Override
-		void latencyHeapIndex(int index) {
-			latencyHeapIndex = index;
 		}
 
 		@Override
