@@ -12,10 +12,8 @@ import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Comparator;
 import java.util.EnumMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableSet;
@@ -75,8 +73,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final int[] capacities = new int[PROFILES.length];
 	private final int[] reservations = new int[PROFILES.length];
 	private final NavigableSet<WorkloadTask> latencyQueue = new TreeSet<>(DEADLINE_ORDER);
-	private final EnumMap<WorkloadProfile, LinkedHashSet<WorkloadTask>> queues;
-	private final EnumMap<WorkloadProfile, CooperativeQueue> cooperativeQueues;
+	private final TaskQueue[] queues = new TaskQueue[PROFILES.length];
+	private final TaskQueue[] cooperativeQueues = new TaskQueue[PROFILES.length];
 	private final NavigableSet<WorkloadTask> deadlineQueue = new TreeSet<>(DEADLINE_ORDER);
 	private final CancellationIndex cancellationIndex = new CancellationIndex();
 	private final int[] queued = new int[PROFILES.length];
@@ -154,8 +152,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			this.quanta[profile.ordinal()] = quantum;
 		}
-		this.queues = new EnumMap<>(WorkloadProfile.class);
-		this.cooperativeQueues = new EnumMap<>(WorkloadProfile.class);
 		this.pressureController = Objects.requireNonNull(pressureController, "pressureController");
 		this.databaseName = Objects.requireNonNull(databaseName, "databaseName");
 		this.resourceKind = Objects.requireNonNull(resourceKind, "resourceKind");
@@ -174,8 +170,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			this.capacities[profile.ordinal()] = capacity;
 			this.reservations[profile.ordinal()] = reservation;
 			if (profile != WorkloadProfile.LATENCY) {
-				this.queues.put(profile, new LinkedHashSet<>());
-				this.cooperativeQueues.put(profile, new CooperativeQueue());
+				this.queues[profile.ordinal()] = new TaskQueue();
+				this.cooperativeQueues[profile.ordinal()] = new TaskQueue();
 			}
 		}
 		if (reservationTotal > workerCount) {
@@ -1274,8 +1270,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void enqueueUnsafe(WorkloadTask task) {
-		if (!normalQueueUnsafe(task.profile()).add(task)) {
-			throw new IllegalStateException("Duplicate workload task sequence " + task.sequence());
+		if (task.profile() == WorkloadProfile.LATENCY) {
+			if (!latencyQueue.add(task)) {
+				throw new IllegalStateException("Duplicate workload task sequence " + task.sequence());
+			}
+		} else {
+			Objects.requireNonNull(queues[task.profile().ordinal()], "Missing workload queue").addLast(task);
 		}
 		if (task.hasDeadline() && !deadlineQueue.add(task)) {
 			throw new IllegalStateException("Duplicate workload deadline sequence " + task.sequence());
@@ -1292,7 +1292,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void enqueueCooperativeUnsafe(WorkloadTask task, boolean initialAdmission) {
-		var queue = cooperativeQueues.get(task.profile());
+		var queue = cooperativeQueues[task.profile().ordinal()];
 		if (queue == null) {
 			throw new IllegalStateException("No cooperative queue for " + task.profile());
 		}
@@ -1323,7 +1323,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			unlinkCooperativeQueuedUnsafe(task);
 			return;
 		}
-		if (!normalQueueUnsafe(task.profile()).remove(task)) {
+		boolean removed = task.profile() == WorkloadProfile.LATENCY
+				? latencyQueue.remove(task)
+				: Objects.requireNonNull(queues[task.profile().ordinal()], "Missing workload queue").remove(task);
+		if (!removed) {
 			throw new IllegalStateException("Workload task is not queued: " + task.sequence());
 		}
 		if (task.hasDeadline() && !deadlineQueue.remove(task)) {
@@ -1341,7 +1344,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void unlinkCooperativeQueuedUnsafe(WorkloadTask task) {
-		var queue = cooperativeQueues.get(task.profile());
+		var queue = cooperativeQueues[task.profile().ordinal()];
 		if (queue == null || !queue.remove(task)) {
 			throw new IllegalStateException("Cooperative workload task is not queued: " + task.sequence());
 		}
@@ -1636,17 +1639,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		task.metrics().recordRunOutcome();
 	}
 
-	private Collection<WorkloadTask> normalQueueUnsafe(WorkloadProfile profile) {
-		return profile == WorkloadProfile.LATENCY ? latencyQueue : queues.get(profile);
-	}
-
 	private WorkloadTask peekUnsafe(WorkloadProfile profile) {
 		if (profile == WorkloadProfile.LATENCY) {
 			return latencyQueue.first();
 		}
-		var normalQueue = queues.get(profile);
-		var cooperativeQueue = cooperativeQueues.get(profile);
-		var normalHead = normalQueue.isEmpty() ? null : normalQueue.getFirst();
+		var normalQueue = queues[profile.ordinal()];
+		var cooperativeQueue = cooperativeQueues[profile.ordinal()];
+		var normalHead = normalQueue.peekFirst();
 		var cooperativeHead = cooperativeQueue == null ? null : cooperativeQueue.peekFirst();
 		if (normalHead == null) {
 			return Objects.requireNonNull(cooperativeHead);
@@ -2035,15 +2034,15 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private final boolean cooperative;
 		private @Nullable WorkloadTask previousCancellation;
 		private @Nullable WorkloadTask nextCancellation;
-		private @Nullable WorkloadTask previousCooperative;
-		private @Nullable WorkloadTask nextCooperative;
+		private @Nullable WorkloadTask previousQueue;
+		private @Nullable WorkloadTask nextQueue;
 		private @Nullable WorkloadPressureController.BatchPermit batchPermit;
 		private volatile @Nullable RWScheduler.TerminalOutcome outcome;
 		private volatile @Nullable RequestedTermination requestedTermination;
 		private volatile TaskState state = TaskState.QUEUED;
 		private boolean cancellationLinked;
 		private boolean deadlineIndexed;
-		private boolean cooperativeQueued;
+		private boolean profileQueued;
 		private boolean resumeRequested;
 		private boolean started;
 		private long cooperativeQueueWaitNanos;
@@ -2442,50 +2441,50 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		TERMINAL
 	}
 
-	private static final class CooperativeQueue {
+	private static final class TaskQueue {
 
 		private @Nullable WorkloadTask first;
 		private @Nullable WorkloadTask last;
 
 		private void addLast(WorkloadTask task) {
-			if (task.cooperativeQueued || task.previousCooperative != null || task.nextCooperative != null) {
-				throw new IllegalStateException("Cooperative workload task is already queued");
+			if (task.profileQueued || task.previousQueue != null || task.nextQueue != null) {
+				throw new IllegalStateException("Workload task is already queued");
 			}
 			if (last == null) {
 				first = task;
 			} else {
-				last.nextCooperative = task;
-				task.previousCooperative = last;
+				last.nextQueue = task;
+				task.previousQueue = last;
 			}
 			last = task;
-			task.cooperativeQueued = true;
+			task.profileQueued = true;
 		}
 
 		private boolean remove(WorkloadTask task) {
-			if (!task.cooperativeQueued) {
+			if (!task.profileQueued) {
 				return false;
 			}
-			var previous = task.previousCooperative;
-			var next = task.nextCooperative;
+			var previous = task.previousQueue;
+			var next = task.nextQueue;
 			if (previous == null) {
 				if (first != task) {
-					throw new IllegalStateException("Cooperative workload task is not in this queue");
+					throw new IllegalStateException("Workload task is not in this queue");
 				}
 				first = next;
 			} else {
-				previous.nextCooperative = next;
+				previous.nextQueue = next;
 			}
 			if (next == null) {
 				if (last != task) {
-					throw new IllegalStateException("Cooperative workload task is not in this queue");
+					throw new IllegalStateException("Workload task is not in this queue");
 				}
 				last = previous;
 			} else {
-				next.previousCooperative = previous;
+				next.previousQueue = previous;
 			}
-			task.previousCooperative = null;
-			task.nextCooperative = null;
-			task.cooperativeQueued = false;
+			task.previousQueue = null;
+			task.nextQueue = null;
+			task.profileQueued = false;
 			return true;
 		}
 
