@@ -396,8 +396,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				boolean stop = false;
 				lock.lock();
 				try {
-					long nowMillis = System.currentTimeMillis();
-					expireDueUnsafe(nowMillis, terminalActions);
+					long nowMillis = 0L;
+					if (!deadlineQueue.isEmpty()) {
+						nowMillis = System.currentTimeMillis();
+						expireDueUnsafe(nowMillis, terminalActions);
+					}
 					task = dispatchUnsafe(nowMillis, terminalActions);
 					if (task == null && shutdown && queuedTotal == 0 && cooperativeTaskCount == 0) {
 						stop = true;
