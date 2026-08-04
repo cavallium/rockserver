@@ -295,7 +295,11 @@ integrity writes plus 1,024 matching reads.
 `results.json` is the machine-readable source of truth. `results.md` contains the
 same provenance plus per-round operation, CPU/allocation/resource, latency,
 request-conservation, scheduler, utilization, integrity, drain, and acceptance
-evidence. The result schema is `rockserver-grpc-overload-v5`. `--smoke=true
+evidence. The result schema is `rockserver-grpc-overload-v6`. CPU and allocation
+totals exclude the registered admission/resource observer thread so a faster or
+slower sampler cannot be attributed to useful operations; its CPU and allocation
+are reported separately as absolute observer counters. GC and peak resources remain
+whole-process measurements and therefore retain any indirect sampler impact. `--smoke=true
 --enforce=false` shortens the dataset and run to verify structure; tmpfs, CI, one
 round, warm cache, a dirty build, low-memory startup, or uncontrolled hardware
 cannot be reported as release acceptance.

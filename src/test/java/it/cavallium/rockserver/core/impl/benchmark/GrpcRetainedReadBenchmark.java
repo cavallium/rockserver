@@ -107,6 +107,7 @@ public final class GrpcRetainedReadBenchmark {
 	private static final String PERFORMANCE_BASELINE_SHA = "bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e";
 	private static final int FIXED_PAIRED_ROUNDS = 10;
 	private static final long READ_TIMEOUT_MILLIS = TimeUnit.MINUTES.toMillis(10L);
+	private static final RWScheduler.Pool[] POOL_VALUES = RWScheduler.Pool.values();
 	private static final Set<String> WORKER_KEYS = Set.of(
 			"schema", "implementation", "scenario", "round", "build-sha", "classpath-sha256",
 			"arena-instrumentation-sha256",
@@ -1180,6 +1181,7 @@ public final class GrpcRetainedReadBenchmark {
 		private final GrpcServer server;
 		private final long sampleNanos;
 		private final ExistsMultiResourceProbe existsMultiProbe;
+		private final long[] schedulerTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
 		private final BenchmarkProcessTelemetry.PeakSampler processPeaks =
 				new BenchmarkProcessTelemetry.PeakSampler();
 		private ResourcePeaks peaks = ResourcePeaks.empty();
@@ -1211,6 +1213,11 @@ public final class GrpcRetainedReadBenchmark {
 		private void sample() {
 			processPeaks.sample();
 			peaks = peaks.max(ResourceSnapshot.capture(embedded, server, this));
+		}
+
+		private long[] copyPoolTelemetry(RWScheduler scheduler, RWScheduler.Pool pool) {
+			BenchmarkSchedulerTelemetry.copyPoolTelemetry(scheduler, pool, schedulerTelemetry);
+			return schedulerTelemetry;
 		}
 
 		private BenchmarkProcessTelemetry.Peaks processPeaks() {
@@ -1589,15 +1596,25 @@ public final class GrpcRetainedReadBenchmark {
 			int outstanding = 0;
 			long submissionAttempts = 0L;
 			long terminalOutcomes = 0L;
-			for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
-				var snapshot = scheduler.poolSnapshot(pool);
-				queued += snapshot.queuedTasks();
-				active += snapshot.activeTasks();
-				int poolOutstanding = BenchmarkSchedulerTelemetry.outstandingTasks(snapshot);
-				parked += BenchmarkSchedulerTelemetry.parkedTasks(snapshot, poolOutstanding);
-				outstanding += poolOutstanding;
-				submissionAttempts += BenchmarkSchedulerTelemetry.submissionAttempts(snapshot);
-				terminalOutcomes += BenchmarkSchedulerTelemetry.terminalOutcomes(snapshot);
+			for (RWScheduler.Pool pool : POOL_VALUES) {
+				if (sampler == null) {
+					var snapshot = scheduler.poolSnapshot(pool);
+					queued += snapshot.queuedTasks();
+					active += snapshot.activeTasks();
+					int poolOutstanding = BenchmarkSchedulerTelemetry.outstandingTasks(snapshot);
+					parked += BenchmarkSchedulerTelemetry.parkedTasks(snapshot, poolOutstanding);
+					outstanding += poolOutstanding;
+					submissionAttempts += BenchmarkSchedulerTelemetry.submissionAttempts(snapshot);
+					terminalOutcomes += BenchmarkSchedulerTelemetry.terminalOutcomes(snapshot);
+				} else {
+					long[] telemetry = sampler.copyPoolTelemetry(scheduler, pool);
+					queued += Math.toIntExact(telemetry[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS]);
+					active += Math.toIntExact(telemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS]);
+					parked += Math.toIntExact(telemetry[RWScheduler.POOL_TELEMETRY_PARKED_TASKS]);
+					outstanding += Math.toIntExact(telemetry[RWScheduler.POOL_TELEMETRY_OUTSTANDING_TASKS]);
+					submissionAttempts += telemetry[RWScheduler.POOL_TELEMETRY_SUBMISSION_ATTEMPTS];
+					terminalOutcomes += telemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES];
+				}
 			}
 			var database = embedded.getInternalDB();
 			var existsMulti = sampler == null ? ExistsMultiResources.empty() : sampler.existsMultiResources();
@@ -2008,6 +2025,10 @@ public final class GrpcRetainedReadBenchmark {
 			if (!accountingValid) failures.add("logical scheduler accounting is invalid");
 			if (implementation == Implementation.CANDIDATE && !finalResources.exactSchedulerAccounting()) {
 				failures.add("candidate did not expose exact scheduler accounting");
+			}
+			if (implementation == Implementation.CANDIDATE
+					&& !BenchmarkSchedulerTelemetry.allocationFreePoolTelemetry()) {
+				failures.add("candidate did not expose allocation-free scheduler telemetry");
 			}
 			if (resourcePeaks.retainedPermits() > configuredRetainedLimit
 					|| resourcePeaks.retainedSnapshots() > configuredRetainedLimit) {

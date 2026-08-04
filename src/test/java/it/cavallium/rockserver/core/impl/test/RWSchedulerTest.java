@@ -36,6 +36,64 @@ import reactor.core.Disposable;
 class RWSchedulerTest {
 
 	@Test
+	void primitivePoolTelemetryMatchesImmutableSnapshot() throws Exception {
+		var scheduler = scheduler(1, "primitive-pool-telemetry");
+		var blockerStarted = new CountDownLatch(1);
+		var release = new CountDownLatch(1);
+		var queuedCompleted = new CountDownLatch(1);
+		try {
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+					.execute(() -> {
+						blockerStarted.countDown();
+						awaitUninterruptibly(release);
+					});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE)
+					.execute(queuedCompleted::countDown);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+
+			assertPoolTelemetryMatchesSnapshot(scheduler, RWScheduler.Pool.READ);
+			assertThrows(IllegalArgumentException.class,
+					() -> scheduler.copyPoolTelemetry(RWScheduler.Pool.READ,
+							new long[RWScheduler.POOL_TELEMETRY_LENGTH - 1]));
+
+			release.countDown();
+			assertTrue(queuedCompleted.await(5, SECONDS));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
+			assertPoolTelemetryMatchesSnapshot(scheduler, RWScheduler.Pool.READ);
+		} finally {
+			release.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	private static void assertPoolTelemetryMatchesSnapshot(RWScheduler scheduler, RWScheduler.Pool pool) {
+		var telemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
+		scheduler.copyPoolTelemetry(pool, telemetry);
+		var snapshot = scheduler.poolSnapshot(pool);
+		assertEquals(snapshot.workerCount(), telemetry[RWScheduler.POOL_TELEMETRY_WORKER_COUNT]);
+		assertEquals(snapshot.queuedTasks(), telemetry[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS]);
+		assertEquals(snapshot.activeTasks(), telemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS]);
+		assertEquals(snapshot.parkedTasks(), telemetry[RWScheduler.POOL_TELEMETRY_PARKED_TASKS]);
+		assertEquals(snapshot.outstandingTasks(), telemetry[RWScheduler.POOL_TELEMETRY_OUTSTANDING_TASKS]);
+		assertEquals(snapshot.submissionAttempts(), telemetry[RWScheduler.POOL_TELEMETRY_SUBMISSION_ATTEMPTS]);
+		assertEquals(snapshot.acceptedTasks(), telemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS]);
+		assertEquals(snapshot.startedTasks(), telemetry[RWScheduler.POOL_TELEMETRY_STARTED_TASKS]);
+		assertEquals(snapshot.completedTasks(), telemetry[RWScheduler.POOL_TELEMETRY_COMPLETED_TASKS]);
+		assertEquals(snapshot.failedTasks(), telemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS]);
+		assertEquals(snapshot.terminalOutcomes(), telemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]);
+		assertEquals(snapshot.batchDispatchLimited() ? 1L : 0L,
+				telemetry[RWScheduler.POOL_TELEMETRY_BATCH_LIMITED]);
+		for (var profile : WorkloadProfile.values()) {
+			assertEquals(snapshot.queuedByProfile().get(profile).longValue(),
+					telemetry[RWScheduler.POOL_TELEMETRY_SCALARS + profile.ordinal()]);
+			assertEquals(snapshot.activeByProfile().get(profile).longValue(),
+					telemetry[RWScheduler.POOL_TELEMETRY_SCALARS
+							+ WorkloadProfile.values().length + profile.ordinal()]);
+		}
+	}
+
+	@Test
 	void latencyUsesEarliestDeadlineFirst() throws Exception {
 		var scheduler = scheduler(1, "edf-test");
 		var blockerStarted = new CountDownLatch(1);

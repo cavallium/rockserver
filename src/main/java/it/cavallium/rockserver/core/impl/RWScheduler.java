@@ -29,6 +29,23 @@ import reactor.core.scheduler.Scheduler;
  */
 public final class RWScheduler {
 
+	public static final int POOL_TELEMETRY_WORKER_COUNT = 0;
+	public static final int POOL_TELEMETRY_WAITING_WORKERS = 1;
+	public static final int POOL_TELEMETRY_QUEUED_TASKS = 2;
+	public static final int POOL_TELEMETRY_ACTIVE_TASKS = 3;
+	public static final int POOL_TELEMETRY_PARKED_TASKS = 4;
+	public static final int POOL_TELEMETRY_OUTSTANDING_TASKS = 5;
+	public static final int POOL_TELEMETRY_SUBMISSION_ATTEMPTS = 6;
+	public static final int POOL_TELEMETRY_ACCEPTED_TASKS = 7;
+	public static final int POOL_TELEMETRY_STARTED_TASKS = 8;
+	public static final int POOL_TELEMETRY_COMPLETED_TASKS = 9;
+	public static final int POOL_TELEMETRY_FAILED_TASKS = 10;
+	public static final int POOL_TELEMETRY_TERMINAL_OUTCOMES = 11;
+	public static final int POOL_TELEMETRY_BATCH_LIMITED = 12;
+	public static final int POOL_TELEMETRY_BATCH_ALLOWANCE = 13;
+	public static final int POOL_TELEMETRY_SCALARS = 14;
+	public static final int POOL_TELEMETRY_LENGTH = POOL_TELEMETRY_SCALARS + 14;
+
 	private static final long SHUTDOWN_WAIT_SECONDS = 10L;
 	private static final Logger LOG = LoggerFactory.getLogger(RWScheduler.class);
 
@@ -365,6 +382,21 @@ public final class RWScheduler {
 				snapshot.workerThreadNames(),
 				snapshot.shutdown(),
 				snapshot.terminated());
+	}
+
+	/**
+	 * Copy allocation-free high-frequency pool telemetry into a caller-owned buffer. Full immutable
+	 * snapshots remain available through {@link #poolSnapshot(Pool)} for drain and conservation
+	 * checks.
+	 */
+	public void copyPoolTelemetry(Pool pool, long[] target) {
+		var executor = switch (Objects.requireNonNull(pool, "pool")) {
+			case READ -> readPool;
+			case WRITE -> writePool;
+			case CONTROL -> controlPool;
+			case PHYSICAL -> physicalPool;
+		};
+		executor.copyPoolTelemetry(target);
 	}
 
 	public SchedulerSnapshot instrumentationSnapshot() {

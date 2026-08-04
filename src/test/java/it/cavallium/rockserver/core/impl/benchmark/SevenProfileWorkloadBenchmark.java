@@ -91,6 +91,7 @@ public final class SevenProfileWorkloadBenchmark {
 	private static final Comparator<WorkloadKey> WORKLOAD_KEY_ORDER = Comparator
 			.comparingInt((WorkloadKey key) -> WorkloadBenchmarkSelector.ALL_PROFILES.indexOf(key.profile()))
 			.thenComparing(key -> key.family().name());
+	private static final RWScheduler.Pool[] POOL_VALUES = RWScheduler.Pool.values();
 
 	private SevenProfileWorkloadBenchmark() {
 	}
@@ -887,7 +888,7 @@ public final class SevenProfileWorkloadBenchmark {
 		int outstanding = 0;
 		long submissionAttempts = 0L;
 		long terminalOutcomes = 0L;
-		for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
+		for (RWScheduler.Pool pool : POOL_VALUES) {
 			var poolSnapshot = scheduler.poolSnapshot(pool);
 			queued += poolSnapshot.queuedTasks();
 			active += poolSnapshot.activeTasks();
@@ -1942,6 +1943,9 @@ public final class SevenProfileWorkloadBenchmark {
 		private final AtomicBoolean cdcLagObserved = new AtomicBoolean();
 		private final AtomicLong maximumRetainedSnapshots = new AtomicLong();
 		private final AtomicLong maximumStoragePressure = new AtomicLong();
+		private final long[] poolTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
+		private final int[] sampledQueued = new int[WorkloadProfile.values().length];
+		private final int[] sampledActive = new int[WorkloadProfile.values().length];
 		private final BenchmarkProcessTelemetry.PeakSampler processPeaks =
 				new BenchmarkProcessTelemetry.PeakSampler();
 
@@ -1969,26 +1973,35 @@ public final class SevenProfileWorkloadBenchmark {
 		private void sample(EmbeddedConnection connection,
 				BenchmarkMeterRegistry meterRegistry,
 				String databaseName) {
-			var admission = connection.getScheduler().admissionSnapshot();
 			var scheduler = connection.getScheduler();
-			for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
-				maximumQueued.get(profile).accumulateAndGet(admission.queued().get(profile), Math::max);
-				maximumActive.get(profile).accumulateAndGet(admission.active().get(profile), Math::max);
-			}
+			Arrays.fill(sampledQueued, 0);
+			Arrays.fill(sampledActive, 0);
 			int parked = 0;
 			int outstanding = 0;
-			for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
-				var poolSnapshot = scheduler.poolSnapshot(pool);
-				int poolOutstanding = BenchmarkSchedulerTelemetry.outstandingTasks(poolSnapshot);
-				parked += BenchmarkSchedulerTelemetry.parkedTasks(poolSnapshot, poolOutstanding);
-				outstanding += poolOutstanding;
+			for (RWScheduler.Pool pool : POOL_VALUES) {
+				BenchmarkSchedulerTelemetry.copyPoolTelemetry(scheduler, pool, poolTelemetry);
+				parked = Math.addExact(parked,
+						Math.toIntExact(poolTelemetry[RWScheduler.POOL_TELEMETRY_PARKED_TASKS]));
+				outstanding = Math.addExact(outstanding,
+						Math.toIntExact(poolTelemetry[RWScheduler.POOL_TELEMETRY_OUTSTANDING_TASKS]));
+				for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
+					int index = profile.ordinal();
+					sampledQueued[index] = Math.addExact(sampledQueued[index],
+							BenchmarkSchedulerTelemetry.queued(poolTelemetry, profile));
+					sampledActive[index] = Math.addExact(sampledActive[index],
+							BenchmarkSchedulerTelemetry.active(poolTelemetry, profile));
+				}
+			}
+			for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
+				maximumQueued.get(profile).accumulateAndGet(sampledQueued[profile.ordinal()], Math::max);
+				maximumActive.get(profile).accumulateAndGet(sampledActive[profile.ordinal()], Math::max);
 			}
 			maximumParked.accumulateAndGet(parked, Math::max);
 			maximumOutstanding.accumulateAndGet(outstanding, Math::max);
 			processPeaks.sample();
 			maximumRetainedSnapshots.accumulateAndGet(
 					connection.getInternalDB().getRetainedRangeSnapshotCount(), Math::max);
-			maximumStoragePressure.accumulateAndGet(admission.storagePressure() ? 1L : 0L, Math::max);
+			maximumStoragePressure.accumulateAndGet(scheduler.isStoragePressure() ? 1L : 0L, Math::max);
 			var cdcLag = meterRegistry.find("rockserver.workload.cdc.lag")
 					.tag("database", databaseName).gauge();
 			if (cdcLag != null) {

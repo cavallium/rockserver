@@ -1113,7 +1113,53 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
-	private void validateAccountingUnsafe() {
+	/**
+	 * Copy the high-frequency scheduler counters used by benchmark and diagnostic samplers into a
+	 * caller-owned primitive buffer. The full immutable {@link ExecutorSnapshot} remains the
+	 * authoritative drain/conservation view; this path avoids materializing its profile maps when a
+	 * sampler only needs primitive utilization counters.
+	 */
+	void copyPoolTelemetry(long[] target) {
+		Objects.requireNonNull(target, "target");
+		int profileCount = PROFILES.length;
+		int requiredLength = RWScheduler.POOL_TELEMETRY_SCALARS + profileCount * 2;
+		if (target.length < requiredLength) {
+			throw new IllegalArgumentException("Pool telemetry buffer requires at least "
+					+ requiredLength + " entries");
+		}
+		lock.lock();
+		try {
+			long terminalOutcomes = validateAccountingUnsafe();
+			int batchQueued = queuedUnsafe(WorkloadProfile.BATCH);
+			int batchStartAllowance = pressureController.batchStartAllowance(
+					shutdown, resourcePool, System.nanoTime());
+			target[RWScheduler.POOL_TELEMETRY_WORKER_COUNT] = workerCount;
+			target[RWScheduler.POOL_TELEMETRY_WAITING_WORKERS] = waitingWorkers;
+			target[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS] = queuedTotal;
+			target[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS] = activeTotal;
+			target[RWScheduler.POOL_TELEMETRY_PARKED_TASKS] = parkedTotal;
+			target[RWScheduler.POOL_TELEMETRY_OUTSTANDING_TASKS] = outstandingTotal;
+			target[RWScheduler.POOL_TELEMETRY_SUBMISSION_ATTEMPTS] = submissionAttempts;
+			target[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS] = acceptedTasks;
+			target[RWScheduler.POOL_TELEMETRY_STARTED_TASKS] = startedTasks;
+			target[RWScheduler.POOL_TELEMETRY_COMPLETED_TASKS] = completedTasks;
+			target[RWScheduler.POOL_TELEMETRY_FAILED_TASKS] = failedTasks;
+			target[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES] = terminalOutcomes;
+			target[RWScheduler.POOL_TELEMETRY_BATCH_LIMITED] =
+					batchQueued > batchStartAllowance ? 1L : 0L;
+			target[RWScheduler.POOL_TELEMETRY_BATCH_ALLOWANCE] = batchStartAllowance;
+			for (var profile : PROFILES) {
+				int profileIndex = profile.ordinal();
+				target[RWScheduler.POOL_TELEMETRY_SCALARS + profileIndex] = queued[profileIndex];
+				target[RWScheduler.POOL_TELEMETRY_SCALARS + profileCount + profileIndex] =
+						active[profileIndex];
+			}
+		} finally {
+			lock.unlock();
+		}
+	}
+
+	private long validateAccountingUnsafe() {
 		if ((long) queuedTotal + activeTotal + parkedTotal != outstandingTotal) {
 			throw new IllegalStateException("Pool outstanding accounting mismatch in " + poolName);
 		}
@@ -1134,6 +1180,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				throw new IllegalStateException("Profile outstanding limit exceeded for " + profile);
 			}
 		}
+		return terminalOutcomes;
 	}
 
 	private static Map<WorkloadProfile, Integer> snapshot(int[] values) {

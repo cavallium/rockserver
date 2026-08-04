@@ -23,6 +23,7 @@ class BenchmarkSchedulerTelemetryTest {
 				false, Integer.MAX_VALUE, List.of(), false, false);
 
 		assertTrue(BenchmarkSchedulerTelemetry.exactAccounting());
+		assertTrue(BenchmarkSchedulerTelemetry.allocationFreePoolTelemetry());
 		assertEquals(6, BenchmarkSchedulerTelemetry.outstandingTasks(snapshot));
 		assertEquals(3, BenchmarkSchedulerTelemetry.parkedTasks(snapshot, 6));
 		assertEquals(12L, BenchmarkSchedulerTelemetry.submissionAttempts(snapshot));

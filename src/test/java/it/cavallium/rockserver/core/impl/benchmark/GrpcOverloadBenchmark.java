@@ -2,7 +2,6 @@ package it.cavallium.rockserver.core.impl.benchmark;
 
 import com.sun.management.OperatingSystemMXBean;
 import com.sun.management.ThreadMXBean;
-import com.sun.management.UnixOperatingSystemMXBean;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
@@ -53,11 +52,8 @@ import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.management.BufferPoolMXBean;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
-import java.lang.management.MemoryPoolMXBean;
-import java.lang.management.MemoryType;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -115,13 +111,16 @@ public final class GrpcOverloadBenchmark {
 	private static final long COOPERATIVE_QUANTUM_NANOS = TimeUnit.MILLISECONDS.toNanos(8L);
 	private static final long RUNTIME_RESOURCE_SAMPLE_NANOS = TimeUnit.MILLISECONDS.toNanos(100L);
 	private static final String CDC_SUBSCRIPTION_PREFIX = "grpc-overload-cdc-";
-	private static final String RESULT_SCHEMA = "rockserver-grpc-overload-v5";
+	private static final String RESULT_SCHEMA = "rockserver-grpc-overload-v6";
+	private static final String PERFORMANCE_BASELINE_SHA = "bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e";
 	private static final String DATASET_SCHEMA = "rockserver-grpc-overload-dataset-v4";
 	private static final String RUN_ATTEMPT_SCHEMA = "rockserver-grpc-overload-run-attempt-v2";
 	private static final String DATASET_MARKER_FILE = ".rockserver-overload-benchmark";
 	private static final String RUN_ATTEMPT_FILE = "run-attempt.properties";
 	private static final long GIBIBYTE = 1L << 30;
 	private static final int MIN_RELEASE_HOST_AVAILABLE_GIB = 8;
+	private static final RWScheduler.Pool[] POOL_VALUES = RWScheduler.Pool.values();
+	private static final WorkloadProfile[] WORKLOAD_PROFILE_VALUES = WorkloadProfile.values();
 
 	private GrpcOverloadBenchmark() {
 	}
@@ -133,6 +132,14 @@ public final class GrpcOverloadBenchmark {
 		}
 
 		Options options = Options.parse(args);
+		if (!options.prepareOnly()
+				&& options.instrumentationMode().equals("strict")
+				&& !options.buildId().equals(PERFORMANCE_BASELINE_SHA)
+				&& (!BenchmarkSchedulerTelemetry.exactAccounting()
+				|| !BenchmarkSchedulerTelemetry.allocationFreePoolTelemetry())) {
+			throw new IllegalStateException("Strict candidate measurement requires exact accounting "
+					+ "and allocation-free pool telemetry");
+		}
 		System.setProperty("rockserver.core.print-config", "false");
 		System.setProperty("it.cavallium.rockserver.leakdetection", "true");
 		Instant started = Instant.now();
@@ -526,6 +533,10 @@ public final class GrpcOverloadBenchmark {
 		return comparisonFingerprint(Options.parse(args));
 	}
 
+	public static long subtractObserverForTesting(long processDelta, long observerDelta) {
+		return RuntimeTelemetryTracker.subtractObserver(processDelta, observerDelta);
+	}
+
 	private static long preload(RocksDBSyncAPI api, Options options) {
 		System.out.printf(Locale.ROOT,
 				"Preloading %,d keys (%d bytes/value), flushing every %,d keys...%n",
@@ -756,6 +767,7 @@ public final class GrpcOverloadBenchmark {
 				composite.remove(meterRegistry);
 			}
 			meterRegistry.close();
+			runtimeTelemetry.close();
 		}
 	}
 
@@ -1069,6 +1081,7 @@ public final class GrpcOverloadBenchmark {
 	private static void monitorAdmission(EmbeddedConnection embedded,
 			Options options,
 			PhaseControl control) throws InterruptedException {
+		control.runtimeTelemetry.registerObserverThread();
 		control.ready.countDown();
 		control.start.await();
 		while (!control.stop.get()) {
@@ -2285,6 +2298,8 @@ public final class GrpcOverloadBenchmark {
 				.append(", \"allocated_bytes\": ").append(telemetry.allocatedBytes())
 				.append(", \"allocated_bytes_per_operation\": ")
 				.append(format(phase.allocatedBytesPerOperation()))
+				.append(", \"observer_cpu_ns\": ").append(telemetry.observerCpuNanos())
+				.append(", \"observer_allocated_bytes\": ").append(telemetry.observerAllocatedBytes())
 				.append(", \"gc_collections\": ").append(telemetry.gcCollections())
 				.append(", \"gc_millis\": ").append(telemetry.gcMillis())
 				.append(", \"peak_live_heap_bytes\": ").append(telemetry.peakLiveHeapBytes())
@@ -2510,14 +2525,16 @@ public final class GrpcOverloadBenchmark {
 			}
 		}
 		markdown.append("\n## Runtime telemetry\n\n")
-				.append("| Round | Phase | CPU ns/op | Allocated B/op | Peak heap bytes | Peak direct bytes | Peak RSS bytes | GC count/ms | Peak threads | Peak native handles | Available |\n")
-				.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+				.append("| Round | Phase | CPU ns/op | Allocated B/op | Observer CPU ns | Observer allocated bytes | Peak heap bytes | Peak direct bytes | Peak RSS bytes | GC count/ms | Peak threads | Peak native handles | Available |\n")
+				.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
 		for (PhaseResult phase : result.phases()) {
 			RuntimeTelemetry telemetry = phase.runtimeTelemetry();
 			markdown.append('|').append(phase.round())
 					.append('|').append(phase.phase().value)
 					.append('|').append(format(phase.cpuNanosPerOperation()))
 					.append('|').append(format(phase.allocatedBytesPerOperation()))
+					.append('|').append(telemetry.observerCpuNanos())
+					.append('|').append(telemetry.observerAllocatedBytes())
 					.append('|').append(telemetry.peakLiveHeapBytes())
 					.append('|').append(telemetry.peakDirectMemoryBytes())
 					.append('|').append(telemetry.peakRssBytes())
@@ -3083,7 +3100,7 @@ public final class GrpcOverloadBenchmark {
 				new EnumMap<>(RWScheduler.Pool.class);
 
 		private AdmissionTracker(boolean exactWaitingWorkerEvidence, long admissionSampleNanos) {
-			for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
+			for (RWScheduler.Pool pool : POOL_VALUES) {
 				poolUtilization.put(pool,
 						new MutablePoolUtilization(exactWaitingWorkerEvidence, admissionSampleNanos));
 			}
@@ -3091,33 +3108,43 @@ public final class GrpcOverloadBenchmark {
 
 		private void sample(EmbeddedConnection embedded) {
 			var scheduler = embedded.getScheduler();
-			var snapshot = scheduler.admissionSnapshot();
-			int foregroundQueue = snapshot.queued().get(WorkloadProfile.INGEST);
-			int maintenanceQueue = snapshot.queued().get(WorkloadProfile.BATCH);
-			int foregroundActive = snapshot.active().get(WorkloadProfile.INGEST);
-			int maintenanceActive = snapshot.active().get(WorkloadProfile.BATCH);
+			boolean storagePressure = scheduler.isStoragePressure();
+			int foregroundQueue = 0;
+			int maintenanceQueue = 0;
+			int foregroundActive = 0;
+			int maintenanceActive = 0;
+			int totalActive = 0;
+			for (RWScheduler.Pool pool : POOL_VALUES) {
+				var utilization = poolUtilization.get(pool);
+				utilization.sample(pool, scheduler, storagePressure);
+				foregroundQueue += utilization.lastQueued(WorkloadProfile.INGEST);
+				maintenanceQueue += utilization.lastQueued(WorkloadProfile.BATCH);
+				foregroundActive += utilization.lastActive(WorkloadProfile.INGEST);
+				maintenanceActive += utilization.lastActive(WorkloadProfile.BATCH);
+				totalActive += utilization.lastActiveTasks();
+			}
 			maxForegroundQueue.accumulateAndGet(foregroundQueue, Math::max);
 			maxMaintenanceQueue.accumulateAndGet(maintenanceQueue, Math::max);
 			maxForegroundActive.accumulateAndGet(foregroundActive, Math::max);
 			maxMaintenanceActive.accumulateAndGet(maintenanceActive, Math::max);
-			maxTotalActive.accumulateAndGet(snapshot.totalActive(), Math::max);
-			for (RWScheduler.Pool pool : RWScheduler.Pool.values()) {
-				poolUtilization.get(pool).sample(pool, scheduler.poolSnapshot(pool), snapshot.storagePressure());
-			}
+			maxTotalActive.accumulateAndGet(totalActive, Math::max);
 		}
 
 		private AdmissionResult finish(EmbeddedConnection embedded, PhaseMetrics metrics) {
 			sample(embedded);
-			var snapshot = embedded.getScheduler().admissionSnapshot();
 			var utilization = new EnumMap<RWScheduler.Pool, PoolUtilization>(RWScheduler.Pool.class);
+			int foregroundQueue = 0;
+			int maintenanceQueue = 0;
 			for (var entry : poolUtilization.entrySet()) {
 				utilization.put(entry.getKey(), entry.getValue().snapshot());
+				foregroundQueue += entry.getValue().lastQueued(WorkloadProfile.INGEST);
+				maintenanceQueue += entry.getValue().lastQueued(WorkloadProfile.BATCH);
 			}
 			return new AdmissionResult(
 					maxForegroundQueue.get(),
 					maxMaintenanceQueue.get(),
-					snapshot.queued().get(WorkloadProfile.INGEST),
-					snapshot.queued().get(WorkloadProfile.BATCH),
+					foregroundQueue,
+					maintenanceQueue,
 					maxForegroundActive.get(),
 					maxMaintenanceActive.get(),
 					maxTotalActive.get(),
@@ -3131,6 +3158,7 @@ public final class GrpcOverloadBenchmark {
 
 		private final boolean exactWaitingWorkerEvidence;
 		private final long samplePeriodNanos;
+		private final long[] telemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
 
 		private long samples;
 		private long eligibleBacklogSamples;
@@ -3149,22 +3177,25 @@ public final class GrpcOverloadBenchmark {
 		}
 
 		private void sample(RWScheduler.Pool pool,
-				RWScheduler.PoolSnapshot snapshot,
+				RWScheduler scheduler,
 				boolean storagePressure) {
+			BenchmarkSchedulerTelemetry.copyPoolTelemetry(scheduler, pool, telemetry);
 			samples++;
-			workerCount = snapshot.workerCount();
-			maximumActive = Math.max(maximumActive, snapshot.activeTasks());
-			if (snapshot.batchDispatchLimited()
-					&& snapshot.queuedByProfile().getOrDefault(WorkloadProfile.BATCH, 0) > 0) {
+			workerCount = value(RWScheduler.POOL_TELEMETRY_WORKER_COUNT);
+			int activeTasks = lastActiveTasks();
+			maximumActive = Math.max(maximumActive, activeTasks);
+			if (telemetry[RWScheduler.POOL_TELEMETRY_BATCH_LIMITED] != 0L
+					&& lastQueued(WorkloadProfile.BATCH) > 0) {
 				policyLimitedBacklogSamples++;
 			}
-			int eligibleQueued = eligibleQueued(pool, snapshot, storagePressure);
+			int eligibleQueued = eligibleQueued(pool, storagePressure);
 			if (eligibleQueued <= 0) {
 				consecutiveAvoidableIdleSamples = 0;
 				return;
 			}
 			eligibleBacklogSamples++;
-			int idleWorkers = exactWaitingWorkerEvidence ? snapshot.waitingWorkers() : 0;
+			int idleWorkers = exactWaitingWorkerEvidence
+					? value(RWScheduler.POOL_TELEMETRY_WAITING_WORKERS) : 0;
 			int avoidablyIdleWorkers = Math.min(idleWorkers, eligibleQueued);
 			if (avoidablyIdleWorkers == 0) {
 				consecutiveAvoidableIdleSamples = 0;
@@ -3173,7 +3204,7 @@ public final class GrpcOverloadBenchmark {
 				maximumConsecutiveAvoidableIdleSamples = Math.max(
 						maximumConsecutiveAvoidableIdleSamples, consecutiveAvoidableIdleSamples);
 			}
-			if ((long) snapshot.activeTasks() + eligibleQueued >= snapshot.workerCount()) {
+			if ((long) activeTasks + eligibleQueued >= workerCount) {
 				saturatingDemandSamples++;
 				idleWorkerSlots += idleWorkers;
 				if (idleWorkers == 0) {
@@ -3182,24 +3213,43 @@ public final class GrpcOverloadBenchmark {
 			}
 		}
 
-		private static int eligibleQueued(RWScheduler.Pool pool,
-				RWScheduler.PoolSnapshot snapshot,
-				boolean storagePressure) {
+		private int eligibleQueued(RWScheduler.Pool pool, boolean storagePressure) {
 			return switch (pool) {
-				case READ -> snapshot.queuedByProfile().entrySet().stream()
-						.filter(entry -> entry.getKey() != WorkloadProfile.ANALYTICAL)
-						.mapToInt(entry -> entry.getKey() == WorkloadProfile.BATCH
-								? Math.min(entry.getValue(), snapshot.batchStartAllowance())
-								: entry.getValue())
-						.sum();
-				case WRITE -> {
-					int batchQueued = snapshot.queuedByProfile().getOrDefault(WorkloadProfile.BATCH, 0);
-					yield snapshot.queuedTasks() - batchQueued
-							+ Math.min(batchQueued, snapshot.batchStartAllowance());
+				case READ -> {
+					int queued = 0;
+					for (var profile : WORKLOAD_PROFILE_VALUES) {
+						if (profile == WorkloadProfile.ANALYTICAL) continue;
+						int profileQueued = lastQueued(profile);
+						queued += profile == WorkloadProfile.BATCH
+								? Math.min(profileQueued, value(RWScheduler.POOL_TELEMETRY_BATCH_ALLOWANCE))
+								: profileQueued;
+					}
+					yield queued;
 				}
-				case CONTROL -> snapshot.queuedTasks();
-				case PHYSICAL -> storagePressure ? 0 : snapshot.queuedTasks();
+				case WRITE -> {
+					int batchQueued = lastQueued(WorkloadProfile.BATCH);
+					yield value(RWScheduler.POOL_TELEMETRY_QUEUED_TASKS) - batchQueued
+							+ Math.min(batchQueued, value(RWScheduler.POOL_TELEMETRY_BATCH_ALLOWANCE));
+				}
+				case CONTROL -> value(RWScheduler.POOL_TELEMETRY_QUEUED_TASKS);
+				case PHYSICAL -> storagePressure ? 0 : value(RWScheduler.POOL_TELEMETRY_QUEUED_TASKS);
 			};
+		}
+
+		private int lastQueued(WorkloadProfile profile) {
+			return BenchmarkSchedulerTelemetry.queued(telemetry, profile);
+		}
+
+		private int lastActive(WorkloadProfile profile) {
+			return BenchmarkSchedulerTelemetry.active(telemetry, profile);
+		}
+
+		private int lastActiveTasks() {
+			return value(RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS);
+		}
+
+		private int value(int index) {
+			return Math.toIntExact(telemetry[index]);
 		}
 
 		private PoolUtilization snapshot() {
@@ -3422,30 +3472,30 @@ public final class GrpcOverloadBenchmark {
 
 	private record ProcessCounters(long cpuNanos,
 			long allocatedBytes,
+			long observerCpuNanos,
+			long observerAllocatedBytes,
 			long gcCollections,
 			long gcMillis) {
 	}
 
-	private static final class RuntimeTelemetryTracker {
+	private static final class RuntimeTelemetryTracker implements AutoCloseable {
 
 		private final OperatingSystemMXBean operatingSystem;
 		private final ThreadMXBean allocationBean;
 		private final java.lang.management.ThreadMXBean threadBean;
-		private final UnixOperatingSystemMXBean unixOperatingSystem;
+		private final BenchmarkProcessTelemetry.PeakSampler peakSampler =
+				new BenchmarkProcessTelemetry.PeakSampler();
+		private final boolean strict;
 		private boolean active;
 		private ProcessCounters before;
+		private long observerThreadId = -1L;
 		private long nextSampleNanos;
-		private long peakLiveHeapBytes;
-		private long peakDirectMemoryBytes;
-		private long peakRssBytes;
-		private int peakThreadCount;
-		private long peakNativeHandles;
 
 		private RuntimeTelemetryTracker(boolean strict) {
+			this.strict = strict;
 			var osBean = ManagementFactory.getOperatingSystemMXBean();
 			var threads = ManagementFactory.getThreadMXBean();
 			this.operatingSystem = osBean instanceof OperatingSystemMXBean extended ? extended : null;
-			this.unixOperatingSystem = osBean instanceof UnixOperatingSystemMXBean unix ? unix : null;
 			this.allocationBean = threads instanceof ThreadMXBean extended ? extended : null;
 			this.threadBean = threads;
 			boolean allocationSupported = allocationBean != null
@@ -3453,29 +3503,38 @@ public final class GrpcOverloadBenchmark {
 			if (allocationSupported && !allocationBean.isThreadAllocatedMemoryEnabled()) {
 				allocationBean.setThreadAllocatedMemoryEnabled(true);
 			}
-			if (strict && (operatingSystem == null || !allocationSupported || unixOperatingSystem == null)) {
+			boolean threadCpuSupported = threadBean.isThreadCpuTimeSupported();
+			if (threadCpuSupported && !threadBean.isThreadCpuTimeEnabled()) {
+				threadBean.setThreadCpuTimeEnabled(true);
+			}
+			if (strict && (operatingSystem == null || !allocationSupported || !threadCpuSupported)) {
 				throw new IllegalStateException("Strict overload telemetry requires HotSpot process CPU, "
-						+ "thread-allocation, and Unix native-handle MXBeans");
+						+ "thread CPU, and thread-allocation MXBeans");
 			}
 		}
 
-		private void start() {
+		private synchronized void registerObserverThread() {
+			long currentThreadId = Thread.currentThread().threadId();
+			if (observerThreadId != -1L && observerThreadId != currentThreadId) {
+				throw new IllegalStateException("Runtime telemetry observer thread changed");
+			}
+			observerThreadId = currentThreadId;
+		}
+
+		private synchronized void start() {
 			if (active) {
 				throw new IllegalStateException("Runtime telemetry window is already active");
 			}
-			peakLiveHeapBytes = 0L;
-			peakDirectMemoryBytes = 0L;
-			peakRssBytes = 0L;
-			peakThreadCount = 0;
-			peakNativeHandles = 0L;
-			threadBean.resetPeakThreadCount();
+			if (strict && observerThreadId < 0L) {
+				throw new IllegalStateException("Runtime telemetry observer thread was not registered");
+			}
+			peakSampler.reset();
 			before = captureCounters();
 			active = true;
-			nextSampleNanos = 0L;
-			sampleIfDue();
+			nextSampleNanos = System.nanoTime() + RUNTIME_RESOURCE_SAMPLE_NANOS;
 		}
 
-		private void sampleIfDue() {
+		private synchronized void sampleIfDue() {
 			if (!active) {
 				return;
 			}
@@ -3484,67 +3543,55 @@ public final class GrpcOverloadBenchmark {
 				return;
 			}
 			nextSampleNanos = now + RUNTIME_RESOURCE_SAMPLE_NANOS;
-			sample();
+			peakSampler.sample();
 		}
 
-		private void sample() {
-			long heap = 0L;
-			for (MemoryPoolMXBean pool : ManagementFactory.getMemoryPoolMXBeans()) {
-				if (pool.getType() == MemoryType.HEAP) {
-					var collection = pool.getCollectionUsage();
-					var usage = collection != null ? collection : pool.getUsage();
-					if (usage != null) heap += Math.max(0L, usage.getUsed());
-				}
-			}
-			long direct = 0L;
-			for (BufferPoolMXBean pool : ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)) {
-				if (pool.getName().equalsIgnoreCase("direct")) {
-					direct += Math.max(0L, pool.getMemoryUsed());
-				}
-			}
-			peakLiveHeapBytes = Math.max(peakLiveHeapBytes, heap);
-			peakDirectMemoryBytes = Math.max(peakDirectMemoryBytes, direct);
-			peakRssBytes = Math.max(peakRssBytes, residentSetBytes());
-			peakThreadCount = Math.max(peakThreadCount, threadBean.getPeakThreadCount());
-			if (unixOperatingSystem != null) {
-				peakNativeHandles = Math.max(peakNativeHandles,
-						unixOperatingSystem.getOpenFileDescriptorCount());
-			}
-		}
-
-		private RuntimeTelemetry stop() {
+		private synchronized RuntimeTelemetry stop() {
 			if (!active) {
 				throw new IllegalStateException("Runtime telemetry window is not active");
 			}
-			sample();
 			ProcessCounters after = captureCounters();
 			active = false;
-			long cpuNanos = delta(before.cpuNanos(), after.cpuNanos());
-			long allocatedBytes = delta(before.allocatedBytes(), after.allocatedBytes());
+			peakSampler.sample();
+			var peaks = peakSampler.peaks();
+			long observerCpuNanos = delta(before.observerCpuNanos(), after.observerCpuNanos());
+			long observerAllocatedBytes = delta(
+					before.observerAllocatedBytes(), after.observerAllocatedBytes());
+			long cpuNanos = subtractObserver(
+					delta(before.cpuNanos(), after.cpuNanos()), observerCpuNanos);
+			long allocatedBytes = subtractObserver(
+					delta(before.allocatedBytes(), after.allocatedBytes()), observerAllocatedBytes);
 			long gcCollections = delta(before.gcCollections(), after.gcCollections());
 			long gcMillis = delta(before.gcMillis(), after.gcMillis());
 			boolean available = cpuNanos > 0L
 					&& allocatedBytes > 0L
 					&& gcCollections >= 0L
 					&& gcMillis >= 0L
-					&& peakLiveHeapBytes > 0L
-					&& peakDirectMemoryBytes > 0L
-					&& peakRssBytes > 0L
-					&& peakThreadCount > 0
-					&& (unixOperatingSystem == null || peakNativeHandles > 0L);
+					&& observerCpuNanos >= 0L
+					&& observerAllocatedBytes >= 0L
+					&& peaks.complete();
 			return new RuntimeTelemetry(cpuNanos,
 					allocatedBytes,
+					observerCpuNanos,
+					observerAllocatedBytes,
 					gcCollections,
 					gcMillis,
-					peakLiveHeapBytes,
-					peakDirectMemoryBytes,
-					peakRssBytes,
-					peakThreadCount,
-					unixOperatingSystem == null ? -1L : peakNativeHandles,
+					peaks.liveHeapBytes(),
+					peaks.directMemoryBytes(),
+					peaks.residentSetBytes(),
+					peaks.threadCount(),
+					peaks.nativeHandles(),
 					available);
 		}
 
 		private ProcessCounters captureCounters() {
+			long cpu = operatingSystem == null ? -1L : operatingSystem.getProcessCpuTime();
+			long allocation = allocationBean == null || !allocationBean.isThreadAllocatedMemoryEnabled()
+					? -1L : allocationBean.getTotalThreadAllocatedBytes();
+			long observerCpu = observerThreadId < 0L || !threadBean.isThreadCpuTimeEnabled()
+					? -1L : threadBean.getThreadCpuTime(observerThreadId);
+			long observerAllocation = observerThreadId < 0L || allocationBean == null
+					? -1L : allocationBean.getThreadAllocatedBytes(observerThreadId);
 			long collections = 0L;
 			long millis = 0L;
 			for (GarbageCollectorMXBean collector : ManagementFactory.getGarbageCollectorMXBeans()) {
@@ -3558,20 +3605,30 @@ public final class GrpcOverloadBenchmark {
 				collections += collectionCount;
 				millis += collectionTime;
 			}
-			long cpu = operatingSystem == null ? -1L : operatingSystem.getProcessCpuTime();
-			long allocation = allocationBean == null || !allocationBean.isThreadAllocatedMemoryEnabled()
-					? -1L : allocationBean.getTotalThreadAllocatedBytes();
-			return new ProcessCounters(cpu, allocation, collections, millis);
+			return new ProcessCounters(cpu, allocation, observerCpu, observerAllocation, collections, millis);
 		}
 
 		private static long delta(long before, long after) {
 			return before < 0L || after < before ? -1L : after - before;
+		}
+
+		private static long subtractObserver(long processDelta, long observerDelta) {
+			return processDelta < 0L || observerDelta < 0L
+					? -1L : Math.max(0L, processDelta - observerDelta);
+		}
+
+		@Override
+		public synchronized void close() {
+			active = false;
+			peakSampler.close();
 		}
 	}
 
 	/** Process and peak-resource evidence captured only inside a measured phase. */
 	public record RuntimeTelemetry(long processCpuNanos,
 			long allocatedBytes,
+			long observerCpuNanos,
+			long observerAllocatedBytes,
 			long gcCollections,
 			long gcMillis,
 			long peakLiveHeapBytes,
@@ -3580,33 +3637,6 @@ public final class GrpcOverloadBenchmark {
 			int peakThreadCount,
 			long peakNativeHandles,
 			boolean available) {
-	}
-
-	private static long residentSetBytes() {
-		try {
-			String status = Files.readString(Path.of("/proc/self/status"));
-			int label = status.indexOf("VmRSS:");
-			if (label < 0) {
-				return -1L;
-			}
-			int index = label + "VmRSS:".length();
-			while (index < status.length() && Character.isWhitespace(status.charAt(index))) {
-				index++;
-			}
-			long kibibytes = 0L;
-			int digits = 0;
-			while (index < status.length()) {
-				char character = status.charAt(index++);
-				if (!Character.isDigit(character)) {
-					break;
-				}
-				kibibytes = Math.addExact(Math.multiplyExact(kibibytes, 10L), character - '0');
-				digits++;
-			}
-			return digits == 0 ? -1L : Math.multiplyExact(kibibytes, 1_024L);
-		} catch (IOException | ArithmeticException ignored) {
-			return -1L;
-		}
 	}
 
 	private record PhaseResult(int round,

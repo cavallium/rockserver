@@ -107,6 +107,14 @@ class GrpcOverloadBenchmarkTest {
 	}
 
 	@Test
+	void runtimeCountersExcludeOnlyTheMeasuredObserverThread() {
+		assertEquals(700L, GrpcOverloadBenchmark.subtractObserverForTesting(1_000L, 300L));
+		assertEquals(0L, GrpcOverloadBenchmark.subtractObserverForTesting(100L, 300L));
+		assertEquals(-1L, GrpcOverloadBenchmark.subtractObserverForTesting(-1L, 0L));
+		assertEquals(-1L, GrpcOverloadBenchmark.subtractObserverForTesting(1L, -1L));
+	}
+
+	@Test
 	void pairedConfidenceIntervalIsExactForStableRoundsAndWidensForNoise() {
 		var stable = GrpcOverloadBenchmark.ratioConfidenceInterval(new double[] {1.0d, 1.0d, 1.0d});
 		assertEquals(1.0d, stable.mean());

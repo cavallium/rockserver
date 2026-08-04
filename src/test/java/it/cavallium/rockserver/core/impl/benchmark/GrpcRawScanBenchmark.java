@@ -1211,6 +1211,7 @@ public final class GrpcRawScanBenchmark {
 		private int maximumConsecutiveAvoidableIdleSamples;
 		private int maximumParked;
 		private int maximumOutstanding;
+		private final long[] telemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
 		private final BenchmarkProcessTelemetry.PeakSampler processPeaks =
 				new BenchmarkProcessTelemetry.PeakSampler();
 
@@ -1223,32 +1224,37 @@ public final class GrpcRawScanBenchmark {
 		}
 
 		private void sample(EmbeddedConnection embedded) {
-			var snapshot = embedded.getScheduler().poolSnapshot(RWScheduler.Pool.READ);
+			BenchmarkSchedulerTelemetry.copyPoolTelemetry(
+					embedded.getScheduler(), RWScheduler.Pool.READ, telemetry);
 			samples++;
-			workerCount = snapshot.workerCount();
-			maximumActive = Math.max(maximumActive, snapshot.activeTasks());
-			int outstanding = BenchmarkSchedulerTelemetry.outstandingTasks(snapshot);
-			maximumParked = Math.max(maximumParked,
-					BenchmarkSchedulerTelemetry.parkedTasks(snapshot, outstanding));
+			workerCount = value(RWScheduler.POOL_TELEMETRY_WORKER_COUNT);
+			int active = value(RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS);
+			int queued = value(RWScheduler.POOL_TELEMETRY_QUEUED_TASKS);
+			int outstanding = value(RWScheduler.POOL_TELEMETRY_OUTSTANDING_TASKS);
+			maximumActive = Math.max(maximumActive, active);
+			maximumParked = Math.max(maximumParked, value(RWScheduler.POOL_TELEMETRY_PARKED_TASKS));
 			maximumOutstanding = Math.max(maximumOutstanding, outstanding);
 			processPeaks.sample();
-			boolean saturating = snapshot.activeTasks() >= snapshot.workerCount()
-					|| (snapshot.queuedTasks() > 0
-					&& snapshot.activeTasks() + snapshot.queuedTasks() >= snapshot.workerCount());
+			boolean saturating = active >= workerCount
+					|| (queued > 0 && active + queued >= workerCount);
 			if (saturating) {
 				saturatingDemandSamples++;
 			}
-			if (!options.instrumentationMode().equals("strict") || snapshot.queuedTasks() == 0) {
+			if (!options.instrumentationMode().equals("strict") || queued == 0) {
 				consecutiveAvoidableIdleSamples = 0;
 				return;
 			}
-			if (snapshot.waitingWorkers() > 0) {
+			if (value(RWScheduler.POOL_TELEMETRY_WAITING_WORKERS) > 0) {
 				consecutiveAvoidableIdleSamples++;
 				maximumConsecutiveAvoidableIdleSamples = Math.max(
 						maximumConsecutiveAvoidableIdleSamples, consecutiveAvoidableIdleSamples);
 			} else {
 				consecutiveAvoidableIdleSamples = 0;
 			}
+		}
+
+		private int value(int index) {
+			return Math.toIntExact(telemetry[index]);
 		}
 
 		private PoolUtilization snapshot() {
@@ -1387,7 +1393,8 @@ public final class GrpcRawScanBenchmark {
 					&& measurement.utilization().passed()
 					&& measurement.counters().conserved()
 					&& (options.implementation() == Implementation.BASELINE
-							|| measurement.counters().exactAccounting())
+							|| (measurement.counters().exactAccounting()
+							&& BenchmarkSchedulerTelemetry.allocationFreePoolTelemetry()))
 					&& measurement.resourcesDrained()
 					&& nativeLeaks == 0L;
 			return new WorkerResult(options.implementation(), options.round(), buildSha,
