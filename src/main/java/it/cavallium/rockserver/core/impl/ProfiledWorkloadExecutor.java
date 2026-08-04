@@ -1124,6 +1124,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private int mappedCount;
 		private @Nullable WorkloadTask firstQueued;
 		private @Nullable WorkloadTask lastQueued;
+		private @Nullable CancellationEntry bucketPrevious;
 		private @Nullable CancellationEntry bucketNext;
 		private @Nullable CancellationEntry freeNext;
 	}
@@ -2577,7 +2578,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				entry.family = checkedOrdinal(family);
 				entry.hash = hash;
 				int bucket = hash & (buckets.length - 1);
-				entry.bucketNext = buckets[bucket];
+				var previousHead = buckets[bucket];
+				entry.bucketNext = previousHead;
+				if (previousHead != null) {
+					previousHead.bucketPrevious = entry;
+				}
 				buckets[bucket] = entry;
 				size++;
 			}
@@ -2657,27 +2662,21 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		private void removeEntry(CancellationEntry entry) {
 			int bucket = entry.hash & (buckets.length - 1);
-			var cursor = buckets[bucket];
-			CancellationEntry previous = null;
-			while (cursor != null && cursor != entry) {
-				previous = cursor;
-				cursor = cursor.bucketNext;
-			}
-			if (cursor == null) {
-				throw new IllegalStateException("Cancellation entry is not hash-indexed");
-			}
+			var previous = entry.bucketPrevious;
+			var next = entry.bucketNext;
 			if (previous == null) {
-				buckets[bucket] = entry.bucketNext;
+				if (buckets[bucket] != entry) {
+					throw new IllegalStateException("Cancellation entry is not hash-indexed");
+				}
+				buckets[bucket] = next;
 			} else {
-				previous.bucketNext = entry.bucketNext;
+				previous.bucketNext = next;
+			}
+			if (next != null) {
+				next.bucketPrevious = previous;
 			}
 			entry.command = null;
-			entry.profile = 0;
-			entry.family = 0;
-			entry.hash = 0;
-			entry.mappedCount = 0;
-			entry.firstQueued = null;
-			entry.lastQueued = null;
+			entry.bucketPrevious = null;
 			entry.bucketNext = null;
 			entry.freeNext = freeHead;
 			freeHead = entry;
@@ -2708,7 +2707,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				while (entry != null) {
 					var next = entry.bucketNext;
 					int bucket = entry.hash & (newCapacity - 1);
-					entry.bucketNext = replacement[bucket];
+					var previousHead = replacement[bucket];
+					entry.bucketPrevious = null;
+					entry.bucketNext = previousHead;
+					if (previousHead != null) {
+						previousHead.bucketPrevious = entry;
+					}
 					replacement[bucket] = entry;
 					entry = next;
 				}
