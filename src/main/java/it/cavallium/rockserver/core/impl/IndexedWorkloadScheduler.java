@@ -3,7 +3,6 @@ package it.cavallium.rockserver.core.impl;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.jetbrains.annotations.Nullable;
 import reactor.core.Disposable;
 import reactor.core.Disposables;
@@ -19,28 +18,57 @@ import reactor.core.scheduler.Schedulers;
  * Keeping the exact submitted wrapper here lets cancellation use the scheduler's identity index
  * immediately instead of waiting for a blocked workload lane to dispatch it.</p>
  */
-final class IndexedWorkloadScheduler implements Scheduler {
+final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadExecutor {
 
-	private final RWScheduler scheduler;
-	private final RWScheduler.WorkloadExecutor executor;
-	private final AtomicBoolean disposed = new AtomicBoolean();
+	private final ProfiledWorkloadExecutor executor;
+	private final it.cavallium.rockserver.core.common.WorkloadProfile profile;
+	private final it.cavallium.rockserver.core.common.OperationFamily family;
+	private final long deadlineEpochMillis;
+	private volatile boolean disposed;
 
-	IndexedWorkloadScheduler(RWScheduler scheduler, RWScheduler.WorkloadExecutor executor) {
-		this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
+	IndexedWorkloadScheduler(ProfiledWorkloadExecutor executor,
+			it.cavallium.rockserver.core.common.WorkloadProfile profile,
+			it.cavallium.rockserver.core.common.OperationFamily family,
+			long deadlineEpochMillis) {
 		this.executor = Objects.requireNonNull(executor, "executor");
+		this.profile = Objects.requireNonNull(profile, "profile");
+		this.family = Objects.requireNonNull(family, "family");
+		this.deadlineEpochMillis = deadlineEpochMillis;
 	}
 
 	RWScheduler.WorkloadExecutor workloadExecutor() {
-		return executor;
+		return this;
+	}
+
+	@Override
+	public void execute(Runnable command) {
+		long estimatedBytes = command instanceof RWScheduler.EstimatedWork estimatedWork
+				? estimatedWork.estimatedBytes()
+				: 0L;
+		execute(command, estimatedBytes);
+	}
+
+	@Override
+	public void execute(Runnable command, long estimatedBytes) {
+		executor.execute(profile, family, deadlineEpochMillis, estimatedBytes, command);
+	}
+
+	@Override
+	public RWScheduler.CooperativeHandle executeCooperatively(RWScheduler.CooperativeTask command,
+			long estimatedBytes) {
+		return executor.executeCooperatively(profile, family, deadlineEpochMillis, estimatedBytes, command);
+	}
+
+	private boolean removeQueuedTask(Runnable command) {
+		return executor.remove(profile, family, command);
 	}
 
 	@Override
 	public Disposable schedule(Runnable task) {
-		if (disposed.get()) {
+		if (disposed) {
 			throw Exceptions.failWithRejected();
 		}
-		var scheduledTask = new IndexedScheduledTask(scheduler,
-				executor,
+		var scheduledTask = new IndexedScheduledTask(this,
 				Schedulers.onSchedule(Objects.requireNonNull(task, "task")),
 				null);
 		scheduledTask.submit();
@@ -49,37 +77,34 @@ final class IndexedWorkloadScheduler implements Scheduler {
 
 	@Override
 	public Worker createWorker() {
-		if (disposed.get()) {
+		if (disposed) {
 			throw Exceptions.failWithRejected();
 		}
-		return new IndexedWorker(scheduler, executor);
+		return new IndexedWorker(this);
 	}
 
 	@Override
 	public void dispose() {
-		disposed.set(true);
+		disposed = true;
 	}
 
 	@Override
 	public boolean isDisposed() {
-		return disposed.get();
+		return disposed;
 	}
 
 	private static final class IndexedWorker implements Worker {
 
-		private final RWScheduler scheduler;
-		private final RWScheduler.WorkloadExecutor executor;
+		private final IndexedWorkloadScheduler scheduler;
 		private final Disposable.Composite tasks = Disposables.composite();
 
-		private IndexedWorker(RWScheduler scheduler, RWScheduler.WorkloadExecutor executor) {
+		private IndexedWorker(IndexedWorkloadScheduler scheduler) {
 			this.scheduler = scheduler;
-			this.executor = executor;
 		}
 
 		@Override
 		public Disposable schedule(Runnable task) {
 			var scheduledTask = new IndexedScheduledTask(scheduler,
-					executor,
 					Schedulers.onSchedule(Objects.requireNonNull(task, "task")),
 					this);
 			if (!tasks.add(scheduledTask)) {
@@ -133,20 +158,17 @@ final class IndexedWorkloadScheduler implements Scheduler {
 			}
 		}
 
-		private final RWScheduler scheduler;
-		private final RWScheduler.WorkloadExecutor executor;
+		private final IndexedWorkloadScheduler scheduler;
 		private final Runnable task;
 		private final @Nullable IndexedWorker parent;
 		private volatile int state = QUEUED;
 		private volatile int dispatchState = DISPATCH_PENDING;
 		private boolean submitted;
 
-		private IndexedScheduledTask(RWScheduler scheduler,
-				RWScheduler.WorkloadExecutor executor,
+		private IndexedScheduledTask(IndexedWorkloadScheduler scheduler,
 				Runnable task,
 				@Nullable IndexedWorker parent) {
 			this.scheduler = scheduler;
-			this.executor = executor;
 			this.task = task;
 			this.parent = parent;
 		}
@@ -156,7 +178,7 @@ final class IndexedWorkloadScheduler implements Scheduler {
 				return;
 			}
 			try {
-				executor.execute(this);
+				scheduler.execute(this);
 				submitted = true;
 			} catch (Throwable failure) {
 				state = FINISHED;
@@ -201,7 +223,7 @@ final class IndexedWorkloadScheduler implements Scheduler {
 				}
 			}
 			if (removeQueued) {
-				scheduler.removeQueuedTask(executor, this);
+				scheduler.removeQueuedTask(this);
 			}
 			if (cancellationWon) {
 				deleteFromParent();

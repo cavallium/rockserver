@@ -55,7 +55,7 @@ public final class RWScheduler {
 	private final ProfiledWorkloadExecutor physicalPool;
 	private final List<ProfiledWorkloadExecutor> pools;
 	private final WorkloadPressureController pressureController;
-	private final EnumMap<WorkloadProfile, EnumMap<OperationFamily, WorkloadExecutor>> noDeadlineExecutors;
+	private final WorkloadExecutor[][] noDeadlineExecutors;
 
 	public RWScheduler(int readCap, int writeCap, String name) {
 		this(WorkloadSettings.defaults(readCap, writeCap), name, null, name, true);
@@ -145,16 +145,15 @@ public final class RWScheduler {
 		registerStoragePressureGauge(registry, databaseName);
 	}
 
-	private EnumMap<WorkloadProfile, EnumMap<OperationFamily, WorkloadExecutor>> createNoDeadlineExecutors() {
-		var result = new EnumMap<WorkloadProfile, EnumMap<OperationFamily, WorkloadExecutor>>(WorkloadProfile.class);
+	private WorkloadExecutor[][] createNoDeadlineExecutors() {
+		var result = new WorkloadExecutor[WorkloadProfile.values().length][OperationFamily.values().length];
 		for (var profile : WorkloadProfile.values()) {
-			var byFamily = new EnumMap<OperationFamily, WorkloadExecutor>(OperationFamily.class);
 			for (var family : OperationFamily.values()) {
 				if (WorkloadAdmission.isAllowed(profile, family)) {
-					byFamily.put(family, pool(profile, family).view(profile, family, RequestContext.NO_DEADLINE));
+					result[profile.ordinal()][family.ordinal()] = pool(profile, family)
+							.view(profile, family, RequestContext.NO_DEADLINE);
 				}
 			}
-			result.put(profile, byFamily);
 		}
 		return result;
 	}
@@ -219,19 +218,26 @@ public final class RWScheduler {
 	/** Resolve and validate the caller context, then return its resource-specific view. */
 	public Scheduler scheduler(RequestContext context, OperationFamily family) {
 		var profile = WorkloadAdmission.resolve(context, family);
-		return scheduler(profile, family, context.deadlineEpochMillis());
+		return schedulerResolved(profile, family, context.deadlineEpochMillis());
 	}
 
 	public WorkloadExecutor executor(RequestContext context, OperationFamily family) {
 		var profile = WorkloadAdmission.resolve(context, family);
-		return executor(profile, family, context.deadlineEpochMillis());
+		return executorResolved(profile, family, context.deadlineEpochMillis());
 	}
 
 	/** Server-only scheduling entry for protected CDC/control/physical work. */
 	public Scheduler scheduler(WorkloadProfile profile,
 			OperationFamily family,
 			long deadlineEpochMillis) {
-		return new IndexedWorkloadScheduler(this, executor(profile, family, deadlineEpochMillis));
+		WorkloadAdmission.validate(profile, family);
+		return schedulerResolved(profile, family, deadlineEpochMillis);
+	}
+
+	private Scheduler schedulerResolved(WorkloadProfile profile,
+			OperationFamily family,
+			long deadlineEpochMillis) {
+		return new IndexedWorkloadScheduler(pool(profile, family), profile, family, deadlineEpochMillis);
 	}
 
 	/** Server-only executor entry for protected CDC/control/physical work. */
@@ -239,8 +245,14 @@ public final class RWScheduler {
 			OperationFamily family,
 			long deadlineEpochMillis) {
 		WorkloadAdmission.validate(profile, family);
+		return executorResolved(profile, family, deadlineEpochMillis);
+	}
+
+	private WorkloadExecutor executorResolved(WorkloadProfile profile,
+			OperationFamily family,
+			long deadlineEpochMillis) {
 		if (deadlineEpochMillis == RequestContext.NO_DEADLINE) {
-			return Objects.requireNonNull(noDeadlineExecutors.get(profile).get(family));
+			return Objects.requireNonNull(noDeadlineExecutors[profile.ordinal()][family.ordinal()]);
 		}
 		return pool(profile, family).view(profile, family, deadlineEpochMillis);
 	}

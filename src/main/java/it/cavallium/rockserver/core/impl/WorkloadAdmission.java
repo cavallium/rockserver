@@ -30,10 +30,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.util.Arrays;
-import java.util.EnumMap;
-import java.util.EnumSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 
 /** Authoritative profile/operation compatibility contract used before admission. */
@@ -43,7 +40,7 @@ public final class WorkloadAdmission {
 	public static final long MAX_LATENCY_ENCODED_INPUT_BYTES = 2L * 1024 * 1024;
 	public static final long MAX_LATENCY_ITERATOR_ADVANCE = 4_096;
 
-	private static final Map<WorkloadProfile, EnumSet<OperationFamily>> ALLOWED = allowedCombinations();
+	private static final long[] ALLOWED_MASKS = allowedCombinations();
 
 	private WorkloadAdmission() {
 	}
@@ -164,7 +161,7 @@ public final class WorkloadAdmission {
 	public static void validate(WorkloadProfile profile, OperationFamily family) {
 		Objects.requireNonNull(profile, "profile");
 		Objects.requireNonNull(family, "family");
-		if (!ALLOWED.get(profile).contains(family)) {
+		if (!isAllowedOrdinal(profile, family)) {
 			throw mismatch(profile, family, "combination is not permitted by the workload contract");
 		}
 	}
@@ -172,7 +169,7 @@ public final class WorkloadAdmission {
 	public static boolean isAllowed(WorkloadProfile profile, OperationFamily family) {
 		Objects.requireNonNull(profile, "profile");
 		Objects.requireNonNull(family, "family");
-		return ALLOWED.get(profile).contains(family);
+		return isAllowedOrdinal(profile, family);
 	}
 
 	private static RocksDBException mismatch(WorkloadProfile profile,
@@ -421,38 +418,55 @@ public final class WorkloadAdmission {
 		return total + bytes;
 	}
 
-	private static Map<WorkloadProfile, EnumSet<OperationFamily>> allowedCombinations() {
-		var allowed = new EnumMap<WorkloadProfile, EnumSet<OperationFamily>>(WorkloadProfile.class);
-		allowed.put(CONTROL, EnumSet.of(OperationFamily.CONTROL));
-		allowed.put(LATENCY, EnumSet.of(METADATA,
+	private static boolean isAllowedOrdinal(WorkloadProfile profile, OperationFamily family) {
+		return (ALLOWED_MASKS[profile.ordinal()] & (1L << family.ordinal())) != 0L;
+	}
+
+	private static long[] allowedCombinations() {
+		if (OperationFamily.values().length > Long.SIZE) {
+			throw new ExceptionInInitializerError("The operation matrix exceeds one ordinal mask");
+		}
+		var allowed = new long[WorkloadProfile.values().length];
+		allowed[CONTROL.ordinal()] = mask(OperationFamily.CONTROL);
+		allowed[LATENCY.ordinal()] = mask(METADATA,
 				POINT_LOOKUP,
 				BOUNDARY_SEEK,
 				BOUNDED_FAN_OUT,
 				RANGE_PAGE,
-				MUTATION));
-		allowed.put(ANALYTICAL, EnumSet.of(METADATA,
+				MUTATION);
+		allowed[ANALYTICAL.ordinal()] = mask(METADATA,
 				POINT_LOOKUP,
 				BOUNDARY_SEEK,
 				BOUNDED_FAN_OUT,
 				RANGE_PAGE,
-				FULL_SCAN_AGGREGATE));
-		allowed.put(INGEST, EnumSet.of(METADATA,
+				FULL_SCAN_AGGREGATE);
+		allowed[INGEST.ordinal()] = mask(METADATA,
 				POINT_LOOKUP,
 				BOUNDED_FAN_OUT,
 				RANGE_PAGE,
-				MUTATION));
-		allowed.put(CDC, EnumSet.of(WAL_PAGE, MUTATION, FLUSH));
-		allowed.put(BATCH, EnumSet.of(METADATA,
+				MUTATION);
+		allowed[CDC.ordinal()] = mask(WAL_PAGE, MUTATION, FLUSH);
+		allowed[BATCH.ordinal()] = mask(METADATA,
 				POINT_LOOKUP,
 				BOUNDARY_SEEK,
 				BOUNDED_FAN_OUT,
 				RANGE_PAGE,
 				FULL_SCAN_AGGREGATE,
-				MUTATION));
-		allowed.put(PHYSICAL_MAINTENANCE, EnumSet.of(FLUSH, COMPACTION));
-		if (allowed.size() != WorkloadProfile.values().length) {
-			throw new ExceptionInInitializerError("Every workload profile must have an explicit operation matrix");
+				MUTATION);
+		allowed[PHYSICAL_MAINTENANCE.ordinal()] = mask(FLUSH, COMPACTION);
+		for (long allowedMask : allowed) {
+			if (allowedMask == 0L) {
+				throw new ExceptionInInitializerError("Every workload profile must have an explicit operation matrix");
+			}
 		}
-		return Map.copyOf(allowed);
+		return allowed;
+	}
+
+	private static long mask(OperationFamily... families) {
+		long result = 0L;
+		for (var family : families) {
+			result |= 1L << family.ordinal();
+		}
+		return result;
 	}
 }

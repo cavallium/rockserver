@@ -1,6 +1,5 @@
 package it.cavallium.rockserver.core.client;
 
-import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -47,6 +46,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.SerializedKVBatch.SerializedKVBatchRef;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.ColumnHashType;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
@@ -64,7 +64,6 @@ import java.net.SocketAddress;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -176,6 +175,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			= "it.cavallium.rockserver.grpc.client.max-retry-backoff";
 	private static final String RETRY_BACKOFF_MULTIPLIER_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.retry-backoff-multiplier";
+	private static final it.cavallium.rockserver.core.common.api.proto.RequestContext[] NO_DEADLINE_WIRE_CONTEXTS
+			= createNoDeadlineWireContexts();
 	public static final String MAX_INBOUND_MESSAGE_SIZE_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.max-inbound-message-size-bytes";
 	public static final int DEFAULT_MAX_INBOUND_MESSAGE_SIZE = 64 * 1024 * 1024;
@@ -188,6 +189,20 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private final AtomicBoolean legacyCdcPollBatchWarningLogged = new AtomicBoolean();
 	private final URI address;
 	private final int maxInboundMessageSize;
+
+	private static it.cavallium.rockserver.core.common.api.proto.RequestContext[] createNoDeadlineWireContexts() {
+		var contexts = new it.cavallium.rockserver.core.common.api.proto.RequestContext[WorkloadProfile.values().length];
+		for (var profile : List.of(
+				WorkloadProfile.ANALYTICAL,
+				WorkloadProfile.INGEST,
+				WorkloadProfile.BATCH)) {
+			contexts[profile.ordinal()] = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+					.setProfileValue(profile.wireValue())
+					.setDeadlineEpochMillis(RequestContext.NO_DEADLINE)
+					.build();
+		}
+		return contexts;
+	}
 
 	GrpcConnectionDelegate(String name, SocketAddress socketAddress, URI address) {
 		super(name);
@@ -527,12 +542,14 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		if (requestType == null) {
 			throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "requestType");
 		}
-		var request = DeleteRequest.newBuilder()
+		var requestBuilder = DeleteRequest.newBuilder()
 				.setTransactionOrUpdateId(transactionOrUpdateId)
 				.setColumnId(columnId)
-				.addAllKeys(mapKeys(keys))
-				.setContext(currentWireRequestContext())
-				.build();
+				.setContext(currentWireRequestContext());
+		for (var key : keys.keys()) {
+			requestBuilder.addKeys(mapKey(key));
+		}
+		var request = requestBuilder.build();
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestNothing<?> _ -> toResponse(futureStubWithRequestDeadline().delete(request), _ -> null);
 			case RequestPrevious<?> _ ->
@@ -648,11 +665,15 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 		Mono<DeleteMultiRequest> initialRequestMono = Mono.just(initialRequest);
 		Flux<DeleteMultiRequest> dataRequestsFlux = Flux.fromIterable(allKeys)
-				.map(keys -> DeleteMultiRequest.newBuilder()
-						.setData(DeleteRequest.newBuilder()
-								.addAllKeys(mapKeys(keys))
-								.build())
-						.build());
+				.map(keys -> {
+					var data = DeleteRequest.newBuilder();
+					for (var key : keys.keys()) {
+						data.addKeys(mapKey(key));
+					}
+					return DeleteMultiRequest.newBuilder()
+							.setData(data)
+							.build();
+				});
 		var inputRequests = initialRequestMono.concatWith(dataRequestsFlux);
 
 		return (CompletableFuture<List<T>>) (switch (requestType) {
@@ -678,12 +699,20 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	public CompletableFuture<Void> deleteRangeAsync(long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive) throws RocksDBException {
-		var request = DeleteRangeRequest.newBuilder()
+		var requestBuilder = DeleteRangeRequest.newBuilder()
 				.setColumnId(columnId)
-				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
-				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
-				.setContext(currentWireRequestContext())
-				.build();
+				.setContext(currentWireRequestContext());
+		if (startKeysInclusive != null) {
+			for (var key : startKeysInclusive.keys()) {
+				requestBuilder.addStartKeysInclusive(mapKey(key));
+			}
+		}
+		if (endKeysExclusive != null) {
+			for (var key : endKeysExclusive.keys()) {
+				requestBuilder.addEndKeysExclusive(mapKey(key));
+			}
+		}
+		var request = requestBuilder.build();
 		return toResponse(futureStubWithRequestDeadline().deleteRange(request), _ -> null);
 	}
 
@@ -799,12 +828,14 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		if (requestType == null) {
 			throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "requestType");
 		}
-		var request = GetRequest.newBuilder()
+		var requestBuilder = GetRequest.newBuilder()
 				.setTransactionOrUpdateId(transactionOrUpdateId)
 				.setColumnId(columnId)
-				.addAllKeys(mapKeys(keys))
-				.setContext(currentWireRequestContext())
-				.build();
+				.setContext(currentWireRequestContext());
+		for (var key : keys.keys()) {
+			requestBuilder.addKeys(mapKey(key));
+		}
+		var request = requestBuilder.build();
 		if (requestType instanceof RequestType.RequestForUpdate<?>) {
 			return toResponse(futureStubWithRequestDeadline().getForUpdate(request), x -> (T) new UpdateContext<>(
 					x.hasPrevious() ? mapByteString(x.getPrevious()) : null,
@@ -812,13 +843,22 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			));
 		} else if (requestType instanceof RequestType.RequestExists<?>) {
 			return toResponse(futureStubWithRequestDeadline().exists(request), x -> (T) (Boolean) x.getPresent());
+		} else if (requestType instanceof RequestNothing<?>) {
+			return toResponse(futureStubWithRequestDeadline().get(request), GrpcConnectionDelegate::ignoreGetResponse);
+		} else if (requestType instanceof RequestType.RequestCurrent<?>) {
+			return toResponse(futureStubWithRequestDeadline().get(request), GrpcConnectionDelegate::mapCurrentGetResponse);
 		} else {
-			return toResponse(futureStubWithRequestDeadline().get(request), x -> switch (requestType) {
-				case RequestNothing<?> _ -> null;
-				case RequestType.RequestCurrent<?> _ -> x.hasValue() ? (T) mapByteString(x.getValue()) : null;
-				case RequestType.RequestForUpdate<?> _ -> throw new IllegalStateException();
-			});
+			throw new IllegalStateException("Unsupported get request type " + requestType);
 		}
+	}
+
+	private static <T> T ignoreGetResponse(GetResponse ignored) {
+		return null;
+	}
+
+	@SuppressWarnings("unchecked")
+	private static <T> T mapCurrentGetResponse(GetResponse response) {
+		return response.hasValue() ? (T) mapByteString(response.getValue()) : null;
 	}
 
 	@Override
@@ -833,7 +873,11 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.setTimeoutMs(timeoutMs)
 				.setContext(currentWireRequestContext());
 		for (var logicalKeys : keys) {
-			request.addKeysMulti(KeyTuple.newBuilder().addAllKeys(mapKeys(logicalKeys)));
+			var wireKeys = KeyTuple.newBuilder();
+			for (var key : logicalKeys.keys()) {
+				wireKeys.addKeys(mapKey(key));
+			}
+			request.addKeysMulti(wireKeys);
 		}
 		return toResponse(deadlineStub.existsMulti(request.build()),
 				response -> List.copyOf(response.getPresentList()),
@@ -847,15 +891,23 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs) throws RocksDBException {
-		var request = OpenIteratorRequest.newBuilder()
+		var requestBuilder = OpenIteratorRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
-				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
-				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
 				.setReverse(reverse)
 				.setTimeoutMs(timeoutMs)
-				.setContext(currentWireRequestContext())
-				.build();
+				.setContext(currentWireRequestContext());
+		if (startKeysInclusive != null) {
+			for (var key : startKeysInclusive.keys()) {
+				requestBuilder.addStartKeysInclusive(mapKey(key));
+			}
+		}
+		if (endKeysExclusive != null) {
+			for (var key : endKeysExclusive.keys()) {
+				requestBuilder.addEndKeysExclusive(mapKey(key));
+			}
+		}
+		var request = requestBuilder.build();
 		return toResponse(futureStubWithRequestDeadline().openIterator(request), OpenIteratorResponse::getIteratorId);
 	}
 
@@ -869,11 +921,13 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@Override
 	public CompletableFuture<Void> seekToAsync(long iterationId, @NotNull Keys keys) throws RocksDBException {
-		var request = SeekToRequest.newBuilder()
+		var requestBuilder = SeekToRequest.newBuilder()
 				.setIterationId(iterationId)
-				.addAllKeys(mapKeys(keys))
-				.setContext(currentWireRequestContext())
-				.build();
+				.setContext(currentWireRequestContext());
+		for (var key : keys.keys()) {
+			requestBuilder.addKeys(mapKey(key));
+		}
+		var request = requestBuilder.build();
 		return toResponse(futureStubWithRequestDeadline().seekTo(request), _ -> null);
 	}
 
@@ -906,15 +960,23 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.
 		RequestReduceRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
 		var deadlineStub = futureStubWithReadDeadline(timeoutMs);
-		var request = GetRangeRequest.newBuilder()
+		var requestBuilder = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
-				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
-				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
 				.setReverse(reverse)
 				.setTimeoutMs(timeoutMs)
-				.setContext(currentWireRequestContext())
-				.build();
+				.setContext(currentWireRequestContext());
+		if (startKeysInclusive != null) {
+			for (var key : startKeysInclusive.keys()) {
+				requestBuilder.addStartKeysInclusive(mapKey(key));
+			}
+		}
+		if (endKeysExclusive != null) {
+			for (var key : endKeysExclusive.keys()) {
+				requestBuilder.addEndKeysExclusive(mapKey(key));
+			}
+		}
+		var request = requestBuilder.build();
 		return (CompletableFuture<T>) switch (requestType) {
 			case RequestType.RequestGetFirstAndLast<?> _ ->
 					toResponse(deadlineStub.reduceRangeFirstAndLast(request), result -> new FirstAndLast<>(
@@ -993,8 +1055,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		var requestBuilder = GetRangePageRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
-				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
-				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
 				.setReverse(reverse)
 				.setRequestTypeValue(switch (requestType) {
 					case RequestType.RequestGetAllInRange<?> _ -> 1;
@@ -1005,8 +1065,22 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 						.setMaxItems(budget.maxItems())
 						.setMaxBytes(budget.maxBytes()))
 				.setContext(currentWireRequestContext());
+		if (startKeysInclusive != null) {
+			for (var key : startKeysInclusive.keys()) {
+				requestBuilder.addStartKeysInclusive(mapKey(key));
+			}
+		}
+		if (endKeysExclusive != null) {
+			for (var key : endKeysExclusive.keys()) {
+				requestBuilder.addEndKeysExclusive(mapKey(key));
+			}
+		}
 		if (resumeAfter != null) {
-			requestBuilder.setResumeAfter(RangeKey.newBuilder().addAllKeys(mapKeys(resumeAfter)));
+			var resumeAfterBuilder = RangeKey.newBuilder();
+			for (var key : resumeAfter.keys()) {
+				resumeAfterBuilder.addKeys(mapKey(key));
+			}
+			requestBuilder.setResumeAfter(resumeAfterBuilder);
 		}
 		return toResponse(futureStubWithReadDeadline(timeoutMs).getRangePage(requestBuilder.build()), response -> {
 			@SuppressWarnings("unchecked")
@@ -1014,9 +1088,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 					.map(GrpcConnectionDelegate::mapKV)
 					.toList();
 			var mappedResumeAfter = response.hasResumeAfter()
-					? new Keys(response.getResumeAfter().getKeysList().stream()
-							.map(GrpcConnectionDelegate::mapByteString)
-							.toArray(Buf[]::new))
+					? mapKeys(response.getResumeAfter().getKeysList())
 					: null;
 			return new it.cavallium.rockserver.core.common.RangePage<>(
 					items, mappedResumeAfter, response.getHasMore());
@@ -1028,15 +1100,23 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.
 		RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
 		var deadlineStub = reactiveStubWithReadDeadline(timeoutMs);
-		var request = GetRangeRequest.newBuilder()
+		var requestBuilder = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
-				.addAllStartKeysInclusive(mapKeys(startKeysInclusive))
-				.addAllEndKeysExclusive(mapKeys(endKeysExclusive))
 				.setReverse(reverse)
 				.setTimeoutMs(timeoutMs)
-				.setContext(currentWireRequestContext())
-				.build();
+				.setContext(currentWireRequestContext());
+		if (startKeysInclusive != null) {
+			for (var key : startKeysInclusive.keys()) {
+				requestBuilder.addStartKeysInclusive(mapKey(key));
+			}
+		}
+		if (endKeysExclusive != null) {
+			for (var key : endKeysExclusive.keys()) {
+				requestBuilder.addEndKeysExclusive(mapKey(key));
+			}
+		}
+		var request = requestBuilder.build();
 		return (Publisher<T>) switch (requestType) {
 			case RequestType.RequestGetAllInRange<?> _ -> toReadResponse(deadlineStub.getAllInRange(request)
 					.map(kv -> mapKV(kv)));
@@ -1225,58 +1305,56 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	private static it.cavallium.rockserver.core.common.api.proto.KVBatch mapKVBatch(@NotNull KVBatch kvBatch) {
-		var list = mapKVList(kvBatch.keys(), kvBatch.values());
-		return it.cavallium.rockserver.core.common.api.proto.KVBatch.newBuilder()
-				.addAllEntries(list)
-				.build();
+		var result = it.cavallium.rockserver.core.common.api.proto.KVBatch.newBuilder();
+		var keys = kvBatch.keys().iterator();
+		var values = kvBatch.values().iterator();
+		while (keys.hasNext()) {
+			result.addEntries(mapKV(keys.next(), values.next()));
+		}
+		return result.build();
 	}
 
 	private it.cavallium.rockserver.core.common.api.proto.RequestContext currentWireRequestContext() {
 		var context = currentRequestContext();
+		if (context.deadlineEpochMillis() == RequestContext.NO_DEADLINE) {
+			var cached = NO_DEADLINE_WIRE_CONTEXTS[context.profile().ordinal()];
+			if (cached != null) {
+				return cached;
+			}
+		}
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfileValue(context.profile().wireValue())
 				.setDeadlineEpochMillis(context.deadlineEpochMillis())
 				.build();
 	}
 
-	private static Iterable<KV> mapKVList(@NotNull List<Keys> keys, @NotNull List<Buf> values) {
-		List<KV> result = new ArrayList<>(keys.size());
-		var it1 = keys.iterator();
-		var it2 = values.iterator();
-		while (it1.hasNext()) {
-			result.add(mapKV(it1.next(), it2.next()));
-		}
-		return result;
-	}
-
 	private static KV mapKV(@NotNull Keys keys, @NotNull Buf value) {
-		return KV.newBuilder()
-				.addAllKeys(mapKeys(keys))
-				.setValue(mapValue(value))
-				.build();
+		var result = KV.newBuilder();
+		for (var key : keys.keys()) {
+			result.addKeys(mapKey(key));
+		}
+		return result.setValue(mapValue(value)).build();
 	}
 
 	private static it.cavallium.rockserver.core.common.KV mapKV(@NotNull KV entry) {
 		return new it.cavallium.rockserver.core.common.KV(
-				mapKeys(entry.getKeysCount(), entry::getKeys),
+				mapKeys(entry.getKeysList()),
 				toBuf(entry.getValue())
 		);
 	}
 
-	private static Keys mapKeys(int count, Int2ObjectFunction<ByteString> keyGetterAt) {
-		var segments = new Buf[count];
-		for (int i = 0; i < count; i++) {
-			segments[i] = toBuf(keyGetterAt.apply(i));
+	private static Keys mapKeys(List<ByteString> wireKeys) {
+		var segments = new Buf[wireKeys.size()];
+		for (int i = 0; i < segments.length; i++) {
+			segments[i] = toBuf(wireKeys.get(i));
 		}
 		return new Keys(segments);
 	}
 
-	private static Iterable<? extends ByteString> mapKeys(Keys keys) {
-		if (keys == null) return List.of();
-		return Iterables.transform(Arrays.asList(keys.keys()),
-				k -> UnsafeByteOperations.unsafeWrap(k.getBackingByteArray(),
-						k.getBackingByteArrayOffset(),
-						k.getBackingByteArrayLength()));
+	private static ByteString mapKey(Buf key) {
+		return UnsafeByteOperations.unsafeWrap(key.getBackingByteArray(),
+				key.getBackingByteArrayOffset(),
+				key.getBackingByteArrayLength());
 	}
 
 	private static ByteString mapValue(@NotNull Buf value) {
@@ -1410,28 +1488,9 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture,
 			Function<T, U> mapper,
 			Function<Throwable, Throwable> errorMapper) {
-		var cf = new CompletableFuture<U>() {
-			@Override
-			public boolean cancel(boolean mayInterruptIfRunning) {
-				boolean cancelled = listenableFuture.cancel(mayInterruptIfRunning);
-				super.cancel(cancelled);
-				return cancelled;
-			}
-		};
-
-		Futures.addCallback(listenableFuture, new FutureCallback<>() {
-			@Override
-			public void onSuccess(T result) {
-				cf.complete(mapper.apply(result));
-			}
-
-			@Override
-			public void onFailure(@NotNull Throwable t) {
-				cf.completeExceptionally(errorMapper.apply(t));
-			}
-		}, callbackExecutor);
-
-		return cf;
+		var response = new GrpcResponseFuture<>(listenableFuture, mapper, errorMapper);
+		Futures.addCallback(listenableFuture, response, callbackExecutor);
+		return response;
 	}
 
 	private static final java.util.Set<Code> RETRYABLE_STATUS_CODES = java.util.Set.of(
@@ -1504,28 +1563,40 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	private <T> CompletableFuture<T> toResponse(ListenableFuture<T> listenableFuture) {
-		var cf = new CompletableFuture<T>() {
-			@Override
-			public boolean cancel(boolean mayInterruptIfRunning) {
-				boolean cancelled = listenableFuture.cancel(mayInterruptIfRunning);
-				super.cancel(cancelled);
-				return cancelled;
-			}
-		};
+		return toResponse(listenableFuture, Function.identity(), Function.identity());
+	}
 
-		Futures.addCallback(listenableFuture, new FutureCallback<>() {
-			@Override
-			public void onSuccess(T result) {
-				cf.complete(result);
-			}
+	private static final class GrpcResponseFuture<T, U> extends CompletableFuture<U>
+			implements FutureCallback<T> {
 
-			@Override
-			public void onFailure(@NotNull Throwable t) {
-				cf.completeExceptionally(t);
-			}
-		}, callbackExecutor);
+		private final ListenableFuture<T> listenableFuture;
+		private final Function<T, U> mapper;
+		private final Function<Throwable, Throwable> errorMapper;
 
-		return cf;
+		private GrpcResponseFuture(ListenableFuture<T> listenableFuture,
+				Function<T, U> mapper,
+				Function<Throwable, Throwable> errorMapper) {
+			this.listenableFuture = listenableFuture;
+			this.mapper = mapper;
+			this.errorMapper = errorMapper;
+		}
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			boolean cancelled = listenableFuture.cancel(mayInterruptIfRunning);
+			super.cancel(cancelled);
+			return cancelled;
+		}
+
+		@Override
+		public void onSuccess(T result) {
+			complete(mapper.apply(result));
+		}
+
+		@Override
+		public void onFailure(@NotNull Throwable failure) {
+			completeExceptionally(errorMapper.apply(failure));
+		}
 	}
 
 	@Override

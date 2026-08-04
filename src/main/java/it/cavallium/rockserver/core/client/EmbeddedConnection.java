@@ -31,7 +31,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -330,8 +329,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				columnId,
 				shardIndex,
 				shardCount,
-				commandScheduler(command),
-				commandExecutor(command));
+				commandScheduler(command));
 	}
 
 	@Override
@@ -574,7 +572,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				// A first dispatch parks until both the scheduler handle and the connection-
 				// shutdown cancellation bridge are installed. This closes the admission race
 				// where shutdown was pending before the handle became cancellable.
-				iteratorOperation.attachCancellation(() -> continuation.cancel(false));
+				iteratorOperation.attachCancellation(continuation);
 				continuation.start();
 			} catch (Throwable admissionFailure) {
 				continuation.finish(null, admissionFailure);
@@ -582,34 +580,27 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			return continuation;
 		}
 
-		var cancelled = new AtomicBoolean();
-		CompletableFuture<T> result = new CompletableFuture<>() {
-			@Override
-			public boolean cancel(boolean mayInterruptIfRunning) {
-				cancelled.set(true);
-				return super.cancel(false);
-			}
-		};
+		var result = new IteratorResultFuture<T>();
 
 		CompletableFuture<T> operation;
 		try {
 			if (skipCount == 0 && takeCount == 0) {
 				operation = scheduleIteratorStep(
-						iterationId, 0, requestType, cancelled, workloadExecutor);
+						iterationId, 0, requestType, result, workloadExecutor);
 			} else {
 				var skipped = advanceIteratorAsync(
-						iterationId, skipCount, cancelled, workloadExecutor);
+						iterationId, skipCount, result, workloadExecutor);
 				operation = switch (requestType) {
 					case RequestType.RequestNothing<?> _ -> (CompletableFuture<T>) (CompletableFuture<?>) skipped
 							.thenCompose(exhausted -> exhausted
 									? CompletableFuture.completedFuture(null)
 									: advanceIteratorAsync(
-											iterationId, takeCount, cancelled, workloadExecutor).thenApply(_ -> null));
+											iterationId, takeCount, result, workloadExecutor).thenApply(_ -> null));
 					case RequestType.RequestExists<?> _ -> (CompletableFuture<T>) (CompletableFuture<?>) skipped
 							.thenCompose(exhausted -> exhausted
 									? CompletableFuture.completedFuture(false)
 									: subsequentExistsAsync(
-											iterationId, takeCount, false, cancelled, workloadExecutor));
+											iterationId, takeCount, false, result, workloadExecutor));
 					case RequestType.RequestMulti<?> _ -> (CompletableFuture<T>) (CompletableFuture<?>) skipped
 							.thenCompose(exhausted -> exhausted
 									? CompletableFuture.completedFuture(List.of())
@@ -617,7 +608,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 											iterationId,
 											takeCount,
 											new ArrayList<>(),
-											cancelled,
+											result,
 											workloadExecutor));
 				};
 			}
@@ -746,12 +737,12 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 		private final CompletableFuture<Void> finished = new CompletableFuture<>();
 		private volatile boolean cancellationRequested;
-		private volatile @Nullable Runnable cancellation;
+		private volatile @Nullable reactor.core.Disposable cancellation;
 
-		private void attachCancellation(Runnable cancellation) {
+		private void attachCancellation(reactor.core.Disposable cancellation) {
 			this.cancellation = Objects.requireNonNull(cancellation, "cancellation");
 			if (cancellationRequested) {
-				cancellation.run();
+				cancellation.dispose();
 			}
 		}
 
@@ -759,8 +750,23 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			cancellationRequested = true;
 			var currentCancellation = cancellation;
 			if (currentCancellation != null) {
-				currentCancellation.run();
+				currentCancellation.dispose();
 			}
+		}
+	}
+
+	private static final class IteratorResultFuture<T> extends CompletableFuture<T> {
+
+		private volatile boolean cancellationRequested;
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			cancellationRequested = true;
+			return super.cancel(false);
+		}
+
+		private boolean cancellationRequested() {
+			return cancellationRequested;
 		}
 	}
 
@@ -789,7 +795,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		private final IteratorRequestMode mode;
 		private final @Nullable ArrayList<Buf> values;
 		private final Object completionLock = new Object();
-		private final AtomicBoolean terminated = new AtomicBoolean();
+		private volatile boolean terminated;
 		private volatile boolean cancellationRequested;
 		private volatile @Nullable RWScheduler.CooperativeHandle handle;
 		private volatile boolean ready;
@@ -832,7 +838,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		private void start() {
 			RWScheduler.CooperativeHandle currentHandle;
 			synchronized (completionLock) {
-				if (terminated.get()) {
+				if (terminated) {
 					return;
 				}
 				ready = true;
@@ -843,7 +849,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 		@Override
 		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
-			if (terminated.get()) {
+			if (terminated) {
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 			if (!ready) {
@@ -946,7 +952,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				if (cancellationRequested) {
 					return true;
 				}
-				if (terminated.get()) {
+				if (terminated) {
 					return false;
 				}
 				var currentHandle = Objects.requireNonNull(handle, "handle");
@@ -972,12 +978,12 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 		@Override
 		public boolean isDisposed() {
-			return terminated.get();
+			return terminated;
 		}
 
 		private void prepareCompletion(@Nullable T value) {
 			synchronized (completionLock) {
-				if (terminated.get()) {
+				if (terminated) {
 					return;
 				}
 				if (completionPrepared) {
@@ -992,7 +998,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		public void completeCooperatively() {
 			final T value;
 			synchronized (completionLock) {
-				if (terminated.get()) {
+				if (terminated) {
 					return;
 				}
 				if (!completionPrepared) {
@@ -1005,9 +1011,10 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 		private void finish(@Nullable T value, @Nullable Throwable failure) {
 			synchronized (completionLock) {
-				if (!terminated.compareAndSet(false, true)) {
+				if (terminated) {
 					return;
 				}
+				terminated = true;
 			}
 			// Publish iterator-gate release before success/failure becomes observable.
 			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
@@ -1022,71 +1029,71 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	/** @return true when the iterator was exhausted before consuming the requested count. */
 	private CompletableFuture<Boolean> advanceIteratorAsync(long iterationId,
 			long remaining,
-			AtomicBoolean cancelled,
+			IteratorResultFuture<?> result,
 			Executor workloadExecutor) {
 		if (remaining <= 0) {
 			return CompletableFuture.completedFuture(false);
 		}
 		long step = Math.min(remaining, ITERATOR_READ_STEP_SIZE);
-		return scheduleIteratorAdvanceStep(iterationId, step, cancelled, workloadExecutor)
+		return scheduleIteratorAdvanceStep(iterationId, step, result, workloadExecutor)
 				.thenCompose(advanced -> advanced < step
 						? CompletableFuture.completedFuture(true)
-						: advanceIteratorAsync(iterationId, remaining - step, cancelled, workloadExecutor));
+						: advanceIteratorAsync(iterationId, remaining - step, result, workloadExecutor));
 	}
 
 	private CompletableFuture<Boolean> subsequentExistsAsync(long iterationId,
 			long remaining,
 			boolean found,
-			AtomicBoolean cancelled,
+			IteratorResultFuture<?> result,
 			Executor workloadExecutor) {
-		if (remaining <= 0 || cancelled.get()) {
-			return cancelled.get()
+		if (remaining <= 0 || result.cancellationRequested()) {
+			return result.cancellationRequested()
 					? CompletableFuture.failedFuture(new CancellationException())
 					: CompletableFuture.completedFuture(found);
 		}
 		long step = Math.min(remaining, ITERATOR_READ_STEP_SIZE);
-		return scheduleIteratorAdvanceStep(iterationId, step, cancelled, workloadExecutor)
+		return scheduleIteratorAdvanceStep(iterationId, step, result, workloadExecutor)
 				.thenCompose(advanced -> {
 					boolean pageFound = found || advanced > 0L;
 					return advanced < step
 							? CompletableFuture.completedFuture(pageFound)
 							: subsequentExistsAsync(
-									iterationId, remaining - step, pageFound, cancelled, workloadExecutor);
+									iterationId, remaining - step, pageFound, result, workloadExecutor);
 				});
 	}
 
 	private CompletableFuture<List<Buf>> subsequentMultiAsync(long iterationId,
 			long remaining,
 			ArrayList<Buf> values,
-			AtomicBoolean cancelled,
+			IteratorResultFuture<?> result,
 			Executor workloadExecutor) {
-		if (remaining <= 0 || cancelled.get()) {
-			return cancelled.get()
+		if (remaining <= 0 || result.cancellationRequested()) {
+			return result.cancellationRequested()
 					? CompletableFuture.failedFuture(new CancellationException())
 					: CompletableFuture.completedFuture(values);
 		}
 		long step = Math.min(remaining, ITERATOR_READ_STEP_SIZE);
 		return scheduleIteratorStep(
-				iterationId, step, RequestType.multi(), cancelled, workloadExecutor)
+				iterationId, step, RequestType.multi(), result, workloadExecutor)
 				.thenCompose(page -> {
 					values.addAll(page);
 					return page.size() < step
 							? CompletableFuture.completedFuture(values)
 							: subsequentMultiAsync(
-									iterationId, remaining - step, values, cancelled, workloadExecutor);
+									iterationId, remaining - step, values, result, workloadExecutor);
 				});
 	}
 
 	private <T> CompletableFuture<T> scheduleIteratorStep(long iterationId,
 			long takeCount,
 			RequestType.RequestIterate<? super Buf, T> requestType,
-			AtomicBoolean cancelled,
+			IteratorResultFuture<?> result,
 			Executor workloadExecutor) {
-		if (cancelled.get()) {
+		if (result.cancellationRequested()) {
 			return CompletableFuture.failedFuture(new CancellationException());
 		}
 		return CompletableFuture.supplyAsync(() -> {
-			if (cancelled.get()) {
+			if (result.cancellationRequested()) {
 				throw new CancellationException();
 			}
 			return db.subsequent(iterationId, 0, takeCount, requestType);
@@ -1095,13 +1102,13 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 	private CompletableFuture<Long> scheduleIteratorAdvanceStep(long iterationId,
 			long takeCount,
-			AtomicBoolean cancelled,
+			IteratorResultFuture<?> result,
 			Executor workloadExecutor) {
-		if (cancelled.get()) {
+		if (result.cancellationRequested()) {
 			return CompletableFuture.failedFuture(new CancellationException());
 		}
 		return CompletableFuture.supplyAsync(() -> {
-			if (cancelled.get()) {
+			if (result.cancellationRequested()) {
 				throw new CancellationException();
 			}
 			return db.advanceIteratorInternal(iterationId, takeCount);

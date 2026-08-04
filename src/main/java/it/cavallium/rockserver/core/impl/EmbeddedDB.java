@@ -59,6 +59,8 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -138,6 +140,14 @@ import org.rocksdb.TransactionLogIterator;
 import org.rocksdb.WriteBatch;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
+
+	private static VarHandle varHandle(Class<?> owner, String field, Class<?> type) {
+		try {
+			return MethodHandles.lookup().findVarHandle(owner, field, type);
+		} catch (NoSuchFieldException | IllegalAccessException failure) {
+			throw new ExceptionInInitializerError(failure);
+		}
+	}
 
 	/** Output ownership requested by the embedded gRPC unary-Get fast path. */
 	public enum FastGetOutput {
@@ -3424,11 +3434,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private abstract class BatchWriteState implements AutoCloseable {
 
+		private static final VarHandle LIFECYCLE =
+				varHandle(BatchWriteState.class, "lifecycle", int.class);
 		private static final int ACTIVE = 1;
 		private static final int CLOSE_REQUESTED = 1 << 1;
 		private static final int CLOSED = 1 << 2;
 
-		private final AtomicInteger lifecycle = new AtomicInteger();
+		private volatile int lifecycle;
 
 		private BatchWriteState() {
 			ops.beginOp();
@@ -3447,11 +3459,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private boolean tryEnter() {
 			for (;;) {
-				int state = lifecycle.get();
+				int state = lifecycle;
 				if ((state & (CLOSE_REQUESTED | CLOSED)) != 0) {
 					return false;
 				}
-				if (lifecycle.compareAndSet(state, state | ACTIVE)) {
+				if (LIFECYCLE.compareAndSet(this, state, state | ACTIVE)) {
 					return true;
 				}
 			}
@@ -3459,9 +3471,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private void exit() {
 			for (;;) {
-				int state = lifecycle.get();
+				int state = lifecycle;
 				int next = state & ~ACTIVE;
-				if (lifecycle.compareAndSet(state, next)) {
+				if (LIFECYCLE.compareAndSet(this, state, next)) {
 					if ((next & CLOSE_REQUESTED) != 0) {
 						closeNow();
 					}
@@ -3473,12 +3485,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		@Override
 		public final void close() {
 			for (;;) {
-				int state = lifecycle.get();
+				int state = lifecycle;
 				if ((state & CLOSED) != 0) {
 					return;
 				}
 				int next = state | CLOSE_REQUESTED;
-				if (lifecycle.compareAndSet(state, next)) {
+				if (LIFECYCLE.compareAndSet(this, state, next)) {
 					if ((state & ACTIVE) == 0) {
 						closeNow();
 					}
@@ -3489,14 +3501,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private void closeNow() {
 			for (;;) {
-				int state = lifecycle.get();
+				int state = lifecycle;
 				if ((state & CLOSED) != 0) {
 					return;
 				}
 				if ((state & ACTIVE) != 0) {
 					return;
 				}
-				if (lifecycle.compareAndSet(state, state | CLOSED)) {
+				if (LIFECYCLE.compareAndSet(this, state, state | CLOSED)) {
 					break;
 				}
 			}
@@ -4764,6 +4776,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final class AsyncExistsMultiRequest extends CompletableFuture<List<Boolean>>
 			implements Runnable, RWScheduler.CooperativeCompletionTask {
 
+		private static final VarHandle RESOURCES_CLEANED =
+				varHandle(AsyncExistsMultiRequest.class, "resourcesCleaned", boolean.class);
 		private static final int INITIAL_QUEUED = 0;
 		private static final int CHUNK_RUNNING = 1;
 		private static final int FINISHED = 2;
@@ -4779,8 +4793,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final Executor executor;
 		private final @Nullable RWScheduler.WorkloadExecutor cooperativeExecutor;
 		private final Object lifecycleLock = new Object();
-		private final AtomicBoolean cancelRequested = new AtomicBoolean();
-		private final AtomicBoolean resourcesCleaned = new AtomicBoolean();
+		private volatile boolean cancelRequested;
+		private volatile boolean resourcesCleaned;
 		private int state = INITIAL_QUEUED;
 		private @Nullable ExistsMultiCursor cursor;
 		private volatile @Nullable RWScheduler.CooperativeHandle cooperativeHandle;
@@ -4854,7 +4868,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					// local flag is published for idempotency.
 					boolean cancellationWon = handle.cancel();
 					if (cancellationWon) {
-						cancelRequested.set(true);
+						cancelRequested = true;
 					}
 					return beforeFirstRun && cancellationWon;
 				}
@@ -4870,11 +4884,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						initialQueuedCancellation = true;
 					}
 					case CHUNK_RUNNING -> {
-						cancelRequested.set(true);
+						cancelRequested = true;
 						return false;
 					}
 					case CHUNK_QUEUED -> {
-						cancelRequested.set(true);
+						cancelRequested = true;
 						state = FINISHED;
 						removeQueuedTask();
 						cleanupQueuedRequest = true;
@@ -5007,7 +5021,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					return;
 				}
 			}
-			if (initialize && cancelRequested.get()) {
+			if (initialize && cancelRequested) {
 				finishRunning(null, new java.util.concurrent.CancellationException());
 				return;
 			}
@@ -5019,7 +5033,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					return;
 				}
 			}
-			if (cancelRequested.get()) {
+			if (cancelRequested) {
 				finishRunning(null, new java.util.concurrent.CancellationException());
 				return;
 			}
@@ -5027,7 +5041,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			try {
 				var activeCursor = Objects.requireNonNull(cursor);
 				boolean exhausted = activeCursor.readChunk();
-				if (cancelRequested.get()) {
+				if (cancelRequested) {
 					finishRunning(null, new java.util.concurrent.CancellationException());
 				} else if (exhausted) {
 					finishRunning(activeCursor.result(), null);
@@ -5072,7 +5086,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (state != CHUNK_RUNNING) {
 					return;
 				}
-				if (cancelRequested.get()) {
+				if (cancelRequested) {
 					state = FINISHED;
 					cancelled = true;
 				} else {
@@ -5112,7 +5126,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		private @Nullable Throwable cleanupTerminalResources(@Nullable Throwable originalFailure) {
-			if (!resourcesCleaned.compareAndSet(false, true)) {
+			if (!RESOURCES_CLEANED.compareAndSet(this, false, true)) {
 				var existingCleanupFailure = resourceCleanupFailure;
 				return existingCleanupFailure == null
 						? originalFailure
@@ -6504,6 +6518,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final class OrdinaryRetainedRangeTask<T> extends CompletableFuture<T>
 			implements Runnable, RWScheduler.RejectionAwareTask {
 
+		private static final VarHandle STATE =
+				varHandle(OrdinaryRetainedRangeTask.class, "state", int.class);
 		private static final int QUEUED = 0;
 		private static final int RUNNING = 1;
 		private static final int FINISHED = 2;
@@ -6513,8 +6529,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final Callable<T> callable;
 		private final @Nullable Consumer<? super T> lateSuccessCleanup;
 		private final reactor.core.publisher.MonoSink<T> sink;
-		private final AtomicInteger state = new AtomicInteger(QUEUED);
-		private final AtomicBoolean deliveryCancelled = new AtomicBoolean();
+		private volatile int state = QUEUED;
+		private volatile boolean deliveryCancelled;
 
 		private OrdinaryRetainedRangeTask(RWScheduler.WorkloadExecutor target,
 				Callable<T> callable,
@@ -6527,8 +6543,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		private void cancelDelivery() {
-			deliveryCancelled.set(true);
-			if (state.compareAndSet(QUEUED, CANCELLED)) {
+			deliveryCancelled = true;
+			if (STATE.compareAndSet(this, QUEUED, CANCELLED)) {
 				super.cancel(false);
 				scheduler.removeQueuedTask(target, this);
 			}
@@ -6536,26 +6552,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public void run() {
-			if (!state.compareAndSet(QUEUED, RUNNING)) {
+			if (!STATE.compareAndSet(this, QUEUED, RUNNING)) {
 				return;
 			}
 			try {
 				var result = callable.call();
 				complete(result);
-				if (deliveryCancelled.get()) {
+				if (deliveryCancelled) {
 					cleanupLateSuccess(result);
 				} else {
 					sink.success(result);
 				}
 			} catch (Throwable error) {
 				completeExceptionally(error);
-				if (!deliveryCancelled.get()) {
+				if (!deliveryCancelled) {
 					sink.error(error);
 				} else {
 					logger.debug("Range quantum failed after subscriber cancellation", error);
 				}
 			} finally {
-				state.set(FINISHED);
+				state = FINISHED;
 			}
 		}
 
@@ -6572,11 +6588,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public void reject(RuntimeException failure) {
-			if (!state.compareAndSet(QUEUED, FINISHED)) {
+			if (!STATE.compareAndSet(this, QUEUED, FINISHED)) {
 				return;
 			}
 			completeExceptionally(failure);
-			if (!deliveryCancelled.get()) {
+			if (!deliveryCancelled) {
 				sink.error(failure);
 			}
 		}
@@ -6716,6 +6732,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			LongConsumer,
 			reactor.core.Disposable {
 
+		private static final VarHandle TERMINATED =
+				varHandle(RetainedRangeCooperativeTask.class, "terminated", boolean.class);
 		private final long transactionId;
 		private final long columnId;
 		private final @Nullable Keys startKeysInclusive;
@@ -6730,7 +6748,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final Timer timer;
 		private final Object admissionLock = new Object();
 		private final Object resourceLock = new Object();
-		private final AtomicBoolean terminated = new AtomicBoolean();
+		private volatile boolean terminated;
 		private final CountDownLatch cleanupFinished = new CountDownLatch(1);
 		private volatile boolean deliveryCancelled;
 		protected volatile @Nullable RWScheduler.CooperativeHandle handle;
@@ -6766,12 +6784,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		protected final void start() {
-			if (terminated.get()) {
+			if (terminated) {
 				return;
 			}
 			activeRangeResources.add(this);
 			synchronized (admissionLock) {
-				if (terminated.get()) {
+				if (terminated) {
 					activeRangeResources.remove(this);
 					return;
 				}
@@ -6788,7 +6806,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// The worker can dispatch immediately after admission. Waiting for this
 			// short monitor handoff guarantees that the stable handle is installed first.
 			synchronized (admissionLock) {
-				if (terminated.get()) {
+				if (terminated) {
 					return null;
 				}
 			}
@@ -6812,7 +6830,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						false,
 						null,
 						false));
-				if (terminated.get()) {
+				if (terminated) {
 					created.close();
 					return null;
 				}
@@ -6826,7 +6844,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		protected final void cancelDelivery() {
-			if (terminated.get()) {
+			if (terminated) {
 				return;
 			}
 			deliveryCancelled = true;
@@ -6846,7 +6864,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public final boolean isDisposed() {
-			return terminated.get();
+			return terminated;
 		}
 
 		@Override
@@ -6858,7 +6876,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public final void expireIfDeadlinePassed(long nowMicros) {
-			if (deadlineMicros == Long.MAX_VALUE || nowMicros < deadlineMicros || terminated.get()) {
+			if (deadlineMicros == Long.MAX_VALUE || nowMicros < deadlineMicros || terminated) {
 				return;
 			}
 			var failure = retainedRangeDeadlineExceeded();
@@ -6871,7 +6889,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// Serialize cancellation with admission. Otherwise cancellation can observe no
 			// handle, release the permit, and then race a late cooperative submission.
 			synchronized (admissionLock) {
-				if (terminated.get()) {
+				if (terminated) {
 					return;
 				}
 				var currentHandle = handle;
@@ -6909,7 +6927,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return;
 			}
 			synchronized (admissionLock) {
-				if (terminated.get()) {
+				if (terminated) {
 					return;
 				}
 				if (completionPrepared) {
@@ -6922,21 +6940,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		@Override
 		public final void completeCooperatively() {
 			synchronized (admissionLock) {
-				if (terminated.get()) {
+				if (terminated) {
 					return;
 				}
 				if (!completionPrepared) {
 					throw new IllegalStateException("Scheduler selected RUN without a retained range result");
 				}
 			}
-			if (!terminated.compareAndSet(false, true)) {
+			if (!TERMINATED.compareAndSet(this, false, true)) {
 				return;
 			}
 			signalTerminal(null);
 		}
 
 		protected final void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
-			if (!terminated.compareAndSet(false, true)) {
+			if (!TERMINATED.compareAndSet(this, false, true)) {
 				return;
 			}
 			var failure = cleanupResources(originalFailure);
@@ -7017,7 +7035,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		protected abstract void signalTerminal(@Nullable Throwable failure);
 
 		protected final boolean isTerminated() {
-			return terminated.get();
+			return terminated;
 		}
 
 		private boolean hasOpenCursor() {
@@ -7032,8 +7050,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private final class RetainedRangeReadTask extends RetainedRangeCooperativeTask {
 
+		private static final VarHandle DEMAND =
+				varHandle(RetainedRangeReadTask.class, "demand", long.class);
 		private final FluxSink<RangeReadChunk> sink;
-		private final AtomicLong demand = new AtomicLong();
+		private volatile long demand;
 
 		private RetainedRangeReadTask(long transactionId,
 				long columnId,
@@ -7069,7 +7089,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (schedulerTerminationRequested(context)) {
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
-			if (demand.get() == 0L) {
+			if (demand == 0L) {
 				return RWScheduler.CooperativeResult.PARK;
 			}
 			try {
@@ -7095,7 +7115,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				// redispatch only makes it run once more to discover zero demand and park.
 				// A concurrent request records resume while this quantum is active, so the
 				// scheduler still requeues the node atomically when PARK is committed.
-				return demand.get() == 0L
+				return demand == 0L
 						? RWScheduler.CooperativeResult.PARK
 						: RWScheduler.CooperativeResult.YIELD;
 			} catch (VirtualMachineError fatal) {
@@ -7109,14 +7129,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private void producedOne() {
 			while (true) {
-				long current = demand.get();
+				long current = demand;
 				if (current == Long.MAX_VALUE) {
 					return;
 				}
 				if (current <= 0L) {
 					throw new IllegalStateException("Range chunk produced without downstream demand");
 				}
-				if (demand.compareAndSet(current, current - 1L)) {
+				if (DEMAND.compareAndSet(this, current, current - 1L)) {
 					return;
 				}
 			}
@@ -7127,7 +7147,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (requested <= 0L || isTerminated()) {
 				return;
 			}
-			addDemand(demand, requested);
+			while (true) {
+				long current = demand;
+				long updated = current + requested;
+				if (updated < 0L) {
+					updated = Long.MAX_VALUE;
+				}
+				if (DEMAND.compareAndSet(this, current, updated)) {
+					break;
+				}
+			}
 			var currentHandle = handle;
 			if (currentHandle != null) {
 				currentHandle.resume();
@@ -7255,19 +7284,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				sink.success(count);
 			} else {
 				sink.error(failure);
-			}
-		}
-	}
-
-	private static void addDemand(AtomicLong demand, long requested) {
-		while (true) {
-			long current = demand.get();
-			long updated = current + requested;
-			if (updated < 0L) {
-				updated = Long.MAX_VALUE;
-			}
-			if (demand.compareAndSet(current, updated)) {
-				return;
 			}
 		}
 	}
@@ -8142,13 +8158,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final class ScanState implements RWScheduler.CooperativeCompletionTask,
 			LongConsumer,
 			reactor.core.Disposable {
+		private static final VarHandle DEMAND =
+				varHandle(ScanState.class, "demand", long.class);
+		private static final VarHandle TERMINATED =
+				varHandle(ScanState.class, "terminated", boolean.class);
 		private final ColumnInstance col;
 		private final String cfName;
 		private final LiveFileMetaData file;
 		private final FluxSink<SerializedKVBatch> sink;
 		private final long maximumQuantumNanos;
-		private final AtomicLong demand = new AtomicLong();
-		private final AtomicBoolean terminated = new AtomicBoolean();
+		private volatile long demand;
+		private volatile boolean terminated;
 		private volatile boolean cancellationRequested;
 		private volatile @Nullable RWScheduler.CooperativeHandle handle;
 		private @Nullable SstFileReader reader;
@@ -8179,7 +8199,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.handle = Objects.requireNonNull(handle, "handle");
 			if (cancellationRequested) {
 				handle.dispose();
-			} else if (demand.get() > 0L) {
+			} else if (demand > 0L) {
 				handle.resume();
 			}
 		}
@@ -8247,7 +8267,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
-			if (terminated.get()) {
+			if (terminated) {
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
 			// executeCooperatively may dispatch before it returns the stable handle. Park
@@ -8259,7 +8279,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (context.terminationRequested()) {
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
-			if (demand.get() == 0L) {
+			if (demand == 0L) {
 				return RWScheduler.CooperativeResult.PARK;
 			}
 			try {
@@ -8312,7 +8332,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (batchSize >= RAW_SCAN_MAX_ENTRIES_PER_CHUNK
 							|| currentBatchBytes >= RAW_SCAN_MAX_BYTES_PER_CHUNK) {
 						emitBatch();
-						if (demand.get() == 0L) {
+						if (demand == 0L) {
 							return RWScheduler.CooperativeResult.PARK;
 						}
 					}
@@ -8355,7 +8375,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (!completionPrepared) {
 				throw new IllegalStateException("Scheduler selected RUN before raw scan cleanup completed");
 			}
-			if (terminated.compareAndSet(false, true)) {
+			if (TERMINATED.compareAndSet(this, false, true)) {
 				sink.complete();
 			}
 		}
@@ -8373,14 +8393,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private void producedOne() {
 			while (true) {
-				long current = demand.get();
+				long current = demand;
 				if (current == Long.MAX_VALUE) {
 					return;
 				}
 				if (current <= 0L) {
 					throw new IllegalStateException("Raw scan produced without downstream demand");
 				}
-				if (demand.compareAndSet(current, current - 1L)) {
+				if (DEMAND.compareAndSet(this, current, current - 1L)) {
 					return;
 				}
 			}
@@ -8388,16 +8408,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public void accept(long requested) {
-			if (requested <= 0L || terminated.get()) {
+			if (requested <= 0L || terminated) {
 				return;
 			}
 			while (true) {
-				long current = demand.get();
+				long current = demand;
 				long updated = current + requested;
 				if (updated < 0L) {
 					updated = Long.MAX_VALUE;
 				}
-				if (demand.compareAndSet(current, updated)) {
+				if (DEMAND.compareAndSet(this, current, updated)) {
 					break;
 				}
 			}
@@ -8414,7 +8434,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public void dispose() {
-			if (terminated.get()) {
+			if (terminated) {
 				return;
 			}
 			cancellationRequested = true;
@@ -8426,11 +8446,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public boolean isDisposed() {
-			return terminated.get();
+			return terminated;
 		}
 
 		private void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
-			if (!terminated.compareAndSet(false, true)) {
+			if (!TERMINATED.compareAndSet(this, false, true)) {
 				return;
 			}
 			var failure = cleanupNativeResources(originalFailure);

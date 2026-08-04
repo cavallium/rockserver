@@ -47,16 +47,7 @@ import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
-import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
-import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
-import it.cavallium.rockserver.core.common.RequestType.RequestDelta;
-import it.cavallium.rockserver.core.common.RequestType.RequestExists;
-import it.cavallium.rockserver.core.common.RequestType.RequestForUpdate;
-import it.cavallium.rockserver.core.common.RequestType.RequestMulti;
-import it.cavallium.rockserver.core.common.RequestType.RequestNothing;
-import it.cavallium.rockserver.core.common.RequestType.RequestPrevious;
-import it.cavallium.rockserver.core.common.RequestType.RequestPreviousPresence;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import it.cavallium.rockserver.core.common.api.proto.Delta;
@@ -78,11 +69,12 @@ import java.io.OutputStream;
 import it.cavallium.buffer.Buf;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.net.SocketAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map.Entry;
@@ -95,13 +87,11 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -469,70 +459,117 @@ public class GrpcServer extends Server {
 		@Override
 		public Listener<GetRequest> startCall(ServerCall<GetRequest, FastGetResponse> call, Metadata headers) {
 			call.request(2);
-			Context callContext = Context.current();
-			return new Listener<>() {
-				private final AtomicBoolean cancelled = new AtomicBoolean();
-				private final AtomicBoolean halfClosed = new AtomicBoolean();
-				private final AtomicReference<Disposable> task = new AtomicReference<>();
-				private @Nullable GetRequest request;
+			return new FastGetListener(call, Context.current());
+		}
 
-				@Override
-				public void onMessage(GetRequest message) {
-					if (request != null) {
-						cancelled.set(true);
-						call.close(Status.INVALID_ARGUMENT.withDescription("Unary Get received multiple requests"),
-								new Metadata());
-						return;
-					}
-					request = message;
+		private final class FastGetListener extends Listener<GetRequest> implements Runnable {
+
+			private static final int CANCELLED = 1;
+			private static final int HALF_CLOSED = 1 << 1;
+			private static final VarHandle STATE;
+
+			static {
+				try {
+					STATE = MethodHandles.lookup().findVarHandle(FastGetListener.class, "state", int.class);
+				} catch (NoSuchFieldException | IllegalAccessException failure) {
+					throw new ExceptionInInitializerError(failure);
+				}
+			}
+
+			private final ServerCall<GetRequest, FastGetResponse> call;
+			private final Context callContext;
+			private volatile int state;
+			private volatile @Nullable Disposable task;
+			private @Nullable GetRequest request;
+			private @Nullable it.cavallium.rockserver.core.common.RequestContext requestContext;
+			private @Nullable Keys keys;
+
+			private FastGetListener(ServerCall<GetRequest, FastGetResponse> call, Context callContext) {
+				this.call = call;
+				this.callContext = callContext;
+			}
+
+			@Override
+			public void onMessage(GetRequest message) {
+				if (request != null) {
+					cancel();
+					call.close(Status.INVALID_ARGUMENT.withDescription("Unary Get received multiple requests"),
+							new Metadata());
+					return;
+				}
+				request = message;
+			}
+
+			@Override
+			public void onHalfClose() {
+				if (!markHalfClosed() || isCancelled()) {
+					return;
+				}
+				GetRequest currentRequest = request;
+				if (currentRequest == null) {
+					cancel();
+					call.close(Status.INVALID_ARGUMENT.withDescription("Unary Get received no request"),
+							new Metadata());
+					return;
 				}
 
-				@Override
-				public void onHalfClose() {
-					if (!halfClosed.compareAndSet(false, true) || cancelled.get()) {
-						return;
-					}
-					GetRequest currentRequest = request;
-					if (currentRequest == null) {
-						cancelled.set(true);
-						call.close(Status.INVALID_ARGUMENT.withDescription("Unary Get received no request"),
-								new Metadata());
-						return;
-					}
-
-					Disposable scheduled;
-					try {
-						var context = grpc.mapRequestContext(currentRequest.getContext());
-						var keys = GrpcServerImpl.mapKeys(currentRequest.getKeysCount(), currentRequest::getKeys);
-						var command = new RocksDBAPICommand.RocksDBAPICommandSingle.Get<>(
-								currentRequest.getTransactionOrUpdateId(),
-								currentRequest.getColumnId(),
-								keys,
-								new RequestCurrent<>());
-						var profile = grpc.resolveCommand(context, command);
-						scheduled = scheduler.scheduler(profile,
-								command.operationFamily(),
-								context.deadlineEpochMillis()).schedule(callContext.wrap(
-								() -> runFastGetCall(call, currentRequest, context, keys, cancelled)));
-					} catch (Throwable schedulingError) {
-						closeFastGetFailure(call, currentRequest, schedulingError, cancelled);
-						return;
-					}
-					task.set(scheduled);
-					if (cancelled.get()) {
-						scheduled.dispose();
-					}
+				Disposable scheduled;
+				try {
+					requestContext = grpc.mapRequestContext(currentRequest.getContext());
+					keys = GrpcServerImpl.mapKeys(currentRequest.getKeysList());
+					scheduled = scheduler.scheduler(requestContext, OperationFamily.POINT_LOOKUP)
+							.schedule(this);
+				} catch (Throwable schedulingError) {
+					closeFastGetFailure(call, currentRequest, schedulingError, this);
+					return;
 				}
-
-				@Override
-				public void onCancel() {
-					cancelled.set(true);
-					Disposable scheduled = task.get();
-					if (scheduled != null) {
-						scheduled.dispose();
-					}
+				task = scheduled;
+				if (isCancelled()) {
+					scheduled.dispose();
 				}
-			};
+			}
+
+			@Override
+			public void onCancel() {
+				cancel();
+				Disposable scheduled = task;
+				if (scheduled != null) {
+					scheduled.dispose();
+				}
+			}
+
+			@Override
+			public void run() {
+				Context previous = callContext.attach();
+				try {
+					runFastGetCall(call,
+							Objects.requireNonNull(request, "request"),
+							Objects.requireNonNull(requestContext, "requestContext"),
+							Objects.requireNonNull(keys, "keys"),
+							this);
+				} finally {
+					callContext.detach(previous);
+				}
+			}
+
+			private boolean markHalfClosed() {
+				int current;
+				do {
+					current = state;
+					if ((current & HALF_CLOSED) != 0) {
+						return false;
+					}
+				} while (!STATE.compareAndSet(this, current, current | HALF_CLOSED));
+				return true;
+			}
+
+			private void cancel() {
+				STATE.getAndBitwiseOr(this, CANCELLED);
+			}
+
+			private boolean isCancelled() {
+				return (state & CANCELLED) != 0;
+			}
 		}
 	}
 
@@ -540,34 +577,34 @@ public class GrpcServer extends Server {
 			GetRequest request,
 			it.cavallium.rockserver.core.common.RequestContext context,
 			Keys keys,
-			AtomicBoolean cancelled) {
+			FastGetCallHandler.FastGetListener listener) {
 		FastGetResponse response = null;
 		try {
-			if (cancelled.get() || call.isCancelled()) {
+			if (listener.isCancelled() || call.isCancelled()) {
 				return;
 			}
 			response = grpc.createFastGetResponse(request, context, keys, grpcGetStrategy, embeddedDatabase);
-			if (cancelled.get() || call.isCancelled()) {
+			if (listener.isCancelled() || call.isCancelled()) {
 				return;
 			}
 			call.sendHeaders(new Metadata());
-			if (cancelled.get() || call.isCancelled()) {
+			if (listener.isCancelled() || call.isCancelled()) {
 				return;
 			}
 			call.sendMessage(response);
 			response.close();
 			response = null;
-			if (!cancelled.get() && !call.isCancelled()) {
+			if (!listener.isCancelled() && !call.isCancelled()) {
 				call.close(Status.OK, new Metadata());
 			}
 		} catch (Throwable error) {
-			closeFastGetFailure(call, request, error, cancelled);
+			closeFastGetFailure(call, request, error, listener);
 		} finally {
 			if (response != null) {
 				try {
 					response.close();
 				} catch (Throwable closeError) {
-					if (!cancelled.get() && !call.isCancelled()) {
+					if (!listener.isCancelled() && !call.isCancelled()) {
 						LOG.error("Failed to close a unary Get response after framing", closeError);
 					}
 				}
@@ -578,11 +615,11 @@ public class GrpcServer extends Server {
 	private void closeFastGetFailure(ServerCall<GetRequest, FastGetResponse> call,
 			GetRequest request,
 			Throwable error,
-			AtomicBoolean cancelled) {
-		if (cancelled.get() || call.isCancelled()) {
+			FastGetCallHandler.FastGetListener listener) {
+		if (listener.isCancelled() || call.isCancelled()) {
 			return;
 		}
-		cancelled.set(true);
+		listener.cancel();
 		Throwable mapped = grpc.mapRequestError("get", request, error);
 		Status status = Status.fromThrowable(mapped);
 		Metadata trailers = Status.trailersFromThrowable(mapped);
@@ -591,11 +628,21 @@ public class GrpcServer extends Server {
 
 	private static final class FastGetResponse implements AutoCloseable {
 
+		private static final VarHandle CLOSED;
+
+		static {
+			try {
+				CLOSED = MethodHandles.lookup().findVarHandle(FastGetResponse.class, "closed", boolean.class);
+			} catch (NoSuchFieldException | IllegalAccessException failure) {
+				throw new ExceptionInInitializerError(failure);
+			}
+		}
+
 		private final boolean present;
 		private final @Nullable Buf value;
 		private final boolean pinned;
 		private final @Nullable EmbeddedDB.FastGetResult owner;
-		private final AtomicBoolean closed = new AtomicBoolean();
+		private volatile boolean closed;
 
 		private FastGetResponse(boolean present,
 				@Nullable Buf value,
@@ -611,7 +658,7 @@ public class GrpcServer extends Server {
 		}
 
 		private InputStream openStream() {
-			if (closed.get()) {
+			if (closed) {
 				throw new IllegalStateException("Get response has already been closed");
 			}
 			return new FastGetInputStream(present, value, pinned);
@@ -619,7 +666,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public void close() {
-			if (closed.compareAndSet(false, true) && owner != null) {
+			if (CLOSED.compareAndSet(this, false, true) && owner != null) {
 				owner.close();
 			}
 		}
@@ -649,6 +696,7 @@ public class GrpcServer extends Server {
 	private static final class FastGetInputStream extends InputStream implements Drainable, KnownLength {
 
 		private static final int COPY_CHUNK_BYTES = 16 * 1024;
+		private static final byte[] EMPTY_PREFIX = new byte[0];
 		private static final ThreadLocal<byte[]> COPY_CHUNK = ThreadLocal.withInitial(
 				() -> new byte[COPY_CHUNK_BYTES]);
 
@@ -661,7 +709,7 @@ public class GrpcServer extends Server {
 		private FastGetInputStream(boolean present, @Nullable Buf value, boolean pinned) {
 			this.value = value;
 			this.pinned = pinned;
-			this.prefix = present ? protobufBytesPrefix(Objects.requireNonNull(value).size()) : new byte[0];
+			this.prefix = present ? protobufBytesPrefix(Objects.requireNonNull(value).size()) : EMPTY_PREFIX;
 			long totalLength = (long) prefix.length + (value != null ? value.size() : 0L);
 			if (totalLength > Integer.MAX_VALUE) {
 				throw new IllegalArgumentException("Get response exceeds the gRPC message length limit: " + totalLength);
@@ -784,9 +832,19 @@ public class GrpcServer extends Server {
 		private static final long ITERATOR_VALUE_PAGE_SIZE = 64L;
 		private static final long ITERATOR_ADVANCE_STEP_SIZE = 4_096L;
 		private static final int WRITE_ELISION_MULTI_STEP_SIZE = 4_096;
+		private static final it.cavallium.rockserver.core.common.RequestContext[] NO_DEADLINE_CONTEXTS
+				= createNoDeadlineContexts();
 
 		private final RocksDBConnection client;
+		private final RocksDBSyncAPI[] noDeadlineSyncApis = new RocksDBSyncAPI[NO_DEADLINE_CONTEXTS.length];
+		private final RocksDBAsyncAPI[] noDeadlineAsyncApis = new RocksDBAsyncAPI[NO_DEADLINE_CONTEXTS.length];
 		private final ConcurrentMap<Long, Object> iteratorOperations = new ConcurrentHashMap<>();
+		private final RocksDBSyncAPI commandCaptureApi = new RocksDBSyncAPI() {
+			@Override
+			public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
+				throw new CapturedCommand(request);
+			}
+		};
 
 		private final class CapturedCommand extends RuntimeException {
 
@@ -800,6 +858,24 @@ public class GrpcServer extends Server {
 
 		public GrpcServerImpl(RocksDBConnection client) {
 			this.client = Objects.requireNonNull(client, "client");
+			for (var profile : WorkloadProfile.values()) {
+				var context = NO_DEADLINE_CONTEXTS[profile.ordinal()];
+				if (context != null) {
+					noDeadlineSyncApis[profile.ordinal()] = client.getSyncApi(context);
+					noDeadlineAsyncApis[profile.ordinal()] = client.getAsyncApi(context);
+				}
+			}
+		}
+
+		private static it.cavallium.rockserver.core.common.RequestContext[] createNoDeadlineContexts() {
+			var contexts = new it.cavallium.rockserver.core.common.RequestContext[WorkloadProfile.values().length];
+			contexts[WorkloadProfile.ANALYTICAL.ordinal()]
+					= it.cavallium.rockserver.core.common.RequestContext.analytical();
+			contexts[WorkloadProfile.INGEST.ordinal()]
+					= it.cavallium.rockserver.core.common.RequestContext.ingest();
+			contexts[WorkloadProfile.BATCH.ordinal()]
+					= it.cavallium.rockserver.core.common.RequestContext.batch();
+			return contexts;
 		}
 
 		private it.cavallium.rockserver.core.common.RequestContext mapRequestContext(
@@ -831,6 +907,12 @@ public class GrpcServer extends Server {
 						"Workload profile " + profile + " is owned by Rockserver");
 			}
 			try {
+				if (deadlineEpochMillis == it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE) {
+					var cached = NO_DEADLINE_CONTEXTS[profile.ordinal()];
+					if (cached != null) {
+						return cached;
+					}
+				}
 				return new it.cavallium.rockserver.core.common.RequestContext(profile, deadlineEpochMillis);
 			} catch (IllegalArgumentException invalid) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -840,26 +922,42 @@ public class GrpcServer extends Server {
 
 		private RocksDBAsyncAPI asyncApi(
 				it.cavallium.rockserver.core.common.api.proto.RequestContext context) {
-			return client.getAsyncApi(mapRequestContext(context));
+			return asyncApi(mapRequestContext(context));
+		}
+
+		private RocksDBSyncAPI syncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			if (context.deadlineEpochMillis()
+					== it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE) {
+				var cached = noDeadlineSyncApis[context.profile().ordinal()];
+				if (cached != null) {
+					return cached;
+				}
+			}
+			return client.getSyncApi(context);
+		}
+
+		private RocksDBAsyncAPI asyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			if (context.deadlineEpochMillis()
+					== it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE) {
+				var cached = noDeadlineAsyncApis[context.profile().ordinal()];
+				if (cached != null) {
+					return cached;
+				}
+			}
+			return client.getAsyncApi(context);
 		}
 
 		private RocksDBSyncAPI protectedApi() {
-			return client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			return noDeadlineSyncApis[WorkloadProfile.BATCH.ordinal()];
 		}
 
 		private RocksDBAsyncAPI protectedAsyncApi() {
-			return client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			return noDeadlineAsyncApis[WorkloadProfile.BATCH.ordinal()];
 		}
 
 		private RocksDBAPICommand<?, ?, ?> captureCommand(Function<RocksDBSyncAPI, ?> operation) {
-			RocksDBSyncAPI captureApi = new RocksDBSyncAPI() {
-				@Override
-				public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
-					throw new CapturedCommand(request);
-				}
-			};
 			try {
-				operation.apply(captureApi);
+				operation.apply(commandCaptureApi);
 			} catch (CapturedCommand captured) {
 				return captured.command;
 			}
@@ -984,9 +1082,9 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						mapKeys(request.getData().getKeysList()),
 						toBuf(request.getData().getValue()),
-						new RequestNothing<>()
+						RequestType.none()
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("put", request));
@@ -997,7 +1095,7 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						mapKeys(request.getData().getKeysList()),
 						toBuf(request.getData().getValue()),
 						RequestType.ensure());
 				return Empty.getDefaultInstance();
@@ -1009,8 +1107,8 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				contextualApi.delete(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestNothing<>()
+						mapKeys(request.getKeysList()),
+						RequestType.none()
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("delete", request));
@@ -1020,8 +1118,8 @@ public class GrpcServer extends Server {
 		public Mono<Empty> deleteRange(DeleteRangeRequest request) {
 			return executeWrite(request.getContext(), contextualApi -> {
 				contextualApi.deleteRange(request.getColumnId(),
-						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive)
+						mapKeys(request.getStartKeysInclusiveList()),
+						mapKeys(request.getEndKeysExclusiveList())
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("deleteRange", request));
@@ -1032,7 +1130,7 @@ public class GrpcServer extends Server {
 			var transportDeadline = Context.current().getDeadline();
 			return Mono.defer(() -> {
 					var keys = request.getKeysMultiList().stream()
-							.map(keyTuple -> mapKeys(keyTuple.getKeysCount(), keyTuple::getKeys))
+							.map(keyTuple -> mapKeys(keyTuple.getKeysList()))
 							.toList();
 					return fromCancellableFuture(asyncApi(request.getContext()).existsMultiAsync(
 							request.getTransactionId(),
@@ -1049,9 +1147,9 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				contextualApi.merge(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						mapKeys(request.getData().getKeysList()),
 						toBuf(request.getData().getValue()),
-						new RequestNothing<>()
+						RequestType.none()
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("merge", request));
@@ -1086,7 +1184,7 @@ public class GrpcServer extends Server {
 								}
 								var batch = putBatchRequest.getData();
 								try {
-									sink.next(mapKVBatch(batch.getEntriesCount(), batch::getEntries));
+									sink.next(mapKVBatch(batch.getEntriesList()));
 								} catch (Throwable ex) {
 									sink.error(ex);
 								}
@@ -1134,7 +1232,7 @@ public class GrpcServer extends Server {
 								}
 								var batch = mergeBatchRequest.getData();
 								try {
-									sink.next(mapKVBatch(batch.getEntriesCount(), batch::getEntries));
+									sink.next(mapKVBatch(batch.getEntriesList()));
 								} catch (Throwable ex) {
 									sink.error(ex);
 								}
@@ -1184,7 +1282,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Flux<Previous> deleteMultiGetPrevious(Flux<DeleteMultiRequest> request) {
-			return deleteMultiResponseFlux(request, "deleteMultiGetPrevious", new RequestPrevious<>(), previous -> {
+			return deleteMultiResponseFlux(request, "deleteMultiGetPrevious", RequestType.previous(), previous -> {
 				var builder = Previous.newBuilder();
 				if (previous != null) {
 					builder.setPrevious(Utils.toByteString(previous));
@@ -1197,7 +1295,7 @@ public class GrpcServer extends Server {
 		public Flux<PreviousPresence> deleteMultiGetPreviousPresence(Flux<DeleteMultiRequest> request) {
 			return deleteMultiResponseFlux(request,
 					"deleteMultiGetPreviousPresence",
-					new RequestPreviousPresence<>(),
+					RequestType.previousPresence(),
 					present -> PreviousPresence.newBuilder().setPresent(present).build());
 		}
 
@@ -1206,23 +1304,29 @@ public class GrpcServer extends Server {
 				String requestName) {
 			var context = mapRequestContext(initialRequest.getContext());
 			if (context.profile() == WorkloadProfile.LATENCY) {
-				var contextualApi = client.getAsyncApi(context);
+				var contextualApi = asyncApi(context);
 				return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
-						.flatMap(data -> Mono.fromFuture(() -> contextualApi.deleteMultiAsync(
-								initialRequest.getTransactionOrUpdateId(),
-								initialRequest.getColumnId(),
-								data.stream().map(value -> mapKeys(value.getKeysCount(), value::getKeys)).toList(),
-								new RequestNothing<>())))
+						.flatMap(data -> Mono.fromFuture(() -> {
+							var keys = new ArrayList<Keys>(data.size());
+							for (var value : data) {
+								keys.add(mapKeys(value.getKeysList()));
+							}
+							return contextualApi.deleteMultiAsync(
+									initialRequest.getTransactionOrUpdateId(),
+									initialRequest.getColumnId(),
+									keys,
+									RequestType.none());
+						}))
 						.thenReturn(Empty.getDefaultInstance())
 						.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
 			}
-			var contextualApi = client.getSyncApi(context);
+			var contextualApi = syncApi(context);
 			return dataFlux
 					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 					.doOnNext(data -> contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 							initialRequest.getColumnId(),
-							mapKeys(data.getKeysCount(), data::getKeys),
-								new RequestNothing<>()))
+							mapKeys(data.getKeysList()),
+								RequestType.none()))
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
 		}
@@ -1250,25 +1354,29 @@ public class GrpcServer extends Server {
 								return deleteRequest.getData();
 							});
 					if (context.profile() == WorkloadProfile.LATENCY) {
-						var contextualApi = client.getAsyncApi(context);
+						var contextualApi = asyncApi(context);
 						return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
-								.flatMapMany(data -> Mono.fromFuture(() -> contextualApi.deleteMultiAsync(
-										initialRequest.getTransactionOrUpdateId(),
-										initialRequest.getColumnId(),
-										data.stream()
-												.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
-												.toList(),
-										requestType))
+								.flatMapMany(data -> {
+									var keys = new ArrayList<Keys>(data.size());
+									for (var value : data) {
+										keys.add(mapKeys(value.getKeysList()));
+									}
+									return Mono.fromFuture(() -> contextualApi.deleteMultiAsync(
+											initialRequest.getTransactionOrUpdateId(),
+											initialRequest.getColumnId(),
+											keys,
+											requestType))
 										.flatMapMany(Flux::fromIterable)
-										.map(mapper))
+										.map(mapper);
+								})
 								.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 					}
-					var contextualApi = client.getSyncApi(context);
+					var contextualApi = syncApi(context);
 					return dataFlux
 							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 							.map(data -> mapper.apply(contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
-									mapKeys(data.getKeysCount(), data::getKeys),
+									mapKeys(data.getKeysList()),
 									requestType)))
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 				} else {
@@ -1283,7 +1391,7 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				var merged = contextualApi.merge(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						mapKeys(request.getData().getKeysList()),
 						toBuf(request.getData().getValue()),
 						RequestType.merged());
 				return Merged.newBuilder()
@@ -1356,30 +1464,31 @@ public class GrpcServer extends Server {
 								return mergeRequest.getData();
 							});
 					if (context.profile() == WorkloadProfile.LATENCY) {
-						var contextualApi = client.getAsyncApi(context);
+						var contextualApi = asyncApi(context);
 						return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes,
 								"mergeMultiGetMerged")
-								.flatMapMany(data -> Mono.fromFuture(() -> contextualApi.mergeMultiAsync(
-										initialRequest.getTransactionOrUpdateId(),
-										initialRequest.getColumnId(),
-										data.stream()
-												.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
-												.toList(),
-										data.stream().map(value -> toBuf(value.getValue())).toList(),
-										RequestType.merged()))
+								.flatMapMany(data -> {
+									var batch = mapKVBatch(data);
+									return Mono.fromFuture(() -> contextualApi.mergeMultiAsync(
+											initialRequest.getTransactionOrUpdateId(),
+											initialRequest.getColumnId(),
+											batch.keys(),
+											batch.values(),
+											RequestType.merged()))
 										.flatMapMany(Flux::fromIterable)
 										.map(merged -> Merged.newBuilder()
 												.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
-												.build()))
+												.build());
+								})
 								.onErrorMap(ex -> this.handleError(ex).asRuntimeException());
 					}
-					var contextualApi = client.getSyncApi(context);
+					var contextualApi = syncApi(context);
 					return dataFlux
 							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 							.map(data -> {
 								var merged = contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 										initialRequest.getColumnId(),
-										mapKeys(data.getKeysCount(), data::getKeys),
+										mapKeys(data.getKeysList()),
 										toBuf(data.getValue()),
 										RequestType.merged());
 								return Merged.newBuilder()
@@ -1398,28 +1507,29 @@ public class GrpcServer extends Server {
 				Flux<KV> dataFlux, String requestName) {
 			var context = mapRequestContext(initialRequest.getContext());
 			if (context.profile() == WorkloadProfile.LATENCY) {
-				var contextualApi = client.getAsyncApi(context);
+				var contextualApi = asyncApi(context);
 				return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
-						.flatMap(data -> Mono.fromFuture(() -> contextualApi.mergeMultiAsync(
-								initialRequest.getTransactionOrUpdateId(),
-								initialRequest.getColumnId(),
-								data.stream()
-										.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
-										.toList(),
-								data.stream().map(value -> toBuf(value.getValue())).toList(),
-								new RequestNothing<>())))
+						.flatMap(data -> {
+							var batch = mapKVBatch(data);
+							return Mono.fromFuture(() -> contextualApi.mergeMultiAsync(
+									initialRequest.getTransactionOrUpdateId(),
+									initialRequest.getColumnId(),
+									batch.keys(),
+									batch.values(),
+									RequestType.none()));
+						})
 						.thenReturn(Empty.getDefaultInstance())
 						.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
 			}
-			var contextualApi = client.getSyncApi(context);
+			var contextualApi = syncApi(context);
 			return dataFlux
 					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 					.doOnNext(data -> {
 						contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
-								mapKeys(data.getKeysCount(), data::getKeys),
+								mapKeys(data.getKeysList()),
 								toBuf(data.getValue()),
-								new RequestNothing<>());
+								RequestType.none());
 					})
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
@@ -1485,7 +1595,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Flux<Previous> putMultiGetPrevious(Flux<PutMultiRequest> request) {
-			return putMultiResponseFlux(request, "putMultiGetPrevious", new RequestPrevious<>(), previous -> {
+			return putMultiResponseFlux(request, "putMultiGetPrevious", RequestType.previous(), previous -> {
 				var builder = Previous.newBuilder();
 				if (previous != null) {
 					builder.setPrevious(Utils.toByteString(previous));
@@ -1496,7 +1606,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Flux<Delta> putMultiGetDelta(Flux<PutMultiRequest> request) {
-			return putMultiResponseFlux(request, "putMultiGetDelta", new RequestDelta<>(), delta -> {
+			return putMultiResponseFlux(request, "putMultiGetDelta", RequestType.delta(), delta -> {
 				var builder = Delta.newBuilder();
 				if (delta.previous() != null) {
 					builder.setPrevious(Utils.toByteString(delta.previous()));
@@ -1512,7 +1622,7 @@ public class GrpcServer extends Server {
 		public Flux<Changed> putMultiGetChanged(Flux<PutMultiRequest> request) {
 			return putMultiResponseFlux(request,
 					"putMultiGetChanged",
-					new RequestChanged<>(),
+					RequestType.changed(),
 					changed -> Changed.newBuilder().setChanged(changed).build());
 		}
 
@@ -1520,7 +1630,7 @@ public class GrpcServer extends Server {
 		public Flux<PreviousPresence> putMultiGetPreviousPresence(Flux<PutMultiRequest> request) {
 			return putMultiResponseFlux(request,
 					"putMultiGetPreviousPresence",
-					new RequestPreviousPresence<>(),
+					RequestType.previousPresence(),
 					present -> PreviousPresence.newBuilder().setPresent(present).build());
 		}
 
@@ -1547,26 +1657,27 @@ public class GrpcServer extends Server {
 								return putRequest.getData();
 							});
 					if (context.profile() == WorkloadProfile.LATENCY) {
-						var contextualApi = client.getAsyncApi(context);
+						var contextualApi = asyncApi(context);
 						return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
-								.flatMapMany(data -> Mono.fromFuture(() -> contextualApi.putMultiAsync(
-										initialRequest.getTransactionOrUpdateId(),
-										initialRequest.getColumnId(),
-										data.stream()
-												.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
-												.toList(),
-										data.stream().map(value -> toBuf(value.getValue())).toList(),
-										requestType))
+								.flatMapMany(data -> {
+									var batch = mapKVBatch(data);
+									return Mono.fromFuture(() -> contextualApi.putMultiAsync(
+											initialRequest.getTransactionOrUpdateId(),
+											initialRequest.getColumnId(),
+											batch.keys(),
+											batch.values(),
+											requestType))
 										.flatMapMany(Flux::fromIterable)
-										.map(mapper))
+										.map(mapper);
+								})
 								.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 					}
-					var contextualApi = client.getSyncApi(context);
+					var contextualApi = syncApi(context);
 					return dataFlux
 							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 							.map(data -> mapper.apply(contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
-									mapKeys(data.getKeysCount(), data::getKeys),
+									mapKeys(data.getKeysList()),
 									toBuf(data.getValue()),
 									requestType)))
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
@@ -1581,28 +1692,29 @@ public class GrpcServer extends Server {
 				Flux<KV> dataFlux, String requestName) {
 			var context = mapRequestContext(initialRequest.getContext());
 			if (context.profile() == WorkloadProfile.LATENCY) {
-				var contextualApi = client.getAsyncApi(context);
+				var contextualApi = asyncApi(context);
 				return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
-						.flatMap(data -> Mono.fromFuture(() -> contextualApi.putMultiAsync(
-								initialRequest.getTransactionOrUpdateId(),
-								initialRequest.getColumnId(),
-								data.stream()
-										.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
-										.toList(),
-								data.stream().map(value -> toBuf(value.getValue())).toList(),
-								new RequestNothing<>())))
+						.flatMap(data -> {
+							var batch = mapKVBatch(data);
+							return Mono.fromFuture(() -> contextualApi.putMultiAsync(
+									initialRequest.getTransactionOrUpdateId(),
+									initialRequest.getColumnId(),
+									batch.keys(),
+									batch.values(),
+									RequestType.none()));
+						})
 						.thenReturn(Empty.getDefaultInstance())
 						.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
 			}
-			var contextualApi = client.getSyncApi(context);
+			var contextualApi = syncApi(context);
 			return dataFlux
 					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
 					.doOnNext(data -> {
 						contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
-								mapKeys(data.getKeysCount(), data::getKeys),
+								mapKeys(data.getKeysList()),
 								toBuf(data.getValue()),
-								new RequestNothing<>());
+								RequestType.none());
 					})
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
@@ -1613,30 +1725,32 @@ public class GrpcServer extends Server {
 				String requestName) {
 			var context = mapRequestContext(initialRequest.getContext());
 			if (context.profile() == WorkloadProfile.LATENCY) {
-				var contextualApi = client.getAsyncApi(context);
+				var contextualApi = asyncApi(context);
 				return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
-						.flatMap(data -> Mono.fromFuture(() -> contextualApi.putMultiAsync(
-								initialRequest.getTransactionOrUpdateId(),
-								initialRequest.getColumnId(),
-								data.stream()
-										.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
-										.toList(),
-								data.stream().map(value -> toBuf(value.getValue())).toList(),
-								RequestType.ensure())))
+						.flatMap(data -> {
+							var batch = mapKVBatch(data);
+							return Mono.fromFuture(() -> contextualApi.putMultiAsync(
+									initialRequest.getTransactionOrUpdateId(),
+									initialRequest.getColumnId(),
+									batch.keys(),
+									batch.values(),
+									RequestType.ensure()));
+						})
 						.thenReturn(Empty.getDefaultInstance())
 						.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
 			}
-			var contextualApi = client.getSyncApi(context);
+			var contextualApi = syncApi(context);
 			return dataFlux
 					.buffer(WRITE_ELISION_MULTI_STEP_SIZE)
 					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
-					.doOnNext(data -> contextualApi.putMulti(initialRequest.getTransactionOrUpdateId(),
-							initialRequest.getColumnId(),
-							data.stream()
-									.map(value -> mapKeys(value.getKeysCount(), value::getKeys))
-									.toList(),
-							data.stream().map(value -> toBuf(value.getValue())).toList(),
-							RequestType.ensure()))
+					.doOnNext(data -> {
+						var batch = mapKVBatch(data);
+						contextualApi.putMulti(initialRequest.getTransactionOrUpdateId(),
+								initialRequest.getColumnId(),
+								batch.keys(),
+								batch.values(),
+								RequestType.ensure());
+					})
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 					.then(Mono.just(Empty.getDefaultInstance()));
 		}
@@ -1710,9 +1824,9 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				var prev = contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						mapKeys(request.getData().getKeysList()),
 						toBuf(request.getData().getValue()),
-						new RequestPrevious<>()
+						RequestType.previous()
 				);
 				var prevBuilder = Previous.newBuilder();
 				if (prev != null) {
@@ -1727,9 +1841,9 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				var delta = contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						mapKeys(request.getData().getKeysList()),
 						toBuf(request.getData().getValue()),
-						new RequestDelta<>()
+						RequestType.delta()
 				);
 				var deltaBuilder = Delta.newBuilder();
 				if (delta.previous() != null) {
@@ -1747,9 +1861,9 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				var changed = contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						mapKeys(request.getData().getKeysList()),
 						toBuf(request.getData().getValue()),
-						new RequestChanged<>()
+						RequestType.changed()
 				);
 				return Changed.newBuilder().setChanged(changed).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("putGetChanged", request));
@@ -1760,9 +1874,9 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				var present = contextualApi.put(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getData().getKeysCount(), request.getData()::getKeys),
+						mapKeys(request.getData().getKeysList()),
 						toBuf(request.getData().getValue()),
-						new RequestPreviousPresence<>()
+						RequestType.previousPresence()
 				);
 				return PreviousPresence.newBuilder().setPresent(present).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("putGetPreviousPresence", request));
@@ -1773,8 +1887,8 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				var prev = contextualApi.delete(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestPrevious<>()
+						mapKeys(request.getKeysList()),
+						RequestType.previous()
 				);
 				var prevBuilder = Previous.newBuilder();
 				if (prev != null) {
@@ -1789,8 +1903,8 @@ public class GrpcServer extends Server {
 			return executeWrite(request.getContext(), contextualApi -> {
 				var present = contextualApi.delete(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestPreviousPresence<>()
+						mapKeys(request.getKeysList()),
+						RequestType.previousPresence()
 				);
 				return PreviousPresence.newBuilder().setPresent(present).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("deleteGetPreviousPresence", request));
@@ -1801,8 +1915,8 @@ public class GrpcServer extends Server {
 			return executeSync(request.getContext(), OperationFamily.POINT_LOOKUP, contextualApi -> {
 				var current = contextualApi.get(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestCurrent<>()
+						mapKeys(request.getKeysList()),
+						RequestType.current()
 				);
 				var responseBuilder = GetResponse.newBuilder();
 				if (current != null) {
@@ -1839,10 +1953,10 @@ public class GrpcServer extends Server {
 				}
 			}
 
-			Buf current = client.getSyncApi(context).get(request.getTransactionOrUpdateId(),
+			Buf current = syncApi(context).get(request.getTransactionOrUpdateId(),
 					request.getColumnId(),
 					keys,
-					new RequestCurrent<>());
+					RequestType.current());
 			return current != null
 					? new FastGetResponse(true, current, false, null)
 					: new FastGetResponse(false, null, false, null);
@@ -1853,8 +1967,8 @@ public class GrpcServer extends Server {
 			return executeSync(request.getContext(), OperationFamily.POINT_LOOKUP, contextualApi -> {
 				var forUpdate = contextualApi.get(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestForUpdate<>()
+						mapKeys(request.getKeysList()),
+						RequestType.forUpdate()
 				);
 				var responseBuilder = UpdateBegin.newBuilder();
 				responseBuilder.setUpdateId(forUpdate.updateId());
@@ -1870,8 +1984,8 @@ public class GrpcServer extends Server {
 			return executeSync(request.getContext(), OperationFamily.POINT_LOOKUP, contextualApi -> {
 				var exists = contextualApi.get(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
-						mapKeys(request.getKeysCount(), request::getKeys),
-						new RequestExists<>()
+						mapKeys(request.getKeysList()),
+						RequestType.exists()
 				);
 				return PreviousPresence.newBuilder().setPresent(exists).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("exists", request));
@@ -1882,8 +1996,8 @@ public class GrpcServer extends Server {
 			return executeSync(request.getContext(), OperationFamily.BOUNDARY_SEEK, contextualApi -> {
 				var iteratorId = contextualApi.openIterator(request.getTransactionId(),
 						request.getColumnId(),
-						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+						mapKeys(request.getStartKeysInclusiveList()),
+						mapKeys(request.getEndKeysExclusiveList()),
 						request.getReverse(),
 						request.getTimeoutMs()
 				);
@@ -1907,7 +2021,7 @@ public class GrpcServer extends Server {
 		public Mono<Empty> seekTo(SeekToRequest request) {
 			return withIteratorLease(request.getIterationId(), () -> executeCompositeRead(
 					request.getContext(), OperationFamily.BOUNDARY_SEEK, contextualApi -> {
-				contextualApi.seekTo(request.getIterationId(), mapKeys(request.getKeysCount(), request::getKeys));
+				contextualApi.seekTo(request.getIterationId(), mapKeys(request.getKeysList()));
 				return Empty.getDefaultInstance();
 			})).transform(this.onErrorMapMonoWithRequestInfo("seekTo", request));
 		}
@@ -1915,7 +2029,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Empty> subsequent(SubsequentRequest request) {
 			return validateIteratorCounts(request)
-					.then(validateSubsequentCommand(request, new RequestExists<>()))
+					.then(validateSubsequentCommand(request, RequestType.exists()))
 					.then(withIteratorLease(request.getIterationId(), () -> {
 						if (requiresCooperativeIteratorContinuation(request)) {
 							return fromCancellableIteratorFuture(() -> asyncApi(request.getContext()).subsequentAsync(
@@ -1935,7 +2049,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<PreviousPresence> subsequentExists(SubsequentRequest request) {
 			return validateIteratorCounts(request)
-					.then(validateSubsequentCommand(request, new RequestExists<>()))
+					.then(validateSubsequentCommand(request, RequestType.exists()))
 					.then(withIteratorLease(request.getIterationId(), () -> {
 						if (requiresCooperativeIteratorContinuation(request)) {
 							return fromCancellableIteratorFuture(() -> asyncApi(request.getContext()).subsequentAsync(
@@ -1949,7 +2063,7 @@ public class GrpcServer extends Server {
 								.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_ADVANCE_STEP_SIZE))
 								.concatMap(take -> executeCompositeRead(request.getContext(), OperationFamily.RANGE_PAGE,
 										contextualApi -> contextualApi.subsequent(
-												request.getIterationId(), 0, take, new RequestExists<>())), 1)
+												request.getIterationId(), 0, take, RequestType.exists())), 1)
 								.takeUntil(found -> !found)
 								.reduce(false, (found, pageFound) -> found || pageFound)
 								.map(found -> PreviousPresence.newBuilder().setPresent(found).build());
@@ -1960,7 +2074,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Flux<KV> subsequentMultiGet(SubsequentRequest request) {
 			return validateIteratorCounts(request)
-					.then(validateSubsequentCommand(request, new RequestMulti<>()))
+					.then(validateSubsequentCommand(request, RequestType.multi()))
 					.thenMany(withIteratorFluxLease(request.getIterationId(), () -> {
 						if (requiresCooperativeIteratorContinuation(request)) {
 							return cooperativeIteratorMulti(request);
@@ -1969,7 +2083,7 @@ public class GrpcServer extends Server {
 								.thenMany(iteratorChunks(request.getTakeCount(), ITERATOR_VALUE_PAGE_SIZE)
 										.concatMap(take -> executeCompositeRead(request.getContext(), OperationFamily.RANGE_PAGE,
 												contextualApi -> contextualApi.subsequent(
-														request.getIterationId(), 0, take, new RequestMulti<>())), 1)
+												request.getIterationId(), 0, take, RequestType.multi())), 1)
 										.takeUntil(values -> values.size() < ITERATOR_VALUE_PAGE_SIZE)
 										.concatMapIterable(Function.identity(), 1)
 										.map(entry -> KV.newBuilder()
@@ -1985,8 +2099,8 @@ public class GrpcServer extends Server {
 			return Mono.defer(() -> fromCancellableFuture(asyncApi(request.getContext()).reduceRangeAsync(
 						request.getTransactionId(),
 						request.getColumnId(),
-						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+						mapKeys(request.getStartKeysInclusiveList()),
+						mapKeys(request.getEndKeysExclusiveList()),
 						request.getReverse(),
 						RequestType.firstAndLast(),
 						effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline))))
@@ -2008,8 +2122,8 @@ public class GrpcServer extends Server {
 			return Mono.defer(() -> fromCancellableFuture(asyncApi(request.getContext()).reduceRangeAsync(
 						request.getTransactionId(),
 						request.getColumnId(),
-						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+						mapKeys(request.getStartKeysInclusiveList()),
+						mapKeys(request.getEndKeysExclusiveList()),
 						request.getReverse(),
 						RequestType.entriesCount(),
 						effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline))))
@@ -2060,13 +2174,13 @@ public class GrpcServer extends Server {
 							"Unknown range request type: " + request.getRequestTypeValue());
 				};
 				var resumeAfter = request.hasResumeAfter()
-						? mapKeys(request.getResumeAfter().getKeysCount(), request.getResumeAfter()::getKeys)
+						? mapKeys(request.getResumeAfter().getKeysList())
 						: null;
 				return fromCancellableFuture(asyncApi(request.getContext()).getRangePageAsync(
 						request.getTransactionId(),
 						request.getColumnId(),
-						mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-						mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+						mapKeys(request.getStartKeysInclusiveList()),
+						mapKeys(request.getEndKeysExclusiveList()),
 						request.getReverse(),
 						resumeAfter,
 						requestType,
@@ -2074,13 +2188,16 @@ public class GrpcServer extends Server {
 						budget));
 			}).map(page -> {
 				var response = it.cavallium.rockserver.core.common.api.proto.RangePage.newBuilder()
-						.addAllItems(page.items().stream().map(GrpcServerImpl::unmapKVHeap).toList())
 						.setHasMore(page.hasMore());
+				for (var item : page.items()) {
+					response.addItems(unmapKVHeap(item));
+				}
 				if (page.resumeAfter() != null) {
-					response.setResumeAfter(RangeKey.newBuilder()
-							.addAllKeys(Arrays.stream(page.resumeAfter().keys())
-									.map(Utils::toByteString)
-									.toList()));
+					var resumeAfter = RangeKey.newBuilder();
+					for (var key : page.resumeAfter().keys()) {
+						resumeAfter.addKeys(Utils.toByteString(key));
+					}
+					response.setResumeAfter(resumeAfter);
 				}
 				return response.build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("getRangePage", request));
@@ -2094,8 +2211,8 @@ public class GrpcServer extends Server {
 			return Flux.defer(() -> Flux
 					.from(asyncApi(request.getContext()).getRangeAsync(request.getTransactionId(),
 							request.getColumnId(),
-							mapKeys(request.getStartKeysInclusiveCount(), request::getStartKeysInclusive),
-							mapKeys(request.getEndKeysExclusiveCount(), request::getEndKeysExclusive),
+							mapKeys(request.getStartKeysInclusiveList()),
+							mapKeys(request.getEndKeysExclusiveList()),
 							request.getReverse(),
 							requestType,
 							effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline))))
@@ -2278,7 +2395,7 @@ public class GrpcServer extends Server {
 				var context = mapRequestContext(wireContext);
 				var command = captureCommand(operation);
 				var profile = preAdmit(context, family, command);
-				return executeScheduled(() -> operation.apply(client.getSyncApi(context)),
+				return executeScheduled(() -> operation.apply(syncApi(context)),
 						scheduler.scheduler(profile, command.operationFamily(), context.deadlineEpochMillis()));
 			});
 		}
@@ -2293,7 +2410,7 @@ public class GrpcServer extends Server {
 				var context = mapRequestContext(wireContext);
 				var command = captureCommand(operation);
 				var profile = preAdmit(context, family, command);
-				return executeScheduled(() -> operation.apply(client.getSyncApi(context)),
+				return executeScheduled(() -> operation.apply(syncApi(context)),
 						scheduler.scheduler(profile, command.operationFamily(), context.deadlineEpochMillis()),
 						lateSuccessCleanup,
 						lateSuccessCleanupScheduler);
@@ -2370,7 +2487,7 @@ public class GrpcServer extends Server {
 							request.getTakeCount(),
 							RequestType.multi());
 					profile = preAdmit(requestContext, OperationFamily.RANGE_PAGE, command);
-					contextualApi = client.getSyncApi(requestContext);
+					contextualApi = syncApi(requestContext);
 					workloadExecutor = scheduler.executor(
 							profile, command.operationFamily(), requestContext.deadlineEpochMillis());
 				} catch (Throwable failure) {
@@ -2440,7 +2557,7 @@ public class GrpcServer extends Server {
 			return iteratorChunks(count, ITERATOR_ADVANCE_STEP_SIZE)
 					.concatMap(step -> executeCompositeRead(context, OperationFamily.RANGE_PAGE,
 							contextualApi -> contextualApi.subsequent(
-									iteratorId, 0, step, new RequestExists<>())), 1)
+									iteratorId, 0, step, RequestType.exists())), 1)
 					.takeUntil(found -> !found)
 					.then();
 		}
@@ -2490,9 +2607,18 @@ public class GrpcServer extends Server {
 
 			private static final int OPERATION_TERMINATED = 1 << 31;
 			private static final int ACTIVE_TASKS_MASK = Integer.MAX_VALUE;
+			private static final VarHandle STATE;
+
+			static {
+				try {
+					STATE = MethodHandles.lookup().findVarHandle(IteratorOperationLease.class, "state", int.class);
+				} catch (NoSuchFieldException | IllegalAccessException failure) {
+					throw new ExceptionInInitializerError(failure);
+				}
+			}
 
 			private final long iteratorId;
-			private final AtomicInteger state = new AtomicInteger();
+			private volatile int state;
 
 			private IteratorOperationLease(long iteratorId) {
 				this.iteratorId = iteratorId;
@@ -2500,14 +2626,14 @@ public class GrpcServer extends Server {
 
 			private boolean registerTask() {
 				while (true) {
-					int current = state.get();
+					int current = state;
 					if ((current & OPERATION_TERMINATED) != 0) {
 						return false;
 					}
 					if ((current & ACTIVE_TASKS_MASK) == ACTIVE_TASKS_MASK) {
 						throw new IllegalStateException("Too many active iterator tasks");
 					}
-					if (state.compareAndSet(current, current + 1)) {
+					if (STATE.compareAndSet(this, current, current + 1)) {
 						return true;
 					}
 				}
@@ -2515,13 +2641,13 @@ public class GrpcServer extends Server {
 
 			private void taskTerminated() {
 				while (true) {
-					int current = state.get();
+					int current = state;
 					int activeTasks = current & ACTIVE_TASKS_MASK;
 					if (activeTasks == 0) {
 						throw new IllegalStateException("Iterator task accounting underflow");
 					}
 					int updated = (current & OPERATION_TERMINATED) | (activeTasks - 1);
-					if (state.compareAndSet(current, updated)) {
+					if (STATE.compareAndSet(this, current, updated)) {
 						if (updated == OPERATION_TERMINATED) {
 							iteratorOperations.remove(iteratorId, this);
 						}
@@ -2532,12 +2658,12 @@ public class GrpcServer extends Server {
 
 			private void operationTerminated() {
 				while (true) {
-					int current = state.get();
+					int current = state;
 					if ((current & OPERATION_TERMINATED) != 0) {
 						return;
 					}
 					int updated = current | OPERATION_TERMINATED;
-					if (state.compareAndSet(current, updated)) {
+					if (STATE.compareAndSet(this, current, updated)) {
 						if (updated == OPERATION_TERMINATED) {
 							iteratorOperations.remove(iteratorId, this);
 						}
@@ -2565,14 +2691,27 @@ public class GrpcServer extends Server {
 		private final class CooperativeIteratorMultiStream
 				implements RWScheduler.CooperativeCompletionTask, Disposable {
 
+			private static final VarHandle DEMAND;
+			private static final VarHandle TERMINATED;
+
+			static {
+				try {
+					var lookup = MethodHandles.lookup();
+					DEMAND = lookup.findVarHandle(CooperativeIteratorMultiStream.class, "demand", long.class);
+					TERMINATED = lookup.findVarHandle(
+							CooperativeIteratorMultiStream.class, "terminated", boolean.class);
+				} catch (NoSuchFieldException | IllegalAccessException failure) {
+					throw new ExceptionInInitializerError(failure);
+				}
+			}
+
 			private final long iteratorId;
 			private final RocksDBSyncAPI contextualApi;
 			private final IteratorOperationLease iteratorLease;
 			private final FluxSink<KV> sink;
 			private final Consumer<Throwable> lateErrors;
-			private final AtomicLong demand = new AtomicLong();
-			private final AtomicBoolean terminated = new AtomicBoolean();
-			private final Object completionLock = new Object();
+			private volatile long demand;
+			private volatile boolean terminated;
 			private volatile boolean ready;
 			private volatile boolean cancellationRequested;
 			private volatile @Nullable RWScheduler.CooperativeHandle handle;
@@ -2602,10 +2741,10 @@ public class GrpcServer extends Server {
 			private void attach(RWScheduler.CooperativeHandle handle) {
 				boolean cancel;
 				boolean resume;
-				synchronized (completionLock) {
+				synchronized (this) {
 					this.handle = Objects.requireNonNull(handle, "handle");
-					cancel = cancellationRequested || terminated.get();
-					resume = ready && (remainingTake == 0L || demand.get() > 0L);
+					cancel = cancellationRequested || terminated;
+					resume = ready && (remainingTake == 0L || demand > 0L);
 				}
 				if (cancel) {
 					handle.cancel();
@@ -2618,14 +2757,14 @@ public class GrpcServer extends Server {
 				RWScheduler.CooperativeHandle currentHandle;
 				boolean cancel;
 				boolean resume;
-				synchronized (completionLock) {
-					if (terminated.get()) {
+				synchronized (this) {
+					if (terminated) {
 						return;
 					}
 					ready = true;
 					currentHandle = Objects.requireNonNull(handle, "handle");
 					cancel = cancellationRequested;
-					resume = remainingTake == 0L || demand.get() > 0L;
+					resume = remainingTake == 0L || demand > 0L;
 				}
 				if (cancel) {
 					currentHandle.cancel();
@@ -2637,7 +2776,7 @@ public class GrpcServer extends Server {
 			@Override
 			public RWScheduler.CooperativeResult runCooperatively(
 					RWScheduler.CooperativeContext context) {
-				if (terminated.get()) {
+				if (terminated) {
 					return RWScheduler.CooperativeResult.COMPLETE;
 				}
 				if (!ready) {
@@ -2660,7 +2799,7 @@ public class GrpcServer extends Server {
 								prepareCompletion();
 								return RWScheduler.CooperativeResult.COMPLETE;
 							}
-							if (demand.get() == 0L) {
+							if (demand == 0L) {
 								return RWScheduler.CooperativeResult.PARK;
 							}
 							if (context.preemptionRequested()) {
@@ -2673,7 +2812,7 @@ public class GrpcServer extends Server {
 							prepareCompletion();
 							return RWScheduler.CooperativeResult.COMPLETE;
 						}
-						if (remainingTake > 0L && demand.get() == 0L) {
+						if (remainingTake > 0L && demand == 0L) {
 							return RWScheduler.CooperativeResult.PARK;
 						}
 
@@ -2724,7 +2863,7 @@ public class GrpcServer extends Server {
 			private boolean emitPage() {
 				var currentPage = Objects.requireNonNull(page, "page");
 				while (pageIndex < currentPage.size()) {
-					if (cancellationRequested || demand.get() == 0L) {
+					if (cancellationRequested || demand == 0L) {
 						return false;
 					}
 					var value = currentPage.get(pageIndex++);
@@ -2740,30 +2879,30 @@ public class GrpcServer extends Server {
 
 			private void producedOne() {
 				while (true) {
-					long current = demand.get();
+					long current = demand;
 					if (current == Long.MAX_VALUE) {
 						return;
 					}
 					if (current <= 0L) {
 						throw new IllegalStateException("Iterator value produced without downstream demand");
 					}
-					if (demand.compareAndSet(current, current - 1L)) {
+					if (DEMAND.compareAndSet(this, current, current - 1L)) {
 						return;
 					}
 				}
 			}
 
 			private void request(long requested) {
-				if (requested <= 0L || terminated.get()) {
+				if (requested <= 0L || terminated) {
 					return;
 				}
 				while (true) {
-					long current = demand.get();
+					long current = demand;
 					long updated = current + requested;
 					if (updated < 0L) {
 						updated = Long.MAX_VALUE;
 					}
-					if (demand.compareAndSet(current, updated)) {
+					if (DEMAND.compareAndSet(this, current, updated)) {
 						break;
 					}
 				}
@@ -2774,7 +2913,7 @@ public class GrpcServer extends Server {
 			}
 
 			private void cancel() {
-				if (terminated.get()) {
+				if (terminated) {
 					return;
 				}
 				cancellationRequested = true;
@@ -2789,8 +2928,8 @@ public class GrpcServer extends Server {
 			}
 
 			private void prepareCompletion() {
-				synchronized (completionLock) {
-					if (terminated.get()) {
+				synchronized (this) {
+					if (terminated) {
 						return;
 					}
 					if (completionPrepared) {
@@ -2802,8 +2941,8 @@ public class GrpcServer extends Server {
 
 			@Override
 			public void completeCooperatively() {
-				synchronized (completionLock) {
-					if (terminated.get()) {
+				synchronized (this) {
+					if (terminated) {
 						return;
 					}
 					if (!completionPrepared) {
@@ -2820,7 +2959,7 @@ public class GrpcServer extends Server {
 			}
 
 			private void finish(@Nullable Throwable failure) {
-				if (!terminated.compareAndSet(false, true)) {
+				if (!TERMINATED.compareAndSet(this, false, true)) {
 					return;
 				}
 				page = null;
@@ -2844,7 +2983,7 @@ public class GrpcServer extends Server {
 
 			@Override
 			public boolean isDisposed() {
-				return terminated.get();
+				return terminated;
 			}
 		}
 
@@ -2854,26 +2993,35 @@ public class GrpcServer extends Server {
 			private static final int QUEUED = 0;
 			private static final int RUNNING = 1;
 			private static final int TERMINATED = 2;
+			private static final VarHandle STATE;
+
+			static {
+				try {
+					STATE = MethodHandles.lookup().findVarHandle(ScheduledTaskLifecycle.class, "state", int.class);
+				} catch (NoSuchFieldException | IllegalAccessException failure) {
+					throw new ExceptionInInitializerError(failure);
+				}
+			}
 
 			private final IteratorOperationLease iteratorLease;
-			private final AtomicInteger state = new AtomicInteger(QUEUED);
+			private volatile int state = QUEUED;
 
 			private ScheduledTaskLifecycle(IteratorOperationLease iteratorLease) {
 				this.iteratorLease = iteratorLease;
 			}
 
 			private boolean start() {
-				return state.compareAndSet(QUEUED, RUNNING);
+				return STATE.compareAndSet(this, QUEUED, RUNNING);
 			}
 
 			private void cancelBeforeStart() {
-				if (state.compareAndSet(QUEUED, TERMINATED)) {
+				if (STATE.compareAndSet(this, QUEUED, TERMINATED)) {
 					taskTerminated();
 				}
 			}
 
 			private void runningTaskTerminated() {
-				if (!state.compareAndSet(RUNNING, TERMINATED)) {
+				if (!STATE.compareAndSet(this, RUNNING, TERMINATED)) {
 					throw new IllegalStateException("Scheduled task did not terminate from running state");
 				}
 				taskTerminated();
@@ -2925,49 +3073,222 @@ public class GrpcServer extends Server {
 					iteratorLease.taskTerminated();
 					return Mono.error(failure);
 				}
-				return bridgeCancellableFuture(future, iteratorLease::taskTerminated);
+				return bridgeCancellableFuture(future, iteratorLease);
 			});
 		}
 
 		private <T> Mono<T> bridgeCancellableFuture(CompletableFuture<T> future,
-				@Nullable Runnable terminalAction) {
+				@Nullable IteratorOperationLease terminalLease) {
 			return Mono.create(sink -> {
-				var emissionLock = new Object();
-				var cancelled = new AtomicBoolean();
-				sink.onCancel(() -> {
-					synchronized (emissionLock) {
-						cancelled.set(true);
-					}
-					future.cancel(true);
-				});
-				future.whenComplete((value, failure) -> {
-					try {
-						Throwable error = failure instanceof CompletionException completionError
-								&& completionError.getCause() != null
-								? completionError.getCause()
-								: failure;
-						boolean late;
-						synchronized (emissionLock) {
-							late = cancelled.get();
-							if (!late) {
-								if (error != null) {
-									sink.error(error);
-								} else {
-									sink.success(value);
-								}
+				var bridge = new CancellableFutureBridge<>(future, sink, terminalLease);
+				sink.onCancel(bridge);
+				future.whenComplete(bridge);
+			});
+		}
+
+		private final class CancellableFutureBridge<T> implements Disposable, BiConsumer<T, Throwable> {
+
+			private final CompletableFuture<T> future;
+			private final reactor.core.publisher.MonoSink<T> sink;
+			private final @Nullable IteratorOperationLease terminalLease;
+			private boolean cancelled;
+
+			private CancellableFutureBridge(CompletableFuture<T> future,
+					reactor.core.publisher.MonoSink<T> sink,
+					@Nullable IteratorOperationLease terminalLease) {
+				this.future = future;
+				this.sink = sink;
+				this.terminalLease = terminalLease;
+			}
+
+			@Override
+			public void dispose() {
+				synchronized (this) {
+					cancelled = true;
+				}
+				future.cancel(true);
+			}
+
+			@Override
+			public void accept(T value, Throwable failure) {
+				try {
+					Throwable error = failure instanceof CompletionException completionError
+							&& completionError.getCause() != null
+							? completionError.getCause()
+							: failure;
+					boolean late;
+					synchronized (this) {
+						late = cancelled;
+						if (!late) {
+							if (error != null) {
+								sink.error(error);
+							} else {
+								sink.success(value);
 							}
 						}
-						if (late && error != null
-								&& !(error instanceof java.util.concurrent.CancellationException)) {
-							lateErrorHandler(sink.contextView()).accept(error);
-						}
-					} finally {
-						if (terminalAction != null) {
-							terminalAction.run();
+					}
+					if (late && error != null
+							&& !(error instanceof java.util.concurrent.CancellationException)) {
+						lateErrorHandler(sink.contextView()).accept(error);
+					}
+				} finally {
+					if (terminalLease != null) {
+						terminalLease.taskTerminated();
+					}
+				}
+			}
+		}
+
+		private final class ScheduledCall<T> implements Disposable, Runnable {
+
+			private final reactor.core.publisher.MonoSink<T> sink;
+			private final Callable<T> callable;
+			private final reactor.core.scheduler.Scheduler executionScheduler;
+			private final @Nullable Consumer<T> lateSuccessCleanup;
+			private final @Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler;
+			private final @Nullable ScheduledTaskLifecycle taskLifecycle;
+			private final boolean mustComplete;
+			private final @Nullable String protectedOperation;
+			private @Nullable Disposable task;
+			private boolean cancelled;
+
+			private ScheduledCall(reactor.core.publisher.MonoSink<T> sink,
+					Callable<T> callable,
+					reactor.core.scheduler.Scheduler executionScheduler,
+					@Nullable Consumer<T> lateSuccessCleanup,
+					@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler,
+					@Nullable ScheduledTaskLifecycle taskLifecycle,
+					boolean mustComplete,
+					@Nullable String protectedOperation) {
+				this.sink = sink;
+				this.callable = callable;
+				this.executionScheduler = executionScheduler;
+				this.lateSuccessCleanup = lateSuccessCleanup;
+				this.lateSuccessCleanupScheduler = lateSuccessCleanupScheduler;
+				this.taskLifecycle = taskLifecycle;
+				this.mustComplete = mustComplete;
+				this.protectedOperation = protectedOperation;
+			}
+
+			private void schedule() {
+				final Disposable submitted;
+				try {
+					submitted = executionScheduler.schedule(this);
+				} catch (Throwable schedulingError) {
+					schedulingFailed(schedulingError);
+					return;
+				}
+				boolean disposeSubmitted;
+				synchronized (this) {
+					task = submitted;
+					disposeSubmitted = cancelled && !mustComplete;
+				}
+				if (disposeSubmitted) {
+					submitted.dispose();
+				}
+			}
+
+			@Override
+			public void dispose() {
+				final Disposable submitted;
+				synchronized (this) {
+					if (cancelled) {
+						return;
+					}
+					cancelled = true;
+					submitted = mustComplete ? null : task;
+				}
+				if (mustComplete) {
+					cancelledMustCompleteOperations.incrementAndGet();
+				} else {
+					if (taskLifecycle != null) {
+						taskLifecycle.cancelBeforeStart();
+					}
+					if (submitted != null) {
+						submitted.dispose();
+					}
+				}
+			}
+
+			@Override
+			public void run() {
+				if (taskLifecycle != null && !taskLifecycle.start()) {
+					return;
+				}
+				try {
+					var result = callable.call();
+					boolean lateSuccess;
+					synchronized (this) {
+						lateSuccess = cancelled;
+						if (!lateSuccess) {
+							sink.success(result);
 						}
 					}
-				});
-			});
+					if (lateSuccess && lateSuccessCleanup != null) {
+						runLateSuccessCleanup(result);
+					}
+				} catch (Throwable error) {
+					emitOrRecordLateError(error);
+				} finally {
+					if (taskLifecycle != null) {
+						taskLifecycle.runningTaskTerminated();
+					}
+					if (mustComplete) {
+						mustCompleteOperations.operationTerminated();
+					}
+				}
+			}
+
+			private void runLateSuccessCleanup(T result) {
+				Runnable cleanup = () -> {
+					try {
+						lateSuccessCleanup.accept(result);
+					} catch (Throwable cleanupError) {
+						lateErrorHandler(sink.contextView()).accept(cleanupError);
+					}
+				};
+				try {
+					if (lateSuccessCleanupScheduler != null) {
+						lateSuccessCleanupScheduler.schedule(cleanup);
+					} else {
+						cleanup.run();
+					}
+				} catch (Throwable schedulingError) {
+					LOG.debug("Late-success cleanup scheduler rejected the task; "
+							+ "running iterator cleanup inline", schedulingError);
+					cleanup.run();
+				}
+			}
+
+			private void schedulingFailed(Throwable schedulingError) {
+				if (taskLifecycle != null) {
+					taskLifecycle.cancelBeforeStart();
+				}
+				if (mustComplete) {
+					mustCompleteOperations.operationTerminated();
+				}
+				emitOrRecordLateError(schedulingError);
+			}
+
+			private void emitOrRecordLateError(Throwable error) {
+				boolean lateError;
+				synchronized (this) {
+					lateError = cancelled;
+					if (!lateError) {
+						sink.error(error);
+					}
+				}
+				if (lateError) {
+					if (mustComplete) {
+						recordLateProtectedOperationFailure(
+								Objects.requireNonNull(protectedOperation),
+								error,
+								sink.contextView());
+					} else {
+						lateErrorHandler(sink.contextView()).accept(error);
+					}
+				}
+			}
 		}
 
 		private <T> Mono<T> executeScheduled(Callable<T> callable, reactor.core.scheduler.Scheduler executionScheduler) {
@@ -3022,9 +3343,6 @@ public class GrpcServer extends Server {
 					taskLifecycle = null;
 				}
 				return Mono.<T>create(sink -> {
-					var emissionLock = new Object();
-					var cancelled = new AtomicBoolean();
-					var task = Disposables.swap();
 					boolean mustComplete = cancellationPolicy == ScheduledCancellationPolicy.MUST_COMPLETE;
 					if (mustComplete && !mustCompleteOperations.register()) {
 						if (taskLifecycle != null) {
@@ -3033,116 +3351,19 @@ public class GrpcServer extends Server {
 						sink.error(new RejectedExecutionException("gRPC server is shutting down"));
 						return;
 					}
-
-					// RocksDB JNI calls may keep running after interruption until their native deadline. Serialize
-					// cancellation with terminal delivery so a late native error is not emitted to an already-cancelled
-					// gRPC subscriber (which Reactor would otherwise report through onErrorDropped). Protected
-					// cleanup and CDC acknowledgement remain scheduled; cancellation only suppresses their response.
-					sink.onCancel(() -> {
-						boolean firstCancellation;
-						synchronized (emissionLock) {
-							firstCancellation = cancelled.compareAndSet(false, true);
-						}
-						if (!firstCancellation) {
-							return;
-						}
-						if (mustComplete) {
-							cancelledMustCompleteOperations.incrementAndGet();
-						}
-						if (!mustComplete) {
-							if (taskLifecycle != null) {
-								taskLifecycle.cancelBeforeStart();
-							}
-							task.dispose();
-						}
-					});
-
-					try {
-						task.replace(executionScheduler.schedule(() -> {
-							if (taskLifecycle != null && !taskLifecycle.start()) {
-								return;
-							}
-							try {
-								var result = callable.call();
-								boolean lateSuccess;
-								synchronized (emissionLock) {
-									lateSuccess = cancelled.get();
-									if (!lateSuccess) {
-										sink.success(result);
-									}
-								}
-								if (lateSuccess && lateSuccessCleanup != null) {
-									Runnable cleanup = () -> {
-										try {
-											lateSuccessCleanup.accept(result);
-										} catch (Throwable cleanupError) {
-											lateErrorHandler(sink.contextView()).accept(cleanupError);
-										}
-									};
-									try {
-										if (lateSuccessCleanupScheduler != null) {
-											lateSuccessCleanupScheduler.schedule(cleanup);
-										} else {
-											cleanup.run();
-										}
-									} catch (Throwable schedulingError) {
-										LOG.debug("Late-success cleanup scheduler rejected the task; "
-												+ "running iterator cleanup inline", schedulingError);
-										cleanup.run();
-									}
-								}
-							} catch (Throwable error) {
-								boolean lateError;
-								synchronized (emissionLock) {
-									lateError = cancelled.get();
-									if (!lateError) {
-										sink.error(error);
-									}
-								}
-								if (lateError) {
-									if (mustComplete) {
-										recordLateProtectedOperationFailure(
-												Objects.requireNonNull(protectedOperation),
-												error,
-												sink.contextView());
-									} else {
-										lateErrorHandler(sink.contextView()).accept(error);
-									}
-								}
-							} finally {
-								if (taskLifecycle != null) {
-									taskLifecycle.runningTaskTerminated();
-								}
-								if (mustComplete) {
-									mustCompleteOperations.operationTerminated();
-								}
-							}
-						}));
-					} catch (Throwable schedulingError) {
-						if (taskLifecycle != null) {
-							taskLifecycle.cancelBeforeStart();
-						}
-						if (mustComplete) {
-							mustCompleteOperations.operationTerminated();
-						}
-						boolean lateError;
-						synchronized (emissionLock) {
-							lateError = cancelled.get();
-							if (!lateError) {
-								sink.error(schedulingError);
-							}
-						}
-						if (lateError) {
-							if (mustComplete) {
-								recordLateProtectedOperationFailure(
-										Objects.requireNonNull(protectedOperation),
-										schedulingError,
-										sink.contextView());
-							} else {
-								lateErrorHandler(sink.contextView()).accept(schedulingError);
-							}
-						}
-					}
+					// RocksDB JNI calls may keep running after interruption until their native deadline. The
+					// lifecycle object serializes cancellation with terminal delivery and retains the submitted
+					// handle so cancellation before handle publication still removes queued work.
+					var scheduledCall = new ScheduledCall<>(sink,
+							callable,
+							executionScheduler,
+							lateSuccessCleanup,
+							lateSuccessCleanupScheduler,
+							taskLifecycle,
+							mustComplete,
+							protectedOperation);
+					sink.onCancel(scheduledCall);
+					scheduledCall.schedule();
 				});
 			});
 		}
@@ -3343,41 +3564,15 @@ public class GrpcServer extends Server {
 			return ex;
 		}
 
-		private static KV unmapKV(it.cavallium.rockserver.core.common.KV kv) {
-			if (kv == null) return null;
-			return KV.newBuilder()
-					.addAllKeys(unmapKeys(kv.keys()))
-					.setValue(unmapValue(kv.value()))
-					.build();
-		}
-
 		private static KV unmapKVHeap(it.cavallium.rockserver.core.common.KV kv) {
 			if (kv == null) return null;
-			return KV.newBuilder()
-					.addAllKeys(unmapKeysHeap(kv.keys()))
+			var result = KV.newBuilder();
+			for (@NotNull Buf key : kv.keys().keys()) {
+				result.addKeys(UnsafeByteOperations.unsafeWrap(toByteArray(key)));
+			}
+			return result
 					.setValue(unmapValueHeap(kv.value()))
 					.build();
-		}
-
-		private static List<ByteString> unmapKeys(@NotNull Keys keys) {
-			var result = new ArrayList<ByteString>(keys.keys().length);
-			for (@NotNull Buf key : keys.keys()) {
-				result.add(Utils.toByteString(key));
-			}
-			return result;
-		}
-
-		private static List<ByteString> unmapKeysHeap(@NotNull Keys keys) {
-			var result = new ArrayList<ByteString>(keys.keys().length);
-			for (@NotNull Buf key : keys.keys()) {
-				result.add(UnsafeByteOperations.unsafeWrap(toByteArray(key)));
-			}
-			return result;
-		}
-
-		private static ByteString unmapValue(@Nullable Buf value) {
-			if (value == null) return null;
-			return Utils.toByteString(value);
 		}
 
 		private static ByteString unmapValueHeap(@Nullable Buf value) {
@@ -3484,35 +3679,22 @@ public class GrpcServer extends Server {
 			return l;
 		}
 
-		private static Keys mapKeys(int count, Int2ObjectFunction<ByteString> keyGetterAt) {
-			var segments = new Buf[count];
-			for (int i = 0; i < count; i++) {
-				segments[i] = toBuf(keyGetterAt.apply(i));
+		private static Keys mapKeys(List<ByteString> wireKeys) {
+			var segments = new Buf[wireKeys.size()];
+			for (int i = 0; i < segments.length; i++) {
+				segments[i] = toBuf(wireKeys.get(i));
 			}
 			return new Keys(segments);
 		}
 
-		private static List<Keys> mapKeysKV(int count, Int2ObjectFunction<KV> keyGetterAt) {
-			var keys = new ArrayList<Keys>(count);
-			for (int i = 0; i < count; i++) {
-				var k = keyGetterAt.apply(i);
-				keys.add(mapKeys(k.getKeysCount(), k::getKeys));
+		private static KVBatch mapKVBatch(List<KV> entries) {
+			var keys = new ArrayList<Keys>(entries.size());
+			var values = new ArrayList<Buf>(entries.size());
+			for (var entry : entries) {
+				keys.add(mapKeys(entry.getKeysList()));
+				values.add(toBuf(entry.getValue()));
 			}
-			return keys;
-		}
-
-		private static List<Buf> mapValuesKV(int count, Int2ObjectFunction<KV> keyGetterAt) {
-			var keys = new ArrayList<Buf>(count);
-			for (int i = 0; i < count; i++) {
-				keys.add(toBuf(keyGetterAt.get(i).getValue()));
-			}
-			return keys;
-		}
-
-		private static KVBatch mapKVBatch(int count, Int2ObjectFunction<KV> getterAt) {
-			var kk = mapKeysKV(count, getterAt);
-			var vv = mapValuesKV(count, getterAt);
-			return new KVBatchRef(kk, vv);
+			return new KVBatchRef(keys, values);
 		}
 
 		private static Status handleError(Throwable ex) {
