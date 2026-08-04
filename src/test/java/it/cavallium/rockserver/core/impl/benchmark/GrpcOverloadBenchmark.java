@@ -1253,6 +1253,11 @@ public final class GrpcOverloadBenchmark {
 		int transactions = db.getOpenTransactionsCount();
 		int iterators = db.getOpenIteratorsCount();
 		int ranges = db.getActiveRangeCursorCount();
+		int retainedSnapshots = db.getRetainedRangeSnapshotCount();
+		int retainedPermits = db.getRetainedRangePermitCount();
+		int retainedWaiters = db.getRetainedRangeWaiterCount();
+		int cdcCursors = db.getActiveCdcPollCursorCount();
+		int existsMultiRequests = db.getActiveExistsMultiRequestCount();
 		int iteratorLeases = server.getActiveIteratorOperationLeaseCountForTesting();
 		SchedulerConservation schedulerConservation = schedulerConservation(scheduler);
 		boolean drained = totalQueued == 0
@@ -1261,6 +1266,11 @@ public final class GrpcOverloadBenchmark {
 				&& transactions == 0
 				&& iterators == 0
 				&& ranges == 0
+				&& retainedSnapshots == 0
+				&& retainedPermits == 0
+				&& retainedWaiters == 0
+				&& cdcCursors == 0
+				&& existsMultiRequests == 0
 				&& iteratorLeases == 0;
 		return new ResourceResult(foregroundQueued,
 				maintenanceQueued,
@@ -1272,6 +1282,11 @@ public final class GrpcOverloadBenchmark {
 				transactions,
 				iterators,
 				ranges,
+				retainedSnapshots,
+				retainedPermits,
+				retainedWaiters,
+				cdcCursors,
+				existsMultiRequests,
 				iteratorLeases,
 				TimeUnit.NANOSECONDS.toMillis(drainNanos),
 				drained,
@@ -2363,6 +2378,11 @@ public final class GrpcOverloadBenchmark {
 				.append(", \"open_transactions\": ").append(resources.openTransactions())
 				.append(", \"open_iterators\": ").append(resources.openIterators())
 				.append(", \"active_range_cursors\": ").append(resources.activeRangeCursors())
+				.append(", \"retained_range_snapshots\": ").append(resources.retainedRangeSnapshots())
+				.append(", \"retained_range_permits\": ").append(resources.retainedRangePermits())
+				.append(", \"retained_range_waiters\": ").append(resources.retainedRangeWaiters())
+				.append(", \"active_cdc_poll_cursors\": ").append(resources.activeCdcPollCursors())
+				.append(", \"active_exists_multi_requests\": ").append(resources.activeExistsMultiRequests())
 				.append(", \"iterator_leases\": ").append(resources.iteratorLeases())
 				.append(", \"drain_ms\": ").append(resources.drainMillis())
 				.append(", \"drained\": ").append(resources.drained())
@@ -3765,9 +3785,14 @@ public final class GrpcOverloadBenchmark {
 			int totalActive,
 			long pendingOperations,
 			int openTransactions,
-			int openIterators,
-			int activeRangeCursors,
-			int iteratorLeases,
+		int openIterators,
+		int activeRangeCursors,
+		int retainedRangeSnapshots,
+		int retainedRangePermits,
+		int retainedRangeWaiters,
+		int activeCdcPollCursors,
+		int activeExistsMultiRequests,
+		int iteratorLeases,
 			long drainMillis,
 			boolean drained,
 			SchedulerConservation schedulerConservation) {
