@@ -218,6 +218,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		var taskMetrics = metrics(profile, family);
 		WorkloadTask task = null;
 		RuntimeException admissionFailure = null;
+		RWScheduler.TerminalOutcome admissionOutcome = null;
 		AdmissionResult admissionResult;
 		List<TerminalAction> terminalActions = null;
 		lock.lock();
@@ -228,41 +229,25 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
 				admissionFailure = deadlineFailure("Workload deadline expired before admission");
 				admissionResult = AdmissionResult.DEADLINE;
-				terminalActions = recordUnacceptedUnsafe(
-						RWScheduler.TerminalOutcome.DEADLINE,
-						command,
-						taskMetrics,
-						admissionFailure,
-						terminalActions);
+				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
+				recordOutcomeUnsafe(admissionOutcome);
 			} else if (shutdown) {
 				admissionFailure = new RejectedExecutionException(poolName + " is shutting down");
 				admissionResult = AdmissionResult.SHUTDOWN;
-				terminalActions = recordUnacceptedUnsafe(
-						RWScheduler.TerminalOutcome.SHUTDOWN,
-						command,
-						taskMetrics,
-						admissionFailure,
-						terminalActions);
+				admissionOutcome = RWScheduler.TerminalOutcome.SHUTDOWN;
+				recordOutcomeUnsafe(admissionOutcome);
 			} else if (capacityUnsafe(profile) == 0 || queuedUnsafe(profile) >= capacityUnsafe(profile)) {
 				admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 						"Workload queue is full for " + profile + " " + family);
 				admissionResult = AdmissionResult.OVERLOAD;
-				terminalActions = recordUnacceptedUnsafe(
-						RWScheduler.TerminalOutcome.OVERLOAD,
-						command,
-						taskMetrics,
-						admissionFailure,
-						terminalActions);
+				admissionOutcome = RWScheduler.TerminalOutcome.OVERLOAD;
+				recordOutcomeUnsafe(admissionOutcome);
 			} else if (outstandingAtLimitUnsafe(profile)) {
 				admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 						"Workload outstanding limit is reached for " + profile + " " + family);
 				admissionResult = AdmissionResult.OVERLOAD;
-				terminalActions = recordUnacceptedUnsafe(
-						RWScheduler.TerminalOutcome.OVERLOAD,
-						command,
-						taskMetrics,
-						admissionFailure,
-						terminalActions);
+				admissionOutcome = RWScheduler.TerminalOutcome.OVERLOAD;
+				recordOutcomeUnsafe(admissionOutcome);
 			} else {
 				task = WorkloadTask.cooperative(this,
 						profile,
@@ -288,6 +273,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		pressureController.signalPendingAvailability();
 		completeTerminalActions(terminalActions);
+		if (admissionFailure != null) {
+			completeTerminalAction(command,
+					null,
+					taskMetrics,
+					admissionFailure,
+					Objects.requireNonNull(admissionOutcome));
+		}
 		taskMetrics.recordAdmission(admissionResult);
 		if (admissionFailure != null) {
 			throw admissionFailure;
@@ -308,6 +300,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				: null;
 		List<TerminalAction> terminalActions = null;
 		RuntimeException admissionFailure = null;
+		RWScheduler.TerminalOutcome admissionOutcome = null;
 		AdmissionResult admissionResult;
 		lock.lock();
 		try {
@@ -317,41 +310,25 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
 				admissionFailure = deadlineFailure("Workload deadline expired before admission");
 				admissionResult = AdmissionResult.DEADLINE;
-				terminalActions = recordUnacceptedUnsafe(
-						RWScheduler.TerminalOutcome.DEADLINE,
-						command,
-						taskMetrics,
-						admissionFailure,
-						terminalActions);
+				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
+				recordOutcomeUnsafe(admissionOutcome);
 			} else if (shutdown) {
 				admissionFailure = new RejectedExecutionException(poolName + " is shutting down");
 				admissionResult = AdmissionResult.SHUTDOWN;
-				terminalActions = recordUnacceptedUnsafe(
-						RWScheduler.TerminalOutcome.SHUTDOWN,
-						command,
-						taskMetrics,
-						admissionFailure,
-						terminalActions);
+				admissionOutcome = RWScheduler.TerminalOutcome.SHUTDOWN;
+				recordOutcomeUnsafe(admissionOutcome);
 			} else if (capacityUnsafe(profile) == 0 || queuedUnsafe(profile) >= capacityUnsafe(profile)) {
 				admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 						"Workload queue is full for " + profile + " " + family);
 				admissionResult = AdmissionResult.OVERLOAD;
-				terminalActions = recordUnacceptedUnsafe(
-						RWScheduler.TerminalOutcome.OVERLOAD,
-						command,
-						taskMetrics,
-						admissionFailure,
-						terminalActions);
+				admissionOutcome = RWScheduler.TerminalOutcome.OVERLOAD;
+				recordOutcomeUnsafe(admissionOutcome);
 			} else if (outstandingAtLimitUnsafe(profile)) {
 				admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 						"Workload outstanding limit is reached for " + profile + " " + family);
 				admissionResult = AdmissionResult.OVERLOAD;
-				terminalActions = recordUnacceptedUnsafe(
-						RWScheduler.TerminalOutcome.OVERLOAD,
-						command,
-						taskMetrics,
-						admissionFailure,
-						terminalActions);
+				admissionOutcome = RWScheduler.TerminalOutcome.OVERLOAD;
+				recordOutcomeUnsafe(admissionOutcome);
 			} else {
 				var task = WorkloadTask.normal(profile,
 						family,
@@ -381,6 +358,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		pressureController.signalPendingAvailability();
 		completeTerminalActions(terminalActions);
+		if (admissionFailure != null) {
+			completeTerminalAction(command,
+					null,
+					taskMetrics,
+					admissionFailure,
+					Objects.requireNonNull(admissionOutcome));
+		}
 		taskMetrics.recordAdmission(admissionResult);
 		if (admissionFailure != null) {
 			throw admissionFailure;
@@ -396,17 +380,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		long cost = 1L + (estimatedBytes - 1L) / COST_BYTES;
 		return (int) Math.max(1L, Math.min(MAX_TASK_COST, cost));
-	}
-
-	private List<TerminalAction> recordUnacceptedUnsafe(RWScheduler.TerminalOutcome outcome,
-	                                                    Runnable command,
-	                                                    TaskMetrics taskMetrics,
-	                                                    RuntimeException failure,
-	                                                    @Nullable List<TerminalAction> terminalActions) {
-		recordOutcomeUnsafe(outcome);
-		var actions = terminalActions != null ? terminalActions : new ArrayList<TerminalAction>(1);
-		actions.add(new TerminalAction(command, null, taskMetrics, failure, outcome));
-		return actions;
 	}
 
 	private void ensureWorkersStartedUnsafe() {
@@ -1602,35 +1575,47 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void completeTerminalAction(TerminalAction action) {
+		completeTerminalAction(action.command(),
+				action.cooperativeTask(),
+				action.metrics(),
+				action.failure(),
+				action.outcome());
+	}
+
+	private void completeTerminalAction(Runnable command,
+	                                    @Nullable WorkloadTask cooperativeTask,
+	                                    TaskMetrics metrics,
+	                                    @Nullable RuntimeException failure,
+	                                    RWScheduler.TerminalOutcome outcome) {
 		try {
-			if (action.outcome() == RWScheduler.TerminalOutcome.RUN && action.failure() == null) {
-				((RWScheduler.CooperativeCompletionTask) action.command()).completeCooperatively();
+			if (outcome == RWScheduler.TerminalOutcome.RUN && failure == null) {
+				((RWScheduler.CooperativeCompletionTask) command).completeCooperatively();
 			} else {
-				var failure = Objects.requireNonNull(action.failure(), "Non-RUN terminal failure");
-				if (action.command() instanceof RWScheduler.RejectionAwareTask rejectionAwareTask) {
-					rejectionAwareTask.reject(failure);
-				} else if (action.command() instanceof CompletableFuture<?> future) {
-					future.completeExceptionally(failure);
-				} else if (action.command() instanceof Future<?> future) {
+				var terminalFailure = Objects.requireNonNull(failure, "Non-RUN terminal failure");
+				if (command instanceof RWScheduler.RejectionAwareTask rejectionAwareTask) {
+					rejectionAwareTask.reject(terminalFailure);
+				} else if (command instanceof CompletableFuture<?> future) {
+					future.completeExceptionally(terminalFailure);
+				} else if (command instanceof Future<?> future) {
 					future.cancel(false);
 				}
 			}
 		} catch (Throwable terminalFailure) {
-			recordInfrastructureFailure("Failed to complete " + action.outcome()
+			recordInfrastructureFailure("Failed to complete " + outcome
 					+ " workload submission in " + poolName, terminalFailure);
 		}
 		try {
-			if (action.command() instanceof Disposable disposable && !disposable.isDisposed()) {
+			if (command instanceof Disposable disposable && !disposable.isDisposed()) {
 				disposable.dispose();
 			}
 		} catch (Throwable disposalFailure) {
-			recordInfrastructureFailure("Failed to dispose " + action.outcome()
+			recordInfrastructureFailure("Failed to dispose " + outcome
 					+ " workload submission in " + poolName, disposalFailure);
 		}
-		if (action.cooperativeTask() != null) {
-			action.cooperativeTask().flushCooperativeMetrics();
+		if (cooperativeTask != null) {
+			cooperativeTask.flushCooperativeMetrics();
 		}
-		action.metrics().recordOutcome(action.outcome());
+		metrics.recordOutcome(outcome);
 	}
 
 	private void completeCooperativeSuccess(WorkloadTask task) {
