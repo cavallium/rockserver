@@ -12,13 +12,12 @@ import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
-import java.util.NavigableSet;
 import java.util.Objects;
-import java.util.TreeSet;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -74,10 +73,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final int[] quanta = new int[PROFILES.length];
 	private final int[] capacities = new int[PROFILES.length];
 	private final int[] reservations = new int[PROFILES.length];
-	private final NavigableSet<WorkloadTask> latencyQueue = new TreeSet<>(DEADLINE_ORDER);
+	private final TaskHeap latencyQueue = new TaskHeap(false);
 	private final TaskQueue[] queues = new TaskQueue[PROFILES.length];
 	private final TaskQueue[] cooperativeQueues = new TaskQueue[PROFILES.length];
-	private final NavigableSet<WorkloadTask> deadlineQueue = new TreeSet<>(DEADLINE_ORDER);
+	private final TaskHeap deadlineQueue = new TaskHeap(true);
 	private final CancellationIndex cancellationIndex = new CancellationIndex();
 	private final int[] queued = new int[PROFILES.length];
 	private final int[] active = new int[PROFILES.length];
@@ -2112,7 +2111,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		private static final int STATE_MASK = 0b11;
 		private static final int DISPATCH_CANCELLATION = 0b100;
-		private final long deadlineEpochMillis;
+		private static final int HAS_DEADLINE = 0b1000;
 		private final long deadlineSequence;
 		private final long enqueuedNanos;
 		private final int cost;
@@ -2134,7 +2133,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		private WorkloadTask(WorkloadProfile profile,
 		                     OperationFamily family,
-		                     long deadlineEpochMillis,
 		                     long sequence,
 		                     long enqueuedNanos,
 		                     int cost,
@@ -2143,7 +2141,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                     TaskMetrics metrics) {
 			this.profile = (byte) profile.ordinal();
 			this.family = (byte) family.ordinal();
-			this.deadlineEpochMillis = deadlineEpochMillis;
 			this.deadlineSequence = sequence;
 			this.enqueuedNanos = enqueuedNanos;
 			this.cost = cost;
@@ -2162,9 +2159,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                                   Runnable command,
 		                                   @Nullable CancellationTrackedTask cancellationTask,
 		                                   TaskMetrics metrics) {
+			if (profile == WorkloadProfile.LATENCY || deadlineEpochMillis != RequestContext.NO_DEADLINE) {
+				return new OrderedWorkloadTask(profile,
+						family,
+						deadlineEpochMillis,
+						sequence,
+						enqueuedNanos,
+						cost,
+						command,
+						cancellationTask,
+						metrics);
+			}
 			return new WorkloadTask(profile,
 					family,
-					deadlineEpochMillis,
 					sequence,
 					enqueuedNanos,
 					cost,
@@ -2182,10 +2189,20 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                                                   int cost,
 		                                                   RWScheduler.CooperativeTask command,
 		                                                   TaskMetrics metrics) {
+			if (profile == WorkloadProfile.LATENCY || deadlineEpochMillis != RequestContext.NO_DEADLINE) {
+				return new OrderedCooperativeWorkloadTask(owner,
+						profile,
+						family,
+						deadlineEpochMillis,
+						sequence,
+						enqueuedNanos,
+						cost,
+						command,
+						metrics);
+			}
 			return new CooperativeWorkloadTask(owner,
 					profile,
 					family,
-					deadlineEpochMillis,
 					sequence,
 					enqueuedNanos,
 					cost,
@@ -2213,12 +2230,16 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			return Byte.toUnsignedInt(family);
 		}
 
-		private long deadlineEpochMillis() {
-			return deadlineEpochMillis;
+		long deadlineEpochMillis() {
+			return RequestContext.NO_DEADLINE;
 		}
 
 		private boolean hasDeadline() {
-			return deadlineEpochMillis != RequestContext.NO_DEADLINE;
+			return (state & HAS_DEADLINE) != 0;
+		}
+
+		final void markHasDeadline() {
+			state |= HAS_DEADLINE;
 		}
 
 		private long deadlineSequence() {
@@ -2233,6 +2254,22 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		private long enqueuedNanos() {
 			return enqueuedNanos;
+		}
+
+		int latencyHeapIndex() {
+			return -1;
+		}
+
+		void latencyHeapIndex(int index) {
+			throw new IllegalStateException("Task has no latency-heap index");
+		}
+
+		int deadlineHeapIndex() {
+			return -1;
+		}
+
+		void deadlineHeapIndex(int index) {
+			throw new IllegalStateException("Task has no deadline-heap index");
 		}
 
 		private int cost() {
@@ -2442,7 +2479,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (cooperativeTask.requestedTermination != null) {
 				return true;
 			}
-			if (hasDeadline() && System.currentTimeMillis() >= deadlineEpochMillis) {
+			if (hasDeadline() && System.currentTimeMillis() >= deadlineEpochMillis()) {
 				CooperativeWorkloadTask.REQUESTED_TERMINATION.compareAndSet(
 						cooperativeTask, null, new RequestedTermination(
 						RWScheduler.TerminalOutcome.DEADLINE,
@@ -2493,7 +2530,62 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
-	private static final class CooperativeWorkloadTask extends WorkloadTask {
+	private static final class OrderedWorkloadTask extends WorkloadTask {
+
+		private final long deadlineEpochMillis;
+		private int latencyHeapIndex = -1;
+		private int deadlineHeapIndex = -1;
+
+		private OrderedWorkloadTask(WorkloadProfile profile,
+		                                OperationFamily family,
+		                                long deadlineEpochMillis,
+		                                long sequence,
+		                                long enqueuedNanos,
+		                                int cost,
+		                                Runnable command,
+		                                @Nullable CancellationTrackedTask cancellationTask,
+		                                TaskMetrics metrics) {
+			super(profile,
+					family,
+					sequence,
+					enqueuedNanos,
+					cost,
+					command,
+					cancellationTask,
+					metrics);
+			this.deadlineEpochMillis = deadlineEpochMillis;
+			if (deadlineEpochMillis != RequestContext.NO_DEADLINE) {
+				markHasDeadline();
+			}
+		}
+
+		@Override
+		long deadlineEpochMillis() {
+			return deadlineEpochMillis;
+		}
+
+		@Override
+		int latencyHeapIndex() {
+			return latencyHeapIndex;
+		}
+
+		@Override
+		void latencyHeapIndex(int index) {
+			latencyHeapIndex = index;
+		}
+
+		@Override
+		int deadlineHeapIndex() {
+			return deadlineHeapIndex;
+		}
+
+		@Override
+		void deadlineHeapIndex(int index) {
+			deadlineHeapIndex = index;
+		}
+	}
+
+	private static class CooperativeWorkloadTask extends WorkloadTask {
 
 		private static final int ADMITTED = 1;
 		private static final int RESUME_REQUESTED = 1 << 1;
@@ -2524,7 +2616,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private CooperativeWorkloadTask(ProfiledWorkloadExecutor owner,
 		                                WorkloadProfile profile,
 		                                OperationFamily family,
-		                                long deadlineEpochMillis,
 		                                long sequence,
 		                                long enqueuedNanos,
 		                                int cost,
@@ -2532,7 +2623,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                                TaskMetrics metrics) {
 			super(profile,
 					family,
-					deadlineEpochMillis,
 					sequence,
 					enqueuedNanos,
 					cost,
@@ -2556,6 +2646,61 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
+	private static final class OrderedCooperativeWorkloadTask extends CooperativeWorkloadTask {
+
+		private final long deadlineEpochMillis;
+		private int latencyHeapIndex = -1;
+		private int deadlineHeapIndex = -1;
+
+		private OrderedCooperativeWorkloadTask(ProfiledWorkloadExecutor owner,
+		                                           WorkloadProfile profile,
+		                                           OperationFamily family,
+		                                           long deadlineEpochMillis,
+		                                           long sequence,
+		                                           long enqueuedNanos,
+		                                           int cost,
+		                                           Runnable command,
+		                                           TaskMetrics metrics) {
+			super(owner,
+					profile,
+					family,
+					sequence,
+					enqueuedNanos,
+					cost,
+					command,
+					metrics);
+			this.deadlineEpochMillis = deadlineEpochMillis;
+			if (deadlineEpochMillis != RequestContext.NO_DEADLINE) {
+				markHasDeadline();
+			}
+		}
+
+		@Override
+		long deadlineEpochMillis() {
+			return deadlineEpochMillis;
+		}
+
+		@Override
+		int latencyHeapIndex() {
+			return latencyHeapIndex;
+		}
+
+		@Override
+		void latencyHeapIndex(int index) {
+			latencyHeapIndex = index;
+		}
+
+		@Override
+		int deadlineHeapIndex() {
+			return deadlineHeapIndex;
+		}
+
+		@Override
+		void deadlineHeapIndex(int index) {
+			deadlineHeapIndex = index;
+		}
+	}
+
 	private record RequestedTermination(RWScheduler.TerminalOutcome outcome, RuntimeException failure) {
 	}
 
@@ -2571,6 +2716,128 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		ACTIVE,
 		PARKED,
 		TERMINAL
+	}
+
+	/**
+	 * Intrusive binary heap for EDF indexes. The backing reference array is contiguous and grows
+	 * only at a new queue high-water mark; task insertion/removal allocates no per-entry tree node.
+	 */
+	private static final class TaskHeap {
+
+		private static final int INITIAL_CAPACITY = 16;
+
+		private final boolean deadlineIndex;
+		private WorkloadTask[] elements = new WorkloadTask[INITIAL_CAPACITY];
+		private int size;
+
+		private TaskHeap(boolean deadlineIndex) {
+			this.deadlineIndex = deadlineIndex;
+		}
+
+		private boolean isEmpty() {
+			return size == 0;
+		}
+
+		private WorkloadTask first() {
+			if (size == 0) {
+				throw new IllegalStateException("EDF task heap is empty");
+			}
+			return Objects.requireNonNull(elements[0]);
+		}
+
+		private boolean add(WorkloadTask task) {
+			if (indexOf(task) >= 0) {
+				return false;
+			}
+			ensureCapacity(size + 1);
+			siftUp(size, task);
+			size++;
+			return true;
+		}
+
+		private boolean remove(WorkloadTask task) {
+			int index = indexOf(task);
+			if (index < 0) {
+				return false;
+			}
+			if (index >= size || elements[index] != task) {
+				throw new IllegalStateException("Corrupt EDF task heap index");
+			}
+			int lastIndex = --size;
+			var moved = elements[lastIndex];
+			elements[lastIndex] = null;
+			setIndex(task, -1);
+			if (index == lastIndex) {
+				return true;
+			}
+			var movedTask = Objects.requireNonNull(moved);
+			int parentIndex = (index - 1) >>> 1;
+			if (index > 0 && DEADLINE_ORDER.compare(movedTask, elements[parentIndex]) < 0) {
+				siftUp(index, movedTask);
+			} else {
+				siftDown(index, movedTask);
+			}
+			return true;
+		}
+
+		private void siftUp(int index, WorkloadTask task) {
+			while (index > 0) {
+				int parentIndex = (index - 1) >>> 1;
+				var parent = Objects.requireNonNull(elements[parentIndex]);
+				if (DEADLINE_ORDER.compare(task, parent) >= 0) {
+					break;
+				}
+				elements[index] = parent;
+				setIndex(parent, index);
+				index = parentIndex;
+			}
+			elements[index] = task;
+			setIndex(task, index);
+		}
+
+		private void siftDown(int index, WorkloadTask task) {
+			int half = size >>> 1;
+			while (index < half) {
+				int childIndex = (index << 1) + 1;
+				var child = Objects.requireNonNull(elements[childIndex]);
+				int rightIndex = childIndex + 1;
+				if (rightIndex < size) {
+					var right = Objects.requireNonNull(elements[rightIndex]);
+					if (DEADLINE_ORDER.compare(right, child) < 0) {
+						childIndex = rightIndex;
+						child = right;
+					}
+				}
+				if (DEADLINE_ORDER.compare(task, child) <= 0) {
+					break;
+				}
+				elements[index] = child;
+				setIndex(child, index);
+				index = childIndex;
+			}
+			elements[index] = task;
+			setIndex(task, index);
+		}
+
+		private void ensureCapacity(int required) {
+			if (required <= elements.length) {
+				return;
+			}
+			int grown = elements.length + (elements.length >>> 1);
+			elements = Arrays.copyOf(elements, Math.max(required, grown));
+		}
+
+		private int indexOf(WorkloadTask task) {
+			return deadlineIndex ? task.deadlineHeapIndex() : task.latencyHeapIndex();
+		}
+
+		private void setIndex(WorkloadTask task, int index) {
+			if (deadlineIndex) {
+				task.deadlineHeapIndex(index);
+			} else {
+				task.latencyHeapIndex(index);
+			}
+		}
 	}
 
 	private static final class TaskQueue {

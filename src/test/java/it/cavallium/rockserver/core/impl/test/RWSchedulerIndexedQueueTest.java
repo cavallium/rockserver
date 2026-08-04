@@ -18,6 +18,7 @@ import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -115,6 +116,58 @@ class RWSchedulerIndexedQueueTest {
 			releaseBlocker.countDown();
 			assertTrue(completed.await(5, SECONDS));
 			assertEquals(List.of("earlier-1", "earlier-2", "later"), order);
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void latencyDeadlineIndexesResizeAndSupportArbitraryRemoval() throws Exception {
+		int taskCount = 64;
+		var scheduler = scheduler(1, 128, "indexed-edf-resize-remove");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var completed = new CountDownLatch(taskCount - taskCount / 4);
+		var order = Collections.synchronizedList(new ArrayList<Integer>());
+		var tasks = new ArrayList<Runnable>(taskCount);
+		var expected = new ArrayList<Integer>(taskCount);
+		long deadlineBase = System.currentTimeMillis() + SECONDS.toMillis(30);
+		var removalView = scheduler.executor(
+				WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP, deadlineBase);
+		try {
+			scheduler.executor(
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+					.execute(() -> {
+						blockerStarted.countDown();
+						awaitUninterruptibly(releaseBlocker);
+					});
+			assertTrue(blockerStarted.await(5, SECONDS));
+
+			for (int value = 0; value < taskCount; value++) {
+				int captured = value;
+				var task = (Runnable) () -> {
+					order.add(captured);
+					completed.countDown();
+				};
+				tasks.add(task);
+				long deadline = deadlineBase + ((value * 37) & (taskCount - 1));
+				scheduler.executor(WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP, deadline)
+						.execute(task);
+				if ((value & 3) != 0) {
+					expected.add(value);
+				}
+			}
+
+			for (int value = 0; value < taskCount; value += 4) {
+				assertTrue(scheduler.removeQueuedTask(removalView, tasks.get(value)));
+			}
+			expected.sort(Comparator.comparingInt(value -> (value * 37) & (taskCount - 1)));
+
+			releaseBlocker.countDown();
+			assertTrue(completed.await(5, SECONDS));
+			assertEquals(expected, order);
+			assertReadPoolDrained(scheduler);
 		} finally {
 			releaseBlocker.countDown();
 			scheduler.disposeNow();

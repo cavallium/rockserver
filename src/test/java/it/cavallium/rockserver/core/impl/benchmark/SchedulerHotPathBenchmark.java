@@ -16,7 +16,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * Fresh-process scheduler microbenchmark for admission, dispatch, cooperative transitions, and cancellation.
  *
  * <p>This deliberately reuses commands and keeps coordination outside the measured scheduler
-	 * allocation. Select {@code normal}, {@code normal-metrics}, {@code indexed}, {@code cooperative},
+	 * allocation. Select {@code normal}, {@code normal-metrics}, {@code latency},
+	 * {@code latency-metrics}, {@code indexed}, {@code cooperative},
  * {@code cooperative-yield}, {@code cooperative-park-resume}, or
  * {@code cooperative-cancel}, or {@code saturated-rejection} as the first argument. Repeated
  * YIELD and PARK/resume measure a
@@ -35,8 +36,12 @@ public final class SchedulerHotPathBenchmark {
 
 	public static void main(String[] args) {
 		String scenario = args.length > 0 ? args[0] : "cooperative";
-		boolean metricsEnabled = scenario.equals("normal-metrics");
-		String executionScenario = metricsEnabled ? "normal" : scenario;
+		boolean metricsEnabled = scenario.equals("normal-metrics") || scenario.equals("latency-metrics");
+		String executionScenario = switch (scenario) {
+			case "normal-metrics" -> "normal";
+			case "latency-metrics" -> "latency";
+			default -> scenario;
+		};
 		int warmupOperations = integerArgument(args, 1, DEFAULT_WARMUP_OPERATIONS);
 		int measuredOperations = integerArgument(args, 2, DEFAULT_MEASURED_OPERATIONS);
 		if (warmupOperations < 1 || measuredOperations < 1) {
@@ -109,6 +114,15 @@ public final class SchedulerHotPathBenchmark {
 					var executor = scheduler.executor(WorkloadProfile.INGEST,
 							OperationFamily.POINT_LOOKUP,
 							RequestContext.NO_DEADLINE);
+					submitter = () -> executor.execute(normalTask);
+					completed = normalTask.completed;
+					failure = normalTask.failure;
+				}
+				case "latency" -> {
+					profile = WorkloadProfile.LATENCY;
+					var executor = scheduler.executor(WorkloadProfile.LATENCY,
+							OperationFamily.POINT_LOOKUP,
+							System.currentTimeMillis() + 600_000L);
 					submitter = () -> executor.execute(normalTask);
 					completed = normalTask.completed;
 					failure = normalTask.failure;
