@@ -303,8 +303,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		Objects.requireNonNull(command, "command");
 		int cost = taskCost(estimatedBytes);
 		var taskMetrics = metrics(profile, family);
-		var cancellationState = command instanceof CancellationTrackedTask trackedTask
-				? trackedTask.workloadCancellationState()
+		var cancellationTask = command instanceof CancellationTrackedTask trackedTask
+				? trackedTask
 				: null;
 		List<TerminalAction> terminalActions = null;
 		RuntimeException admissionFailure = null;
@@ -360,7 +360,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						System.nanoTime(),
 						cost,
 						command,
-						cancellationState,
+						cancellationTask,
 						taskMetrics);
 				boolean becomesDeadlineHead = task.hasDeadline()
 						&& (deadlineQueue.isEmpty() || DEADLINE_ORDER.compare(task, deadlineQueue.first()) < 0);
@@ -2045,7 +2045,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private long enqueuedNanos;
 		private final int cost;
 		private final Runnable command;
-		private final @Nullable CancellationState cancellationState;
+		private final @Nullable CancellationTrackedTask cancellationTask;
 		private final TaskMetrics metrics;
 		private final boolean cooperative;
 		private @Nullable WorkloadTask previousCancellation;
@@ -2075,7 +2075,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                     long enqueuedNanos,
 		                     int cost,
 		                     Runnable command,
-		                     @Nullable CancellationState cancellationState,
+		                     @Nullable CancellationTrackedTask cancellationTask,
 		                     TaskMetrics metrics,
 		                     boolean cooperative) {
 			this.owner = owner;
@@ -2087,7 +2087,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			this.enqueuedNanos = enqueuedNanos;
 			this.cost = cost;
 			this.command = command;
-			this.cancellationState = cancellationState;
+			this.cancellationTask = cancellationTask;
 			this.metrics = metrics;
 			this.cooperative = cooperative;
 		}
@@ -2099,7 +2099,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                                   long enqueuedNanos,
 		                                   int cost,
 		                                   Runnable command,
-		                                   @Nullable CancellationState cancellationState,
+		                                   @Nullable CancellationTrackedTask cancellationTask,
 		                                   TaskMetrics metrics) {
 			return new WorkloadTask(null,
 					profile,
@@ -2109,7 +2109,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					enqueuedNanos,
 					cost,
 					command,
-					cancellationState,
+					cancellationTask,
 					metrics,
 					false);
 		}
@@ -2201,11 +2201,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		private boolean cancellationRequested() {
-			return cancellationState != null && cancellationState.isCancellationRequested();
+			return cancellationTask != null && cancellationTask.workloadCancellationRequested();
 		}
 
 		private boolean claimForDispatch() {
-			return cancellationState == null || cancellationState.claimForDispatch();
+			return cancellationTask == null || cancellationTask.claimWorkloadDispatch();
 		}
 
 		private @Nullable CancellationEntry cancellationEntry() {
@@ -2445,37 +2445,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	interface CancellationTrackedTask {
 
-		CancellationState workloadCancellationState();
-	}
+		boolean workloadCancellationRequested();
 
-	static final class CancellationState {
-
-		private static final int PENDING = 0;
-		private static final int CLAIMED = 1;
-		private static final int CANCELLED = 2;
-		private static final VarHandle STATE;
-
-		static {
-			try {
-				STATE = MethodHandles.lookup().findVarHandle(CancellationState.class, "state", int.class);
-			} catch (NoSuchFieldException | IllegalAccessException failure) {
-				throw new ExceptionInInitializerError(failure);
-			}
-		}
-
-		private volatile int state = PENDING;
-
-		boolean cancel() {
-			return STATE.compareAndSet(this, PENDING, CANCELLED);
-		}
-
-		boolean isCancellationRequested() {
-			return state == CANCELLED;
-		}
-
-		boolean claimForDispatch() {
-			return STATE.compareAndSet(this, PENDING, CLAIMED) || state == CLAIMED;
-		}
+		boolean claimWorkloadDispatch();
 	}
 
 	private enum TaskState {

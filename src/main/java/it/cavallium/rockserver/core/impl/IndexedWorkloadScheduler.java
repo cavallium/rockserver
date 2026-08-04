@@ -117,11 +117,17 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		private static final int RUNNING = 1;
 		private static final int FINISHED = 2;
 		private static final int CANCELLED = 3;
+		private static final int DISPATCH_PENDING = 0;
+		private static final int DISPATCH_CLAIMED = 1;
+		private static final int DISPATCH_CANCELLED = 2;
 		private static final VarHandle STATE;
+		private static final VarHandle DISPATCH_STATE;
 
 		static {
 			try {
 				STATE = MethodHandles.lookup().findVarHandle(IndexedScheduledTask.class, "state", int.class);
+				DISPATCH_STATE = MethodHandles.lookup()
+						.findVarHandle(IndexedScheduledTask.class, "dispatchState", int.class);
 			} catch (NoSuchFieldException | IllegalAccessException failure) {
 				throw new ExceptionInInitializerError(failure);
 			}
@@ -132,8 +138,7 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		private final Runnable task;
 		private final @Nullable IndexedWorker parent;
 		private volatile int state = QUEUED;
-		private final ProfiledWorkloadExecutor.CancellationState cancellationState =
-				new ProfiledWorkloadExecutor.CancellationState();
+		private volatile int dispatchState = DISPATCH_PENDING;
 		private boolean submitted;
 
 		private IndexedScheduledTask(RWScheduler scheduler,
@@ -185,7 +190,8 @@ final class IndexedWorkloadScheduler implements Scheduler {
 
 		@Override
 		public void dispose() {
-			boolean cancelledBeforeDispatch = cancellationState.cancel();
+			boolean cancelledBeforeDispatch = DISPATCH_STATE.compareAndSet(
+					this, DISPATCH_PENDING, DISPATCH_CANCELLED);
 			boolean removeQueued = false;
 			boolean cancellationWon = false;
 			synchronized (this) {
@@ -208,8 +214,14 @@ final class IndexedWorkloadScheduler implements Scheduler {
 		}
 
 		@Override
-		public ProfiledWorkloadExecutor.CancellationState workloadCancellationState() {
-			return cancellationState;
+		public boolean workloadCancellationRequested() {
+			return dispatchState == DISPATCH_CANCELLED;
+		}
+
+		@Override
+		public boolean claimWorkloadDispatch() {
+			return DISPATCH_STATE.compareAndSet(this, DISPATCH_PENDING, DISPATCH_CLAIMED)
+					|| dispatchState == DISPATCH_CLAIMED;
 		}
 
 		private void deleteFromParent() {
