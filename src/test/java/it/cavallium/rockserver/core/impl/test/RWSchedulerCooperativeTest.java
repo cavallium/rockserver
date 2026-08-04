@@ -349,6 +349,37 @@ class RWSchedulerCooperativeTest {
 	}
 
 	@Test
+	void duplicateCooperativeIdentityRemainsMappedAcrossParkCancelAndResume() throws Exception {
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-duplicate-identity");
+		var executor = scheduler.executor(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+		var task = new AlwaysParkTask();
+		try {
+			var first = executor.executeCooperatively(task, 1L);
+			var second = executor.executeCooperatively(task, 1L);
+			assertEventually(() -> task.parks.get() == 2);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).parkedTasks() == 2);
+
+			assertTrue(first.cancel());
+			assertEventually(() -> task.rejections.get() == 1);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).parkedTasks() == 1);
+
+			second.resume();
+			assertEventually(() -> task.parks.get() == 3);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).parkedTasks() == 1);
+			assertTrue(second.cancel());
+			assertEventually(() -> task.rejections.get() == 2);
+
+			var drained = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(2L, drained.submissionAttempts());
+			assertEquals(2L, drained.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+			assertTrue(drained.drainedAndConserved());
+		} finally {
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void parkedBacklogHasAFixedAdmissionBoundAndExactConservation() throws Exception {
 		var registry = new SimpleMeterRegistry();
 		var scheduler = RWScheduler.forTesting(
@@ -1064,6 +1095,23 @@ class RWSchedulerCooperativeTest {
 		public void reject(RuntimeException failure) {
 			this.failure.compareAndSet(null, failure);
 			completed.countDown();
+		}
+	}
+
+	private static final class AlwaysParkTask implements RWScheduler.CooperativeTask {
+
+		private final AtomicInteger parks = new AtomicInteger();
+		private final AtomicInteger rejections = new AtomicInteger();
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			parks.incrementAndGet();
+			return RWScheduler.CooperativeResult.PARK;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			rejections.incrementAndGet();
 		}
 	}
 

@@ -122,6 +122,10 @@ class RWSchedulerMetricsTest {
 					"rockserver.workload.outstanding.limit",
 					Map.of("database", DATABASE, RESOURCE, "read", PROFILE, "batch"),
 					2.0);
+			assertTrue(registry.find("rockserver.workload.outstanding")
+					.tags("database", DATABASE, RESOURCE, "read", PROFILE, "control")
+					.gauge() == null,
+					"zero-capacity profile gauges must not consume permanent registry cardinality");
 			assertGauge(registry,
 					"rockserver.workload.storage.pressure",
 					Map.of("database", DATABASE),

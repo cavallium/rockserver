@@ -12,6 +12,8 @@ import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -30,7 +32,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
@@ -117,6 +119,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	private static final int ASYNC_TASK_FINISHED = 2;
 	private static final int ASYNC_TASK_CANCELLED = 3;
 	private final EmbeddedDB db;
+	private final BiPredicate<Executor, Runnable> queuedTaskRemover;
 	private final Map<Long, AsyncIteratorOperation> asyncIteratorOperations = new ConcurrentHashMap<>();
 	private final Map<Long, CompletableFuture<Void>> closingAsyncIterators = new ConcurrentHashMap<>();
 	private volatile boolean closingConnection;
@@ -125,6 +128,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	EmbeddedConnectionDelegate(@Nullable Path path, String name, @Nullable Path embeddedConfig) throws IOException {
 		super(name);
 		this.db = new EmbeddedDB(path, name, embeddedConfig);
+		this.queuedTaskRemover = db.getScheduler()::removeQueuedTask;
 	}
 
 	@VisibleForTesting
@@ -1264,7 +1268,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		var future = new RunningCompletionFuture<>(
 				supplier,
 				executor,
-				db.getScheduler()::removeQueuedTask);
+				queuedTaskRemover);
 		try {
 			if (executor instanceof RWScheduler.WorkloadExecutor workloadExecutor) {
 				workloadExecutor.execute(future, estimatedBytes);
@@ -1332,14 +1336,24 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 	private static final class RunningCompletionFuture<T> extends CompletableFuture<T> implements Runnable {
 
+		private static final VarHandle STATE;
+
+		static {
+			try {
+				STATE = MethodHandles.lookup().findVarHandle(RunningCompletionFuture.class, "state", int.class);
+			} catch (NoSuchFieldException | IllegalAccessException failure) {
+				throw new ExceptionInInitializerError(failure);
+			}
+		}
+
 		private final Supplier<T> supplier;
 		private final Executor executor;
-		private final java.util.function.BiPredicate<Executor, Runnable> queuedTaskRemover;
-		private final AtomicInteger state = new AtomicInteger(ASYNC_TASK_QUEUED);
+		private final BiPredicate<Executor, Runnable> queuedTaskRemover;
+		private volatile int state = ASYNC_TASK_QUEUED;
 
 		private RunningCompletionFuture(Supplier<T> supplier,
 				Executor executor,
-				java.util.function.BiPredicate<Executor, Runnable> queuedTaskRemover) {
+				BiPredicate<Executor, Runnable> queuedTaskRemover) {
 			this.supplier = supplier;
 			this.executor = executor;
 			this.queuedTaskRemover = queuedTaskRemover;
@@ -1347,7 +1361,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 		@Override
 		public boolean cancel(boolean mayInterruptIfRunning) {
-			if (!state.compareAndSet(ASYNC_TASK_QUEUED, ASYNC_TASK_CANCELLED)) {
+			if (!STATE.compareAndSet(this, ASYNC_TASK_QUEUED, ASYNC_TASK_CANCELLED)) {
 				return false;
 			}
 			var cancelled = super.cancel(mayInterruptIfRunning);
@@ -1357,7 +1371,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 		@Override
 		public void run() {
-			if (!state.compareAndSet(ASYNC_TASK_QUEUED, ASYNC_TASK_RUNNING)) {
+			if (!STATE.compareAndSet(this, ASYNC_TASK_QUEUED, ASYNC_TASK_RUNNING)) {
 				return;
 			}
 			try {
@@ -1365,12 +1379,12 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			} catch (Throwable error) {
 				completeExceptionally(error);
 			} finally {
-				state.set(ASYNC_TASK_FINISHED);
+				state = ASYNC_TASK_FINISHED;
 			}
 		}
 
 		private void reject(Throwable error) {
-			if (state.compareAndSet(ASYNC_TASK_QUEUED, ASYNC_TASK_FINISHED)) {
+			if (STATE.compareAndSet(this, ASYNC_TASK_QUEUED, ASYNC_TASK_FINISHED)) {
 				completeExceptionally(error);
 			}
 		}

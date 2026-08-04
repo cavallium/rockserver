@@ -523,6 +523,108 @@ class RWSchedulerTest {
 	}
 
 	@Test
+	void queuedRemovalPreservesDuplicateIdentitySubmissionOrder() throws Exception {
+		var scheduler = scheduler(1, "duplicate-identity-removal-test");
+		var blockerStarted = new CountDownLatch(1);
+		var release = new CountDownLatch(1);
+		var runs = new AtomicInteger();
+		Runnable duplicate = runs::incrementAndGet;
+		var view = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
+		try {
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+					.execute(() -> {
+						blockerStarted.countDown();
+						awaitUninterruptibly(release);
+					});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			view.execute(duplicate);
+			view.execute(duplicate);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 2);
+
+			assertTrue(scheduler.removeQueuedTask(view, duplicate));
+			assertTrue(scheduler.removeQueuedTask(view, duplicate));
+			assertFalse(scheduler.removeQueuedTask(view, duplicate));
+			assertEquals(0, scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks());
+			assertEquals(2L, scheduler.poolSnapshot(RWScheduler.Pool.READ)
+					.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+			assertEquals(0, runs.get());
+		} finally {
+			release.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void cancellationIndexRehashesAndReusesEntriesWithoutLosingIdentity() throws Exception {
+		var scheduler = scheduler(1, "cancellation-index-reuse-test");
+		var blockerStarted = new CountDownLatch(1);
+		var release = new CountDownLatch(1);
+		var view = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
+		try {
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+					.execute(() -> {
+						blockerStarted.countDown();
+						awaitUninterruptibly(release);
+					});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			for (int wave = 0; wave < 3; wave++) {
+				var commands = new ArrayList<Runnable>(64);
+				for (int index = 0; index < 64; index++) {
+					int identity = wave * 64 + index;
+					Runnable command = () -> {
+						if (identity < 0) throw new AssertionError("unreachable");
+					};
+					commands.add(command);
+					view.execute(command);
+				}
+				assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 64);
+				for (var command : commands) {
+					assertTrue(scheduler.removeQueuedTask(view, command));
+					assertFalse(scheduler.removeQueuedTask(view, command));
+				}
+				assertEquals(0, scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks());
+			}
+			assertEquals(192L, scheduler.poolSnapshot(RWScheduler.Pool.READ)
+					.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+		} finally {
+			release.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void cancellationIdentityIsScopedByProfileAndOperationFamily() throws Exception {
+		var scheduler = scheduler(1, "cancellation-index-scope-test");
+		var blockerStarted = new CountDownLatch(1);
+		var release = new CountDownLatch(1);
+		var ran = new CountDownLatch(1);
+		Runnable shared = ran::countDown;
+		var batch = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
+		var analytical = scheduler.executor(RequestContext.analytical(),
+				OperationFamily.FULL_SCAN_AGGREGATE);
+		try {
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+					.execute(() -> {
+						blockerStarted.countDown();
+						awaitUninterruptibly(release);
+					});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			batch.execute(shared);
+			analytical.execute(shared);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 2);
+
+			assertTrue(scheduler.removeQueuedTask(batch, shared));
+			assertFalse(scheduler.removeQueuedTask(batch, shared));
+			release.countDown();
+			assertTrue(ran.await(5, SECONDS));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).outstandingTasks() == 0);
+		} finally {
+			release.countDown();
+			scheduler.dispose();
+		}
+	}
+
+	@Test
 	void forcedShutdownCompletesQueuedWorkDisposesItAndInterruptsRunningWork() throws Exception {
 		var scheduler = scheduler(1, "forced-shutdown");
 		var started = new CountDownLatch(1);
