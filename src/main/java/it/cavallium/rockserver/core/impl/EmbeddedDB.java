@@ -56,6 +56,7 @@ import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -288,6 +289,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final long WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
 	private static final int RAW_SCAN_MAX_ENTRIES_PER_CHUNK = 65_536;
 	private static final long RAW_SCAN_MAX_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
+	private static final long RAW_SCAN_PIN_MAX_DURATION_NANOS = TimeUnit.MILLISECONDS.toNanos(Math.max(1L,
+			Long.getLong("it.cavallium.rockserver.raw-scan.pin-max-duration-ms", 30_000L)));
+	private static final String RAW_SCAN_PIN_DIRECTORY_NAME = ".rockserver-raw-scan-pins";
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final String SHUTDOWN_PENDING_OPS_TIMEOUT_MS_PROPERTY
 			= "it.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms";
@@ -328,6 +332,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Set<AsyncExistsMultiRequest> activeExistsMultiRequests = ConcurrentHashMap.newKeySet();
 	private final ConcurrentMap<String, CdcMetadataLock> cdcMetadataLocks = new ConcurrentHashMap<>();
 	private final RawScanFileDeletionRecovery rawScanFileDeletionRecovery = new RawScanFileDeletionRecovery();
+	private final Object rawScanPinAcquisitionLock = new Object();
+	private final Object rawScanPinInitializationLock = new Object();
+	private final Set<Path> initializedRawScanPinRoots = new HashSet<>();
+	private final Set<Path> activeRawScanPinnedFiles = ConcurrentHashMap.newKeySet();
+	private final AtomicLong activeRawScanPinnedBytes = new AtomicLong();
 	private final Object asyncExistsMultiAdmissionLock = new Object();
 	private final SafeShutdown ops;
 	private final AtomicLong resourceLeases = new AtomicLong();
@@ -365,6 +374,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicBoolean nativeDeleteRangeFallbackLogged = new AtomicBoolean();
 	private final Counter cdcEventsEmitted;
 	private final Counter cdcBytesEmitted;
+	private final Counter rawScanPinAcquisitionFailures;
+	private final Timer rawScanPinAcquisitionTimer;
 	private final EnumMap<WriteElisionRequest, EnumMap<WriteElisionDecision, Counter>> writeElisionDecisionCounters;
 	private final RocksDBStatistics rocksDBStatistics;
 	private final boolean fastGet;
@@ -451,6 +462,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.getAllColumnDefinitionsTimer = createActionTimer(GetAllColumnDefinitions.class);
 		this.cdcEventsEmitted = metrics.getRegistry().counter("rockserver.cdc.events", "db", name);
 		this.cdcBytesEmitted = metrics.getRegistry().counter("rockserver.cdc.bytes", "db", name);
+		this.rawScanPinAcquisitionFailures = metrics.getRegistry().counter(
+				"rockserver.raw.scan.pin.acquisition.failures",
+				"database",
+				name);
+		this.rawScanPinAcquisitionTimer = Timer.builder("rockserver.raw.scan.pin.acquisition")
+				.description("Time RocksDB file deletion is disabled while raw-scan SSTs are hard-linked")
+				.tag("database", name)
+				.register(metrics.getRegistry());
+		Gauge.builder("rockserver.raw.scan.pinned.files", activeRawScanPinnedFiles, Set::size)
+				.description("SST hard links currently retained by raw scans")
+				.tag("database", name)
+				.register(metrics.getRegistry());
+		Gauge.builder("rockserver.raw.scan.pinned.bytes", activeRawScanPinnedBytes, AtomicLong::get)
+				.description("Logical bytes in SST files currently retained by raw-scan hard links")
+				.baseUnit("bytes")
+				.tag("database", name)
+				.register(metrics.getRegistry());
 		this.writeElisionDecisionCounters = new EnumMap<>(WriteElisionRequest.class);
 		for (var request : WriteElisionRequest.values()) {
 			var counters = new EnumMap<WriteElisionDecision, Counter>(WriteElisionDecision.class);
@@ -533,6 +561,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		var beforeLoad = Instant.now();
 		var loadedDb = RocksDBLoader.load(path, config, logger);
+		try {
+			recoverRawScanPinsAtStartup(loadedDb.db().get(), loadedDb.definitiveDbPath(), config);
+		} catch (IOException | RuntimeException | Error recoveryFailure) {
+			try {
+				loadedDb.db().close();
+			} catch (Throwable closeFailure) {
+				recoveryFailure.addSuppressed(closeFailure);
+			}
+			try {
+				loadedDb.refs().close();
+			} catch (Throwable closeFailure) {
+				recoveryFailure.addSuppressed(closeFailure);
+			}
+			throw recoveryFailure;
+		}
 		this.db = loadedDb.db();
 		this.dbOptions = loadedDb.dbOptions();
 		this.refs = loadedDb.refs();
@@ -1947,6 +1990,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setRawScanCleanupObserverForTesting(@Nullable Runnable observer) {
 		this.rawScanCleanupObserver = observer;
+	}
+
+	@VisibleForTesting
+	public Set<Path> getRawScanPinnedFilesForTesting() {
+		return Set.copyOf(activeRawScanPinnedFiles);
 	}
 
 	@VisibleForTesting
@@ -8060,7 +8108,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	/**
 	 * RocksDB counts disable/enable file-deletion calls. A failed enable must therefore
-	 * be retried, otherwise one transient error leaves obsolete SST deletion disabled
+	 * be retried, otherwise one transient error leaves obsolete-file deletion disabled
 	 * for the rest of the process lifetime.
 	 */
 	private final class RawScanFileDeletionRecovery {
@@ -8084,7 +8132,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					enableRawScanFileDeletions(rocksDB);
 					pendingEnables--;
 				} catch (org.rocksdb.RocksDBException error) {
-					logger.warn("Failed to re-enable RocksDB file deletions after raw scan; retrying in {} ms",
+					logger.warn("Failed to re-enable RocksDB file deletions after raw-scan SST pinning; "
+							+ "retrying in {} ms",
 							RETRY_DELAY_MILLIS,
 							error);
 					scheduleRetry(rocksDB);
@@ -8125,23 +8174,265 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		rocksDB.enableFileDeletions();
 	}
 
-	private final class RawScanFileDeletionLease implements AutoCloseable {
-		private final RocksDB rocksDB;
-		private final List<LiveFileMetaData> files;
-		private boolean closed;
+	@VisibleForTesting
+	protected void createRawScanHardLink(Path source, Path target) throws IOException {
+		Files.createLink(target, source);
+	}
 
-		private RawScanFileDeletionLease() throws org.rocksdb.RocksDBException {
-			this.rocksDB = db.get();
-			rocksDB.disableFileDeletions();
-			try {
-				this.files = List.copyOf(rocksDB.getLiveFilesMetaData());
-			} catch (RuntimeException | Error captureFailure) {
-				rawScanFileDeletionRecovery.release(rocksDB);
-				throw captureFailure;
+	private static Path rawScanSourcePath(LiveFileMetaData file) {
+		String filePath = file.path();
+		if (!filePath.endsWith(".sst")) {
+			filePath += file.fileName();
+		}
+		return Path.of(filePath).toAbsolutePath().normalize();
+	}
+
+	private static boolean isSelectedRawScanFile(LiveFileMetaData file,
+			String cfName,
+			int shardIndex,
+			int shardCount) {
+		return file.fileName().endsWith(".sst")
+				&& new String(file.columnFamilyName(), StandardCharsets.UTF_8).equals(cfName)
+				&& (shardCount == 1
+						|| Math.floorMod(file.fileName().hashCode(), shardCount)
+						== Math.floorMod(shardIndex, shardCount));
+	}
+
+	private List<LiveFileMetaData> selectedRawScanFiles(RocksDB rocksDB,
+			String cfName,
+			int shardIndex,
+			int shardCount) {
+		return rocksDB.getLiveFilesMetaData()
+				.stream()
+				.filter(file -> isSelectedRawScanFile(file, cfName, shardIndex, shardCount))
+				.sorted(Comparator.comparingInt(LiveFileMetaData::level)
+						.thenComparingLong(LiveFileMetaData::smallestSeqno)
+						.thenComparing(LiveFileMetaData::fileName))
+				.toList();
+	}
+
+	private static Path rawScanDatabasePinRoot(Path sourceDirectory, Path databasePath) {
+		return sourceDirectory
+				.toAbsolutePath()
+				.normalize()
+				.resolve(RAW_SCAN_PIN_DIRECTORY_NAME)
+				.resolve(UUID.nameUUIDFromBytes(databasePath
+						.toAbsolutePath()
+						.normalize()
+						.toString()
+						.getBytes(StandardCharsets.UTF_8)).toString());
+	}
+
+	private void recoverRawScanPinsAtStartup(RocksDB rocksDB,
+			Path databasePath,
+			DatabaseConfig databaseConfig) throws IOException {
+		var sourceDirectories = new LinkedHashSet<Path>();
+		sourceDirectories.add(databasePath.toAbsolutePath().normalize());
+		try {
+			GlobalDatabaseConfig globalConfig = databaseConfig.global();
+			addRawScanConfiguredSourceDirectories(sourceDirectories,
+					databasePath,
+					globalConfig.fallbackColumnOptions());
+			for (NamedColumnConfig columnConfig : globalConfig.columnOptions()) {
+				addRawScanConfiguredSourceDirectories(sourceDirectories, databasePath, columnConfig);
+			}
+		} catch (GestaltException configFailure) {
+			throw new IOException("Failed to resolve raw-scan SST volumes during startup recovery", configFailure);
+		}
+		for (LiveFileMetaData file : rocksDB.getLiveFilesMetaData()) {
+			Path source = rawScanSourcePath(file);
+			Path sourceDirectory = source.getParent();
+			if (sourceDirectory != null) {
+				sourceDirectories.add(sourceDirectory);
 			}
 		}
 
-		private List<LiveFileMetaData> files() {
+		long recoveredFiles = 0L;
+		int recoveredRoots = 0;
+		for (Path sourceDirectory : sourceDirectories) {
+			Path databasePinRoot = rawScanDatabasePinRoot(sourceDirectory, databasePath);
+			if (Files.notExists(databasePinRoot)) {
+				continue;
+			}
+			long filesInRoot;
+			try (var paths = Files.walk(databasePinRoot)) {
+				filesInRoot = paths.filter(Files::isRegularFile).count();
+			}
+			deleteRawScanPinTree(databasePinRoot);
+			recoveredFiles += filesInRoot;
+			recoveredRoots++;
+		}
+		if (recoveredRoots > 0) {
+			logger.warn("Removed {} orphaned raw-scan SST hard links from {} pin roots during startup",
+					recoveredFiles,
+					recoveredRoots);
+		}
+	}
+
+	private static void addRawScanConfiguredSourceDirectories(Set<Path> sourceDirectories,
+			Path databasePath,
+			FallbackColumnConfig columnConfig) throws GestaltException {
+		for (RocksDBLoader.DbPathRecord volume : RocksDBLoader.getVolumeConfigs(databasePath, columnConfig)) {
+			sourceDirectories.add(volume.path().toAbsolutePath().normalize());
+		}
+	}
+
+	private Path prepareRawScanPinRoot(Path sourceDirectory) throws IOException {
+		Path databasePinRoot = rawScanDatabasePinRoot(sourceDirectory, definitiveDbPath);
+		synchronized (rawScanPinInitializationLock) {
+			if (initializedRawScanPinRoots.add(databasePinRoot)) {
+				// A process crash cannot run Reactor cleanup. Remove only this database's
+				// prior pin namespace, before entering the deletion-disabled critical section.
+				deleteRawScanPinTree(databasePinRoot);
+			}
+			Files.createDirectories(databasePinRoot);
+		}
+		return databasePinRoot;
+	}
+
+	private static void deleteRawScanPinTree(Path root) throws IOException {
+		if (Files.notExists(root)) {
+			return;
+		}
+		try (var paths = Files.walk(root)) {
+			for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+				Files.deleteIfExists(path);
+			}
+		}
+	}
+
+	@VisibleForTesting
+	protected long rawScanPinMaxDurationNanos() {
+		return RAW_SCAN_PIN_MAX_DURATION_NANOS;
+	}
+
+	private void checkRawScanPinDeadline(long startedNanos) throws IOException {
+		long maximumDurationNanos = rawScanPinMaxDurationNanos();
+		if (System.nanoTime() - startedNanos > maximumDurationNanos) {
+			throw new IOException("Raw-scan SST pinning exceeded the configured maximum duration of "
+					+ TimeUnit.NANOSECONDS.toMillis(maximumDurationNanos)
+					+ " ms");
+		}
+	}
+
+	private final class PinnedSstFile implements AutoCloseable {
+		private final LiveFileMetaData metadata;
+		private final Path path;
+		private final long size;
+		private boolean closed;
+
+		private PinnedSstFile(LiveFileMetaData metadata, Path path) {
+			this.metadata = metadata;
+			this.path = path;
+			this.size = metadata.size();
+			if (!activeRawScanPinnedFiles.add(path)) {
+				throw new IllegalStateException("Raw-scan SST pin path is already active: " + path);
+			}
+			activeRawScanPinnedBytes.addAndGet(size);
+		}
+
+		private String fileName() {
+			return metadata.fileName();
+		}
+
+		private Path path() {
+			return path;
+		}
+
+		@Override
+		public synchronized void close() {
+			if (closed) {
+				return;
+			}
+			try {
+				Files.deleteIfExists(path);
+			} catch (IOException failure) {
+				throw new UncheckedIOException("Failed to release raw-scan SST pin " + path, failure);
+			}
+			closed = true;
+			activeRawScanPinnedFiles.remove(path);
+			activeRawScanPinnedBytes.addAndGet(-size);
+		}
+	}
+
+	/**
+	 * Captures immutable SST contents without holding RocksDB's database-wide
+	 * file-deletion switch for the lifetime of the scan. Targets live beside their
+	 * source files, so hard links cannot cross a filesystem. There is deliberately no
+	 * copy fallback: copying a multi-terabyte column while deletion is disabled would
+	 * recreate the unbounded WAL/obsolete-file retention this lease is meant to avoid.
+	 */
+	private final class RawScanPinnedSstSet implements AutoCloseable {
+		private final List<PinnedSstFile> files;
+		private final Set<Path> scanDirectories;
+		private boolean closed;
+
+		private RawScanPinnedSstSet(String cfName, int shardIndex, int shardCount)
+				throws IOException, org.rocksdb.RocksDBException {
+			var pinnedFiles = new ArrayList<PinnedSstFile>();
+			var createdScanDirectories = new LinkedHashSet<Path>();
+			var scanId = UUID.randomUUID().toString();
+			Throwable captureFailure = null;
+			synchronized (rawScanPinAcquisitionLock) {
+				RocksDB rocksDB = db.get();
+				for (LiveFileMetaData file : selectedRawScanFiles(rocksDB, cfName, shardIndex, shardCount)) {
+					Path source = rawScanSourcePath(file);
+					Path sourceDirectory = Objects.requireNonNull(source.getParent(),
+							"Raw-scan SST has no parent directory: " + source);
+					prepareRawScanPinRoot(sourceDirectory);
+				}
+
+				rocksDB.disableFileDeletions();
+				long startedNanos = System.nanoTime();
+				try {
+					var scanDirectoriesBySource = new HashMap<Path, Path>();
+					for (LiveFileMetaData file : selectedRawScanFiles(rocksDB,
+							cfName,
+							shardIndex,
+							shardCount)) {
+						checkRawScanPinDeadline(startedNanos);
+						Path source = rawScanSourcePath(file);
+						Path sourceDirectory = Objects.requireNonNull(source.getParent(),
+								"Raw-scan SST has no parent directory: " + source);
+						Path scanDirectory = scanDirectoriesBySource.get(sourceDirectory);
+						if (scanDirectory == null) {
+							scanDirectory = prepareRawScanPinRoot(sourceDirectory).resolve(scanId);
+							Files.createDirectories(scanDirectory);
+							scanDirectoriesBySource.put(sourceDirectory, scanDirectory);
+							createdScanDirectories.add(scanDirectory);
+						}
+						Path pinnedPath = scanDirectory.resolve(source.getFileName().toString());
+						createRawScanHardLink(source, pinnedPath);
+						pinnedFiles.add(new PinnedSstFile(file, pinnedPath));
+						checkRawScanPinDeadline(startedNanos);
+					}
+				} catch (Throwable failure) {
+					captureFailure = failure;
+					rawScanPinAcquisitionFailures.increment();
+				} finally {
+					rawScanFileDeletionRecovery.release(rocksDB);
+					rawScanPinAcquisitionTimer.record(System.nanoTime() - startedNanos, TimeUnit.NANOSECONDS);
+				}
+			}
+
+			if (captureFailure != null) {
+				captureFailure = cleanupPinnedFiles(pinnedFiles, createdScanDirectories, captureFailure);
+				if (captureFailure instanceof IOException ioFailure) {
+					throw ioFailure;
+				}
+				if (captureFailure instanceof RuntimeException runtimeFailure) {
+					throw runtimeFailure;
+				}
+				if (captureFailure instanceof Error error) {
+					throw error;
+				}
+				throw new IOException("Failed to pin raw-scan SST files", captureFailure);
+			}
+			this.files = List.copyOf(pinnedFiles);
+			this.scanDirectories = Set.copyOf(createdScanDirectories);
+		}
+
+		private List<PinnedSstFile> files() {
 			return files;
 		}
 
@@ -8151,8 +8442,32 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return;
 			}
 			closed = true;
-			rawScanFileDeletionRecovery.release(rocksDB);
+			Throwable failure = cleanupPinnedFiles(files, scanDirectories, null);
+			if (failure != null) {
+				throw new IllegalStateException("Failed to clean up raw-scan SST pins", failure);
+			}
 		}
+	}
+
+	private static @Nullable Throwable cleanupPinnedFiles(Collection<PinnedSstFile> files,
+			Collection<Path> scanDirectories,
+			@Nullable Throwable originalFailure) {
+		Throwable failure = originalFailure;
+		for (PinnedSstFile file : files) {
+			try {
+				file.close();
+			} catch (Throwable cleanupFailure) {
+				failure = appendFailure(failure, cleanupFailure);
+			}
+		}
+		for (Path scanDirectory : scanDirectories) {
+			try {
+				Files.deleteIfExists(scanDirectory);
+			} catch (Throwable cleanupFailure) {
+				failure = appendFailure(failure, cleanupFailure);
+			}
+		}
+		return failure;
 	}
 
 	private final class ScanState implements RWScheduler.CooperativeCompletionTask,
@@ -8164,7 +8479,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				varHandle(ScanState.class, "terminated", boolean.class);
 		private final ColumnInstance col;
 		private final String cfName;
-		private final LiveFileMetaData file;
+		private final PinnedSstFile file;
 		private final FluxSink<SerializedKVBatch> sink;
 		private final long maximumQuantumNanos;
 		private volatile long demand;
@@ -8185,7 +8500,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private ScanState(ColumnInstance col,
 		                  String cfName,
-		                  LiveFileMetaData file,
+		                  PinnedSstFile file,
 		                  FluxSink<SerializedKVBatch> sink,
 		                  long maximumQuantumNanos) {
 			this.col = col;
@@ -8208,10 +8523,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (it != null) {
 				return;
 			}
-			String filePath = file.path();
-			if (!filePath.endsWith(".sst")) {
-				filePath = filePath + file.fileName();
-			}
+			String filePath = file.path().toString();
 
 			Options createdOptions = null;
 			SstFileReader createdReader = null;
@@ -8521,6 +8833,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					failure = appendFailure(failure, error);
 				}
 			}
+			try {
+				file.close();
+			} catch (Throwable error) {
+				failure = appendFailure(failure, error);
+			}
 			var cleanupObserver = rawScanCleanupObserver;
 			if (cleanupObserver != null) {
 				try {
@@ -8589,14 +8906,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 
 			return Flux.using(
-					RawScanFileDeletionLease::new,
-					lease -> {
+					() -> new RawScanPinnedSstSet(cfName, shardIndex, shardCount),
+					pinnedSsts -> {
 						var observer = rawScanFilesCapturedObserver;
 						if (observer != null) {
 							observer.run();
 						}
 
-						Function<LiveFileMetaData, Publisher<SerializedKVBatch>> mapper = f ->
+						Function<PinnedSstFile, Publisher<SerializedKVBatch>> mapper = f ->
 								Flux.<SerializedKVBatch>create(rawSink -> {
 									var state = new ScanState(col, cfName, f, rawSink, maximumQuantumNanos);
 									rawSink.onRequest(state);
@@ -8612,20 +8929,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								}, FluxSink.OverflowStrategy.ERROR)
 										.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
 
-						var ssts = Flux.fromIterable(lease.files())
-								.filter(f -> new String(f.columnFamilyName(), StandardCharsets.UTF_8).equals(cfName))
-								.filter(f -> f.fileName().endsWith(".sst"));
+						var ssts = Flux.fromIterable(pinnedSsts.files());
 
 						if (shardCount == 1) {
 							return ssts.flatMap(mapper, 4, 1);
 						} else {
-							return ssts
-									.filter(m -> Math.floorMod(m.fileName().hashCode(), shardCount)
-											== Math.floorMod(shardIndex, shardCount))
-									.concatMap(mapper, 2);
+							return ssts.concatMap(mapper, 2);
 						}
 					},
-					RawScanFileDeletionLease::close,
+					RawScanPinnedSstSet::close,
 					true);
 				}),
 				columnUse -> {

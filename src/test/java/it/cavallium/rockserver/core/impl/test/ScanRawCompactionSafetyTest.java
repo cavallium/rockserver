@@ -225,7 +225,7 @@ class ScanRawCompactionSafetyTest {
 	}
 
 	@Test
-	void compactionCannotDeleteCapturedSstsUntilScanCompletes(@TempDir Path tempDir) throws Exception {
+	void compactionCanDeleteOriginalSstsWhilePinnedScanCompletes(@TempDir Path tempDir) throws Exception {
 		Path configFile = tempDir.resolve("scan-raw.conf");
 		Files.writeString(configFile, """
 				database: { global: {
@@ -259,6 +259,11 @@ class ScanRawCompactionSafetyTest {
 					.toFuture();
 			try {
 				assertTrue(filesCaptured.await(10, TimeUnit.SECONDS), "Raw scan did not capture its SST list");
+				Set<Path> pinnedFiles = internal.getRawScanPinnedFilesForTesting();
+				assertEquals(capturedFiles.size(), pinnedFiles.size());
+				assertHardLinks(capturedFiles, pinnedFiles);
+				assertFileDeletionsEnabled(internal);
+
 				api.compact();
 
 				Set<Path> currentFiles = liveColumnSsts(internal);
@@ -266,8 +271,9 @@ class ScanRawCompactionSafetyTest {
 				obsoleteCapturedFiles.removeAll(currentFiles);
 				assertFalse(obsoleteCapturedFiles.isEmpty(),
 						"Manual compaction must replace at least one captured input SST");
-				assertTrue(obsoleteCapturedFiles.stream().allMatch(Files::exists),
-						"Captured input SSTs must stay on disk while their raw scan is active");
+				awaitFilesDeleted(obsoleteCapturedFiles, Duration.ofSeconds(10));
+				assertTrue(pinnedFiles.stream().allMatch(Files::exists),
+						"Raw-scan hard links must retain captured SST contents after RocksDB deletes originals");
 
 				allowReadersToOpen.countDown();
 				var batches = scan.get(30, TimeUnit.SECONDS);
@@ -278,7 +284,8 @@ class ScanRawCompactionSafetyTest {
 				assertEquals((long) GENERATIONS * KEYS_PER_GENERATION, entries,
 						"The scan must read every captured physical generation, even after compaction");
 
-				awaitFilesDeleted(obsoleteCapturedFiles, Duration.ofSeconds(10));
+				awaitFilesDeleted(pinnedFiles, Duration.ofSeconds(10));
+				assertFileDeletionsEnabled(internal);
 			} finally {
 				internal.setRawScanFilesCapturedObserverForTesting(null);
 				allowReadersToOpen.countDown();
@@ -290,7 +297,7 @@ class ScanRawCompactionSafetyTest {
 	}
 
 	@Test
-	void cancellationReleasesTheFileDeletionLease(@TempDir Path tempDir) throws Exception {
+	void cancellationReleasesPinnedSstsWithoutChangingFileDeletionState(@TempDir Path tempDir) throws Exception {
 		Path configFile = tempDir.resolve("scan-raw-cancel.conf");
 		Files.writeString(configFile, """
 				database: { global: {
@@ -320,8 +327,13 @@ class ScanRawCompactionSafetyTest {
 					.toFuture();
 			try {
 				assertTrue(filesCaptured.await(10, TimeUnit.SECONDS));
+				Set<Path> pinnedFiles = internal.getRawScanPinnedFilesForTesting();
+				assertEquals(capturedFiles.size(), pinnedFiles.size());
+				assertFileDeletionsEnabled(internal);
 				assertTrue(scan.cancel(true));
 				allowReadersToOpen.countDown();
+				awaitFilesDeleted(pinnedFiles, Duration.ofSeconds(10));
+				assertFileDeletionsEnabled(internal);
 				api.compact();
 
 				Set<Path> obsoleteCapturedFiles = new LinkedHashSet<>(capturedFiles);
@@ -332,6 +344,124 @@ class ScanRawCompactionSafetyTest {
 				internal.setRawScanFilesCapturedObserverForTesting(null);
 				allowReadersToOpen.countDown();
 			}
+		}
+	}
+
+	@Test
+	void hardLinkFailureDoesNotCopyOrLeaveFileDeletionDisabled(@TempDir Path tempDir) throws Exception {
+		Path configFile = tempDir.resolve("scan-raw-link-failure.conf");
+		Files.writeString(configFile, """
+				database: { global: {
+				  ingest-behind: false
+				  optimistic: false
+				  disable-auto-compactions: true
+				  disable-write-slowdown: true
+				} }
+				""");
+		try (var db = new FailSecondHardLinkEmbeddedDB(tempDir.resolve("db"),
+				"scan-raw-link-failure",
+				configFile)) {
+			long columnId = db.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			writeOverlappingSsts(db, columnId);
+
+			RuntimeException failure = assertThrows(RuntimeException.class,
+					() -> db.scanRawAsyncInternal(columnId, 0, 1).collectList().block());
+			assertTrue(hasCauseMessage(failure, "synthetic hard-link failure"),
+					"The raw scan must expose the hard-link failure instead of copying the SST: " + failure);
+			assertTrue(db.getRawScanPinnedFilesForTesting().isEmpty(),
+					"Partial pin acquisition must release every hard link");
+			assertFileDeletionsEnabled(db);
+		}
+	}
+
+	@Test
+	void pinAcquisitionDeadlineFailsClosed(@TempDir Path tempDir) throws Exception {
+		try (var db = new ExpiredPinDeadlineEmbeddedDB(tempDir.resolve("db"), "scan-raw-pin-timeout")) {
+			long columnId = db.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			db.put(0, columnId, key(1), value(0, 1), RequestType.none());
+			db.flush();
+
+			RuntimeException failure = assertThrows(RuntimeException.class,
+					() -> db.scanRawAsyncInternal(columnId, 0, 1).collectList().block());
+			assertTrue(hasCauseMessage(failure, "exceeded the configured maximum duration"));
+			assertTrue(db.getRawScanPinnedFilesForTesting().isEmpty());
+			assertFileDeletionsEnabled(db);
+		}
+	}
+
+	@Test
+	void nextProcessRemovesOrphanedPinsDuringStartup(@TempDir Path tempDir) throws Exception {
+		Path databasePath = tempDir.resolve("db");
+		String databaseName = "scan-raw-orphan-cleanup";
+		Path firstVolume = tempDir.resolve("sst-volume-a");
+		Path secondVolume = tempDir.resolve("sst-volume-b");
+		Path configFile = tempDir.resolve("scan-raw-orphan-cleanup.conf");
+		Files.writeString(configFile, """
+				database: { global: {
+				  ingest-behind: false
+				  optimistic: false
+				  fallback-column-options: { volumes: [
+				    { volume-path: "%s", target-size: "1TiB" }
+				    { volume-path: "%s", target-size: "1TiB" }
+				  ] }
+				} }
+				""".formatted(firstVolume, secondVolume));
+		Path databasePinRoot;
+		Path sourceSst;
+		try (var connection = new EmbeddedConnection(databasePath, databaseName, configFile)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			long columnId = api.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			api.put(0, columnId, key(1), value(0, 1), RequestType.none());
+			api.flush();
+			connection.getInternalDB().scanRawAsyncInternal(columnId, 0, 1).blockLast();
+
+			sourceSst = liveColumnSsts(connection.getInternalDB()).iterator().next();
+			Path pinRoot = sourceSst.getParent().resolve(".rockserver-raw-scan-pins");
+			try (var roots = Files.list(pinRoot)) {
+				databasePinRoot = roots.findFirst().orElseThrow();
+			}
+		}
+
+		Path orphanDirectory = databasePinRoot.resolve("orphaned-process");
+		Files.createDirectories(orphanDirectory);
+		Path orphanPin = orphanDirectory.resolve(sourceSst.getFileName());
+		Files.createLink(orphanPin, sourceSst);
+		assertTrue(Files.exists(orphanPin));
+
+		Path unusedConfiguredVolume = sourceSst.getParent().equals(firstVolume)
+				? secondVolume
+				: firstVolume;
+		Path unusedVolumeDatabasePinRoot = unusedConfiguredVolume
+				.resolve(".rockserver-raw-scan-pins")
+				.resolve(databasePinRoot.getFileName());
+		Path unusedVolumeOrphanDirectory = unusedVolumeDatabasePinRoot.resolve("orphaned-process");
+		Files.createDirectories(unusedVolumeOrphanDirectory);
+		Path unusedVolumeOrphanPin = unusedVolumeOrphanDirectory.resolve(sourceSst.getFileName());
+		Files.createLink(unusedVolumeOrphanPin, sourceSst);
+
+		Path otherDatabasePin = sourceSst.getParent()
+				.resolve(".rockserver-raw-scan-pins")
+				.resolve("other-database")
+				.resolve(sourceSst.getFileName());
+		Files.createDirectories(otherDatabasePin.getParent());
+		Files.createLink(otherDatabasePin, sourceSst);
+
+		try (var connection = new EmbeddedConnection(databasePath, databaseName, configFile)) {
+			EmbeddedDB internal = connection.getInternalDB();
+			assertFalse(Files.exists(orphanPin),
+					"Restart must remove hard links left by an interrupted raw scan before another scan");
+			assertFalse(Files.exists(databasePinRoot),
+					"Restart recovery must remove the interrupted process's complete pin namespace");
+			assertFalse(Files.exists(unusedVolumeOrphanPin),
+					"Restart must inspect configured SST volumes even when they contain no live SST");
+			assertFalse(Files.exists(unusedVolumeDatabasePinRoot));
+			assertTrue(Files.exists(otherDatabasePin),
+					"Recovery for one database must not delete another database's pin namespace");
+			assertTrue(internal.getRawScanPinnedFilesForTesting().isEmpty());
+			assertFileDeletionsEnabled(internal);
 		}
 	}
 
@@ -403,6 +533,32 @@ class ScanRawCompactionSafetyTest {
 		return Path.of(filePath);
 	}
 
+	private static void assertHardLinks(Set<Path> originals, Set<Path> pins) throws IOException {
+		for (Path original : originals) {
+			Path pin = pins.stream()
+					.filter(candidate -> candidate.getFileName().equals(original.getFileName()))
+					.findFirst()
+					.orElseThrow(() -> new AssertionError("Missing pin for " + original));
+			assertTrue(Files.isSameFile(original, pin),
+					() -> "Raw scan must hard-link rather than copy " + original);
+		}
+	}
+
+	private static void assertFileDeletionsEnabled(EmbeddedDB db) throws org.rocksdb.RocksDBException {
+		assertEquals(1L,
+				db.getDb().get().getLongProperty("rocksdb.is-file-deletions-enabled"),
+				"A raw scan must not keep RocksDB file and WAL deletion disabled");
+	}
+
+	private static boolean hasCauseMessage(Throwable failure, String expected) {
+		for (Throwable current = failure; current != null; current = current.getCause()) {
+			if (current.getMessage() != null && current.getMessage().contains(expected)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private static void awaitFilesDeleted(Set<Path> files, Duration timeout) throws InterruptedException {
 		long deadline = System.nanoTime() + timeout.toNanos();
 		do {
@@ -455,6 +611,34 @@ class ScanRawCompactionSafetyTest {
 			}
 			super.enableRawScanFileDeletions(rocksDB);
 			recovered.countDown();
+		}
+	}
+
+	private static final class FailSecondHardLinkEmbeddedDB extends EmbeddedDB {
+		private final AtomicInteger hardLinkAttempts = new AtomicInteger();
+
+		private FailSecondHardLinkEmbeddedDB(Path path, String name, Path configPath) throws IOException {
+			super(path, name, configPath);
+		}
+
+		@Override
+		protected void createRawScanHardLink(Path source, Path target) throws IOException {
+			if (hardLinkAttempts.incrementAndGet() == 2) {
+				throw new IOException("synthetic hard-link failure");
+			}
+			super.createRawScanHardLink(source, target);
+		}
+	}
+
+	private static final class ExpiredPinDeadlineEmbeddedDB extends EmbeddedDB {
+
+		private ExpiredPinDeadlineEmbeddedDB(Path path, String name) throws IOException {
+			super(path, name, null);
+		}
+
+		@Override
+		protected long rawScanPinMaxDurationNanos() {
+			return 0L;
 		}
 	}
 }
