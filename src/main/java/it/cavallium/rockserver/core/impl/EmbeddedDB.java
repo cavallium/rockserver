@@ -290,7 +290,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final int RAW_SCAN_MAX_ENTRIES_PER_CHUNK = 65_536;
 	private static final long RAW_SCAN_MAX_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
 	private static final long RAW_SCAN_PIN_MAX_DURATION_NANOS = TimeUnit.MILLISECONDS.toNanos(Math.max(1L,
-			Long.getLong("it.cavallium.rockserver.raw-scan.pin-max-duration-ms", 30_000L)));
+			Long.getLong("it.cavallium.rockserver.raw-scan.pin-max-duration-ms", 120_000L)));
 	private static final String RAW_SCAN_PIN_DIRECTORY_NAME = ".rockserver-raw-scan-pins";
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final String SHUTDOWN_PENDING_OPS_TIMEOUT_MS_PROPERTY
