@@ -560,7 +560,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		var beforeLoad = Instant.now();
-		var loadedDb = RocksDBLoader.load(path, config, logger);
+		var loadedDb = RocksDBLoader.load(path, config, logger, metrics.getRegistry(), name);
 		try {
 			recoverRawScanPinsAtStartup(loadedDb.db().get(), loadedDb.definitiveDbPath(), config);
 		} catch (IOException | RuntimeException | Error recoveryFailure) {

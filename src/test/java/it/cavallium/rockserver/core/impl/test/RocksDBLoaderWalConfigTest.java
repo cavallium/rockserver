@@ -2,9 +2,12 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
@@ -46,17 +49,34 @@ class RocksDBLoaderWalConfigTest {
     void typedWalConfigurationReachesNativeOptionsAndStartupDiagnostics(@TempDir Path tempDir)
             throws Exception {
         var logger = mock(Logger.class);
-        var loaded = RocksDBLoader.load(tempDir.resolve("wal-config-db"), ConfigParser.parseDefault(), logger);
+        var registry = new SimpleMeterRegistry();
         try {
-            assertEquals(4L * 1024 * 1024 * 1024, loaded.dbOptions().maxTotalWalSize());
-            assertEquals(86_400L, loaded.dbOptions().walTtlSeconds());
-            assertEquals(102_400L, loaded.dbOptions().walSizeLimitMB());
-            verify(logger).info("Opened RocksDB with effective WAL configuration: "
-                    + "max-total-wal-size=4GiB (4294967296 bytes), wal-ttl-seconds=86400, "
-                    + "wal-size-limit-mb=102400");
+            var loaded = RocksDBLoader.load(tempDir.resolve("wal-config-db"),
+                    ConfigParser.parseDefault(), logger, registry, "wal-config-test");
+            try {
+                assertEquals(4L * 1024 * 1024 * 1024, loaded.dbOptions().maxTotalWalSize());
+                assertEquals(86_400L, loaded.dbOptions().walTtlSeconds());
+                assertEquals(102_400L, loaded.dbOptions().walSizeLimitMB());
+                assertEquals(0.0d, registry.get("rocksdb.startup.native.open.active")
+                        .tag("database", "wal-config-test").gauge().value());
+                assertEquals(1.0d, registry.get("rocksdb.startup.wal.observed.progress.ratio")
+                        .tag("database", "wal-config-test").gauge().value());
+                assertEquals(1.0d, registry.get("rocksdb.startup.native.open.completions")
+                        .tag("database", "wal-config-test")
+                        .tag("outcome", "success")
+                        .counter()
+                        .count());
+                verify(logger).info(startsWith("Starting RocksDB native open:"), any(Object[].class));
+                verify(logger).info(startsWith("Completed RocksDB native open:"), any(Object[].class));
+                verify(logger).info("Opened RocksDB with effective WAL configuration: "
+                        + "max-total-wal-size=4GiB (4294967296 bytes), wal-ttl-seconds=86400, "
+                        + "wal-size-limit-mb=102400");
+            } finally {
+                loaded.db().close();
+                loaded.refs().close();
+            }
         } finally {
-            loaded.db().close();
-            loaded.refs().close();
+            registry.close();
         }
     }
 

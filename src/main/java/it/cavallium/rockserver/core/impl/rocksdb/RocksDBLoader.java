@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
 import it.cavallium.rockserver.core.impl.DelegatingMergeOperator;
@@ -526,6 +527,14 @@ public class RocksDBLoader {
     }
 
     public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger) {
+        return load(path, config, logger, null, null);
+    }
+
+    public static LoadedDb load(@Nullable Path path,
+            DatabaseConfig config,
+            Logger logger,
+            @Nullable MeterRegistry meterRegistry,
+            @Nullable String databaseName) {
         var refs = new RocksDBObjects();
         try {
             // Get databases directory path
@@ -540,7 +549,8 @@ public class RocksDBLoader {
                 }
             }
             var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
-            return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger);
+            return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger,
+                    meterRegistry, databaseName);
         } catch (RuntimeException | Error failure) {
             try {
                 refs.close();
@@ -882,7 +892,8 @@ public class RocksDBLoader {
 
     private static LoadedDb loadDb(@Nullable Path path,
         @NotNull Path definitiveDbPath,
-        DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger) {
+        DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger,
+        @Nullable MeterRegistry meterRegistry, @Nullable String databaseName) {
         var inMemory = path == null;
         var rocksdbOptions = optionsWithCache.options();
         Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap = new HashMap<>();
@@ -955,40 +966,62 @@ public class RocksDBLoader {
             var handles = new ArrayList<ColumnFamilyHandle>();
             RocksDB db;
             boolean envRegistered = false;
-            // a factory method that returns a RocksDB instance
-            if (databaseOptions.global().optimistic()) {
-                RocksDBEnvLifecycle.beforeOpen(rocksdbOptions.getEnv());
-                envRegistered = true;
+            var effectiveDatabaseName = databaseName != null
+                    ? databaseName
+                    : Objects.requireNonNullElse(definitiveDbPath.getFileName(), Path.of("default")).toString();
+            var effectiveWalDirectory = walPath.orElse(definitiveDbPath);
+            var statistics = rocksdbOptions.statistics();
+            try (var openMonitor = RocksDBOpenProgressMonitor.prepare(
+                    logger,
+                    effectiveDatabaseName,
+                    definitiveDbPath,
+                    effectiveWalDirectory,
+                    meterRegistry,
+                    () -> statistics == null ? 0L : statistics.getTickerCount(TickerType.FLUSH_WRITE_BYTES))) {
+                openMonitor.start();
                 try {
-                    db = OptimisticTransactionDB.open(rocksdbOptions, definitiveDbPath.toString(), descriptors, handles);
-                } catch (RocksDBException | RuntimeException ex) {
-                    RocksDBEnvLifecycle.openFailed();
-                    envRegistered = false;
-                    throw ex;
-                }
-            } else {
-                var transactionOptions = new TransactionDBOptions() {
-                  {
-                    RocksLeakDetector.register(this, "transaction-db-options", owningHandle_);
-                  }
-                }
-                    .setWritePolicy(TxnDBWritePolicy.WRITE_COMMITTED)
-                    .setTransactionLockTimeout(5000)
-                    .setDefaultLockTimeout(5000);
-                refs.add(transactionOptions);
-                RocksDBEnvLifecycle.beforeOpen(rocksdbOptions.getEnv());
-                envRegistered = true;
-                try {
-                    db = TransactionDB.open(rocksdbOptions,
-                        transactionOptions,
-                        definitiveDbPath.toString(),
-                        descriptors,
-                        handles
-                    );
-                } catch (RocksDBException | RuntimeException ex) {
-                    RocksDBEnvLifecycle.openFailed();
-                    envRegistered = false;
-                    throw ex;
+                    // A factory method that returns a RocksDB instance. WAL recovery, manifest recovery,
+                    // and any recovery flushes execute synchronously inside this native call.
+                    if (databaseOptions.global().optimistic()) {
+                        RocksDBEnvLifecycle.beforeOpen(rocksdbOptions.getEnv());
+                        envRegistered = true;
+                        try {
+                            db = OptimisticTransactionDB.open(
+                                    rocksdbOptions, definitiveDbPath.toString(), descriptors, handles);
+                        } catch (RocksDBException | RuntimeException ex) {
+                            RocksDBEnvLifecycle.openFailed();
+                            envRegistered = false;
+                            throw ex;
+                        }
+                    } else {
+                        var transactionOptions = new TransactionDBOptions() {
+                          {
+                            RocksLeakDetector.register(this, "transaction-db-options", owningHandle_);
+                          }
+                        }
+                            .setWritePolicy(TxnDBWritePolicy.WRITE_COMMITTED)
+                            .setTransactionLockTimeout(5000)
+                            .setDefaultLockTimeout(5000);
+                        refs.add(transactionOptions);
+                        RocksDBEnvLifecycle.beforeOpen(rocksdbOptions.getEnv());
+                        envRegistered = true;
+                        try {
+                            db = TransactionDB.open(rocksdbOptions,
+                                transactionOptions,
+                                definitiveDbPath.toString(),
+                                descriptors,
+                                handles
+                            );
+                        } catch (RocksDBException | RuntimeException ex) {
+                            RocksDBEnvLifecycle.openFailed();
+                            envRegistered = false;
+                            throw ex;
+                        }
+                    }
+                    openMonitor.succeeded();
+                } catch (RocksDBException | RuntimeException | Error failure) {
+                    openMonitor.failed(failure);
+                    throw failure;
                 }
             }
 
