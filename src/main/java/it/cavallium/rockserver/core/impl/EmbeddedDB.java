@@ -6102,11 +6102,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								: null;
 				try (var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null; var endKeySlice =
 						calculatedEndKey != null ? toSlice(calculatedEndKey) : null) {
-					if (startKeySlice != null) {
-						ro.setIterateLowerBound(startKeySlice);
-					}
-					if (endKeySlice != null) {
-						ro.setIterateUpperBound(endKeySlice);
+					boolean endpointSeek = requestType instanceof RequestType.RequestGetFirstAndLast<?>;
+					if (!endpointSeek) {
+						if (startKeySlice != null) {
+							ro.setIterateLowerBound(startKeySlice);
+						}
+						if (endKeySlice != null) {
+							ro.setIterateUpperBound(endKeySlice);
+						}
 					}
 
 					RocksIterator it;
@@ -6134,11 +6137,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								yield count;
 							}
 							case RequestType.RequestGetFirstAndLast<?> _ -> {
-								var first = seekLogicalEndpoint(it, col, reverse);
+								var first = seekLogicalEndpoint(it,
+										col,
+										reverse,
+										calculatedStartKey,
+										calculatedEndKey);
 								if (first == null) {
 									yield new FirstAndLast<>(null, null);
 								}
-								var last = Objects.requireNonNull(seekLogicalEndpoint(it, col, !reverse));
+								var last = Objects.requireNonNull(seekLogicalEndpoint(it,
+										col,
+										!reverse,
+										calculatedStartKey,
+										calculatedEndKey));
 								yield new FirstAndLast<>(first, last);
 							}
 						};
@@ -6155,14 +6166,48 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private @Nullable KV seekLogicalEndpoint(RocksIterator iterator, ColumnInstance column, boolean fromEnd) {
+	private @Nullable KV seekLogicalEndpoint(RocksIterator iterator,
+			ColumnInstance column,
+			boolean fromEnd,
+			@Nullable Buf startKeyInclusive,
+			@Nullable Buf endKeyExclusive) {
+		byte[] inclusiveStart = startKeyInclusive != null ? startKeyInclusive.toByteArray() : null;
+		byte[] exclusiveEnd = endKeyExclusive != null ? endKeyExclusive.toByteArray() : null;
 		if (fromEnd) {
-			iterator.seekToLast();
+			if (exclusiveEnd == null) {
+				iterator.seekToLast();
+			} else {
+				iterator.seek(exclusiveEnd);
+				if (iterator.isValid()) {
+					iterator.prev();
+				} else {
+					iterator.seekToLast();
+				}
+			}
 		} else {
-			iterator.seekToFirst();
+			if (inclusiveStart == null) {
+				iterator.seekToFirst();
+			} else {
+				iterator.seek(inclusiveStart);
+			}
 		}
 		while (iterator.isValid()) {
-			var calculatedKey = toBuf(iterator.key());
+			byte[] rawKey = iterator.key();
+			if (inclusiveStart != null && Arrays.compareUnsigned(rawKey, inclusiveStart) < 0) {
+				if (fromEnd) {
+					return null;
+				}
+				iterator.next();
+				continue;
+			}
+			if (exclusiveEnd != null && Arrays.compareUnsigned(rawKey, exclusiveEnd) >= 0) {
+				if (!fromEnd) {
+					return null;
+				}
+				iterator.prev();
+				continue;
+			}
+			var calculatedKey = toBuf(rawKey);
 			var calculatedValue = (column.schema().hasValue() || column.hasBuckets())
 					? toBuf(iterator.value())
 					: emptyBuf();

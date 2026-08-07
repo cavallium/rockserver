@@ -15,6 +15,8 @@
     <maven.compiler.release>25</maven.compiler.release>
     <native.maven.plugin.version>0.10.6</native.maven.plugin.version>
     <gestalt.version>0.37.2</gestalt.version>
+    <jazzer.version>0.30.0</jazzer.version>
+    <junit.version>5.14.3</junit.version>
     <rocksdb.version>11.8.0.1</rocksdb.version>
     <slf4j.version>2.0.17</slf4j.version>
     <imageName>rockserver-core</imageName>
@@ -92,6 +94,13 @@
         <groupId>io.micrometer</groupId>
         <artifactId>micrometer-bom</artifactId>
         <version>1.15.11</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>${junit.version}</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
@@ -311,8 +320,26 @@
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
-      <version>5.14.3</version>
       <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.code-intelligence</groupId>
+      <artifactId>jazzer-api</artifactId>
+      <version>${jazzer.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.code-intelligence</groupId>
+      <artifactId>jazzer-junit</artifactId>
+      <version>${jazzer.version}</version>
+      <scope>test</scope>
+      <exclusions>
+        <!-- The all-in-one jar duplicates jazzer-junit's package on the JPMS module path. -->
+        <exclusion>
+          <groupId>com.code-intelligence</groupId>
+          <artifactId>jazzer</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <dependency>
       <groupId>io.projectreactor</groupId>
@@ -394,8 +421,41 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
         <configuration>
-          <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+          <argLine>-XX:+EnableDynamicAgentLoading --enable-native-access=ALL-UNNAMED</argLine>
+          <systemPropertyVariables>
+            <jazzer.instrument>it.cavallium.rockserver.**</jazzer.instrument>
+          </systemPropertyVariables>
         </configuration>
+        <executions>
+          <execution>
+            <id>default-test</id>
+            <configuration>
+              <excludes>
+                <exclude>**/*FuzzTest.java</exclude>
+              </excludes>
+            </configuration>
+          </execution>
+          <execution>
+            <id>fuzz-regressions</id>
+            <goals>
+              <goal>test</goal>
+            </goals>
+            <configuration>
+              <!-- Jazzer 0.30.0 is not split-package-safe on the module path. -->
+              <useModulePath>false</useModulePath>
+              <includes>
+                <include>**/*FuzzTest.java</include>
+              </includes>
+              <additionalClasspathDependencies>
+                <additionalClasspathDependency>
+                  <groupId>com.code-intelligence</groupId>
+                  <artifactId>jazzer</artifactId>
+                  <version>${jazzer.version}</version>
+                </additionalClasspathDependency>
+              </additionalClasspathDependencies>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
       <plugin>
         <artifactId>maven-failsafe-plugin</artifactId>

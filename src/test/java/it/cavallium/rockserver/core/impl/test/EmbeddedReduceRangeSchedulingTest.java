@@ -79,6 +79,39 @@ class EmbeddedReduceRangeSchedulingTest {
 	}
 
 	@Test
+	void boundedFirstAndLastPositionsAgainstBothIteratorBounds() throws Exception {
+		try (var connection = new EmbeddedConnection(tempDir.resolve("bounded-db"), "bounded-first-last", null)) {
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			long columnId = api.createColumn("entries",
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			Keys firstKey = intKey(1);
+			Keys middleKey = intKey(20);
+			Keys lastKey = intKey(100);
+			Buf firstValue = intValue(1);
+			Buf middleValue = intValue(20);
+			Buf lastValue = intValue(100);
+			KV first = new KV(firstKey, firstValue);
+			KV middle = new KV(middleKey, middleValue);
+			KV last = new KV(lastKey, lastValue);
+			api.put(0, columnId, firstKey, firstValue, RequestType.none());
+			api.put(0, columnId, middleKey, middleValue, RequestType.none());
+			api.put(0, columnId, lastKey, lastValue, RequestType.none());
+
+			Keys upperBound = intKey(45);
+			assertEquals(new FirstAndLast<>(first, middle),
+					api.reduceRange(0, columnId, null, upperBound, false, RequestType.firstAndLast(), 1_000));
+			assertEquals(new FirstAndLast<>(middle, first),
+					api.reduceRange(0, columnId, null, upperBound, true, RequestType.firstAndLast(), 1_000));
+
+			Keys lowerBound = intKey(15);
+			assertEquals(new FirstAndLast<>(middle, last),
+					api.reduceRange(0, columnId, lowerBound, null, false, RequestType.firstAndLast(), 1_000));
+			assertEquals(new FirstAndLast<>(last, middle),
+					api.reduceRange(0, columnId, lowerBound, null, true, RequestType.firstAndLast(), 1_000));
+		}
+	}
+
+	@Test
 	void firstAndLastDeadlineIncludesTimeWaitingForTheReadWorker() throws Exception {
 		var configFile = tempDir.resolve("single-reader.conf");
 		Files.writeString(configFile, """

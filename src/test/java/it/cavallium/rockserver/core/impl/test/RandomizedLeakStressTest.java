@@ -9,296 +9,628 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import reactor.core.Disposable;
+import reactor.core.publisher.Flux;
 
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.Random;
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Randomized stress test performing a very wide variety of operations to detect native leaks.
- * Runs quickly by default; extend duration by setting -Drockserver.test.stress.seconds.
+ * Randomized stress test performing a wide variety of operations to detect native resource leaks.
+ * The default run is time bounded. Set {@code -Drockserver.test.stress.operations=N} for an exact,
+ * reproducible operation count; {@code -Drockserver.test.stress.seed=N} selects the random seed.
  *
- * Coverage highlights:
- * - plain put/get/merge
- * - explicit transactions (commit/rollback) and tiny-timeout transactions that expire
- * - forUpdate flows with both changed and unchanged paths (closeFailedUpdate)
- * - getRange async streams with bounds, reverse order, and random cancellations
- * - explicit openIterator/closeIterator flows and occasionally intentional no-close + forced cleanup
- * - batch put/merge with successful publisher and failing publisher
- * - reduceRange entriesCount and firstAndLast
- * - periodic flush/compact
+ * <p>Coverage includes point and multi-key writes, merges and reads; transaction commit/rollback;
+ * for-update success and abort; bounded forward/reverse ranges and cancellation; explicit and
+ * expiring iterators; range reductions; flush; and compaction.</p>
  */
 public class RandomizedLeakStressTest {
 
-    private EmbeddedConnection db;
-    private long colId;
-    private Path configFile;
+	private static final String LEAK_DETECTION_PROPERTY = "it.cavallium.rockserver.leakdetection";
+	private static final String PRINT_CONFIG_PROPERTY = "rockserver.core.print-config";
+	private static final String SEED_PROPERTY = "rockserver.test.stress.seed";
+	private static final String OPERATIONS_PROPERTY = "rockserver.test.stress.operations";
+	private static final String SECONDS_PROPERTY = "rockserver.test.stress.seconds";
+	private static final long DEFAULT_SEED = 12_345L;
+	private static final int DEFAULT_SECONDS = 6;
+	private static final int KEY_SPACE = 256;
+	private static final int MAX_RECENT_OPERATIONS = 64;
+	private static final int MAX_LIVE_RANGES = 32;
+	private static final int MAX_TRACKED_ITERATORS = 64;
+	private static final long RESOURCE_RELEASE_TIMEOUT_MILLIS = 5_000L;
 
-    @BeforeEach
-    void setUp() throws Exception {
-        System.setProperty("it.cavallium.rockserver.leakdetection", "true");
-        System.setProperty("rockserver.core.print-config", "false");
+	private EmbeddedConnection db;
+	private RocksDBSyncAPI syncApi;
+	private RocksDBAsyncAPI asyncApi;
+	private long colId;
+	private Path configFile;
+	private String previousLeakDetection;
+	private String previousPrintConfig;
+	private Set<Thread> baselineResourceThreads = Set.of();
 
-        configFile = Files.createTempFile("leak-rand", ".conf");
-        Files.writeString(configFile, """
-database: {
-  global: {
-    ingest-behind: true
-    fallback-column-options: {
-      merge-operator-class: "it.cavallium.rockserver.core.impl.MyStringAppendOperator"
-    }
-  }
-}
-""");
-        db = new EmbeddedConnection(null, "rnd-leaks", configFile);
-        colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("rnd-col", ColumnSchema.of(
-                IntList.of(Integer.BYTES), ObjectList.of(), true));
-    }
+	@BeforeEach
+	void setUp() throws Exception {
+		baselineResourceThreads = resourceThreads();
+		previousLeakDetection = System.getProperty(LEAK_DETECTION_PROPERTY);
+		previousPrintConfig = System.getProperty(PRINT_CONFIG_PROPERTY);
+		System.setProperty(LEAK_DETECTION_PROPERTY, "true");
+		System.setProperty(PRINT_CONFIG_PROPERTY, "false");
 
-    @AfterEach
-    void tearDown() throws Exception {
-        if (db != null) db.closeTesting();
-        if (configFile != null) Files.deleteIfExists(configFile);
-    }
+		configFile = Files.createTempFile("leak-rand", ".conf");
+		Files.writeString(configFile, """
+				database: {
+				  global: {
+				    ingest-behind: true
+				    fallback-column-options: {
+				      merge-operator-class: "it.cavallium.rockserver.core.impl.MyStringAppendOperator"
+				    }
+				  }
+				}
+				""");
+		db = new EmbeddedConnection(null, "rnd-leaks", configFile);
+		syncApi = db.getSyncApi(RequestContext.batch());
+		asyncApi = db.getAsyncApi(RequestContext.batch());
+		colId = syncApi.createColumn("rnd-col", ColumnSchema.of(
+				IntList.of(Integer.BYTES), ObjectList.of(), true));
+	}
 
-    @Test
-    void randomizedWorkloadHasNoLeaks() {
-        int seconds = Integer.getInteger("rockserver.test.stress.seconds", 6);
-        long endAt = System.currentTimeMillis() + seconds * 1000L;
-        Random rnd = new Random(12345);
+	@AfterEach
+	void tearDown() throws Exception {
+		Throwable failure = null;
+		if (db != null) {
+			try {
+				db.closeTesting();
+			} catch (Throwable closeFailure) {
+				failure = closeFailure;
+			}
+		}
+		db = null;
+		syncApi = null;
+		asyncApi = null;
 
-        int keySpace = 256;
+		if (configFile != null) {
+			try {
+				Files.deleteIfExists(configFile);
+			} catch (Throwable deleteFailure) {
+				failure = appendFailure(failure, deleteFailure);
+			}
+			configFile = null;
+		}
 
-        // Keep a few range subscriptions to cancel later
-        java.util.List<reactor.core.Disposable> liveRanges = new java.util.ArrayList<>();
-        // Keep a few explicitly opened iterators (ids) to close later
-        java.util.List<Long> openIterators = new java.util.ArrayList<>();
+		restoreProperty(LEAK_DETECTION_PROPERTY, previousLeakDetection);
+		restoreProperty(PRINT_CONFIG_PROPERTY, previousPrintConfig);
+		if (failure != null) {
+			rethrow(failure);
+		}
+	}
 
-        while (System.currentTimeMillis() < endAt) {
-            int op = rnd.nextInt(14);
-            switch (op) {
-                case 0 -> doPut(rnd, keySpace);
-                case 1 -> doMerge(rnd, keySpace);
-                case 2 -> doGet(rnd, keySpace);
-                case 3 -> doTxCommit(rnd, keySpace);
-                case 4 -> doTxRollback(rnd, keySpace);
-                case 5 -> doRangeCancel(rnd);
-                case 6 -> doForUpdateFlow(rnd, keySpace);
-                case 7 -> startConcurrentRange(rnd, liveRanges);
-                case 8 -> maybeCancelARange(rnd, liveRanges);
-                case 9 -> openIteratorShortLived(rnd, openIterators);
-                case 10 -> maybeCloseAnIterator(rnd, openIterators);
-                case 11 -> doReduceRange(rnd);
-                case 12 -> maybeFlush();
-                case 13 -> maybeCompact();
-            }
+	@Test
+	void randomizedWorkloadHasNoLeaks() throws Exception {
+		long seed = configuredSeed();
+		Integer operationLimit = configuredOperationLimit();
+		long durationNanos = operationLimit == null
+				? TimeUnit.SECONDS.toNanos(configuredDurationSeconds())
+				: Long.MAX_VALUE;
+		long startedAt = System.nanoTime();
+		var random = new Random(seed);
+		var liveRanges = new CopyOnWriteArrayList<Disposable>();
+		var openIterators = new ArrayList<Long>();
+		var asyncFailures = new ConcurrentLinkedQueue<Throwable>();
+		var recentOperations = new ArrayDeque<String>(MAX_RECENT_OPERATIONS);
+		int operationIndex = 0;
 
-            // Occasionally simulate expiring tx + forced cleanup
-            if ((rnd.nextInt(100)) == 0) {
-                openExpiringTxAndIteratorThenCleanup();
-            }
-        }
+		while (shouldContinue(operationIndex, operationLimit, startedAt, durationNanos)) {
+			liveRanges.removeIf(Disposable::isDisposed);
+			throwIfAsyncFailed(asyncFailures, seed, operationIndex, recentOperations);
+			Operation operation = nextOperation(random);
+			remember(recentOperations, operationIndex + ":" + operation);
+			try {
+				switch (operation) {
+					case PUT -> doPut(random);
+					case MERGE -> doMerge(random);
+					case GET -> doGet(random);
+					case TX_COMMIT -> doTxCommit(random);
+					case TX_ROLLBACK -> doTxRollback(random);
+					case RANGE_CANCEL -> doRangeCancel(random, asyncFailures);
+					case FOR_UPDATE -> doForUpdateFlow(random);
+					case START_RANGE -> startConcurrentRange(random, liveRanges, asyncFailures);
+					case CANCEL_RANGE -> maybeCancelARange(random, liveRanges);
+					case OPEN_ITERATOR -> openIteratorShortLived(random, openIterators);
+					case CLOSE_ITERATOR -> maybeCloseAnIterator(random, openIterators);
+					case REDUCE_RANGE -> doReduceRange(random);
+					case PUT_MULTI -> doPutMulti(random);
+					case DELETE_MULTI -> doDeleteMulti(random);
+					case FLUSH -> syncApi.flush();
+					case COMPACT -> syncApi.compact();
+				}
+			} catch (Exception | AssertionError failure) {
+				throw fuzzFailure(seed, operationIndex, recentOperations, failure);
+			}
 
-        // Allow async cleanup to finish
-        sleep(100);
+			if (random.nextInt(100) == 0) {
+				remember(recentOperations, operationIndex + ":EXPIRE_AND_CLEAN");
+				try {
+					openExpiringTxAndIteratorThenCleanup();
+				} catch (Exception | AssertionError failure) {
+					throw fuzzFailure(seed, operationIndex, recentOperations, failure);
+				}
+			}
+			operationIndex++;
+		}
 
-        // Cancel leftover ranges and close outstanding iterators, then force cleanup
-        for (var d : liveRanges) {
-            try { d.dispose(); } catch (Throwable ignored) {}
-        }
-        for (Long itId : openIterators) {
-            try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(itId); } catch (Throwable ignored) {}
-        }
-        // Deterministic cleanup of any expiring items
-        invokeCleanup(getInternal(db));
+		for (Disposable range : liveRanges) {
+			range.dispose();
+		}
+		liveRanges.clear();
+		for (long iteratorId : openIterators) {
+			syncApi.closeIterator(iteratorId);
+		}
+		openIterators.clear();
 
-        var internal = getInternal(db);
-        assertEquals(0, internal.getPendingOpsCount(), "Pending ops must be zero after randomized run");
-        assertEquals(0, internal.getOpenTransactionsCount(), "Open transactions must be zero after randomized run");
-        assertEquals(0, internal.getOpenIteratorsCount(), "Open iterators must be zero after randomized run");
+		invokeCleanup(getInternal(db));
+		awaitResourcesReleased(getInternal(db), seed, operationIndex);
+		throwIfAsyncFailed(asyncFailures, seed, operationIndex, recentOperations);
 
-        // Explicitly close DB
-        try { db.closeTesting(); db = null; } catch (Exception e) { e.printStackTrace(); }
+		db.closeTesting();
+		db = null;
+		syncApi = null;
+		asyncApi = null;
+		awaitNoNewResourceThreads(seed, operationIndex);
+	}
 
-        // Wait for background threads to die
-        long deadline = System.currentTimeMillis() + 5000;
-        while (System.currentTimeMillis() < deadline) {
-            boolean clean = true;
-            for (Thread t : Thread.getAllStackTraces().keySet()) {
-                String name = t.getName();
-                if (name.contains("db-") || name.contains("rocksdb") || name.contains("influx")) {
-                    clean = false;
-                    break;
-                }
-            }
-            if (clean) break;
-            try { Thread.sleep(100); } catch (InterruptedException e) { break; }
-        }
+	private void doPut(Random random) {
+		var key = key(random.nextInt(KEY_SPACE));
+		var value = Buf.wrap((byte) random.nextInt(256));
+		syncApi.put(0, colId, key, value, RequestType.none());
+	}
 
-        // Final verification
-        StringBuilder err = new StringBuilder();
-        for (Thread t : Thread.getAllStackTraces().keySet()) {
-            String name = t.getName();
-            if (t.isAlive() && (name.contains("db-") || name.contains("rocksdb") || name.contains("influx"))) {
-                err.append("Leaked thread: ").append(name).append(" (Daemon=").append(t.isDaemon()).append(")\n");
-            }
-            if (!t.isDaemon() && !name.equals("main") && !name.startsWith("Test worker") && !name.startsWith("junit")) {
-                 // Note: In IDE/Maven, test runner threads might be non-daemon. Be careful failing on them.
-                 // But we should ensure *our* threads are gone.
-            }
-        }
-        if (err.length() > 0) {
-            throw new RuntimeException("Threads leaked:\n" + err);
-        }
-    }
+	private void doMerge(Random random) {
+		var key = key(random.nextInt(KEY_SPACE));
+		var value = Buf.wrap(("+" + (char) ('a' + random.nextInt(26))).getBytes(StandardCharsets.UTF_8));
+		syncApi.merge(0, colId, key, value, RequestType.none());
+	}
 
-    private void doPut(Random rnd, int keySpace) {
-        var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        var val = Buf.wrap(new byte[]{(byte) rnd.nextInt(256)});
-        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, val, RequestType.none());
-    }
+	private void doGet(Random random) {
+		syncApi.get(0, colId, key(random.nextInt(KEY_SPACE)), RequestType.current());
+	}
 
-    private void doMerge(Random rnd, int keySpace) {
-        var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        var val = Buf.wrap(("+" + (char) ('a' + rnd.nextInt(26))).getBytes());
-        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, key, val, RequestType.none());
-    }
+	private void doTxCommit(Random random) {
+		long transactionId = syncApi.openTransaction(5_000);
+		boolean closed = false;
+		try {
+			syncApi.put(transactionId,
+					colId,
+					key(random.nextInt(KEY_SPACE)),
+					Buf.wrap((byte) random.nextInt(256)),
+					RequestType.none());
+			assertTrue(syncApi.closeTransaction(transactionId, true), "Transaction disappeared before commit");
+			closed = true;
+		} finally {
+			if (!closed) {
+				syncApi.closeTransaction(transactionId, false);
+			}
+		}
+	}
 
-    private void doGet(Random rnd, int keySpace) {
-        var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.current());
-    }
+	private void doTxRollback(Random random) {
+		long transactionId = syncApi.openTransaction(5_000);
+		boolean closed = false;
+		try {
+			syncApi.put(transactionId,
+					colId,
+					key(random.nextInt(KEY_SPACE)),
+					Buf.wrap((byte) random.nextInt(256)),
+					RequestType.none());
+			assertTrue(syncApi.closeTransaction(transactionId, false), "Transaction disappeared before rollback");
+			closed = true;
+		} finally {
+			if (!closed) {
+				syncApi.closeTransaction(transactionId, false);
+			}
+		}
+	}
 
-    private void doTxCommit(Random rnd, int keySpace) {
-        var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        long tx = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(5_000);
-        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(tx, colId, key, Buf.wrap(new byte[]{(byte) rnd.nextInt(256)}), RequestType.none());
-        assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(tx, true));
-    }
+	private void doRangeCancel(Random random, ConcurrentLinkedQueue<Throwable> asyncFailures) {
+		var publisher = asyncApi.getRangeAsync(0,
+				colId,
+				null,
+				null,
+				random.nextBoolean(),
+				RequestType.allInRange(),
+				Duration.ofSeconds(5).toMillis());
+		var disposable = Flux.from(publisher)
+				.take(1 + random.nextInt(5))
+				.subscribe(ignored -> {
+				}, failure -> recordUnexpectedAsyncFailure(asyncFailures, failure));
+		disposable.dispose();
+	}
 
-    private void doTxRollback(Random rnd, int keySpace) {
-        var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        long tx = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(5_000);
-        db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(tx, colId, key, Buf.wrap(new byte[]{(byte) rnd.nextInt(256)}), RequestType.none());
-        assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(tx, false));
-    }
-
-    private void doRangeCancel(Random rnd) {
-        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, rnd.nextBoolean(), RequestType.allInRange(), Duration.ofSeconds(5).toMillis());
-        var d = reactor.core.publisher.Flux.from(pub).take(1 + rnd.nextInt(5)).subscribe();
-        d.dispose();
-    }
-
-    private void doForUpdateFlow(Random rnd, int keySpace) {
-        var key = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(keySpace))) });
-        var ctx = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key, RequestType.forUpdate());
-        long updateId = ctx.updateId();
-        if (rnd.nextBoolean()) {
-            // change path
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(updateId, colId, key, Buf.wrap(new byte[]{(byte) rnd.nextInt(256)}), RequestType.none());
-        } else {
-            // unchanged path
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeFailedUpdate(updateId);
-        }
-    }
-
-    private void startConcurrentRange(Random rnd, java.util.List<reactor.core.Disposable> subs) {
-        // Random lower/upper bounds
-        Integer from = rnd.nextBoolean() ? rnd.nextInt(256) : null;
-        Integer to = rnd.nextBoolean() ? rnd.nextInt(256) : null;
-        Buf fromBuf = from != null ? Buf.wrap(intKey(from)) : null;
-        Buf toBuf = to != null ? Buf.wrap(intKey(to)) : null;
-        Keys start = (fromBuf != null) ? new Keys(new Buf[]{fromBuf}) : null;
-        Keys end = (toBuf != null) ? new Keys(new Buf[]{toBuf}) : null;
-        boolean reverse = rnd.nextBoolean();
-        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, start, end, reverse, RequestType.allInRange(), Duration.ofSeconds(10).toMillis());
-        var sub = reactor.core.publisher.Flux.from(pub).take(1 + rnd.nextInt(8)).subscribe();
-        subs.add(sub);
-    }
-
-    private void maybeCancelARange(Random rnd, java.util.List<reactor.core.Disposable> subs) {
-        if (subs.isEmpty()) return;
-        int idx = rnd.nextInt(subs.size());
-        try { subs.get(idx).dispose(); } catch (Throwable ignored) {}
-    }
-
-    private void openIteratorShortLived(Random rnd, java.util.List<Long> openIterators) {
-        try {
-            var start = new Keys(new Buf[]{Buf.wrap(intKey(rnd.nextInt(256))) });
-			long iteratorId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(0, colId, start, null, rnd.nextBoolean(), 5); // 5ms timeout
-            // sometimes keep it open to expire
-            if (rnd.nextBoolean()) {
-				openIterators.add(iteratorId);
+	private void doForUpdateFlow(Random random) {
+		var key = key(random.nextInt(KEY_SPACE));
+		var context = syncApi.get(0, colId, key, RequestType.forUpdate());
+		long updateId = context.updateId();
+		boolean closed = false;
+		try {
+			if (random.nextBoolean()) {
+				syncApi.put(updateId,
+						colId,
+						key,
+						Buf.wrap((byte) random.nextInt(256)),
+						RequestType.none());
 			} else {
-				db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(iteratorId);
-            }
-        } catch (Exception ignored) {
-            // ignore expected errors if iterator expired immediately
-        }
-    }
+				syncApi.closeFailedUpdate(updateId);
+			}
+			closed = true;
+		} finally {
+			if (!closed) {
+				syncApi.closeFailedUpdate(updateId);
+			}
+		}
+	}
 
-    private void maybeCloseAnIterator(Random rnd, java.util.List<Long> openIterators) {
-        if (openIterators.isEmpty()) return;
-        int idx = rnd.nextInt(openIterators.size());
-        Long id = openIterators.remove(idx);
-        try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeIterator(id); } catch (Throwable ignored) {}
-    }
+	private void startConcurrentRange(Random random,
+	                                  CopyOnWriteArrayList<Disposable> subscriptions,
+	                                  ConcurrentLinkedQueue<Throwable> asyncFailures) {
+		while (subscriptions.size() >= MAX_LIVE_RANGES) {
+			subscriptions.removeFirst().dispose();
+		}
+		Integer from = random.nextBoolean() ? random.nextInt(KEY_SPACE) : null;
+		Integer to = random.nextBoolean() ? random.nextInt(KEY_SPACE) : null;
+		Keys start = from == null ? null : key(from);
+		Keys end = to == null ? null : key(to);
+		var publisher = asyncApi.getRangeAsync(0,
+				colId,
+				start,
+				end,
+				random.nextBoolean(),
+				RequestType.allInRange(),
+				Duration.ofSeconds(10).toMillis());
+		var subscription = Flux.from(publisher)
+				.take(1 + random.nextInt(8))
+				.subscribe(ignored -> {
+				}, failure -> recordUnexpectedAsyncFailure(asyncFailures, failure));
+		subscriptions.add(subscription);
+	}
 
-    private void doReduceRange(Random rnd) {
-        boolean reverse = rnd.nextBoolean();
-        long timeout = Duration.ofSeconds(5).toMillis();
-        if (rnd.nextBoolean()) {
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0, colId, null, null, reverse, RequestType.entriesCount(), timeout);
-        } else {
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRange(0, colId, null, null, reverse, RequestType.firstAndLast(), timeout);
-        }
-    }
+	private static void maybeCancelARange(Random random, CopyOnWriteArrayList<Disposable> subscriptions) {
+		if (subscriptions.isEmpty()) {
+			return;
+		}
+		subscriptions.remove(random.nextInt(subscriptions.size())).dispose();
+	}
 
-    private void maybeFlush() {
-        // Best-effort flush; should not leak resources
-        try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).flush(); } catch (Throwable ignored) {}
-    }
+	private void openIteratorShortLived(Random random, List<Long> openIterators) {
+		while (openIterators.size() >= MAX_TRACKED_ITERATORS) {
+			syncApi.closeIterator(openIterators.removeFirst());
+		}
+		long iteratorId;
+		try {
+			iteratorId = syncApi.openIterator(0,
+					colId,
+					key(random.nextInt(KEY_SPACE)),
+					null,
+					random.nextBoolean(),
+					50);
+		} catch (RocksDBException deadline) {
+			if (deadline.getErrorUniqueId() == RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED) {
+				return;
+			}
+			throw deadline;
+		}
+		if (random.nextBoolean()) {
+			openIterators.add(iteratorId);
+		} else {
+			syncApi.closeIterator(iteratorId);
+		}
+	}
 
-    private void maybeCompact() {
-        // Best-effort compact; should not leak resources
-        try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).compact(); } catch (Throwable ignored) {}
-    }
+	private void maybeCloseAnIterator(Random random, List<Long> openIterators) {
+		if (openIterators.isEmpty()) {
+			return;
+		}
+		syncApi.closeIterator(openIterators.remove(random.nextInt(openIterators.size())));
+	}
 
-    private void openExpiringTxAndIteratorThenCleanup() {
-        try {
-            long tx = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(1);
-            var key = new Keys(new Buf[]{Buf.wrap(intKey(1))});
-            try { db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(tx, colId, key, null, false, 1); } catch (Throwable ignored) {}
-        } catch (Throwable ignored) {}
-        // Sleep a moment, then run deterministic cleanup
-        sleep(5);
-        invokeCleanup(getInternal(db));
-    }
+	private void doReduceRange(Random random) {
+		Integer startValue = random.nextBoolean() ? random.nextInt(KEY_SPACE) : null;
+		Integer endValue = random.nextBoolean() ? random.nextInt(KEY_SPACE) : null;
+		if (startValue != null && endValue != null && startValue > endValue) {
+			int swapped = startValue;
+			startValue = endValue;
+			endValue = swapped;
+		}
+		Keys start = startValue != null ? key(startValue) : null;
+		Keys end = endValue != null ? key(endValue) : null;
+		boolean reverse = random.nextBoolean();
+		long timeout = Duration.ofSeconds(5).toMillis();
+		boolean countEntries = random.nextBoolean();
+		try {
+			if (countEntries) {
+				syncApi.reduceRange(0, colId, start, end, reverse, RequestType.entriesCount(), timeout);
+			} else {
+				syncApi.reduceRange(0, colId, start, end, reverse, RequestType.firstAndLast(), timeout);
+			}
+		} catch (RuntimeException failure) {
+			throw new AssertionError("reduceRange failed; start=" + startValue + ", end=" + endValue
+					+ ", reverse=" + reverse + ", request=" + (countEntries ? "count" : "first-and-last"), failure);
+		}
+	}
 
-    private static byte[] intKey(int v) {
-        return new byte[] { (byte) (v & 0xFF), (byte) ((v >> 8) & 0xFF), (byte) ((v >> 16) & 0xFF), (byte) ((v >> 24) & 0xFF)};
-    }
+	private void doPutMulti(Random random) {
+		int size = 1 + random.nextInt(4);
+		var keys = new ArrayList<Keys>(size);
+		var values = new ArrayList<Buf>(size);
+		for (int index = 0; index < size; index++) {
+			keys.add(key(random.nextInt(KEY_SPACE)));
+			values.add(Buf.wrap((byte) random.nextInt(256)));
+		}
+		syncApi.putMulti(0, colId, keys, values, RequestType.none());
+	}
 
-    private static EmbeddedDB getInternal(EmbeddedConnection c) { return c.getInternalDB(); }
+	private void doDeleteMulti(Random random) {
+		int size = 1 + random.nextInt(4);
+		var keys = new ArrayList<Keys>(size);
+		for (int index = 0; index < size; index++) {
+			keys.add(key(random.nextInt(KEY_SPACE)));
+		}
+		syncApi.deleteMulti(0, colId, keys, RequestType.none());
+	}
 
-    private static void sleep(long ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException ignored) { }
-    }
+	private void openExpiringTxAndIteratorThenCleanup() {
+		long transactionId = syncApi.openTransaction(10);
+		try {
+			syncApi.openIterator(transactionId, colId, key(1), null, false, 10);
+		} catch (RocksDBException expired) {
+			switch (expired.getErrorUniqueId()) {
+				case TX_NOT_FOUND, TRANSACTION_NOT_FOUND, READ_DEADLINE_EXCEEDED -> {
+				}
+				default -> throw expired;
+			}
+		}
+		sleep(20);
+		invokeCleanup(getInternal(db));
+	}
 
-    private static void invokeCleanup(EmbeddedDB internal) {
-        try {
-            java.lang.reflect.Method m1 = EmbeddedDB.class.getDeclaredMethod("cleanupExpiredTransactionsNow");
-            java.lang.reflect.Method m2 = EmbeddedDB.class.getDeclaredMethod("cleanupExpiredIteratorsNow");
-            m1.setAccessible(true);
-            m2.setAccessible(true);
-            m1.invoke(internal);
-            m2.invoke(internal);
-        } catch (Exception e) {
-            // Testing helper; ignore if not present
-        }
-    }
+	private static Operation nextOperation(Random random) {
+		return switch (random.nextInt(25)) {
+			case 0, 1, 2, 3 -> Operation.PUT;
+			case 4, 5, 6 -> Operation.MERGE;
+			case 7, 8, 9 -> Operation.GET;
+			case 10, 11 -> Operation.TX_COMMIT;
+			case 12 -> Operation.TX_ROLLBACK;
+			case 13 -> Operation.RANGE_CANCEL;
+			case 14, 15 -> Operation.FOR_UPDATE;
+			case 16 -> Operation.START_RANGE;
+			case 17 -> Operation.CANCEL_RANGE;
+			case 18 -> Operation.OPEN_ITERATOR;
+			case 19 -> Operation.CLOSE_ITERATOR;
+			case 20 -> Operation.REDUCE_RANGE;
+			case 21 -> Operation.PUT_MULTI;
+			case 22 -> Operation.DELETE_MULTI;
+			case 23 -> Operation.FLUSH;
+			case 24 -> Operation.COMPACT;
+			default -> throw new AssertionError("Unreachable operation selector");
+		};
+	}
+
+	private static boolean shouldContinue(int operationIndex,
+	                                      Integer operationLimit,
+	                                      long startedAt,
+	                                      long durationNanos) {
+		return operationLimit != null
+				? operationIndex < operationLimit
+				: System.nanoTime() - startedAt < durationNanos;
+	}
+
+	private static void awaitResourcesReleased(EmbeddedDB internal, long seed, int operationCount) {
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RESOURCE_RELEASE_TIMEOUT_MILLIS);
+		while (System.nanoTime() < deadline) {
+			if (internal.getPendingOpsCount() == 0
+					&& internal.getOpenTransactionsCount() == 0
+					&& internal.getOpenIteratorsCount() == 0) {
+				return;
+			}
+			sleep(25);
+			invokeCleanup(internal);
+		}
+		assertEquals(0, internal.getPendingOpsCount(),
+				"Pending operations remained after fuzz cleanup; seed=" + seed + ", operations=" + operationCount);
+		assertEquals(0, internal.getOpenTransactionsCount(),
+				"Transactions remained after fuzz cleanup; seed=" + seed + ", operations=" + operationCount);
+		assertEquals(0, internal.getOpenIteratorsCount(),
+				"Iterators remained after fuzz cleanup; seed=" + seed + ", operations=" + operationCount);
+	}
+
+	private void awaitNoNewResourceThreads(long seed, int operationCount) {
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RESOURCE_RELEASE_TIMEOUT_MILLIS);
+		Set<Thread> leaked;
+		do {
+			leaked = resourceThreads();
+			leaked.removeAll(baselineResourceThreads);
+			if (leaked.isEmpty()) {
+				return;
+			}
+			sleep(100);
+		} while (System.nanoTime() < deadline);
+
+		String names = leaked.stream()
+				.map(thread -> thread.getName() + " (daemon=" + thread.isDaemon() + ")")
+				.sorted()
+				.collect(Collectors.joining(", "));
+		assertTrue(leaked.isEmpty(),
+				"Resource threads leaked: " + names + "; seed=" + seed + ", operations=" + operationCount);
+	}
+
+	private static Set<Thread> resourceThreads() {
+		Set<Thread> result = Collections.newSetFromMap(new IdentityHashMap<>());
+		for (Thread thread : Thread.getAllStackTraces().keySet()) {
+			String name = thread.getName().toLowerCase(Locale.ROOT);
+			if (thread.isAlive() && (name.contains("db-") || name.contains("rocksdb") || name.contains("influx"))) {
+				result.add(thread);
+			}
+		}
+		return result;
+	}
+
+	private static void throwIfAsyncFailed(ConcurrentLinkedQueue<Throwable> failures,
+	                                       long seed,
+	                                       int operationIndex,
+	                                       Deque<String> recentOperations) {
+		Throwable failure = failures.poll();
+		if (failure == null) {
+			return;
+		}
+		Throwable additional;
+		while ((additional = failures.poll()) != null) {
+			failure.addSuppressed(additional);
+		}
+		throw fuzzFailure(seed, operationIndex, recentOperations, failure);
+	}
+
+	private static void recordUnexpectedAsyncFailure(ConcurrentLinkedQueue<Throwable> failures, Throwable failure) {
+		if (failure instanceof RocksDBException rocksFailure
+				&& rocksFailure.getErrorUniqueId() == RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED) {
+			return;
+		}
+		failures.add(failure);
+	}
+
+	private static AssertionError fuzzFailure(long seed,
+	                                          int operationIndex,
+	                                          Deque<String> recentOperations,
+	                                          Throwable cause) {
+		String message = "Randomized leak workload failed; seed=" + seed + ", operation=" + operationIndex
+				+ ". Replay through this operation with -D" + SEED_PROPERTY + "=" + seed
+				+ " -D" + OPERATIONS_PROPERTY + "=" + (operationIndex + 1)
+				+ ". Recent operations: " + String.join(" -> ", recentOperations);
+		return new AssertionError(message, cause);
+	}
+
+	private static void remember(Deque<String> recentOperations, String operation) {
+		if (recentOperations.size() == MAX_RECENT_OPERATIONS) {
+			recentOperations.removeFirst();
+		}
+		recentOperations.addLast(operation);
+	}
+
+	private static Keys key(int value) {
+		return new Keys(Buf.wrap(intKey(value)));
+	}
+
+	private static byte[] intKey(int value) {
+		return new byte[]{
+				(byte) (value & 0xFF),
+				(byte) ((value >> 8) & 0xFF),
+				(byte) ((value >> 16) & 0xFF),
+				(byte) ((value >> 24) & 0xFF)
+		};
+	}
+
+	private static EmbeddedDB getInternal(EmbeddedConnection connection) {
+		return connection.getInternalDB();
+	}
+
+	private static void sleep(long millis) {
+		try {
+			Thread.sleep(millis);
+		} catch (InterruptedException interrupted) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError("Interrupted while waiting for fuzz resource cleanup", interrupted);
+		}
+	}
+
+	private static void invokeCleanup(EmbeddedDB internal) {
+		try {
+			Method transactionCleanup = EmbeddedDB.class.getDeclaredMethod("cleanupExpiredTransactionsNow");
+			Method iteratorCleanup = EmbeddedDB.class.getDeclaredMethod("cleanupExpiredIteratorsNow");
+			transactionCleanup.setAccessible(true);
+			iteratorCleanup.setAccessible(true);
+			transactionCleanup.invoke(internal);
+			iteratorCleanup.invoke(internal);
+		} catch (ReflectiveOperationException failure) {
+			throw new AssertionError("Unable to invoke deterministic leak cleanup", failure);
+		}
+	}
+
+	private static long configuredSeed() {
+		String configured = System.getProperty(SEED_PROPERTY);
+		return configured == null ? DEFAULT_SEED : Long.parseLong(configured);
+	}
+
+	private static Integer configuredOperationLimit() {
+		String configured = System.getProperty(OPERATIONS_PROPERTY);
+		if (configured == null) {
+			return null;
+		}
+		int value = Integer.parseInt(configured);
+		if (value <= 0) {
+			throw new IllegalArgumentException(OPERATIONS_PROPERTY + " must be positive, but was " + value);
+		}
+		return value;
+	}
+
+	private static int configuredDurationSeconds() {
+		String configured = System.getProperty(SECONDS_PROPERTY);
+		int value = configured == null ? DEFAULT_SECONDS : Integer.parseInt(configured);
+		if (value <= 0) {
+			throw new IllegalArgumentException(SECONDS_PROPERTY + " must be positive, but was " + value);
+		}
+		return value;
+	}
+
+	private static void restoreProperty(String name, String previousValue) {
+		if (previousValue == null) {
+			System.clearProperty(name);
+		} else {
+			System.setProperty(name, previousValue);
+		}
+	}
+
+	private static Throwable appendFailure(Throwable existing, Throwable additional) {
+		if (existing == null) {
+			return additional;
+		}
+		existing.addSuppressed(additional);
+		return existing;
+	}
+
+	private static void rethrow(Throwable failure) throws Exception {
+		if (failure instanceof Exception exception) {
+			throw exception;
+		}
+		if (failure instanceof Error error) {
+			throw error;
+		}
+		throw new AssertionError(failure);
+	}
+
+	private enum Operation {
+		PUT,
+		MERGE,
+		GET,
+		TX_COMMIT,
+		TX_ROLLBACK,
+		RANGE_CANCEL,
+		FOR_UPDATE,
+		START_RANGE,
+		CANCEL_RANGE,
+		OPEN_ITERATOR,
+		CLOSE_ITERATOR,
+		REDUCE_RANGE,
+		PUT_MULTI,
+		DELETE_MULTI,
+		FLUSH,
+		COMPACT
+	}
 }

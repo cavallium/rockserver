@@ -1,4 +1,6 @@
 module rockserver.core.test {
+	requires jazzer.api;
+	requires jazzer.junit;
 	requires org.lz4.java;
 	requires rockserver.core;
 	requires com.google.common;

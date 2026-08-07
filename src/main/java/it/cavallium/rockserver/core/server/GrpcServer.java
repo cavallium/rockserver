@@ -2570,6 +2570,7 @@ public class GrpcServer extends Server {
 				}
 				try {
 					return operation.get()
+							.doOnTerminate(lease::operationTerminated)
 							.doFinally(_ -> lease.operationTerminated())
 							.contextWrite(context -> context.put(ITERATOR_OPERATION_LEASE_CONTEXT_KEY, lease));
 				} catch (Throwable error) {
@@ -2587,6 +2588,7 @@ public class GrpcServer extends Server {
 				}
 				try {
 					return operation.get()
+							.doOnTerminate(lease::operationTerminated)
 							.doFinally(_ -> lease.operationTerminated())
 							.contextWrite(context -> context.put(ITERATOR_OPERATION_LEASE_CONTEXT_KEY, lease));
 				} catch (Throwable error) {
@@ -3111,30 +3113,27 @@ public class GrpcServer extends Server {
 
 			@Override
 			public void accept(T value, Throwable failure) {
-				try {
-					Throwable error = failure instanceof CompletionException completionError
-							&& completionError.getCause() != null
-							? completionError.getCause()
-							: failure;
-					boolean late;
-					synchronized (this) {
-						late = cancelled;
-						if (!late) {
-							if (error != null) {
-								sink.error(error);
-							} else {
-								sink.success(value);
-							}
+				Throwable error = failure instanceof CompletionException completionError
+						&& completionError.getCause() != null
+						? completionError.getCause()
+						: failure;
+				if (terminalLease != null) {
+					terminalLease.taskTerminated();
+				}
+				boolean late;
+				synchronized (this) {
+					late = cancelled;
+					if (!late) {
+						if (error != null) {
+							sink.error(error);
+						} else {
+							sink.success(value);
 						}
 					}
-					if (late && error != null
-							&& !(error instanceof java.util.concurrent.CancellationException)) {
-						lateErrorHandler(sink.contextView()).accept(error);
-					}
-				} finally {
-					if (terminalLease != null) {
-						terminalLease.taskTerminated();
-					}
+				}
+				if (late && error != null
+						&& !(error instanceof java.util.concurrent.CancellationException)) {
+					lateErrorHandler(sink.contextView()).accept(error);
 				}
 			}
 		}
@@ -3215,27 +3214,33 @@ public class GrpcServer extends Server {
 				if (taskLifecycle != null && !taskLifecycle.start()) {
 					return;
 				}
+				final T result;
 				try {
-					var result = callable.call();
-					boolean lateSuccess;
-					synchronized (this) {
-						lateSuccess = cancelled;
-						if (!lateSuccess) {
-							sink.success(result);
-						}
-					}
-					if (lateSuccess && lateSuccessCleanup != null) {
-						runLateSuccessCleanup(result);
-					}
+					result = callable.call();
 				} catch (Throwable error) {
+					runningTaskTerminated();
 					emitOrRecordLateError(error);
-				} finally {
-					if (taskLifecycle != null) {
-						taskLifecycle.runningTaskTerminated();
+					return;
+				}
+				runningTaskTerminated();
+				boolean lateSuccess;
+				synchronized (this) {
+					lateSuccess = cancelled;
+					if (!lateSuccess) {
+						sink.success(result);
 					}
-					if (mustComplete) {
-						mustCompleteOperations.operationTerminated();
-					}
+				}
+				if (lateSuccess && lateSuccessCleanup != null) {
+					runLateSuccessCleanup(result);
+				}
+			}
+
+			private void runningTaskTerminated() {
+				if (taskLifecycle != null) {
+					taskLifecycle.runningTaskTerminated();
+				}
+				if (mustComplete) {
+					mustCompleteOperations.operationTerminated();
 				}
 			}
 
