@@ -3,12 +3,16 @@ package it.cavallium.rockserver.core.client;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RawScanEvent;
+import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
 import java.net.URI;
 import java.util.concurrent.CompletableFuture;
+import java.util.Set;
 
 import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
@@ -30,6 +34,11 @@ public class LoggingClient implements RocksDBConnection {
 	@Override
 	public URI getUrl() {
 		return client.getUrl();
+	}
+
+	@Override
+	public RockserverCapabilities getCapabilities() {
+		return client.getCapabilities();
 	}
 
 	@Override
@@ -120,6 +129,15 @@ public class LoggingClient implements RocksDBConnection {
 		@Override
 		public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
 			return requestAsync(new RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw(columnId, shardIndex, shardCount));
+		}
+
+		@Override
+		public Publisher<RawScanEvent> scanRawResumableAsync(long columnId,
+				int shardIndex,
+				int shardCount,
+				Set<RawSstToken> completedSsts) {
+			return requestAsync(new RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable(
+					columnId, shardIndex, shardCount, completedSsts));
 		}
 
 		@Override

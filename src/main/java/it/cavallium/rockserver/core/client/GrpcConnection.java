@@ -68,6 +68,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
@@ -137,6 +138,11 @@ public final class GrpcConnection extends BaseConnection {
 	}
 
 	@Override
+	public RockserverCapabilities getCapabilities() {
+		return delegate.getCapabilities();
+	}
+
+	@Override
 	<R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestSync(context, request);
 	}
@@ -189,6 +195,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private final AtomicBoolean legacyCdcPollBatchWarningLogged = new AtomicBoolean();
 	private final URI address;
 	private final int maxInboundMessageSize;
+	private final RockserverCapabilities capabilities;
 
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext[] createNoDeadlineWireContexts() {
 		var contexts = new it.cavallium.rockserver.core.common.api.proto.RequestContext[WorkloadProfile.values().length];
@@ -254,13 +261,16 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			throw ex;
 		}
 		var futureStub = RocksDBServiceGrpc.newFutureStub(channel);
+		RockserverCapabilities capabilities;
 		try {
 			var response = futureStub
 					.withDeadlineAfter(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
 					.getCapabilities(CapabilitiesRequest.getDefaultInstance())
 					.get(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-			new RockserverCapabilities(response.getWorkloadContractVersion(), response.getBoundedRange())
-					.requireCompatible();
+			capabilities = new RockserverCapabilities(response.getWorkloadContractVersion(),
+					response.getBoundedRange(),
+					response.getResumableRawScan());
+			capabilities.requireCompatible();
 		} catch (InterruptedException interrupted) {
 			Thread.currentThread().interrupt();
 			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
@@ -291,6 +301,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 		this.address = address;
 		this.maxInboundMessageSize = maxInboundMessageSize;
+		this.capabilities = capabilities;
+	}
+
+	@Override
+	public RockserverCapabilities getCapabilities() {
+		return capabilities;
 	}
 
 	private static void closeFailedConstruction(ManagedChannel channel,
@@ -767,6 +783,34 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 						.setContext(currentWireRequestContext())
 						.build())
 				.map(batch -> new SerializedKVBatchRef(Buf.wrap(batch.getSerialized().toByteArray())));
+	}
+
+	@Override
+	public Publisher<RawScanEvent> scanRawResumableAsync(long columnId,
+			int shardIndex,
+			int shardCount,
+			Set<RawSstToken> completedSsts) {
+		if (!capabilities.resumableRawScan()) {
+			return Flux.error(RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
+					"The connected Rockserver does not support resumable raw SST scans"));
+		}
+		var request = ScanRawRequest.newBuilder()
+				.setColumnId(columnId)
+				.setShardIndex(shardIndex)
+				.setShardCount(shardCount)
+				.setContext(currentWireRequestContext())
+				.setResumable(true);
+		for (RawSstToken completedSst : completedSsts) {
+			request.addCompletedSstTokens(completedSst.value());
+		}
+		return reactiveStubWithRequestDeadline().scanRaw(request.build())
+				.map(event -> switch (event.getEventCase()) {
+					case SERIALIZED -> new RawScanEvent.Batch(Buf.wrap(event.getSerialized().toByteArray()));
+					case COMPLETEDSSTTOKEN -> new RawScanEvent.SstCompleted(
+							new RawSstToken(event.getCompletedSstToken()));
+					case EVENT_NOT_SET -> throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+							"Rockserver returned an empty resumable raw-scan event");
+				});
 	}
 
 	@Override

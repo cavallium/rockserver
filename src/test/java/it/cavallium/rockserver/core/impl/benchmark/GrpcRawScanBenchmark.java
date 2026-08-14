@@ -24,6 +24,7 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.PutBatchMode;
+import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.SerializedKVBatch.SerializedKVBatchRef;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
@@ -78,8 +79,8 @@ import reactor.core.publisher.Flux;
  */
 public final class GrpcRawScanBenchmark {
 
-	private static final String RESULT_SCHEMA = "rockserver-grpc-raw-scan-comparison-v3";
-	private static final String WORKER_SCHEMA = "rockserver-grpc-raw-scan-worker-v2";
+	private static final String RESULT_SCHEMA = "rockserver-grpc-raw-scan-comparison-v4";
+	private static final String WORKER_SCHEMA = "rockserver-grpc-raw-scan-worker-v3";
 	private static final String DATASET_SCHEMA = "rockserver-grpc-raw-scan-dataset-v2";
 	private static final String COLUMN_NAME = "grpc-raw-scan-benchmark";
 	private static final long VALUE_SEED = 0x5241575343414e31L;
@@ -271,15 +272,21 @@ public final class GrpcRawScanBenchmark {
 			Channel tracked = ClientInterceptors.intercept(channel, tracker);
 			var stub = RocksDBServiceGrpc.newBlockingStub(tracked)
 					.withDeadlineAfter(STREAM_DEADLINE_MINUTES, TimeUnit.MINUTES);
-			ScanRawRequest request = ScanRawRequest.newBuilder()
+			var requestBuilder = ScanRawRequest.newBuilder()
 					.setColumnId(columnId)
 					.setShardIndex(0)
 					.setShardCount(1)
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
 							.setDeadlineEpochMillis(Long.MAX_VALUE)
-							.build())
-					.build();
+							.build());
+			// The untouched baseline may predate the extension. Invoke the new builder
+			// method only in the candidate process so the same benchmark can compare
+			// baseline raw scanning with the exact resumable candidate path.
+			if (options.implementation() == Implementation.CANDIDATE) {
+				ResumableProtocol.enable(requestBuilder);
+			}
+			ScanRawRequest request = requestBuilder.build();
 
 			byte[] expectedValue = valueBytes(options.valueBytes());
 			runWarmup(stub, request, options, expectedValue);
@@ -384,7 +391,8 @@ public final class GrpcRawScanBenchmark {
 			for (int client = 0; client < options.scanClients(); client++) {
 				futures.add(executor.submit(() -> {
 					for (int pass = 0; pass < options.warmupPasses(); pass++) {
-						scanOnce(stub, request, options.preloadKeys(), expectedValue);
+						scanOnce(stub, request, options.preloadKeys(), expectedValue,
+								options.implementation() == Implementation.CANDIDATE);
 					}
 					return null;
 				}));
@@ -434,7 +442,8 @@ public final class GrpcRawScanBenchmark {
 					while (first || System.nanoTime() < deadline[0]) {
 						first = false;
 						long scanStarted = System.nanoTime();
-						ScanResult result = scanOnce(stub, request, options.preloadKeys(), expectedValue);
+						ScanResult result = scanOnce(stub, request, options.preloadKeys(), expectedValue,
+								options.implementation() == Implementation.CANDIDATE);
 						scanLatencies.record(System.nanoTime() - scanStarted);
 						scans.increment();
 						entries.add(result.entries());
@@ -508,16 +517,27 @@ public final class GrpcRawScanBenchmark {
 	private static ScanResult scanOnce(RocksDBServiceGrpc.RocksDBServiceBlockingStub stub,
 			ScanRawRequest request,
 			int expectedEntries,
-			byte[] expectedValue) {
+			byte[] expectedValue,
+			boolean resumable) {
 		BitSet seen = new BitSet(expectedEntries);
 		long entries = 0L;
 		long serializedBytes = 0L;
 		long batches = 0L;
 		long fullBatches = 0L;
+		long completedSsts = 0L;
 		int maximumBatchBytes = 0;
 		var responses = stub.scanRaw(request);
 		while (responses.hasNext()) {
-			var bytes = responses.next().getSerialized();
+			var response = responses.next();
+			if (resumable) {
+				String completionToken = ResumableProtocol.completionToken(response);
+				if (completionToken != null) {
+					validateRawSstToken(completionToken);
+					completedSsts++;
+					continue;
+				}
+			}
+			var bytes = response.getSerialized();
 			int serializedSize = bytes.size();
 			if (serializedSize < Integer.BYTES || serializedSize > RAW_MAX_SERIALIZED_BYTES) {
 				throw new IllegalStateException("Raw wire batch has invalid size: " + serializedSize);
@@ -543,7 +563,8 @@ public final class GrpcRawScanBenchmark {
 						throw new IllegalStateException("Raw scan returned a duplicate key: " + key);
 					}
 					seen.set((int) key);
-					if (!Arrays.equals(expectedValue, kv.value().toByteArray())) {
+					var value = kv.value();
+					if (value == null || !Arrays.equals(expectedValue, value.toByteArray())) {
 						throw new IllegalStateException("Raw scan returned a corrupt value for key " + key);
 					}
 					decoded++;
@@ -565,7 +586,35 @@ public final class GrpcRawScanBenchmark {
 			throw new IllegalStateException("Raw scan content mismatch: entries=" + entries
 					+ " unique=" + seen.cardinality() + " expected=" + expectedEntries);
 		}
+		if (resumable && completedSsts == 0L) {
+			throw new IllegalStateException("Resumable raw scan returned no SST completion tokens");
+		}
 		return new ScanResult(entries, serializedBytes, batches, fullBatches, maximumBatchBytes);
+	}
+
+	private static void validateRawSstToken(String token) {
+		try {
+			new RawSstToken(token);
+		} catch (IllegalArgumentException malformedToken) {
+			throw new IllegalStateException(
+					"Resumable raw scan returned a malformed SST completion token", malformedToken);
+		}
+	}
+
+	/**
+	 * Keeps candidate-only protobuf accessors out of the benchmark controller and
+	 * legacy worker's linked bytecode. The helper is loaded only by candidate workers.
+	 */
+	private static final class ResumableProtocol {
+
+		private static void enable(ScanRawRequest.Builder request) {
+			request.setResumable(true);
+		}
+
+		private static @Nullable String completionToken(
+				it.cavallium.rockserver.core.common.api.proto.ScanRawResponse response) {
+			return response.hasCompletedSstToken() ? response.getCompletedSstToken() : null;
+		}
 	}
 
 	private static SchedulerMetrics schedulerMetrics(BenchmarkMeterRegistry registry) {
@@ -1096,7 +1145,9 @@ public final class GrpcRawScanBenchmark {
 
 	private static void printUsage() {
 		System.out.println("""
-				Paired whole-gRPC raw-SST comparison. Compile tests and build the untouched baseline first:
+				Paired whole-gRPC raw-SST comparison. The baseline uses the legacy scan and the
+				candidate uses resumable scanning with an empty acknowledgement set. Compile tests
+				and build the untouched baseline first:
 
 				  java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \\
 				    -cp target/test-classes:target/classes:<test-dependencies> \\

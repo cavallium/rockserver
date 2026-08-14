@@ -80,6 +80,7 @@ import java.util.Locale;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.StringJoiner;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
@@ -96,11 +97,11 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.function.ToLongFunction;
+import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import reactor.core.Disposables;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
@@ -995,10 +996,11 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
-			var capabilities = RockserverCapabilities.CURRENT;
+			var capabilities = client.getCapabilities();
 			return Mono.just(CapabilitiesResponse.newBuilder()
 					.setWorkloadContractVersion(capabilities.workloadContractVersion())
 					.setBoundedRange(capabilities.boundedRange())
+					.setResumableRawScan(capabilities.resumableRawScan())
 					.build());
 		}
 
@@ -2222,20 +2224,54 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Flux<it.cavallium.rockserver.core.common.api.proto.ScanRawResponse> scanRaw(ScanRawRequest request) {
-			return Flux.defer(() -> Flux
-					.from(asyncApi(request.getContext()).scanRawAsync(request.getColumnId(), request.getShardIndex(), request.getShardCount())))
-					.map(batch -> {
-						var builder = it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder();
-						var serializedBatchValue = UnsafeByteOperations.unsafeWrap(
-								batch.serialized().getBackingByteArray(),
-								batch.serialized().getBackingByteArrayOffset(),
-								batch.serialized().getBackingByteArrayLength()
-						);
-						builder.setSerialized(serializedBatchValue);
-						return builder.build();
-					})
+			return Flux.defer(() -> {
+				var api = asyncApi(request.getContext());
+				if (request.getResumable()) {
+					final Set<RawSstToken> completedSsts;
+					try {
+						completedSsts = request.getCompletedSstTokensList().stream()
+								.map(RawSstToken::new)
+								.collect(Collectors.toUnmodifiableSet());
+					} catch (IllegalArgumentException invalidToken) {
+						return Flux.error(Status.INVALID_ARGUMENT
+								.withDescription(invalidToken.getMessage())
+								.withCause(invalidToken)
+								.asRuntimeException());
+					}
+					return Flux.from(api.scanRawResumableAsync(request.getColumnId(),
+							request.getShardIndex(), request.getShardCount(), completedSsts))
+							.map(event -> switch (event) {
+								case RawScanEvent.Batch batch -> rawScanBatchResponse(batch.serialized());
+								case RawScanEvent.SstCompleted completed ->
+										it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder()
+												.setCompletedSstToken(completed.token().value())
+												.build();
+							});
+				}
+				if (request.getCompletedSstTokensCount() != 0) {
+					return Flux.error(Status.INVALID_ARGUMENT
+							.withDescription("completed SST tokens require resumable raw scan mode")
+							.asRuntimeException());
+				}
+				// Keep the established legacy path allocation-neutral: only resumable scans
+				// need RawScanEvent wrappers.
+				return Flux.from(api.scanRawAsync(
+						request.getColumnId(), request.getShardIndex(), request.getShardCount()))
+						.map(batch -> rawScanBatchResponse(batch.serialized()));
+			})
 					.limitRate(17, 1)
 					.transform(this.onErrorMapFluxWithRequestInfo("scanRaw", request));
+		}
+
+		private static it.cavallium.rockserver.core.common.api.proto.ScanRawResponse rawScanBatchResponse(
+				Buf serialized) {
+			var serializedBatchValue = UnsafeByteOperations.unsafeWrap(
+					serialized.getBackingByteArray(),
+					serialized.getBackingByteArrayOffset(),
+					serialized.getBackingByteArrayLength());
+			return it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder()
+					.setSerialized(serializedBatchValue)
+					.build();
 		}
 
 		@Override

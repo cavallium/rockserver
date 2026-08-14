@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Stream;
 
@@ -63,7 +64,8 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 							: OperationFamily.FULL_SCAN_AGGREGATE;
 			case RocksDBAPICommandSingle.GetRangePage<?> _ -> OperationFamily.RANGE_PAGE;
 			case RocksDBAPICommandStream.GetRange<?> _ -> OperationFamily.RANGE_PAGE;
-			case RocksDBAPICommandStream.ScanRaw _ -> OperationFamily.RANGE_PAGE;
+			case RocksDBAPICommandStream.ScanRaw _, RocksDBAPICommandStream.ScanRawResumable _ ->
+					OperationFamily.RANGE_PAGE;
 			case RocksDBAPICommandStream.CdcPoll _ -> OperationFamily.WAL_PAGE;
 			case Flush _ -> OperationFamily.FLUSH;
 			case Compact _ -> OperationFamily.COMPACTION;
@@ -1069,6 +1071,41 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Override
 			public boolean isReadOnly() {
 				return true;
+			}
+		}
+
+		/**
+		 * Scan raw SST files, skipping exact files whose completion tokens are
+		 * acknowledged by the client.
+		 */
+		record ScanRawResumable(long columnId,
+				int shardIndex,
+				int shardCount,
+				Set<RawSstToken> completedSsts) implements RocksDBAPICommandStream<RawScanEvent> {
+
+			public ScanRawResumable {
+				completedSsts = Set.copyOf(completedSsts);
+			}
+
+			@Override
+			public Stream<RawScanEvent> handleSync(RocksDBSyncAPI api) {
+				return api.scanRawResumable(columnId, shardIndex, shardCount, completedSsts);
+			}
+
+			@Override
+			public Publisher<RawScanEvent> handleAsync(RocksDBAsyncAPI api) {
+				return api.scanRawResumableAsync(columnId, shardIndex, shardCount, completedSsts);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
+			}
+
+			@Override
+			public String toString() {
+				return "ScanRawResumable[columnId=" + columnId + ", shardIndex=" + shardIndex
+						+ ", shardCount=" + shardCount + ", completedSsts=" + completedSsts.size() + ']';
 			}
 		}
 

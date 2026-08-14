@@ -37,10 +37,12 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.UploadMergeOperator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import org.jetbrains.annotations.NotNull;
@@ -283,6 +285,14 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	/** See: {@link ScanRaw}. */
 	default Stream<SerializedKVBatch> scanRaw(long columnId, int shardIndex, int shardCount) {
 		return requestSync(new ScanRaw(columnId, shardIndex, shardCount));
+	}
+
+	/** See: {@link ScanRawResumable}. */
+	default Stream<RawScanEvent> scanRawResumable(long columnId,
+			int shardIndex,
+			int shardCount,
+			Set<RawSstToken> completedSsts) {
+		return requestSync(new ScanRawResumable(columnId, shardIndex, shardCount, completedSsts));
 	}
 
 	/** See: {@link Flush}. */

@@ -37,6 +37,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.UploadMergeOperator;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CDCEventAck;
@@ -47,6 +48,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -313,6 +315,18 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	/** See: {@link ScanRaw}. */
 	default Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
 		return requestAsync(new ScanRaw(columnId, shardIndex, shardCount));
+	}
+
+	/**
+	 * Scan raw SSTs and emit a completion token after each fully emitted file.
+	 * Tokens acknowledged in {@code completedSsts} skip only an exact SST that is
+	 * still live in the same database.
+	 */
+	default Publisher<RawScanEvent> scanRawResumableAsync(long columnId,
+			int shardIndex,
+			int shardCount,
+			Set<RawSstToken> completedSsts) {
+		return requestAsync(new ScanRawResumable(columnId, shardIndex, shardCount, completedSsts));
 	}
 
 	/** See: {@link Flush}. */

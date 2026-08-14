@@ -89,6 +89,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
@@ -8364,12 +8365,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final LiveFileMetaData metadata;
 		private final Path path;
 		private final long size;
+		private final @Nullable RawSstToken token;
 		private boolean closed;
 
-		private PinnedSstFile(LiveFileMetaData metadata, Path path) {
+		private PinnedSstFile(LiveFileMetaData metadata, Path path, @Nullable RawSstToken token) {
 			this.metadata = metadata;
 			this.path = path;
 			this.size = metadata.size();
+			this.token = token;
 			if (!activeRawScanPinnedFiles.add(path)) {
 				throw new IllegalStateException("Raw-scan SST pin path is already active: " + path);
 			}
@@ -8382,6 +8385,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private Path path() {
 			return path;
+		}
+
+		private RawSstToken resumableToken() {
+			return Objects.requireNonNull(token, "Resumable raw scan SST token");
 		}
 
 		@Override
@@ -8412,7 +8419,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final Set<Path> scanDirectories;
 		private boolean closed;
 
-		private RawScanPinnedSstSet(String cfName, int shardIndex, int shardCount)
+		private RawScanPinnedSstSet(String cfName,
+				int shardIndex,
+				int shardCount,
+				@Nullable Set<String> completedSstFileNames)
 				throws IOException, org.rocksdb.RocksDBException {
 			var pinnedFiles = new ArrayList<PinnedSstFile>();
 			var createdScanDirectories = new LinkedHashSet<Path>();
@@ -8421,6 +8431,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			synchronized (rawScanPinAcquisitionLock) {
 				RocksDB rocksDB = db.get();
 				for (LiveFileMetaData file : selectedRawScanFiles(rocksDB, cfName, shardIndex, shardCount)) {
+					if (completedSstFileNames != null && completedSstFileNames.contains(file.fileName())) {
+						continue;
+					}
 					Path source = rawScanSourcePath(file);
 					Path sourceDirectory = Objects.requireNonNull(source.getParent(),
 							"Raw-scan SST has no parent directory: " + source);
@@ -8435,8 +8448,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							cfName,
 							shardIndex,
 							shardCount)) {
-						checkRawScanPinDeadline(startedNanos);
+						if (completedSstFileNames != null && completedSstFileNames.contains(file.fileName())) {
+							continue;
+						}
 						Path source = rawScanSourcePath(file);
+						RawSstToken token = completedSstFileNames == null
+								? null
+								: new RawSstToken(file.fileName());
+						checkRawScanPinDeadline(startedNanos);
 						Path sourceDirectory = Objects.requireNonNull(source.getParent(),
 								"Raw-scan SST has no parent directory: " + source);
 						Path scanDirectory = scanDirectoriesBySource.get(sourceDirectory);
@@ -8448,7 +8467,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						}
 						Path pinnedPath = scanDirectory.resolve(source.getFileName().toString());
 						createRawScanHardLink(source, pinnedPath);
-						pinnedFiles.add(new PinnedSstFile(file, pinnedPath));
+						pinnedFiles.add(new PinnedSstFile(file, pinnedPath, token));
 						checkRawScanPinDeadline(startedNanos);
 					}
 				} catch (Throwable failure) {
@@ -8907,6 +8926,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return scanRawAsyncInternal(columnId,
 				shardIndex,
 				shardCount,
+				null,
+				(_, batches) -> batches,
 				scheduler.read(),
 				scheduler.readExecutor());
 	}
@@ -8921,6 +8942,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return scanRawAsyncInternal(columnId,
 				shardIndex,
 				shardCount,
+				null,
+				(_, batches) -> batches,
 				workloadScheduler,
 				workloadExecutor);
 	}
@@ -8928,6 +8951,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId,
 			int shardIndex,
 			int shardCount,
+			@NotNull Scheduler workloadScheduler,
+			@NotNull RWScheduler.WorkloadExecutor workloadExecutor) {
+		return scanRawAsyncInternal(columnId,
+				shardIndex,
+				shardCount,
+				null,
+				(_, batches) -> batches,
+				workloadScheduler,
+				workloadExecutor);
+	}
+
+	private <T> Flux<T> scanRawAsyncInternal(long columnId,
+			int shardIndex,
+			int shardCount,
+			@Nullable Set<String> completedSstFileNames,
+			BiFunction<PinnedSstFile, Flux<SerializedKVBatch>, Publisher<T>> fileMapper,
 			@NotNull Scheduler workloadScheduler,
 			@NotNull RWScheduler.WorkloadExecutor workloadExecutor) {
 		long maximumQuantumNanos = workloadSettings.rangeQuantumMaxDuration().toNanos();
@@ -8942,48 +8981,49 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 				},
 				columnUse -> Flux.defer(() -> {
-			ColumnInstance col = columnUse.column();
-			String cfName;
-			try {
-				cfName = new String(col.cfh().getName(), StandardCharsets.UTF_8);
-			} catch (RocksDBException | org.rocksdb.RocksDBException e) {
-				return Flux.error(e);
-			}
+					ColumnInstance col = columnUse.column();
+					String cfName;
+					try {
+						cfName = new String(col.cfh().getName(), StandardCharsets.UTF_8);
+					} catch (RocksDBException | org.rocksdb.RocksDBException e) {
+						return Flux.error(e);
+					}
 
-			return Flux.using(
-					() -> new RawScanPinnedSstSet(cfName, shardIndex, shardCount),
-					pinnedSsts -> {
-						var observer = rawScanFilesCapturedObserver;
-						if (observer != null) {
-							observer.run();
-						}
+					return Flux.using(
+							() -> new RawScanPinnedSstSet(cfName, shardIndex, shardCount, completedSstFileNames),
+							pinnedSsts -> {
+								var observer = rawScanFilesCapturedObserver;
+								if (observer != null) {
+									observer.run();
+								}
 
-						Function<PinnedSstFile, Publisher<SerializedKVBatch>> mapper = f ->
-								Flux.<SerializedKVBatch>create(rawSink -> {
-									var state = new ScanState(col, cfName, f, rawSink, maximumQuantumNanos);
-									rawSink.onRequest(state);
-									rawSink.onCancel(state);
-									rawSink.onDispose(state);
-									try {
-										state.attach(workloadExecutor.executeCooperatively(
-												state,
-												RAW_SCAN_MAX_BYTES_PER_CHUNK));
-									} catch (RuntimeException admissionFailure) {
-										state.reject(admissionFailure);
-									}
-								}, FluxSink.OverflowStrategy.ERROR)
-										.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
+								Function<PinnedSstFile, Publisher<T>> mapper = file -> {
+									var batches = Flux.<SerializedKVBatch>create(rawSink -> {
+										var state = new ScanState(col, cfName, file, rawSink, maximumQuantumNanos);
+										rawSink.onRequest(state);
+										rawSink.onCancel(state);
+										rawSink.onDispose(state);
+										try {
+											state.attach(workloadExecutor.executeCooperatively(
+													state,
+													RAW_SCAN_MAX_BYTES_PER_CHUNK));
+										} catch (RuntimeException admissionFailure) {
+											state.reject(admissionFailure);
+										}
+									}, FluxSink.OverflowStrategy.ERROR)
+											.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
+									return fileMapper.apply(file, batches);
+								};
 
-						var ssts = Flux.fromIterable(pinnedSsts.files());
-
-						if (shardCount == 1) {
-							return ssts.flatMap(mapper, 4, 1);
-						} else {
-							return ssts.concatMap(mapper, 2);
-						}
-					},
-					RawScanPinnedSstSet::close,
-					true);
+								var ssts = Flux.fromIterable(pinnedSsts.files());
+								if (shardCount == 1) {
+									return ssts.flatMap(mapper, 4, 1);
+								} else {
+									return ssts.concatMap(mapper, 2);
+								}
+							},
+							RawScanPinnedSstSet::close,
+							true);
 				}),
 				columnUse -> {
 					try {
@@ -8994,6 +9034,27 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				},
 				true)
 				.subscribeOn(workloadScheduler);
+	}
+
+	public Flux<RawScanEvent> scanRawResumableAsyncInternal(long columnId,
+			int shardIndex,
+			int shardCount,
+			Set<RawSstToken> completedSsts,
+			@NotNull Scheduler workloadScheduler) {
+		var workloadExecutor = workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler
+				? indexedScheduler.workloadExecutor()
+				: scheduler.readExecutor();
+		return scanRawAsyncInternal(columnId,
+				shardIndex,
+				shardCount,
+				completedSsts.stream()
+						.map(RawSstToken::value)
+						.collect(Collectors.toUnmodifiableSet()),
+				(file, batches) -> batches
+						.<RawScanEvent>map(batch -> new RawScanEvent.Batch(batch.serialized()))
+						.concatWithValues(new RawScanEvent.SstCompleted(file.resumableToken())),
+				workloadScheduler,
+				workloadExecutor);
 	}
 
 	public Stream<SerializedKVBatch> scanRaw(long columnId, int shardIndex, int shardCount) {

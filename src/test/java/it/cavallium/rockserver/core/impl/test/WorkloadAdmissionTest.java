@@ -364,6 +364,8 @@ class WorkloadAdmissionTest {
 		commands.add(client("getRange", new RocksDBAPICommandStream.GetRange<>(
 				0, 1, EMPTY_KEYS, null, false, RequestType.allInRange(), 1_000), analyticalOrBatch));
 		commands.add(client("scanRaw", new RocksDBAPICommandStream.ScanRaw(1, 0, 1), batch));
+		commands.add(client("scanRawResumable",
+				new RocksDBAPICommandStream.ScanRawResumable(1, 0, 1, Set.of()), batch));
 		commands.add(protectedCommand("cdcPoll", new RocksDBAPICommandStream.CdcPoll("cdc", null, 1), CDC));
 		commands.add(protectedCommand("flush", new RocksDBAPICommand.Flush(), PHYSICAL_MAINTENANCE));
 		commands.add(protectedCommand("compact", new RocksDBAPICommand.Compact(), PHYSICAL_MAINTENANCE));

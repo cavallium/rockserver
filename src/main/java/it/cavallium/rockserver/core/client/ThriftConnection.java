@@ -9,6 +9,8 @@ import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RangePage;
+import it.cavallium.rockserver.core.common.RawScanEvent;
+import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestChanged;
 import it.cavallium.rockserver.core.common.RequestType.RequestCurrent;
@@ -60,6 +62,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -230,6 +233,23 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
 		throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "scanRawAsync not implemented for Thrift");
+	}
+
+	@Override
+	public Stream<RawScanEvent> scanRawResumable(long columnId,
+			int shardIndex,
+			int shardCount,
+			Set<RawSstToken> completedSsts) {
+		throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "scanRawResumable not implemented for Thrift");
+	}
+
+	@Override
+	public Publisher<RawScanEvent> scanRawResumableAsync(long columnId,
+			int shardIndex,
+			int shardCount,
+			Set<RawSstToken> completedSsts) {
+		throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
+				"scanRawResumableAsync not implemented for Thrift");
 	}
 
 	@Override

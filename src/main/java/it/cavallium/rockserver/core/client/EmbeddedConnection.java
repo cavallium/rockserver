@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import java.util.concurrent.CancellationException;
@@ -72,6 +73,11 @@ public final class EmbeddedConnection extends BaseConnection implements Internal
 	@Override
 	public URI getUrl() {
 		return delegate.getUrl();
+	}
+
+	@Override
+	public RockserverCapabilities getCapabilities() {
+		return RockserverCapabilities.CURRENT;
 	}
 
 	@Override
@@ -286,6 +292,9 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					page.budget());
             case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
             case RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw scanRaw -> this.scanRawAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount());
+			case RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable scanRaw ->
+					this.scanRawResumableAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount(),
+							scanRaw.completedSsts());
             case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
 			case RocksDBAPICommand.CdcCommit cdcCommit -> db.cdcCommitAsyncInternal(cdcCommit.id(), cdcCommit.seq());
 			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> supplyAsyncPreservingRunningCompletion(
@@ -333,8 +342,31 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	}
 
 	@Override
+	public Flux<RawScanEvent> scanRawResumableAsync(long columnId,
+			int shardIndex,
+			int shardCount,
+			Set<RawSstToken> completedSsts) {
+		var command = new RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable(
+				columnId, shardIndex, shardCount, completedSsts);
+		return db.scanRawResumableAsyncInternal(
+				columnId,
+				shardIndex,
+				shardCount,
+				completedSsts,
+				commandScheduler(command));
+	}
+
+	@Override
 	public Stream<SerializedKVBatch> scanRaw(long columnId, int shardIndex, int shardCount) {
 		return db.scanRaw(columnId, shardIndex, shardCount);
+	}
+
+	@Override
+	public Stream<RawScanEvent> scanRawResumable(long columnId,
+			int shardIndex,
+			int shardCount,
+			Set<RawSstToken> completedSsts) {
+		return scanRawResumableAsync(columnId, shardIndex, shardCount, completedSsts).toStream();
 	}
 
 	@Override

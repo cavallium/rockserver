@@ -195,7 +195,8 @@ public final class WorkloadAdmission {
 		switch (command) {
 			case RocksDBAPICommandSingle.CreateColumn _, RocksDBAPICommandSingle.UploadMergeOperator _,
 					RocksDBAPICommandSingle.DeleteColumn _, RocksDBAPICommandSingle.DeleteColumnIfExists _,
-					RocksDBAPICommandStream.ScanRaw _ -> requireProfile(profile, command, BATCH);
+					RocksDBAPICommandStream.ScanRaw _, RocksDBAPICommandStream.ScanRawResumable _ ->
+					requireProfile(profile, command, BATCH);
 			case RocksDBAPICommandSingle.DeleteRange _, RocksDBAPICommandSingle.PutBatch _,
 					RocksDBAPICommandSingle.MergeBatch _ -> requireProfile(profile, command, INGEST, BATCH);
 			case RocksDBAPICommandStream.GetRange<?> _ -> requireProfile(profile, command, ANALYTICAL, BATCH);

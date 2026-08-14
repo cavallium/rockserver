@@ -60,7 +60,7 @@ class MandatoryContextApiSurfaceTest {
 		var publicMethods = Arrays.stream(RocksDBConnection.class.getMethods())
 				.map(Method::getName)
 				.collect(Collectors.toUnmodifiableSet());
-		assertEquals(Set.of("close", "getUrl", "getSyncApi", "getAsyncApi"), publicMethods);
+		assertEquals(Set.of("close", "getUrl", "getCapabilities", "getSyncApi", "getAsyncApi"), publicMethods);
 	}
 
 	@Test
