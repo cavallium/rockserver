@@ -2238,19 +2238,33 @@ public class GrpcServer extends Server {
 								.withCause(invalidToken)
 								.asRuntimeException());
 					}
-					return Flux.from(api.scanRawResumableAsync(request.getColumnId(),
-							request.getShardIndex(), request.getShardCount(), completedSsts))
-							.map(event -> switch (event) {
-								case RawScanEvent.Batch batch -> rawScanBatchResponse(batch.serialized());
-								case RawScanEvent.SstCompleted completed ->
-										it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder()
-												.setCompletedSstToken(completed.token().value())
-												.build();
-							});
+					var events = Flux.from(api.scanRawResumableAsync(request.getColumnId(),
+							request.getShardIndex(), request.getShardCount(), completedSsts));
+					if (request.getCoalesceCompletedSstToken()) {
+						return events.map(event -> switch (event) {
+							case RawScanEvent.Batch batch -> rawScanBatchResponse(
+									batch.serialized(), batch.completedSstToken());
+							case RawScanEvent.SstCompleted completed -> rawScanCompletionResponse(completed.token());
+						});
+					}
+					// Preserve the original response shape for rolling upgrades: clients that
+					// did not opt in still receive a distinct completion event.
+					return events.concatMap(event -> switch (event) {
+						case RawScanEvent.Batch batch when batch.completedSstToken() != null -> Flux.just(
+								rawScanBatchResponse(batch.serialized()),
+								rawScanCompletionResponse(batch.completedSstToken()));
+						case RawScanEvent.Batch batch -> Mono.just(rawScanBatchResponse(batch.serialized()));
+						case RawScanEvent.SstCompleted completed -> Mono.just(rawScanCompletionResponse(completed.token()));
+					}, 1);
 				}
 				if (request.getCompletedSstTokensCount() != 0) {
 					return Flux.error(Status.INVALID_ARGUMENT
 							.withDescription("completed SST tokens require resumable raw scan mode")
+							.asRuntimeException());
+				}
+				if (request.getCoalesceCompletedSstToken()) {
+					return Flux.error(Status.INVALID_ARGUMENT
+							.withDescription("coalesced SST completion requires resumable raw scan mode")
 							.asRuntimeException());
 				}
 				// Keep the established legacy path allocation-neutral: only resumable scans
@@ -2265,12 +2279,28 @@ public class GrpcServer extends Server {
 
 		private static it.cavallium.rockserver.core.common.api.proto.ScanRawResponse rawScanBatchResponse(
 				Buf serialized) {
+			return rawScanBatchResponse(serialized, null);
+		}
+
+		private static it.cavallium.rockserver.core.common.api.proto.ScanRawResponse rawScanBatchResponse(
+				Buf serialized,
+				@Nullable RawSstToken completedSstToken) {
 			var serializedBatchValue = UnsafeByteOperations.unsafeWrap(
 					serialized.getBackingByteArray(),
 					serialized.getBackingByteArrayOffset(),
 					serialized.getBackingByteArrayLength());
+			var response = it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder()
+					.setSerialized(serializedBatchValue);
+			if (completedSstToken != null) {
+				response.setCompletedSstTokenAfterBatch(completedSstToken.value());
+			}
+			return response.build();
+		}
+
+		private static it.cavallium.rockserver.core.common.api.proto.ScanRawResponse rawScanCompletionResponse(
+				RawSstToken completedSstToken) {
 			return it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder()
-					.setSerialized(serializedBatchValue)
+					.setCompletedSstToken(completedSstToken.value())
 					.build();
 		}
 

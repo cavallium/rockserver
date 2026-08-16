@@ -799,15 +799,27 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.setShardIndex(shardIndex)
 				.setShardCount(shardCount)
 				.setContext(currentWireRequestContext())
-				.setResumable(true);
+				.setResumable(true)
+				// This flag is the rolling-upgrade negotiation. Older servers ignore it
+				// and continue returning completion-only events.
+				.setCoalesceCompletedSstToken(true);
 		for (RawSstToken completedSst : completedSsts) {
 			request.addCompletedSstTokens(completedSst.value());
 		}
 		return reactiveStubWithRequestDeadline().scanRaw(request.build())
 				.map(event -> switch (event.getEventCase()) {
-					case SERIALIZED -> new RawScanEvent.Batch(Buf.wrap(event.getSerialized().toByteArray()));
-					case COMPLETEDSSTTOKEN -> new RawScanEvent.SstCompleted(
-							new RawSstToken(event.getCompletedSstToken()));
+					case SERIALIZED -> new RawScanEvent.Batch(
+							Buf.wrap(event.getSerialized().toByteArray()),
+							event.hasCompletedSstTokenAfterBatch()
+									? new RawSstToken(event.getCompletedSstTokenAfterBatch())
+									: null);
+					case COMPLETEDSSTTOKEN -> {
+						if (event.hasCompletedSstTokenAfterBatch()) {
+							throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+									"Rockserver returned two completion tokens in one raw-scan event");
+						}
+						yield new RawScanEvent.SstCompleted(new RawSstToken(event.getCompletedSstToken()));
+					}
 					case EVENT_NOT_SET -> throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
 							"Rockserver returned an empty resumable raw-scan event");
 				});

@@ -43,6 +43,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.LiveFileMetaData;
+import reactor.test.StepVerifier;
 
 @Timeout(90)
 class RawScanResumeTest {
@@ -163,12 +164,50 @@ class RawScanResumeTest {
 						columnId, 0, 1, Set.of(), db.getScheduler().read())
 						.doOnNext(observed::add)
 						.blockLast(Duration.ofSeconds(30)));
-				assertTrue(observed.stream().anyMatch(RawScanEvent.Batch.class::isInstance));
-				assertFalse(observed.stream().anyMatch(RawScanEvent.SstCompleted.class::isInstance),
+				assertTrue(completionTokens(observed).isEmpty(),
 						"a token is acknowledgable only after native reader cleanup succeeds");
 			} finally {
 				db.setRawScanCleanupObserverForTesting(null);
 			}
+		}
+	}
+
+	@Test
+	void finalBatchCompletionNeedsNoAdditionalDownstreamDemand(@TempDir Path tempDir) throws Exception {
+		Path config = rawScanConfig(tempDir);
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-demand", config)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			long columnId = createPopulatedColumn(api);
+			EmbeddedDB db = connection.getInternalDB();
+			StepVerifier.create(db.scanRawResumableAsyncInternal(
+					columnId, 0, 1, Set.of(), db.getScheduler().read()), SST_COUNT)
+					.expectNextMatches(RawScanResumeTest::isBatchWithCompletion)
+					.expectNextMatches(RawScanResumeTest::isBatchWithCompletion)
+					.expectNextMatches(RawScanResumeTest::isBatchWithCompletion)
+					.expectNextMatches(RawScanResumeTest::isBatchWithCompletion)
+					.expectComplete()
+					.verify(Duration.ofSeconds(30));
+		}
+	}
+
+	@Test
+	void rangeTombstoneOnlySstStillEmitsACompletion(@TempDir Path tempDir) throws Exception {
+		Path config = rawScanConfig(tempDir);
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-empty", config)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			long columnId = api.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			api.put(0, columnId, intKey(5), Buf.wrap((byte) 1), RequestType.none());
+			api.flush();
+			api.deleteRange(columnId, intKey(0), intKey(10));
+			api.flush();
+
+			Set<RawSstToken> liveSsts = liveColumnSstTokens(connection.getInternalDB());
+			assertEquals(2, liveSsts.size(), "the fixture needs one data and one range-tombstone SST");
+			List<RawScanEvent> events = scan(api, columnId, Set.of());
+			assertEquals(1L, decodedRows(events));
+			assertEquals(liveSsts, completionTokens(events));
+			assertEquals(1L, events.stream().filter(RawScanEvent.SstCompleted.class::isInstance).count());
 		}
 	}
 
@@ -186,8 +225,56 @@ class RawScanResumeTest {
 					assertEquals((long) SST_COUNT * KEYS_PER_SST, decodedRows(events));
 					Set<RawSstToken> completed = completionTokens(events);
 					assertFalse(completed.isEmpty());
+					assertTrue(events.stream()
+							.filter(RawScanEvent.Batch.class::isInstance)
+							.map(RawScanEvent.Batch.class::cast)
+							.allMatch(batch -> batch.completedSstToken() != null),
+							"a one-batch SST should carry completion without a separate stream item");
+					assertFalse(events.stream().anyMatch(RawScanEvent.SstCompleted.class::isInstance));
 					assertTrue(scan(api, columnId, completed).isEmpty());
 				}
+			}
+		}
+	}
+
+	@Test
+	void grpcRetainsLegacyCompletionShapeForClientsThatDoNotOptIn(@TempDir Path tempDir) throws Exception {
+		try (var embedded = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-grpc-legacy", null);
+				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+			RocksDBSyncAPI embeddedApi = embedded.getSyncApi(RequestContext.batch());
+			long columnId = createPopulatedColumn(embeddedApi);
+			server.start();
+			var channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort())
+					.usePlaintext()
+					.build();
+			try {
+				var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+						.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+						.setDeadlineEpochMillis(Long.MAX_VALUE)
+						.build();
+				var request = ScanRawRequest.newBuilder()
+						.setColumnId(columnId)
+						.setShardCount(1)
+						.setContext(context)
+						.setResumable(true)
+						.build();
+				var responses = RocksDBServiceGrpc.newBlockingStub(channel).scanRaw(request);
+				int batches = 0;
+				int completions = 0;
+				while (responses.hasNext()) {
+					var response = responses.next();
+					assertFalse(response.hasCompletedSstTokenAfterBatch());
+					switch (response.getEventCase()) {
+						case SERIALIZED -> batches++;
+						case COMPLETEDSSTTOKEN -> completions++;
+						case EVENT_NOT_SET -> throw new AssertionError("empty raw-scan response");
+					}
+				}
+				assertEquals(SST_COUNT, batches);
+				assertEquals(SST_COUNT, completions);
+			} finally {
+				channel.shutdownNow();
+				assertTrue(channel.awaitTermination(5, TimeUnit.SECONDS));
 			}
 		}
 	}
@@ -248,6 +335,16 @@ class RawScanResumeTest {
 				assertEquals(Status.Code.INVALID_ARGUMENT, modeFailure.getStatus().getCode());
 				assertEquals("completed SST tokens require resumable raw scan mode",
 						modeFailure.getStatus().getDescription());
+
+				var legacyWithCoalescing = legacyWithToken.toBuilder()
+						.clearCompletedSstTokens()
+						.setCoalesceCompletedSstToken(true)
+						.build();
+				var coalescingFailure = assertThrows(StatusRuntimeException.class,
+						() -> stub.scanRaw(legacyWithCoalescing).hasNext());
+				assertEquals(Status.Code.INVALID_ARGUMENT, coalescingFailure.getStatus().getCode());
+				assertEquals("coalesced SST completion requires resumable raw scan mode",
+						coalescingFailure.getStatus().getDescription());
 			} finally {
 				channel.shutdownNow();
 				assertTrue(channel.awaitTermination(5, TimeUnit.SECONDS));
@@ -354,11 +451,25 @@ class RawScanResumeTest {
 				.sum();
 	}
 
+	private static boolean isBatchWithCompletion(RawScanEvent event) {
+		return event instanceof RawScanEvent.Batch batch && batch.completedSstToken() != null;
+	}
+
+	private static Keys intKey(int value) {
+		var key = Buf.createZeroes(Integer.BYTES);
+		key.setInt(0, value);
+		return new Keys(key);
+	}
+
 	private static Set<RawSstToken> completionTokens(List<RawScanEvent> events) {
 		var result = new HashSet<RawSstToken>();
 		for (var event : events) {
-				if (event instanceof RawScanEvent.SstCompleted(var token)) {
-					assertTrue(result.add(token), "each captured SST must complete exactly once");
+			RawSstToken token = switch (event) {
+				case RawScanEvent.Batch batch -> batch.completedSstToken();
+				case RawScanEvent.SstCompleted completed -> completed.token();
+			};
+			if (token != null) {
+				assertTrue(result.add(token), "each captured SST must complete exactly once");
 			}
 		}
 		return Set.copyOf(result);

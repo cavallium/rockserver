@@ -1076,7 +1076,8 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 		/**
 		 * Scan raw SST files, skipping exact files whose completion tokens are
-		 * acknowledged by the client.
+		 * acknowledged by the client. Non-empty SSTs coalesce completion with
+		 * their final data batch.
 		 */
 		record ScanRawResumable(long columnId,
 				int shardIndex,

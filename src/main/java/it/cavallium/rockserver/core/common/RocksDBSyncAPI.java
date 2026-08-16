@@ -287,7 +287,10 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new ScanRaw(columnId, shardIndex, shardCount));
 	}
 
-	/** See: {@link ScanRawResumable}. */
+	/**
+	 * See: {@link ScanRawResumable}. A non-empty SST carries its completion
+	 * token on its final {@link RawScanEvent.Batch}.
+	 */
 	default Stream<RawScanEvent> scanRawResumable(long columnId,
 			int shardIndex,
 			int shardCount,

@@ -8534,7 +8534,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return failure;
 	}
 
-	private final class ScanState implements RWScheduler.CooperativeCompletionTask,
+	@FunctionalInterface
+	private interface RawScanTerminalMapper<T> {
+
+		T map(@Nullable SerializedKVBatch finalBatch, RawSstToken token);
+	}
+
+	private final class ScanState<T> implements RWScheduler.CooperativeCompletionTask,
 			LongConsumer,
 			reactor.core.Disposable {
 		private static final VarHandle DEMAND =
@@ -8544,8 +8550,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final ColumnInstance col;
 		private final String cfName;
 		private final PinnedSstFile file;
-		private final FluxSink<SerializedKVBatch> sink;
+		private final FluxSink<T> sink;
 		private final long maximumQuantumNanos;
+		private final Function<SerializedKVBatch, T> batchMapper;
+		private final @Nullable RawScanTerminalMapper<T> terminalMapper;
 		private volatile long demand;
 		private volatile boolean terminated;
 		private volatile boolean cancellationRequested;
@@ -8561,17 +8569,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private boolean completionPrepared;
 		private boolean resourcesCleaned;
 		private @Nullable Throwable resourceCleanupFailure;
+		private @Nullable T pendingSuccessfulEmission;
 
 		private ScanState(ColumnInstance col,
 		                  String cfName,
 		                  PinnedSstFile file,
-		                  FluxSink<SerializedKVBatch> sink,
-		                  long maximumQuantumNanos) {
+		                  FluxSink<T> sink,
+		                  long maximumQuantumNanos,
+		                  Function<SerializedKVBatch, T> batchMapper,
+		                  @Nullable RawScanTerminalMapper<T> terminalMapper) {
 			this.col = col;
 			this.cfName = cfName;
 			this.file = file;
 			this.sink = sink;
 			this.maximumQuantumNanos = maximumQuantumNanos;
+			this.batchMapper = batchMapper;
+			this.terminalMapper = terminalMapper;
 		}
 
 		private void attach(RWScheduler.CooperativeHandle handle) {
@@ -8668,14 +8681,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					var iterator = Objects.requireNonNull(it, "Raw scan iterator");
 					if (!iterator.isValid()) {
 						iterator.status();
-						if (batchSize > 0) {
-							emitBatch();
-						}
-						if (context.terminationRequested()) {
-							return RWScheduler.CooperativeResult.COMPLETE;
-						}
-						prepareSuccessfulCompletion(context);
-						return RWScheduler.CooperativeResult.COMPLETE;
+						return prepareEndOfFile(context);
 					}
 
 					batchSize++;
@@ -8707,6 +8713,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					iterator.next();
 					if (batchSize >= RAW_SCAN_MAX_ENTRIES_PER_CHUNK
 							|| currentBatchBytes >= RAW_SCAN_MAX_BYTES_PER_CHUNK) {
+						if (terminalMapper != null && !iterator.isValid()) {
+							iterator.status();
+							return prepareEndOfFile(context);
+						}
 						emitBatch();
 						if (demand == 0L) {
 							return RWScheduler.CooperativeResult.PARK;
@@ -8733,6 +8743,27 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 		}
 
+		private RWScheduler.CooperativeResult prepareEndOfFile(RWScheduler.CooperativeContext context) {
+			var localTerminalMapper = terminalMapper;
+			if (localTerminalMapper == null) {
+				if (batchSize > 0) {
+					emitBatch();
+				}
+			} else {
+				var finalBatch = batchSize > 0 ? takeBatch() : null;
+				T terminalEmission = Objects.requireNonNull(
+						localTerminalMapper.map(finalBatch, file.resumableToken()),
+						"Raw scan terminal mapper returned null");
+				producedOne();
+				pendingSuccessfulEmission = terminalEmission;
+			}
+			if (context.terminationRequested()) {
+				return RWScheduler.CooperativeResult.COMPLETE;
+			}
+			prepareSuccessfulCompletion(context);
+			return RWScheduler.CooperativeResult.COMPLETE;
+		}
+
 		private void prepareSuccessfulCompletion(RWScheduler.CooperativeContext context) {
 			var failure = cleanupNativeResources(null);
 			if (failure != null) {
@@ -8752,19 +8783,28 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				throw new IllegalStateException("Scheduler selected RUN before raw scan cleanup completed");
 			}
 			if (TERMINATED.compareAndSet(this, false, true)) {
+				var terminalEmission = pendingSuccessfulEmission;
+				pendingSuccessfulEmission = null;
+				if (terminalEmission != null) {
+					sink.next(terminalEmission);
+				}
 				sink.complete();
 			}
 		}
 
 		private void emitBatch() {
 			producedOne();
+			sink.next(batchMapper.apply(takeBatch()));
+		}
+
+		private SerializedKVBatch takeBatch() {
 			outBuf.setIntLE(0, batchSize);
 			var batch = new SerializedKVBatch.SerializedKVBatchRef(
 					outBuf.copyOfRange(0, currentSerializedBatchBytes));
 			batchSize = 0;
 			currentBatchBytes = 0;
 			currentSerializedBatchBytes = Integer.BYTES;
-			sink.next(batch);
+			return batch;
 		}
 
 		private void producedOne() {
@@ -8829,6 +8869,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (!TERMINATED.compareAndSet(this, false, true)) {
 				return;
 			}
+			pendingSuccessfulEmission = null;
 			var failure = cleanupNativeResources(originalFailure);
 			if (!signalTerminal) {
 				return;
@@ -8927,7 +8968,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				shardIndex,
 				shardCount,
 				null,
-				(_, batches) -> batches,
+				Function.identity(),
+				null,
 				scheduler.read(),
 				scheduler.readExecutor());
 	}
@@ -8943,7 +8985,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				shardIndex,
 				shardCount,
 				null,
-				(_, batches) -> batches,
+				Function.identity(),
+				null,
 				workloadScheduler,
 				workloadExecutor);
 	}
@@ -8957,7 +9000,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				shardIndex,
 				shardCount,
 				null,
-				(_, batches) -> batches,
+				Function.identity(),
+				null,
 				workloadScheduler,
 				workloadExecutor);
 	}
@@ -8966,7 +9010,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			int shardIndex,
 			int shardCount,
 			@Nullable Set<String> completedSstFileNames,
-			BiFunction<PinnedSstFile, Flux<SerializedKVBatch>, Publisher<T>> fileMapper,
+			Function<SerializedKVBatch, T> batchMapper,
+			@Nullable RawScanTerminalMapper<T> terminalMapper,
 			@NotNull Scheduler workloadScheduler,
 			@NotNull RWScheduler.WorkloadExecutor workloadExecutor) {
 		long maximumQuantumNanos = workloadSettings.rangeQuantumMaxDuration().toNanos();
@@ -8997,9 +9042,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									observer.run();
 								}
 
-								Function<PinnedSstFile, Publisher<T>> mapper = file -> {
-									var batches = Flux.<SerializedKVBatch>create(rawSink -> {
-										var state = new ScanState(col, cfName, file, rawSink, maximumQuantumNanos);
+								Function<PinnedSstFile, Publisher<T>> mapper = file ->
+									Flux.<T>create(rawSink -> {
+										var state = new ScanState<>(col, cfName, file, rawSink,
+												maximumQuantumNanos, batchMapper, terminalMapper);
 										rawSink.onRequest(state);
 										rawSink.onCancel(state);
 										rawSink.onDispose(state);
@@ -9012,8 +9058,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 										}
 									}, FluxSink.OverflowStrategy.ERROR)
 											.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
-									return fileMapper.apply(file, batches);
-								};
 
 								var ssts = Flux.fromIterable(pinnedSsts.files());
 								if (shardCount == 1) {
@@ -9050,9 +9094,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				completedSsts.stream()
 						.map(RawSstToken::value)
 						.collect(Collectors.toUnmodifiableSet()),
-				(file, batches) -> batches
-						.<RawScanEvent>map(batch -> new RawScanEvent.Batch(batch.serialized()))
-						.concatWithValues(new RawScanEvent.SstCompleted(file.resumableToken())),
+				batch -> new RawScanEvent.Batch(batch.serialized()),
+				(finalBatch, token) -> finalBatch != null
+						? new RawScanEvent.Batch(finalBatch.serialized(), token)
+						: new RawScanEvent.SstCompleted(token),
 				workloadScheduler,
 				workloadExecutor);
 	}

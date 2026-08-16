@@ -546,6 +546,8 @@ public final class GrpcRawScanBenchmark {
 				if (completionToken != null) {
 					validateRawSstToken(completionToken);
 					completedSsts++;
+				}
+				if (ResumableProtocol.completionOnly(response)) {
 					continue;
 				}
 			}
@@ -620,12 +622,21 @@ public final class GrpcRawScanBenchmark {
 	private static final class ResumableProtocol {
 
 		private static void enable(ScanRawRequest.Builder request) {
-			request.setResumable(true);
+			request.setResumable(true)
+					.setCoalesceCompletedSstToken(true);
 		}
 
 		private static @Nullable String completionToken(
 				it.cavallium.rockserver.core.common.api.proto.ScanRawResponse response) {
+			if (response.hasCompletedSstTokenAfterBatch()) {
+				return response.getCompletedSstTokenAfterBatch();
+			}
 			return response.hasCompletedSstToken() ? response.getCompletedSstToken() : null;
+		}
+
+		private static boolean completionOnly(
+				it.cavallium.rockserver.core.common.api.proto.ScanRawResponse response) {
+			return response.hasCompletedSstToken();
 		}
 	}
 

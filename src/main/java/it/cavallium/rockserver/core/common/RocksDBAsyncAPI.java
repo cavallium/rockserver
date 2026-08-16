@@ -319,6 +319,8 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 
 	/**
 	 * Scan raw SSTs and emit a completion token after each fully emitted file.
+	 * A non-empty SST carries its token on its final {@link RawScanEvent.Batch};
+	 * an SST with no point-data batch emits {@link RawScanEvent.SstCompleted}.
 	 * Tokens acknowledged in {@code completedSsts} skip only an exact SST that is
 	 * still live in the same database.
 	 */

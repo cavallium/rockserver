@@ -228,6 +228,9 @@ message ScanRawRequest {
   // Database-scoped SST filename tokens returned by resumable responses.
   repeated string completedSstTokens = 5;
   bool resumable = 6;
+  // Opt in to receiving an SST completion token on its final serialized batch.
+  // Older servers ignore this field and continue sending completion-only events.
+  bool coalesceCompletedSstToken = 7;
 }
 /*
 
@@ -266,6 +269,9 @@ message ScanRawResponse {
     // Exact immutable SST filename, scoped to this database.
     string completedSstToken = 2;
   }
+  // Set together with serialized when the requesting client opted in. The
+  // token becomes acknowledgable only after the SST reader closed successfully.
+  optional string completedSstTokenAfterBatch = 3;
 }
 
 message CompactRequest {}
