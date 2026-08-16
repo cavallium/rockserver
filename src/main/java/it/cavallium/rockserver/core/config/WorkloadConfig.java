@@ -68,6 +68,10 @@ public interface WorkloadConfig {
 
 	Duration rangeQuantumMaxDuration() throws GestaltException;
 
+	Integer rawScanFileConcurrency() throws GestaltException;
+
+	DataSize rawScanReadaheadBytes() throws GestaltException;
+
 	Integer cdcQuantumMaxMutations() throws GestaltException;
 
 	DataSize cdcQuantumMaxBytes() throws GestaltException;

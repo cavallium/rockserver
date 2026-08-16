@@ -36,6 +36,10 @@ class ConfigParserBoundaryTest {
 				() -> assertEquals(1, config.parallelism().workload().readLatencyReservation()),
 				() -> assertEquals(Duration.ofSeconds(60),
 						config.parallelism().workload().retainedSnapshotMaximumAge()),
+				() -> assertEquals(WorkloadSettings.DEFAULT_RAW_SCAN_FILE_CONCURRENCY,
+						config.parallelism().workload().rawScanFileConcurrency()),
+				() -> assertEquals(new DataSize("8MiB"),
+						config.parallelism().workload().rawScanReadaheadBytes()),
 				() -> assertEquals("default", config.metrics().databaseName()),
 				() -> assertFalse(config.metrics().influx().enabled()),
 				() -> assertTrue(config.metrics().influx().allowInsecureCertificates()),
@@ -139,6 +143,8 @@ class ConfigParserBoundaryTest {
 				"range-quantum-max-items",
 				"range-quantum-max-bytes",
 				"range-quantum-max-duration",
+				"raw-scan-file-concurrency",
+				"raw-scan-readahead-bytes",
 				"cdc-quantum-max-mutations",
 				"cdc-quantum-max-bytes",
 				"cdc-quantum-max-duration",
@@ -168,6 +174,9 @@ class ConfigParserBoundaryTest {
 				"database.parallelism.workload.competing-batch-write-interval = PT0S",
 				"database.parallelism.workload.pressured-batch-maximum-active = 57",
 				"database.parallelism.workload.range-quantum-max-duration = PT0S",
+				"database.parallelism.workload.raw-scan-file-concurrency = 0",
+				"database.parallelism.workload.raw-scan-file-concurrency = 65",
+				"database.parallelism.workload.raw-scan-readahead-bytes = 0B",
 				"database.parallelism.workload.cdc-quantum-max-bytes = 0B"
 		};
 		for (int i = 0; i < invalidOverrides.length; i++) {
@@ -308,6 +317,8 @@ class ConfigParserBoundaryTest {
 				database.parallelism.workload.range-quantum-max-items = 1900
 				database.parallelism.workload.range-quantum-max-bytes = 20MiB
 				database.parallelism.workload.range-quantum-max-duration = PT0.021S
+				database.parallelism.workload.raw-scan-file-concurrency = 6
+				database.parallelism.workload.raw-scan-readahead-bytes = 32MiB
 				database.parallelism.workload.cdc-quantum-max-mutations = 2200
 				database.parallelism.workload.cdc-quantum-max-bytes = 23MiB
 				database.parallelism.workload.cdc-quantum-max-duration = PT0.024S
@@ -343,6 +354,9 @@ class ConfigParserBoundaryTest {
 				() -> assertEquals(20, reparsed.parallelism().read()),
 				() -> assertEquals(21, reparsed.parallelism().write()),
 				() -> assertEquals(WorkloadSettings.resolve(original), WorkloadSettings.resolve(reparsed)),
+				() -> assertEquals(6, reparsed.parallelism().workload().rawScanFileConcurrency()),
+				() -> assertEquals(new DataSize("32MiB"),
+						reparsed.parallelism().workload().rawScanReadaheadBytes()),
 				() -> assertFalse(reparsed.global().followRocksdbOptimizations()),
 				() -> assertFalse(reparsed.global().paranoidChecks()),
 				() -> assertTrue(reparsed.global().useClockCache()),

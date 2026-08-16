@@ -50,6 +50,37 @@ class RawScanResumeTest {
 	private static final String COLUMN_NAME = "events";
 	private static final int SST_COUNT = 4;
 	private static final int KEYS_PER_SST = 32;
+	private static final long MIB = 1024L * 1024L;
+
+	@Test
+	void customRawScanConcurrencyAndReadaheadDriveACompleteScan(@TempDir Path tempDir) throws Exception {
+		Path config = tempDir.resolve("raw-scan-tuning.conf");
+		Files.writeString(config, """
+				database: {
+				  parallelism: {
+				    workload: {
+				      raw-scan-file-concurrency: 6
+				      raw-scan-readahead-bytes: 32MiB
+				    }
+				  }
+				  global: {
+				    ingest-behind: false
+				    optimistic: false
+				    disable-auto-compactions: true
+				    disable-write-slowdown: true
+				  }
+				}
+				""");
+
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "raw-scan-tuning", config)) {
+			var settings = connection.getInternalDB().getWorkloadSettings();
+			assertEquals(6, settings.rawScanFileConcurrency());
+			assertEquals(32L * MIB, settings.rawScanReadaheadBytes());
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			long columnId = createPopulatedColumn(api);
+			assertEquals((long) SST_COUNT * KEYS_PER_SST, decodedRows(scan(api, columnId, Set.of())));
+		}
+	}
 
 	@Test
 	void acknowledgedLiveSstsAreSkippedBeforePinningAndAcrossRestart(@TempDir Path tempDir) throws Exception {

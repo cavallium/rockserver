@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.config.DataSize;
+import it.cavallium.rockserver.core.config.WorkloadSettings;
 import java.nio.file.Path;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.junit.jupiter.api.Assertions;
@@ -21,5 +22,9 @@ class DefaultConfigTest {
 		Assertions.assertEquals(new DataSize("32KiB"), def.global().fallbackColumnOptions().levels()[6].maxDictBytes());
 		Assertions.assertEquals(86_400L, def.global().walTtlSeconds());
 		Assertions.assertEquals(102_400L, def.global().walSizeLimitMb());
+		Assertions.assertEquals(WorkloadSettings.DEFAULT_RAW_SCAN_FILE_CONCURRENCY,
+				def.parallelism().workload().rawScanFileConcurrency());
+		Assertions.assertEquals(new DataSize("8MiB"),
+				def.parallelism().workload().rawScanReadaheadBytes());
 	}
 }

@@ -29,6 +29,7 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.SerializedKVBatch.SerializedKVBatchRef;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
 import it.cavallium.rockserver.core.common.api.proto.ScanRawRequest;
+import it.cavallium.rockserver.core.config.DataSize;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
 import it.cavallium.rockserver.core.server.GrpcServer;
@@ -88,6 +89,10 @@ public final class GrpcRawScanBenchmark {
 	private static final long STREAM_DEADLINE_MINUTES = 15L;
 	private static final int RAW_MAX_ENTRIES = 65_536;
 	private static final int RAW_MAX_SERIALIZED_BYTES = 3 * 1024 * 1024;
+	// Keep the controller binary-compatible with the immutable baseline production classes.
+	private static final int DEFAULT_RAW_SCAN_FILE_CONCURRENCY = 4;
+	private static final long DEFAULT_RAW_SCAN_READAHEAD_BYTES = 8L * 1024L * 1024L;
+	private static final int MAX_RAW_SCAN_FILE_CONCURRENCY = 64;
 	private static final String PERFORMANCE_BASELINE_SHA =
 			"bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e";
 	private static final Set<String> WORKER_KEYS = Set.of(
@@ -216,7 +221,14 @@ public final class GrpcRawScanBenchmark {
 				"--batch-entries=" + options.batchEntries(),
 				"--scan-clients=" + options.scanClients(),
 				"--read-parallelism=" + options.readParallelism(),
-				"--write-parallelism=" + options.writeParallelism(),
+				"--write-parallelism=" + options.writeParallelism()));
+		// The immutable baseline predates these CLI options and rejects unknown flags.
+		// Its EmbeddedDB also retains the historical hard-coded 4-reader/8-MiB behavior.
+		if (implementation == Implementation.CANDIDATE) {
+			command.add("--raw-scan-file-concurrency=" + options.rawScanFileConcurrency());
+			command.add("--raw-scan-readahead-bytes=" + options.rawScanReadaheadBytes() + "B");
+		}
+		command.addAll(List.of(
 				"--warmup-passes=" + options.warmupPasses(),
 				"--measure-seconds=" + options.measureSeconds(),
 				"--sample-micros=" + options.sampleMicros(),
@@ -797,7 +809,11 @@ public final class GrpcRawScanBenchmark {
 				  parallelism: {
 				    read: %d
 				    write: %d
-				    workload: { batch-queue-capacity: 4096 }
+				    workload: {
+				      batch-queue-capacity: 4096
+				      raw-scan-file-concurrency: %d
+				      raw-scan-readahead-bytes: "%dB"
+				    }
 				  }
 				  global: {
 				    ingest-behind: false
@@ -808,7 +824,10 @@ public final class GrpcRawScanBenchmark {
 				    fallback-column-options: { write-buffer-size: "64MiB" }
 				  }
 				}
-				""".formatted(options.readParallelism(), options.writeParallelism());
+				""".formatted(options.readParallelism(),
+				options.writeParallelism(),
+				options.rawScanFileConcurrency(),
+				options.rawScanReadaheadBytes());
 	}
 
 	private static String datasetId(Options options, String config) {
@@ -919,6 +938,8 @@ public final class GrpcRawScanBenchmark {
 						+ "scan-clients=" + options.scanClients() + "\n"
 						+ "read-parallelism=" + options.readParallelism() + "\n"
 						+ "write-parallelism=" + options.writeParallelism() + "\n"
+						+ "raw-scan-file-concurrency=" + options.rawScanFileConcurrency() + "\n"
+						+ "raw-scan-readahead-bytes=" + options.rawScanReadaheadBytes() + "\n"
 						+ "warmup-passes=" + options.warmupPasses() + "\n"
 						+ "measure-seconds=" + options.measureSeconds() + "\n"
 						+ "rounds=" + options.rounds() + "\n"
@@ -964,6 +985,9 @@ public final class GrpcRawScanBenchmark {
 				.append(candidateProvenance.classPathSha256()).append("`\n")
 				.append("- Storage: `").append(options.storageLabel()).append("`, `")
 				.append(store.name()).append("`, `").append(store.type()).append("`\n")
+				.append("- Candidate raw-scan file concurrency / readahead: `")
+				.append(options.rawScanFileConcurrency()).append("` / `")
+				.append(new DataSize(options.rawScanReadaheadBytes())).append("`\n")
 				.append("- Host/build state: `").append(options.hostState()).append("`, `")
 				.append(options.buildStateBaseline()).append("` / `")
 				.append(options.buildStateCandidate()).append("`\n")
@@ -1160,11 +1184,15 @@ public final class GrpcRawScanBenchmark {
 					--storage-label=hdd-btrfs --host-state=dedicated --enforce=true
 
 				Full defaults: 1,000,000 keys, eight explicit SST flushes, five scan clients,
-				20 READ workers, one complete warmup scan/client, 15 measured seconds, alternating
+				20 READ workers, four SST readers/scan, 8 MiB readahead/reader, one complete
+				warmup scan/client, 15 measured seconds, alternating
 				implementation order, and strict candidate idle instrumentation. Pareto mode fixes ten
 				paired rounds, requires every point estimate to be no worse than equality, rejects a
 				confidence interval that demonstrates regression, and requires one material primary gain.
 				The 0.99/1.02 ceilings are report-only exception candidates, never automatic passes.
+				Tune candidates with --raw-scan-file-concurrency=4|6|8 and
+				--raw-scan-readahead-bytes=8MiB|32MiB|64MiB; each one-shot root compares the
+				candidate setting against the unchanged baseline defaults.
 				Use --smoke=true --enforce=false for structural validation only.
 				""");
 	}
@@ -1747,6 +1775,8 @@ public final class GrpcRawScanBenchmark {
 			int scanClients,
 			int readParallelism,
 			int writeParallelism,
+			int rawScanFileConcurrency,
+			long rawScanReadaheadBytes,
 			int warmupPasses,
 			int measureSeconds,
 			int rounds,
@@ -1761,6 +1791,7 @@ public final class GrpcRawScanBenchmark {
 				"implementation", "round", "build-baseline", "build-candidate", "build-state-baseline",
 				"build-state-candidate", "storage-label", "host-state", "preload-keys", "flush-keys",
 				"value-bytes", "batch-entries", "scan-clients", "read-parallelism", "write-parallelism",
+				"raw-scan-file-concurrency", "raw-scan-readahead-bytes",
 				"warmup-passes", "measure-seconds", "rounds", "sample-micros", "instrumentation-mode",
 				"child-heap", "enforce", "smoke");
 
@@ -1781,6 +1812,9 @@ public final class GrpcRawScanBenchmark {
 			boolean smoke = bool(values, "smoke", false);
 			Path root = Path.of(values.getOrDefault("root", Path.of(System.getProperty("java.io.tmpdir"),
 					"rockserver-raw-scan-" + System.currentTimeMillis()).toString()));
+			long rawScanReadaheadBytes = new DataSize(values.getOrDefault(
+					"raw-scan-readahead-bytes",
+					new DataSize(DEFAULT_RAW_SCAN_READAHEAD_BYTES).toString())).longValue();
 			Options options = new Options(worker, root,
 					Path.of(values.getOrDefault("dataset-root", root.resolve("shared-dataset").toString())),
 					Path.of(values.getOrDefault("output", root.resolve("worker.properties").toString())),
@@ -1799,6 +1833,9 @@ public final class GrpcRawScanBenchmark {
 					integer(values, "scan-clients", smoke ? 2 : 5),
 					integer(values, "read-parallelism", smoke ? 4 : 20),
 					integer(values, "write-parallelism", smoke ? 4 : 8),
+					integer(values, "raw-scan-file-concurrency",
+							DEFAULT_RAW_SCAN_FILE_CONCURRENCY),
+					rawScanReadaheadBytes,
 					integer(values, "warmup-passes", 1), integer(values, "measure-seconds", smoke ? 2 : 15),
 					integer(values, "rounds", smoke ? 1 : 10),
 					integer(values, "sample-micros", 250),
@@ -1815,8 +1852,11 @@ public final class GrpcRawScanBenchmark {
 				throw new IllegalArgumentException("preload/flush/batch/value dimensions must be positive and exact multiples");
 			}
 			if (scanClients < 1 || readParallelism < 1 || writeParallelism < 1
+					|| rawScanFileConcurrency < 1
+					|| rawScanFileConcurrency > MAX_RAW_SCAN_FILE_CONCURRENCY
+					|| rawScanReadaheadBytes < 1L
 					|| warmupPasses < 1 || measureSeconds < 1 || rounds < 1 || sampleMicros < 1) {
-				throw new IllegalArgumentException("worker, duration, round, and sampling dimensions must be positive");
+				throw new IllegalArgumentException("worker, raw-scan, duration, round, and sampling dimensions are invalid");
 			}
 			if (!List.of("strict", "portable", "controller").contains(instrumentationMode)) {
 				throw new IllegalArgumentException("instrumentation-mode must be strict, portable, or controller");

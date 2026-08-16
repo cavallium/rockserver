@@ -16,8 +16,10 @@ configuration, client count, scheduler parallelism, host, and storage. Odd round
 baseline first; even rounds run candidate first. Every child completes one full warm
 scan per client before timing, so this gate intentionally measures warmed raw scans.
 
-Five clients each expose Rockserver's existing four-way per-stream SST parallelism,
-enough to saturate the default 20 READ workers. During every measured interval the
+Five clients expose at least Rockserver's baseline four-way per-stream SST parallelism,
+enough to saturate the default 20 READ workers. Candidate file concurrency and per-reader
+readahead are explicit benchmark inputs and are fingerprinted into the dataset and report.
+During every measured interval the
 candidate's strict scheduler sampler requires observed 20/20 activity and rejects an
 eligible queued task coexisting with a sleeping worker for more than the eight-ms
 cooperative quantum plus one sampling period. No scheduler sleep or rate cap is
@@ -80,7 +82,9 @@ java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
   --candidate-classes=target/classes \
   "--build-baseline=${baseline_sha}" "--build-candidate=${candidate_sha}" \
   --build-state-baseline=clean --build-state-candidate=clean \
-  --storage-label=hdd-btrfs --host-state=dedicated --enforce=true
+  --storage-label=hdd-btrfs --host-state=dedicated \
+  --raw-scan-file-concurrency=4 --raw-scan-readahead-bytes=8MiB \
+  --enforce=true
 ```
 
 The default full shape is 1,000,000 256-byte values, flushes every 125,000 keys,
@@ -90,6 +94,14 @@ five scan clients, 20 READ workers, one complete warmup pass per client, and at 
 dedicated non-CI hardware, and those dimensions. The root is one-shot and is never
 overwritten. Preserve `results.json`, `results.md`, metadata, the immutable dataset,
 and every per-round worker file.
+
+To select a production candidate, run separate one-shot roots for file concurrency
+`4`, `6`, and `8` crossed with readahead `8MiB`, `32MiB`, and `64MiB`. Each run keeps
+the untouched baseline at its historical 4-reader/8-MiB behavior while applying the
+requested values to the candidate. Accept a setting only if the complete Pareto gate
+passes, including scheduler queue p99 and native/direct/RSS bounds, and the separate
+mixed-workload gate confirms foreground latency; do not combine results from different
+roots as if they were paired rounds.
 
 Use `--smoke=true --enforce=false` only to validate structure and binary compatibility.
 A tmpfs/shared-host smoke result, a dirty build, a short interval, or an incomplete

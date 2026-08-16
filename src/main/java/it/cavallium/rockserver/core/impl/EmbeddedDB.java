@@ -8607,7 +8607,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						.setFillCache(false)
 						.setIgnoreRangeDeletions(true)
 						.setVerifyChecksums(true)
-						.setReadaheadSize(8 * SizeUnit.MB);
+						.setReadaheadSize(workloadSettings.rawScanReadaheadBytes());
 
 				createdIterator = createdReader.newIterator(createdReadOptions);
 				createdIterator.seekToFirst();
@@ -9017,7 +9017,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 								var ssts = Flux.fromIterable(pinnedSsts.files());
 								if (shardCount == 1) {
-									return ssts.flatMap(mapper, 4, 1);
+									return ssts.flatMap(mapper, workloadSettings.rawScanFileConcurrency(), 1);
 								} else {
 									return ssts.concatMap(mapper, 2);
 								}

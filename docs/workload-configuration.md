@@ -87,6 +87,8 @@ transport/operation deadline, and the earliest deadline wins.
 | `range-quantum-max-items` | 4096 | Maximum logical keys in one range/count quantum |
 | `range-quantum-max-bytes` | `8MiB` | Maximum encoded key/value bytes in one range/count quantum |
 | `range-quantum-max-duration` | `PT0.008S` | Maximum monotonic runtime of one range/count quantum |
+| `raw-scan-file-concurrency` | 4 | Maximum simultaneously subscribed SST readers for one unsharded raw scan |
+| `raw-scan-readahead-bytes` | `8MiB` | Sequential readahead reserved by each active raw-SST reader |
 | `cdc-quantum-max-mutations` | 4096 | Maximum mutations parsed in one CDC quantum |
 | `cdc-quantum-max-bytes` | `8MiB` | Maximum decoded WAL key/value bytes scanned in one CDC quantum |
 | `cdc-quantum-max-duration` | `PT0.008S` | Maximum monotonic runtime of one CDC quantum |
@@ -95,8 +97,9 @@ transport/operation deadline, and the earliest deadline wins.
 | `latency-fan-out-max-items` | 256 | Server maximum items accepted for LATENCY fixed multi/fan-out commands |
 | `latency-fan-out-max-bytes` | `2MiB` | Server maximum encoded input for LATENCY point mutations and fixed multi/fan-out commands |
 
-Every item, mutation, and byte limit must be positive. Quantum durations must be
-positive and representable. A quantum stops at the first key, byte, or elapsed
+Every item, mutation, and byte limit must be positive. Raw-scan concurrency must
+be between 1 and 64, and raw-scan readahead must be positive. Quantum durations
+must be positive and representable. A quantum stops at the first key, byte, or elapsed
 time bound it reaches; continuations reacquire workload admission. Every bounded
 range page is rejected if its explicit `RangeBudget` exceeds the public
 4096-item/8-MiB ceiling, regardless of profile. LATENCY pages are also rejected
@@ -111,7 +114,10 @@ With no competing work in any scheduler pool it keeps producing the existing ful
 wire batches without a duration cap or scheduler delay. Once any non-BATCH submission
 is queued or active in any pool, the scan observes the same `range-quantum-max-duration` bound,
 yields after the current indivisible RocksDB iterator call, and later resumes the same
-task and partial batch. Four-way SST concurrency and sharded scan ordering are unchanged.
+task and partial batch. `raw-scan-file-concurrency` controls only unsharded scans; actual
+simultaneous execution is also bounded by READ-pool admission. Higher concurrency and
+readahead increase per-scan native reader and I/O memory pressure, so tune them together
+on representative storage. Sharded scans retain their ordered two-item prefetch behavior.
 
 Cooperative queue-wait and execution timers are published once per logical SST task at
 terminal completion. Queue wait remains admission-to-first-dispatch latency; it does not

@@ -12,7 +12,9 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
@@ -30,6 +32,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import reactor.core.publisher.Flux;
 
 class EnsureWriteElisionTest {
 
@@ -118,6 +121,28 @@ class EnsureWriteElisionTest {
 		assertTrue(result.isEmpty());
 		assertValue(second, api.get(0, bucketedColumn, firstKey, RequestType.current()));
 		assertValue(first, api.get(0, bucketedColumn, secondKey, RequestType.current()));
+	}
+
+	@Test
+	void walBackedPutBatchIsIdempotentForKeyOnlyColumnsAndCompatibleWithEnsure() {
+		long columnId = api.createColumn("key-only-batch", fixedSchema(false));
+		var firstKey = intKey(1);
+		var secondKey = intKey(2);
+		var empty = Utils.emptyBuf();
+		var batch = new KVBatch.KVBatchRef(
+				List.of(firstKey, secondKey),
+				List.of(empty, empty));
+
+		api.putBatch(columnId, Flux.just(batch), PutBatchMode.WRITE_BATCH);
+		api.putBatch(columnId, Flux.just(batch), PutBatchMode.WRITE_BATCH);
+		assertTrue(api.get(0, columnId, firstKey, RequestType.exists()));
+		assertTrue(api.get(0, columnId, secondKey, RequestType.exists()));
+
+		assertNull(api.put(0, columnId, firstKey, empty, RequestType.ensure()));
+		assertTrue(api.get(0, columnId, firstKey, RequestType.exists()));
+		api.flush();
+		assertTrue(api.get(0, columnId, firstKey, RequestType.exists()));
+		assertTrue(api.get(0, columnId, secondKey, RequestType.exists()));
 	}
 
 	@Test

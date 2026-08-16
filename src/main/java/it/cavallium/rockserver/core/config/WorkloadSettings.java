@@ -46,6 +46,8 @@ public record WorkloadSettings(
 		int rangeQuantumMaxItems,
 		long rangeQuantumMaxBytes,
 		Duration rangeQuantumMaxDuration,
+		int rawScanFileConcurrency,
+		long rawScanReadaheadBytes,
 		int cdcQuantumMaxMutations,
 		long cdcQuantumMaxBytes,
 		Duration cdcQuantumMaxDuration,
@@ -55,6 +57,9 @@ public record WorkloadSettings(
 		long latencyFanOutMaxBytes) {
 
 	public static final int MIN_PRODUCTION_DATA_THREADS = 3;
+	public static final int DEFAULT_RAW_SCAN_FILE_CONCURRENCY = 4;
+	public static final long DEFAULT_RAW_SCAN_READAHEAD_BYTES = 8L * 1024L * 1024L;
+	public static final int MAX_RAW_SCAN_FILE_CONCURRENCY = 64;
 	private static final int MAX_DRR_WEIGHT = 16;
 	private static final int LATENCY_RANGE_HARD_MAX_ITEMS = RangeBudget.DEFAULT_MAX_ITEMS;
 	private static final long LATENCY_RANGE_HARD_MAX_BYTES = RangeBudget.DEFAULT_MAX_BYTES;
@@ -86,6 +91,8 @@ public record WorkloadSettings(
 		positive("pressured-batch-maximum-active", pressuredBatchMaximumActive);
 		positive("range-quantum-max-items", rangeQuantumMaxItems);
 		positive("range-quantum-max-bytes", rangeQuantumMaxBytes);
+		positive("raw-scan-file-concurrency", rawScanFileConcurrency);
+		positive("raw-scan-readahead-bytes", rawScanReadaheadBytes);
 		positive("cdc-quantum-max-mutations", cdcQuantumMaxMutations);
 		positive("cdc-quantum-max-bytes", cdcQuantumMaxBytes);
 		positive("latency-range-max-items", latencyRangeMaxItems);
@@ -104,6 +111,9 @@ public record WorkloadSettings(
 		}
 		if (competingBatchWriteMaximumActive > writeParallelism) {
 			throw invalid("competing-batch-write-maximum-active must not exceed write-pool capacity");
+		}
+		if (rawScanFileConcurrency > MAX_RAW_SCAN_FILE_CONCURRENCY) {
+			throw invalid("raw-scan-file-concurrency must not exceed " + MAX_RAW_SCAN_FILE_CONCURRENCY);
 		}
 		long combinedDataCapacity = (long) readParallelism + writeParallelism;
 		if (pressuredBatchMaximumActive > combinedDataCapacity) {
@@ -196,6 +206,8 @@ public record WorkloadSettings(
 				require(o.rangeQuantumMaxItems(), "range-quantum-max-items"),
 				require(o.rangeQuantumMaxBytes(), "range-quantum-max-bytes").longValue(),
 				require(o.rangeQuantumMaxDuration(), "range-quantum-max-duration"),
+				require(o.rawScanFileConcurrency(), "raw-scan-file-concurrency"),
+				require(o.rawScanReadaheadBytes(), "raw-scan-readahead-bytes").longValue(),
 				require(o.cdcQuantumMaxMutations(), "cdc-quantum-max-mutations"),
 				require(o.cdcQuantumMaxBytes(), "cdc-quantum-max-bytes").longValue(),
 				require(o.cdcQuantumMaxDuration(), "cdc-quantum-max-duration"),
@@ -246,6 +258,8 @@ public record WorkloadSettings(
 				4_096,
 				8L * 1024L * 1024L,
 				Duration.ofMillis(8),
+				DEFAULT_RAW_SCAN_FILE_CONCURRENCY,
+				DEFAULT_RAW_SCAN_READAHEAD_BYTES,
 				4_096,
 				8L * 1024L * 1024L,
 				Duration.ofMillis(8),
