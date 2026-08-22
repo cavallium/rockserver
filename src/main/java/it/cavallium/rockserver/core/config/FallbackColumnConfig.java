@@ -28,6 +28,9 @@ public interface FallbackColumnConfig {
 	Boolean cacheIndexAndFilterBlocks() throws GestaltException;
 
 	@Nullable
+	String blockCacheName() throws GestaltException;
+
+	@Nullable
 	Boolean partitionFilters() throws GestaltException;
 
 	@Nullable

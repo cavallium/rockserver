@@ -12,9 +12,20 @@ public class ConfigPrinter {
 		return """
 				{
 				        "bits-per-key": %d,
+				        "use-ribbon": %s,
+				        "ribbon-bloom-before-level": %s,
 				        "optimize-for-hits": %s
 				      }\
-				""".formatted(o.bitsPerKey(), o.optimizeForHits());
+				""".formatted(o.bitsPerKey(), o.useRibbon(), o.ribbonBloomBeforeLevel(), o.optimizeForHits());
+	}
+
+	private static String stringifyBlockCache(BlockCacheConfig o) throws GestaltException {
+		return """
+				{
+				        "name": %s,
+				        "size": %s
+				      }\
+				""".formatted(quote(o.name()), quote(o.size()));
 	}
 
 	public static String stringify(DatabaseConfig config) {
@@ -55,6 +66,10 @@ public class ConfigPrinter {
 			String s = stringifyNamedColumn(namedColumnConfig);
 			joiner.add(s);
 		}
+		StringJoiner blockCaches = new StringJoiner(",", "[", "]");
+		for (BlockCacheConfig blockCache : Objects.requireNonNullElse(o.blockCaches(), new BlockCacheConfig[0])) {
+			blockCaches.add(stringifyBlockCache(blockCache));
+		}
 		return """
 				{
 				    "follow-rocksdb-optimizations": %b,
@@ -71,6 +86,7 @@ public class ConfigPrinter {
 				    "max-file-opening-threads": %s,
 				    "optimistic": %b,
 				    "block-cache": %s,
+				    "block-caches": %s,
 				    "block-cache-high-priority-ratio": %s,
 				    "write-buffer-manager": %s,
 				    "database-write-buffer-size": %s,
@@ -105,6 +121,7 @@ public class ConfigPrinter {
 				o.maxFileOpeningThreads(),
 				o.optimistic(),
 				quote(o.blockCache()),
+				blockCaches.toString(),
 				o.blockCacheHighPriorityRatio(),
 				quote(o.writeBufferManager()),
 				quote(o.databaseWriteBufferSize()),
@@ -308,6 +325,7 @@ public class ConfigPrinter {
 				      "memtable-memory-budget-bytes": %s,
 				      "memtable-max-range-deletions": %s,
 				      "cache-index-and-filter-blocks": %s,
+				      "block-cache-name": %s,
 				      "partition-filters": %s,
 				      "bloom-filter": %s,
 				      "block-size": %s,
@@ -322,6 +340,7 @@ public class ConfigPrinter {
 				quote(o.memtableMemoryBudgetBytes()),
 				o.memtableMaxRangeDeletions(),
 				o.cacheIndexAndFilterBlocks(),
+				quote(o.blockCacheName()),
 				o.partitionFilters(),
 				bloom,
 				quote(o.blockSize()),
@@ -357,6 +376,7 @@ public class ConfigPrinter {
 				      "memtable-memory-budget-bytes": %s,
 				      "memtable-max-range-deletions": %s,
 				      "cache-index-and-filter-blocks": %s,
+				      "block-cache-name": %s,
 				      "partition-filters": %s,
 				      "bloom-filter": %s,
 				      "block-size": %s,
@@ -371,6 +391,7 @@ public class ConfigPrinter {
 				quote(o.memtableMemoryBudgetBytes()),
 				o.memtableMaxRangeDeletions(),
 				o.cacheIndexAndFilterBlocks(),
+				quote(o.blockCacheName()),
 				o.partitionFilters(),
 				bloom,
 				quote(o.blockSize()),

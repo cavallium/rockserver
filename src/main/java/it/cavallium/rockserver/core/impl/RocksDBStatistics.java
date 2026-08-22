@@ -20,7 +20,6 @@ import it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.rocksdb.Cache;
 import org.rocksdb.HistogramData;
@@ -43,6 +42,7 @@ public class RocksDBStatistics {
 	private final EnumMap<RocksDBLongProperty, MultiGauge> perCfLongPropertyMap;
 	private final Thread executor;
 	private final MultiGauge cacheStats;
+	private final MultiGauge namedCacheStats;
 	private final @Nullable RocksDBWalMetrics walMetrics;
 	private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -78,6 +78,40 @@ public class RocksDBStatistics {
 			Function<String, Map<String, Long>> perCfLongPropertyGetter,
 			MemoryUpperBoundConfig memoryUpperBoundConfig,
 			@Nullable WalMetricsConfig walMetricsConfig) {
+		this(name,
+				statistics,
+				metrics,
+				cache == null ? Map.of() : Map.of("default", cache),
+				Map.of(),
+				longPropertyGetter,
+				perCfLongPropertyGetter,
+				memoryUpperBoundConfig,
+				walMetricsConfig);
+	}
+
+	public RocksDBStatistics(String name,
+			Statistics statistics,
+			MetricsManager metrics,
+			Map<String, Cache> caches,
+			Map<String, Long> cacheCapacities,
+			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter,
+			Function<String, Map<String, Long>> perCfLongPropertyGetter,
+			MemoryUpperBoundConfig memoryUpperBoundConfig) {
+		this(name, statistics, metrics, caches, cacheCapacities, longPropertyGetter,
+				perCfLongPropertyGetter, memoryUpperBoundConfig, null);
+	}
+
+	RocksDBStatistics(String name,
+			Statistics statistics,
+			MetricsManager metrics,
+			Map<String, Cache> caches,
+			Map<String, Long> cacheCapacities,
+			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter,
+			Function<String, Map<String, Long>> perCfLongPropertyGetter,
+			MemoryUpperBoundConfig memoryUpperBoundConfig,
+			@Nullable WalMetricsConfig walMetricsConfig) {
+		Map<String, Cache> effectiveCaches = Map.copyOf(caches);
+		Map<String, Long> effectiveCacheCapacities = Map.copyOf(cacheCapacities);
 		this.statistics = statistics;
 		this.metrics = metrics;
 		this.walMetrics = walMetricsConfig == null ? null : new RocksDBWalMetrics(
@@ -133,6 +167,10 @@ public class RocksDBStatistics {
 				.builder("rocksdb.cache")
 				.tag("database", name)
 				.register(metrics.getRegistry());
+		this.namedCacheStats = MultiGauge
+				.builder("rocksdb.cache.named")
+				.tag("database", name)
+				.register(metrics.getRegistry());
 
 		// Realistic total memory gauge: block cache + table readers (index/filter outside cache) + memtables
 		// Note: block-cache-pinned-usage is a subset of block-cache-usage, so it's not added separately
@@ -141,10 +179,7 @@ public class RocksDBStatistics {
 				return Double.NaN;
 			}
 			try {
-				long blockCacheUsage = longPropertyGetter.apply(
-						RocksDBLongProperty.BLOCK_CACHE_USAGE.getName(),
-						RocksDBLongProperty.BLOCK_CACHE_USAGE.getAggregationMode()
-				).longValue();
+				long blockCacheUsage = effectiveCaches.values().stream().mapToLong(Cache::getUsage).sum();
 				long tableReadersMem = longPropertyGetter.apply(
 						RocksDBLongProperty.ESTIMATE_TABLE_READERS_MEM.getName(),
 						RocksDBLongProperty.ESTIMATE_TABLE_READERS_MEM.getAggregationMode()
@@ -173,10 +208,11 @@ public class RocksDBStatistics {
 			}
 			try {
 				// Block cache capacity (configured max, not current usage)
-				long blockCacheCapacity = longPropertyGetter.apply(
-						RocksDBLongProperty.BLOCK_CACHE_CAPACITY.getName(),
-						RocksDBLongProperty.BLOCK_CACHE_CAPACITY.getAggregationMode()
-				).longValue();
+				long blockCacheCapacity = effectiveCacheCapacities.isEmpty()
+						? longPropertyGetter.apply(
+								RocksDBLongProperty.BLOCK_CACHE_CAPACITY.getName(),
+								RocksDBLongProperty.BLOCK_CACHE_CAPACITY.getAggregationMode()).longValue()
+						: effectiveCacheCapacities.values().stream().mapToLong(Long::longValue).sum();
 				// All memtables including those pending flush (not yet freed)
 				long allMemtables = longPropertyGetter.apply(
 						RocksDBLongProperty.SIZE_ALL_MEM_TABLES.getName(),
@@ -202,7 +238,8 @@ public class RocksDBStatistics {
 		}).tag("database", name).register(metrics.getRegistry());
 
 		EnumMap<HistogramType, HistogramData> histogramDataRef = new EnumMap<>(HistogramType.class);
-		AtomicReference<CacheStats> cacheStatsRef = new AtomicReference<>(cache != null ? getCacheStats(cache) : new CacheStats(0L, 0L));
+		AtomicReference<Map<String, CacheStats>> cacheStatsRef = new AtomicReference<>(getCacheStats(
+				effectiveCaches, effectiveCacheCapacities));
 		// Per-CF property snapshots: property -> (column_name -> value)
 		ConcurrentHashMap<RocksDBLongProperty, Map<String, Long>> perCfSnapshots = new ConcurrentHashMap<>();
 
@@ -223,11 +260,21 @@ public class RocksDBStatistics {
 			), true);
 		});
 
-		if (cache != null) {
+		if (!effectiveCaches.isEmpty()) {
 			cacheStats.register(List.of(
-					Row.of(Tags.of("field", "usage"), () -> cacheStatsRef.get().usage()),
-					Row.of(Tags.of("field", "pinned_usage"), () -> cacheStatsRef.get().pinnedUsage())
+					Row.of(Tags.of("field", "usage"), () -> cacheStatsRef.get().values().stream()
+							.mapToLong(CacheStats::usage).sum()),
+					Row.of(Tags.of("field", "pinned_usage"), () -> cacheStatsRef.get().values().stream()
+							.mapToLong(CacheStats::pinnedUsage).sum())
 			), true);
+			namedCacheStats.register(effectiveCaches.keySet().stream().flatMap(cacheName -> java.util.stream.Stream.of(
+					Row.of(Tags.of("cache", cacheName, "field", "usage"),
+							() -> cacheStatsRef.get().get(cacheName).usage()),
+					Row.of(Tags.of("cache", cacheName, "field", "pinned_usage"),
+							() -> cacheStatsRef.get().get(cacheName).pinnedUsage()),
+					Row.of(Tags.of("cache", cacheName, "field", "capacity"),
+							() -> cacheStatsRef.get().get(cacheName).capacity())
+			)).toList(), true);
 		}
 
 		this.executor = new Thread(() -> {
@@ -244,8 +291,8 @@ public class RocksDBStatistics {
 						histogramDataRef.put(histogramType, statistics.getHistogramData(histogramType));
 					}
 
-					if (cache != null) {
-						cacheStatsRef.set(getCacheStats(cache));
+					if (!effectiveCaches.isEmpty()) {
+						cacheStatsRef.set(getCacheStats(effectiveCaches, effectiveCacheCapacities));
 					}
 
 					if (walMetrics != null) {
@@ -290,8 +337,12 @@ public class RocksDBStatistics {
 		executor.start();
 	}
 
-	private CacheStats getCacheStats(@NotNull Cache cache) {
-		return new CacheStats(cache.getUsage(), cache.getPinnedUsage());
+	private Map<String, CacheStats> getCacheStats(Map<String, Cache> caches,
+			Map<String, Long> cacheCapacities) {
+		Map<String, CacheStats> result = new java.util.LinkedHashMap<>();
+		caches.forEach((name, cache) -> result.put(name,
+				new CacheStats(cache.getUsage(), cache.getPinnedUsage(), cacheCapacities.getOrDefault(name, 0L))));
+		return Map.copyOf(result);
 	}
 
 	private Number readLongPropertyForGauge(
@@ -310,7 +361,7 @@ public class RocksDBStatistics {
 		}
 	}
 
-	private record CacheStats(long usage, long pinnedUsage) {}
+	private record CacheStats(long usage, long pinnedUsage, long capacity) {}
 
 	public void close() {
 		stopRequested = true;

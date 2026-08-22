@@ -20,6 +20,7 @@ import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
+import it.cavallium.rockserver.core.impl.rocksdb.SSTWriter;
 import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
@@ -37,10 +38,13 @@ import org.rocksdb.AbstractEventListener;
 import org.rocksdb.BackgroundErrorReason;
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.ChecksumType;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.DbPath;
 import org.rocksdb.HyperClockCache;
 import org.rocksdb.IndexType;
 import org.rocksdb.LRUCache;
 import org.rocksdb.RocksObject;
+import org.rocksdb.RibbonFilter;
 import org.rocksdb.Status;
 import org.rocksdb.StatsLevel;
 import org.rocksdb.WALRecoveryMode;
@@ -184,6 +188,124 @@ class RocksDBLoaderComplexConfigTest {
             loaded.db().close();
             loaded.refs().close();
         }
+    }
+
+    @Test
+    void assignsNamedCachesRibbonFiltersAndSafeMultiPathMaintenance(@TempDir Path tempDir) throws Exception {
+        var config = parse(tempDir, "named-caches", """
+                database.global: {
+                  use-clock-cache: true
+                  block-cache: "8MiB"
+                  block-cache-high-priority-ratio: 0
+                  write-buffer-manager: "4MiB"
+                  block-caches: [
+                    { name: "sender-index", size: "4MiB" }
+                    { name: "messages-v2-migration", size: "2MiB" }
+                  ]
+                  fallback-column-options: {
+                    merge-operator-class: null
+                    volumes: [{ volume-path: "hdd-default", target-size: "4GiB" }]
+                    first-level-sst-size: "64MiB"
+                    max-last-level-sst-size: null
+                    levels: []
+                    memtable-memory-budget-bytes: "64MiB"
+                    memtable-max-range-deletions: null
+                    cache-index-and-filter-blocks: true
+                    block-cache-name: null
+                    partition-filters: false
+                    bloom-filter: {
+                      bits-per-key: 10
+                      use-ribbon: false
+                      ribbon-bloom-before-level: null
+                      optimize-for-hits: false
+                    }
+                    block-size: "128KiB"
+                    write-buffer-size: "16MiB"
+                  }
+                  column-options: [
+                    ${database.global.fallback-column-options} {
+                      name: "default"
+                      volumes: [{ volume-path: "hdd-default", target-size: "4GiB" }]
+                    }
+                    ${database.global.fallback-column-options} {
+                      name: "messages"
+                      partition-filters: true
+                      bloom-filter: { bits-per-key: 10, use-ribbon: true, ribbon-bloom-before-level: 2 }
+                      volumes: [{ volume-path: "hdd-messages", target-size: "4GiB" }]
+                    }
+                    ${database.global.fallback-column-options} {
+                      name: "messages-by-sender-blocks-v1"
+                      block-cache-name: "sender-index"
+                      partition-filters: true
+                      bloom-filter: { bits-per-key: 10, use-ribbon: true, ribbon-bloom-before-level: 2 }
+                      volumes: [{ volume-path: "nvme-sender", target-size: "4GiB" }]
+                    }
+                    ${database.global.fallback-column-options} {
+                      name: "messages-v2"
+                      block-cache-name: "messages-v2-migration"
+                      partition-filters: true
+                      bloom-filter: { bits-per-key: 10, use-ribbon: true, ribbon-bloom-before-level: 2 }
+                      volumes: [
+                        { volume-path: "nvme-v2", target-size: "1GiB" }
+                        { volume-path: "hdd-v2", target-size: "16GiB" }
+                      ]
+                    }
+                  ]
+                }
+                """);
+
+        Path dbPath = tempDir.resolve("named-cache-db");
+        var loaded = RocksDBLoader.load(dbPath, config, LoggerFactory.getLogger(getClass()));
+        try {
+            assertEquals(3, loaded.caches().size());
+            assertEquals(12L * 1024L * 1024L, loaded.cacheCapacities().get("default"));
+            assertEquals(4L * 1024L * 1024L, loaded.cacheCapacities().get("sender-index"));
+            assertEquals(2L * 1024L * 1024L, loaded.cacheCapacities().get("messages-v2-migration"));
+            assertEquals("default", loaded.definitiveColumnCacheNames().get("messages"));
+            assertEquals("sender-index",
+                    loaded.definitiveColumnCacheNames().get("messages-by-sender-blocks-v1"));
+            assertEquals("messages-v2-migration", loaded.definitiveColumnCacheNames().get("messages-v2"));
+
+            var messagesTable = assertInstanceOf(BlockBasedTableConfig.class,
+                    loaded.definitiveColumnFamilyOptionsMap().get("messages").tableFormatConfig());
+            var ribbon = assertInstanceOf(RibbonFilter.class, messagesTable.filterPolicy());
+            try (var expectedRibbon = new RibbonFilter(10.0, 2)) {
+                assertEquals(expectedRibbon.hashCode(), ribbon.hashCode(),
+                        "Ribbon bits-per-key and Bloom-before-level must reach the native policy");
+            }
+            assertTrue(messagesTable.partitionFilters());
+            assertTrue(messagesTable.optimizeFiltersForMemory());
+
+            ColumnFamilyOptions v2 = loaded.definitiveColumnFamilyOptionsMap().get("messages-v2");
+            assertFalse(v2.levelCompactionDynamicLevelBytes());
+            assertEquals(List.of(
+                    new DbPath(dbPath.resolve("nvme-v2").toAbsolutePath().normalize(), 1L << 30),
+                    // RocksDB normalizes the final capacity path target to zero (unbounded).
+                    new DbPath(dbPath.resolve("hdd-v2").toAbsolutePath().normalize(), 0L)),
+                    v2.cfPaths());
+            assertEquals(1, EmbeddedDB.bottommostCompactionTargetPathId(v2));
+            var rejected = assertThrows(RocksDBException.class,
+                    () -> SSTWriter.rejectUnsafeMultiPathIngestion(v2, false));
+            assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, rejected.getErrorUniqueId());
+            SSTWriter.rejectUnsafeMultiPathIngestion(v2, true);
+        } finally {
+            loaded.db().close();
+            loaded.refs().close();
+        }
+    }
+
+    @Test
+    void rejectsUnknownNamedCache(@TempDir Path tempDir) throws Exception {
+        var config = parse(tempDir, "unknown-cache", """
+                database.global.column-options: [{
+                  name: "default"
+                  block-cache-name: "missing"
+                }]
+                """);
+        var failure = assertThrows(RocksDBException.class,
+                () -> RocksDBLoader.load(tempDir.resolve("unknown-cache-db"), config,
+                        LoggerFactory.getLogger(getClass())));
+        assertEquals(RocksDBErrorType.CONFIG_ERROR, failure.getErrorUniqueId());
     }
 
     @Test

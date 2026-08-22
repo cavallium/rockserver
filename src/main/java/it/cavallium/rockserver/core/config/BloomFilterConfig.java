@@ -8,6 +8,13 @@ public interface BloomFilterConfig {
 	int bitsPerKey() throws GestaltException;
 
 	@Nullable
+	Boolean useRibbon() throws GestaltException;
+
+	/** Use Bloom filters below this level, then Ribbon. Null uses RocksDB's Ribbon default. */
+	@Nullable
+	Integer ribbonBloomBeforeLevel() throws GestaltException;
+
+	@Nullable
 	Boolean optimizeForHits() throws GestaltException;
 
 }

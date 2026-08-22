@@ -21,6 +21,7 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
     private static final Logger LOG = LoggerFactory.getLogger(SSTWriter.class);
 
     public static SSTWriter open(Path tempSSTsPath, TransactionalDB db, ColumnInstance col, ColumnFamilyOptions columnConifg, boolean forceNoOptions, boolean ingestBehind, RocksDBObjects refs) throws IOException, org.rocksdb.RocksDBException {
+        rejectUnsafeMultiPathIngestion(columnConifg, forceNoOptions);
         if (refs == null) {
             refs = new RocksDBObjects();
         }
@@ -89,6 +90,19 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
         var sstWriter = new SSTWriter(db.get(), col, tempFile, sstFileWriter, ingestBehind, refs);
         sstFileWriter.open(tempFile.toString());
         return sstWriter;
+    }
+
+    /**
+     * RocksDB's external-file ingestion API does not expose a destination path id. Letting it
+     * default to path 0 would allow a bulk migration to exhaust a bounded NVMe upper-level tier.
+     */
+    public static void rejectUnsafeMultiPathIngestion(ColumnFamilyOptions columnConfig, boolean forceNoOptions) {
+        if (!forceNoOptions && columnConfig != null && columnConfig.cfPaths() != null
+                && columnConfig.cfPaths().size() > 1) {
+            throw RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+                    "Raw SST ingestion is disabled for multi-path columns because RocksDB does not expose "
+                            + "a destination path id; use ordinary writes or a path-aware migration workflow");
+        }
     }
 
     private static CompressionOptions cloneCompressionOptions(CompressionOptions compressionOptions, RocksDBObjects refs) {

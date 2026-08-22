@@ -345,7 +345,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final DatabaseConfig config;
 	private final WorkloadSettings workloadSettings;
 	private final RocksDBObjects refs;
-	private final @Nullable Cache cache;
+	private final Map<String, Cache> caches;
+	private final Map<String, Long> cacheCapacities;
 	private final MetricsManager metrics;
 	private final String name;
 	private final List<Meter> meters = new ArrayList<>();
@@ -580,7 +581,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.db = loadedDb.db();
 		this.dbOptions = loadedDb.dbOptions();
 		this.refs = loadedDb.refs();
-		this.cache = loadedDb.cache();
+		this.caches = loadedDb.caches();
+		this.cacheCapacities = loadedDb.cacheCapacities();
 		this.definitiveDbPath = loadedDb.definitiveDbPath();
 		// Compute upper-bound memory config from database options
 		RocksDBStatistics.MemoryUpperBoundConfig memoryUpperBoundConfig;
@@ -618,7 +620,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				: Path.of(configuredWalDirectory);
 		var walMetricsConfig = new RocksDBStatistics.WalMetricsConfig(
 				db.get(), walDirectory, dbOptions.maxTotalWalSize());
-		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics, cache,
+		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics,
+				caches, cacheCapacities,
 				this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig, walMetricsConfig);
 		this.scheduler = new RWScheduler(
 				workloadSettings,
@@ -2293,7 +2296,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								logger,
 								refs,
 								this.path == null,
-								cache
+								caches
 						);
 						// Force use of configured merge operator if available, or resolve from new schema
 						var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
@@ -2318,7 +2321,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									logger,
 									this.refs,
 									path == null,
-									cache
+									caches
 							);
 							var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
 							if (mergeOp != null && !(mergeOp instanceof DelegatingMergeOperator)) {
@@ -2347,7 +2350,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								logger,
 								this.refs,
 								path == null,
-								cache
+								caches
 						);
 						var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
 						if (mergeOp != null && !(mergeOp instanceof DelegatingMergeOperator)) {
@@ -3870,7 +3873,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							logger,
 							refs,
 							false,
-							null
+							caches
 					);
 				} else {
 					try {
@@ -3881,7 +3884,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								logger,
 								refs,
 								false,
-								null
+								caches
 						);
 					} catch (GestaltException e) {
 						throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
@@ -9157,10 +9160,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var db = this.db.get();
 				for (ColumnInstance value : columns.values()) {
 					if (value.cfh().isOwningHandle()) {
+						String columnName = new String(value.cfh().getName(), StandardCharsets.UTF_8);
+						ColumnFamilyOptions columnOptions = columnsConifg.get(columnName);
 						try (var cro = new CompactRangeOptions()
 								.setAllowWriteStall(false)
 								.setExclusiveManualCompaction(true)
 								.setChangeLevel(false)
+								.setTargetPathId(bottommostCompactionTargetPathId(columnOptions))
 								.setMaxSubcompactions(16)
 								.setBottommostLevelCompaction(BottommostLevelCompaction.kForceOptimized)) {
 							db.compactRange(value.cfh(), null, null, cro);
@@ -9177,6 +9183,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var end = System.nanoTime();
 			compactTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
+	}
+
+	@VisibleForTesting
+	public static int bottommostCompactionTargetPathId(@Nullable ColumnFamilyOptions options) {
+		if (options == null || options.cfPaths() == null || options.cfPaths().size() <= 1) {
+			return 0;
+		}
+		return options.cfPaths().size() - 1;
 	}
 
 	@Override
