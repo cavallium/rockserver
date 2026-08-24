@@ -1404,16 +1404,27 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> putMultiList(PutMultiListRequest request) {
-			var initialRequest = request.getInitialRequest();
-			var dataFlux = Flux.fromIterable(request.getDataList());
-			return putMultiDataFlux(initialRequest, dataFlux, "putMultiList");
+			return executePutMultiList(request, RequestType.none(), "putMultiList");
 		}
 
 		@Override
 		public Mono<Empty> putMultiListEnsure(PutMultiListRequest request) {
+			return executePutMultiList(request, RequestType.ensure(), "putMultiListEnsure");
+		}
+
+		private Mono<Empty> executePutMultiList(PutMultiListRequest request,
+				RequestType.RequestPut<? super Buf, ?> requestType,
+				String requestName) {
 			var initialRequest = request.getInitialRequest();
-			var dataFlux = Flux.fromIterable(request.getDataList());
-			return putMultiEnsureDataFlux(initialRequest, dataFlux, "putMultiListEnsure");
+			var batch = mapKVBatch(request.getDataList());
+			return executeWrite(initialRequest.getContext(), contextualApi -> {
+				contextualApi.putMulti(initialRequest.getTransactionOrUpdateId(),
+						initialRequest.getColumnId(),
+						batch.keys(),
+						batch.values(),
+						requestType);
+				return Empty.getDefaultInstance();
+			}).transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
 		}
 
 		@Override

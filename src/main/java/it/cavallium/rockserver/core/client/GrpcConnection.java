@@ -181,6 +181,10 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			= "it.cavallium.rockserver.grpc.client.max-retry-backoff";
 	private static final String RETRY_BACKOFF_MULTIPLIER_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.retry-backoff-multiplier";
+	private static final int PUT_MULTI_LIST_MAX_ITEMS =
+			it.cavallium.rockserver.core.common.RangeBudget.DEFAULT_MAX_ITEMS;
+	private static final long PUT_MULTI_LIST_MAX_LOGICAL_BYTES =
+			it.cavallium.rockserver.core.common.RangeBudget.DEFAULT_MAX_BYTES;
 	private static final it.cavallium.rockserver.core.common.api.proto.RequestContext[] NO_DEADLINE_WIRE_CONTEXTS
 			= createNoDeadlineWireContexts();
 	public static final String MAX_INBOUND_MESSAGE_SIZE_PROPERTY
@@ -612,15 +616,34 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 					+ count + " != " + allValues.size());
 		}
 
-		var initialRequest = PutMultiRequest.newBuilder()
-				.setInitialRequest(PutMultiInitialRequest.newBuilder()
-							.setTransactionOrUpdateId(transactionOrUpdateId)
-							.setColumnId(columnId)
-							.setContext(currentWireRequestContext())
-						.build())
+		var initialRequest = PutMultiInitialRequest.newBuilder()
+				.setTransactionOrUpdateId(transactionOrUpdateId)
+				.setColumnId(columnId)
+				.setContext(currentWireRequestContext())
 				.build();
 
-		Mono<PutMultiRequest> initialRequestMono = Mono.just(initialRequest);
+		if ((requestType instanceof RequestNothing<?> || requestType instanceof RequestType.RequestEnsure<?>)
+				&& fitsPutMultiListBudget(allKeys, allValues)) {
+			var listRequest = PutMultiListRequest.newBuilder()
+					.setInitialRequest(initialRequest);
+			for (int index = 0; index < count; index++) {
+				listRequest.addData(mapKV(allKeys.get(index), allValues.get(index)));
+			}
+			var request = listRequest.build();
+			return (CompletableFuture<List<T>>) (switch (requestType) {
+				case RequestNothing<?> _ -> toResponse(
+						futureStubWithRequestDeadline().putMultiList(request), _ -> List.<T>of());
+				case RequestType.RequestEnsure<?> _ -> toResponse(
+						futureStubWithRequestDeadline().putMultiListEnsure(request), _ -> List.<T>of());
+				default -> throw new IllegalStateException("Unexpected unary put-multi request type");
+			});
+		}
+
+		var streamingInitialRequest = PutMultiRequest.newBuilder()
+				.setInitialRequest(initialRequest)
+				.build();
+
+		Mono<PutMultiRequest> initialRequestMono = Mono.just(streamingInitialRequest);
 		Flux<PutMultiRequest> dataRequestsFlux = Flux.fromIterable(() -> GrpcConnectionDelegate
 				.map(allKeys.iterator(), allValues.iterator(), (keys, value) -> PutMultiRequest.newBuilder()
 						.setData(mapKV(keys, value))
@@ -1009,6 +1032,26 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 							.collectList()
 							.toFuture());
 		};
+	}
+
+	private static boolean fitsPutMultiListBudget(List<Keys> allKeys, List<Buf> allValues) {
+		if (allKeys.size() > PUT_MULTI_LIST_MAX_ITEMS) {
+			return false;
+		}
+		long bytes = 0L;
+		for (int index = 0; index < allKeys.size(); index++) {
+			bytes += allValues.get(index).size();
+			if (bytes > PUT_MULTI_LIST_MAX_LOGICAL_BYTES) {
+				return false;
+			}
+			for (var key : allKeys.get(index).keys()) {
+				bytes += key.size();
+				if (bytes > PUT_MULTI_LIST_MAX_LOGICAL_BYTES) {
+					return false;
+				}
+			}
+		}
+		return true;
 	}
 
 	@SuppressWarnings("unchecked")

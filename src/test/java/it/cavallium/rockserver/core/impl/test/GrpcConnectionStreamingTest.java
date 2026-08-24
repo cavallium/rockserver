@@ -13,6 +13,7 @@ import io.netty.channel.EventLoopGroup;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -26,6 +27,7 @@ import it.cavallium.rockserver.core.common.api.proto.GetColumnIdResponse;
 import it.cavallium.rockserver.core.common.api.proto.GetRangeRequest;
 import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.common.api.proto.MergeMultiRequest;
+import it.cavallium.rockserver.core.common.api.proto.PutMultiListRequest;
 import it.cavallium.rockserver.core.common.api.proto.PutMultiRequest;
 import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
 import java.io.IOException;
@@ -59,6 +61,7 @@ class GrpcConnectionStreamingTest {
 	private static final long STREAMING_RANGE_COLUMN_ID = 41;
 	private static final long CANCELLABLE_RANGE_COLUMN_ID = 43;
 	private static final long CLEANUP_WRITE_COLUMN_ID = 47;
+	private static final long BULK_TRANSACTION_ID = 59;
 	private static final long RANGE_TIMEOUT_MS = 1_000;
 
 	private RecordingService service;
@@ -88,14 +91,41 @@ class GrpcConnectionStreamingTest {
 	}
 
 	@Test
-	void putMultiAboveLegacyChunkSizeUsesOneStreamingRpc() throws Exception {
+	void boundedPutMultiUsesOneUnaryListRpcAndPreservesTheTransaction() throws Exception {
 		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
-				0, 17, keys(), values(), RequestType.none()).get(10, TimeUnit.SECONDS);
+				BULK_TRANSACTION_ID, 17, keys(), values(), RequestType.none()).get(10, TimeUnit.SECONDS);
 
 		assertEquals(List.of(), response);
+		assertEquals(1, service.putListCalls.get());
+		assertEquals(0, service.putCalls.get());
+		assertEquals(BATCH_SIZE, service.putListItems.get());
+		assertEquals(BULK_TRANSACTION_ID, service.putListTransactionId.get());
+		assertEquals(17, service.putListColumnId.get());
+	}
+
+	@Test
+	void boundedEnsurePutMultiUsesTheUnaryListEnsureRpc() throws Exception {
+		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
+				BULK_TRANSACTION_ID, 19, keys(), values(), RequestType.ensure()).get(10, TimeUnit.SECONDS);
+
+		assertEquals(List.of(), response);
+		assertEquals(1, service.putListEnsureCalls.get());
+		assertEquals(0, service.putListCalls.get());
+		assertEquals(0, service.putCalls.get());
+		assertEquals(BATCH_SIZE, service.putListItems.get());
+	}
+
+	@Test
+	void putMultiAboveTheUnaryItemBudgetFallsBackToOneStreamingRpc() throws Exception {
+		int items = RangeBudget.DEFAULT_MAX_ITEMS + 1;
+		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
+				BULK_TRANSACTION_ID, 21, keys(items), values(items), RequestType.none()).get(10, TimeUnit.SECONDS);
+
+		assertEquals(List.of(), response);
+		assertEquals(0, service.putListCalls.get());
 		assertEquals(1, service.putCalls.get());
 		assertEquals(1, service.putInitialFrames.get());
-		assertEquals(BATCH_SIZE, service.putDataFrames.get());
+		assertEquals(items, service.putDataFrames.get());
 	}
 
 	@Test
@@ -167,7 +197,8 @@ class GrpcConnectionStreamingTest {
 				"range callbacks ran on a Netty platform thread instead of the owned virtual-thread executor");
 		assertEquals((RANGE_SIZE + CLEANUP_BATCH_SIZE - 1) / CLEANUP_BATCH_SIZE,
 				service.cleanupWriteCalls.get());
-		assertEquals(RANGE_SIZE, service.putDataFrames.get());
+		assertEquals(RANGE_SIZE, service.putListItems.get());
+		assertEquals(0, service.putDataFrames.get());
 	}
 
 	@Test
@@ -218,13 +249,21 @@ class GrpcConnectionStreamingTest {
 	}
 
 	private static List<Keys> keys() {
-		return IntStream.range(0, BATCH_SIZE)
+		return keys(BATCH_SIZE);
+	}
+
+	private static List<Keys> keys(int size) {
+		return IntStream.range(0, size)
 				.mapToObj(value -> new Keys(intBuf(value)))
 				.toList();
 	}
 
 	private static List<Buf> values() {
-		return IntStream.range(0, BATCH_SIZE)
+		return values(BATCH_SIZE);
+	}
+
+	private static List<Buf> values(int size) {
+		return IntStream.range(0, size)
 				.mapToObj(GrpcConnectionStreamingTest::intBuf)
 				.toList();
 	}
@@ -262,6 +301,11 @@ class GrpcConnectionStreamingTest {
 		private final AtomicInteger putCalls = new AtomicInteger();
 		private final AtomicInteger putInitialFrames = new AtomicInteger();
 		private final AtomicInteger putDataFrames = new AtomicInteger();
+		private final AtomicInteger putListCalls = new AtomicInteger();
+		private final AtomicInteger putListEnsureCalls = new AtomicInteger();
+		private final AtomicInteger putListItems = new AtomicInteger();
+		private final AtomicLong putListTransactionId = new AtomicLong(-1L);
+		private final AtomicLong putListColumnId = new AtomicLong(-1L);
 		private final AtomicInteger cleanupWriteCalls = new AtomicInteger();
 		private final AtomicInteger mergeCalls = new AtomicInteger();
 		private final AtomicInteger mergeInitialFrames = new AtomicInteger();
@@ -294,6 +338,30 @@ class GrpcConnectionStreamingTest {
 						}
 						return Mono.just(Empty.getDefaultInstance());
 					}));
+		}
+
+		@Override
+		public Mono<Empty> putMultiList(PutMultiListRequest request) {
+			putListCalls.incrementAndGet();
+			return recordPutMultiList(request);
+		}
+
+		@Override
+		public Mono<Empty> putMultiListEnsure(PutMultiListRequest request) {
+			putListEnsureCalls.incrementAndGet();
+			return recordPutMultiList(request);
+		}
+
+		private Mono<Empty> recordPutMultiList(PutMultiListRequest request) {
+			putListItems.addAndGet(request.getDataCount());
+			putListTransactionId.set(request.getInitialRequest().getTransactionOrUpdateId());
+			putListColumnId.set(request.getInitialRequest().getColumnId());
+			if (request.getInitialRequest().getColumnId() == CLEANUP_WRITE_COLUMN_ID
+					&& cleanupWriteCalls.incrementAndGet() == 1) {
+				firstCleanupWriteStarted.countDown();
+				return Mono.fromFuture(firstCleanupWriteResponse);
+			}
+			return Mono.just(Empty.getDefaultInstance());
 		}
 
 		@Override
