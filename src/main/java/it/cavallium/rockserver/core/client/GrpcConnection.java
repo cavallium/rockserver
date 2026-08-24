@@ -181,8 +181,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			= "it.cavallium.rockserver.grpc.client.max-retry-backoff";
 	private static final String RETRY_BACKOFF_MULTIPLIER_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.retry-backoff-multiplier";
-	private static final int PUT_MULTI_LIST_MAX_ITEMS =
-			it.cavallium.rockserver.core.common.RangeBudget.DEFAULT_MAX_ITEMS;
+	private static final int PUT_MULTI_LIST_MAX_ITEMS = 65_536;
 	private static final long PUT_MULTI_LIST_MAX_LOGICAL_BYTES =
 			it.cavallium.rockserver.core.common.RangeBudget.DEFAULT_MAX_BYTES;
 	private static final it.cavallium.rockserver.core.common.api.proto.RequestContext[] NO_DEADLINE_WIRE_CONTEXTS

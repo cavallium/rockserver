@@ -33,6 +33,7 @@ import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -56,6 +57,7 @@ import reactor.test.StepVerifier;
 class GrpcConnectionStreamingTest {
 
 	private static final int BATCH_SIZE = 1_001;
+	private static final int MAX_UNARY_PUT_MULTI_ITEMS = 65_536;
 	private static final int RANGE_SIZE = 1_025;
 	private static final int CLEANUP_BATCH_SIZE = 256;
 	private static final long STREAMING_RANGE_COLUMN_ID = 41;
@@ -116,10 +118,26 @@ class GrpcConnectionStreamingTest {
 	}
 
 	@Test
-	void putMultiAboveTheUnaryItemBudgetFallsBackToOneStreamingRpc() throws Exception {
-		int items = RangeBudget.DEFAULT_MAX_ITEMS + 1;
+	void maximumItemCountStillUsesOneUnaryListRpc() throws Exception {
 		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
-				BULK_TRANSACTION_ID, 21, keys(items), values(items), RequestType.none()).get(10, TimeUnit.SECONDS);
+				BULK_TRANSACTION_ID,
+				20,
+				keys(MAX_UNARY_PUT_MULTI_ITEMS),
+				values(MAX_UNARY_PUT_MULTI_ITEMS),
+				RequestType.none()).get(10, TimeUnit.SECONDS);
+
+		assertEquals(List.of(), response);
+		assertEquals(1, service.putListCalls.get());
+		assertEquals(0, service.putCalls.get());
+		assertEquals(MAX_UNARY_PUT_MULTI_ITEMS, service.putListItems.get());
+	}
+
+	@Test
+	void putMultiAboveTheUnaryByteBudgetFallsBackToOneStreamingRpc() throws Exception {
+		int items = RangeBudget.DEFAULT_MAX_ITEMS;
+		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
+				BULK_TRANSACTION_ID, 21, keys(items), values(items, 2_048), RequestType.none())
+				.get(10, TimeUnit.SECONDS);
 
 		assertEquals(List.of(), response);
 		assertEquals(0, service.putListCalls.get());
@@ -266,6 +284,10 @@ class GrpcConnectionStreamingTest {
 		return IntStream.range(0, size)
 				.mapToObj(GrpcConnectionStreamingTest::intBuf)
 				.toList();
+	}
+
+	private static List<Buf> values(int size, int valueBytes) {
+		return Collections.nCopies(size, Buf.createZeroes(valueBytes));
 	}
 
 	private static Buf intBuf(int value) {
