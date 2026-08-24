@@ -348,6 +348,60 @@ class ScanRawCompactionSafetyTest {
 	}
 
 	@Test
+	void activeCancellationKeepsPinsAndDatabaseLeasesUntilNativeReaderCleanup(@TempDir Path tempDir)
+			throws Exception {
+		Path configFile = tempDir.resolve("scan-raw-active-cancel.conf");
+		Files.writeString(configFile, """
+				database: { global: {
+				  ingest-behind: false
+				  optimistic: false
+				  disable-auto-compactions: true
+				  disable-write-slowdown: true
+				} }
+				""");
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "scan-raw-active-cancel", configFile)) {
+			RocksDBSyncAPI api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = api.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			writeOverlappingSsts(api, columnId);
+
+			var readerOpened = new CountDownLatch(1);
+			var allowNativeReaderToReturn = new CountDownLatch(1);
+			internal.setRawScanReaderOpenedObserverForTesting(() -> {
+				readerOpened.countDown();
+				awaitLatch(allowNativeReaderToReturn);
+			});
+			CompletableFuture<? extends java.util.List<?>> scan = internal
+					.scanRawAsyncInternal(columnId, 0, 1)
+					.collectList()
+					.toFuture();
+			try {
+				assertTrue(readerOpened.await(10, TimeUnit.SECONDS));
+				Set<Path> allPinnedFiles = internal.getRawScanPinnedFilesForTesting();
+				assertFalse(allPinnedFiles.isEmpty());
+				assertTrue(scan.cancel(true));
+
+				Set<Path> claimedPins = internal.getRawScanPinnedFilesForTesting();
+				assertFalse(claimedPins.isEmpty(),
+						"active native readers must retain their pin after outer stream cancellation");
+				assertTrue(claimedPins.stream().allMatch(Files::exists));
+				assertTrue(internal.getDb().get().isOwningHandle(),
+						"database handle must remain owned while cancelled native readers drain");
+
+				allowNativeReaderToReturn.countDown();
+				awaitFilesDeleted(allPinnedFiles, Duration.ofSeconds(10));
+				assertTrue(internal.getRawScanPinnedFilesForTesting().isEmpty());
+				assertTrue(api.estimateNumKeys(columnId) > 0L,
+						"database must remain usable after active raw-scan cancellation");
+			} finally {
+				internal.setRawScanReaderOpenedObserverForTesting(null);
+				allowNativeReaderToReturn.countDown();
+			}
+		}
+	}
+
+	@Test
 	void hardLinkFailureDoesNotCopyOrLeaveFileDeletionDisabled(@TempDir Path tempDir) throws Exception {
 		Path configFile = tempDir.resolve("scan-raw-link-failure.conf");
 		Files.writeString(configFile, """

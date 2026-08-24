@@ -361,7 +361,11 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 										"initialBackoff", System.getProperty(INITIAL_RETRY_BACKOFF_PROPERTY, "0.5s"),
 										"maxBackoff", System.getProperty(MAX_RETRY_BACKOFF_PROPERTY, "30s"),
 										"backoffMultiplier", doubleProperty(RETRY_BACKOFF_MULTIPLIER_PROPERTY, 2.0d, 1.0d),
-										"retryableStatusCodes", List.of("UNAVAILABLE", "RESOURCE_EXHAUSTED", "ABORTED")
+										// Retry only transport loss here. SERVER_OVERLOADED and
+										// UPDATE_RETRY are application backpressure/conflict signals;
+										// callers must observe them immediately and apply domain-level
+										// retry, cooldown, or transaction reconstruction.
+										"retryableStatusCodes", AUTOMATIC_RETRYABLE_STATUS_CODE_NAMES
 								)
 						))
 				));
@@ -1591,9 +1595,14 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		return response;
 	}
 
-	private static final java.util.Set<Code> RETRYABLE_STATUS_CODES = java.util.Set.of(
-			Code.UNAVAILABLE, Code.RESOURCE_EXHAUSTED, Code.ABORTED
-	);
+	private static final List<String> AUTOMATIC_RETRYABLE_STATUS_CODE_NAMES = List.of(Code.UNAVAILABLE.name());
+	private static final Set<Code> AUTOMATIC_RETRYABLE_STATUS_CODES = AUTOMATIC_RETRYABLE_STATUS_CODE_NAMES.stream()
+			.map(Code::valueOf)
+			.collect(java.util.stream.Collectors.toUnmodifiableSet());
+
+	static boolean isAutomaticallyRetryableStatus(Code code) {
+		return AUTOMATIC_RETRYABLE_STATUS_CODES.contains(code);
+	}
 
 	private static class RetryLoggingInterceptor implements ClientInterceptor {
 		@Override
@@ -1605,7 +1614,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 					var loggingListener = new ForwardingClientCallListener.SimpleForwardingClientCallListener<>(responseListener) {
 						@Override
 						public void onClose(Status status, Metadata trailers) {
-							if (!status.isOk() && RETRYABLE_STATUS_CODES.contains(status.getCode())) {
+							if (!status.isOk() && isAutomaticallyRetryableStatus(status.getCode())) {
 								LOG.warn("gRPC call to {} failed with retryable status {}: {}. Retry will be attempted automatically.",
 										method.getFullMethodName(), status.getCode(), status.getDescription());
 							}

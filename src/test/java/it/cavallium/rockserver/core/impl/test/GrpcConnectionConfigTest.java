@@ -4,10 +4,13 @@ import static it.cavallium.rockserver.core.client.GrpcConnection.DEFAULT_MAX_INB
 import static it.cavallium.rockserver.core.client.GrpcConnection.MAX_INBOUND_MESSAGE_SIZE_PROPERTY;
 import static it.cavallium.rockserver.core.client.GrpcConnection.MIN_MAX_INBOUND_MESSAGE_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.grpc.Status.Code;
 import it.cavallium.rockserver.core.client.GrpcConnection;
+import java.lang.reflect.Method;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -68,5 +71,18 @@ class GrpcConnectionConfigTest {
 				GrpcConnection::configuredMaxInboundMessageSize);
 		assertTrue(error.getMessage().contains(MAX_INBOUND_MESSAGE_SIZE_PROPERTY));
 		assertTrue(error.getMessage().contains(configuredValue));
+	}
+
+	@Test
+	void automaticRetryIsLimitedToTransportUnavailability() throws Exception {
+		Class<?> delegate = Class.forName("it.cavallium.rockserver.core.client.GrpcConnectionDelegate");
+		Method retryPolicy = delegate.getDeclaredMethod("isAutomaticallyRetryableStatus", Code.class);
+		retryPolicy.setAccessible(true);
+
+		assertTrue((boolean) retryPolicy.invoke(null, Code.UNAVAILABLE));
+		assertFalse((boolean) retryPolicy.invoke(null, Code.RESOURCE_EXHAUSTED),
+				"server overload must reach adaptive/application backoff immediately");
+		assertFalse((boolean) retryPolicy.invoke(null, Code.ABORTED),
+				"optimistic conflicts require a reconstructed application transaction");
 	}
 }

@@ -406,6 +406,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private volatile @Nullable BiConsumer<String, String> cdcMetadataOperationObserver;
 	private volatile @Nullable BiConsumer<String, String> cdcMetadataLoadedObserver;
 	private volatile @Nullable Runnable rawScanFilesCapturedObserver;
+	private volatile @Nullable Runnable rawScanReaderOpenedObserver;
 	private volatile @Nullable Runnable rawScanCleanupObserver;
 	private volatile @Nullable Runnable columnMaintenanceObserver;
 	private volatile @Nullable LongConsumer columnUseAcquiredObserver;
@@ -1989,6 +1990,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setRawScanFilesCapturedObserverForTesting(@Nullable Runnable observer) {
 		this.rawScanFilesCapturedObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setRawScanReaderOpenedObserverForTesting(@Nullable Runnable observer) {
+		this.rawScanReaderOpenedObserver = observer;
 	}
 
 	@VisibleForTesting
@@ -8369,6 +8375,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final Path path;
 		private final long size;
 		private final @Nullable RawSstToken token;
+		private boolean claimed;
 		private boolean closed;
 
 		private PinnedSstFile(LiveFileMetaData metadata, Path path, @Nullable RawSstToken token) {
@@ -8394,11 +8401,35 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return Objects.requireNonNull(token, "Resumable raw scan SST token");
 		}
 
+		private synchronized Claim claim() {
+			if (closed || claimed) {
+				throw new IllegalStateException("Raw-scan SST pin cannot be claimed: " + path);
+			}
+			claimed = true;
+			return new Claim(this);
+		}
+
 		@Override
 		public synchronized void close() {
+			// The scan-set owns unclaimed files. Once a ScanState claims a pin, only
+			// that state may unlink it after its iterator, reader, and options close.
+			if (closed || claimed) {
+				return;
+			}
+			closeClaimedOrUnclaimed();
+		}
+
+		private synchronized void releaseClaim() {
 			if (closed) {
 				return;
 			}
+			if (!claimed) {
+				throw new IllegalStateException("Raw-scan SST pin released without a claim: " + path);
+			}
+			closeClaimedOrUnclaimed();
+		}
+
+		private void closeClaimedOrUnclaimed() {
 			try {
 				Files.deleteIfExists(path);
 			} catch (IOException failure) {
@@ -8407,6 +8438,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			closed = true;
 			activeRawScanPinnedFiles.remove(path);
 			activeRawScanPinnedBytes.addAndGet(-size);
+		}
+
+		private static final class Claim implements AutoCloseable {
+
+			private final PinnedSstFile file;
+			private final AtomicBoolean closed = new AtomicBoolean();
+
+			private Claim(PinnedSstFile file) {
+				this.file = file;
+			}
+
+			@Override
+			public void close() {
+				if (closed.compareAndSet(false, true)) {
+					file.releaseClaim();
+				}
+			}
 		}
 	}
 
@@ -8551,8 +8599,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private static final VarHandle TERMINATED =
 				varHandle(ScanState.class, "terminated", boolean.class);
 		private final ColumnInstance col;
+		private final ColumnInstance.ColumnUse retainedColumnUse;
 		private final String cfName;
 		private final PinnedSstFile file;
+		private final PinnedSstFile.Claim fileClaim;
 		private final FluxSink<T> sink;
 		private final long maximumQuantumNanos;
 		private final Function<SerializedKVBatch, T> batchMapper;
@@ -8581,13 +8631,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		                  long maximumQuantumNanos,
 		                  Function<SerializedKVBatch, T> batchMapper,
 		                  @Nullable RawScanTerminalMapper<T> terminalMapper) {
-			this.col = col;
-			this.cfName = cfName;
-			this.file = file;
-			this.sink = sink;
-			this.maximumQuantumNanos = maximumQuantumNanos;
-			this.batchMapper = batchMapper;
-			this.terminalMapper = terminalMapper;
+			// Reactor eagerly releases the outer scan/session resources on cancellation.
+			// Retain the database, column, and this specific pin until the scheduler has
+			// returned from the last JNI quantum and closeNativeResources finishes.
+			ops.beginOp();
+			ColumnInstance.ColumnUse acquiredColumnUse = null;
+			PinnedSstFile.Claim acquiredFileClaim = null;
+			try {
+				acquiredColumnUse = col.acquireUse();
+				acquiredFileClaim = file.claim();
+				this.col = col;
+				this.retainedColumnUse = acquiredColumnUse;
+				this.cfName = cfName;
+				this.file = file;
+				this.fileClaim = acquiredFileClaim;
+				this.sink = sink;
+				this.maximumQuantumNanos = maximumQuantumNanos;
+				this.batchMapper = batchMapper;
+				this.terminalMapper = terminalMapper;
+			} catch (RuntimeException | Error failure) {
+				if (acquiredFileClaim != null) {
+					acquiredFileClaim.close();
+				}
+				if (acquiredColumnUse != null) {
+					acquiredColumnUse.close();
+				}
+				ops.endOp();
+				throw failure;
+			}
 		}
 
 		private void attach(RWScheduler.CooperativeHandle handle) {
@@ -8655,6 +8726,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			reader = createdReader;
 			readOptions = createdReadOptions;
 			it = createdIterator;
+			var readerOpenedObserver = rawScanReaderOpenedObserver;
+			if (readerOpenedObserver != null) {
+				readerOpenedObserver.run();
+			}
 		}
 
 		@Override
@@ -8947,7 +9022,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 			try {
-				file.close();
+				fileClaim.close();
+			} catch (Throwable error) {
+				failure = appendFailure(failure, error);
+			}
+			try {
+				retainedColumnUse.close();
+			} catch (Throwable error) {
+				failure = appendFailure(failure, error);
+			}
+			try {
+				ops.endOp();
 			} catch (Throwable error) {
 				failure = appendFailure(failure, error);
 			}
