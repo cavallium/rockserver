@@ -37,12 +37,14 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.LiveFileMetaData;
+import reactor.core.publisher.BaseSubscriber;
 import reactor.test.StepVerifier;
 
 @Timeout(90)
@@ -238,6 +240,44 @@ class RawScanResumeTest {
 	}
 
 	@Test
+	void repeatedGrpcCancellationCannotRaceNativeRawScanCleanup(@TempDir Path tempDir) throws Exception {
+		try (var embedded = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-grpc-cancel", null)) {
+			RocksDBSyncAPI embeddedApi = embedded.getSyncApi(RequestContext.batch());
+			int cancellationSsts = 128;
+			long columnId = createPopulatedColumn(embeddedApi, cancellationSsts, 1);
+			try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+				server.start();
+				try (var client = GrpcConnection.forHostAndPort("raw-resume-grpc-cancel-client",
+						new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
+					RocksDBAsyncAPI api = client.getAsyncApi(RequestContext.batch());
+					for (int attempt = 0; attempt < 32; attempt++) {
+						var firstEvent = new CountDownLatch(1);
+						var subscriber = new BaseSubscriber<RawScanEvent>() {
+							@Override
+							protected void hookOnSubscribe(org.reactivestreams.Subscription subscription) {
+								request(1);
+							}
+
+							@Override
+							protected void hookOnNext(RawScanEvent value) {
+								firstEvent.countDown();
+								cancel();
+							}
+						};
+						reactor.core.publisher.Flux.from(api.scanRawResumableAsync(columnId, 0, 1, Set.of()))
+								.subscribe(subscriber);
+						assertTrue(firstEvent.await(10, TimeUnit.SECONDS),
+								"raw scan did not emit before cancellation attempt " + attempt);
+						awaitNoRawScanPins(embedded.getInternalDB(), Duration.ofSeconds(10));
+					}
+					assertEquals((long) cancellationSsts,
+							api.estimateNumKeysAsync(columnId).get(10, TimeUnit.SECONDS));
+				}
+			}
+		}
+	}
+
+	@Test
 	void grpcRetainsLegacyCompletionShapeForClientsThatDoNotOptIn(@TempDir Path tempDir) throws Exception {
 		try (var embedded = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-grpc-legacy", null);
 				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
@@ -406,6 +446,15 @@ class RawScanResumeTest {
 				new RawSstToken("18446744073709551615.sst").value());
 	}
 
+	private static void awaitNoRawScanPins(EmbeddedDB db, Duration timeout) throws InterruptedException {
+		long deadline = System.nanoTime() + timeout.toNanos();
+		while (!db.getRawScanPinnedFilesForTesting().isEmpty() && System.nanoTime() < deadline) {
+			Thread.sleep(10L);
+		}
+		assertTrue(db.getRawScanPinnedFilesForTesting().isEmpty(),
+				"cancelled raw scan did not release every pinned SST");
+	}
+
 	private static Path rawScanConfig(Path tempDir) throws Exception {
 		Path config = tempDir.resolve("raw-resume.conf");
 		Files.writeString(config, """
@@ -420,11 +469,15 @@ class RawScanResumeTest {
 	}
 
 	private static long createPopulatedColumn(RocksDBSyncAPI api) {
+		return createPopulatedColumn(api, SST_COUNT, KEYS_PER_SST);
+	}
+
+	private static long createPopulatedColumn(RocksDBSyncAPI api, int sstCount, int keysPerSst) {
 		long columnId = api.createColumn(COLUMN_NAME,
 				ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-		for (int sst = 0; sst < SST_COUNT; sst++) {
-			for (int index = 0; index < KEYS_PER_SST; index++) {
-				int key = sst * KEYS_PER_SST + index;
+		for (int sst = 0; sst < sstCount; sst++) {
+			for (int index = 0; index < keysPerSst; index++) {
+				int key = sst * keysPerSst + index;
 				Buf serializedKey = Buf.createZeroes(Integer.BYTES);
 				serializedKey.setInt(0, key);
 				api.put(0, columnId, new Keys(serializedKey),

@@ -8658,7 +8658,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		@Override
-		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+		public synchronized RWScheduler.CooperativeResult runCooperatively(
+				RWScheduler.CooperativeContext context) {
+			// RocksJava native iterators have no protection against a concurrent close.
+			// Serialize each JNI quantum with reject/terminal cleanup because gRPC
+			// cancellation arrives on a transport thread while this worker may still be
+			// inside isValid/key/value/next.
 			if (terminated) {
 				return RWScheduler.CooperativeResult.COMPLETE;
 			}
@@ -8781,7 +8786,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		@Override
-		public void completeCooperatively() {
+		public synchronized void completeCooperatively() {
 			if (!completionPrepared) {
 				throw new IllegalStateException("Scheduler selected RUN before raw scan cleanup completed");
 			}
@@ -8868,7 +8873,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return terminated;
 		}
 
-		private void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
+		private synchronized void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
 			if (!TERMINATED.compareAndSet(this, false, true)) {
 				return;
 			}
