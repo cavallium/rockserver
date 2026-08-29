@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -19,10 +20,12 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
@@ -32,11 +35,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.LiveFileMetaData;
 import org.rocksdb.RocksDB;
+import reactor.core.publisher.BaseSubscriber;
 
 @Timeout(90)
 class ScanRawCompactionSafetyTest {
@@ -304,8 +309,8 @@ class ScanRawCompactionSafetyTest {
 						.block(Duration.ofSeconds(30));
 				assertTrue(batches.size() > 10,
 						"repeated cooperative yields must publish partial progress instead of hiding it");
-				assertEquals(COOPERATIVE_SCAN_KEYS,
-						batches.stream().mapToLong(batch -> batch.decode().count()).sum());
+				assertEquals(expectedCooperativeKeys(), decodedKeys(batches),
+						"partial legacy batches must preserve every row exactly once and in SST order");
 				assertTrue(batches.stream().allMatch(batch -> batch.decode().count() < COOPERATIVE_SCAN_KEYS),
 						"no yielded batch may retain the entire scan until EOF");
 
@@ -318,8 +323,8 @@ class ScanRawCompactionSafetyTest {
 						.map(RawScanEvent.Batch.class::cast)
 						.toList();
 				assertTrue(resumableBatches.size() > 10);
-				assertEquals(COOPERATIVE_SCAN_KEYS,
-						resumableBatches.stream().mapToLong(batch -> batch.decode().count()).sum());
+				assertEquals(expectedCooperativeKeys(), decodedKeys(resumableBatches),
+						"partial resumable batches must preserve every row exactly once and in SST order");
 				assertEquals(1L, resumableEvents.stream().filter(event -> switch (event) {
 					case RawScanEvent.Batch batch -> batch.completedSstToken() != null;
 					case RawScanEvent.SstCompleted _ -> true;
@@ -332,6 +337,124 @@ class ScanRawCompactionSafetyTest {
 				assertTrue(quantumCounter.count() - quantumsBefore > 20.0,
 						"the competing LATENCY task must force repeated raw-scan scheduler quanta");
 			} finally {
+				releaseForeground.countDown();
+			}
+		}
+	}
+
+	@Test
+	void uncontendedScanKeepsNormalWireBatchDespiteTinyQuantum(@TempDir Path tempDir) throws Exception {
+		Path configFile = tempDir.resolve("scan-raw-uncontended.conf");
+		Files.writeString(configFile, """
+				database.parallelism.workload.range-quantum-max-duration = PT0.000001S
+				""");
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"),
+				"scan-raw-uncontended",
+				configFile)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = createCooperativeScanColumn(api);
+
+			var batches = internal.scanRawAsyncInternal(columnId, 0, 1)
+					.collectList()
+					.block(Duration.ofSeconds(30));
+
+			assertEquals(1, batches.size(),
+					"a quantum deadline alone must not fragment an uncontended scan");
+			assertEquals(expectedCooperativeKeys(), decodedKeys(batches));
+		}
+	}
+
+	@Test
+	void yieldedPartialBatchConsumesDemandAndParksUntilMoreIsRequested(@TempDir Path tempDir)
+			throws Exception {
+		Path configFile = tempDir.resolve("scan-raw-backpressure.conf");
+		Files.writeString(configFile, """
+				database.parallelism.workload.range-quantum-max-duration = PT0.000001S
+				""");
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"),
+				"scan-raw-backpressure",
+				configFile)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = createCooperativeScanColumn(api);
+
+			var foregroundStarted = new CountDownLatch(1);
+			var releaseForeground = new CountDownLatch(1);
+			internal.getScheduler().executor(
+					WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30)).execute(() -> {
+				foregroundStarted.countDown();
+				awaitLatch(releaseForeground);
+			});
+			assertTrue(foregroundStarted.await(10, TimeUnit.SECONDS));
+
+			var received = new CopyOnWriteArrayList<SerializedKVBatch>();
+			var firstBatch = new CountDownLatch(1);
+			var secondBatch = new CountDownLatch(1);
+			var terminal = new CountDownLatch(1);
+			var completed = new AtomicBoolean();
+			var failure = new AtomicReference<Throwable>();
+			class DemandSubscriber extends BaseSubscriber<SerializedKVBatch> {
+				@Override
+				protected void hookOnSubscribe(org.reactivestreams.Subscription subscription) {
+					request(1);
+				}
+
+				@Override
+				protected void hookOnNext(SerializedKVBatch batch) {
+					received.add(batch);
+					if (received.size() == 1) {
+						firstBatch.countDown();
+					} else if (received.size() == 2) {
+						secondBatch.countDown();
+					}
+				}
+
+				@Override
+				protected void hookOnComplete() {
+					completed.set(true);
+					terminal.countDown();
+				}
+
+				@Override
+				protected void hookOnError(Throwable error) {
+					failure.set(error);
+					terminal.countDown();
+				}
+
+				void requestMore(long count) {
+					request(count);
+				}
+			}
+			var subscriber = new DemandSubscriber();
+			try {
+				internal.scanRawAsyncInternal(columnId, 0, 1).subscribe(subscriber);
+				assertTrue(firstBatch.await(10, TimeUnit.SECONDS),
+						"first bounded yield did not publish its partial batch");
+				assertFalse(secondBatch.await(250, TimeUnit.MILLISECONDS),
+						"scan advanced after consuming all downstream demand");
+				assertEquals(1, received.size());
+				assertFalse(completed.get(), "parked scan must retain resumable native state");
+
+				subscriber.requestMore(1);
+				assertTrue(secondBatch.await(10, TimeUnit.SECONDS),
+						"new demand did not resume the parked scan");
+				assertFalse(terminal.await(250, TimeUnit.MILLISECONDS),
+						"scan completed after producing more batches than requested");
+				assertEquals(2, received.size());
+
+				subscriber.requestMore(Long.MAX_VALUE);
+				assertTrue(terminal.await(30, TimeUnit.SECONDS));
+				assertNull(failure.get());
+				assertTrue(completed.get());
+				assertTrue(received.size() > 2,
+						"remaining unbounded demand should retain cooperative partial emissions");
+				assertEquals(expectedCooperativeKeys(), decodedKeys(received),
+						"park/resume boundaries must not duplicate, skip, or reorder rows");
+			} finally {
+				subscriber.cancel();
 				releaseForeground.countDown();
 			}
 		}
@@ -884,6 +1007,27 @@ class ScanRawCompactionSafetyTest {
 			}
 			api.flush();
 		}
+	}
+
+	private static long createCooperativeScanColumn(RocksDBSyncAPI api) {
+		long columnId = api.createColumn(COLUMN_NAME,
+				ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+		for (int i = 0; i < COOPERATIVE_SCAN_KEYS; i++) {
+			api.put(0, columnId, key(i), value(0, i), RequestType.none());
+		}
+		api.flush();
+		return columnId;
+	}
+
+	private static List<Integer> expectedCooperativeKeys() {
+		return IntStream.range(0, COOPERATIVE_SCAN_KEYS).boxed().toList();
+	}
+
+	private static List<Integer> decodedKeys(Collection<? extends SerializedKVBatch> batches) {
+		return batches.stream()
+				.flatMap(SerializedKVBatch::decode)
+				.map(kv -> ByteBuffer.wrap(kv.keys().keys()[0].toByteArray()).getInt())
+				.toList();
 	}
 
 	private static Set<Path> liveColumnSsts(EmbeddedDB db) {
