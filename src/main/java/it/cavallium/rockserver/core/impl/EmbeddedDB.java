@@ -2445,7 +2445,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			WorkloadProfile workloadProfile,
 			boolean captureSnapshot) {
 		Objects.requireNonNull(workloadProfile, "workloadProfile");
-		var expirationTimestamp = timeoutMs + System.currentTimeMillis();
+		var expirationTimestamp = saturatingAdd(System.currentTimeMillis(), timeoutMs);
 		TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
 		var writeOpts = new LeakSafeWriteOptions("open-transaction-internal-write-options");
 		var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
