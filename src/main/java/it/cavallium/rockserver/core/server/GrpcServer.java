@@ -465,10 +465,11 @@ public class GrpcServer extends Server {
 		}
 
 		private final class FastGetListener extends Listener<GetRequest>
-				implements Runnable, RWScheduler.EstimatedWork {
+				implements Runnable, RWScheduler.EstimatedWork, RWScheduler.RejectionAwareTask {
 
 			private static final int CANCELLED = 1;
 			private static final int HALF_CLOSED = 1 << 1;
+			private static final int TERMINATED = 1 << 2;
 			private static final VarHandle STATE;
 
 			static {
@@ -533,7 +534,9 @@ public class GrpcServer extends Server {
 							requestContext.deadlineEpochMillis())
 							.schedule(this);
 				} catch (Throwable schedulingError) {
-					closeFastGetFailure(call, currentRequest, schedulingError, this);
+					if (tryTerminate()) {
+						closeFastGetFailure(call, currentRequest, schedulingError, this);
+					}
 					return;
 				}
 				task = scheduled;
@@ -553,6 +556,9 @@ public class GrpcServer extends Server {
 
 			@Override
 			public void run() {
+				if (!tryTerminate()) {
+					return;
+				}
 				Context previous = callContext.attach();
 				try {
 					runFastGetCall(call,
@@ -568,6 +574,16 @@ public class GrpcServer extends Server {
 			@Override
 			public long estimatedBytes() {
 				return estimatedBytes;
+			}
+
+			@Override
+			public void reject(RuntimeException failure) {
+				if (tryTerminate()) {
+					closeFastGetFailure(call,
+							Objects.requireNonNull(request, "request"),
+							failure,
+							this);
+				}
 			}
 
 			private boolean markHalfClosed() {
@@ -587,6 +603,17 @@ public class GrpcServer extends Server {
 
 			private boolean isCancelled() {
 				return (state & CANCELLED) != 0;
+			}
+
+			private boolean tryTerminate() {
+				int current;
+				do {
+					current = state;
+					if ((current & (CANCELLED | TERMINATED)) != 0) {
+						return false;
+					}
+				} while (!STATE.compareAndSet(this, current, current | TERMINATED));
+				return true;
 			}
 		}
 	}
@@ -3236,7 +3263,10 @@ public class GrpcServer extends Server {
 			}
 		}
 
-		private final class ScheduledCall<T> implements Disposable, Runnable, RWScheduler.EstimatedWork {
+		private final class ScheduledCall<T> implements Disposable,
+				Runnable,
+				RWScheduler.EstimatedWork,
+				RWScheduler.RejectionAwareTask {
 
 			private final reactor.core.publisher.MonoSink<T> sink;
 			private final Callable<T> callable;
@@ -3249,6 +3279,8 @@ public class GrpcServer extends Server {
 			private final long estimatedBytes;
 			private @Nullable Disposable task;
 			private boolean cancelled;
+			private boolean running;
+			private boolean terminated;
 
 			private ScheduledCall(reactor.core.publisher.MonoSink<T> sink,
 					Callable<T> callable,
@@ -3317,7 +3349,11 @@ public class GrpcServer extends Server {
 
 			@Override
 			public void run() {
+				if (!claimRun()) {
+					return;
+				}
 				if (taskLifecycle != null && !taskLifecycle.start()) {
+					markAbortedRunTerminated();
 					return;
 				}
 				final T result;
@@ -3342,6 +3378,13 @@ public class GrpcServer extends Server {
 			}
 
 			private void runningTaskTerminated() {
+				synchronized (this) {
+					if (!running || terminated) {
+						throw new IllegalStateException("Scheduled call did not terminate exactly once from running state");
+					}
+					running = false;
+					terminated = true;
+				}
 				if (taskLifecycle != null) {
 					taskLifecycle.runningTaskTerminated();
 				}
@@ -3372,13 +3415,56 @@ public class GrpcServer extends Server {
 			}
 
 			private void schedulingFailed(Throwable schedulingError) {
+				if (schedulingError instanceof RuntimeException runtimeFailure) {
+					reject(runtimeFailure);
+				} else {
+					reject(new RejectedExecutionException("gRPC scheduling failed", schedulingError));
+				}
+			}
+
+			@Override
+			public void reject(RuntimeException failure) {
+				if (!claimRejection()) {
+					return;
+				}
 				if (taskLifecycle != null) {
 					taskLifecycle.cancelBeforeStart();
 				}
 				if (mustComplete) {
 					mustCompleteOperations.operationTerminated();
 				}
-				emitOrRecordLateError(schedulingError);
+				emitOrRecordLateError(failure);
+			}
+
+			private boolean claimRun() {
+				synchronized (this) {
+					if (terminated || running) {
+						return false;
+					}
+					if (cancelled && !mustComplete) {
+						terminated = true;
+						return false;
+					}
+					running = true;
+					return true;
+				}
+			}
+
+			private boolean claimRejection() {
+				synchronized (this) {
+					if (terminated || running) {
+						return false;
+					}
+					terminated = true;
+					return true;
+				}
+			}
+
+			private void markAbortedRunTerminated() {
+				synchronized (this) {
+					running = false;
+					terminated = true;
+				}
 			}
 
 			private void emitOrRecordLateError(Throwable error) {

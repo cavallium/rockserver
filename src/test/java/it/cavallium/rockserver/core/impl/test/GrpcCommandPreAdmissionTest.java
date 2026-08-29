@@ -25,14 +25,23 @@ import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import reactor.core.Disposable;
+import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
 
 @Timeout(30)
 class GrpcCommandPreAdmissionTest {
@@ -181,10 +190,113 @@ class GrpcCommandPreAdmissionTest {
 	@Test
 	void grpcScheduledWrappersExposeEstimatedWorkToDeficitAccounting() throws Exception {
 		var estimatedWork = it.cavallium.rockserver.core.impl.RWScheduler.EstimatedWork.class;
+		var rejectionAware = it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask.class;
 		assertTrue(estimatedWork.isAssignableFrom(Class.forName(
 				"it.cavallium.rockserver.core.server.GrpcServer$FastGetCallHandler$FastGetListener")));
 		assertTrue(estimatedWork.isAssignableFrom(Class.forName(
 				"it.cavallium.rockserver.core.server.GrpcServer$GrpcServerImpl$ScheduledCall")));
+		assertTrue(rejectionAware.isAssignableFrom(Class.forName(
+				"it.cavallium.rockserver.core.server.GrpcServer$FastGetCallHandler$FastGetListener")));
+		assertTrue(rejectionAware.isAssignableFrom(Class.forName(
+				"it.cavallium.rockserver.core.server.GrpcServer$GrpcServerImpl$ScheduledCall")));
+	}
+
+	@Test
+	void grpcScheduledCallArbitratesRunCancelAndRejectionExactlyOnce() throws Exception {
+		Path root = Files.createTempDirectory("rockserver-grpc-scheduled-terminal");
+		try (var embedded = new EmbeddedConnection(root, "grpc-scheduled-terminal", null);
+				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			Object grpc = field(GrpcServer.class, "grpc").get(server);
+			Method execute = grpc.getClass().getDeclaredMethod(
+					"executeScheduled", Callable.class, Scheduler.class, long.class);
+			execute.setAccessible(true);
+
+			var rejectedScheduler = new CapturingScheduler();
+			var rejectedCalls = new AtomicInteger();
+			var rejected = invokeScheduled(execute, grpc, rejectedScheduler,
+					() -> rejectedCalls.incrementAndGet(), 8L);
+			var firstFailure = new java.util.concurrent.RejectedExecutionException("deadline");
+			var rejectedTask = (it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask)
+					rejectedScheduler.task();
+			rejectedTask.reject(firstFailure);
+			rejectedTask.reject(new java.util.concurrent.RejectedExecutionException("duplicate"));
+			var rejectedResult = assertThrows(ExecutionException.class,
+					() -> rejected.get(5, TimeUnit.SECONDS));
+			assertEquals(firstFailure, rejectedResult.getCause());
+			assertEquals(0, rejectedCalls.get());
+
+			var runningScheduler = new CapturingScheduler();
+			var runningCalls = new AtomicInteger();
+			var running = invokeScheduled(execute, grpc, runningScheduler,
+					runningCalls::incrementAndGet, 16L);
+			runningScheduler.task().run();
+			((it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask) runningScheduler.task())
+					.reject(new java.util.concurrent.RejectedExecutionException("late"));
+			assertEquals(1, running.get(5, TimeUnit.SECONDS));
+			assertEquals(1, runningCalls.get());
+
+			var cancelledScheduler = new CapturingScheduler();
+			var cancelledCalls = new AtomicInteger();
+			var cancelled = invokeScheduled(execute, grpc, cancelledScheduler,
+					cancelledCalls::incrementAndGet, 32L);
+			assertTrue(cancelled.cancel(true));
+			((it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask) cancelledScheduler.task())
+					.reject(new java.util.concurrent.RejectedExecutionException("cancelled"));
+			cancelledScheduler.task().run();
+			assertTrue(cancelled.isCancelled());
+			assertEquals(0, cancelledCalls.get());
+		} finally {
+			Utils.deleteDirectory(root.toString());
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private static <T> CompletableFuture<T> invokeScheduled(Method method,
+			Object grpc,
+			Scheduler scheduler,
+			Callable<T> callable,
+			long estimatedBytes) throws Exception {
+		return ((Mono<T>) method.invoke(grpc, callable, scheduler, estimatedBytes)).toFuture();
+	}
+
+	private static Field field(Class<?> owner, String name) throws Exception {
+		var field = owner.getDeclaredField(name);
+		field.setAccessible(true);
+		return field;
+	}
+
+	private static final class CapturingScheduler implements Scheduler {
+
+		private final AtomicReference<Runnable> task = new AtomicReference<>();
+
+		@Override
+		public Disposable schedule(Runnable submitted) {
+			if (!task.compareAndSet(null, submitted)) {
+				throw new AssertionError("scheduler received more than one task");
+			}
+			return Disposables.disposed();
+		}
+
+		@Override
+		public Worker createWorker() {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public void dispose() {
+		}
+
+		@Override
+		public boolean isDisposed() {
+			return false;
+		}
+
+		private Runnable task() {
+			var captured = task.get();
+			org.junit.jupiter.api.Assertions.assertNotNull(captured);
+			return captured;
+		}
 	}
 
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext(
