@@ -70,6 +70,31 @@ class SchedulerHighContentionBenchmarkTest {
 			assertTrue(poolResult.peakQueued() <= poolResult.queueBound(), "queue bound exceeded: " + pool);
 			assertTrue(poolResult.finalSnapshot().drainedAndConserved(), "pool did not drain: " + pool);
 		}
+		var progress = result.pressureProgress();
+		assertTrue(progress.batchReadPressured() + progress.batchReadUnpressured() > 0L);
+		assertTrue(progress.batchWritePressured() + progress.batchWriteUnpressured() > 0L);
+		assertTrue(progress.foregroundReadPressured() > 0L);
+		assertTrue(progress.foregroundWritePressured() > 0L);
+	}
+
+	@Test
+	void noPressureRunKeepsEveryProgressCounterInTheUnpressuredPhase() throws Exception {
+		var base = config(24_000, 24, 4, 4, 256, 512, 512, 0xA11CE55L);
+		var result = SchedulerHighContentionBenchmark.run(new SchedulerHighContentionBenchmark.Config(
+				base.operations(), base.submitters(), base.readWorkers(), base.writeWorkers(),
+				base.analyticalLimit(), base.foregroundQueueCapacity(), base.batchQueueCapacity(),
+				base.workTokens(), base.cooperativeYields(), base.cooperativeParks(),
+				base.expiredDeadlinePercent(), base.cancellationPercent(), base.failurePercent(),
+				base.cooperativePercent(), false, base.seed(), base.timeout()));
+
+		var progress = result.pressureProgress();
+		assertEquals(0L, result.pressureTransitions());
+		assertEquals(0L, progress.batchReadPressured());
+		assertEquals(0L, progress.batchWritePressured());
+		assertEquals(0L, progress.foregroundReadPressured());
+		assertEquals(0L, progress.foregroundWritePressured());
+		assertTrue(progress.batchReadUnpressured() > 0L);
+		assertTrue(progress.batchWriteUnpressured() > 0L);
 	}
 
 	@Test
@@ -109,6 +134,8 @@ class SchedulerHighContentionBenchmarkTest {
 		assertTrue(report.contains("useful_runs_per_second="));
 		assertTrue(report.contains("process.cpu_nanos_per_attempt="));
 		assertTrue(report.contains("process.allocated_bytes_per_attempt="));
+		assertTrue(report.contains("pressure.batch_read.pressured_runs="));
+		assertTrue(report.contains("pressure.foreground_write.unpressured_runs="));
 		for (var profile : WorkloadProfile.values()) {
 			assertTrue(report.contains("profile." + profile.name().toLowerCase(java.util.Locale.ROOT)
 					+ ".queue_p99_nanos="));

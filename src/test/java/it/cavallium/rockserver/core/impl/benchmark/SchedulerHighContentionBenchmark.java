@@ -269,6 +269,16 @@ public final class SchedulerHighContentionBenchmark {
 			RWScheduler.PoolSnapshot finalSnapshot) {
 	}
 
+	public record PressureProgress(long batchReadPressured,
+			long batchReadUnpressured,
+			long batchWritePressured,
+			long batchWriteUnpressured,
+			long foregroundReadPressured,
+			long foregroundReadUnpressured,
+			long foregroundWritePressured,
+			long foregroundWriteUnpressured) {
+	}
+
 	public record Result(Config config,
 			long elapsedNanos,
 			long attempts,
@@ -286,6 +296,7 @@ public final class SchedulerHighContentionBenchmark {
 			Map<WorkloadProfile, ProfileResult> profiles,
 			Map<OperationFamily, FamilyResult> families,
 			Map<RWScheduler.Pool, PoolResult> pools,
+			PressureProgress pressureProgress,
 			BenchmarkProcessTelemetry.ProcessDelta process,
 			BenchmarkProcessTelemetry.Peaks peaks) {
 
@@ -377,6 +388,18 @@ public final class SchedulerHighContentionBenchmark {
 					throw new IllegalStateException("pool exceeded configured bounds: " + pool + " " + result);
 				}
 			}
+			boolean incompletePressureCoverage = config.alternateStoragePressure()
+					? pressureProgress.foregroundReadPressured() == 0L
+							|| pressureProgress.foregroundWritePressured() == 0L
+					: pressureProgress.batchReadPressured() != 0L
+							|| pressureProgress.batchWritePressured() != 0L
+							|| pressureProgress.foregroundReadPressured() != 0L
+							|| pressureProgress.foregroundWritePressured() != 0L;
+			if (pressureProgress.batchReadPressured() + pressureProgress.batchReadUnpressured() == 0L
+					|| pressureProgress.batchWritePressured() + pressureProgress.batchWriteUnpressured() == 0L
+					|| incompletePressureCoverage) {
+				throw new IllegalStateException("pressure-phase workload coverage is incomplete: " + pressureProgress);
+			}
 		}
 
 		public String toReport() {
@@ -396,6 +419,22 @@ public final class SchedulerHighContentionBenchmark {
 			report.append("park_transitions=").append(parkTransitions).append('\n');
 			report.append("pressure_transitions=").append(pressureTransitions).append('\n');
 			report.append("injected_failures=").append(injectedFailures).append('\n');
+			report.append("pressure.batch_read.pressured_runs=")
+					.append(pressureProgress.batchReadPressured()).append('\n');
+			report.append("pressure.batch_read.unpressured_runs=")
+					.append(pressureProgress.batchReadUnpressured()).append('\n');
+			report.append("pressure.batch_write.pressured_runs=")
+					.append(pressureProgress.batchWritePressured()).append('\n');
+			report.append("pressure.batch_write.unpressured_runs=")
+					.append(pressureProgress.batchWriteUnpressured()).append('\n');
+			report.append("pressure.foreground_read.pressured_runs=")
+					.append(pressureProgress.foregroundReadPressured()).append('\n');
+			report.append("pressure.foreground_read.unpressured_runs=")
+					.append(pressureProgress.foregroundReadUnpressured()).append('\n');
+			report.append("pressure.foreground_write.pressured_runs=")
+					.append(pressureProgress.foregroundWritePressured()).append('\n');
+			report.append("pressure.foreground_write.unpressured_runs=")
+					.append(pressureProgress.foregroundWriteUnpressured()).append('\n');
 			report.append("process.cpu_nanos=").append(process.cpuNanos()).append('\n');
 			report.append("process.cpu_nanos_per_attempt=")
 					.append(String.format(Locale.ROOT, "%.3f", cpuNanosPerAttempt())).append('\n');
@@ -479,6 +518,14 @@ public final class SchedulerHighContentionBenchmark {
 		private final LongAdder parkTransitions = new LongAdder();
 		private final LongAdder pressureTransitions = new LongAdder();
 		private final LongAdder duplicateExecutions = new LongAdder();
+		private final LongAdder batchReadPressured = new LongAdder();
+		private final LongAdder batchReadUnpressured = new LongAdder();
+		private final LongAdder batchWritePressured = new LongAdder();
+		private final LongAdder batchWriteUnpressured = new LongAdder();
+		private final LongAdder foregroundReadPressured = new LongAdder();
+		private final LongAdder foregroundReadUnpressured = new LongAdder();
+		private final LongAdder foregroundWritePressured = new LongAdder();
+		private final LongAdder foregroundWriteUnpressured = new LongAdder();
 		private final long[] queueLatencyNanos;
 		private final long[] executionNanos;
 		private final long[] endToEndNanos;
@@ -699,6 +746,14 @@ public final class SchedulerHighContentionBenchmark {
 					Map.copyOf(profileResults),
 					Map.copyOf(familyResults),
 					Map.copyOf(poolResults),
+					new PressureProgress(batchReadPressured.sum(),
+							batchReadUnpressured.sum(),
+							batchWritePressured.sum(),
+							batchWriteUnpressured.sum(),
+							foregroundReadPressured.sum(),
+							foregroundReadUnpressured.sum(),
+							foregroundWritePressured.sum(),
+							foregroundWriteUnpressured.sum()),
 					process,
 					peaks);
 		}
@@ -744,6 +799,26 @@ public final class SchedulerHighContentionBenchmark {
 				previous = completion;
 			}
 			return Math.max(maximum, startedNanos + elapsedNanos - previous);
+		}
+
+		private void recordPressureProgress(Lane lane) {
+			boolean pressured = scheduler.isStoragePressure();
+			boolean write = lane.family() == OperationFamily.MUTATION
+					|| lane.family() == OperationFamily.FLUSH;
+			if (lane.profile() == WorkloadProfile.BATCH) {
+				if (write) {
+					(pressured ? batchWritePressured : batchWriteUnpressured).increment();
+				} else {
+					(pressured ? batchReadPressured : batchReadUnpressured).increment();
+				}
+			} else if (lane.profile() != WorkloadProfile.CONTROL
+					&& lane.profile() != WorkloadProfile.PHYSICAL_MAINTENANCE) {
+				if (write) {
+					(pressured ? foregroundWritePressured : foregroundWriteUnpressured).increment();
+				} else {
+					(pressured ? foregroundReadPressured : foregroundReadUnpressured).increment();
+				}
+			}
 		}
 	}
 
@@ -795,6 +870,7 @@ public final class SchedulerHighContentionBenchmark {
 			owner.familyRuns[lane.family().ordinal()].increment();
 			owner.completionNanos[index] = completedNanos;
 			owner.successfulRuns[index] = true;
+			owner.recordPressureProgress(lane);
 		}
 
 		final void executeTokens() {
