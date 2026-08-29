@@ -855,12 +855,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@Override
 	public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
-		return reactiveStubWithRequestDeadline().scanRaw(ScanRawRequest.newBuilder()
+		return toResponse(reactiveStubWithRequestDeadline().scanRaw(ScanRawRequest.newBuilder()
 						.setColumnId(columnId)
 						.setShardIndex(shardIndex)
 						.setShardCount(shardCount)
 						.setContext(currentWireRequestContext())
-						.build())
+						.build()))
 				.map(batch -> new SerializedKVBatchRef(Buf.wrap(batch.getSerialized().toByteArray())));
 	}
 
@@ -885,7 +885,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		for (RawSstToken completedSst : completedSsts) {
 			request.addCompletedSstTokens(completedSst.value());
 		}
-		return reactiveStubWithRequestDeadline().scanRaw(request.build())
+		return toResponse(reactiveStubWithRequestDeadline().scanRaw(request.build()))
 				.map(event -> switch (event.getEventCase()) {
 					case SERIALIZED -> new RawScanEvent.Batch(
 							Buf.wrap(event.getSerialized().toByteArray()),
