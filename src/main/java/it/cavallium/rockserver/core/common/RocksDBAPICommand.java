@@ -69,17 +69,25 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		};
 	}
 
-	private static long estimatedBytes(@Nullable Keys... keys) {
+	private static long estimatedBytes(@Nullable Keys logicalKey) {
 		long total = 0L;
-		for (Keys logicalKey : keys) {
-			if (logicalKey == null) {
-				continue;
-			}
-			for (Buf segment : logicalKey.keys()) {
-				total = saturatedAdd(total, segment.size());
-			}
+		if (logicalKey == null) {
+			return total;
+		}
+		for (Buf segment : logicalKey.keys()) {
+			total = saturatedAdd(total, segment.size());
 		}
 		return total;
+	}
+
+	private static long estimatedBytes(@Nullable Keys first, @Nullable Keys second) {
+		return saturatedAdd(estimatedBytes(first), estimatedBytes(second));
+	}
+
+	private static long estimatedBytes(@Nullable Keys first,
+			@Nullable Keys second,
+			@Nullable Keys third) {
+		return saturatedAdd(estimatedBytes(first, second), estimatedBytes(third));
 	}
 
 	private static long estimatedBytes(List<Keys> keys) {
