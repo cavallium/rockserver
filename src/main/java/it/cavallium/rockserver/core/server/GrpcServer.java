@@ -172,8 +172,9 @@ public class GrpcServer extends Server {
 		}
 
 		private DrainResult stopAcceptingAndAwait(Duration timeout) {
-			long remainingNanos = timeout.toNanos();
-			long deadlineNanos = System.nanoTime() + remainingNanos;
+			long timeoutNanos = saturatedTimeoutNanos(timeout);
+			long remainingNanos = timeoutNanos;
+			long waitStartedNanos = System.nanoTime();
 			boolean interrupted = false;
 			synchronized (monitor) {
 				accepting = false;
@@ -186,7 +187,7 @@ public class GrpcServer extends Server {
 					} catch (InterruptedException _) {
 						interrupted = true;
 					}
-					remainingNanos = deadlineNanos - System.nanoTime();
+					remainingNanos = remainingTimeoutNanos(timeoutNanos, waitStartedNanos);
 				}
 				return new DrainResult(true, interrupted);
 			}
@@ -3928,8 +3929,9 @@ public class GrpcServer extends Server {
 
 	private static AwaitTerminationResult awaitTerminationUninterruptibly(io.grpc.Server server,
 			Duration timeout) {
-		long remainingNanos = timeout.toNanos();
-		long deadlineNanos = System.nanoTime() + remainingNanos;
+		long timeoutNanos = saturatedTimeoutNanos(timeout);
+		long remainingNanos = timeoutNanos;
+		long waitStartedNanos = System.nanoTime();
 		boolean interrupted = false;
 		do {
 			try {
@@ -3938,10 +3940,29 @@ public class GrpcServer extends Server {
 						interrupted);
 			} catch (InterruptedException _) {
 				interrupted = true;
-				remainingNanos = deadlineNanos - System.nanoTime();
+				remainingNanos = remainingTimeoutNanos(timeoutNanos, waitStartedNanos);
 			}
 		} while (remainingNanos > 0L);
 		return new AwaitTerminationResult(server.isTerminated(), interrupted);
+	}
+
+	private static long saturatedTimeoutNanos(Duration timeout) {
+		if (timeout.isNegative()) {
+			throw new IllegalArgumentException("timeout must not be negative");
+		}
+		try {
+			return timeout.toNanos();
+		} catch (ArithmeticException overflow) {
+			return Long.MAX_VALUE;
+		}
+	}
+
+	private static long remainingTimeoutNanos(long timeoutNanos, long waitStartedNanos) {
+		long elapsedNanos = System.nanoTime() - waitStartedNanos;
+		if (elapsedNanos <= 0L) {
+			return timeoutNanos;
+		}
+		return elapsedNanos >= timeoutNanos ? 0L : timeoutNanos - elapsedNanos;
 	}
 
 	private static IOException appendCloseFailure(@Nullable IOException current, IOException additional) {
@@ -3963,7 +3984,7 @@ public class GrpcServer extends Server {
 				LOG.warn("Invalid negative duration for system property {}: {}", name, value);
 				return defaultValue;
 			}
-			return Duration.ofMillis(millis);
+			return Duration.ofNanos(TimeUnit.MILLISECONDS.toNanos(millis));
 		} catch (NumberFormatException ex) {
 			LOG.warn("Invalid duration in milliseconds for system property {}: {}", name, value);
 			return defaultValue;

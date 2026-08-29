@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -48,6 +49,8 @@ class GrpcShutdownTest {
 			= "it.cavallium.rockserver.grpc.server.shutdown-graceful-timeout-ms";
 	private static final String SERVER_FORCED_TIMEOUT
 			= "it.cavallium.rockserver.grpc.server.shutdown-forced-timeout-ms";
+	private static final String SERVER_SCHEDULER_TIMEOUT
+			= "it.cavallium.rockserver.grpc.server.scheduler-shutdown-timeout-ms";
 	private static final String DB_PENDING_OPS_TIMEOUT
 			= "it.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms";
 	private static final List<String> TEST_PROPERTIES = List.of(
@@ -57,6 +60,7 @@ class GrpcShutdownTest {
 			CLIENT_BACKOFF_MULTIPLIER,
 			SERVER_GRACEFUL_TIMEOUT,
 			SERVER_FORCED_TIMEOUT,
+			SERVER_SCHEDULER_TIMEOUT,
 			DB_PENDING_OPS_TIMEOUT
 	);
 
@@ -141,6 +145,22 @@ class GrpcShutdownTest {
 		assertEquals(colId, client2.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("idle-col"));
 
 		assertTimeoutPreemptively(Duration.ofSeconds(10), this::closeGrpcServer);
+	}
+
+	@Test
+	void maximumConfiguredShutdownDurationsDoNotOverflowMonotonicDeadlines() throws Exception {
+		System.setProperty(SERVER_GRACEFUL_TIMEOUT, Long.toString(Long.MAX_VALUE));
+		System.setProperty(SERVER_FORCED_TIMEOUT, Long.toString(Long.MAX_VALUE));
+		System.setProperty(SERVER_SCHEDULER_TIMEOUT, Long.toString(Long.MAX_VALUE));
+		try {
+			assertTimeoutPreemptively(Duration.ofSeconds(10),
+					() -> assertDoesNotThrow(this::closeGrpcServer));
+		} finally {
+			System.setProperty(SERVER_GRACEFUL_TIMEOUT, "5000");
+			System.setProperty(SERVER_FORCED_TIMEOUT, "5000");
+			System.setProperty(SERVER_SCHEDULER_TIMEOUT, "5000");
+			closeGrpcServer();
+		}
 	}
 
 	@Test
