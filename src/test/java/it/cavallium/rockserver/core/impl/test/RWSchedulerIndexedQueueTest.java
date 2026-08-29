@@ -777,6 +777,11 @@ class RWSchedulerIndexedQueueTest {
 
 			releaseBlocker.countDown();
 			assertTrue(ran.await(5, SECONDS));
+			assertEventually(() -> {
+				var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				return snapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN) == 2L
+						&& snapshot.drainedAndConserved();
+			});
 			assertEquals(0, cancellationChecks.get(),
 					"dispatch must read scheduler-owned cancellation state, not invoke queued commands");
 			assertEquals(2L,
