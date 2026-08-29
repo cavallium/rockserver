@@ -1,10 +1,12 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import java.lang.reflect.Method;
 import java.nio.file.Path;
@@ -37,6 +39,22 @@ class TransactionDeadlineOverflowTest {
 			assertEquals(0, internal.getOpenTransactionsCount());
 			assertEquals(0L, internal.getPendingOpsCount(),
 					"explicit rollback must release the transaction lease exactly once");
+		}
+	}
+
+	@Test
+	void negativeTimeoutIsRejectedBeforeAllocatingANativeTransaction(@TempDir Path tempDir)
+			throws Exception {
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db-negative"),
+				"transaction-negative-timeout", null)) {
+			EmbeddedDB internal = connection.getInternalDB();
+			var api = connection.getSyncApi(RequestContext.batch());
+
+			var failure = assertThrows(RocksDBException.class, () -> api.openTransaction(-1L));
+			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, failure.getErrorUniqueId());
+			assertEquals(0, internal.getOpenTransactionsCount());
+			assertEquals(0L, internal.getPendingOpsCount(),
+					"invalid timeout admission must not allocate or retain a native resource");
 		}
 	}
 
