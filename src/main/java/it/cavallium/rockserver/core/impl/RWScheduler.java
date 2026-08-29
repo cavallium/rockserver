@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl;
 
+import com.google.common.annotations.VisibleForTesting;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import it.cavallium.rockserver.core.common.OperationFamily;
@@ -446,6 +447,17 @@ public final class RWScheduler {
 
 	public boolean isStoragePressure() {
 		return pressureController.isPressured();
+	}
+
+	@VisibleForTesting
+	public void setBeforeBatchPermitAcquisitionObserverForTesting(Pool pool, @Nullable Runnable observer) {
+		var executor = switch (Objects.requireNonNull(pool, "pool")) {
+			case READ -> readPool;
+			case WRITE -> writePool;
+			case CONTROL, PHYSICAL -> throw new IllegalArgumentException(
+					"BATCH permit observers require a data pool");
+		};
+		executor.setBeforeBatchPermitAcquisitionObserverForTesting(observer);
 	}
 
 	private void signalAllPools() {

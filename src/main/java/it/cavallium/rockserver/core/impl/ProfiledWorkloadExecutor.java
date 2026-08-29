@@ -121,6 +121,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private long completedTasks;
 	private long failedTasks;
 	private long sequence;
+	private @Nullable Runnable beforeBatchPermitAcquisitionObserver;
 
 	ProfiledWorkloadExecutor(int workerCount,
 	                         int analyticalLimit,
@@ -532,8 +533,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private @Nullable WorkloadTask dispatchUnsafe(long nowMillis,
 	                                              List<TerminalAction> terminalActions) {
+		boolean batchEligible = true;
 		while (queuedTotal > 0) {
-			var task = selectCandidateUnsafe();
+			var task = selectCandidateUnsafe(batchEligible);
 			if (task == null) {
 				return null;
 			}
@@ -553,10 +555,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			WorkloadPressureController.BatchPermit batchPermit = null;
 			if (task.hasProfile(WorkloadProfile.BATCH)) {
+				var observer = beforeBatchPermitAcquisitionObserver;
+				if (observer != null) {
+					observer.run();
+				}
 				batchPermit = pressureController.tryStartBatch(shutdown, resourcePool, System.nanoTime());
 				if (batchPermit == null) {
+					// Eligibility is only a snapshot: the other data pool can claim the
+					// final shared permit before this pool reaches the atomic start. Keep
+					// dispatch work-conserving by re-selecting queued foreground work, but
+					// do not retry this stale BATCH candidate while holding the pool lock.
+					batchEligible = false;
 					advanceGuaranteedCursor();
-					return null;
+					continue;
 				}
 			}
 			// A BATCH permit must exist before the one-shot dispatch claim. Cancellation
@@ -591,6 +602,15 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		refreshPreemptionUnsafe();
 		return null;
+	}
+
+	void setBeforeBatchPermitAcquisitionObserverForTesting(@Nullable Runnable observer) {
+		lock.lock();
+		try {
+			beforeBatchPermitAcquisitionObserver = observer;
+		} finally {
+			lock.unlock();
+		}
 	}
 
 	private boolean cancelSelectedUnsafe(WorkloadTask task,
@@ -922,17 +942,17 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return EXECUTING_POOL.get() == this;
 	}
 
-	private @Nullable WorkloadTask selectCandidateUnsafe() {
+	private @Nullable WorkloadTask selectCandidateUnsafe(boolean batchEligible) {
 		if (activeTotal >= workerCount) {
 			return null;
 		}
 		boolean reservedLatency = hasReservationDeficitUnsafe(WorkloadProfile.LATENCY);
-		boolean reservedGuaranteed = hasGuaranteedReservationDeficitUnsafe();
+		boolean reservedGuaranteed = hasGuaranteedReservationDeficitUnsafe(batchEligible);
 		if (reservedLatency || reservedGuaranteed) {
 			if (reservedLatency && (latencyBurst < maxLatencyBurst || !reservedGuaranteed)) {
 				return peekUnsafe(WorkloadProfile.LATENCY);
 			}
-			var guaranteed = selectGuaranteedCandidateUnsafe(true);
+			var guaranteed = selectGuaranteedCandidateUnsafe(true, batchEligible);
 			if (guaranteed != null) {
 				return guaranteed;
 			}
@@ -941,12 +961,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 		}
 
-		boolean latencyEligible = isEligibleUnsafe(WorkloadProfile.LATENCY);
-		boolean guaranteedEligible = hasGuaranteedEligibleUnsafe();
+		boolean latencyEligible = isEligibleUnsafe(WorkloadProfile.LATENCY, batchEligible);
+		boolean guaranteedEligible = hasGuaranteedEligibleUnsafe(batchEligible);
 		if (latencyEligible && (latencyBurst < maxLatencyBurst || !guaranteedEligible)) {
 			return peekUnsafe(WorkloadProfile.LATENCY);
 		}
-		var guaranteed = selectGuaranteedCandidateUnsafe(false);
+		var guaranteed = selectGuaranteedCandidateUnsafe(false, batchEligible);
 		if (guaranteed != null) {
 			return guaranteed;
 		}
@@ -954,32 +974,33 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			return peekUnsafe(WorkloadProfile.LATENCY);
 		}
 		for (var profile : ISOLATED) {
-			if (isEligibleUnsafe(profile)) {
+			if (isEligibleUnsafe(profile, batchEligible)) {
 				return peekUnsafe(profile);
 			}
 		}
 		return null;
 	}
 
-	private boolean hasGuaranteedReservationDeficitUnsafe() {
+	private boolean hasGuaranteedReservationDeficitUnsafe(boolean batchEligible) {
 		for (var profile : GUARANTEED) {
-			if (hasReservationDeficitUnsafe(profile) && isEligibleUnsafe(profile)) {
+			if (hasReservationDeficitUnsafe(profile) && isEligibleUnsafe(profile, batchEligible)) {
 				return true;
 			}
 		}
 		return false;
 	}
 
-	private boolean hasGuaranteedEligibleUnsafe() {
+	private boolean hasGuaranteedEligibleUnsafe(boolean batchEligible) {
 		for (var profile : GUARANTEED) {
-			if (isEligibleUnsafe(profile)) {
+			if (isEligibleUnsafe(profile, batchEligible)) {
 				return true;
 			}
 		}
 		return false;
 	}
 
-	private @Nullable WorkloadTask selectGuaranteedCandidateUnsafe(boolean reservationOnly) {
+	private @Nullable WorkloadTask selectGuaranteedCandidateUnsafe(boolean reservationOnly,
+	                                                               boolean batchEligible) {
 		int maxAttempts = GUARANTEED.length * (MAX_TASK_COST + 1);
 		for (int attempts = 0; attempts < maxAttempts; attempts++) {
 			var profile = GUARANTEED[guaranteedCursor];
@@ -988,7 +1009,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				advanceGuaranteedCursor();
 				continue;
 			}
-			if ((reservationOnly && !hasReservationDeficitUnsafe(profile)) || !isEligibleUnsafe(profile)) {
+			if ((reservationOnly && !hasReservationDeficitUnsafe(profile))
+					|| !isEligibleUnsafe(profile, batchEligible)) {
 				advanceGuaranteedCursor();
 				continue;
 			}
@@ -1057,8 +1079,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return reservations[profileIndex] > active[profileIndex] && queued[profileIndex] > 0;
 	}
 
-	private boolean isEligibleUnsafe(WorkloadProfile profile) {
+	private boolean isEligibleUnsafe(WorkloadProfile profile, boolean batchEligible) {
 		if (queuedUnsafe(profile) == 0 || activeTotal >= workerCount) {
+			return false;
+		}
+		if (profile == WorkloadProfile.BATCH && !batchEligible) {
 			return false;
 		}
 		if (profile == WorkloadProfile.ANALYTICAL && activeUnsafe(profile) >= analyticalLimit) {
