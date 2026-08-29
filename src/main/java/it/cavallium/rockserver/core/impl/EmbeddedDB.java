@@ -281,9 +281,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final int PINNED_GET_MIN_BYTES_OVERRIDE = Integer.getInteger(
 			"rockserver.fast-get.pinned-min-bytes", -1);
 
-	private static final long STORAGE_PRESSURE_PER_CF_PENDING_COMPACTION_BYTES = Math.max(1L, Long.getLong(
-			"it.cavallium.rockserver.workload.storage-pressure-pending-compaction-bytes",
-			64L * SizeUnit.GB));
+	private static final String STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_PROPERTY =
+			"it.cavallium.rockserver.workload.storage-pressure-pending-compaction-bytes";
+	private static final long STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_OVERRIDE =
+			storagePressurePendingCompactionBytesOverride();
+	private static final String ROCKSDB_IS_WRITE_STOPPED_PROPERTY =
+			RocksDBLongProperty.IS_WRITE_STOPPED.getName();
+	private static final String ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY =
+			RocksDBLongProperty.ACTUAL_DELAYED_WRITE_RATE.getName();
+	private static final String ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY =
+			RocksDBLongProperty.ESTIMATE_PENDING_COMPACTION_BYTES.getName();
+	private static final StoragePressureColumn[] EMPTY_STORAGE_PRESSURE_COLUMNS = new StoragePressureColumn[0];
 	private static final int EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL = 4_096;
 	private static final long EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
 	private static final int EXISTS_MULTI_MAX_VARIABLE_HASH_BYTES = Arrays.stream(ColumnHashType.values())
@@ -316,6 +324,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			MERGE_OPERATORS_COLUMN,
 			CDC_META_COLUMN
 	);
+
+	private record StoragePressureColumn(long id,
+			ColumnFamilyHandle handle,
+			@Nullable ColumnInstance registeredColumn,
+			long effectiveSoftPendingCompactionBytesLimit) {
+	}
+
+	private static long storagePressurePendingCompactionBytesOverride() {
+		Long configured = Long.getLong(STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_PROPERTY);
+		return configured == null ? 0L : Math.max(1L, configured);
+	}
+
 	private final Logger logger;
 	private final ActionLoggerConsumer actionLogger;
 	private final @Nullable Path path;
@@ -331,6 +351,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final ColumnFamilyHandle cdcMetaColumnDescriptorHandle;
 	private final MergeOperatorRegistry mergeOperatorRegistry;
 	private final NonBlockingHashMapLong<ColumnInstance> columns;
+	private volatile StoragePressureColumn[] storagePressureColumns = EMPTY_STORAGE_PRESSURE_COLUMNS;
 	private final Map<String, ColumnFamilyOptions> columnsConifg;
 	private final ConcurrentMap<String, Long> columnNamesIndex;
 	private final ConcurrentMap<String, ColumnFamilyHandle> unconfiguredColumns;
@@ -389,6 +410,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicBoolean nativeDeleteRangeFallbackLogged = new AtomicBoolean();
 	private final Counter cdcEventsEmitted;
 	private final Counter cdcBytesEmitted;
+	private final Counter storagePressureRefreshFailures;
+	private final StoragePressureSignal storagePressureSignal;
 	private final Counter rawScanPinAcquisitionFailures;
 	private final Timer rawScanPinAcquisitionTimer;
 	private final EnumMap<WriteElisionRequest, EnumMap<WriteElisionDecision, Counter>> writeElisionDecisionCounters;
@@ -431,6 +454,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.name = name;
 		this.logger = LoggerFactory.getLogger("db." + name);
 		this.columns = new NonBlockingHashMapLong<>();
+		this.storagePressureSignal = STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_OVERRIDE == 0L
+				? new StoragePressureSignal()
+				: new StoragePressureSignal(STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_OVERRIDE);
 		this.txs = new NonBlockingHashMapLong<>();
 		this.its = new NonBlockingHashMapLong<>();
 		this.columnNamesIndex = new ConcurrentHashMap<>();
@@ -479,6 +505,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.getAllColumnDefinitionsTimer = createActionTimer(GetAllColumnDefinitions.class);
 		this.cdcEventsEmitted = metrics.getRegistry().counter("rockserver.cdc.events", "db", name);
 		this.cdcBytesEmitted = metrics.getRegistry().counter("rockserver.cdc.bytes", "db", name);
+		this.storagePressureRefreshFailures = metrics.getRegistry().counter(
+				"rockserver.workload.storage.pressure.refresh.failures",
+				"database",
+				name);
 		this.rawScanPinAcquisitionFailures = metrics.getRegistry().counter(
 				"rockserver.raw.scan.pin.acquisition.failures",
 				"database",
@@ -643,6 +673,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				"db[" + name + "]",
 				metrics.getRegistry(),
 				name);
+		registerStoragePressureSignalMetrics(metrics.getRegistry());
 		// Pin capture performs filesystem work while RocksDB file deletion is
 		// disabled. Keep that serialized critical section on one owned thread so
 		// capture waiters never occupy the latency-sensitive read pool.
@@ -671,7 +702,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		leakScheduler.scheduleWithFixedDelay(this::cleanupExpiredTransactionsNow, 1, 1, TimeUnit.MINUTES);
 
 		leakScheduler.scheduleWithFixedDelay(this::cleanupExpiredIteratorsNow, 1, 1, TimeUnit.MINUTES);
-		leakScheduler.scheduleWithFixedDelay(this::refreshStoragePressure, 1, 1, TimeUnit.SECONDS);
 		long retainedSnapshotSweepMillis = Math.max(1L,
 				Math.min(100L, maxRetainedSnapshotAgeMs / 4L));
 		this.expiredRangeCleanupTask = leakScheduler.scheduleWithFixedDelay(
@@ -748,6 +778,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} else {
 			this.cdcMetaColumnDescriptorHandle = existingCdcMetaColumnDescriptorOptional.get().getValue();
 		}
+		registerSystemStoragePressureColumns();
 		loadCdcSubscriptionProgress();
 
 		// Metrics for merge-operator cache sizes (diagnostics to detect leaks in uploaded operators)
@@ -766,6 +797,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		loadExistingColumns(loadedDb.mergeOperators());
+		// Do not publish this object to the polling thread until column options,
+		// system handles, and registered-column pressure entries are complete.
+		leakScheduler.scheduleWithFixedDelay(this::refreshStoragePressure, 1, 1, TimeUnit.SECONDS);
 		if (Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
 			logger.info("Database configuration: {}", ConfigPrinter.stringify(config));
 		}
@@ -789,6 +823,56 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				.register(metrics.getRegistry());
 		meters.add(t);
 		return t;
+	}
+
+	private void registerStoragePressureSignalMetrics(MeterRegistry registry) {
+		registerStoragePressureReasonGauge(registry,
+				"write_stopped",
+				StoragePressureSignal.REASON_WRITE_STOPPED);
+		registerStoragePressureReasonGauge(registry,
+				"delayed_write",
+				StoragePressureSignal.REASON_DELAYED_WRITE);
+		registerStoragePressureReasonGauge(registry,
+				"pending_compaction",
+				StoragePressureSignal.REASON_PENDING_COMPACTION);
+		registerStoragePressureReasonGauge(registry,
+				"signal_failure",
+				StoragePressureSignal.REASON_SIGNAL_FAILURE);
+		meters.add(Gauge.builder("rockserver.workload.storage.pressure.actual.delayed.write.rate",
+					storagePressureSignal,
+					signal -> unsignedLongToDouble(signal.actualDelayedWriteRate()))
+				.description("RocksDB's current database-wide delayed-write rate")
+				.baseUnit("bytes")
+				.tag("database", name)
+				.register(registry));
+		meters.add(Gauge.builder("rockserver.workload.storage.pressure.pending.compaction.observed.max",
+					storagePressureSignal,
+					signal -> unsignedLongToDouble(signal.maximumPendingCompactionBytes()))
+				.description("Largest pending-compaction byte count observed before pressure short-circuited the poll")
+				.baseUnit("bytes")
+				.tag("database", name)
+				.register(registry));
+		meters.add(Gauge.builder("rockserver.workload.storage.pressure.pending.compaction.trigger.limit",
+					storagePressureSignal,
+					signal -> unsignedLongToDouble(signal.triggeringPendingCompactionLimit()))
+				.description("Effective per-column pending-compaction limit that triggered scheduler pressure")
+				.baseUnit("bytes")
+				.tag("database", name)
+				.register(registry));
+	}
+
+	private void registerStoragePressureReasonGauge(MeterRegistry registry, String reason, int reasonBit) {
+		meters.add(Gauge.builder("rockserver.workload.storage.pressure.reason",
+					storagePressureSignal,
+					signal -> signal.hasReason(reasonBit) ? 1.0d : 0.0d)
+				.description("Active RocksDB storage-pressure reasons")
+				.tag("database", name)
+				.tag("reason", reason)
+				.register(registry));
+	}
+
+	private static double unsignedLongToDouble(long value) {
+		return value >= 0L ? value : (double) (value & Long.MAX_VALUE) + 0x1.0p63;
 	}
 
 	private ColumnSchema decodeColumnSchema(byte[] value) {
@@ -913,12 +997,82 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return configuredMergeOperator;
 	}
 
+	private void registerSystemStoragePressureColumns() {
+		ColumnFamilyHandle defaultColumn = db.getStartupColumns()
+				.entrySet()
+				.stream()
+				.filter(entry -> Arrays.equals(entry.getKey().getName(), RocksDB.DEFAULT_COLUMN_FAMILY))
+				.map(Entry::getValue)
+				.findFirst()
+				.orElseThrow(() -> new IllegalStateException("RocksDB default column family was not opened"));
+		upsertStoragePressureColumn(storagePressureColumn("default", defaultColumn, null));
+		upsertStoragePressureColumn(storagePressureColumn(
+				new String(COLUMN_SCHEMAS_COLUMN, StandardCharsets.UTF_8),
+				columnSchemasColumnDescriptorHandle,
+				null));
+		upsertStoragePressureColumn(storagePressureColumn(
+				new String(MERGE_OPERATORS_COLUMN, StandardCharsets.UTF_8),
+				mergeOperatorsColumnDescriptorHandle,
+				null));
+		upsertStoragePressureColumn(storagePressureColumn(
+				new String(CDC_META_COLUMN, StandardCharsets.UTF_8),
+				cdcMetaColumnDescriptorHandle,
+				null));
+	}
+
+	private StoragePressureColumn storagePressureColumn(String name,
+			ColumnFamilyHandle handle,
+			@Nullable ColumnInstance registeredColumn) {
+		ColumnFamilyOptions options = Objects.requireNonNull(columnsConifg.get(name),
+				() -> "Column config not found while registering storage-pressure signal: " + name);
+		return new StoragePressureColumn(handle.getID(),
+				handle,
+				registeredColumn,
+				options.softPendingCompactionBytesLimit());
+	}
+
+	private void upsertStoragePressureColumn(StoragePressureColumn replacement) {
+		synchronized (columnEditLock) {
+			StoragePressureColumn[] current = storagePressureColumns;
+			for (int i = 0; i < current.length; i++) {
+				if (current[i].id() == replacement.id()) {
+					StoragePressureColumn[] updated = current.clone();
+					updated[i] = replacement;
+					storagePressureColumns = updated;
+					return;
+				}
+			}
+			StoragePressureColumn[] updated = Arrays.copyOf(current, current.length + 1);
+			updated[current.length] = replacement;
+			storagePressureColumns = updated;
+		}
+	}
+
+	private void removeStoragePressureColumn(long columnId) {
+		StoragePressureColumn[] current = storagePressureColumns;
+		for (int i = 0; i < current.length; i++) {
+			if (current[i].id() != columnId) {
+				continue;
+			}
+			if (current.length == 1) {
+				storagePressureColumns = EMPTY_STORAGE_PRESSURE_COLUMNS;
+			} else {
+				StoragePressureColumn[] updated = new StoragePressureColumn[current.length - 1];
+				System.arraycopy(current, 0, updated, 0, i);
+				System.arraycopy(current, i + 1, updated, i, current.length - i - 1);
+				storagePressureColumns = updated;
+			}
+			return;
+		}
+	}
+
 
 	private long internalRegisterColumn(@NotNull String name,
 			@NotNull ColumnFamilyHandle cfh,
 			@NotNull ColumnSchema schema,
 			@Nullable FFMAbstractMergeOperator mergeOp) {
 		long id = cfh.getID();
+		var pressureColumn = storagePressureColumn(name, cfh, null);
 
 		if (this.columns.containsKey(id)) {
 			throw new IllegalStateException("Column ID already registered: " + id);
@@ -931,6 +1085,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		var column = new ColumnInstance(cfh, schema, mergeOp);
 		this.columns.put(id, column);
+		upsertStoragePressureColumn(new StoragePressureColumn(
+				pressureColumn.id(),
+				pressureColumn.handle(),
+				column,
+				pressureColumn.effectiveSoftPendingCompactionBytesLimit()));
 
 		logger.info("Registered column: " + column);
 		return id;
@@ -1101,6 +1260,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		synchronized (columnEditLock) {
 			var col = this.columns.remove(id);
 			Objects.requireNonNull(col, () -> "Column does not exist: " + id);
+			removeStoragePressureColumn(id);
 
 			if (this.columnNamesIndex.remove(name) == null) {
 				logger.warn("Column name not found in index during unregister: {}", name);
@@ -2795,77 +2955,59 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private void refreshStoragePressure() {
-		try {
-			boolean writeStopped = getLongProperty(
-					RocksDBLongProperty.IS_WRITE_STOPPED.getName(),
-					RocksDBLongProperty.IS_WRITE_STOPPED.getAggregationMode()).signum() > 0;
-			var pressure = new StoragePressureAccumulator(writeStopped,
-					STORAGE_PRESSURE_PER_CF_PENDING_COMPACTION_BYTES);
-			forEachPerCfLongProperty(
-					RocksDBLongProperty.ESTIMATE_PENDING_COMPACTION_BYTES.getName(),
-					pressure);
-			scheduler.setStoragePressure(pressure.pressured());
-		} catch (Throwable error) {
-			logger.debug("Unable to refresh workload storage-pressure state", error);
+		if (!ops.isOpen()) {
+			return;
 		}
-	}
-
-	private void forEachPerCfLongProperty(String name, LongConsumer consumer) {
-		ops.beginOp();
+		boolean operationStarted = false;
 		try {
-			for (Entry<Long, ColumnInstance> entry : columns.entrySet()) {
-				ColumnInstance ci = entry.getValue();
-				if (!tryBeginColumnUse(ci)) {
-					continue;
-				}
-				try {
-					consumer.accept(db.get().getLongProperty(ci.cfh(), name));
-				} catch (org.rocksdb.RocksDBException e) {
-					if (e.getStatus().getCode() != Code.NotFound) {
-						throw new RuntimeException(e);
+			ops.beginOp();
+			operationStarted = true;
+			storagePressureSignal.reset(0L, 0L);
+			var rocksDb = db.get();
+			long writeStopped = rocksDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY);
+			long actualDelayedWriteRate = rocksDb.getLongProperty(ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY);
+			storagePressureSignal.reset(writeStopped, actualDelayedWriteRate);
+
+			// The DB-wide signals already prove pressure. Avoid one JNI call per
+			// column until RocksDB reports that writes are flowing normally again.
+			if (!storagePressureSignal.pressured()) {
+				for (StoragePressureColumn pressureColumn : storagePressureColumns) {
+					ColumnInstance registeredColumn = pressureColumn.registeredColumn();
+					if (registeredColumn != null && !tryBeginColumnUse(registeredColumn)) {
+						continue;
 					}
-				} finally {
-					ci.endUse();
+					try {
+						long pendingCompactionBytes = rocksDb.getLongProperty(
+								pressureColumn.handle(),
+								ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
+						storagePressureSignal.observeColumn(pressureColumn.id(),
+								pendingCompactionBytes,
+								pressureColumn.effectiveSoftPendingCompactionBytesLimit());
+					} finally {
+						if (registeredColumn != null) {
+							registeredColumn.endUse();
+						}
+					}
+					if (storagePressureSignal.pressured()) {
+						break;
+					}
 				}
 			}
-		} finally {
-			ops.endOp();
-		}
-	}
-
-	@VisibleForTesting
-	public static boolean storagePressureForTesting(boolean writeStopped,
-			long... perColumnFamilyPendingCompactionBytes) {
-		Objects.requireNonNull(perColumnFamilyPendingCompactionBytes,
-				"perColumnFamilyPendingCompactionBytes");
-		var pressure = new StoragePressureAccumulator(writeStopped,
-				STORAGE_PRESSURE_PER_CF_PENDING_COMPACTION_BYTES);
-		for (long pendingCompactionBytes : perColumnFamilyPendingCompactionBytes) {
-			pressure.accept(pendingCompactionBytes);
-		}
-		return pressure.pressured();
-	}
-
-	/** RocksDB's soft pending-compaction limit is enforced independently per column family. */
-	private static final class StoragePressureAccumulator implements LongConsumer {
-
-		private final long pendingCompactionThreshold;
-		private boolean pressured;
-
-		private StoragePressureAccumulator(boolean writeStopped, long pendingCompactionThreshold) {
-			this.pendingCompactionThreshold = pendingCompactionThreshold;
-			this.pressured = writeStopped;
-		}
-
-		@Override
-		public void accept(long pendingCompactionBytes) {
-			if (Long.compareUnsigned(pendingCompactionBytes, pendingCompactionThreshold) >= 0) {
-				pressured = true;
+			scheduler.setStoragePressure(storagePressureSignal.pressured());
+		} catch (VirtualMachineError fatal) {
+			throw fatal;
+		} catch (Throwable error) {
+			if (!operationStarted && !ops.isOpen()) {
+				return;
 			}
-		}
-
-		private boolean pressured() {
-			return pressured;
+			storagePressureSignal.markSignalFailure();
+			scheduler.setStoragePressure(true);
+			storagePressureRefreshFailures.increment();
+			logger.debug("Unable to refresh workload storage-pressure state", error);
+		} finally {
+			if (operationStarted) {
+				ops.endOp();
+			}
 		}
 	}
 
