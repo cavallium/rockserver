@@ -2,7 +2,9 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.grpc.ManagedChannelBuilder;
@@ -111,6 +113,54 @@ class RawScanResumeTest {
 					"one rejected SST admission must be retried inside the same pinned scan");
 			awaitNoRawScanPins(db, Duration.ofSeconds(10));
 			assertEquals(0L, db.getPendingOpsCount());
+		}
+	}
+
+	@Test
+	void admissionCleanupFailureIsTerminalAndCannotBeHiddenByRetry(@TempDir Path tempDir) throws Exception {
+		Path config = rawScanConfig(tempDir);
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-overload-cleanup", config)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB db = connection.getInternalDB();
+			long columnId = createPopulatedColumn(api, 1, KEYS_PER_SST);
+			var overloadOnce = new AdmissionOverloadExecutor(db.getScheduler().readExecutor(), 1);
+			var cleanupCalls = new AtomicInteger();
+			db.setRawScanCleanupObserverForTesting(() -> {
+				if (cleanupCalls.incrementAndGet() == 1) {
+					throw new IllegalStateException("synthetic cleanup failure after admission overload");
+				}
+			});
+			try {
+				StepVerifier.create(db.scanRawAsyncInternal(
+						columnId,
+						0,
+						1,
+						reactor.core.scheduler.Schedulers.immediate(),
+						overloadOnce))
+						.expectErrorSatisfies(error -> {
+							var failure = assertInstanceOf(RocksDBException.class, error);
+							assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
+									failure.getErrorUniqueId());
+							assertEquals(1, failure.getSuppressed().length,
+									"the overload remains the admission cause while cleanup is retained as suppressed context");
+							var cleanupFailure = assertInstanceOf(IllegalStateException.class, failure.getSuppressed()[0]);
+							assertEquals("synthetic cleanup failure after admission overload", cleanupFailure.getMessage());
+						})
+						.verify(Duration.ofSeconds(30));
+				assertEquals(1, overloadOnce.attempts(),
+						"a cleanup failure must stop before a second ScanState claims the retained pin");
+				assertEquals(1, cleanupCalls.get(), "admission cleanup must run exactly once");
+
+				awaitNoRawScanPins(db, Duration.ofSeconds(10));
+				assertEquals(0L, db.getPendingOpsCount(),
+						"scan-level and per-SST operation leases must both drain before error publication");
+				assertTimeoutPreemptively(Duration.ofSeconds(5), () -> api.deleteColumn(columnId),
+						"the per-SST and outer column-use leases must not survive terminal cleanup");
+				var deleted = assertThrows(RocksDBException.class, () -> api.getColumnId(COLUMN_NAME));
+				assertEquals(RocksDBException.RocksDBErrorType.COLUMN_NOT_FOUND, deleted.getErrorUniqueId());
+			} finally {
+				db.setRawScanCleanupObserverForTesting(null);
+			}
 		}
 	}
 

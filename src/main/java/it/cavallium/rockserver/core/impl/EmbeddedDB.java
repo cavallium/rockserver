@@ -298,7 +298,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			.backoff(Long.MAX_VALUE, Duration.ofMillis(10))
 			.maxBackoff(Duration.ofSeconds(1))
 			.jitter(0.5d)
-			.filter(EmbeddedDB::isRawScanAdmissionOverload);
+			.filter(EmbeddedDB::isRetryableRawScanAdmissionOverload);
 	private static final long RAW_SCAN_PIN_MAX_DURATION_NANOS = TimeUnit.MILLISECONDS.toNanos(Math.max(1L,
 			Long.getLong("it.cavallium.rockserver.raw-scan.pin-max-duration-ms", 120_000L)));
 	private static final String RAW_SCAN_PIN_DIRECTORY_NAME = ".rockserver-raw-scan-pins";
@@ -8254,6 +8254,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static boolean isRawScanAdmissionOverload(Throwable failure) {
 		return failure instanceof RocksDBException rocksDBException
 				&& rocksDBException.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED;
+	}
+
+	private static boolean isRetryableRawScanAdmissionOverload(Throwable failure) {
+		// ScanState appends every failed cleanup stage to the original admission
+		// failure before publishing it. Retrying is safe only when releasing the pin
+		// claim, column use, operation lease, and test/metric hooks all succeeded.
+		return isRawScanAdmissionOverload(failure) && failure.getSuppressed().length == 0;
 	}
 
 	private static boolean isSelectedRawScanFile(LiveFileMetaData file,
