@@ -2445,6 +2445,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			WorkloadProfile workloadProfile,
 			boolean captureSnapshot) {
 		Objects.requireNonNull(workloadProfile, "workloadProfile");
+		if (timeoutMs < 0L) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Transaction timeout must be non-negative");
+		}
 		var expirationTimestamp = saturatingAdd(System.currentTimeMillis(), timeoutMs);
 		TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
 		var writeOpts = new LeakSafeWriteOptions("open-transaction-internal-write-options");
