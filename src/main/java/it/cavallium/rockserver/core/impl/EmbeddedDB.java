@@ -11899,7 +11899,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var cancelled = new AtomicBoolean();
 			var state = new AtomicInteger(queued);
 			var task = Disposables.swap();
-			final class TrackedNativeTask implements Runnable, RWScheduler.EstimatedWork {
+			final class TrackedNativeTask implements Runnable,
+					RWScheduler.EstimatedWork,
+					RWScheduler.RejectionAwareTask {
 
 				@Override
 				public long estimatedBytes() {
@@ -11944,7 +11946,30 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						ops.endOp();
 					}
 				}
+
+				@Override
+				public void reject(RuntimeException failure) {
+					failBeforeStart(failure, "CDC tracked native task was rejected after subscriber cancellation");
+				}
+
+				private void failBeforeStart(Throwable failure, String lateMessage) {
+					if (!state.compareAndSet(queued, finished)) {
+						return;
+					}
+					ops.endOp();
+					boolean late;
+					synchronized (emissionLock) {
+						late = cancelled.get();
+						if (!late) {
+							sink.error(failure);
+						}
+					}
+					if (late) {
+						logger.debug(lateMessage, failure);
+					}
+				}
 			}
+			var trackedTask = new TrackedNativeTask();
 			try {
 				ops.beginOp();
 			} catch (Throwable error) {
@@ -11965,21 +11990,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			});
 			try {
-				task.replace(target.schedule(new TrackedNativeTask()));
+				task.replace(target.schedule(trackedTask));
 			} catch (Throwable error) {
-				if (state.compareAndSet(queued, finished)) {
-					ops.endOp();
-					boolean late;
-					synchronized (emissionLock) {
-						late = cancelled.get();
-						if (!late) {
-							sink.error(error);
-						}
-					}
-					if (late) {
-						logger.debug("CDC task scheduling failed after subscriber cancellation", error);
-					}
-				}
+				trackedTask.failBeforeStart(error,
+						"CDC task scheduling failed after subscriber cancellation");
 			}
 		});
 	}
