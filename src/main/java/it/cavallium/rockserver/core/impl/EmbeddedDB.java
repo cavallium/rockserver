@@ -136,6 +136,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
+import reactor.util.retry.Retry;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import org.rocksdb.TransactionLogIterator;
@@ -290,6 +291,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final long WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
 	private static final int RAW_SCAN_MAX_ENTRIES_PER_CHUNK = 65_536;
 	private static final long RAW_SCAN_MAX_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
+	// A logical raw scan spans many independently scheduled SST readers. Once its
+	// immutable snapshot is pinned, transient queue pressure between files must pause
+	// that scan rather than tear down and recapture the multi-terabyte snapshot.
+	private static final Retry RAW_SCAN_ADMISSION_RETRY = Retry
+			.backoff(Long.MAX_VALUE, Duration.ofMillis(10))
+			.maxBackoff(Duration.ofSeconds(1))
+			.jitter(0.5d)
+			.filter(EmbeddedDB::isRawScanAdmissionOverload);
 	private static final long RAW_SCAN_PIN_MAX_DURATION_NANOS = TimeUnit.MILLISECONDS.toNanos(Math.max(1L,
 			Long.getLong("it.cavallium.rockserver.raw-scan.pin-max-duration-ms", 120_000L)));
 	private static final String RAW_SCAN_PIN_DIRECTORY_NAME = ".rockserver-raw-scan-pins";
@@ -8242,6 +8251,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return Path.of(filePath).toAbsolutePath().normalize();
 	}
 
+	private static boolean isRawScanAdmissionOverload(Throwable failure) {
+		return failure instanceof RocksDBException rocksDBException
+				&& rocksDBException.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED;
+	}
+
 	private static boolean isSelectedRawScanFile(LiveFileMetaData file,
 			String cfName,
 			int shardIndex,
@@ -8376,6 +8390,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final long size;
 		private final @Nullable RawSstToken token;
 		private boolean claimed;
+		private boolean closeRequested;
 		private boolean closed;
 
 		private PinnedSstFile(LiveFileMetaData metadata, Path path, @Nullable RawSstToken token) {
@@ -8402,7 +8417,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		private synchronized Claim claim() {
-			if (closed || claimed) {
+			if (closed || closeRequested || claimed) {
 				throw new IllegalStateException("Raw-scan SST pin cannot be claimed: " + path);
 			}
 			claimed = true;
@@ -8413,7 +8428,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		public synchronized void close() {
 			// The scan-set owns unclaimed files. Once a ScanState claims a pin, only
 			// that state may unlink it after its iterator, reader, and options close.
-			if (closed || claimed) {
+			if (closed) {
+				return;
+			}
+			if (claimed) {
+				closeRequested = true;
 				return;
 			}
 			closeClaimedOrUnclaimed();
@@ -8429,6 +8448,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			closeClaimedOrUnclaimed();
 		}
 
+		private synchronized void releaseClaimForAdmissionRetry() {
+			if (closed) {
+				return;
+			}
+			if (!claimed) {
+				throw new IllegalStateException("Raw-scan SST pin retry released without a claim: " + path);
+			}
+			claimed = false;
+			// Cancellation may close the owning scan set while scheduler rejection is
+			// unwinding. Honor that deferred close instead of leaving an unowned pin.
+			if (closeRequested) {
+				closeClaimedOrUnclaimed();
+			}
+		}
+
 		private void closeClaimedOrUnclaimed() {
 			try {
 				Files.deleteIfExists(path);
@@ -8436,6 +8470,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				throw new UncheckedIOException("Failed to release raw-scan SST pin " + path, failure);
 			}
 			closed = true;
+			claimed = false;
 			activeRawScanPinnedFiles.remove(path);
 			activeRawScanPinnedBytes.addAndGet(-size);
 		}
@@ -8453,6 +8488,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			public void close() {
 				if (closed.compareAndSet(false, true)) {
 					file.releaseClaim();
+				}
+			}
+
+			private void releaseForAdmissionRetry() {
+				if (closed.compareAndSet(false, true)) {
+					file.releaseClaimForAdmissionRetry();
 				}
 			}
 		}
@@ -8610,6 +8651,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private volatile long demand;
 		private volatile boolean terminated;
 		private volatile boolean cancellationRequested;
+		private volatile boolean dispatched;
 		private volatile @Nullable RWScheduler.CooperativeHandle handle;
 		private @Nullable SstFileReader reader;
 		private @Nullable SstFileReaderIterator it;
@@ -8735,6 +8777,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		@Override
 		public synchronized RWScheduler.CooperativeResult runCooperatively(
 				RWScheduler.CooperativeContext context) {
+			dispatched = true;
 			// RocksJava native iterators have no protection against a concurrent close.
 			// Serialize each JNI quantum with reject/terminal cleanup because gRPC
 			// cancellation arrives on a transport thread while this worker may still be
@@ -8848,7 +8891,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		private void prepareSuccessfulCompletion(RWScheduler.CooperativeContext context) {
-			var failure = cleanupNativeResources(null);
+			var failure = cleanupNativeResources(null, false);
 			if (failure != null) {
 				if (failure instanceof VirtualMachineError fatal) {
 					throw fatal;
@@ -8928,7 +8971,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		@Override
 		public void reject(RuntimeException failure) {
-			finish(failure, !(failure instanceof CancellationException));
+			boolean admissionRetry = !dispatched && isRawScanAdmissionOverload(failure);
+			finish(failure, !(failure instanceof CancellationException), admissionRetry);
 		}
 
 		@Override
@@ -8948,12 +8992,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return terminated;
 		}
 
-		private synchronized void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
+		private synchronized void finish(@Nullable Throwable originalFailure,
+				boolean signalTerminal,
+				boolean admissionRetry) {
 			if (!TERMINATED.compareAndSet(this, false, true)) {
 				return;
 			}
 			pendingSuccessfulEmission = null;
-			var failure = cleanupNativeResources(originalFailure);
+			var failure = cleanupNativeResources(originalFailure, admissionRetry);
 			if (!signalTerminal) {
 				return;
 			}
@@ -8964,7 +9010,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 		}
 
-		private @Nullable Throwable cleanupNativeResources(@Nullable Throwable originalFailure) {
+		private @Nullable Throwable cleanupNativeResources(@Nullable Throwable originalFailure,
+				boolean admissionRetry) {
 			if (resourcesCleaned) {
 				return resourceCleanupFailure == null
 						? originalFailure
@@ -8973,7 +9020,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			resourcesCleaned = true;
 			Throwable cleanupFailure = null;
 			try {
-				closeNativeResources();
+				closeNativeResources(admissionRetry);
 			} catch (Throwable closeFailure) {
 				cleanupFailure = appendFailure(cleanupFailure, closeFailure);
 			}
@@ -8983,7 +9030,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					: appendFailure(originalFailure, cleanupFailure);
 		}
 
-		private void closeNativeResources() {
+		private void closeNativeResources(boolean admissionRetry) {
 			Throwable failure = null;
 			var iterator = it;
 			it = null;
@@ -9022,7 +9069,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 			try {
-				fileClaim.close();
+				if (admissionRetry) {
+					fileClaim.releaseForAdmissionRetry();
+				} else {
+					fileClaim.close();
+				}
 			} catch (Throwable error) {
 				failure = appendFailure(failure, error);
 			}
@@ -9136,21 +9187,24 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								}
 
 								Function<PinnedSstFile, Publisher<T>> mapper = file ->
-									Flux.<T>create(rawSink -> {
-										var state = new ScanState<>(col, cfName, file, rawSink,
-												maximumQuantumNanos, batchMapper, terminalMapper);
-										rawSink.onRequest(state);
-										rawSink.onCancel(state);
-										rawSink.onDispose(state);
-										try {
-											state.attach(workloadExecutor.executeCooperatively(
-													state,
-													RAW_SCAN_MAX_BYTES_PER_CHUNK));
-										} catch (RuntimeException admissionFailure) {
-											state.reject(admissionFailure);
-										}
-									}, FluxSink.OverflowStrategy.ERROR)
-											.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
+										Flux.defer(() -> Flux.<T>create(rawSink -> {
+											var state = new ScanState<>(col, cfName, file, rawSink,
+													maximumQuantumNanos, batchMapper, terminalMapper);
+											rawSink.onRequest(state);
+											rawSink.onCancel(state);
+											rawSink.onDispose(state);
+											try {
+												state.attach(workloadExecutor.executeCooperatively(
+														state,
+														RAW_SCAN_MAX_BYTES_PER_CHUNK));
+											} catch (RuntimeException admissionFailure) {
+												state.reject(admissionFailure);
+											}
+										}, FluxSink.OverflowStrategy.ERROR))
+												// Retry only pre-dispatch queue rejection. ScanState keeps the
+												// same hard link available, while native/data failures remain terminal.
+												.retryWhen(RAW_SCAN_ADMISSION_RETRY)
+												.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
 
 								var ssts = Flux.fromIterable(pinnedSsts.files());
 								if (shardCount == 1) {
