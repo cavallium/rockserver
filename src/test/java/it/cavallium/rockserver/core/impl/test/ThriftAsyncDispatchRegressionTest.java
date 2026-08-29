@@ -42,6 +42,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.api.parallel.Resources;
 import reactor.core.publisher.Flux;
 
 @Timeout(30)
@@ -164,6 +166,48 @@ class ThriftAsyncDispatchRegressionTest {
 	@Test
 	void interruptedRunningOpenIteratorClosesTheHandleAfterNativeCompletion() throws Exception {
 		assertInterruptedOpenIteratorCleanup(true);
+	}
+
+	@Test
+	@ResourceLock(Resources.SYSTEM_PROPERTIES)
+	void runningAsyncThriftResourceCreationCannotLoseItsEventualHandleToCancellation() throws Exception {
+		String property = "rockserver.thrift.client.connections";
+		String previous = System.getProperty(property);
+		System.setProperty(property, "1");
+		var connection = new TrackingConnection();
+		int port = freePort();
+		try (var server = new ThriftServer(connection, "127.0.0.1", port)) {
+			server.start();
+			try (var client = new ThriftConnection("thrift-running-cancel", "127.0.0.1", port)) {
+				var api = client.getAsyncApi(
+						it.cavallium.rockserver.core.common.RequestContext.batch());
+				var opened = api.openIteratorAsync(0, 1, key(0), null, false, 10_000);
+				boolean cancelled;
+				try {
+					assertTrue(connection.openIteratorRequested.await(5, SECONDS));
+					cancelled = opened.cancel(true);
+					var queued = api.openTransactionAsync(10_000);
+					assertTrue(queued.cancel(true),
+							"a queued transport call must be removable before it acquires a socket");
+				} finally {
+					connection.openIteratorFuture.complete(77L);
+				}
+				assertFalse(cancelled, "a running transport call must retain its eventual resource handle");
+				assertEquals(77L, opened.get(5, SECONDS));
+				assertTrue(connection.syncRequests.isEmpty(),
+						"the cancelled queued transaction creation must never reach the server");
+				api.closeIteratorAsync(77L).get(5, SECONDS);
+				assertEquals(List.of(77L), connection.closedIteratorIds);
+			}
+		} finally {
+			connection.openIteratorFuture.completeExceptionally(
+					new IllegalStateException("test cleanup"));
+			if (previous == null) {
+				System.clearProperty(property);
+			} else {
+				System.setProperty(property, previous);
+			}
+		}
 	}
 
 	@Test

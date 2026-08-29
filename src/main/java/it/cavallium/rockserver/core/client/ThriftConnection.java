@@ -65,9 +65,11 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.thrift.TApplicationException;
@@ -148,7 +150,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	private final List<ClientSlot> allClientSlots;
 	private final ArrayBlockingQueue<ClientSlot> availableClientSlots;
 	private final RocksDB.Iface client;
-	private final ExecutorService executor;
+	private final ThreadPoolExecutor executor;
 	private final Scheduler executorScheduler;
 	private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -200,7 +202,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 				RocksDB.Iface.class.getClassLoader(),
 				new Class<?>[] {RocksDB.Iface.class},
 				this::invokeClient);
-		this.executor = Executors.newFixedThreadPool(poolSize,
+		this.executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(poolSize,
 				Thread.ofPlatform().name("rockserver-thrift-client-", 0).factory());
 		this.executorScheduler = Schedulers.fromExecutorService(executor);
 	}
@@ -218,8 +220,17 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		for (var slot : allClientSlots) {
 			slot.close();
 		}
+		for (Object queued : executor.getQueue().toArray()) {
+			if (queued instanceof ThriftCallFuture<?> future && executor.remove(future)) {
+				future.reject(new RejectedExecutionException("Thrift connection is closing"));
+			}
+		}
 		executorScheduler.dispose();
-		executor.shutdownNow();
+		for (Runnable queued : executor.shutdownNow()) {
+			if (queued instanceof ThriftCallFuture<?> future) {
+				future.reject(new RejectedExecutionException("Thrift connection is closing"));
+			}
+		}
 		super.close();
 	}
 
@@ -1280,7 +1291,13 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	private <T> CompletableFuture<T> supplyAsyncContextual(java.util.function.Supplier<T> operation,
 			java.util.concurrent.Executor ignoredExecutor) {
 		var context = currentRequestContext();
-		return CompletableFuture.supplyAsync(() -> withRequestContext(context, operation), executor);
+		var future = new ThriftCallFuture<>(context, operation);
+		try {
+			executor.execute(future);
+		} catch (Throwable rejection) {
+			future.reject(rejection);
+		}
+		return future;
 	}
 
 	private CompletableFuture<Void> runAsyncContextual(Runnable operation,
@@ -1289,6 +1306,58 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			operation.run();
 			return null;
 		}, ignoredExecutor);
+	}
+
+	/**
+	 * A queued Thrift call is removable, while a running blocking transport call keeps
+	 * its eventual result observable. In particular, resource-producing calls cannot
+	 * report cancellation and silently discard an iterator, transaction, or update id.
+	 */
+	private final class ThriftCallFuture<T> extends CompletableFuture<T> implements Runnable {
+
+		private static final int QUEUED = 0;
+		private static final int RUNNING = 1;
+		private static final int FINISHED = 2;
+		private static final int CANCELLED = 3;
+
+		private final RequestContext context;
+		private final java.util.function.Supplier<T> operation;
+		private final AtomicInteger state = new AtomicInteger(QUEUED);
+
+		private ThriftCallFuture(RequestContext context, java.util.function.Supplier<T> operation) {
+			this.context = context;
+			this.operation = operation;
+		}
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			if (!state.compareAndSet(QUEUED, CANCELLED)) {
+				return false;
+			}
+			boolean cancelled = super.cancel(mayInterruptIfRunning);
+			executor.remove(this);
+			return cancelled;
+		}
+
+		@Override
+		public void run() {
+			if (!state.compareAndSet(QUEUED, RUNNING)) {
+				return;
+			}
+			try {
+				complete(withRequestContext(context, operation));
+			} catch (Throwable failure) {
+				completeExceptionally(failure);
+			} finally {
+				state.set(FINISHED);
+			}
+		}
+
+		private void reject(Throwable failure) {
+			if (state.compareAndSet(QUEUED, FINISHED)) {
+				completeExceptionally(failure);
+			}
+		}
 	}
 
 	private List<ByteBuffer> mapKeys(Keys keys) {
