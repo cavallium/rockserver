@@ -9,8 +9,11 @@ import it.cavallium.rockserver.core.common.api.RocksDB;
 import it.cavallium.rockserver.core.common.api.proto.PutBatchInitialRequest;
 import it.cavallium.rockserver.core.common.api.proto.PutRequest;
 import java.nio.ByteBuffer;
+import java.lang.reflect.InvocationTargetException;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.server.ThriftServer;
 
 class WorkloadWireContractTest {
 
@@ -103,5 +106,36 @@ class WorkloadWireContractTest {
 				it.cavallium.rockserver.core.common.api.RangeBudget.class,
 				it.cavallium.rockserver.core.common.api.RequestContext.class));
 		assertNotNull(RocksDB.Iface.class.getMethod("flush"));
+	}
+
+	@Test
+	void thriftServerRejectsEveryProtectedProfileSpoofAtTheWireBoundary() throws Exception {
+		var mapper = ThriftServer.class.getDeclaredMethod("mapRequestContext",
+				it.cavallium.rockserver.core.common.api.RequestContext.class);
+		mapper.setAccessible(true);
+		for (var profile : List.of(
+				it.cavallium.rockserver.core.common.api.WorkloadProfile.CONTROL,
+				it.cavallium.rockserver.core.common.api.WorkloadProfile.CDC,
+				it.cavallium.rockserver.core.common.api.WorkloadProfile.PHYSICAL_MAINTENANCE)) {
+			var wire = new it.cavallium.rockserver.core.common.api.RequestContext(
+					profile,
+					it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE);
+			var invocation = assertThrows(InvocationTargetException.class,
+					() -> mapper.invoke(null, wire));
+			var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(
+					RocksDBException.class, invocation.getCause());
+			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					failure.getErrorUniqueId());
+		}
+
+		var expired = new it.cavallium.rockserver.core.common.api.RequestContext(
+				it.cavallium.rockserver.core.common.api.WorkloadProfile.BATCH,
+				1L);
+		var invocation = assertThrows(InvocationTargetException.class,
+				() -> mapper.invoke(null, expired));
+		var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(
+				RocksDBException.class, invocation.getCause());
+		assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+				failure.getErrorUniqueId());
 	}
 }

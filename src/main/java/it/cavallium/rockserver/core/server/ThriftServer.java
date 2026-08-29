@@ -216,7 +216,14 @@ public class ThriftServer extends Server {
 					"Workload profile " + profile + " is owned by Rockserver");
 		}
 		try {
-			return new RequestContext(profile, wireContext.deadlineEpochMillis);
+			var context = new RequestContext(profile, wireContext.deadlineEpochMillis);
+			if (context.deadlineEpochMillis() != RequestContext.NO_DEADLINE
+					&& context.deadlineEpochMillis() <= System.currentTimeMillis()) {
+				throw it.cavallium.rockserver.core.common.RocksDBException.of(
+						it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						"Request deadline already expired");
+			}
+			return context;
 		} catch (IllegalArgumentException invalid) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(
 					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
