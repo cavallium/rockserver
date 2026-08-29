@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -43,22 +44,10 @@ import reactor.core.Disposable;
  */
 public final class SchedulerHighContentionBenchmark {
 
-	private static final Lane[] LANES = {
-			new Lane(WorkloadProfile.CONTROL, OperationFamily.CONTROL),
-			new Lane(WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP),
-			new Lane(WorkloadProfile.LATENCY, OperationFamily.MUTATION),
-			new Lane(WorkloadProfile.ANALYTICAL, OperationFamily.FULL_SCAN_AGGREGATE),
-			new Lane(WorkloadProfile.INGEST, OperationFamily.RANGE_PAGE),
-			new Lane(WorkloadProfile.INGEST, OperationFamily.MUTATION),
-			new Lane(WorkloadProfile.CDC, OperationFamily.WAL_PAGE),
-			new Lane(WorkloadProfile.CDC, OperationFamily.FLUSH),
-			new Lane(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE),
-			new Lane(WorkloadProfile.BATCH, OperationFamily.MUTATION),
-			new Lane(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.FLUSH),
-			new Lane(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION)
-	};
+	private static final Lane[] LANES = allowedLanes();
 	private static final RWScheduler.Pool[] POOLS = RWScheduler.Pool.values();
 	private static final WorkloadProfile[] PROFILES = WorkloadProfile.values();
+	private static final OperationFamily[] FAMILIES = OperationFamily.values();
 	private static final RWScheduler.TerminalOutcome[] OUTCOMES = RWScheduler.TerminalOutcome.values();
 	private static final int TASK_NEW = 0;
 	private static final int TASK_RUNNING = 1;
@@ -122,6 +111,7 @@ public final class SchedulerHighContentionBenchmark {
 
 	public static Result run(Config config) throws Exception {
 		Objects.requireNonNull(config, "config").validate();
+		BenchmarkProcessTelemetry.enableAllocationMeasurement();
 		var scheduler = RWScheduler.forTesting(config.readWorkers(),
 				config.writeWorkers(),
 				config.analyticalLimit(),
@@ -129,6 +119,9 @@ public final class SchedulerHighContentionBenchmark {
 				config.batchQueueCapacity(),
 				"scheduler-high-contention");
 		var state = new RunState(config, scheduler);
+		var peaks = new BenchmarkProcessTelemetry.PeakSampler();
+		peaks.reset();
+		state.peaks = peaks;
 		ExecutorService producers = Executors.newFixedThreadPool(config.submitters(),
 				Thread.ofPlatform().name("scheduler-contention-submitter-", 0).factory());
 		Thread monitor = Thread.ofPlatform()
@@ -140,9 +133,9 @@ public final class SchedulerHighContentionBenchmark {
 		var producerFailure = new ConcurrentLinkedQueue<Throwable>();
 		var start = new CountDownLatch(1);
 		var producersDone = new CountDownLatch(config.submitters());
-		try {
+		try (peaks) {
 			if (config.alternateStoragePressure()) {
-				scheduler.setStoragePressure(true);
+				state.setStoragePressure(true);
 			}
 			for (int producer = 0; producer < config.submitters(); producer++) {
 				producers.execute(() -> {
@@ -162,6 +155,7 @@ public final class SchedulerHighContentionBenchmark {
 					}
 				});
 			}
+			var processBefore = BenchmarkProcessTelemetry.processSnapshot();
 			long startedNanos = System.nanoTime();
 			state.startedNanos = startedNanos;
 			start.countDown();
@@ -186,7 +180,8 @@ public final class SchedulerHighContentionBenchmark {
 			if (monitor.isAlive() || resumer.isAlive()) {
 				throw new IllegalStateException("benchmark coordination threads did not stop");
 			}
-			var result = state.finish();
+			var process = BenchmarkProcessTelemetry.processSnapshot().minus(processBefore);
+			var result = state.finish(process, peaks.peaks());
 			result.assertCorrect();
 			return result;
 		} finally {
@@ -252,7 +247,16 @@ public final class SchedulerHighContentionBenchmark {
 			long queueP95Nanos,
 			long queueP99Nanos,
 			long executionP99Nanos,
-			long endToEndP99Nanos) {
+			long endToEndP99Nanos,
+			long maximumProgressGapNanos) {
+	}
+
+	public record FamilyResult(long attempts,
+			long runs,
+			long queueP99Nanos,
+			long executionP99Nanos,
+			long endToEndP99Nanos,
+			long maximumProgressGapNanos) {
 	}
 
 	public record PoolResult(int workers,
@@ -276,10 +280,14 @@ public final class SchedulerHighContentionBenchmark {
 			long injectedFailures,
 			long yieldTransitions,
 			long parkTransitions,
+			long pressureTransitions,
 			long duplicateExecutions,
 			Map<RWScheduler.TerminalOutcome, Long> outcomes,
 			Map<WorkloadProfile, ProfileResult> profiles,
-			Map<RWScheduler.Pool, PoolResult> pools) {
+			Map<OperationFamily, FamilyResult> families,
+			Map<RWScheduler.Pool, PoolResult> pools,
+			BenchmarkProcessTelemetry.ProcessDelta process,
+			BenchmarkProcessTelemetry.Peaks peaks) {
 
 		public double attemptsPerSecond() {
 			return attempts * 1_000_000_000.0d / elapsedNanos;
@@ -287,6 +295,14 @@ public final class SchedulerHighContentionBenchmark {
 
 		public double usefulRunsPerSecond() {
 			return runs * 1_000_000_000.0d / elapsedNanos;
+		}
+
+		public double cpuNanosPerAttempt() {
+			return process.cpuNanos() / (double) attempts;
+		}
+
+		public double allocatedBytesPerAttempt() {
+			return process.allocatedBytes() / (double) attempts;
 		}
 
 		public void assertCorrect() {
@@ -337,6 +353,12 @@ public final class SchedulerHighContentionBenchmark {
 					throw new IllegalStateException("profile made no useful progress: " + profile + " " + result);
 				}
 			}
+			for (var family : FAMILIES) {
+				var result = Objects.requireNonNull(families.get(family), "missing family " + family);
+				if (result.attempts() == 0L || result.runs() == 0L) {
+					throw new IllegalStateException("operation family made no useful progress: " + family + " " + result);
+				}
+			}
 			if (yieldTransitions == 0L || parkTransitions == 0L) {
 				throw new IllegalStateException("cooperative transitions were not exercised");
 			}
@@ -359,7 +381,7 @@ public final class SchedulerHighContentionBenchmark {
 
 		public String toReport() {
 			var report = new StringBuilder();
-			report.append("schema=rockserver-scheduler-high-contention-v1\n");
+			report.append("schema=rockserver-scheduler-high-contention-v2\n");
 			report.append("operations=").append(attempts).append('\n');
 			report.append("seed=").append(config.seed()).append('\n');
 			report.append("submitters=").append(config.submitters()).append('\n');
@@ -372,7 +394,21 @@ public final class SchedulerHighContentionBenchmark {
 			report.append("runs=").append(runs).append('\n');
 			report.append("yield_transitions=").append(yieldTransitions).append('\n');
 			report.append("park_transitions=").append(parkTransitions).append('\n');
+			report.append("pressure_transitions=").append(pressureTransitions).append('\n');
 			report.append("injected_failures=").append(injectedFailures).append('\n');
+			report.append("process.cpu_nanos=").append(process.cpuNanos()).append('\n');
+			report.append("process.cpu_nanos_per_attempt=")
+					.append(String.format(Locale.ROOT, "%.3f", cpuNanosPerAttempt())).append('\n');
+			report.append("process.allocated_bytes=").append(process.allocatedBytes()).append('\n');
+			report.append("process.allocated_bytes_per_attempt=")
+					.append(String.format(Locale.ROOT, "%.3f", allocatedBytesPerAttempt())).append('\n');
+			report.append("process.gc_collections=").append(process.gcCollections()).append('\n');
+			report.append("process.gc_millis=").append(process.gcMillis()).append('\n');
+			report.append("process.peak_live_heap_bytes=").append(peaks.liveHeapBytes()).append('\n');
+			report.append("process.peak_direct_memory_bytes=").append(peaks.directMemoryBytes()).append('\n');
+			report.append("process.peak_resident_set_bytes=").append(peaks.residentSetBytes()).append('\n');
+			report.append("process.peak_threads=").append(peaks.threadCount()).append('\n');
+			report.append("process.peak_native_handles=").append(peaks.nativeHandles()).append('\n');
 			for (var outcome : OUTCOMES) {
 				report.append("outcome.").append(outcome.name().toLowerCase(Locale.ROOT)).append('=')
 						.append(outcomes.get(outcome)).append('\n');
@@ -385,6 +421,19 @@ public final class SchedulerHighContentionBenchmark {
 				report.append(prefix).append("queue_p99_nanos=").append(result.queueP99Nanos()).append('\n');
 				report.append(prefix).append("execution_p99_nanos=").append(result.executionP99Nanos()).append('\n');
 				report.append(prefix).append("end_to_end_p99_nanos=").append(result.endToEndP99Nanos()).append('\n');
+				report.append(prefix).append("maximum_progress_gap_nanos=")
+						.append(result.maximumProgressGapNanos()).append('\n');
+			}
+			for (var family : FAMILIES) {
+				var result = families.get(family);
+				String prefix = "family." + family.name().toLowerCase(Locale.ROOT) + ".";
+				report.append(prefix).append("attempts=").append(result.attempts()).append('\n');
+				report.append(prefix).append("runs=").append(result.runs()).append('\n');
+				report.append(prefix).append("queue_p99_nanos=").append(result.queueP99Nanos()).append('\n');
+				report.append(prefix).append("execution_p99_nanos=").append(result.executionP99Nanos()).append('\n');
+				report.append(prefix).append("end_to_end_p99_nanos=").append(result.endToEndP99Nanos()).append('\n');
+				report.append(prefix).append("maximum_progress_gap_nanos=")
+						.append(result.maximumProgressGapNanos()).append('\n');
 			}
 			for (var pool : POOLS) {
 				var result = pools.get(pool);
@@ -420,20 +469,26 @@ public final class SchedulerHighContentionBenchmark {
 		private final LongAdder[] attempts = adders(PROFILES.length);
 		private final LongAdder[] runs = adders(PROFILES.length);
 		private final LongAdder[] rejectedCallbacks = adders(PROFILES.length);
+		private final LongAdder[] familyAttempts = adders(FAMILIES.length);
+		private final LongAdder[] familyRuns = adders(FAMILIES.length);
 		private final LongAdder expectedDeadlines = new LongAdder();
 		private final LongAdder cancellationRequests = new LongAdder();
 		private final LongAdder cancelledJobsThatRan = new LongAdder();
 		private final LongAdder injectedFailures = new LongAdder();
 		private final LongAdder yieldTransitions = new LongAdder();
 		private final LongAdder parkTransitions = new LongAdder();
+		private final LongAdder pressureTransitions = new LongAdder();
 		private final LongAdder duplicateExecutions = new LongAdder();
 		private final long[] queueLatencyNanos;
 		private final long[] executionNanos;
 		private final long[] endToEndNanos;
+		private final long[] completionNanos;
 		private final boolean[] successfulRuns;
 		private final byte[] profileOrdinals;
+		private final byte[] familyOrdinals;
 		private final PoolObservation[] poolObservations = new PoolObservation[POOLS.length];
 		private final AtomicLong monitorSamples = new AtomicLong();
+		private BenchmarkProcessTelemetry.PeakSampler peaks;
 		private volatile long startedNanos;
 		private volatile long elapsedNanos;
 
@@ -443,8 +498,10 @@ public final class SchedulerHighContentionBenchmark {
 			this.queueLatencyNanos = new long[config.operations()];
 			this.executionNanos = new long[config.operations()];
 			this.endToEndNanos = new long[config.operations()];
+			this.completionNanos = new long[config.operations()];
 			this.successfulRuns = new boolean[config.operations()];
 			this.profileOrdinals = new byte[config.operations()];
+			this.familyOrdinals = new byte[config.operations()];
 			for (var pool : POOLS) {
 				poolObservations[pool.ordinal()] = new PoolObservation();
 			}
@@ -454,7 +511,9 @@ public final class SchedulerHighContentionBenchmark {
 			long hash = mix64(config.seed() + index * 0x9E3779B97F4A7C15L);
 			Lane lane = LANES[Math.floorMod((int) hash, LANES.length)];
 			profileOrdinals[index] = (byte) lane.profile().ordinal();
+			familyOrdinals[index] = (byte) lane.family().ordinal();
 			attempts[lane.profile().ordinal()].increment();
+			familyAttempts[lane.family().ordinal()].increment();
 			boolean expired = lane.profile() == WorkloadProfile.LATENCY
 					&& percent(hash) < config.expiredDeadlinePercent();
 			boolean fail = !expired && percent(hash >>> 11) < config.failurePercent();
@@ -512,15 +571,23 @@ public final class SchedulerHighContentionBenchmark {
 			long sample = 0L;
 			while (!stop.get()) {
 				if (config.alternateStoragePressure() && (sample & 31L) == 0L) {
-					scheduler.setStoragePressure((sample & 32L) == 0L);
+					setStoragePressure((sample & 32L) == 0L);
 				}
 				for (var pool : POOLS) {
 					scheduler.copyPoolTelemetry(pool, telemetry[pool.ordinal()]);
 					poolObservations[pool.ordinal()].observe(telemetry[pool.ordinal()]);
 				}
 				monitorSamples.incrementAndGet();
+				peaks.sample();
 				sample++;
 				LockSupport.parkNanos(50_000L);
+			}
+		}
+
+		private void setStoragePressure(boolean pressured) {
+			if (scheduler.isStoragePressure() != pressured) {
+				scheduler.setStoragePressure(pressured);
+				pressureTransitions.increment();
 			}
 		}
 
@@ -551,7 +618,8 @@ public final class SchedulerHighContentionBenchmark {
 			return terminal;
 		}
 
-		private Result finish() {
+		private Result finish(BenchmarkProcessTelemetry.ProcessDelta process,
+				BenchmarkProcessTelemetry.Peaks peaks) {
 			var outcomeCounts = new EnumMap<RWScheduler.TerminalOutcome, Long>(RWScheduler.TerminalOutcome.class);
 			for (var outcome : OUTCOMES) {
 				outcomeCounts.put(outcome, 0L);
@@ -598,7 +666,21 @@ public final class SchedulerHighContentionBenchmark {
 						quantile(queueSamples, 0.95d),
 						quantile(queueSamples, 0.99d),
 						quantile(executionSamples, 0.99d),
-						quantile(endToEndSamples, 0.99d)));
+						quantile(endToEndSamples, 0.99d),
+						maximumProgressGap(profile, null)));
+			}
+			var familyResults = new EnumMap<OperationFamily, FamilyResult>(OperationFamily.class);
+			for (var family : FAMILIES) {
+				long[] queueSamples = samples(null, family, queueLatencyNanos);
+				long[] executionSamples = samples(null, family, executionNanos);
+				long[] endToEndSamples = samples(null, family, endToEndNanos);
+				familyResults.put(family, new FamilyResult(
+						familyAttempts[family.ordinal()].sum(),
+						familyRuns[family.ordinal()].sum(),
+						quantile(queueSamples, 0.99d),
+						quantile(executionSamples, 0.99d),
+						quantile(endToEndSamples, 0.99d),
+						maximumProgressGap(null, family)));
 			}
 			return new Result(config,
 					elapsedNanos,
@@ -611,28 +693,57 @@ public final class SchedulerHighContentionBenchmark {
 					injectedFailures.sum(),
 					yieldTransitions.sum(),
 					parkTransitions.sum(),
+					pressureTransitions.sum(),
 					duplicateExecutions.sum(),
 					Map.copyOf(outcomeCounts),
 					Map.copyOf(profileResults),
-					Map.copyOf(poolResults));
+					Map.copyOf(familyResults),
+					Map.copyOf(poolResults),
+					process,
+					peaks);
 		}
 
 		private long[] samples(WorkloadProfile profile, long[] values) {
-			long[] selected = new long[Math.toIntExact(runs[profile.ordinal()].sum())];
+			return samples(profile, null, values);
+		}
+
+		private long[] samples(WorkloadProfile profile, OperationFamily family, long[] values) {
+			long sampleCount = profile != null
+					? runs[profile.ordinal()].sum()
+					: familyRuns[Objects.requireNonNull(family, "family").ordinal()].sum();
+			long[] selected = new long[Math.toIntExact(sampleCount)];
 			int target = 0;
 			for (int index = 0; index < values.length; index++) {
-				if (profileOrdinals[index] == profile.ordinal()
+				boolean matches = profile != null
+						? profileOrdinals[index] == profile.ordinal()
+						: familyOrdinals[index] == family.ordinal();
+				if (matches
 						&& successfulRuns[index]
 						&& values[index] > 0L) {
 					selected[target++] = values[index];
 				}
 			}
 			if (target != selected.length) {
-				throw new IllegalStateException("latency sample mismatch for " + profile + ": expected="
+				throw new IllegalStateException("latency sample mismatch for "
+						+ (profile != null ? profile : family) + ": expected="
 						+ selected.length + " actual=" + target);
 			}
 			Arrays.sort(selected);
 			return selected;
+		}
+
+		private long maximumProgressGap(WorkloadProfile profile, OperationFamily family) {
+			long[] completions = samples(profile, family, completionNanos);
+			if (completions.length == 0) {
+				return elapsedNanos;
+			}
+			long previous = startedNanos;
+			long maximum = 0L;
+			for (long completion : completions) {
+				maximum = Math.max(maximum, completion - previous);
+				previous = completion;
+			}
+			return Math.max(maximum, startedNanos + elapsedNanos - previous);
 		}
 	}
 
@@ -681,6 +792,8 @@ public final class SchedulerHighContentionBenchmark {
 				return;
 			}
 			owner.runs[lane.profile().ordinal()].increment();
+			owner.familyRuns[lane.family().ordinal()].increment();
+			owner.completionNanos[index] = completedNanos;
 			owner.successfulRuns[index] = true;
 		}
 
@@ -917,6 +1030,18 @@ public final class SchedulerHighContentionBenchmark {
 			result[i] = new LongAdder();
 		}
 		return result;
+	}
+
+	private static Lane[] allowedLanes() {
+		var lanes = new ArrayList<Lane>();
+		for (var profile : WorkloadProfile.values()) {
+			for (var family : OperationFamily.values()) {
+				if (WorkloadAdmission.isAllowed(profile, family)) {
+					lanes.add(new Lane(profile, family));
+				}
+			}
+		}
+		return lanes.toArray(Lane[]::new);
 	}
 
 	private static int percent(long value) {

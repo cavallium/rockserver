@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.time.Duration;
@@ -40,6 +41,12 @@ class SchedulerHighContentionBenchmarkTest {
 						result.outcomes().get(RWScheduler.TerminalOutcome.FAILURE)),
 				() -> assertTrue(result.yieldTransitions() > 0L),
 				() -> assertTrue(result.parkTransitions() > 0L),
+				() -> assertTrue(result.pressureTransitions() > 2L,
+						"the run must exercise repeated pressure entry and recovery"),
+				() -> assertTrue(result.process().cpuNanos() > 0L),
+				() -> assertTrue(result.process().allocatedBytes() > 0L),
+				() -> assertTrue(result.cpuNanosPerAttempt() > 0.0d),
+				() -> assertTrue(result.allocatedBytesPerAttempt() > 0.0d),
 				() -> assertTrue(result.pools().get(RWScheduler.Pool.READ).batchLimitedObserved()),
 				() -> assertTrue(result.pools().get(RWScheduler.Pool.WRITE).batchLimitedObserved()));
 
@@ -48,6 +55,14 @@ class SchedulerHighContentionBenchmarkTest {
 			assertTrue(profileResult.attempts() > 1_000L, "insufficient contention for " + profile);
 			assertTrue(profileResult.runs() > 0L, "no useful progress for " + profile);
 			assertTrue(profileResult.queueP99Nanos() > 0L, "missing queue distribution for " + profile);
+		}
+		for (var family : OperationFamily.values()) {
+			var familyResult = result.families().get(family);
+			assertTrue(familyResult.attempts() > 1_000L, "insufficient contention for " + family);
+			assertTrue(familyResult.runs() > 0L, "no useful progress for " + family);
+			assertTrue(familyResult.queueP99Nanos() > 0L, "missing queue distribution for " + family);
+			assertTrue(familyResult.maximumProgressGapNanos() > 0L,
+					"missing starvation observation for " + family);
 		}
 		for (var pool : RWScheduler.Pool.values()) {
 			var poolResult = result.pools().get(pool);
@@ -89,14 +104,22 @@ class SchedulerHighContentionBenchmarkTest {
 				42L));
 		String report = result.toReport();
 
-		assertTrue(report.startsWith("schema=rockserver-scheduler-high-contention-v1\n"));
+		assertTrue(report.startsWith("schema=rockserver-scheduler-high-contention-v2\n"));
 		assertTrue(report.contains("attempts_per_second="));
 		assertTrue(report.contains("useful_runs_per_second="));
+		assertTrue(report.contains("process.cpu_nanos_per_attempt="));
+		assertTrue(report.contains("process.allocated_bytes_per_attempt="));
 		for (var profile : WorkloadProfile.values()) {
 			assertTrue(report.contains("profile." + profile.name().toLowerCase(java.util.Locale.ROOT)
 					+ ".queue_p99_nanos="));
 			assertTrue(report.contains("profile." + profile.name().toLowerCase(java.util.Locale.ROOT)
 					+ ".end_to_end_p99_nanos="));
+		}
+		for (var family : OperationFamily.values()) {
+			assertTrue(report.contains("family." + family.name().toLowerCase(java.util.Locale.ROOT)
+					+ ".queue_p99_nanos="));
+			assertTrue(report.contains("family." + family.name().toLowerCase(java.util.Locale.ROOT)
+					+ ".maximum_progress_gap_nanos="));
 		}
 		for (var pool : RWScheduler.Pool.values()) {
 			assertTrue(report.contains("pool." + pool.name().toLowerCase(java.util.Locale.ROOT)
