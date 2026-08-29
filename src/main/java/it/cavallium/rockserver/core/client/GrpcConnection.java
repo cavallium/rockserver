@@ -67,6 +67,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
@@ -80,6 +81,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
@@ -1664,7 +1666,26 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		return AUTOMATIC_RETRYABLE_STATUS_CODES.contains(code);
 	}
 
-	private static class RetryLoggingInterceptor implements ClientInterceptor {
+	private static final class RetryLoggingInterceptor implements ClientInterceptor {
+
+		private final Consumer<String> warningLogger;
+
+		private RetryLoggingInterceptor() {
+			this(LOG::warn);
+		}
+
+		private RetryLoggingInterceptor(Consumer<String> warningLogger) {
+			this.warningLogger = Objects.requireNonNull(warningLogger, "warningLogger");
+		}
+
+		private static String terminalStatusWarning(MethodDescriptor<?, ?> method, Status status) {
+			// A client interceptor observes the logical call's final close after any
+			// transparent or configured retries, not each individual transport attempt.
+			return "gRPC call to " + method.getFullMethodName()
+					+ " reached terminal status " + status.getCode()
+					+ ". No further automatic retry will be attempted by gRPC.";
+		}
+
 		@Override
 		public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
 				MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
@@ -1675,8 +1696,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 						@Override
 						public void onClose(Status status, Metadata trailers) {
 							if (!status.isOk() && isAutomaticallyRetryableStatus(status.getCode())) {
-								LOG.warn("gRPC call to {} failed with retryable status {}: {}. Retry will be attempted automatically.",
-										method.getFullMethodName(), status.getCode(), status.getDescription());
+								warningLogger.accept(terminalStatusWarning(method, status));
 							}
 							super.onClose(status, trailers);
 						}
