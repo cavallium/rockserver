@@ -263,7 +263,7 @@ class ScanRawCompactionSafetyTest {
 	}
 
 	@Test
-	void competingReadWorkYieldsWithoutShorteningWireBatches(@TempDir Path tempDir) throws Exception {
+	void competingReadWorkPublishesPartialBatchesAtEveryBoundedYield(@TempDir Path tempDir) throws Exception {
 		Path configFile = tempDir.resolve("scan-raw-cooperative.conf");
 		Files.writeString(configFile, """
 				database.parallelism.workload.range-quantum-max-duration = PT0.000001S
@@ -302,15 +302,34 @@ class ScanRawCompactionSafetyTest {
 				var batches = internal.scanRawAsyncInternal(columnId, 0, 1)
 						.collectList()
 						.block(Duration.ofSeconds(30));
-				assertEquals(1, batches.size(),
-						"cooperative yields must retain the partial buffer instead of shortening wire batches");
-				assertEquals(COOPERATIVE_SCAN_KEYS, batches.getFirst().decode().count());
+				assertTrue(batches.size() > 10,
+						"repeated cooperative yields must publish partial progress instead of hiding it");
+				assertEquals(COOPERATIVE_SCAN_KEYS,
+						batches.stream().mapToLong(batch -> batch.decode().count()).sum());
+				assertTrue(batches.stream().allMatch(batch -> batch.decode().count() < COOPERATIVE_SCAN_KEYS),
+						"no yielded batch may retain the entire scan until EOF");
+
+				var resumableEvents = internal.scanRawResumableAsyncInternal(
+						columnId, 0, 1, Set.of(), internal.getScheduler().read())
+						.collectList()
+						.block(Duration.ofSeconds(30));
+				var resumableBatches = resumableEvents.stream()
+						.filter(RawScanEvent.Batch.class::isInstance)
+						.map(RawScanEvent.Batch.class::cast)
+						.toList();
+				assertTrue(resumableBatches.size() > 10);
+				assertEquals(COOPERATIVE_SCAN_KEYS,
+						resumableBatches.stream().mapToLong(batch -> batch.decode().count()).sum());
+				assertEquals(1L, resumableEvents.stream().filter(event -> switch (event) {
+					case RawScanEvent.Batch batch -> batch.completedSstToken() != null;
+					case RawScanEvent.SstCompleted _ -> true;
+				}).count(), "partial emissions must preserve exactly one durable SST completion token");
 				long metricDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-				while (quantumCounter.count() - quantumsBefore <= 10.0
+				while (quantumCounter.count() - quantumsBefore <= 20.0
 						&& System.nanoTime() < metricDeadline) {
 					Thread.onSpinWait();
 				}
-				assertTrue(quantumCounter.count() - quantumsBefore > 10.0,
+				assertTrue(quantumCounter.count() - quantumsBefore > 20.0,
 						"the competing LATENCY task must force repeated raw-scan scheduler quanta");
 			} finally {
 				releaseForeground.countDown();

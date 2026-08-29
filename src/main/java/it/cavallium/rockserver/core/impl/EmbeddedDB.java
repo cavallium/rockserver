@@ -9089,6 +9089,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						if (preemptionStartNanos == 0L) {
 							preemptionStartNanos = nowNanos;
 						} else if (nowNanos - preemptionStartNanos >= maximumQuantumNanos) {
+							// Publish useful progress at the same bounded checkpoint where the
+							// scheduler yields. Retaining a partial 2 MiB/65,536-row wire batch
+							// across paced BATCH turns can make a healthy raw scan appear idle
+							// for minutes even though every quantum advances its SST iterator.
+							if (batchSize > 0) {
+								emitBatch();
+								if (demand == 0L) {
+									return RWScheduler.CooperativeResult.PARK;
+								}
+							}
 							return RWScheduler.CooperativeResult.YIELD;
 						}
 					} else {
