@@ -2,6 +2,16 @@ use std::path::Path;
 use std::fs;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bundled_proto = Path::new("proto/rocksdb.proto");
+    let repository_proto = Path::new("../src/main/proto/rocksdb.proto");
+    if repository_proto.exists() {
+        let bundled = fs::read(bundled_proto)?;
+        let canonical = fs::read(repository_proto)?;
+        if bundled != canonical {
+            return Err("rust-client/proto/rocksdb.proto must exactly match src/main/proto/rocksdb.proto".into());
+        }
+    }
+
     // Compile proto
     // Find protobuf include path from Maven artifacts
     let proto_dep_dir = Path::new("../target/protoc-dependencies");
@@ -22,10 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_build::configure()
         .compile_protos(
-            &["proto/rocksdb.proto"],
+            &[bundled_proto],
             &["proto", &include_path],
         )?;
 
     Ok(())
 }
-

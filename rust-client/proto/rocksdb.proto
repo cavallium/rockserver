@@ -89,6 +89,7 @@ message CapabilitiesRequest {}
 message CapabilitiesResponse {
   int32 workloadContractVersion = 1;
   bool boundedRange = 2;
+  bool resumableRawScan = 3;
 }
 
 enum PutBatchMode {
@@ -219,7 +220,18 @@ message RangePage {
 }
 
 
-message ScanRawRequest {int64 columnId = 1; int32 shardIndex = 2; int32 shardCount = 3; RequestContext context = 4;}
+message ScanRawRequest {
+  int64 columnId = 1;
+  int32 shardIndex = 2;
+  int32 shardCount = 3;
+  RequestContext context = 4;
+  // Database-scoped SST filename tokens returned by resumable responses.
+  repeated string completedSstTokens = 5;
+  bool resumable = 6;
+  // Opt in to receiving an SST completion token on its final serialized batch.
+  // Older servers ignore this field and continue sending completion-only events.
+  bool coalesceCompletedSstToken = 7;
+}
 /*
 
 +---------------------------------------------------------------+
@@ -251,7 +263,16 @@ message ScanRawRequest {int64 columnId = 1; int32 shardIndex = 2; int32 shardCou
 +---------------------------------------------------------------+
 
 */
-message ScanRawResponse {bytes serialized = 1;}
+message ScanRawResponse {
+  oneof event {
+    bytes serialized = 1;
+    // Exact immutable SST filename, scoped to this database.
+    string completedSstToken = 2;
+  }
+  // Set together with serialized when the requesting client opted in. The
+  // token becomes acknowledgable only after the SST reader closed successfully.
+  optional string completedSstTokenAfterBatch = 3;
+}
 
 message CompactRequest {}
 
