@@ -72,6 +72,7 @@ class RWSchedulerTest {
 		scheduler.copyPoolTelemetry(pool, telemetry);
 		var snapshot = scheduler.poolSnapshot(pool);
 		assertEquals(snapshot.workerCount(), telemetry[RWScheduler.POOL_TELEMETRY_WORKER_COUNT]);
+		assertEquals(snapshot.waitingWorkers(), telemetry[RWScheduler.POOL_TELEMETRY_WAITING_WORKERS]);
 		assertEquals(snapshot.queuedTasks(), telemetry[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS]);
 		assertEquals(snapshot.activeTasks(), telemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS]);
 		assertEquals(snapshot.parkedTasks(), telemetry[RWScheduler.POOL_TELEMETRY_PARKED_TASKS]);
@@ -84,13 +85,46 @@ class RWSchedulerTest {
 		assertEquals(snapshot.terminalOutcomes(), telemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]);
 		assertEquals(snapshot.batchDispatchLimited() ? 1L : 0L,
 				telemetry[RWScheduler.POOL_TELEMETRY_BATCH_LIMITED]);
+		assertEquals(snapshot.batchStartAllowance(), telemetry[RWScheduler.POOL_TELEMETRY_BATCH_ALLOWANCE]);
 		for (var profile : WorkloadProfile.values()) {
 			assertEquals(snapshot.queuedByProfile().get(profile).longValue(),
-					telemetry[RWScheduler.POOL_TELEMETRY_SCALARS + profile.ordinal()]);
+					telemetry[RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + profile.ordinal()]);
 			assertEquals(snapshot.activeByProfile().get(profile).longValue(),
-					telemetry[RWScheduler.POOL_TELEMETRY_SCALARS
-							+ WorkloadProfile.values().length + profile.ordinal()]);
+					telemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE + profile.ordinal()]);
 		}
+	}
+
+	@Test
+	void everyAllowedProfileFamilyHasOneExactPhysicalPoolRoute() {
+		var seenFamilies = java.util.EnumSet.noneOf(OperationFamily.class);
+		var seenPools = java.util.EnumSet.noneOf(RWScheduler.Pool.class);
+		for (var profile : WorkloadProfile.values()) {
+			for (var family : OperationFamily.values()) {
+				if (it.cavallium.rockserver.core.impl.WorkloadAdmission.isAllowed(profile, family)) {
+					var expected = expectedPool(profile, family);
+					assertEquals(expected, RWScheduler.resourcePool(profile, family),
+							profile + "/" + family);
+					seenFamilies.add(family);
+					seenPools.add(expected);
+				} else {
+					assertThrows(RocksDBException.class, () -> RWScheduler.resourcePool(profile, family));
+				}
+			}
+		}
+		assertEquals(java.util.EnumSet.allOf(OperationFamily.class), seenFamilies);
+		assertEquals(java.util.EnumSet.allOf(RWScheduler.Pool.class), seenPools);
+	}
+
+	private static RWScheduler.Pool expectedPool(WorkloadProfile profile, OperationFamily family) {
+		if (profile == WorkloadProfile.CONTROL) return RWScheduler.Pool.CONTROL;
+		if (profile == WorkloadProfile.PHYSICAL_MAINTENANCE) return RWScheduler.Pool.PHYSICAL;
+		return switch (family) {
+			case MUTATION, FLUSH -> RWScheduler.Pool.WRITE;
+			case CONTROL -> RWScheduler.Pool.CONTROL;
+			case COMPACTION -> RWScheduler.Pool.PHYSICAL;
+			case METADATA, POINT_LOOKUP, BOUNDARY_SEEK, BOUNDED_FAN_OUT,
+					RANGE_PAGE, FULL_SCAN_AGGREGATE, WAL_PAGE -> RWScheduler.Pool.READ;
+		};
 	}
 
 	@Test

@@ -177,13 +177,50 @@ class ConfigParserBoundaryTest {
 				"database.parallelism.workload.raw-scan-file-concurrency = 0",
 				"database.parallelism.workload.raw-scan-file-concurrency = 65",
 				"database.parallelism.workload.raw-scan-readahead-bytes = 0B",
-				"database.parallelism.workload.cdc-quantum-max-bytes = 0B"
+				"database.parallelism.workload.cdc-quantum-max-bytes = 0B",
+				"database.parallelism.workload.latency-queue-capacity = 2147483647",
+				"database.parallelism.workload.control-queue-capacity = 2147483647",
+				"database.parallelism.workload.physical-maintenance-queue-capacity = 2147483647",
+				"database.parallelism.workload.latency-queue-capacity = 500000000\n"
+						+ "database.parallelism.workload.ingest-queue-capacity = 500000000\n"
+						+ "database.parallelism.workload.cdc-queue-capacity = 500000000\n"
+						+ "database.parallelism.workload.analytical-queue-capacity = 500000000\n"
+						+ "database.parallelism.workload.batch-queue-capacity = 500000000"
 		};
 		for (int i = 0; i < invalidOverrides.length; i++) {
 			Path invalid = write("invalid-workload-" + i + ".conf", invalidOverrides[i]);
 			var exception = assertThrows(RocksDBException.class,
 					() -> ConfigParser.parse(invalid), invalidOverrides[i]);
 			assertEquals(RocksDBErrorType.CONFIG_ERROR, exception.getErrorUniqueId());
+		}
+	}
+
+	@Test
+	void analyticalCapacityIsBoundedByAndProvisionedOnlyOnTheReadPool() throws Exception {
+		Path asymmetric = write("asymmetric-analytical.conf", """
+				database.parallelism.read = 20
+				database.parallelism.write = 3
+				database.parallelism.workload.analytical-active-limit = 20
+				database.parallelism.workload.analytical-queue-capacity = 777
+				""");
+
+		var settings = WorkloadSettings.resolve(ConfigParser.parse(asymmetric));
+		assertEquals(20, settings.analyticalActiveLimit());
+		var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+		try {
+			var scheduler = new it.cavallium.rockserver.core.impl.RWScheduler(
+					settings, "asymmetric-analytical", registry, "asymmetric-analytical");
+			try {
+				assertEquals(777, scheduler.queueCapacity(it.cavallium.rockserver.core.common.WorkloadProfile.ANALYTICAL));
+				assertTrue(registry.find("rockserver.workload.queue.capacity")
+						.tags("database", "asymmetric-analytical", "resource", "write",
+								"profile", "analytical")
+						.gauge() == null);
+			} finally {
+				scheduler.dispose();
+			}
+		} finally {
+			registry.close();
 		}
 	}
 

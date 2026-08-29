@@ -45,7 +45,11 @@ public final class RWScheduler {
 	public static final int POOL_TELEMETRY_BATCH_LIMITED = 12;
 	public static final int POOL_TELEMETRY_BATCH_ALLOWANCE = 13;
 	public static final int POOL_TELEMETRY_SCALARS = 14;
-	public static final int POOL_TELEMETRY_LENGTH = POOL_TELEMETRY_SCALARS + 14;
+	public static final int POOL_TELEMETRY_QUEUED_BY_PROFILE = POOL_TELEMETRY_SCALARS;
+	public static final int POOL_TELEMETRY_ACTIVE_BY_PROFILE =
+			POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.values().length;
+	public static final int POOL_TELEMETRY_LENGTH =
+			POOL_TELEMETRY_ACTIVE_BY_PROFILE + WorkloadProfile.values().length;
 
 	private static final long SHUTDOWN_WAIT_SECONDS = 10L;
 	private static final Logger LOG = LoggerFactory.getLogger(RWScheduler.class);
@@ -89,11 +93,12 @@ public final class RWScheduler {
 				settings.pressuredBatchMaximumActive(),
 				settings.rangeQuantumMaxDuration(),
 				settings.pressuredBatchInterval());
-		var dataCapacities = settings.queueCapacities();
+		var readCapacities = dataCapacities(settings, Pool.READ);
+		var writeCapacities = dataCapacities(settings, Pool.WRITE);
 		var drrWeights = settings.drrWeights();
 		this.readPool = new ProfiledWorkloadExecutor(settings.readParallelism(),
 				settings.analyticalActiveLimit(),
-				dataCapacities,
+				readCapacities,
 				settings.readReservations(),
 				settings.latencyBurst(),
 				drrWeights,
@@ -104,8 +109,8 @@ public final class RWScheduler {
 				registry,
 				databaseName);
 		this.writePool = new ProfiledWorkloadExecutor(settings.writeParallelism(),
-				settings.analyticalActiveLimit(),
-				dataCapacities,
+				1,
+				writeCapacities,
 				settings.writeReservations(),
 				settings.latencyBurst(),
 				drrWeights,
@@ -157,6 +162,25 @@ public final class RWScheduler {
 			}
 		}
 		return result;
+	}
+
+	private static Map<WorkloadProfile, Integer> dataCapacities(WorkloadSettings settings, Pool pool) {
+		var capacities = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
+		for (var entry : settings.queueCapacities().entrySet()) {
+			if (profileUsesPool(entry.getKey(), pool)) {
+				capacities.put(entry.getKey(), entry.getValue());
+			}
+		}
+		return Map.copyOf(capacities);
+	}
+
+	private static boolean profileUsesPool(WorkloadProfile profile, Pool pool) {
+		for (var family : OperationFamily.values()) {
+			if (WorkloadAdmission.isAllowed(profile, family) && resourceKind(profile, family) == pool) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private void registerStoragePressureGauge(@Nullable MeterRegistry registry, String databaseName) {
@@ -267,6 +291,12 @@ public final class RWScheduler {
 		};
 	}
 
+	/** Authoritative profile/family to physical scheduler-pool routing. */
+	public static Pool resourcePool(WorkloadProfile profile, OperationFamily family) {
+		WorkloadAdmission.validate(profile, family);
+		return resourceKind(profile, family);
+	}
+
 	private static Pool resourceKind(WorkloadProfile profile, OperationFamily family) {
 		if (profile == WorkloadProfile.CONTROL) {
 			return Pool.CONTROL;
@@ -347,18 +377,24 @@ public final class RWScheduler {
 	}
 
 	public int queuedTasks(WorkloadProfile profile) {
-		return readPool.queued(profile) + writePool.queued(profile)
-				+ controlPool.queued(profile) + physicalPool.queued(profile);
+		return addExact(readPool.queued(profile), writePool.queued(profile),
+				controlPool.queued(profile), physicalPool.queued(profile));
 	}
 
 	public int activeTasks(WorkloadProfile profile) {
-		return readPool.active(profile) + writePool.active(profile)
-				+ controlPool.active(profile) + physicalPool.active(profile);
+		return addExact(readPool.active(profile), writePool.active(profile),
+				controlPool.active(profile), physicalPool.active(profile));
 	}
 
 	public int queueCapacity(WorkloadProfile profile) {
-		return readPool.capacity(profile) + writePool.capacity(profile)
-				+ controlPool.capacity(profile) + physicalPool.capacity(profile);
+		return addExact(readPool.capacity(profile), writePool.capacity(profile),
+				controlPool.capacity(profile), physicalPool.capacity(profile));
+	}
+
+	private static int addExact(int... values) {
+		int result = 0;
+		for (int value : values) result = Math.addExact(result, value);
+		return result;
 	}
 
 	public ProfileAdmissionSnapshot admissionSnapshot() {
@@ -685,11 +721,11 @@ public final class RWScheduler {
 			boolean storagePressure) {
 
 		public int totalActive() {
-			return active.values().stream().mapToInt(Integer::intValue).sum();
+			return active.values().stream().reduce(0, Math::addExact);
 		}
 
 		public int totalQueued() {
-			return queued.values().stream().mapToInt(Integer::intValue).sum();
+			return queued.values().stream().reduce(0, Math::addExact);
 		}
 	}
 
@@ -717,7 +753,7 @@ public final class RWScheduler {
 			boolean terminated) {
 
 		public long terminalOutcomes() {
-			return outcomes.values().stream().mapToLong(Long::longValue).sum();
+			return outcomes.values().stream().reduce(0L, Math::addExact);
 		}
 
 		public boolean drainedAndConserved() {

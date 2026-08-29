@@ -137,6 +137,27 @@ class RWSchedulerMetricsTest {
 	}
 
 	@Test
+	void gaugeCardinalityContainsOnlyProfilesThatCanRouteToEachPool() {
+		var registry = new SimpleMeterRegistry();
+		var scheduler = scheduler(registry, "metric-routing-cardinality");
+		try {
+			var profileGauges = registry.getMeters().stream()
+					.filter(meter -> meter.getId().getType() == Meter.Type.GAUGE)
+					.filter(meter -> meter.getId().getName().startsWith("rockserver.workload."))
+					.filter(meter -> meter.getId().getTag(PROFILE) != null)
+					.toList();
+			assertEquals(11L * 7L, profileGauges.size(),
+					"eleven routable profile/pool pairs expose seven bounded gauges each");
+			assertTrue(profileGauges.stream().noneMatch(meter ->
+					"write".equals(meter.getId().getTag(RESOURCE))
+							&& "analytical".equals(meter.getId().getTag(PROFILE))));
+		} finally {
+			scheduler.dispose();
+			registry.close();
+		}
+	}
+
+	@Test
 	void recordsExistingTimersCountersAndTerminalMetrics() throws Exception {
 		var registry = new SimpleMeterRegistry();
 		var scheduler = scheduler(registry, "metric-values");

@@ -103,8 +103,8 @@ public record WorkloadSettings(
 		positiveDuration("pressured-batch-interval", pressuredBatchInterval, false);
 		positiveDuration("range-quantum-max-duration", rangeQuantumMaxDuration, false);
 		positiveDuration("cdc-quantum-max-duration", cdcQuantumMaxDuration, false);
-		if (analyticalActiveLimit > Math.min(readParallelism, writeParallelism)) {
-			throw invalid("analytical-active-limit must not exceed either data-pool capacity");
+		if (analyticalActiveLimit > readParallelism) {
+			throw invalid("analytical-active-limit must not exceed read-pool capacity");
 		}
 		if (competingBatchReadMaximumActive > readParallelism) {
 			throw invalid("competing-batch-read-maximum-active must not exceed read-pool capacity");
@@ -131,6 +131,60 @@ public record WorkloadSettings(
 				readLatencyReservation, readIngestReservation, readCdcReservation);
 		validateReservations("write", writeParallelism,
 				writeLatencyReservation, writeIngestReservation, writeCdcReservation);
+		validateCounterBounds(readParallelism,
+				writeParallelism,
+				latencyQueueCapacity,
+				ingestQueueCapacity,
+				cdcQueueCapacity,
+				analyticalQueueCapacity,
+				batchQueueCapacity,
+				controlQueueCapacity,
+				physicalMaintenanceQueueCapacity,
+				controlThreads,
+				physicalConcurrency);
+	}
+
+	private static void validateCounterBounds(int readParallelism,
+			int writeParallelism,
+			int latencyQueueCapacity,
+			int ingestQueueCapacity,
+			int cdcQueueCapacity,
+			int analyticalQueueCapacity,
+			int batchQueueCapacity,
+			int controlQueueCapacity,
+			int physicalMaintenanceQueueCapacity,
+			int controlThreads,
+			int physicalConcurrency) {
+		long readQueueCapacity = sum(latencyQueueCapacity,
+				ingestQueueCapacity,
+				cdcQueueCapacity,
+				analyticalQueueCapacity,
+				batchQueueCapacity);
+		long writeQueueCapacity = sum(latencyQueueCapacity,
+				ingestQueueCapacity,
+				cdcQueueCapacity,
+				batchQueueCapacity);
+		maximumInt("read-pool aggregate queue capacity", readQueueCapacity);
+		maximumInt("write-pool aggregate queue capacity", writeQueueCapacity);
+		maximumInt("read-pool aggregate outstanding limit",
+				readQueueCapacity + (long) readParallelism * 5L);
+		maximumInt("write-pool aggregate outstanding limit",
+				writeQueueCapacity + (long) writeParallelism * 4L);
+		maximumInt("CONTROL outstanding limit", (long) controlQueueCapacity + controlThreads);
+		maximumInt("PHYSICAL_MAINTENANCE outstanding limit",
+				(long) physicalMaintenanceQueueCapacity + physicalConcurrency);
+		maximumInt("scheduler aggregate queue capacity",
+				readQueueCapacity + writeQueueCapacity
+						+ controlQueueCapacity + (long) physicalMaintenanceQueueCapacity);
+		maximumInt("scheduler aggregate worker capacity",
+				(long) readParallelism + writeParallelism + controlThreads + physicalConcurrency);
+		for (var entry : Map.of(
+				"LATENCY", latencyQueueCapacity,
+				"INGEST", ingestQueueCapacity,
+				"CDC", cdcQueueCapacity,
+				"BATCH", batchQueueCapacity).entrySet()) {
+			maximumInt(entry.getKey() + " aggregate queue capacity", (long) entry.getValue() * 2L);
+		}
 	}
 
 	public static WorkloadSettings resolve(DatabaseConfig config) throws GestaltException {
@@ -313,6 +367,18 @@ public record WorkloadSettings(
 		long sum = (long) latency + ingest + cdc;
 		if (sum > capacity) {
 			throw invalid(pool + " reservation sum " + sum + " exceeds capacity " + capacity);
+		}
+	}
+
+	private static long sum(int... values) {
+		long result = 0L;
+		for (int value : values) result += value;
+		return result;
+	}
+
+	private static void maximumInt(String key, long value) {
+		if (value > Integer.MAX_VALUE) {
+			throw invalid(key + " exceeds the signed scheduler counter range");
 		}
 	}
 
