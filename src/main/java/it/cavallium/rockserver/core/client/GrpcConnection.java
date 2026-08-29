@@ -69,9 +69,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -1641,6 +1643,13 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture,
 			Function<T, U> mapper,
 			Function<Throwable, Throwable> errorMapper) {
+		return bridgeResponse(listenableFuture, mapper, errorMapper, callbackExecutor);
+	}
+
+	static <T, U> CompletableFuture<U> bridgeResponse(ListenableFuture<T> listenableFuture,
+			Function<T, U> mapper,
+			Function<Throwable, Throwable> errorMapper,
+			Executor callbackExecutor) {
 		var response = new GrpcResponseFuture<>(listenableFuture, mapper, errorMapper);
 		Futures.addCallback(listenableFuture, response, callbackExecutor);
 		return response;
@@ -1742,17 +1751,30 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		@Override
 		public boolean cancel(boolean mayInterruptIfRunning) {
 			boolean cancelled = listenableFuture.cancel(mayInterruptIfRunning);
-			super.cancel(cancelled);
+			if (!cancelled) {
+				return false;
+			}
+			super.cancel(mayInterruptIfRunning);
 			return cancelled;
 		}
 
 		@Override
 		public void onSuccess(T result) {
+			if (isDone()) {
+				return;
+			}
 			complete(mapper.apply(result));
 		}
 
 		@Override
 		public void onFailure(@NotNull Throwable failure) {
+			if (failure instanceof CancellationException && listenableFuture.isCancelled()) {
+				super.cancel(false);
+				return;
+			}
+			if (isDone()) {
+				return;
+			}
 			completeExceptionally(errorMapper.apply(failure));
 		}
 	}
