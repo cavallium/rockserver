@@ -8391,22 +8391,81 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private static final class RawScanPinDirectory implements AutoCloseable {
+		private final Path path;
+		private int retainedFiles;
+		private boolean closeRequested;
+		private boolean closed;
+
+		private RawScanPinDirectory(Path path) {
+			this.path = path;
+		}
+
+		private synchronized void retainFile() {
+			if (closed || closeRequested) {
+				throw new IllegalStateException("Raw-scan pin directory is already closing: " + path);
+			}
+			retainedFiles++;
+		}
+
+		private synchronized void releaseFile() {
+			if (retainedFiles <= 0) {
+				throw new IllegalStateException("Raw-scan pin directory released without ownership: " + path);
+			}
+			retainedFiles--;
+			if (closeRequested && retainedFiles == 0) {
+				deleteDirectory();
+			}
+		}
+
+		@Override
+		public synchronized void close() {
+			if (closed) {
+				return;
+			}
+			closeRequested = true;
+			if (retainedFiles == 0) {
+				deleteDirectory();
+			}
+		}
+
+		private void deleteDirectory() {
+			try {
+				Files.deleteIfExists(path);
+			} catch (IOException failure) {
+				throw new UncheckedIOException("Failed to release raw-scan pin directory " + path, failure);
+			}
+			closed = true;
+		}
+	}
+
 	private final class PinnedSstFile implements AutoCloseable {
 		private final LiveFileMetaData metadata;
 		private final Path path;
 		private final long size;
 		private final @Nullable RawSstToken token;
+		private final RawScanPinDirectory directory;
 		private boolean claimed;
 		private boolean closeRequested;
 		private boolean closed;
 
-		private PinnedSstFile(LiveFileMetaData metadata, Path path, @Nullable RawSstToken token) {
+		private PinnedSstFile(LiveFileMetaData metadata,
+				Path path,
+				@Nullable RawSstToken token,
+				RawScanPinDirectory directory) {
 			this.metadata = metadata;
 			this.path = path;
 			this.size = metadata.size();
 			this.token = token;
+			this.directory = directory;
 			if (!activeRawScanPinnedFiles.add(path)) {
 				throw new IllegalStateException("Raw-scan SST pin path is already active: " + path);
+			}
+			try {
+				directory.retainFile();
+			} catch (RuntimeException | Error failure) {
+				activeRawScanPinnedFiles.remove(path);
+				throw failure;
 			}
 			activeRawScanPinnedBytes.addAndGet(size);
 		}
@@ -8480,6 +8539,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			claimed = false;
 			activeRawScanPinnedFiles.remove(path);
 			activeRawScanPinnedBytes.addAndGet(-size);
+			directory.releaseFile();
 		}
 
 		private static final class Claim implements AutoCloseable {
@@ -8515,7 +8575,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 */
 	private final class RawScanPinnedSstSet implements AutoCloseable {
 		private final List<PinnedSstFile> files;
-		private final Set<Path> scanDirectories;
+		private final Set<RawScanPinDirectory> scanDirectories;
 		private boolean closed;
 
 		private RawScanPinnedSstSet(String cfName,
@@ -8524,7 +8584,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				@Nullable Set<String> completedSstFileNames)
 				throws IOException, org.rocksdb.RocksDBException {
 			var pinnedFiles = new ArrayList<PinnedSstFile>();
-			var createdScanDirectories = new LinkedHashSet<Path>();
+			var createdScanDirectories = new LinkedHashSet<RawScanPinDirectory>();
 			var scanId = UUID.randomUUID().toString();
 			Throwable captureFailure = null;
 			synchronized (rawScanPinAcquisitionLock) {
@@ -8542,7 +8602,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				rocksDB.disableFileDeletions();
 				long startedNanos = System.nanoTime();
 				try {
-					var scanDirectoriesBySource = new HashMap<Path, Path>();
+					var scanDirectoriesBySource = new HashMap<Path, RawScanPinDirectory>();
 					for (LiveFileMetaData file : selectedRawScanFiles(rocksDB,
 							cfName,
 							shardIndex,
@@ -8557,16 +8617,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						checkRawScanPinDeadline(startedNanos);
 						Path sourceDirectory = Objects.requireNonNull(source.getParent(),
 								"Raw-scan SST has no parent directory: " + source);
-						Path scanDirectory = scanDirectoriesBySource.get(sourceDirectory);
+						RawScanPinDirectory scanDirectory = scanDirectoriesBySource.get(sourceDirectory);
 						if (scanDirectory == null) {
-							scanDirectory = prepareRawScanPinRoot(sourceDirectory).resolve(scanId);
-							Files.createDirectories(scanDirectory);
+							Path scanDirectoryPath = prepareRawScanPinRoot(sourceDirectory).resolve(scanId);
+							Files.createDirectories(scanDirectoryPath);
+							scanDirectory = new RawScanPinDirectory(scanDirectoryPath);
 							scanDirectoriesBySource.put(sourceDirectory, scanDirectory);
 							createdScanDirectories.add(scanDirectory);
 						}
-						Path pinnedPath = scanDirectory.resolve(source.getFileName().toString());
+						Path pinnedPath = scanDirectory.path.resolve(source.getFileName().toString());
 						createRawScanHardLink(source, pinnedPath);
-						pinnedFiles.add(new PinnedSstFile(file, pinnedPath, token));
+						pinnedFiles.add(new PinnedSstFile(file, pinnedPath, token, scanDirectory));
 						checkRawScanPinDeadline(startedNanos);
 					}
 				} catch (Throwable failure) {
@@ -8613,7 +8674,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private static @Nullable Throwable cleanupPinnedFiles(Collection<PinnedSstFile> files,
-			Collection<Path> scanDirectories,
+			Collection<RawScanPinDirectory> scanDirectories,
 			@Nullable Throwable originalFailure) {
 		Throwable failure = originalFailure;
 		for (PinnedSstFile file : files) {
@@ -8623,9 +8684,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				failure = appendFailure(failure, cleanupFailure);
 			}
 		}
-		for (Path scanDirectory : scanDirectories) {
+		for (RawScanPinDirectory scanDirectory : scanDirectories) {
 			try {
-				Files.deleteIfExists(scanDirectory);
+				scanDirectory.close();
 			} catch (Throwable cleanupFailure) {
 				failure = appendFailure(failure, cleanupFailure);
 			}

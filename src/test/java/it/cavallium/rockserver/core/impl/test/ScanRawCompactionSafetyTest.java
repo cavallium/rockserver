@@ -23,6 +23,7 @@ import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -366,38 +367,117 @@ class ScanRawCompactionSafetyTest {
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			writeOverlappingSsts(api, columnId);
 
-			var readerOpened = new CountDownLatch(1);
-			var allowNativeReaderToReturn = new CountDownLatch(1);
+			for (int attempt = 0; attempt < 8; attempt++) {
+				var readerOpened = new CountDownLatch(1);
+				var allowNativeReaderToReturn = new CountDownLatch(1);
+				internal.setRawScanReaderOpenedObserverForTesting(() -> {
+					readerOpened.countDown();
+					awaitLatch(allowNativeReaderToReturn);
+				});
+				CompletableFuture<? extends java.util.List<?>> scan = internal
+						.scanRawAsyncInternal(columnId, 0, 1)
+						.collectList()
+						.toFuture();
+				try {
+					assertTrue(readerOpened.await(10, TimeUnit.SECONDS),
+							"raw-scan reader did not open on cancellation attempt " + attempt);
+					Set<Path> allPinnedFiles = internal.getRawScanPinnedFilesForTesting();
+					assertEquals(GENERATIONS, allPinnedFiles.size(),
+							"the real multi-SST fixture must pin every captured generation");
+					Set<Path> scanDirectories = scanDirectories(allPinnedFiles);
+					assertEquals(1, scanDirectories.size());
+					assertEquals(GENERATIONS, rawScanPinnedFilesGauge(internal));
+					assertTrue(rawScanPinnedBytesGauge(internal) > 0.0d);
+					assertTrue(scan.cancel(true));
+
+					Set<Path> claimedPins = awaitExistingRawScanPins(internal, Duration.ofSeconds(5));
+					assertFalse(claimedPins.isEmpty(),
+							"active native readers must retain their pin after outer stream cancellation");
+					assertTrue(claimedPins.stream().allMatch(Files::exists));
+					assertTrue(scanDirectories.stream().allMatch(Files::isDirectory),
+							"a scan directory must outlive its active claimed pins");
+					assertTrue(internal.getDb().get().isOwningHandle(),
+							"database handle must remain owned while cancelled native readers drain");
+
+					allowNativeReaderToReturn.countDown();
+					awaitRawScanDrained(internal, allPinnedFiles, scanDirectories, Duration.ofSeconds(10));
+					assertTrue(api.estimateNumKeys(columnId) > 0L,
+							"database must remain usable after active raw-scan cancellation");
+				} finally {
+					internal.setRawScanReaderOpenedObserverForTesting(null);
+					allowNativeReaderToReturn.countDown();
+					if (!scan.isDone()) {
+						scan.cancel(true);
+					}
+				}
+			}
+		}
+	}
+
+	@Test
+	void oneInnerFailurePreservesCauseAndDeletesDirectoriesAfterActiveSiblingsDrain(@TempDir Path tempDir)
+			throws Exception {
+		Path configFile = tempDir.resolve("scan-raw-sibling-failure.conf");
+		Files.writeString(configFile, """
+				database: {
+				  parallelism: { workload: { raw-scan-file-concurrency: 4 } }
+				  global: {
+				    ingest-behind: false
+				    optimistic: false
+				    disable-auto-compactions: true
+				    disable-write-slowdown: true
+				  }
+				}
+				""");
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"),
+				"scan-raw-sibling-failure",
+				configFile)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = api.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			writeOverlappingSsts(api, columnId);
+			assertEquals(GENERATIONS, liveColumnSsts(internal).size());
+
+			var readersOpened = new AtomicInteger();
+			var injectedFailure = new CountDownLatch(1);
+			var allowActiveSiblingsToReturn = new CountDownLatch(1);
 			internal.setRawScanReaderOpenedObserverForTesting(() -> {
-				readerOpened.countDown();
-				awaitLatch(allowNativeReaderToReturn);
+				int readerNumber = readersOpened.incrementAndGet();
+				if (readerNumber == GENERATIONS) {
+					injectedFailure.countDown();
+					throw new IllegalStateException("synthetic inner raw-scan failure");
+				}
+				awaitLatch(allowActiveSiblingsToReturn);
 			});
 			CompletableFuture<? extends java.util.List<?>> scan = internal
 					.scanRawAsyncInternal(columnId, 0, 1)
 					.collectList()
 					.toFuture();
+			Set<Path> pinnedFiles = Set.of();
+			Set<Path> scanDirectories = Set.of();
 			try {
-				assertTrue(readerOpened.await(10, TimeUnit.SECONDS));
-				Set<Path> allPinnedFiles = internal.getRawScanPinnedFilesForTesting();
-				assertFalse(allPinnedFiles.isEmpty());
-				assertTrue(scan.cancel(true));
+				assertTrue(injectedFailure.await(10, TimeUnit.SECONDS),
+						"four real SST readers did not enter the failure barrier");
+				pinnedFiles = internal.getRawScanPinnedFilesForTesting();
+				scanDirectories = scanDirectories(pinnedFiles);
+				assertEquals(1, scanDirectories.size());
 
-				Set<Path> claimedPins = internal.getRawScanPinnedFilesForTesting();
-				assertFalse(claimedPins.isEmpty(),
-						"active native readers must retain their pin after outer stream cancellation");
-				assertTrue(claimedPins.stream().allMatch(Files::exists));
-				assertTrue(internal.getDb().get().isOwningHandle(),
-						"database handle must remain owned while cancelled native readers drain");
-
-				allowNativeReaderToReturn.countDown();
-				awaitFilesDeleted(allPinnedFiles, Duration.ofSeconds(10));
-				assertTrue(internal.getRawScanPinnedFilesForTesting().isEmpty());
-				assertTrue(api.estimateNumKeys(columnId) > 0L,
-						"database must remain usable after active raw-scan cancellation");
+				ExecutionException terminal = assertThrows(ExecutionException.class,
+						() -> scan.get(10, TimeUnit.SECONDS));
+				assertEquals("synthetic inner raw-scan failure", terminal.getCause().getMessage(),
+						"eager outer cleanup must not replace the first inner terminal cause");
+				assertTrue(scanDirectories.stream().allMatch(Files::isDirectory),
+						"the directory must remain while cancelled sibling readers still own pins");
 			} finally {
 				internal.setRawScanReaderOpenedObserverForTesting(null);
-				allowNativeReaderToReturn.countDown();
+				allowActiveSiblingsToReturn.countDown();
+				if (!scan.isDone()) {
+					scan.cancel(true);
+				}
 			}
+			awaitRawScanDrained(internal, pinnedFiles, scanDirectories, Duration.ofSeconds(10));
+			assertTrue(api.estimateNumKeys(columnId) > 0L);
 		}
 	}
 
@@ -623,6 +703,63 @@ class ScanRawCompactionSafetyTest {
 		} while (System.nanoTime() < deadline);
 		assertTrue(files.stream().noneMatch(Files::exists),
 				"Obsolete SSTs must be deleted after the raw-scan lease is released: " + files);
+	}
+
+	private static Set<Path> scanDirectories(Set<Path> pinnedFiles) {
+		return pinnedFiles.stream()
+				.map(Path::getParent)
+				.collect(java.util.stream.Collectors.toUnmodifiableSet());
+	}
+
+	private static double rawScanPinnedFilesGauge(EmbeddedDB db) {
+		return db.getMetricsRegistry().get("rockserver.raw.scan.pinned.files").gauge().value();
+	}
+
+	private static double rawScanPinnedBytesGauge(EmbeddedDB db) {
+		return db.getMetricsRegistry().get("rockserver.raw.scan.pinned.bytes").gauge().value();
+	}
+
+	private static void awaitRawScanDrained(EmbeddedDB db,
+			Set<Path> pinnedFiles,
+			Set<Path> scanDirectories,
+			Duration timeout) throws InterruptedException {
+		long deadline = System.nanoTime() + timeout.toNanos();
+		do {
+			if (pinnedFiles.stream().noneMatch(Files::exists)
+					&& scanDirectories.stream().noneMatch(Files::exists)
+					&& db.getRawScanPinnedFilesForTesting().isEmpty()
+					&& rawScanPinnedFilesGauge(db) == 0.0d
+					&& rawScanPinnedBytesGauge(db) == 0.0d
+					&& db.getPendingOpsCount() == 0L) {
+				return;
+			}
+			Thread.sleep(20L);
+		} while (System.nanoTime() < deadline);
+		assertTrue(pinnedFiles.stream().noneMatch(Files::exists),
+				"raw-scan hard links did not drain: " + pinnedFiles);
+		assertTrue(scanDirectories.stream().noneMatch(Files::exists),
+				"raw-scan UUID directories leaked after their last pin drained: " + scanDirectories);
+		assertTrue(db.getRawScanPinnedFilesForTesting().isEmpty());
+		assertEquals(0.0d, rawScanPinnedFilesGauge(db));
+		assertEquals(0.0d, rawScanPinnedBytesGauge(db));
+		assertEquals(0L, db.getPendingOpsCount());
+	}
+
+	private static Set<Path> awaitExistingRawScanPins(EmbeddedDB db, Duration timeout)
+			throws InterruptedException {
+		long deadline = System.nanoTime() + timeout.toNanos();
+		do {
+			Set<Path> pins = db.getRawScanPinnedFilesForTesting();
+			if (!pins.isEmpty() && pins.stream().allMatch(Files::exists)) {
+				return pins;
+			}
+			Thread.sleep(10L);
+		} while (System.nanoTime() < deadline);
+		Set<Path> pins = db.getRawScanPinnedFilesForTesting();
+		assertFalse(pins.isEmpty(), "active native readers did not retain any raw-scan pin");
+		assertTrue(pins.stream().allMatch(Files::exists),
+				"active pin accounting did not converge to files still owned by readers: " + pins);
+		return pins;
 	}
 
 	private static void awaitLatch(CountDownLatch latch) {
