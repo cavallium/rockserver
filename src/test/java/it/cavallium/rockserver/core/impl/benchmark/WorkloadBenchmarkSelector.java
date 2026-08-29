@@ -96,11 +96,17 @@ public final class WorkloadBenchmarkSelector {
 			}
 		}
 
-		double maximumThroughput = measurements.stream()
+		var referenceMeasurements = measurements.stream()
+				.filter(CandidateMeasurement::selectionReferenceEligible)
+				.toList();
+		if (referenceMeasurements.isEmpty()) {
+			throw new IllegalStateException("No valid benchmark candidate can define performance windows");
+		}
+		double maximumThroughput = referenceMeasurements.stream()
 				.mapToDouble(CandidateMeasurement::totalThroughput)
 				.max()
 				.orElseThrow();
-		long minimumRelevantP99 = measurements.stream()
+		long minimumRelevantP99 = referenceMeasurements.stream()
 				.mapToLong(CandidateMeasurement::relevantP99Nanos)
 				.filter(value -> value > 0L)
 				.min()
@@ -204,6 +210,13 @@ public final class WorkloadBenchmarkSelector {
 				throw new IllegalArgumentException(
 						"Dataset fingerprint, comparison fingerprint, build ID, and storage label are required");
 			}
+			for (String value : List.of(datasetFingerprint, comparisonFingerprint, buildId, storageLabel)) {
+				if (!value.equals(value.strip()) || value.indexOf('\n') >= 0
+						|| value.indexOf('\r') >= 0 || value.indexOf('\\') >= 0) {
+					throw new IllegalArgumentException(
+							"Benchmark identity values must be single-line canonical property values");
+				}
+			}
 			if (maximumCdcLag < 0L || maximumRetainedSnapshots < 0L
 					|| maximumStoragePressure < 0L || leakedResources < 0L) {
 				throw new IllegalArgumentException("Candidate counters must be non-negative");
@@ -240,6 +253,10 @@ public final class WorkloadBenchmarkSelector {
 
 		public boolean hardwareAcceptancePassed() {
 			return enforcedHardwareRun && runChecksPassed;
+		}
+
+		private boolean selectionReferenceEligible() {
+			return hardwareAcceptancePassed() && allSlosPassed() && leakedResources == 0L;
 		}
 	}
 

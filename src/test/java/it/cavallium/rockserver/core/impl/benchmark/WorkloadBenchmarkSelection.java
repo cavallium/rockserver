@@ -8,9 +8,12 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.Set;
 
 /** Command-line, machine-readable selection over completed seven-profile candidate runs. */
 public final class WorkloadBenchmarkSelection {
@@ -81,6 +84,7 @@ public final class WorkloadBenchmarkSelection {
 	}
 
 	public static WorkloadBenchmarkSelector.CandidateMeasurement readSelectionInput(Path input) throws IOException {
+		validatePropertyKeys(input);
 		var properties = new Properties();
 		try (Reader reader = Files.newBufferedReader(input)) {
 			properties.load(reader);
@@ -116,6 +120,61 @@ public final class WorkloadBenchmarkSelection {
 				Long.parseLong(required(properties, "maximum-retained-snapshots")),
 				Long.parseLong(required(properties, "maximum-storage-pressure")),
 				Long.parseLong(required(properties, "leaked-resources")));
+	}
+
+	private static void validatePropertyKeys(Path input) throws IOException {
+		Set<String> expected = expectedPropertyKeys();
+		var observed = new HashSet<String>();
+		for (String rawLine : Files.readAllLines(input)) {
+			String line = rawLine.strip();
+			if (line.isEmpty() || line.startsWith("#") || line.startsWith("!")) continue;
+			int separator = line.indexOf('=');
+			if (separator <= 0) {
+				throw new IllegalArgumentException("Selection input requires canonical key=value lines: " + rawLine);
+			}
+			String key = line.substring(0, separator).strip();
+			if (!expected.contains(key)) {
+				throw new IllegalArgumentException("Unknown selection input property: " + key);
+			}
+			if (!observed.add(key)) {
+				throw new IllegalArgumentException("Duplicate selection input property: " + key);
+			}
+		}
+		if (!observed.equals(expected)) {
+			var missing = new LinkedHashSet<>(expected);
+			missing.removeAll(observed);
+			throw new IllegalArgumentException("Missing selection input properties: " + missing);
+		}
+	}
+
+	private static Set<String> expectedPropertyKeys() {
+		var keys = new LinkedHashSet<String>();
+		keys.add("schema");
+		keys.add("candidate");
+		keys.add("dataset-fingerprint");
+		keys.add("comparison-fingerprint");
+		keys.add("build-id");
+		keys.add("storage-label");
+		keys.add("seed");
+		keys.add("enforced-hardware-run");
+		keys.add("run-checks-passed");
+		keys.add("maximum-cdc-lag");
+		keys.add("maximum-retained-snapshots");
+		keys.add("maximum-storage-pressure");
+		keys.add("leaked-resources");
+		for (var profile : WorkloadBenchmarkSelector.ALL_PROFILES) {
+			String prefix = "profile." + metricName(profile) + '.';
+			keys.add(prefix + "throughput");
+			keys.add(prefix + "queue-p99-nanos");
+			keys.add(prefix + "execution-p99-nanos");
+			keys.add(prefix + "end-to-end-p99-nanos");
+			keys.add(prefix + "rejections");
+			keys.add(prefix + "cancellations");
+			keys.add(prefix + "quantum-count");
+			keys.add(prefix + "relevant-p99");
+			keys.add(prefix + "slo-passed");
+		}
+		return Set.copyOf(keys);
 	}
 
 	public static String toJson(WorkloadBenchmarkSelector.Selection selection) {

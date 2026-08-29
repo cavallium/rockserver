@@ -97,6 +97,22 @@ class WorkloadBenchmarkSelectorTest {
 	}
 
 	@Test
+	void failedCandidateCannotPoisonValidThroughputAndLatencyWindows() {
+		var invalidOutlier = candidate(
+				8, 10_000.0d, 1L, true, 0L, true, false);
+
+		var selection = WorkloadBenchmarkSelector.select(List.of(
+				candidate(4, 100.0d, 10_000_000L, true, 0L),
+				invalidOutlier,
+				candidate(16, 96.0d, 10_500_000L, true, 0L)));
+
+		assertEquals(4, selection.winner());
+		assertEquals(100.0d * WorkloadBenchmarkSelector.ALL_PROFILES.size(),
+				selection.maximumThroughput());
+		assertEquals(10_000_000L, selection.minimumRelevantP99Nanos());
+	}
+
+	@Test
 	void selectionInputRoundTripsAndJsonNamesAdjacentVerification(@TempDir Path temporary) throws Exception {
 		var measurement = candidate(8, 100.123456789d, 10_000_000L, true, 0L);
 		Path input = temporary.resolve("selection-input.properties");
@@ -116,6 +132,22 @@ class WorkloadBenchmarkSelectorTest {
 				.replace("enforced-hardware-run=true", "enforced-hardware-run=tru");
 		Files.writeString(input, malformed);
 		assertThrows(IllegalArgumentException.class, () -> WorkloadBenchmarkSelection.readSelectionInput(input));
+	}
+
+	@Test
+	void selectionInputRejectsUnknownAndDuplicateProperties(@TempDir Path temporary) throws Exception {
+		Path input = temporary.resolve("selection-input.properties");
+		WorkloadBenchmarkSelection.writeSelectionInput(input,
+				candidate(8, 100.0d, 10_000_000L, true, 0L));
+		Files.writeString(input, Files.readString(input) + "unknown-field=1\n");
+		assertThrows(IllegalArgumentException.class,
+				() -> WorkloadBenchmarkSelection.readSelectionInput(input));
+
+		WorkloadBenchmarkSelection.writeSelectionInput(input,
+				candidate(8, 100.0d, 10_000_000L, true, 0L));
+		Files.writeString(input, Files.readString(input) + "candidate=16\n");
+		assertThrows(IllegalArgumentException.class,
+				() -> WorkloadBenchmarkSelection.readSelectionInput(input));
 	}
 
 	@Test
