@@ -32,6 +32,10 @@ class StoragePressureSignalBenchmarkTest {
 			assertTrue(measurement.columnObservationsPerSecond() > 0.0d);
 			assertTrue(measurement.cpuNanosPerEvaluation() > 0.0d);
 		}
+		var pairedMetrics = PressurePerformanceContract.signalMetrics(result);
+		assertEquals(result.cases().size() * 4, pairedMetrics.size());
+		assertTrue(pairedMetrics.containsKey(
+				"case.frequent_transitions.cf_4096.cpu_nanos_per_column_observation"));
 	}
 
 	@Test

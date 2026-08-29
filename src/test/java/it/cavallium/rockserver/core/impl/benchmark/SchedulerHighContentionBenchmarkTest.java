@@ -152,6 +152,11 @@ class SchedulerHighContentionBenchmarkTest {
 			assertTrue(report.contains("pool." + pool.name().toLowerCase(java.util.Locale.ROOT)
 					+ ".peak_outstanding="));
 		}
+		var pairedMetrics = PressurePerformanceContract.schedulerMetrics(result);
+		assertEquals(11 + WorkloadProfile.values().length * 3
+				+ OperationFamily.values().length * 3 + RWScheduler.Pool.values().length * 3,
+				pairedMetrics.size());
+		assertTrue(pairedMetrics.containsKey("family.range_page.maximum_progress_gap_nanos"));
 	}
 
 	@Test
