@@ -40,6 +40,20 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		return this;
 	}
 
+	Disposable executeWhenCapacity(Runnable command) {
+		if (disposed) {
+			throw Exceptions.failWithRejected();
+		}
+		long estimatedBytes = command instanceof RWScheduler.EstimatedWork estimatedWork
+				? estimatedWork.estimatedBytes()
+				: 0L;
+		return executor.executeWhenCapacity(profile,
+				family,
+				deadlineEpochMillis,
+				estimatedBytes,
+				command);
+	}
+
 	@Override
 	public void execute(Runnable command) {
 		long estimatedBytes = command instanceof RWScheduler.EstimatedWork estimatedWork

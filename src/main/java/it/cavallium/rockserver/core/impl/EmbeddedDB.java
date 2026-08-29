@@ -9394,7 +9394,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Scheduler workloadScheduler,
 			@NotNull RWScheduler.WorkloadExecutor workloadExecutor) {
 		long maximumQuantumNanos = workloadSettings.rangeQuantumMaxDuration().toNanos();
-		return Flux.using(
+		Flux<T> scan = Flux.using(
 				() -> {
 					ops.beginOp();
 					try {
@@ -9461,8 +9461,38 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						ops.endOp();
 					}
 				},
-				true)
-				.subscribeOn(workloadScheduler);
+				true);
+		return subscribeOnInitialAdmission(scan, workloadScheduler);
+	}
+
+	private static <T> Flux<T> subscribeOnInitialAdmission(Flux<T> scan, Scheduler workloadScheduler) {
+		if (!(workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler)) {
+			return scan.subscribeOn(workloadScheduler);
+		}
+		return Mono.<Void>create(sink -> {
+			var registration = Disposables.swap();
+			sink.onCancel(registration);
+			var initialAdmission = new RawScanInitialAdmission(sink);
+			try {
+				registration.update(indexedScheduler.executeWhenCapacity(initialAdmission));
+			} catch (Throwable failure) {
+				sink.error(failure);
+			}
+		}).thenMany(scan);
+	}
+
+	private record RawScanInitialAdmission(reactor.core.publisher.MonoSink<Void> sink)
+			implements Runnable, RWScheduler.RejectionAwareTask {
+
+		@Override
+		public void run() {
+			sink.success();
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			sink.error(failure);
+		}
 	}
 
 	public Flux<RawScanEvent> scanRawResumableAsyncInternal(long columnId,

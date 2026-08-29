@@ -23,6 +23,7 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
 import it.cavallium.rockserver.core.common.api.proto.ScanRawRequest;
@@ -40,9 +41,12 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -193,6 +197,80 @@ class RawScanResumeTest {
 
 			awaitNoRawScanPins(db, Duration.ofSeconds(10));
 			assertEquals(0L, db.getPendingOpsCount());
+		}
+	}
+
+	@Test
+	void initialAdmissionWaitsInTheRealBatchSchedulerBeforeCapturingSsts(@TempDir Path tempDir) throws Exception {
+		Path config = saturatedRawScanConfig(tempDir);
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "raw-initial-admission", config)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB db = connection.getInternalDB();
+			long columnId = createPopulatedColumn(api);
+			var blockers = saturateBatchReadPool(db.getScheduler());
+			var captureCount = new AtomicInteger();
+			db.setRawScanFilesCapturedObserverForTesting(captureCount::incrementAndGet);
+			try {
+				CompletableFuture<List<SerializedKVBatch>> result =
+						db.scanRawAsyncInternal(columnId, 0, 1).collectList().toFuture();
+
+				assertFalse(result.isDone(), "a full BATCH queue must wait instead of rejecting the scan");
+				assertEquals(0, captureCount.get(), "SSTs must not be pinned before initial admission");
+				assertTrue(db.getRawScanPinnedFilesForTesting().isEmpty());
+				assertEquals(0L, db.getPendingOpsCount(),
+						"the admission waiter must not acquire a database or column lease");
+
+				blockers.releaseOneActive();
+				assertTrue(blockers.queuedBlockerStarted().await(10, TimeUnit.SECONDS));
+				assertEquals(0, captureCount.get(),
+						"the older queued BATCH task must run before the waiting scan");
+				assertEquals(0L, db.getPendingOpsCount());
+
+				blockers.releaseOneActive();
+				assertEventually(() -> captureCount.get() == 1);
+				assertFalse(result.isDone(), "the remaining saturated workers must still delay SST readers");
+
+				blockers.releaseAll();
+				var batches = result.get(30, TimeUnit.SECONDS);
+				assertEquals((long) SST_COUNT * KEYS_PER_SST,
+						batches.stream().mapToLong(batch -> batch.decode().count()).sum());
+				assertEquals(1, captureCount.get(), "capacity recovery must not restart pin capture");
+				awaitNoRawScanPins(db, Duration.ofSeconds(10));
+				assertEventually(() -> db.getScheduler().poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
+				assertEquals(0L, db.getPendingOpsCount());
+			} finally {
+				blockers.releaseAll();
+				db.setRawScanFilesCapturedObserverForTesting(null);
+			}
+		}
+	}
+
+	@Test
+	void cancellationWhileWaitingForInitialAdmissionNeverPinsOrLeaksWork(@TempDir Path tempDir) throws Exception {
+		Path config = saturatedRawScanConfig(tempDir);
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "raw-initial-cancel", config)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB db = connection.getInternalDB();
+			long columnId = createPopulatedColumn(api);
+			var blockers = saturateBatchReadPool(db.getScheduler());
+			var captured = new AtomicBoolean();
+			db.setRawScanFilesCapturedObserverForTesting(() -> captured.set(true));
+			try {
+				var scan = db.scanRawAsyncInternal(columnId, 0, 1).subscribe();
+				assertFalse(captured.get());
+				assertTrue(db.getRawScanPinnedFilesForTesting().isEmpty());
+
+				scan.dispose();
+				blockers.releaseAll();
+
+				assertEventually(() -> db.getScheduler().poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
+				assertFalse(captured.get(), "a cancelled admission waiter must never capture SSTs later");
+				assertTrue(db.getRawScanPinnedFilesForTesting().isEmpty());
+				assertEquals(0L, db.getPendingOpsCount());
+			} finally {
+				blockers.releaseAll();
+				db.setRawScanFilesCapturedObserverForTesting(null);
+			}
 		}
 	}
 
@@ -577,6 +655,91 @@ class RawScanResumeTest {
 				} }
 				""");
 		return config;
+	}
+
+	private static Path saturatedRawScanConfig(Path tempDir) throws Exception {
+		Path config = tempDir.resolve("raw-initial-admission.conf");
+		Files.writeString(config, """
+				database.parallelism.read = 3
+				database.parallelism.write = 3
+				database.parallelism.workload.batch-queue-capacity = 1
+				database.parallelism.workload.analytical-active-limit = 1
+				database.parallelism.workload.competing-batch-read-maximum-active = 3
+				database.parallelism.workload.competing-batch-write-maximum-active = 3
+				database.global.ingest-behind = false
+				database.global.optimistic = false
+				database.global.disable-auto-compactions = true
+				database.global.disable-write-slowdown = true
+				""");
+		return config;
+	}
+
+	private static BatchReadSaturation saturateBatchReadPool(RWScheduler scheduler) throws Exception {
+		int workerCount = scheduler.poolSnapshot(RWScheduler.Pool.READ).workerCount();
+		var activeReleases = new ArrayList<CountDownLatch>(workerCount);
+		try {
+			for (int index = 0; index < workerCount; index++) {
+				var started = new CountDownLatch(1);
+				var release = new CountDownLatch(1);
+				activeReleases.add(release);
+				scheduler.readExecutor().execute(() -> {
+					started.countDown();
+					awaitUninterruptibly(release);
+				});
+				assertTrue(started.await(10, TimeUnit.SECONDS));
+			}
+		} catch (Throwable failure) {
+			activeReleases.forEach(CountDownLatch::countDown);
+			throw failure;
+		}
+
+		var queuedBlockerStarted = new CountDownLatch(1);
+		var queuedBlockerRelease = new CountDownLatch(1);
+		scheduler.readExecutor().execute(() -> {
+			queuedBlockerStarted.countDown();
+			awaitUninterruptibly(queuedBlockerRelease);
+		});
+		assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)
+				.queuedByProfile().get(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH) == 1);
+		return new BatchReadSaturation(activeReleases, queuedBlockerStarted, queuedBlockerRelease);
+	}
+
+	private static void awaitUninterruptibly(CountDownLatch latch) {
+		boolean interrupted = false;
+		while (true) {
+			try {
+				latch.await();
+				break;
+			} catch (InterruptedException ignored) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static void assertEventually(BooleanSupplier condition) throws InterruptedException {
+		long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+			Thread.sleep(10L);
+		}
+		assertTrue(condition.getAsBoolean(), "condition did not become true before timeout");
+	}
+
+	private record BatchReadSaturation(List<CountDownLatch> activeReleases,
+			CountDownLatch queuedBlockerStarted,
+			CountDownLatch queuedBlockerRelease) {
+
+		private void releaseOneActive() {
+			activeReleases.stream().filter(latch -> latch.getCount() != 0L).findFirst()
+					.ifPresent(CountDownLatch::countDown);
+		}
+
+		private void releaseAll() {
+			activeReleases.forEach(CountDownLatch::countDown);
+			queuedBlockerRelease.countDown();
+		}
 	}
 
 	private static long createPopulatedColumn(RocksDBSyncAPI api) {

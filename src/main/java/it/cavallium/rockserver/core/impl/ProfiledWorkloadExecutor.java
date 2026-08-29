@@ -11,6 +11,7 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -18,6 +19,7 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.PriorityQueue;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -77,6 +79,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final TaskQueue[] queues = new TaskQueue[PROFILES.length];
 	private final TaskQueue[] cooperativeQueues = new TaskQueue[PROFILES.length];
 	private final TaskHeap deadlineQueue = new TaskHeap(true);
+	private final ArrayDeque<DeferredAdmission> deferredAdmissions = new ArrayDeque<>();
+	private final PriorityQueue<DeferredAdmission> deferredDeadlines = new PriorityQueue<>(Comparator
+			.comparingLong((DeferredAdmission deferred) -> deferred.deadlineEpochMillis)
+			.thenComparingLong(deferred -> deferred.sequence));
 	private final CancellationIndex cancellationIndex = new CancellationIndex();
 	private int indexedDeadlineCount;
 	private final int[] queued = new int[PROFILES.length];
@@ -191,6 +197,82 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				"database", databaseName,
 				"resource", resourceKind);
 		registerGauges(registry);
+	}
+
+	/**
+	 * Bounded FIFO admission for a one-shot scheduler task that is allowed to wait for a real
+	 * profile queue slot. Unlike retry/backoff, ownership remains in this executor and promotion is
+	 * atomic with capacity release, so later submissions cannot overtake a waiter. The pre-admission
+	 * lane is BATCH-only and capped at the configured BATCH queue capacity; waiters do not enter
+	 * workload attempt/outstanding/outcome accounting until promotion into the real queue.
+	 */
+	Disposable executeWhenCapacity(WorkloadProfile profile,
+	                               OperationFamily family,
+	                               long deadlineEpochMillis,
+	                               long estimatedBytes,
+	                               Runnable command) {
+		Objects.requireNonNull(command, "command");
+		if (profile != WorkloadProfile.BATCH) {
+			throw new IllegalArgumentException("Deferred admission is reserved for restartable BATCH work");
+		}
+		if (!(command instanceof RWScheduler.RejectionAwareTask)) {
+			throw new IllegalArgumentException("Deferred workload tasks must handle asynchronous rejection");
+		}
+		int cost = taskCost(estimatedBytes);
+		var taskMetrics = metrics(profile, family);
+		DeferredAdmission deferred = null;
+		RuntimeException admissionFailure = null;
+		RWScheduler.TerminalOutcome admissionOutcome = null;
+		lock.lock();
+		try {
+			long nowMillis = deadlineEpochMillis == RequestContext.NO_DEADLINE
+					? 0L
+					: System.currentTimeMillis();
+			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
+				admissionFailure = deadlineFailure("Workload deadline expired before deferred admission");
+				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
+			} else if (shutdown) {
+				admissionFailure = new RejectedExecutionException(poolName + " is shutting down");
+				admissionOutcome = RWScheduler.TerminalOutcome.SHUTDOWN;
+			} else {
+				int waiterCapacity = capacityUnsafe(profile);
+				if (waiterCapacity == 0 || deferredAdmissions.size() >= waiterCapacity) {
+					admissionFailure = RocksDBException.of(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
+							"Deferred workload admission is full for " + profile + " " + family);
+					admissionOutcome = RWScheduler.TerminalOutcome.OVERLOAD;
+				} else {
+					deferred = new DeferredAdmission(this,
+							profile,
+							family,
+							deadlineEpochMillis,
+							sequence++,
+							metricsTimestamp(taskMetrics),
+							cost,
+							command,
+							taskMetrics);
+					deferredAdmissions.addLast(deferred);
+					if (deferred.hasDeadline()) {
+						deferredDeadlines.add(deferred);
+						timedWaitLeader = null;
+					}
+					promoteDeferredUnsafe(profile);
+					ensureWorkersStartedUnsafe();
+					signalWorkerUnsafe();
+				}
+			}
+		} finally {
+			lock.unlock();
+		}
+		pressureController.signalPendingAvailability();
+		if (admissionFailure != null) {
+			completeTerminalAction(command,
+					null,
+					INERT_TASK_METRICS,
+					admissionFailure,
+					Objects.requireNonNull(admissionOutcome));
+			throw admissionFailure;
+		}
+		return Objects.requireNonNull(deferred, "Accepted deferred workload task");
 	}
 
 	RWScheduler.WorkloadExecutor view(WorkloadProfile profile,
@@ -421,10 +503,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				lock.lock();
 				try {
 					long nowMillis = 0L;
-					if (indexedDeadlineCount != 0) {
+					if (indexedDeadlineCount != 0 || !deferredDeadlines.isEmpty()) {
 						nowMillis = System.currentTimeMillis();
+					}
+					if (indexedDeadlineCount != 0) {
 						expireDueUnsafe(nowMillis, terminalActions);
 					}
+					expireDeferredDueUnsafe(nowMillis, terminalActions);
 					task = dispatchUnsafe(nowMillis, terminalActions);
 					if (task == null && shutdown && queuedTotal == 0 && cooperativeTaskCount == 0) {
 						stop = true;
@@ -494,10 +579,16 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private long deadlineWaitNanosUnsafe() {
-		if (indexedDeadlineCount == 0) {
+		if (indexedDeadlineCount == 0 && deferredDeadlines.isEmpty()) {
 			return Long.MAX_VALUE;
 		}
-		long earliestDeadlineMillis = earliestDeadlineUnsafe().deadlineEpochMillis();
+		long earliestDeadlineMillis = indexedDeadlineCount == 0
+				? Long.MAX_VALUE
+				: earliestDeadlineUnsafe().deadlineEpochMillis();
+		if (!deferredDeadlines.isEmpty()) {
+			earliestDeadlineMillis = Math.min(earliestDeadlineMillis,
+					Objects.requireNonNull(deferredDeadlines.peek()).deadlineEpochMillis);
+		}
 		long remainingMillis = earliestDeadlineMillis - System.currentTimeMillis();
 		return remainingMillis <= 0L ? 0L : TimeUnit.MILLISECONDS.toNanos(remainingMillis);
 	}
@@ -1284,6 +1375,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private long validateAccountingUnsafe() {
+		if (deferredAdmissions.size() > capacityUnsafe(WorkloadProfile.BATCH)
+				|| deferredDeadlines.size() > deferredAdmissions.size()) {
+			throw new IllegalStateException("Deferred BATCH admission index mismatch in " + poolName);
+		}
 		if ((long) queuedTotal + activeTotal + parkedTotal != outstandingTotal) {
 			throw new IllegalStateException("Pool outstanding accounting mismatch in " + poolName);
 		}
@@ -1415,6 +1510,61 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return terminalActions;
 	}
 
+	private void expireDeferredDueUnsafe(long nowMillis, List<TerminalAction> terminalActions) {
+		while (!deferredDeadlines.isEmpty()) {
+			var deferred = Objects.requireNonNull(deferredDeadlines.peek());
+			if (nowMillis < deferred.deadlineEpochMillis) {
+				return;
+			}
+			deferredDeadlines.remove();
+			if (!deferred.isWaiting()) {
+				throw new IllegalStateException("Deferred deadline task is not waiting");
+			}
+			if (!deferredAdmissions.remove(deferred)) {
+				throw new IllegalStateException("Deferred deadline task is not admission-indexed");
+			}
+			deferred.markTerminal();
+			terminalActions.add(new TerminalAction(deferred,
+					null,
+					INERT_TASK_METRICS,
+					deadlineFailure("Workload deadline expired while awaiting admission"),
+					RWScheduler.TerminalOutcome.DEADLINE));
+		}
+	}
+
+	private void promoteDeferredUnsafe(WorkloadProfile profile) {
+		if (profile != WorkloadProfile.BATCH) {
+			return;
+		}
+		while (!deferredAdmissions.isEmpty()
+				&& !shutdown
+				&& queuedUnsafe(profile) < capacityUnsafe(profile)
+				&& !outstandingAtLimitUnsafe(profile)) {
+			var deferred = Objects.requireNonNull(deferredAdmissions.removeFirst());
+			if (!deferred.isWaiting()) {
+				continue;
+			}
+			deferred.unlinkDeadlineUnsafe();
+			deferred.markQueued();
+			recordSubmissionAttemptUnsafe(profile);
+			var task = WorkloadTask.normal(profile,
+					deferred.family,
+					deferred.deadlineEpochMillis,
+					deferred.sequence,
+					deferred.enqueuedNanos,
+					deferred.cost,
+					deferred,
+					deferred,
+					deferred.metrics);
+			enqueueUnsafe(task);
+			incrementOutstandingUnsafe(profile);
+			admitCompetitionUnsafe(task);
+			acceptedTasks++;
+			deferred.metrics.recordAdmission(AdmissionResult.ACCEPTED);
+			refreshPreemptionUnsafe();
+		}
+	}
+
 	private void enqueueUnsafe(WorkloadTask task) {
 		int profileIndex = task.profileIndex();
 		if (task.hasProfile(WorkloadProfile.LATENCY)) {
@@ -1494,6 +1644,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
 		decrementQueuedTotalUnsafe();
+		promoteDeferredUnsafe(task.profile());
 	}
 
 	private void unlinkCooperativeQueuedUnsafe(WorkloadTask task) {
@@ -1508,6 +1659,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
 		decrementQueuedTotalUnsafe();
+		promoteDeferredUnsafe(task.profile());
 	}
 
 	private void admitCooperativeTaskUnsafe(WorkloadTask task) {
@@ -1598,6 +1750,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		outstanding[index] = current - 1;
 		outstandingTotal--;
+		promoteDeferredUnsafe(PROFILES[index]);
 	}
 
 	private void markParkedUnsafe(WorkloadTask task) {
@@ -2056,9 +2209,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	@Override
 	public void shutdown() {
+		var terminalActions = new ArrayList<TerminalAction>();
 		lock.lock();
 		try {
 			shutdown = true;
+			rejectDeferredUnsafe(new RejectedExecutionException(poolName + " is shutting down"),
+					RWScheduler.TerminalOutcome.SHUTDOWN,
+					terminalActions);
 			timedWaitLeader = null;
 			if (startedWorkers == 0) {
 				terminated = true;
@@ -2067,6 +2224,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} finally {
 			lock.unlock();
 		}
+		completeTerminalActions(terminalActions);
 	}
 
 	@Override
@@ -2076,6 +2234,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		lock.lock();
 		try {
 			shutdown = true;
+			rejectDeferredUnsafe(new RejectedExecutionException(poolName + " was forced to shut down"),
+					RWScheduler.TerminalOutcome.SHUTDOWN,
+					terminalActions);
 			timedWaitLeader = null;
 			for (var profile : PROFILES) {
 				while (queuedUnsafe(profile) > 0) {
@@ -2117,6 +2278,27 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		pressureController.signalPendingAvailability();
 		completeTerminalActions(terminalActions);
 		return remaining;
+	}
+
+	private void rejectDeferredUnsafe(RuntimeException failure,
+	                                  RWScheduler.TerminalOutcome outcome,
+	                                  List<TerminalAction> terminalActions) {
+		while (!deferredAdmissions.isEmpty()) {
+			var deferred = Objects.requireNonNull(deferredAdmissions.removeFirst());
+			if (!deferred.isWaiting()) {
+				continue;
+			}
+			deferred.unlinkDeadlineUnsafe();
+			deferred.markTerminal();
+			terminalActions.add(new TerminalAction(deferred,
+					null,
+					INERT_TASK_METRICS,
+					failure,
+					outcome));
+		}
+		if (!deferredDeadlines.isEmpty()) {
+			throw new IllegalStateException("Shutdown left deferred workload deadlines indexed");
+		}
 	}
 
 	@Override
@@ -2178,6 +2360,159 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		public RWScheduler.CooperativeHandle executeCooperatively(RWScheduler.CooperativeTask command,
 		                                                          long estimatedBytes) {
 			return owner.executeCooperatively(profile, family, deadlineEpochMillis, estimatedBytes, command);
+		}
+	}
+
+	private void cancelDeferred(DeferredAdmission deferred) {
+		List<TerminalAction> terminalActions = null;
+		lock.lock();
+		try {
+			if (deferred.isWaiting()) {
+				if (!deferredAdmissions.remove(deferred)) {
+					throw new IllegalStateException("Deferred workload task is not waiting");
+				}
+				deferred.unlinkDeadlineUnsafe();
+				deferred.markCancelled();
+			} else if (deferred.isQueued()) {
+				var task = cancellationIndex.first(deferred, deferred.profile, deferred.family);
+				if (task == null) {
+					throw new IllegalStateException("Deferred workload task is not queued");
+				}
+				deferred.markCancelled();
+				terminalActions = new ArrayList<>(1);
+				unlinkUnsafe(task);
+				if (!terminateUnsafe(task,
+						RWScheduler.TerminalOutcome.CANCELLATION,
+						new CancellationException("Deferred workload admission cancelled while queued"),
+						terminalActions)) {
+					throw new IllegalStateException("Deferred workload cancellation did not terminate the task");
+				}
+				refreshPreemptionUnsafe();
+				signalWorkerUnsafe();
+			}
+		} finally {
+			lock.unlock();
+		}
+		pressureController.signalPendingAvailability();
+		completeTerminalActions(terminalActions);
+	}
+
+	private static final class DeferredAdmission implements Runnable,
+			Disposable,
+			CancellationTrackedTask,
+			RWScheduler.RejectionAwareTask {
+
+		private static final int WAITING = 0;
+		private static final int QUEUED = 1;
+		private static final int RUNNING = 2;
+		private static final int TERMINAL = 3;
+		private static final int CANCELLED = 4;
+
+		private final ProfiledWorkloadExecutor owner;
+		private final WorkloadProfile profile;
+		private final OperationFamily family;
+		private final long deadlineEpochMillis;
+		private final long sequence;
+		private final long enqueuedNanos;
+		private final int cost;
+		private final Runnable command;
+		private final TaskMetrics metrics;
+		private volatile int state = WAITING;
+
+		private DeferredAdmission(ProfiledWorkloadExecutor owner,
+				WorkloadProfile profile,
+				OperationFamily family,
+				long deadlineEpochMillis,
+				long sequence,
+				long enqueuedNanos,
+				int cost,
+				Runnable command,
+				TaskMetrics metrics) {
+			this.owner = owner;
+			this.profile = profile;
+			this.family = family;
+			this.deadlineEpochMillis = deadlineEpochMillis;
+			this.sequence = sequence;
+			this.enqueuedNanos = enqueuedNanos;
+			this.cost = cost;
+			this.command = command;
+			this.metrics = metrics;
+		}
+
+		@Override
+		public void run() {
+			try {
+				command.run();
+			} finally {
+				markTerminal();
+			}
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			try {
+				((RWScheduler.RejectionAwareTask) command).reject(failure);
+			} finally {
+				markTerminal();
+			}
+		}
+
+		@Override
+		public void dispose() {
+			owner.cancelDeferred(this);
+		}
+
+		@Override
+		public boolean isDisposed() {
+			return state >= TERMINAL;
+		}
+
+		@Override
+		public boolean workloadCancellationRequested() {
+			return state == CANCELLED;
+		}
+
+		@Override
+		public boolean claimWorkloadDispatch() {
+			if (state == QUEUED) {
+				state = RUNNING;
+			}
+			return state == RUNNING;
+		}
+
+		private boolean isWaiting() {
+			return state == WAITING;
+		}
+
+		private boolean isQueued() {
+			return state == QUEUED;
+		}
+
+		private boolean hasDeadline() {
+			return deadlineEpochMillis != RequestContext.NO_DEADLINE;
+		}
+
+		private void unlinkDeadlineUnsafe() {
+			if (hasDeadline() && !owner.deferredDeadlines.remove(this)) {
+				throw new IllegalStateException("Deferred workload deadline is not indexed");
+			}
+		}
+
+		private void markQueued() {
+			if (state != WAITING) {
+				throw new IllegalStateException("Deferred workload task is not waiting");
+			}
+			state = QUEUED;
+		}
+
+		private void markCancelled() {
+			state = CANCELLED;
+		}
+
+		private void markTerminal() {
+			if (state != CANCELLED) {
+				state = TERMINAL;
+			}
 		}
 	}
 
