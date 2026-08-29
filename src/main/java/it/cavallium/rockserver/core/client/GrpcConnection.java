@@ -65,6 +65,7 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -83,6 +84,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -1668,14 +1670,38 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	private static final class RetryLoggingInterceptor implements ClientInterceptor {
 
+		private static final long DEFAULT_WARNING_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
+		private static final int DEFAULT_MAX_WARNING_KEYS = 256;
+
 		private final Consumer<String> warningLogger;
+		private final LongSupplier nanoTimeSource;
+		private final long warningIntervalNanos;
+		private final int maxWarningKeys;
+		private final LinkedHashMap<WarningKey, WarningState> warningStates =
+				new LinkedHashMap<>(16, 0.75f, true);
 
 		private RetryLoggingInterceptor() {
 			this(LOG::warn);
 		}
 
 		private RetryLoggingInterceptor(Consumer<String> warningLogger) {
+			this(warningLogger, System::nanoTime, DEFAULT_WARNING_INTERVAL_NANOS, DEFAULT_MAX_WARNING_KEYS);
+		}
+
+		private RetryLoggingInterceptor(Consumer<String> warningLogger,
+				LongSupplier nanoTimeSource,
+				long warningIntervalNanos,
+				int maxWarningKeys) {
 			this.warningLogger = Objects.requireNonNull(warningLogger, "warningLogger");
+			this.nanoTimeSource = Objects.requireNonNull(nanoTimeSource, "nanoTimeSource");
+			if (warningIntervalNanos <= 0) {
+				throw new IllegalArgumentException("warningIntervalNanos must be positive");
+			}
+			if (maxWarningKeys <= 0) {
+				throw new IllegalArgumentException("maxWarningKeys must be positive");
+			}
+			this.warningIntervalNanos = warningIntervalNanos;
+			this.maxWarningKeys = maxWarningKeys;
 		}
 
 		private static String terminalStatusWarning(MethodDescriptor<?, ?> method, Status status) {
@@ -1684,6 +1710,38 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			return "gRPC call to " + method.getFullMethodName()
 					+ " reached terminal status " + status.getCode()
 					+ ". No further automatic retry will be attempted by gRPC.";
+		}
+
+		private void logTerminalStatusWarning(MethodDescriptor<?, ?> method, Status status) {
+			var key = new WarningKey(method.getFullMethodName(), status.getCode());
+			var nowNanos = nanoTimeSource.getAsLong();
+			long suppressedCount;
+			synchronized (warningStates) {
+				var state = warningStates.get(key);
+				if (state == null) {
+					if (warningStates.size() == maxWarningKeys) {
+						var eldest = warningStates.entrySet().iterator();
+						eldest.next();
+						eldest.remove();
+					}
+					warningStates.put(key, new WarningState(nowNanos + warningIntervalNanos));
+					suppressedCount = 0;
+				} else if (nowNanos - state.nextWarningNanos >= 0) {
+					suppressedCount = state.suppressedCount;
+					state.suppressedCount = 0;
+					state.nextWarningNanos = nowNanos + warningIntervalNanos;
+				} else {
+					state.suppressedCount++;
+					return;
+				}
+			}
+
+			var warning = terminalStatusWarning(method, status);
+			if (suppressedCount > 0) {
+				warning += " Suppressed " + suppressedCount
+						+ " additional terminal warnings for this method and status since the previous warning.";
+			}
+			warningLogger.accept(warning);
 		}
 
 		@Override
@@ -1696,7 +1754,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 						@Override
 						public void onClose(Status status, Metadata trailers) {
 							if (!status.isOk() && isAutomaticallyRetryableStatus(status.getCode())) {
-								warningLogger.accept(terminalStatusWarning(method, status));
+								logTerminalStatusWarning(method, status);
 							}
 							super.onClose(status, trailers);
 						}
@@ -1704,6 +1762,18 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 					super.start(loggingListener, headers);
 				}
 			};
+		}
+
+		private record WarningKey(String methodName, Code statusCode) {}
+
+		private static final class WarningState {
+
+			private long nextWarningNanos;
+			private long suppressedCount;
+
+			private WarningState(long nextWarningNanos) {
+				this.nextWarningNanos = nextWarningNanos;
+			}
 		}
 	}
 

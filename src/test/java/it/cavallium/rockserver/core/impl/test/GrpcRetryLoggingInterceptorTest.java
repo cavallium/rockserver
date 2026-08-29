@@ -22,6 +22,8 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.List;
@@ -29,7 +31,9 @@ import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -61,6 +65,7 @@ class GrpcRetryLoggingInterceptorTest {
 	private final AtomicInteger retryThenSucceedCalls = new AtomicInteger();
 	private final AtomicInteger alwaysUnavailableCalls = new AtomicInteger();
 	private final AtomicInteger nonRetryableCalls = new AtomicInteger();
+	private final AtomicLong nanoTime = new AtomicLong();
 	private final List<String> warnings = new CopyOnWriteArrayList<>();
 	private Server server;
 	private ManagedChannel channel;
@@ -96,7 +101,8 @@ class GrpcRetryLoggingInterceptorTest {
 				.enableRetry()
 				.maxRetryAttempts(3)
 				.defaultServiceConfig(retryServiceConfig())
-				.intercept(retryLoggingInterceptor(warnings::add))
+				.intercept(retryLoggingInterceptor(warnings::add, nanoTime::get,
+						TimeUnit.MINUTES.toNanos(1), 256))
 				.build();
 	}
 
@@ -147,6 +153,69 @@ class GrpcRetryLoggingInterceptorTest {
 		), warnings);
 	}
 
+	@Test
+	void burstOfTerminalFailuresLogsOnlyTheImmediateWarning() {
+		for (int call = 0; call < 8; call++) {
+			assertThrows(StatusRuntimeException.class, () -> call(ALWAYS_UNAVAILABLE));
+		}
+
+		assertEquals(24, alwaysUnavailableCalls.get(), "every logical call must still exhaust all three attempts");
+		assertEquals(1, warnings.size(), "failures within one interval must be coalesced");
+		assertFalse(warnings.getFirst().contains("Suppressed"),
+				"the immediate warning has no earlier failures to summarize");
+	}
+
+	@Test
+	void nextIntervalWarningReportsTheCoalescedSuppressedCount() {
+		assertThrows(StatusRuntimeException.class, () -> call(ALWAYS_UNAVAILABLE));
+		for (int call = 0; call < 6; call++) {
+			assertThrows(StatusRuntimeException.class, () -> call(ALWAYS_UNAVAILABLE));
+		}
+		assertEquals(1, warnings.size());
+
+		nanoTime.set(TimeUnit.MINUTES.toNanos(1));
+		assertThrows(StatusRuntimeException.class, () -> call(ALWAYS_UNAVAILABLE));
+
+		assertEquals(2, warnings.size());
+		assertEquals(
+				"gRPC call to retry.logging.Test/AlwaysUnavailable reached terminal status UNAVAILABLE. "
+						+ "No further automatic retry will be attempted by gRPC. "
+						+ "Suppressed 6 additional terminal warnings for this method and status since the previous warning.",
+				warnings.get(1));
+	}
+
+	@Test
+	void methodAndStatusCombinationsHaveDistinctRateLimitState() throws ReflectiveOperationException {
+		var localWarnings = new CopyOnWriteArrayList<String>();
+		var interceptor = retryLoggingInterceptor(localWarnings::add, () -> 0L, 100L, 8);
+		var otherMethod = method("OtherUnavailable");
+
+		logTerminalWarning(interceptor, ALWAYS_UNAVAILABLE, Status.UNAVAILABLE);
+		logTerminalWarning(interceptor, ALWAYS_UNAVAILABLE, Status.UNAVAILABLE);
+		logTerminalWarning(interceptor, ALWAYS_UNAVAILABLE, Status.RESOURCE_EXHAUSTED);
+		logTerminalWarning(interceptor, ALWAYS_UNAVAILABLE, Status.RESOURCE_EXHAUSTED);
+		logTerminalWarning(interceptor, otherMethod, Status.UNAVAILABLE);
+		logTerminalWarning(interceptor, otherMethod, Status.UNAVAILABLE);
+
+		assertEquals(3, localWarnings.size());
+		assertTrue(localWarnings.get(0).contains("AlwaysUnavailable reached terminal status UNAVAILABLE"));
+		assertTrue(localWarnings.get(1).contains("AlwaysUnavailable reached terminal status RESOURCE_EXHAUSTED"));
+		assertTrue(localWarnings.get(2).contains("OtherUnavailable reached terminal status UNAVAILABLE"));
+	}
+
+	@Test
+	void rateLimitStateRetainsOnlyTheConfiguredNumberOfKeys() throws ReflectiveOperationException {
+		var localWarnings = new CopyOnWriteArrayList<String>();
+		var interceptor = retryLoggingInterceptor(localWarnings::add, () -> 0L, 100L, 3);
+
+		for (int index = 0; index < 20; index++) {
+			logTerminalWarning(interceptor, method("Dynamic" + index), Status.UNAVAILABLE);
+		}
+
+		assertEquals(3, warningStateSize(interceptor));
+		assertEquals(20, localWarnings.size(), "a newly observed key still receives its immediate warning");
+	}
+
 	private StringValue call(MethodDescriptor<StringValue, StringValue> method) {
 		return ClientCalls.blockingUnaryCall(channel, method,
 				CallOptions.DEFAULT.withDeadlineAfter(10, TimeUnit.SECONDS), StringValue.of("request"));
@@ -177,12 +246,31 @@ class GrpcRetryLoggingInterceptorTest {
 				.build();
 	}
 
-	private static ClientInterceptor retryLoggingInterceptor(Consumer<String> warningLogger)
-			throws ReflectiveOperationException {
+	private static ClientInterceptor retryLoggingInterceptor(Consumer<String> warningLogger,
+			LongSupplier nanoTimeSource,
+			long warningIntervalNanos,
+			int maxWarningKeys) throws ReflectiveOperationException {
 		Class<?> interceptorClass = Class.forName(
 				"it.cavallium.rockserver.core.client.GrpcConnectionDelegate$RetryLoggingInterceptor");
-		Constructor<?> constructor = interceptorClass.getDeclaredConstructor(Consumer.class);
+		Constructor<?> constructor = interceptorClass.getDeclaredConstructor(
+				Consumer.class, LongSupplier.class, long.class, int.class);
 		constructor.setAccessible(true);
-		return (ClientInterceptor) constructor.newInstance(warningLogger);
+		return (ClientInterceptor) constructor.newInstance(
+				warningLogger, nanoTimeSource, warningIntervalNanos, maxWarningKeys);
+	}
+
+	private static void logTerminalWarning(ClientInterceptor interceptor,
+			MethodDescriptor<?, ?> method,
+			Status status) throws ReflectiveOperationException {
+		Method logMethod = interceptor.getClass().getDeclaredMethod(
+				"logTerminalStatusWarning", MethodDescriptor.class, Status.class);
+		logMethod.setAccessible(true);
+		logMethod.invoke(interceptor, method, status);
+	}
+
+	private static int warningStateSize(ClientInterceptor interceptor) throws ReflectiveOperationException {
+		Field statesField = interceptor.getClass().getDeclaredField("warningStates");
+		statesField.setAccessible(true);
+		return ((Map<?, ?>) statesField.get(interceptor)).size();
 	}
 }
