@@ -366,6 +366,151 @@ class ScanRawCompactionSafetyTest {
 	}
 
 	@Test
+	void finalFullBatchCompletesWithoutRequiringDemandBeyondItsLastEmission(@TempDir Path tempDir)
+			throws Exception {
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"),
+				"scan-raw-final-full-batch", null)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = api.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			api.put(0,
+					columnId,
+					key(1),
+					Buf.wrap(new byte[3 * 1024 * 1024]),
+					RequestType.none());
+			api.flush();
+
+			var firstQuantumResult = new AtomicReference<RWScheduler.CooperativeResult>();
+			var firstQuantumRan = new AtomicBoolean();
+			RWScheduler.WorkloadExecutor oneQuantumExecutor = new RWScheduler.WorkloadExecutor() {
+				@Override
+				public void execute(Runnable command) {
+					throw new AssertionError("raw scan must use cooperative execution");
+				}
+
+				@Override
+				public void execute(Runnable command, long estimatedBytes) {
+					throw new AssertionError("raw scan must use cooperative execution");
+				}
+
+				@Override
+				public RWScheduler.CooperativeHandle executeCooperatively(
+						RWScheduler.CooperativeTask command,
+						long estimatedBytes) {
+					var completion = (RWScheduler.CooperativeCompletionTask) command;
+					return new RWScheduler.CooperativeHandle() {
+						private final AtomicBoolean disposed = new AtomicBoolean();
+
+						@Override
+						public void resume() {
+							if (!firstQuantumRan.compareAndSet(false, true)) {
+								return;
+							}
+							var failure = new AtomicReference<RuntimeException>();
+							var result = command.runCooperatively(new RWScheduler.CooperativeContext() {
+								@Override
+								public boolean preemptionRequested() {
+									return false;
+								}
+
+								@Override
+								public boolean terminationRequested() {
+									return false;
+								}
+
+								@Override
+								public RuntimeException terminationFailure() {
+									return failure.get();
+								}
+
+								@Override
+								public boolean fail(RuntimeException error) {
+									return failure.compareAndSet(null, error);
+								}
+							});
+							firstQuantumResult.set(result);
+							var terminalFailure = failure.get();
+							if (terminalFailure != null) {
+								command.reject(terminalFailure);
+								disposed.set(true);
+							} else if (result == RWScheduler.CooperativeResult.COMPLETE) {
+								completion.completeCooperatively();
+								disposed.set(true);
+							}
+						}
+
+						@Override
+						public void dispose() {
+							if (disposed.compareAndSet(false, true)) {
+								command.reject(new java.util.concurrent.CancellationException());
+							}
+						}
+
+						@Override
+						public boolean isDisposed() {
+							return disposed.get();
+						}
+					};
+				}
+			};
+			var receivedBatches = new AtomicInteger();
+			var receivedRows = new AtomicInteger();
+			var completed = new AtomicBoolean();
+			var failure = new AtomicReference<Throwable>();
+			var terminal = new CountDownLatch(1);
+			class OneBatchSubscriber extends BaseSubscriber<SerializedKVBatch> {
+				@Override
+				protected void hookOnSubscribe(org.reactivestreams.Subscription subscription) {
+					request(1L);
+				}
+
+				@Override
+				protected void hookOnNext(SerializedKVBatch batch) {
+					receivedBatches.incrementAndGet();
+					receivedRows.addAndGet(Math.toIntExact(batch.decode().count()));
+				}
+
+				@Override
+				protected void hookOnComplete() {
+					completed.set(true);
+					terminal.countDown();
+				}
+
+				@Override
+				protected void hookOnError(Throwable error) {
+					failure.set(error);
+					terminal.countDown();
+				}
+			}
+			var subscriber = new OneBatchSubscriber();
+			try {
+				internal.scanRawAsyncInternal(
+						columnId,
+						0,
+						1,
+						reactor.core.scheduler.Schedulers.immediate(),
+						oneQuantumExecutor).subscribe(subscriber);
+				assertTrue(awaitCondition(() -> firstQuantumResult.get() != null, Duration.ofSeconds(5)),
+						"raw scan did not execute its first cooperative quantum");
+				assertEquals(RWScheduler.CooperativeResult.COMPLETE, firstQuantumResult.get(),
+						"EOF behind the full final batch must be discovered in the same demand-bearing quantum");
+				assertTrue(terminal.await(5, TimeUnit.SECONDS),
+						"EOF after a full final batch must complete without a second request");
+				assertNull(failure.get());
+				assertTrue(completed.get());
+				assertEquals(1, receivedBatches.get());
+				assertEquals(1, receivedRows.get());
+				assertTrue(awaitCondition(() -> internal.getPendingOpsCount() == 0L
+						&& internal.getRawScanPinnedFilesForTesting().isEmpty(), Duration.ofSeconds(5)),
+						"terminal publication must follow raw-scan native and pin cleanup");
+			} finally {
+				subscriber.dispose();
+			}
+		}
+	}
+
+	@Test
 	void yieldedPartialBatchConsumesDemandAndParksUntilMoreIsRequested(@TempDir Path tempDir)
 			throws Exception {
 		Path configFile = tempDir.resolve("scan-raw-backpressure.conf");
