@@ -47,6 +47,7 @@ impl std::error::Error for RockserverConnectError {
 pub struct RockserverClient {
     client: RocksDbServiceClient<Channel>,
 	context: RequestContext,
+	resumable_raw_scan: bool,
 }
 
 impl RockserverClient {
@@ -65,26 +66,26 @@ impl RockserverClient {
 		let mut client = RocksDbServiceClient::connect(dst)
 			.await
 			.map_err(RockserverConnectError::Transport)?;
-		Self::require_capabilities(&mut client)
+		let resumable_raw_scan = Self::require_capabilities(&mut client)
 			.await
 			.map_err(RockserverConnectError::Capabilities)?;
-		Ok(Self { client, context })
+		Ok(Self { client, context, resumable_raw_scan })
     }
 
 	/// Creates a new client from an existing Tonic `Channel` after the mandatory
 	/// workload-contract capability handshake.
 	pub async fn new(channel: Channel, context: RequestContext) -> Result<Self> {
 		let mut client = RocksDbServiceClient::new(channel);
-		Self::require_capabilities(&mut client).await?;
-		Ok(Self { client, context })
+		let resumable_raw_scan = Self::require_capabilities(&mut client).await?;
+		Ok(Self { client, context, resumable_raw_scan })
 	}
 
 	#[cfg(test)]
 	fn new_unchecked(channel: Channel, context: RequestContext) -> Self {
-		Self { client: RocksDbServiceClient::new(channel), context }
+		Self { client: RocksDbServiceClient::new(channel), context, resumable_raw_scan: false }
 	}
 
-	async fn require_capabilities(client: &mut RocksDbServiceClient<Channel>) -> Result<()> {
+	async fn require_capabilities(client: &mut RocksDbServiceClient<Channel>) -> Result<bool> {
 		let mut request = Request::new(CapabilitiesRequest {});
 		request.set_timeout(Duration::from_secs(10));
 		let capabilities = client.get_capabilities(request).await?.into_inner();
@@ -98,7 +99,7 @@ impl RockserverClient {
 				capabilities.bounded_range,
 			)));
 		}
-		Ok(())
+		Ok(capabilities.resumable_raw_scan)
 	}
 
 	/// Returns a client view that applies one mandatory workload context to every generic request.
@@ -107,6 +108,7 @@ impl RockserverClient {
 		Self {
 			client: self.client.clone(),
 			context,
+			resumable_raw_scan: self.resumable_raw_scan,
 		}
 	}
 
@@ -1095,15 +1097,50 @@ impl RockserverClient {
 			shard_index,
 			shard_count,
 			context: Some(self.context.clone()),
+			completed_sst_tokens: Vec::new(),
+			resumable: false,
+			coalesce_completed_sst_token: false,
 		};
 		let resp = self.client.clone().scan_raw(self.contextual_request(req)?).await?;
         Ok(resp.into_inner().map(|res| {
             match res {
-                Ok(batch) => decode_kv_batch(&batch.serialized),
+				Ok(response) => match response.event {
+					Some(scan_raw_response::Event::Serialized(serialized))
+							if response.completed_sst_token_after_batch.is_none() => decode_kv_batch(&serialized),
+					_ => Err(Status::internal("Rockserver returned a resumable event to a legacy raw scan")),
+				},
                 Err(e) => Err(e),
             }
         }))
     }
+
+	/// Scans immutable SSTs with durable completion tokens. A caller may pass
+	/// tokens checkpointed by an earlier attempt; live matching SSTs are skipped.
+	pub async fn scan_raw_resumable(
+		&self,
+		column_id: i64,
+		shard_index: i32,
+		shard_count: i32,
+		completed_ssts: impl IntoIterator<Item = RawSstToken>,
+	) -> Result<impl Stream<Item = Result<RawScanEvent>>> {
+		if !self.resumable_raw_scan {
+			return Err(Status::unimplemented("connected Rockserver does not support resumable raw scans"));
+		}
+		let req = ScanRawRequest {
+			column_id,
+			shard_index,
+			shard_count,
+			context: Some(self.context.clone()),
+			completed_sst_tokens: completed_ssts
+				.into_iter()
+				.map(RawSstToken::into_string)
+				.collect(),
+			resumable: true,
+			coalesce_completed_sst_token: true,
+		};
+		let resp = self.client.clone().scan_raw(self.contextual_request(req)?).await?;
+		Ok(resp.into_inner().map(|result| result.and_then(decode_raw_scan_event)))
+	}
 
     // ============================================================================================
     // Maintenance
@@ -1379,6 +1416,31 @@ impl RockserverClient {
     }
 }
 
+fn decode_raw_scan_event(response: ScanRawResponse) -> Result<RawScanEvent> {
+	let ScanRawResponse { event, completed_sst_token_after_batch } = response;
+	match event {
+		Some(scan_raw_response::Event::Serialized(serialized)) => {
+			let completed_sst_token = completed_sst_token_after_batch
+				.map(RawSstToken::new)
+				.transpose()
+				.map_err(Status::internal)?;
+			Ok(RawScanEvent::Batch {
+				batch: decode_kv_batch(&serialized)?,
+				completed_sst_token,
+			})
+		}
+		Some(scan_raw_response::Event::CompletedSstToken(token)) => {
+			if completed_sst_token_after_batch.is_some() {
+				return Err(Status::internal("Rockserver returned two completion tokens in one raw-scan event"));
+			}
+			Ok(RawScanEvent::SstCompleted(
+				RawSstToken::new(token).map_err(Status::internal)?,
+			))
+		}
+		None => Err(Status::internal("Rockserver returned an empty resumable raw-scan event")),
+	}
+}
+
 fn decode_kv_batch(mut buf: &[u8]) -> Result<KvBatch> {
     use std::convert::TryInto;
 
@@ -1465,5 +1527,47 @@ mod workload_context_tests {
 			.await
 			.unwrap_err();
 		assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+	}
+
+	#[test]
+	fn resumable_raw_scan_decodes_coalesced_completion_without_extra_event() {
+		let event = decode_raw_scan_event(ScanRawResponse {
+			event: Some(scan_raw_response::Event::Serialized(vec![0, 0, 0, 0])),
+			completed_sst_token_after_batch: Some("/000123.sst".to_owned()),
+		}).unwrap();
+
+		assert_eq!(event, RawScanEvent::Batch {
+			batch: KvBatch { entries: Vec::new() },
+			completed_sst_token: Some(RawSstToken::new("/000123.sst".to_owned()).unwrap()),
+		});
+	}
+
+	#[test]
+	fn resumable_raw_scan_decodes_empty_sst_completion() {
+		let event = decode_raw_scan_event(ScanRawResponse {
+			event: Some(scan_raw_response::Event::CompletedSstToken("000456.sst".to_owned())),
+			completed_sst_token_after_batch: None,
+		}).unwrap();
+
+		assert_eq!(event, RawScanEvent::SstCompleted(
+			RawSstToken::new("000456.sst".to_owned()).unwrap()
+		));
+	}
+
+	#[test]
+	fn resumable_raw_scan_rejects_ambiguous_or_malformed_completion() {
+		for response in [
+			ScanRawResponse {
+				event: Some(scan_raw_response::Event::CompletedSstToken("000123.sst".to_owned())),
+				completed_sst_token_after_batch: Some("000124.sst".to_owned()),
+			},
+			ScanRawResponse {
+				event: Some(scan_raw_response::Event::CompletedSstToken("../000123.sst".to_owned())),
+				completed_sst_token_after_batch: None,
+			},
+			ScanRawResponse { event: None, completed_sst_token_after_batch: None },
+		] {
+			assert_eq!(decode_raw_scan_event(response).unwrap_err().code(), tonic::Code::Internal);
+		}
 	}
 }

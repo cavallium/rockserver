@@ -8,6 +8,46 @@ pub use crate::proto::{
     FirstAndLast, CdcEvent,
 };
 
+/// Opaque, database-scoped identity of an immutable RocksDB SST file.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RawSstToken(String);
+
+impl RawSstToken {
+	pub fn new(value: String) -> Result<Self, &'static str> {
+		let without_slash = value.strip_prefix('/').unwrap_or(&value);
+		let digits = without_slash
+			.strip_suffix(".sst")
+			.ok_or("raw SST token must end in .sst")?;
+		if !(6..=20).contains(&digits.len())
+			|| (digits.len() > 6 && digits.starts_with('0'))
+			|| !digits.bytes().all(|byte| byte.is_ascii_digit())
+			|| digits.parse::<u64>().ok().filter(|number| *number != 0).is_none()
+		{
+			return Err("raw SST token must be a canonical RocksDB table filename");
+		}
+		Ok(Self(value))
+	}
+
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+
+	pub fn into_string(self) -> String {
+		self.0
+	}
+}
+
+/// One resumable raw-scan event. A completion token is safe to checkpoint only
+/// after the event carrying it has been consumed successfully.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RawScanEvent {
+	Batch {
+		batch: KvBatch,
+		completed_sst_token: Option<RawSstToken>,
+	},
+	SstCompleted(RawSstToken),
+}
+
 fn workload_profile_wire_value(profile: WorkloadProfile) -> i32 {
 	match profile {
 		WorkloadProfile::Unspecified => 0,

@@ -10,10 +10,12 @@ fn workload_v2_and_bounded_range_capability_are_mandatory() {
     let capability = CapabilitiesResponse {
         workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         bounded_range: true,
+		resumable_raw_scan: true,
     };
     let decoded = CapabilitiesResponse::decode(capability.encode_to_vec().as_slice()).unwrap();
     assert_eq!(decoded.workload_contract_version, 2);
     assert!(decoded.bounded_range);
+	assert!(decoded.resumable_raw_scan);
 }
 
 #[test]

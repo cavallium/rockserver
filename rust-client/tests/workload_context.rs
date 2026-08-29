@@ -3,6 +3,7 @@ use rockserver_client::proto::{
 	put_batch_request, Kv, PutBatchInitialRequest, PutBatchRequest, PutRequest,
 	RequestContext, WorkloadProfile,
 };
+use rockserver_client::RawSstToken;
 
 #[test]
 fn unary_request_retains_mandatory_workload_context() {
@@ -64,6 +65,23 @@ fn typed_context_constructor_rejects_protected_profiles() {
 		WorkloadProfile::PhysicalMaintenance,
 	] {
 		assert!(std::panic::catch_unwind(|| RequestContext::for_profile(profile, i64::MAX)).is_err());
+	}
+}
+
+#[test]
+fn raw_sst_tokens_accept_only_canonical_opaque_table_names() {
+	for valid in ["000001.sst", "/000001.sst", "18446744073709551615.sst"] {
+		assert_eq!(RawSstToken::new(valid.to_owned()).unwrap().as_str(), valid);
+	}
+	for invalid in [
+		"000000.sst",
+		"00001.sst",
+		"0000001.sst",
+		"../000001.sst",
+		"/000001.ldb",
+		"18446744073709551616.sst",
+	] {
+		assert!(RawSstToken::new(invalid.to_owned()).is_err(), "accepted {invalid}");
 	}
 }
 

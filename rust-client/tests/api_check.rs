@@ -1,5 +1,5 @@
 use rockserver_client::proto::Kv;
-use rockserver_client::{ColumnHashType, ColumnSchema, RockserverClient};
+use rockserver_client::{ColumnHashType, ColumnSchema, RawSstToken, RockserverClient};
 
 #[allow(dead_code)]
 async fn ensure_api_compiles(client: &RockserverClient) {
@@ -11,6 +11,12 @@ async fn ensure_api_compiles(client: &RockserverClient) {
         .put_multi_ensure(0, 1, futures::stream::empty::<Kv>())
         .await
         .unwrap();
+	let _resumable = client.scan_raw_resumable(
+		1,
+		0,
+		1,
+		[RawSstToken::new("000123.sst".to_owned()).unwrap()],
+	);
 }
 
 #[tokio::test]
