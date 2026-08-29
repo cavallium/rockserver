@@ -77,6 +77,18 @@ class PressurePerformanceContractTest {
 		var missingResult = PressurePerformanceContract.evaluateScheduler(
 				repeated(baseline), repeated(missing), List.of());
 		assertFalse(missingResult.automaticAcceptancePassed());
+		assertTrue(missingResult.failures().stream().anyMatch(failure ->
+				failure.equals("missing candidate metric profile.batch.maximum_progress_gap_nanos")));
+
+		int[] signalCounts = {64};
+		Map<String, Double> signalBaseline = signalMetrics(signalCounts, 100.0d);
+		var signalMissing = new LinkedHashMap<>(signalBaseline);
+		signalMissing.remove("case.disabled_limits.cf_64.latency_p99_nanos");
+		var missingSignalResult = PressurePerformanceContract.evaluateSignal(
+				signalCounts, repeated(signalBaseline), repeated(signalMissing), List.of());
+		assertFalse(missingSignalResult.automaticAcceptancePassed());
+		assertTrue(missingSignalResult.failures().stream().anyMatch(failure ->
+				failure.equals("missing candidate metric case.disabled_limits.cf_64.latency_p99_nanos")));
 
 		var shortRuns = new ArrayList<>(repeated(baseline));
 		shortRuns.removeLast();

@@ -146,16 +146,23 @@ public final class PressurePerformanceContract {
 			List<String> structuralFailures,
 			boolean requireMaterialImprovement) {
 		var failures = new ArrayList<>(structuralFailures);
-		if (baseline.size() != PairedPerformanceContract.REQUIRED_PAIRS
-				|| candidate.size() != PairedPerformanceContract.REQUIRED_PAIRS) {
+		boolean validPairCount = baseline.size() == PairedPerformanceContract.REQUIRED_PAIRS
+				&& candidate.size() == PairedPerformanceContract.REQUIRED_PAIRS;
+		if (!validPairCount) {
 			failures.add("exactly " + PairedPerformanceContract.REQUIRED_PAIRS
 					+ " counterbalanced pairs are required");
 		}
 		var samples = new LinkedHashMap<String, PairedPerformanceContract.MetricSamples>();
-		if (failures.size() == structuralFailures.size()) {
+		if (validPairCount) {
 			for (var specification : specifications) {
 				double[] baselineValues = values(baseline, specification.name());
 				double[] candidateValues = values(candidate, specification.name());
+				if (baselineValues == null) {
+					failures.add("missing baseline metric " + specification.name());
+				}
+				if (candidateValues == null) {
+					failures.add("missing candidate metric " + specification.name());
+				}
 				if (baselineValues != null && candidateValues != null) {
 					samples.put(specification.name(),
 							new PairedPerformanceContract.MetricSamples(baselineValues, candidateValues));
