@@ -94,3 +94,34 @@ stricter than a priority hint. For example, `LATENCY + FULL_SCAN_AGGREGATE` is r
 an exact count cannot silently enter the chat-extremes lane. CDC-required internal flush
 is `CDC + FLUSH`, while an explicit manual flush is
 `PHYSICAL_MAINTENANCE + FLUSH`.
+
+## Physical scheduler-pool routing
+
+Profile validation and physical resource routing are separate, exhaustive decisions.
+After `WorkloadAdmission` accepts a profile/family pair, `RWScheduler.resourcePool`
+maps it exactly once:
+
+| Accepted work | Pool |
+| --- | --- |
+| `CONTROL` | isolated control pool |
+| `PHYSICAL_MAINTENANCE` | isolated physical pool |
+| non-protected `MUTATION`, plus CDC-owned `FLUSH` | write pool |
+| `METADATA`, `POINT_LOOKUP`, `BOUNDARY_SEEK`, `BOUNDED_FAN_OUT`, `RANGE_PAGE`, `FULL_SCAN_AGGREGATE`, `WAL_PAGE` | read pool |
+
+`ANALYTICAL` currently has only read-side families. Its queue capacity and active limit
+therefore exist only in the read pool; a small write pool must not lower the configured
+analytical read concurrency or create dead write-side gauges. LATENCY, INGEST, CDC, and
+BATCH have both read- and write-side families, so their configured queue capacity applies
+independently to each pool.
+
+Configuration validation rejects any combination whose aggregate queue, outstanding, or
+worker bounds cannot fit the scheduler's signed primitive counters. Runtime aggregate
+accessors use exact arithmetic as a second line of defense and fail loudly instead of
+publishing wrapped negative telemetry.
+
+The high-frequency pool telemetry API copies into a caller-owned primitive array. Its
+scalar region includes worker/utilization and exact conservation counters; named profile
+offsets then contain queued and active counts. Immutable pool snapshots remain authoritative
+for per-outcome, parked, outstanding, drain, and conservation diagnosis. Gauges are created
+only for profile/pool pairs that can actually route work, keeping permanent metric cardinality
+bounded. Profile/family timers and counters must likewise use the single physical route above.

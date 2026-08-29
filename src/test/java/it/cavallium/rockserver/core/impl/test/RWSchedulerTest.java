@@ -60,11 +60,73 @@ class RWSchedulerTest {
 			release.countDown();
 			assertTrue(queuedCompleted.await(5, SECONDS));
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
-			assertPoolTelemetryMatchesSnapshot(scheduler, RWScheduler.Pool.READ);
+			for (var pool : RWScheduler.Pool.values()) {
+				assertPoolTelemetryMatchesSnapshot(scheduler, pool);
+			}
 		} finally {
 			release.countDown();
 			scheduler.dispose();
 		}
+	}
+
+	@Test
+	void primitiveTelemetrySchemaIsBoundedAndWarmedCopiesAllocateNothing() {
+		assertEquals(RWScheduler.POOL_TELEMETRY_SCALARS,
+				RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE);
+		assertEquals(RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.values().length,
+				RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE);
+		assertEquals(RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE + WorkloadProfile.values().length,
+				RWScheduler.POOL_TELEMETRY_LENGTH);
+		var scheduler = scheduler(1, "primitive-telemetry-allocation");
+		var telemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH + 1];
+		try {
+			for (int iteration = 0; iteration < 100_000; iteration++) {
+				scheduler.copyPoolTelemetry(RWScheduler.Pool.READ, telemetry);
+			}
+			java.util.Arrays.fill(telemetry, -1L);
+			var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory
+					.getThreadMXBean();
+			if (!threads.isThreadAllocatedMemoryEnabled()) threads.setThreadAllocatedMemoryEnabled(true);
+			long threadId = Thread.currentThread().threadId();
+			for (int iteration = 0; iteration < 256; iteration++) {
+				threads.getThreadAllocatedBytes(threadId);
+			}
+			long minimumAllocated = Long.MAX_VALUE;
+			for (int window = 0; window < 8; window++) {
+				long before = threads.getThreadAllocatedBytes(threadId);
+				for (int iteration = 0; iteration < 250_000; iteration++) {
+					scheduler.copyPoolTelemetry(RWScheduler.Pool.READ, telemetry);
+				}
+				minimumAllocated = Math.min(minimumAllocated,
+						threads.getThreadAllocatedBytes(threadId) - before);
+			}
+			assertEquals(0L, minimumAllocated,
+					"a fully warmed caller-owned telemetry window must remain allocation-free");
+			assertEquals(-1L, telemetry[RWScheduler.POOL_TELEMETRY_LENGTH],
+					"copy must not write beyond the public schema");
+		} finally {
+			scheduler.dispose();
+		}
+	}
+
+	@Test
+	void immutableTelemetryAggregatesFailLoudlyInsteadOfWrapping() {
+		var admission = new RWScheduler.ProfileAdmissionSnapshot(
+				Map.of(WorkloadProfile.LATENCY, Integer.MAX_VALUE,
+						WorkloadProfile.BATCH, 1),
+				Map.of(WorkloadProfile.LATENCY, Integer.MAX_VALUE,
+						WorkloadProfile.BATCH, 1),
+				false);
+		assertThrows(ArithmeticException.class, admission::totalQueued);
+		assertThrows(ArithmeticException.class, admission::totalActive);
+
+		var pool = new RWScheduler.PoolSnapshot(1, 0, 0, 0, 0, 0,
+				0L, 0L, 0L, 0L, 0L,
+				Map.of(), Map.of(), Map.of(), Map.of(), Map.of(),
+				Map.of(RWScheduler.TerminalOutcome.RUN, Long.MAX_VALUE,
+						RWScheduler.TerminalOutcome.FAILURE, 1L),
+				false, 1, List.of(), false, false);
+		assertThrows(ArithmeticException.class, pool::terminalOutcomes);
 	}
 
 	private static void assertPoolTelemetryMatchesSnapshot(RWScheduler scheduler, RWScheduler.Pool pool) {
