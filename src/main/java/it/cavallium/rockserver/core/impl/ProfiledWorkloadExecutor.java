@@ -509,7 +509,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					if (indexedDeadlineCount != 0) {
 						expireDueUnsafe(nowMillis, terminalActions);
 					}
-					expireDeferredDueUnsafe(nowMillis, terminalActions);
+					if (!deferredDeadlines.isEmpty()) {
+						expireDeferredDueUnsafe(nowMillis, terminalActions);
+					}
 					task = dispatchUnsafe(nowMillis, terminalActions);
 					if (task == null && shutdown && queuedTotal == 0 && cooperativeTaskCount == 0) {
 						stop = true;
@@ -626,7 +628,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	                                              List<TerminalAction> terminalActions) {
 		boolean batchEligible = true;
 		while (queuedTotal > 0) {
-			var task = selectCandidateUnsafe(batchEligible);
+			var task = batchEligible ? selectCandidateUnsafe() : selectCandidateUnsafe(false);
 			if (task == null) {
 				return null;
 			}
@@ -1031,6 +1033,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	boolean isExecutingTask() {
 		return EXECUTING_POOL.get() == this;
+	}
+
+	private @Nullable WorkloadTask selectCandidateUnsafe() {
+		return selectCandidateUnsafe(true);
 	}
 
 	private @Nullable WorkloadTask selectCandidateUnsafe(boolean batchEligible) {
@@ -1644,7 +1650,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
 		decrementQueuedTotalUnsafe();
-		promoteDeferredUnsafe(task.profile());
+		if (task.hasProfile(WorkloadProfile.BATCH) && !deferredAdmissions.isEmpty()) {
+			promoteDeferredUnsafe(WorkloadProfile.BATCH);
+		}
 	}
 
 	private void unlinkCooperativeQueuedUnsafe(WorkloadTask task) {
@@ -1659,7 +1667,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.setBatchQueued(resourcePool, false);
 		}
 		decrementQueuedTotalUnsafe();
-		promoteDeferredUnsafe(task.profile());
+		if (task.hasProfile(WorkloadProfile.BATCH) && !deferredAdmissions.isEmpty()) {
+			promoteDeferredUnsafe(WorkloadProfile.BATCH);
+		}
 	}
 
 	private void admitCooperativeTaskUnsafe(WorkloadTask task) {
@@ -1750,7 +1760,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		outstanding[index] = current - 1;
 		outstandingTotal--;
-		promoteDeferredUnsafe(PROFILES[index]);
+		if (index == WorkloadProfile.BATCH.ordinal() && !deferredAdmissions.isEmpty()) {
+			promoteDeferredUnsafe(WorkloadProfile.BATCH);
+		}
 	}
 
 	private void markParkedUnsafe(WorkloadTask task) {
@@ -1859,10 +1871,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.hasProfile(WorkloadProfile.BATCH)) {
 			return;
 		}
-		if (task.competitionActive()) {
-			throw new IllegalStateException("Workload task already publishes competition in " + poolName);
+		if (task.isCooperative()) {
+			if (task.competitionActive()) {
+				throw new IllegalStateException("Workload task already publishes competition in " + poolName);
+			}
+			task.markCompetitionActive();
 		}
-		task.markCompetitionActive();
 		if (competingTasks++ == 0) {
 			pressureController.setPoolCompetition(resourcePool, true);
 		}
@@ -1872,16 +1886,18 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.hasProfile(WorkloadProfile.BATCH)) {
 			return;
 		}
-		if (!task.competitionActive()) {
-			if (task.isCooperative() && task.state() == TaskState.PARKED) {
-				return;
+		if (task.isCooperative()) {
+			if (!task.competitionActive()) {
+				if (task.state() == TaskState.PARKED) {
+					return;
+				}
+				throw new IllegalStateException("Workload task does not publish competition in " + poolName);
 			}
-			throw new IllegalStateException("Workload task does not publish competition in " + poolName);
+			task.markCompetitionInactive();
 		}
 		if (competingTasks <= 0) {
 			throw new IllegalStateException("Competing workload count underflow in " + poolName);
 		}
-		task.markCompetitionInactive();
 		if (--competingTasks == 0) {
 			pressureController.setPoolCompetition(resourcePool, false);
 		}
