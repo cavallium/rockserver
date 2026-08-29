@@ -94,6 +94,38 @@ class WorkloadPressureControllerTest {
 	}
 
 	@Test
+	void repeatedEquivalentPressureSignalKeepsTheCurrentEpisodeAndItsPacing() throws Exception {
+		var controller = Controller.create(1, Duration.ofSeconds(30));
+		controller.setPressured(true);
+		controller.setQueued(RWScheduler.Pool.READ, true);
+		var permit = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
+
+		controller.setPressured(true);
+		controller.finish(permit, RWScheduler.Pool.READ);
+		long deadline = controller.longField("nextBatchNanos");
+		assertEquals(0, controller.allowance(RWScheduler.Pool.READ, deadline - 1L),
+				"polling the same pressure state must not invalidate the active episode");
+		assertEquals(1, controller.allowance(RWScheduler.Pool.READ, deadline));
+	}
+
+	@Test
+	void competingWriteIntervalIsClosedBeforeAndOpenExactlyAtItsDeadline() throws Exception {
+		var controller = Controller.create(
+				4,
+				Duration.ofSeconds(30),
+				Duration.ofSeconds(30),
+				Duration.ofSeconds(30));
+		controller.setQueued(RWScheduler.Pool.WRITE, true);
+		controller.setCompeting(RWScheduler.Pool.READ, true);
+		var permit = controller.requireStart(RWScheduler.Pool.WRITE, ELIGIBLE_TIME);
+		controller.finish(permit, RWScheduler.Pool.WRITE);
+		long deadline = controller.longField("nextCompetingWriteNanos");
+
+		assertEquals(0, controller.allowance(RWScheduler.Pool.WRITE, deadline - 1L));
+		assertEquals(4, controller.allowance(RWScheduler.Pool.WRITE, deadline));
+	}
+
+	@Test
 	void pressureTransitionsNeitherRetroactivelyPaceOldWorkNorRetainAStaleClock() throws Exception {
 		var controller = Controller.create(1, Duration.ofSeconds(30));
 		controller.setQueued(RWScheduler.Pool.READ, true);
