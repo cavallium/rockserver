@@ -651,7 +651,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} catch (VirtualMachineError fatal) {
 			throw fatal;
 		} catch (Throwable error) {
-			recordTaskFailure(task, error);
+			logTaskExecutionFailure(task, error);
 		} finally {
 			EXECUTING_POOL.set(null);
 			finishActive(task, outcome);
@@ -670,7 +670,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} catch (VirtualMachineError fatal) {
 			throw fatal;
 		} catch (Throwable error) {
-			recordTaskFailure(task, error);
+			logTaskExecutionFailure(task, error);
 		} finally {
 			EXECUTING_POOL.set(null);
 			try {
@@ -707,7 +707,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			task.fail(new RejectedExecutionException("Cooperative workload quantum failed", fatal));
 			throw fatal;
 		} catch (Throwable error) {
-			recordTaskFailure(task, error);
+			logTaskExecutionFailure(task, error);
 			var failure = error instanceof RuntimeException runtimeException
 					? runtimeException
 					: new RejectedExecutionException("Cooperative workload quantum failed", error);
@@ -737,7 +737,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			task.fail(new RejectedExecutionException("Cooperative workload quantum failed", fatal));
 			throw fatal;
 		} catch (Throwable error) {
-			recordTaskFailure(task, error);
+			logTaskExecutionFailure(task, error);
 			var failure = error instanceof RuntimeException runtimeException
 					? runtimeException
 					: new RejectedExecutionException("Cooperative workload quantum failed", error);
@@ -1697,6 +1697,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private void recordOutcomeUnsafe(RWScheduler.TerminalOutcome outcome) {
 		outcomes[outcome.ordinal()]++;
+		if (outcome == RWScheduler.TerminalOutcome.FAILURE) {
+			failedTasks++;
+		}
 	}
 
 	private void admitCompetitionUnsafe(WorkloadTask task) {
@@ -2014,17 +2017,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		};
 	}
 
-	private void recordTaskFailure(WorkloadTask task, Throwable failure) {
-		lock.lock();
-		try {
-			failedTasks++;
-		} finally {
-			lock.unlock();
-		}
-		var metrics = task.metrics();
-		if (metrics != INERT_TASK_METRICS) {
-			metrics.failure().increment();
-		}
+	private void logTaskExecutionFailure(WorkloadTask task, Throwable failure) {
 		LOG.error("Workload task failed: pool={}, profile={}, operation={}",
 				poolName,
 				task.profile(),
@@ -3298,6 +3291,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		private void recordOutcome(RWScheduler.TerminalOutcome outcome) {
 			outcomes[outcome.ordinal()].increment();
+			if (outcome == RWScheduler.TerminalOutcome.FAILURE) {
+				failure.increment();
+			}
 			if (outcome == RWScheduler.TerminalOutcome.CANCELLATION) {
 				cancellation.increment();
 			}

@@ -735,8 +735,189 @@ class RWSchedulerCooperativeTest {
 	}
 
 	@Test
+	void cooperativeContextFailureIsCountedInSnapshotAndMeter() throws Exception {
+		var registry = new SimpleMeterRegistry();
+		var scheduler = RWScheduler.forTesting(
+				1, 1, 1, 8, 8, "cooperative-context-failure", registry, "cooperative-failure-db");
+		var expectedFailure = new IllegalStateException("expected context failure");
+		var task = new ContextFailureTask(expectedFailure);
+		try {
+			var handle = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+
+			assertTrue(task.terminal.await(5, SECONDS));
+			assertTrue(task.failureSelected);
+			assertSame(expectedFailure, task.rejection.get());
+			assertEventually(handle::isDisposed);
+
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(1L, snapshot.failedTasks());
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			awaitPostTerminalSchedulerTurn(scheduler);
+			assertEquals(1.0, failureCounter(registry));
+		} finally {
+			scheduler.disposeNow();
+			registry.close();
+		}
+	}
+
+	@Test
+	void thrownCooperativeFailureIsCountedExactlyOnce() throws Exception {
+		var registry = new SimpleMeterRegistry();
+		var scheduler = RWScheduler.forTesting(
+				1, 1, 1, 8, 8, "cooperative-thrown-failure", registry, "cooperative-failure-db");
+		var expectedFailure = new IllegalStateException("expected thrown failure");
+		var task = new ThrowAfterTerminationTask(expectedFailure, false);
+		try {
+			var handle = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+			task.release.countDown();
+
+			assertTrue(task.terminal.await(5, SECONDS));
+			assertSame(expectedFailure, task.rejection.get());
+			assertEventually(handle::isDisposed);
+
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(1L, snapshot.failedTasks());
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+			awaitPostTerminalSchedulerTurn(scheduler);
+			assertEquals(1.0, failureCounter(registry));
+		} finally {
+			task.release.countDown();
+			scheduler.disposeNow();
+			registry.close();
+		}
+	}
+
+	@Test
+	void cancellationWinningBeforeThrownFailureDoesNotIncrementFailureTelemetry() throws Exception {
+		var registry = new SimpleMeterRegistry();
+		var scheduler = RWScheduler.forTesting(
+				1, 1, 1, 8, 8, "cooperative-cancelled-failure", registry, "cooperative-failure-db");
+		var task = new ThrowAfterTerminationTask(
+				new IllegalStateException("thrown after cancellation"), false);
+		try {
+			var handle = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+			assertTrue(task.entered.await(5, SECONDS));
+			assertTrue(handle.cancel());
+			task.release.countDown();
+
+			assertTrue(task.terminal.await(5, SECONDS));
+			assertTrue(task.rejection.get() instanceof java.util.concurrent.CancellationException);
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(0L, snapshot.failedTasks());
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+			awaitPostTerminalSchedulerTurn(scheduler);
+			assertEquals(0.0, failureCounter(registry));
+		} finally {
+			task.release.countDown();
+			scheduler.disposeNow();
+			registry.close();
+		}
+	}
+
+	@Test
+	void deadlineWinningBeforeThrownFailureDoesNotIncrementFailureTelemetry() throws Exception {
+		var registry = new SimpleMeterRegistry();
+		var scheduler = RWScheduler.forTesting(
+				1, 1, 1, 8, 8, "cooperative-deadline-failure", registry, "cooperative-failure-db");
+		var task = new ThrowAfterTerminationTask(
+				new IllegalStateException("thrown after deadline"), true);
+		try {
+			long deadline = System.currentTimeMillis() + 100L;
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					deadline).executeCooperatively(task, 1L);
+			assertTrue(task.entered.await(5, SECONDS));
+			while (System.currentTimeMillis() < deadline) {
+				Thread.onSpinWait();
+			}
+			task.release.countDown();
+
+			assertTrue(task.terminal.await(5, SECONDS));
+			assertTrue(task.terminationObserved);
+			assertTrue(task.rejection.get() instanceof RocksDBException);
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(0L, snapshot.failedTasks());
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.DEADLINE));
+			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+			awaitPostTerminalSchedulerTurn(scheduler);
+			assertEquals(0.0, failureCounter(registry));
+		} finally {
+			task.release.countDown();
+			scheduler.disposeNow();
+			registry.close();
+		}
+	}
+
+	@Test
+	void shutdownWinningBeforeThrownFailureDoesNotIncrementFailureTelemetry() throws Exception {
+		var registry = new SimpleMeterRegistry();
+		var scheduler = RWScheduler.forTesting(
+				1, 1, 1, 8, 8, "cooperative-shutdown-failure", registry, "cooperative-failure-db");
+		var task = new ThrowAfterTerminationTask(
+				new IllegalStateException("thrown after shutdown"), true);
+		var shutdown = new AtomicReference<Thread>();
+		try {
+			var handle = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+			assertTrue(task.entered.await(5, SECONDS));
+			var shutdownThread = Thread.ofPlatform().start(scheduler::disposeNow);
+			shutdown.set(shutdownThread);
+			assertEventually(handle::isDisposed);
+			task.release.countDown();
+
+			assertTrue(task.terminal.await(5, SECONDS));
+			shutdownThread.join(SECONDS.toMillis(5));
+			assertFalse(shutdownThread.isAlive());
+			assertTrue(task.terminationObserved);
+			assertTrue(task.rejection.get() instanceof java.util.concurrent.RejectedExecutionException);
+			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(0L, snapshot.failedTasks());
+			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
+			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
+			assertEquals(0.0, failureCounter(registry));
+		} finally {
+			task.release.countDown();
+			var shutdownThread = shutdown.get();
+			if (shutdownThread != null) {
+				shutdownThread.join(SECONDS.toMillis(5));
+			}
+			scheduler.disposeNow();
+			registry.close();
+		}
+	}
+
+	private static double failureCounter(SimpleMeterRegistry registry) {
+		return registry.get("rockserver.workload.failures")
+				.tags("database", "cooperative-failure-db",
+						"resource", "read",
+						"profile", "batch",
+						"operation", "range_page")
+				.counter()
+				.count();
+	}
+
+	private static void awaitPostTerminalSchedulerTurn(RWScheduler scheduler) throws InterruptedException {
+		var completed = new CountDownLatch(1);
+		scheduler.executor(WorkloadProfile.BATCH,
+				OperationFamily.RANGE_PAGE,
+				RequestContext.NO_DEADLINE).execute(completed::countDown);
+		assertTrue(completed.await(5, SECONDS));
+	}
+
+	@Test
 	void cooperativeFailureUsesDeterministicFirstCauseArbitration() throws Exception {
-		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-failure-authority");
+		var registry = new SimpleMeterRegistry();
+		var scheduler = RWScheduler.forTesting(
+				1, 1, 1, 8, 8, "cooperative-failure-authority", registry, "cooperative-failure-db");
 		var firstFailure = new IllegalStateException("first cooperative failure");
 		var task = new FirstCauseFailureTask(firstFailure);
 		try {
@@ -754,12 +935,16 @@ class RWSchedulerCooperativeTest {
 			assertEventually(handle::isDisposed);
 
 			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+			assertEquals(1L, snapshot.failedTasks());
 			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.FAILURE));
 			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
 			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN));
+			awaitPostTerminalSchedulerTurn(scheduler);
+			assertEquals(1.0, failureCounter(registry));
 		} finally {
 			task.release.countDown();
 			scheduler.disposeNow();
+			registry.close();
 		}
 	}
 
@@ -1129,6 +1314,62 @@ class RWSchedulerCooperativeTest {
 			laterFailureSelected = context.fail(laterFailure);
 			failureSelected.countDown();
 			awaitUninterruptibly(release);
+			throw thrownFailure;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			rejection.set(failure);
+			terminal.countDown();
+		}
+	}
+
+	private static final class ContextFailureTask implements RWScheduler.CooperativeTask {
+
+		private final RuntimeException expectedFailure;
+		private final CountDownLatch terminal = new CountDownLatch(1);
+		private final AtomicReference<RuntimeException> rejection = new AtomicReference<>();
+		private volatile boolean failureSelected;
+
+		private ContextFailureTask(RuntimeException expectedFailure) {
+			this.expectedFailure = expectedFailure;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			failureSelected = context.fail(expectedFailure);
+			return RWScheduler.CooperativeResult.COMPLETE;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			rejection.set(failure);
+			terminal.countDown();
+		}
+	}
+
+	private static final class ThrowAfterTerminationTask implements RWScheduler.CooperativeTask {
+
+		private final RuntimeException thrownFailure;
+		private final boolean inspectTermination;
+		private final CountDownLatch entered = new CountDownLatch(1);
+		private final CountDownLatch release = new CountDownLatch(1);
+		private final CountDownLatch terminal = new CountDownLatch(1);
+		private final AtomicReference<RuntimeException> rejection = new AtomicReference<>();
+		private volatile boolean terminationObserved;
+
+		private ThrowAfterTerminationTask(RuntimeException thrownFailure, boolean inspectTermination) {
+			this.thrownFailure = thrownFailure;
+			this.inspectTermination = inspectTermination;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			entered.countDown();
+			awaitUninterruptibly(release);
+			if (inspectTermination) {
+				terminationObserved = context.terminationRequested();
+			}
 			throw thrownFailure;
 		}
 
