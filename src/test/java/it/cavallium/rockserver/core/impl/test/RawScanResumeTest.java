@@ -25,6 +25,7 @@ import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
 import it.cavallium.rockserver.core.common.api.proto.ScanRawRequest;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -82,6 +83,66 @@ class RawScanResumeTest {
 			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
 			long columnId = createPopulatedColumn(api);
 			assertEquals((long) SST_COUNT * KEYS_PER_SST, decodedRows(scan(api, columnId, Set.of())));
+		}
+	}
+
+	@Test
+	void perSstAdmissionOverloadWaitsWithoutRestartingThePinnedScan(@TempDir Path tempDir) throws Exception {
+		Path config = rawScanConfig(tempDir);
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-overload", config)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB db = connection.getInternalDB();
+			long columnId = createPopulatedColumn(api);
+			var overloadOnce = new AdmissionOverloadExecutor(db.getScheduler().readExecutor(), 1);
+
+			var batches = db.scanRawAsyncInternal(columnId,
+					0,
+					1,
+					reactor.core.scheduler.Schedulers.immediate(),
+					overloadOnce)
+					.collectList()
+					.block(Duration.ofSeconds(30));
+
+			assertEquals((long) SST_COUNT * KEYS_PER_SST,
+					java.util.Objects.requireNonNull(batches).stream()
+							.mapToLong(batch -> batch.decode().count())
+							.sum());
+			assertEquals(SST_COUNT + 1, overloadOnce.attempts(),
+					"one rejected SST admission must be retried inside the same pinned scan");
+			awaitNoRawScanPins(db, Duration.ofSeconds(10));
+			assertEquals(0L, db.getPendingOpsCount());
+		}
+	}
+
+	@Test
+	void cancellationDuringAdmissionBackoffReleasesThePinnedSnapshot(@TempDir Path tempDir) throws Exception {
+		Path config = rawScanConfig(tempDir);
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-overload-cancel", config)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB db = connection.getInternalDB();
+			long columnId = createPopulatedColumn(api);
+			var alwaysOverloaded = new AdmissionOverloadExecutor(
+					db.getScheduler().readExecutor(), Integer.MAX_VALUE);
+
+			var scan = db.scanRawAsyncInternal(columnId,
+					0,
+					1,
+					reactor.core.scheduler.Schedulers.immediate(),
+					alwaysOverloaded)
+					.subscribe();
+			try {
+				long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+				while (alwaysOverloaded.attempts() == 0 && System.nanoTime() < deadline) {
+					Thread.onSpinWait();
+				}
+				assertTrue(alwaysOverloaded.attempts() > 0);
+				assertFalse(db.getRawScanPinnedFilesForTesting().isEmpty());
+			} finally {
+				scan.dispose();
+			}
+
+			awaitNoRawScanPins(db, Duration.ofSeconds(10));
+			assertEquals(0L, db.getPendingOpsCount());
 		}
 	}
 
@@ -538,6 +599,47 @@ class RawScanResumeTest {
 			}
 		}
 		return Set.copyOf(tokens);
+	}
+
+	private static final class AdmissionOverloadExecutor implements RWScheduler.WorkloadExecutor {
+
+		private final RWScheduler.WorkloadExecutor delegate;
+		private final AtomicInteger remainingRejections;
+		private final AtomicInteger attempts = new AtomicInteger();
+
+		private AdmissionOverloadExecutor(RWScheduler.WorkloadExecutor delegate, int rejections) {
+			this.delegate = delegate;
+			this.remainingRejections = new AtomicInteger(rejections);
+		}
+
+		@Override
+		public void execute(Runnable command) {
+			delegate.execute(command);
+		}
+
+		@Override
+		public void execute(Runnable command, long estimatedBytes) {
+			delegate.execute(command, estimatedBytes);
+		}
+
+		@Override
+		public RWScheduler.CooperativeHandle executeCooperatively(
+				RWScheduler.CooperativeTask command,
+				long estimatedBytes) {
+			attempts.incrementAndGet();
+			if (remainingRejections.getAndUpdate(current -> Math.max(0, current - 1)) > 0) {
+				var overload = RocksDBException.of(
+						RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
+						"synthetic raw-scan SST admission overload");
+				command.reject(overload);
+				throw overload;
+			}
+			return delegate.executeCooperatively(command, estimatedBytes);
+		}
+
+		private int attempts() {
+			return attempts.get();
+		}
 	}
 
 	private record CapabilityMaskingConnection(RocksDBConnection delegate) implements RocksDBConnection {
