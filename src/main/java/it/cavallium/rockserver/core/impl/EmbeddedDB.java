@@ -281,7 +281,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static final int PINNED_GET_MIN_BYTES_OVERRIDE = Integer.getInteger(
 			"rockserver.fast-get.pinned-min-bytes", -1);
 
-	private static final long STORAGE_PRESSURE_PENDING_COMPACTION_BYTES = Math.max(1L, Long.getLong(
+	private static final long STORAGE_PRESSURE_PER_CF_PENDING_COMPACTION_BYTES = Math.max(1L, Long.getLong(
 			"it.cavallium.rockserver.workload.storage-pressure-pending-compaction-bytes",
 			64L * SizeUnit.GB));
 	private static final int EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL = 4_096;
@@ -2799,13 +2799,73 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean writeStopped = getLongProperty(
 					RocksDBLongProperty.IS_WRITE_STOPPED.getName(),
 					RocksDBLongProperty.IS_WRITE_STOPPED.getAggregationMode()).signum() > 0;
-			var pendingCompactionBytes = getLongProperty(
+			var pressure = new StoragePressureAccumulator(writeStopped,
+					STORAGE_PRESSURE_PER_CF_PENDING_COMPACTION_BYTES);
+			forEachPerCfLongProperty(
 					RocksDBLongProperty.ESTIMATE_PENDING_COMPACTION_BYTES.getName(),
-					RocksDBLongProperty.ESTIMATE_PENDING_COMPACTION_BYTES.getAggregationMode());
-			scheduler.setStoragePressure(writeStopped || pendingCompactionBytes.compareTo(
-					BigInteger.valueOf(STORAGE_PRESSURE_PENDING_COMPACTION_BYTES)) >= 0);
+					pressure);
+			scheduler.setStoragePressure(pressure.pressured());
 		} catch (Throwable error) {
 			logger.debug("Unable to refresh workload storage-pressure state", error);
+		}
+	}
+
+	private void forEachPerCfLongProperty(String name, LongConsumer consumer) {
+		ops.beginOp();
+		try {
+			for (Entry<Long, ColumnInstance> entry : columns.entrySet()) {
+				ColumnInstance ci = entry.getValue();
+				if (!tryBeginColumnUse(ci)) {
+					continue;
+				}
+				try {
+					consumer.accept(db.get().getLongProperty(ci.cfh(), name));
+				} catch (org.rocksdb.RocksDBException e) {
+					if (e.getStatus().getCode() != Code.NotFound) {
+						throw new RuntimeException(e);
+					}
+				} finally {
+					ci.endUse();
+				}
+			}
+		} finally {
+			ops.endOp();
+		}
+	}
+
+	@VisibleForTesting
+	public static boolean storagePressureForTesting(boolean writeStopped,
+			long... perColumnFamilyPendingCompactionBytes) {
+		Objects.requireNonNull(perColumnFamilyPendingCompactionBytes,
+				"perColumnFamilyPendingCompactionBytes");
+		var pressure = new StoragePressureAccumulator(writeStopped,
+				STORAGE_PRESSURE_PER_CF_PENDING_COMPACTION_BYTES);
+		for (long pendingCompactionBytes : perColumnFamilyPendingCompactionBytes) {
+			pressure.accept(pendingCompactionBytes);
+		}
+		return pressure.pressured();
+	}
+
+	/** RocksDB's soft pending-compaction limit is enforced independently per column family. */
+	private static final class StoragePressureAccumulator implements LongConsumer {
+
+		private final long pendingCompactionThreshold;
+		private boolean pressured;
+
+		private StoragePressureAccumulator(boolean writeStopped, long pendingCompactionThreshold) {
+			this.pendingCompactionThreshold = pendingCompactionThreshold;
+			this.pressured = writeStopped;
+		}
+
+		@Override
+		public void accept(long pendingCompactionBytes) {
+			if (Long.compareUnsigned(pendingCompactionBytes, pendingCompactionThreshold) >= 0) {
+				pressured = true;
+			}
+		}
+
+		private boolean pressured() {
+			return pressured;
 		}
 	}
 
