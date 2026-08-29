@@ -18,7 +18,7 @@ limits. Production values must each be at least three.
 | `latency-queue-capacity` | 4096 | Maximum queued LATENCY submissions per data pool |
 | `ingest-queue-capacity` | 4096 | Maximum queued INGEST submissions per data pool |
 | `cdc-queue-capacity` | 1024 | Maximum queued CDC submissions per data pool |
-| `analytical-queue-capacity` | 512 | Maximum queued ANALYTICAL submissions per data pool |
+| `analytical-queue-capacity` | 512 | Maximum queued ANALYTICAL submissions in the read pool |
 | `batch-queue-capacity` | 512 | Maximum queued BATCH submissions per data pool |
 | `control-queue-capacity` | 256 | Maximum queued protected CONTROL submissions |
 | `physical-maintenance-queue-capacity` | 16 | Maximum queued physical-maintenance submissions |
@@ -30,13 +30,19 @@ limits. Production values must each be at least three.
 | `write-cdc-reservation` | 1 | Borrowable CDC worker reservation in the write pool |
 | `control-threads` | 2 | Workers in the isolated CONTROL pool |
 | `physical-concurrency` | 1 | Workers in the isolated physical-maintenance pool |
-| `analytical-active-limit` | 1 | Maximum active ANALYTICAL submissions in either data pool |
+| `analytical-active-limit` | 1 | Maximum active ANALYTICAL submissions in the read pool |
 
 Every queue and worker capacity must be positive. Reservations must be
 non-negative, must refer to a profile with a queue, and the reservation sum for
-each pool must not exceed that pool's worker limit. The analytical active limit
-must not exceed either data-pool limit. Invalid values fail configuration loading
-before the database opens.
+each pool must not exceed that pool's worker limit. ANALYTICAL has no write-side
+operation family, so neither its queue nor its active limit is provisioned in the
+write pool; its active limit must not exceed the read-pool worker limit.
+
+The combined queue, worker, and worst-case outstanding bounds must fit the
+scheduler's signed primitive counters. This is validated across each pool and
+across the aggregate diagnostic views before any worker is created. Invalid values
+fail configuration loading before the database opens rather than producing wrapped
+negative telemetry later.
 
 Reservations are borrowable: an idle reserved profile does not strand a worker.
 When that profile has queued work, dispatch restores its guaranteed share.
@@ -57,7 +63,8 @@ When that profile has queued work, dispatch restores its guaranteed share.
 | `pressured-batch-interval` | `PT1S` | Minimum idle interval after pressured BATCH completion |
 
 Weights must be between 1 and 16. The latency burst and all BATCH maxima must be
-positive; neither maximum can exceed the combined read/write worker capacity.
+positive. The competing read and write maxima cannot exceed their respective pool
+capacity; the global pressured maximum cannot exceed the combined read/write capacity.
 The competing caps are coordinated across the read and write pools. They preserve
 the existing four-way raw-SST parallelism while preventing an otherwise idle write
 pool from flooding RocksDB behind a saturated foreground read pool. They are removed
