@@ -190,6 +190,32 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			= "it.cavallium.rockserver.grpc.client.max-inbound-message-size-bytes";
 	public static final int DEFAULT_MAX_INBOUND_MESSAGE_SIZE = 64 * 1024 * 1024;
 	public static final int MIN_MAX_INBOUND_MESSAGE_SIZE = 4 * 1024 * 1024;
+	/*
+	 * A retry can run after the server completed an operation but before its
+	 * response reached the client. Keep this allowlist to stateless unary reads:
+	 * transaction/update/iterator creation, mutations, maintenance, CDC polling
+	 * and every streaming method require caller-owned recovery instead.
+	 *
+	 * Generated descriptors bind the service-config names to the wire schema.
+	 */
+	private static final List<MethodDescriptor<?, ?>> AUTOMATIC_RETRY_METHOD_DESCRIPTORS = List.of(
+			RocksDBServiceGrpc.getGetCapabilitiesMethod(),
+			RocksDBServiceGrpc.getGetColumnIdMethod(),
+			RocksDBServiceGrpc.getEstimateNumKeysMethod(),
+			RocksDBServiceGrpc.getGetMethod(),
+			RocksDBServiceGrpc.getExistsMethod(),
+			RocksDBServiceGrpc.getExistsMultiMethod(),
+			RocksDBServiceGrpc.getReduceRangeFirstAndLastMethod(),
+			RocksDBServiceGrpc.getReduceRangeEntriesCountMethod(),
+			RocksDBServiceGrpc.getGetRangePageMethod(),
+			RocksDBServiceGrpc.getGetAllColumnDefinitionsMethod(),
+			RocksDBServiceGrpc.getCheckMergeOperatorMethod(),
+			RocksDBServiceGrpc.getCdcGetEarliestAvailableSequenceMethod(),
+			RocksDBServiceGrpc.getCdcGetLastCommittedSequenceMethod());
+	private static final List<Map<String, String>> AUTOMATIC_RETRY_METHOD_CONFIG_NAMES =
+			AUTOMATIC_RETRY_METHOD_DESCRIPTORS.stream()
+					.map(GrpcConnectionDelegate::serviceConfigName)
+					.toList();
 	final ManagedChannel channel;
 	final ExecutorService callbackExecutor;
 	final EventLoopGroup eventLoopGroup;
@@ -355,7 +381,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.maxRetryAttempts(maxAttempts)
 				.defaultServiceConfig(Map.of(
 						"methodConfig", List.of(Map.of(
-								"name", List.of(Map.of()),
+								"name", AUTOMATIC_RETRY_METHOD_CONFIG_NAMES,
 								"retryPolicy", Map.of(
 										"maxAttempts", (double) maxAttempts,
 										"initialBackoff", System.getProperty(INITIAL_RETRY_BACKOFF_PROPERTY, "0.5s"),
@@ -369,6 +395,31 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 								)
 						))
 				));
+	}
+
+	private static Map<String, String> serviceConfigName(MethodDescriptor<?, ?> method) {
+		if (method.getType() != MethodDescriptor.MethodType.UNARY) {
+			throw new IllegalArgumentException("Automatic gRPC retry requires a unary method: "
+					+ method.getFullMethodName());
+		}
+		String fullMethodName = method.getFullMethodName();
+		int separator = fullMethodName.lastIndexOf('/');
+		if (separator <= 0 || separator == fullMethodName.length() - 1) {
+			throw new IllegalArgumentException("Invalid generated gRPC method name: " + fullMethodName);
+		}
+		return Map.of(
+				"service", fullMethodName.substring(0, separator),
+				"method", fullMethodName.substring(separator + 1));
+	}
+
+	private static List<MethodDescriptor<?, ?>> automaticRetryMethodDescriptors() {
+		return AUTOMATIC_RETRY_METHOD_DESCRIPTORS;
+	}
+
+	private static Set<String> automaticRetryMethodFullNames() {
+		return AUTOMATIC_RETRY_METHOD_DESCRIPTORS.stream()
+				.map(MethodDescriptor::getFullMethodName)
+				.collect(Collectors.toUnmodifiableSet());
 	}
 
 	private static int intProperty(String name, int defaultValue, int minValue) {
