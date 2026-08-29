@@ -1739,6 +1739,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		private final ListenableFuture<T> listenableFuture;
 		private final Function<T, U> mapper;
 		private final Function<Throwable, Throwable> errorMapper;
+		private final AtomicBoolean callbackClaimed = new AtomicBoolean();
 
 		private GrpcResponseFuture(ListenableFuture<T> listenableFuture,
 				Function<T, U> mapper,
@@ -1760,10 +1761,17 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 		@Override
 		public void onSuccess(T result) {
-			if (isDone()) {
+			if (!tryClaimCallback()) {
 				return;
 			}
-			complete(mapper.apply(result));
+			try {
+				complete(mapper.apply(result));
+			} catch (VirtualMachineError fatal) {
+				completeExceptionally(fatal);
+				throw fatal;
+			} catch (Throwable mapperFailure) {
+				completeExceptionally(mapperFailure);
+			}
 		}
 
 		@Override
@@ -1772,10 +1780,39 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				super.cancel(false);
 				return;
 			}
-			if (isDone()) {
+			if (!tryClaimCallback()) {
 				return;
 			}
-			completeExceptionally(errorMapper.apply(failure));
+			final Throwable mappedFailure;
+			try {
+				mappedFailure = errorMapper.apply(failure);
+			} catch (VirtualMachineError fatal) {
+				preserveOriginalFailure(fatal, failure);
+				completeExceptionally(fatal);
+				throw fatal;
+			} catch (Throwable mapperFailure) {
+				preserveOriginalFailure(mapperFailure, failure);
+				completeExceptionally(mapperFailure);
+				return;
+			}
+
+			if (mappedFailure == null) {
+				var invalidResult = new NullPointerException("The gRPC error mapper returned null");
+				preserveOriginalFailure(invalidResult, failure);
+				completeExceptionally(invalidResult);
+			} else {
+				completeExceptionally(mappedFailure);
+			}
+		}
+
+		private boolean tryClaimCallback() {
+			return !isDone() && callbackClaimed.compareAndSet(false, true) && !isDone();
+		}
+
+		private static void preserveOriginalFailure(Throwable mapperFailure, Throwable originalFailure) {
+			if (mapperFailure != originalFailure && mapperFailure.getCause() != originalFailure) {
+				mapperFailure.addSuppressed(originalFailure);
+			}
 		}
 	}
 
