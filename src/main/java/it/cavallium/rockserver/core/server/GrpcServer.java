@@ -463,7 +463,8 @@ public class GrpcServer extends Server {
 			return new FastGetListener(call, Context.current());
 		}
 
-		private final class FastGetListener extends Listener<GetRequest> implements Runnable {
+		private final class FastGetListener extends Listener<GetRequest>
+				implements Runnable, RWScheduler.EstimatedWork {
 
 			private static final int CANCELLED = 1;
 			private static final int HALF_CLOSED = 1 << 1;
@@ -484,6 +485,7 @@ public class GrpcServer extends Server {
 			private @Nullable GetRequest request;
 			private @Nullable it.cavallium.rockserver.core.common.RequestContext requestContext;
 			private @Nullable Keys keys;
+			private long estimatedBytes;
 
 			private FastGetListener(ServerCall<GetRequest, FastGetResponse> call, Context callContext) {
 				this.call = call;
@@ -524,6 +526,7 @@ public class GrpcServer extends Server {
 							keys,
 							RequestType.current());
 					var profile = grpc.preAdmit(requestContext, OperationFamily.POINT_LOOKUP, command);
+					estimatedBytes = command.estimatedBytes();
 					scheduled = scheduler.scheduler(profile,
 							command.operationFamily(),
 							requestContext.deadlineEpochMillis())
@@ -559,6 +562,11 @@ public class GrpcServer extends Server {
 				} finally {
 					callContext.detach(previous);
 				}
+			}
+
+			@Override
+			public long estimatedBytes() {
+				return estimatedBytes;
 			}
 
 			private boolean markHalfClosed() {
@@ -2483,7 +2491,8 @@ public class GrpcServer extends Server {
 				var command = captureCommand(operation);
 				var profile = preAdmit(context, family, command);
 				return executeScheduled(() -> operation.apply(syncApi(context)),
-						scheduler.scheduler(profile, command.operationFamily(), context.deadlineEpochMillis()));
+						scheduler.scheduler(profile, command.operationFamily(), context.deadlineEpochMillis()),
+						command.estimatedBytes());
 			});
 		}
 
@@ -2500,7 +2509,8 @@ public class GrpcServer extends Server {
 				return executeScheduled(() -> operation.apply(syncApi(context)),
 						scheduler.scheduler(profile, command.operationFamily(), context.deadlineEpochMillis()),
 						lateSuccessCleanup,
-						lateSuccessCleanupScheduler);
+						lateSuccessCleanupScheduler,
+						command.estimatedBytes());
 			});
 		}
 
@@ -3225,7 +3235,7 @@ public class GrpcServer extends Server {
 			}
 		}
 
-		private final class ScheduledCall<T> implements Disposable, Runnable {
+		private final class ScheduledCall<T> implements Disposable, Runnable, RWScheduler.EstimatedWork {
 
 			private final reactor.core.publisher.MonoSink<T> sink;
 			private final Callable<T> callable;
@@ -3235,6 +3245,7 @@ public class GrpcServer extends Server {
 			private final @Nullable ScheduledTaskLifecycle taskLifecycle;
 			private final boolean mustComplete;
 			private final @Nullable String protectedOperation;
+			private final long estimatedBytes;
 			private @Nullable Disposable task;
 			private boolean cancelled;
 
@@ -3245,7 +3256,8 @@ public class GrpcServer extends Server {
 					@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler,
 					@Nullable ScheduledTaskLifecycle taskLifecycle,
 					boolean mustComplete,
-					@Nullable String protectedOperation) {
+					@Nullable String protectedOperation,
+					long estimatedBytes) {
 				this.sink = sink;
 				this.callable = callable;
 				this.executionScheduler = executionScheduler;
@@ -3254,6 +3266,12 @@ public class GrpcServer extends Server {
 				this.taskLifecycle = taskLifecycle;
 				this.mustComplete = mustComplete;
 				this.protectedOperation = protectedOperation;
+				this.estimatedBytes = estimatedBytes;
+			}
+
+			@Override
+			public long estimatedBytes() {
+				return estimatedBytes;
 			}
 
 			private void schedule() {
@@ -3384,12 +3402,19 @@ public class GrpcServer extends Server {
 		}
 
 		private <T> Mono<T> executeScheduled(Callable<T> callable, reactor.core.scheduler.Scheduler executionScheduler) {
+			return executeScheduled(callable, executionScheduler, 0L);
+		}
+
+		private <T> Mono<T> executeScheduled(Callable<T> callable,
+				reactor.core.scheduler.Scheduler executionScheduler,
+				long estimatedBytes) {
 			return executeScheduled(callable,
 					executionScheduler,
 					null,
 					null,
 					ScheduledCancellationPolicy.CANCEL_WHILE_QUEUED,
-					null);
+					null,
+					estimatedBytes);
 		}
 
 		private <T> Mono<T> executeMustComplete(String operation,
@@ -3400,7 +3425,8 @@ public class GrpcServer extends Server {
 					null,
 					null,
 					ScheduledCancellationPolicy.MUST_COMPLETE,
-					operation);
+					operation,
+					0L);
 		}
 
 		private <T> Mono<T> executeScheduled(Callable<T> callable,
@@ -3411,8 +3437,21 @@ public class GrpcServer extends Server {
 					executionScheduler,
 					lateSuccessCleanup,
 					lateSuccessCleanupScheduler,
+					0L);
+		}
+
+		private <T> Mono<T> executeScheduled(Callable<T> callable,
+				reactor.core.scheduler.Scheduler executionScheduler,
+				@Nullable Consumer<T> lateSuccessCleanup,
+				@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler,
+				long estimatedBytes) {
+			return executeScheduled(callable,
+					executionScheduler,
+					lateSuccessCleanup,
+					lateSuccessCleanupScheduler,
 					ScheduledCancellationPolicy.CANCEL_WHILE_QUEUED,
-					null);
+					null,
+					estimatedBytes);
 		}
 
 		private <T> Mono<T> executeScheduled(Callable<T> callable,
@@ -3420,7 +3459,8 @@ public class GrpcServer extends Server {
 				@Nullable Consumer<T> lateSuccessCleanup,
 				@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler,
 				ScheduledCancellationPolicy cancellationPolicy,
-				@Nullable String protectedOperation) {
+				@Nullable String protectedOperation,
+				long estimatedBytes) {
 			return Mono.deferContextual(contextView -> {
 				var iteratorLease = contextView.<IteratorOperationLease>getOrDefault(
 						ITERATOR_OPERATION_LEASE_CONTEXT_KEY, null);
@@ -3451,9 +3491,10 @@ public class GrpcServer extends Server {
 							executionScheduler,
 							lateSuccessCleanup,
 							lateSuccessCleanupScheduler,
-							taskLifecycle,
-							mustComplete,
-							protectedOperation);
+								taskLifecycle,
+								mustComplete,
+								protectedOperation,
+								estimatedBytes);
 					sink.onCancel(scheduledCall);
 					scheduledCall.schedule();
 				});

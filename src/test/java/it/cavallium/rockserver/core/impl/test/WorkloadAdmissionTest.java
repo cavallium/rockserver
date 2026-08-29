@@ -108,6 +108,8 @@ class WorkloadAdmissionTest {
 				"Every sealed command subtype must have an admission expectation");
 
 		for (var expectation : commands) {
+			assertTrue(expectation.command().estimatedBytes() >= 0L,
+					expectation.name() + " produced a negative scheduler cost estimate");
 			for (var profile : CLIENT_PROFILES) {
 				var context = context(profile);
 				if (expectation.protectedProfile() != null) {
@@ -126,6 +128,29 @@ class WorkloadAdmissionTest {
 				}
 			}
 		}
+	}
+
+	@Test
+	void schedulerByteEstimatesCoverBoundedPayloadsWithoutOverflow() {
+		assertEquals(7L, new RocksDBAPICommandSingle.Get<>(
+				0, 1, keys(7), RequestType.current()).estimatedBytes());
+		assertEquals(12L, new RocksDBAPICommandSingle.Put<>(
+				0, 1, keys(5), buffer(7), RequestType.none()).estimatedBytes());
+		assertEquals(15L, new RocksDBAPICommandSingle.PutMulti<>(
+				0, 1, List.of(keys(2), keys(3)), List.of(buffer(4), buffer(6)), RequestType.none())
+				.estimatedBytes());
+		assertEquals(11L, new RocksDBAPICommandSingle.ExistsMulti(
+				0, 1, List.of(keys(5), keys(6)), 1_000).estimatedBytes());
+		assertEquals(19L, new RocksDBAPICommandSingle.UploadMergeOperator(
+				"operator", "Type", new byte[19]).estimatedBytes());
+		assertEquals(71L, new RocksDBAPICommandSingle.GetRangePage<>(
+				0, 1, keys(3), keys(4), false, null,
+				RequestType.allInRange(), 1_000, new RangeBudget(8, 64)).estimatedBytes());
+
+		var saturated = new RocksDBAPICommandSingle.GetRangePage<>(
+				0, 1, keys(1), null, false, null,
+				RequestType.allInRange(), 1_000, new RangeBudget(1, Long.MAX_VALUE));
+		assertEquals(Long.MAX_VALUE, saturated.estimatedBytes());
 	}
 
 	@Test

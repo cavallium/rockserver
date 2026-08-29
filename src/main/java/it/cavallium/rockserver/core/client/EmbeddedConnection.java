@@ -298,7 +298,9 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
             case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
 			case RocksDBAPICommand.CdcCommit cdcCommit -> db.cdcCommitAsyncInternal(cdcCommit.id(), cdcCommit.seq());
 			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> supplyAsyncPreservingRunningCompletion(
-					() -> withRequestContext(context, () -> req.handleSync(this)), commandExecutor(req));
+					() -> withRequestContext(context, () -> req.handleSync(this)),
+					commandExecutor(req),
+					req.estimatedBytes());
             case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
 		});
     }

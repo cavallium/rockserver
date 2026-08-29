@@ -178,6 +178,15 @@ class GrpcCommandPreAdmissionTest {
 		}
 	}
 
+	@Test
+	void grpcScheduledWrappersExposeEstimatedWorkToDeficitAccounting() throws Exception {
+		var estimatedWork = it.cavallium.rockserver.core.impl.RWScheduler.EstimatedWork.class;
+		assertTrue(estimatedWork.isAssignableFrom(Class.forName(
+				"it.cavallium.rockserver.core.server.GrpcServer$FastGetCallHandler$FastGetListener")));
+		assertTrue(estimatedWork.isAssignableFrom(Class.forName(
+				"it.cavallium.rockserver.core.server.GrpcServer$GrpcServerImpl$ScheduledCall")));
+	}
+
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext(
 			it.cavallium.rockserver.core.common.api.proto.WorkloadProfile profile) {
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()

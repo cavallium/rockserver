@@ -25,6 +25,92 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 	boolean isReadOnly();
 
 	/**
+	 * Allocation-free byte estimate used by scheduler deficit accounting.
+	 *
+	 * <p>Inputs are counted when they dominate request work; bounded range pages also
+	 * include their maximum response budget. Unknown or incrementally streamed work
+	 * reports zero and retains the scheduler's minimum unit cost.</p>
+	 */
+	default long estimatedBytes() {
+		return switch (this) {
+			case RocksDBAPICommandSingle.UploadMergeOperator upload -> upload.jarData().length;
+			case RocksDBAPICommandSingle.CheckMergeOperator check -> check.hash().length;
+			case RocksDBAPICommandSingle.Put<?> put -> estimatedBytes(put.keys(), put.value());
+			case RocksDBAPICommandSingle.Delete<?> delete -> estimatedBytes(delete.keys());
+			case RocksDBAPICommandSingle.DeleteMulti<?> delete -> estimatedBytes(delete.keys());
+			case RocksDBAPICommandSingle.DeleteRange delete -> estimatedBytes(
+					delete.startKeysInclusive(), delete.endKeysExclusive());
+			case RocksDBAPICommandSingle.PutMulti<?> put -> estimatedBytes(put.keys(), put.values());
+			case RocksDBAPICommandSingle.Merge<?> merge -> estimatedBytes(merge.keys(), merge.value());
+			case RocksDBAPICommandSingle.MergeMulti<?> merge -> estimatedBytes(merge.keys(), merge.values());
+			case RocksDBAPICommandSingle.Get<?> get -> estimatedBytes(get.keys());
+			case RocksDBAPICommandSingle.ExistsMulti exists -> estimatedBytes(exists.keys());
+			case RocksDBAPICommandSingle.OpenIterator open -> estimatedBytes(
+					open.startKeysInclusive(), open.endKeysExclusive());
+			case RocksDBAPICommandSingle.SeekTo seek -> estimatedBytes(seek.keys());
+			case RocksDBAPICommandSingle.ReduceRange<?> reduce -> estimatedBytes(
+					reduce.startKeysInclusive(), reduce.endKeysExclusive());
+			case RocksDBAPICommandSingle.GetRangePage<?> page -> saturatedAdd(
+					page.budget().maxBytes(),
+					estimatedBytes(page.startKeysInclusive(), page.endKeysExclusive(), page.resumeAfter()));
+			case RocksDBAPICommandStream.GetRange<?> range -> estimatedBytes(
+					range.startKeysInclusive(), range.endKeysExclusive());
+			case RocksDBAPICommandStream.ScanRawResumable scan ->
+					saturatedMultiply(scan.completedSsts().size(), RawSstToken.MAX_CHARACTERS * Character.BYTES);
+			case RocksDBAPICommandSingle.OpenTransaction _, RocksDBAPICommandSingle.CloseTransaction _,
+					RocksDBAPICommandSingle.CloseFailedUpdate _, RocksDBAPICommandSingle.CreateColumn _,
+					RocksDBAPICommandSingle.DeleteColumn _, RocksDBAPICommandSingle.DeleteColumnIfExists _,
+					RocksDBAPICommandSingle.GetColumnId _, RocksDBAPICommandSingle.EstimateNumKeys _,
+					RocksDBAPICommandSingle.PutBatch _, RocksDBAPICommandSingle.MergeBatch _,
+					RocksDBAPICommandSingle.CloseIterator _, RocksDBAPICommandSingle.Subsequent<?> _,
+					RocksDBAPICommandStream.ScanRaw _, RocksDBAPICommandStream.CdcPoll _,
+					Flush _, Compact _, GetAllColumnDefinitions _, CdcCreate _, CdcDelete _,
+					CdcGetEarliestAvailableSequence _, CdcGetLastCommittedSequence _, CdcCommit _ -> 0L;
+		};
+	}
+
+	private static long estimatedBytes(@Nullable Keys... keys) {
+		long total = 0L;
+		for (Keys logicalKey : keys) {
+			if (logicalKey == null) {
+				continue;
+			}
+			for (Buf segment : logicalKey.keys()) {
+				total = saturatedAdd(total, segment.size());
+			}
+		}
+		return total;
+	}
+
+	private static long estimatedBytes(List<Keys> keys) {
+		long total = 0L;
+		for (Keys logicalKey : keys) {
+			total = saturatedAdd(total, estimatedBytes(logicalKey));
+		}
+		return total;
+	}
+
+	private static long estimatedBytes(Keys keys, Buf value) {
+		return saturatedAdd(estimatedBytes(keys), value.size());
+	}
+
+	private static long estimatedBytes(List<Keys> keys, List<Buf> values) {
+		long total = estimatedBytes(keys);
+		for (Buf value : values) {
+			total = saturatedAdd(total, value.size());
+		}
+		return total;
+	}
+
+	private static long saturatedMultiply(long left, long right) {
+		return left != 0L && right > Long.MAX_VALUE / left ? Long.MAX_VALUE : left * right;
+	}
+
+	private static long saturatedAdd(long left, long right) {
+		return right > Long.MAX_VALUE - left ? Long.MAX_VALUE : left + right;
+	}
+
+	/**
 	 * Derive the actual operation/resource-cost family from the concrete request.
 	 * This value is server-owned and deliberately independent from the caller's
 	 * workload profile.
