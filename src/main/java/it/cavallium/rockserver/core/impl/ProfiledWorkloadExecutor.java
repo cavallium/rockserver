@@ -775,7 +775,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.finishBatch(batchPermit, resourcePool);
 		}
 		TerminalAction terminalAction = null;
-		boolean notifyCompetitionEnded = false;
+		boolean notifyCompetitionChanged = false;
 		lock.lock();
 		try {
 			if (task.state() != TaskState.ACTIVE) {
@@ -811,12 +811,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			refreshPreemptionUnsafe();
 			signalWorkerUnsafe();
-			notifyCompetitionEnded = !task.hasProfile(WorkloadProfile.BATCH)
-					&& task.state() == TaskState.TERMINAL;
+			notifyCompetitionChanged = !task.hasProfile(WorkloadProfile.BATCH)
+					&& (task.state() == TaskState.PARKED || task.state() == TaskState.TERMINAL);
 		} finally {
 			lock.unlock();
 		}
-		if (notifyCompetitionEnded) {
+		if (notifyCompetitionChanged) {
 			pressureController.signalPendingAvailability();
 		}
 		return terminalAction;
@@ -834,6 +834,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				case PARKED -> {
 					if (task.requestedOutcome() == null) {
 						unmarkParkedUnsafe(task);
+						// Publish competition before exposing the continuation to a worker. Both
+						// transitions happen under this executor lock, so local dispatch cannot race it.
+						admitCompetitionUnsafe(task);
 						refreshCooperativeSequenceUnsafe(task);
 						enqueueCooperativeUnsafe(task, false);
 						refreshPreemptionUnsafe();
@@ -1576,6 +1579,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.state() != TaskState.ACTIVE) {
 			throw new IllegalStateException("Only an active cooperative task can park");
 		}
+		// A genuinely parked continuation has no runnable quantum and must not reserve global
+		// BATCH capacity. The pressure controller retains its configured transition hold.
+		completeCompetitionUnsafe(task);
 		parked[task.profileIndex()]++;
 		parkedTotal++;
 		task.markParked();
@@ -1672,6 +1678,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.hasProfile(WorkloadProfile.BATCH)) {
 			return;
 		}
+		if (task.competitionActive()) {
+			throw new IllegalStateException("Workload task already publishes competition in " + poolName);
+		}
+		task.markCompetitionActive();
 		if (competingTasks++ == 0) {
 			pressureController.setPoolCompetition(resourcePool, true);
 		}
@@ -1681,9 +1691,16 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.hasProfile(WorkloadProfile.BATCH)) {
 			return;
 		}
+		if (!task.competitionActive()) {
+			if (task.isCooperative() && task.state() == TaskState.PARKED) {
+				return;
+			}
+			throw new IllegalStateException("Workload task does not publish competition in " + poolName);
+		}
 		if (competingTasks <= 0) {
 			throw new IllegalStateException("Competing workload count underflow in " + poolName);
 		}
+		task.markCompetitionInactive();
 		if (--competingTasks == 0) {
 			pressureController.setPoolCompetition(resourcePool, false);
 		}
@@ -2152,6 +2169,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private static final int STATE_MASK = 0b11;
 		private static final int DISPATCH_CANCELLATION = 0b100;
 		private static final int HAS_DEADLINE = 0b1000;
+		private static final int COMPETITION_ACTIVE = 0b1_0000;
 		private final long deadlineSequence;
 		private final long enqueuedNanos;
 		private final int cost;
@@ -2440,6 +2458,18 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (this instanceof CooperativeWorkloadTask cooperativeTask) {
 				cooperativeTask.terminalPublished = true;
 			}
+		}
+
+		private boolean competitionActive() {
+			return (state & COMPETITION_ACTIVE) != 0;
+		}
+
+		private void markCompetitionActive() {
+			state |= COMPETITION_ACTIVE;
+		}
+
+		private void markCompetitionInactive() {
+			state &= (byte) ~COMPETITION_ACTIVE;
 		}
 
 		private boolean markStarted() {
