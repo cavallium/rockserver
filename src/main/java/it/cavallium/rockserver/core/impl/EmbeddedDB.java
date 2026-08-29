@@ -9331,7 +9331,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					iterator.next();
 					if (batchSize >= RAW_SCAN_MAX_ENTRIES_PER_CHUNK
 							|| currentBatchBytes >= RAW_SCAN_MAX_BYTES_PER_CHUNK) {
-						if (terminalMapper != null && !iterator.isValid()) {
+						if (!iterator.isValid()) {
 							iterator.status();
 							return prepareEndOfFile(context);
 						}
