@@ -2,16 +2,39 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import it.cavallium.rockserver.core.client.EmbeddedConnection;
+import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.impl.StoragePressureSignal;
+import it.unimi.dsi.fastutil.ints.IntList;
+import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.math.BigInteger;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.util.SizeUnit;
 
+@Timeout(30)
 class EmbeddedStoragePressureTest {
 
 	private static final long PENDING_COMPACTION_THRESHOLD = 64L * SizeUnit.GB;
+	private static final ColumnSchema TEST_SCHEMA = ColumnSchema.of(
+			IntList.of(Integer.BYTES),
+			ObjectList.of(),
+			true);
+
+	@TempDir
+	Path tempDir;
 
 	@Test
 	void productionStallDebtIsNotSummedAgainstOneColumnLimit() {
@@ -134,5 +157,191 @@ class EmbeddedStoragePressureTest {
 					| StoragePressureSignal.REASON_DELAYED_WRITE
 					| StoragePressureSignal.REASON_SIGNAL_FAILURE,
 				signal.reasonMask());
+	}
+
+	@Test
+	void runtimeColumnCreateAndDeleteUpdateThePolledSnapshotExactlyOnce() throws Exception {
+		try (var connection = new EmbeddedConnection(tempDir.resolve("column-lifecycle"),
+				"pressure-column-lifecycle",
+				null)) {
+			var db = connection.getInternalDB();
+			var api = connection.getSyncApi(RequestContext.batch());
+			int initialColumns = db.getStoragePressureColumnCountForTesting();
+			assertTrue(initialColumns >= 4, "default and internal columns must be polled after initialization");
+
+			long columnId = api.createColumn("runtime-pressure-column", TEST_SCHEMA);
+			assertEquals(initialColumns + 1, db.getStoragePressureColumnCountForTesting());
+			assertTrue(db.hasStoragePressureColumnForTesting(columnId));
+
+			assertEquals(columnId, api.createColumn("runtime-pressure-column", TEST_SCHEMA));
+			assertEquals(initialColumns + 1, db.getStoragePressureColumnCountForTesting(),
+					"idempotent logical creation must not duplicate the pressure entry");
+
+			api.deleteColumn(columnId);
+			assertEquals(initialColumns, db.getStoragePressureColumnCountForTesting());
+			assertFalse(db.hasStoragePressureColumnForTesting(columnId));
+		}
+	}
+
+	@Test
+	void configuredDisabledSlowdownPublishesDisabledEffectiveLimit() throws Exception {
+		Path config = tempDir.resolve("disabled-slowdown.conf");
+		Files.writeString(config, "database.global.disable-write-slowdown = true\n");
+		try (var connection = new EmbeddedConnection(tempDir.resolve("disabled-slowdown"),
+				"pressure-disabled-slowdown",
+				config)) {
+			var db = connection.getInternalDB();
+			long columnId = connection.getSyncApi(RequestContext.batch())
+					.createColumn("disabled-pressure-column", TEST_SCHEMA);
+
+			assertEquals(Long.MAX_VALUE, db.getStoragePressureColumnLimitForTesting(columnId));
+			db.refreshStoragePressureForTesting();
+			assertFalse(connection.getScheduler().isStoragePressure());
+		}
+	}
+
+	@Test
+	void deleteRacingACapturedPollSnapshotNeverUsesTheRetiredHandle() throws Exception {
+		try (var connection = new EmbeddedConnection(tempDir.resolve("delete-race"),
+				"pressure-delete-race",
+				null)) {
+			var db = connection.getInternalDB();
+			var api = connection.getSyncApi(RequestContext.batch());
+			long columnId = api.createColumn("delete-race-column", TEST_SCHEMA);
+			var pollAdmitted = new CountDownLatch(1);
+			var releasePoll = new CountDownLatch(1);
+			db.setStoragePressurePollAdmittedObserverForTesting(() -> {
+				pollAdmitted.countDown();
+				awaitUninterruptibly(releasePoll);
+			});
+			CompletableFuture<Void> poll = CompletableFuture.runAsync(db::refreshStoragePressureForTesting);
+			try {
+				assertTrue(pollAdmitted.await(5, TimeUnit.SECONDS));
+				CompletableFuture.runAsync(() -> api.deleteColumn(columnId)).get(5, TimeUnit.SECONDS);
+				assertFalse(db.hasStoragePressureColumnForTesting(columnId));
+			} finally {
+				db.setStoragePressurePollAdmittedObserverForTesting(null);
+				releasePoll.countDown();
+			}
+			poll.get(5, TimeUnit.SECONDS);
+			assertFalse(connection.getScheduler().isStoragePressure());
+		}
+	}
+
+	@Test
+	void failureMetricsAndSchedulerStateRecoverOnTheNextSuccessfulPoll() throws Exception {
+		var exported = new SimpleMeterRegistry();
+		try (var connection = new EmbeddedConnection(tempDir.resolve("failure-recovery"),
+				"pressure-failure-recovery",
+				null)) {
+			var db = connection.getInternalDB();
+			((CompositeMeterRegistry) db.getMetricsRegistry()).add(exported);
+
+			db.failStoragePressureRefreshForTesting(new IllegalStateException("synthetic property failure"));
+			assertTrue(connection.getScheduler().isStoragePressure());
+			assertEquals(1.0d, reasonGauge(exported, "signal_failure"));
+			var failureCounter = exported.find("rockserver.workload.storage.pressure.refresh.failures")
+					.tag("database", "pressure-failure-recovery")
+					.counter();
+			assertNotNull(failureCounter);
+			assertEquals(1.0d, failureCounter.count());
+
+			db.refreshStoragePressureForTesting();
+			assertFalse(connection.getScheduler().isStoragePressure());
+			assertEquals(0.0d, reasonGauge(exported, "signal_failure"));
+			assertEquals(4, exported.find("rockserver.workload.storage.pressure.reason").gauges().size());
+			var delayedRateGauge = exported
+					.find("rockserver.workload.storage.pressure.actual.delayed.write.rate")
+					.gauge();
+			assertNotNull(delayedRateGauge);
+			assertEquals("bytes", delayedRateGauge.getId().getBaseUnit());
+		} finally {
+			exported.close();
+		}
+	}
+
+	@Test
+	void closeWaitsForAnAdmittedPressurePollBeforeClosingNativeHandles() throws Exception {
+		var connection = new EmbeddedConnection(tempDir.resolve("close-race"),
+				"pressure-close-race",
+				null);
+		var db = connection.getInternalDB();
+		var pollAdmitted = new CountDownLatch(1);
+		var releasePoll = new CountDownLatch(1);
+		var closeStarted = new CountDownLatch(1);
+		db.setStoragePressurePollAdmittedObserverForTesting(() -> {
+			pollAdmitted.countDown();
+			awaitUninterruptibly(releasePoll);
+		});
+
+		CompletableFuture<Void> poll = CompletableFuture.runAsync(db::refreshStoragePressureForTesting);
+		CompletableFuture<Void> close = null;
+		try {
+			assertTrue(pollAdmitted.await(5, TimeUnit.SECONDS));
+			close = CompletableFuture.runAsync(() -> {
+				closeStarted.countDown();
+				try {
+					connection.closeTesting();
+				} catch (Exception failure) {
+					throw new RuntimeException(failure);
+				}
+			});
+			assertTrue(closeStarted.await(5, TimeUnit.SECONDS));
+			assertTrue(awaitCondition(() -> !db.isAcceptingOperationsForTesting()),
+					"close did not close operation admission");
+			assertFalse(close.isDone(), "close must retain DB/CF handles while the native poll owns an operation");
+
+			releasePoll.countDown();
+			poll.get(5, TimeUnit.SECONDS);
+			close.get(5, TimeUnit.SECONDS);
+		} finally {
+			db.setStoragePressurePollAdmittedObserverForTesting(null);
+			releasePoll.countDown();
+			if (close != null) {
+				try {
+					close.get(5, TimeUnit.SECONDS);
+				} catch (Exception ignored) {
+					// Retry the idempotent test close below to avoid leaking native state.
+				}
+			}
+			if (close == null || close.isCompletedExceptionally()) {
+				connection.closeTesting();
+			}
+		}
+	}
+
+	private static double reasonGauge(SimpleMeterRegistry registry, String reason) {
+		var gauge = registry.find("rockserver.workload.storage.pressure.reason")
+				.tag("database", "pressure-failure-recovery")
+				.tag("reason", reason)
+				.gauge();
+		assertNotNull(gauge);
+		return gauge.value();
+	}
+
+	private static void awaitUninterruptibly(CountDownLatch latch) {
+		boolean interrupted = false;
+		while (true) {
+			try {
+				latch.await();
+				break;
+			} catch (InterruptedException ignored) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static boolean awaitCondition(java.util.function.BooleanSupplier condition) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		do {
+			if (condition.getAsBoolean()) {
+				return true;
+			}
+			Thread.sleep(5L);
+		} while (System.nanoTime() < deadline);
+		return condition.getAsBoolean();
 	}
 }

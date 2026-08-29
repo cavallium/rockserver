@@ -447,6 +447,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private volatile @Nullable Runnable rawScanCleanupObserver;
 	private volatile @Nullable Runnable columnMaintenanceObserver;
 	private volatile @Nullable LongConsumer columnUseAcquiredObserver;
+	private volatile @Nullable Runnable storagePressurePollAdmittedObserver;
 	private Path tempSSTsPath;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
@@ -2349,6 +2350,51 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.columnUseAcquiredObserver = observer;
 	}
 
+	@VisibleForTesting
+	public void setStoragePressurePollAdmittedObserverForTesting(@Nullable Runnable observer) {
+		this.storagePressurePollAdmittedObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void refreshStoragePressureForTesting() {
+		refreshStoragePressure();
+	}
+
+	@VisibleForTesting
+	public void failStoragePressureRefreshForTesting(Throwable failure) {
+		handleStoragePressureRefreshFailure(failure);
+	}
+
+	@VisibleForTesting
+	public int getStoragePressureColumnCountForTesting() {
+		return storagePressureColumns.length;
+	}
+
+	@VisibleForTesting
+	public boolean isAcceptingOperationsForTesting() {
+		return ops.isOpen();
+	}
+
+	@VisibleForTesting
+	public boolean hasStoragePressureColumnForTesting(long columnId) {
+		for (StoragePressureColumn pressureColumn : storagePressureColumns) {
+			if (pressureColumn.id() == columnId) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	@VisibleForTesting
+	public long getStoragePressureColumnLimitForTesting(long columnId) {
+		for (StoragePressureColumn pressureColumn : storagePressureColumns) {
+			if (pressureColumn.id() == columnId) {
+				return pressureColumn.effectiveSoftPendingCompactionBytesLimit();
+			}
+		}
+		throw new IllegalArgumentException("Column is not registered for storage-pressure polling: " + columnId);
+	}
+
 	private void notifyRangeIteratorOpened() {
 		var observer = rangeIteratorOpenObserver;
 		if (observer != null) {
@@ -2962,6 +3008,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			ops.beginOp();
 			operationStarted = true;
+			StoragePressureColumn[] pressureColumns = storagePressureColumns;
+			var pollAdmittedObserver = storagePressurePollAdmittedObserver;
+			if (pollAdmittedObserver != null) {
+				pollAdmittedObserver.run();
+			}
 			storagePressureSignal.reset(0L, 0L);
 			var rocksDb = db.get();
 			long writeStopped = rocksDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY);
@@ -2971,7 +3022,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// The DB-wide signals already prove pressure. Avoid one JNI call per
 			// column until RocksDB reports that writes are flowing normally again.
 			if (!storagePressureSignal.pressured()) {
-				for (StoragePressureColumn pressureColumn : storagePressureColumns) {
+				for (StoragePressureColumn pressureColumn : pressureColumns) {
 					ColumnInstance registeredColumn = pressureColumn.registeredColumn();
 					if (registeredColumn != null && !tryBeginColumnUse(registeredColumn)) {
 						continue;
@@ -3000,15 +3051,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (!operationStarted && !ops.isOpen()) {
 				return;
 			}
-			storagePressureSignal.markSignalFailure();
-			scheduler.setStoragePressure(true);
-			storagePressureRefreshFailures.increment();
-			logger.debug("Unable to refresh workload storage-pressure state", error);
+			handleStoragePressureRefreshFailure(error);
 		} finally {
 			if (operationStarted) {
 				ops.endOp();
 			}
 		}
+	}
+
+	private void handleStoragePressureRefreshFailure(Throwable error) {
+		storagePressureSignal.markSignalFailure();
+		scheduler.setStoragePressure(true);
+		storagePressureRefreshFailures.increment();
+		logger.debug("Unable to refresh workload storage-pressure state", error);
 	}
 
 	/**

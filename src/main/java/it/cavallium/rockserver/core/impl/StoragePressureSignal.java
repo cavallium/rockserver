@@ -11,7 +11,9 @@ import org.jetbrains.annotations.VisibleForTesting;
  * otherwise zero and {@link Long#MAX_VALUE} limits disable proactive pressure for that column.</p>
  *
  * <p>One instance is reusable by one polling thread. Observation getters are safe for concurrent metric
- * readers and do not allocate.</p>
+ * readers and do not allocate. This type is public only so the qualified Rockserver test/benchmark
+ * module can exercise the exact production evaluator; the {@code impl} package is not exported as a
+ * public library API.</p>
  */
 public final class StoragePressureSignal {
 
