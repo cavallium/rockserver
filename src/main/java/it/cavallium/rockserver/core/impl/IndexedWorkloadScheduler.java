@@ -82,11 +82,19 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		if (disposed) {
 			throw Exceptions.failWithRejected();
 		}
+		Runnable original = Objects.requireNonNull(task, "task");
 		var scheduledTask = new IndexedScheduledTask(this,
-				Schedulers.onSchedule(Objects.requireNonNull(task, "task")),
-				null);
+				Schedulers.onSchedule(original),
+				null,
+				estimatedBytes(original));
 		scheduledTask.submit();
 		return scheduledTask;
+	}
+
+	private static long estimatedBytes(Runnable task) {
+		return task instanceof RWScheduler.EstimatedWork estimatedWork
+				? estimatedWork.estimatedBytes()
+				: 0L;
 	}
 
 	@Override
@@ -118,9 +126,11 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 
 		@Override
 		public Disposable schedule(Runnable task) {
+			Runnable original = Objects.requireNonNull(task, "task");
 			var scheduledTask = new IndexedScheduledTask(scheduler,
-					Schedulers.onSchedule(Objects.requireNonNull(task, "task")),
-					this);
+					Schedulers.onSchedule(original),
+					this,
+					estimatedBytes(original));
 			if (!tasks.add(scheduledTask)) {
 				throw Exceptions.failWithRejected();
 			}
@@ -150,7 +160,8 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 
 	private static final class IndexedScheduledTask implements Runnable,
 			Disposable,
-			ProfiledWorkloadExecutor.CancellationTrackedTask {
+			ProfiledWorkloadExecutor.CancellationTrackedTask,
+			RWScheduler.EstimatedWork {
 
 		private static final int QUEUED = 0;
 		private static final int RUNNING = 1;
@@ -175,16 +186,24 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		private final IndexedWorkloadScheduler scheduler;
 		private final Runnable task;
 		private final @Nullable IndexedWorker parent;
+		private final long estimatedBytes;
 		private volatile int state = QUEUED;
 		private volatile int dispatchState = DISPATCH_PENDING;
 		private boolean submitted;
 
 		private IndexedScheduledTask(IndexedWorkloadScheduler scheduler,
 				Runnable task,
-				@Nullable IndexedWorker parent) {
+				@Nullable IndexedWorker parent,
+				long estimatedBytes) {
 			this.scheduler = scheduler;
 			this.task = task;
 			this.parent = parent;
+			this.estimatedBytes = estimatedBytes;
+		}
+
+		@Override
+		public long estimatedBytes() {
+			return estimatedBytes;
 		}
 
 		private synchronized void submit() {

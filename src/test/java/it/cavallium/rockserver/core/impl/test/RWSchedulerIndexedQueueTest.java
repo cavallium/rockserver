@@ -34,10 +34,53 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import reactor.core.Disposable;
+import reactor.core.scheduler.Schedulers;
 
 class RWSchedulerIndexedQueueTest {
 
 	private static final int LARGE_QUEUE_SIZE = 4_096;
+
+	@Test
+	void reactorHookCannotEraseEstimatedWorkFromDrrAdmission() throws Exception {
+		String hook = "indexed-estimated-work-" + System.identityHashCode(this);
+		Schedulers.onScheduleHook(hook, original -> original::run);
+		var scheduler = scheduler(1, 16, "indexed-estimated-work");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var completed = new CountDownLatch(8);
+		var order = Collections.synchronizedList(new ArrayList<WorkloadProfile>());
+		try {
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+
+			var ingest = scheduler.scheduler(
+					WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, RequestContext.NO_DEADLINE);
+			var batch = scheduler.scheduler(
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+			for (int i = 0; i < 4; i++) {
+				ingest.schedule(new EstimatedOrderTask(8L * 1024L * 1024L,
+						WorkloadProfile.INGEST, order, completed));
+				batch.schedule(new EstimatedOrderTask(1L, WorkloadProfile.BATCH, order, completed));
+			}
+
+			releaseBlocker.countDown();
+			assertTrue(completed.await(5, SECONDS));
+			assertEquals(List.of(
+					WorkloadProfile.INGEST,
+					WorkloadProfile.BATCH,
+					WorkloadProfile.INGEST,
+					WorkloadProfile.BATCH), order.subList(0, 4));
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.disposeNow();
+			Schedulers.resetOnScheduleHook(hook);
+		}
+	}
 
 	@Test
 	void largeQueueAdmissionSnapshotsAndGaugeSamplingNeverInspectCommands() throws Exception {
@@ -982,6 +1025,18 @@ class RWSchedulerIndexedQueueTest {
 		public boolean isDisposed() {
 			cancellationChecks.incrementAndGet();
 			return false;
+		}
+	}
+
+	private record EstimatedOrderTask(long estimatedBytes,
+			WorkloadProfile profile,
+			List<WorkloadProfile> order,
+			CountDownLatch completed) implements Runnable, RWScheduler.EstimatedWork {
+
+		@Override
+		public void run() {
+			order.add(profile);
+			completed.countDown();
 		}
 	}
 
