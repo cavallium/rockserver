@@ -70,6 +70,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.Map.Entry;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -77,10 +78,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -320,6 +323,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final TransactionalDB db;
 	private final DBOptions dbOptions;
 	private final RWScheduler scheduler;
+	private final ThreadPoolExecutor rawScanPinCaptureExecutor;
 	private final ScheduledExecutorService leakScheduler;
 	private final ScheduledFuture<?> expiredRangeCleanupTask;
 	private final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
@@ -415,6 +419,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private volatile @Nullable BiConsumer<String, String> cdcMetadataOperationObserver;
 	private volatile @Nullable BiConsumer<String, String> cdcMetadataLoadedObserver;
 	private volatile @Nullable Runnable rawScanFilesCapturedObserver;
+	private volatile @Nullable Runnable rawScanHardLinkObserver;
 	private volatile @Nullable Runnable rawScanReaderOpenedObserver;
 	private volatile @Nullable Runnable rawScanCleanupObserver;
 	private volatile @Nullable Runnable columnMaintenanceObserver;
@@ -638,6 +643,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				"db[" + name + "]",
 				metrics.getRegistry(),
 				name);
+		// Pin capture performs filesystem work while RocksDB file deletion is
+		// disabled. Keep that serialized critical section on one owned thread so
+		// capture waiters never occupy the latency-sensitive read pool.
+		this.rawScanPinCaptureExecutor = new ThreadPoolExecutor(
+				1,
+				1,
+				0L,
+				TimeUnit.MILLISECONDS,
+				new ArrayBlockingQueue<>(workloadSettings.batchQueueCapacity()),
+				new NamedThreadFactory("db-raw-scan-pin-capture"),
+				new ThreadPoolExecutor.AbortPolicy());
 		Gauge.builder("rockserver.workload.retained.snapshots", retainedRangeSnapshots, AtomicInteger::get)
 				.tag("database", name)
 				.register(metrics.getRegistry());
@@ -971,6 +987,112 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private Mono<RawScanPinnedSstSet> scheduleRawScanPinCapture(
+			Callable<RawScanPinnedSstSet> capture) {
+		return Mono.create(sink -> {
+			var task = new RawScanPinCaptureTask(capture, sink);
+			sink.onCancel(task::cancelDelivery);
+			try {
+				rawScanPinCaptureExecutor.execute(task);
+				// Cancellation may win before execute() publishes the task to the
+				// queue. Retry removal after publication so canceled entries never
+				// consume the bounded capture admission budget.
+				task.removeIfCancelled();
+			} catch (RejectedExecutionException rejection) {
+				task.reject(rejection);
+			}
+		});
+	}
+
+	private final class RawScanPinCaptureTask implements Runnable {
+
+		private static final int QUEUED = 0;
+		private static final int RUNNING = 1;
+		private static final int FINISHED = 2;
+		private static final int CANCELLED = 3;
+
+		private final Callable<RawScanPinnedSstSet> capture;
+		private final reactor.core.publisher.MonoSink<RawScanPinnedSstSet> sink;
+		private final Object emissionLock = new Object();
+		private final AtomicInteger state = new AtomicInteger(QUEUED);
+		private boolean deliveryCancelled;
+
+		private RawScanPinCaptureTask(Callable<RawScanPinnedSstSet> capture,
+				reactor.core.publisher.MonoSink<RawScanPinnedSstSet> sink) {
+			this.capture = capture;
+			this.sink = sink;
+		}
+
+		private void cancelDelivery() {
+			synchronized (emissionLock) {
+				deliveryCancelled = true;
+			}
+			if (state.compareAndSet(QUEUED, CANCELLED)) {
+				rawScanPinCaptureExecutor.remove(this);
+			}
+		}
+
+		private void removeIfCancelled() {
+			if (state.get() == CANCELLED) {
+				rawScanPinCaptureExecutor.remove(this);
+			}
+		}
+
+		private void reject(RejectedExecutionException rejection) {
+			if (!state.compareAndSet(QUEUED, FINISHED)) {
+				return;
+			}
+			synchronized (emissionLock) {
+				if (!deliveryCancelled) {
+					sink.error(RocksDBException.of(
+							RocksDBErrorType.SERVER_OVERLOADED,
+							rawScanPinCaptureExecutor.isShutdown()
+									? "Raw-scan pin capture executor is shutting down"
+									: "Raw-scan pin capture queue is full",
+							rejection));
+				}
+			}
+		}
+
+		@Override
+		public void run() {
+			if (!state.compareAndSet(QUEUED, RUNNING)) {
+				return;
+			}
+			try {
+				RawScanPinnedSstSet result = capture.call();
+				boolean late;
+				synchronized (emissionLock) {
+					late = deliveryCancelled;
+					if (!late) {
+						sink.success(result);
+					}
+				}
+				if (late) {
+					try {
+						result.close();
+					} catch (Throwable cleanupFailure) {
+						logger.warn("Failed to clean raw-scan pins captured after subscriber cancellation",
+								cleanupFailure);
+					}
+				}
+			} catch (Throwable captureFailure) {
+				boolean late;
+				synchronized (emissionLock) {
+					late = deliveryCancelled;
+					if (!late) {
+						sink.error(captureFailure);
+					}
+				}
+				if (late) {
+					logger.debug("Raw-scan pin capture failed after subscriber cancellation", captureFailure);
+				}
+			} finally {
+				state.set(FINISHED);
+			}
+		}
+	}
+
 	/**
 	 * The column must be unregistered once!!! Do not try to unregister a column that may already be unregistered, or that
 	 * may not be registered
@@ -1024,6 +1146,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			closeActiveRangeResources();
 			logger.info("Waiting for active operations");
 			ops.waitForExit(pendingOpsTimeoutMs);
+			shutdownRawScanPinCaptureExecutor();
 			// Cooperative tasks can release their SafeShutdown operation before their
 			// worker publishes terminal scheduler metrics. Join the scheduler before
 			// closeResources tears down meters or other observability state.
@@ -1035,6 +1158,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			closeResources(false);
 			if (testing && (resourceLeases.get() > 0
 					|| (scheduler != null && !scheduler.isFullyTerminated())
+					|| !rawScanPinCaptureExecutor.isTerminated()
 					|| retainedQueryLimiter.activeCount() > 0
 					|| retainedQueryLimiter.waitingCount() > 0
 					|| retainedRangeSnapshots.get() > 0
@@ -1042,6 +1166,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					|| !activeCdcPollCursors.isEmpty())) {
 				throw new IllegalStateException("Shutdown left resources open: schedulerTerminated="
 						+ (scheduler == null || scheduler.isFullyTerminated())
+						+ ", rawScanPinCaptureTerminated=" + rawScanPinCaptureExecutor.isTerminated()
 						+ ", leases=" + resourceLeases.get()
 						+ ", retainedPermits=" + retainedQueryLimiter.activeCount()
 						+ ", retainedWaiters=" + retainedQueryLimiter.waitingCount()
@@ -1068,11 +1193,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (scheduler != null) {
 				scheduler.disposeNow();
 			}
+			shutdownRawScanPinCaptureExecutor();
 			// After forcing close of leaked resources, proceed to close DB/native resources defensively
 			closeResources(true);
 
 			if (testing && (ops.getPendingOpsCount() > 0
 					|| (scheduler != null && !scheduler.isFullyTerminated())
+					|| !rawScanPinCaptureExecutor.isTerminated()
 					|| resourceLeases.get() > 0
 					|| retainedQueryLimiter.activeCount() > 0
 					|| retainedQueryLimiter.waitingCount() > 0
@@ -1081,6 +1208,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					|| !activeCdcPollCursors.isEmpty())) {
 				throw new IllegalStateException("Some active operations lasted more than " + pendingOpsTimeoutMs
 						+ " ms! schedulerTerminated=" + (scheduler == null || scheduler.isFullyTerminated())
+						+ ", rawScanPinCaptureTerminated=" + rawScanPinCaptureExecutor.isTerminated()
 						+ ", activeOps=" + ops.getPendingOpsCount() + ", resourceLeases="
 						+ resourceLeases.get() + ", retainedPermits=" + retainedQueryLimiter.activeCount()
 						+ ", retainedWaiters=" + retainedQueryLimiter.waitingCount()
@@ -1100,7 +1228,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				logger.warn("Failed to dispose RWScheduler", t);
 			}
 			try {
-				shutdownExecutor(leakScheduler);
+				shutdownRawScanPinCaptureExecutor();
+			} catch (Throwable t) {
+				logger.warn("Failed to shutdown raw-scan pin capture scheduler", t);
+			}
+			try {
+				shutdownExecutor(leakScheduler, "Leak scheduler");
 			} catch (Throwable t) {
 				logger.warn("Failed to shutdown leak scheduler", t);
 			}
@@ -1389,18 +1522,32 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private void shutdownExecutor(ScheduledExecutorService exec) {
+	private void shutdownExecutor(ExecutorService exec, String description) {
 		if (exec == null) {
 			return;
 		}
 		exec.shutdownNow();
+		awaitExecutorTermination(exec, description);
+	}
+
+	private void awaitExecutorTermination(ExecutorService exec, String description) {
 		try {
 			if (!exec.awaitTermination(10, TimeUnit.SECONDS)) {
-				logger.warn("Leak scheduler did not terminate within timeout");
+				logger.warn("{} did not terminate within timeout", description);
 			}
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
 		}
+	}
+
+	private void shutdownRawScanPinCaptureExecutor() {
+		var shutdownFailure = new RejectedExecutionException("Raw-scan pin capture scheduler is shutting down");
+		for (Runnable queuedTask : rawScanPinCaptureExecutor.shutdownNow()) {
+			if (queuedTask instanceof RawScanPinCaptureTask captureTask) {
+				captureTask.reject(shutdownFailure);
+			}
+		}
+		awaitExecutorTermination(rawScanPinCaptureExecutor, "Raw-scan pin capture scheduler");
 	}
 
 	/**
@@ -1999,6 +2146,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setRawScanFilesCapturedObserverForTesting(@Nullable Runnable observer) {
 		this.rawScanFilesCapturedObserver = observer;
+	}
+
+	@VisibleForTesting
+	public void setRawScanHardLinkObserverForTesting(@Nullable Runnable observer) {
+		this.rawScanHardLinkObserver = observer;
+	}
+
+	@VisibleForTesting
+	public int getRawScanPinCaptureQueueSizeForTesting() {
+		return rawScanPinCaptureExecutor.getQueue().size();
+	}
+
+	@VisibleForTesting
+	public long getRawScanPinCaptureQueueCapacityForTesting() {
+		var queue = rawScanPinCaptureExecutor.getQueue();
+		return (long) queue.size() + queue.remainingCapacity();
 	}
 
 	@VisibleForTesting
@@ -8240,6 +8403,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@VisibleForTesting
 	protected void createRawScanHardLink(Path source, Path target) throws IOException {
+		var observer = rawScanHardLinkObserver;
+		if (observer != null) {
+			observer.run();
+		}
 		Files.createLink(target, source);
 	}
 
@@ -9246,43 +9413,46 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						return Flux.error(e);
 					}
 
-					return Flux.using(
-							() -> new RawScanPinnedSstSet(cfName, shardIndex, shardCount, completedSstFileNames),
-							pinnedSsts -> {
-								var observer = rawScanFilesCapturedObserver;
-								if (observer != null) {
-									observer.run();
-								}
+					return scheduleRawScanPinCapture(
+								() -> new RawScanPinnedSstSet(cfName, shardIndex, shardCount, completedSstFileNames))
+							.flatMapMany(capturedPins -> Flux.using(
+									() -> capturedPins,
+									pinnedSsts -> {
+										var observer = rawScanFilesCapturedObserver;
+										if (observer != null) {
+											observer.run();
+										}
 
-								Function<PinnedSstFile, Publisher<T>> mapper = file ->
-										Flux.defer(() -> Flux.<T>create(rawSink -> {
-											var state = new ScanState<>(col, cfName, file, rawSink,
-													maximumQuantumNanos, batchMapper, terminalMapper);
-											rawSink.onRequest(state);
-											rawSink.onCancel(state);
-											rawSink.onDispose(state);
-											try {
-												state.attach(workloadExecutor.executeCooperatively(
-														state,
-														RAW_SCAN_MAX_BYTES_PER_CHUNK));
-											} catch (RuntimeException admissionFailure) {
-												state.reject(admissionFailure);
-											}
-										}, FluxSink.OverflowStrategy.ERROR))
-												// Retry only pre-dispatch queue rejection. ScanState keeps the
-												// same hard link available, while native/data failures remain terminal.
-												.retryWhen(RAW_SCAN_ADMISSION_RETRY)
-												.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
+										Function<PinnedSstFile, Publisher<T>> mapper = file ->
+												Flux.defer(() -> Flux.<T>create(rawSink -> {
+													var state = new ScanState<>(col, cfName, file, rawSink,
+															maximumQuantumNanos, batchMapper, terminalMapper);
+													rawSink.onRequest(state);
+													rawSink.onCancel(state);
+													rawSink.onDispose(state);
+													try {
+														state.attach(workloadExecutor.executeCooperatively(
+																state,
+																RAW_SCAN_MAX_BYTES_PER_CHUNK));
+													} catch (RuntimeException admissionFailure) {
+														state.reject(admissionFailure);
+													}
+												}, FluxSink.OverflowStrategy.ERROR))
+														// Retry only pre-dispatch queue rejection. ScanState keeps the
+														// same hard link available, while native/data failures remain terminal.
+														.retryWhen(RAW_SCAN_ADMISSION_RETRY)
+														.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
 
-								var ssts = Flux.fromIterable(pinnedSsts.files());
-								if (shardCount == 1) {
-									return ssts.flatMap(mapper, workloadSettings.rawScanFileConcurrency(), 1);
-								} else {
-									return ssts.concatMap(mapper, 2);
-								}
-							},
-							RawScanPinnedSstSet::close,
-							true);
+										var ssts = Flux.fromIterable(pinnedSsts.files());
+										if (shardCount == 1) {
+											return ssts.flatMap(mapper, workloadSettings.rawScanFileConcurrency(), 1);
+										} else {
+											return ssts.concatMap(mapper, 2);
+										}
+									},
+									RawScanPinnedSstSet::close,
+									true))
+							.doOnDiscard(RawScanPinnedSstSet.class, RawScanPinnedSstSet::close);
 				}),
 				columnUse -> {
 					try {
