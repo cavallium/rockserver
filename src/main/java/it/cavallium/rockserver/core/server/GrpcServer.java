@@ -2320,7 +2320,8 @@ public class GrpcServer extends Server {
 			return executeScheduled(() -> {
 				protectedApi().flush();
 				return Empty.getDefaultInstance();
-			}, scheduler.maintenance()).transform(this.onErrorMapMonoWithRequestInfo("flush", request));
+			}, scheduler.maintenance(OperationFamily.FLUSH))
+					.transform(this.onErrorMapMonoWithRequestInfo("flush", request));
 		}
 
 		@Override
@@ -2328,7 +2329,8 @@ public class GrpcServer extends Server {
 			return executeScheduled(() -> {
 				protectedApi().compact();
 				return Empty.getDefaultInstance();
-			}, scheduler.maintenance()).transform(this.onErrorMapMonoWithRequestInfo("compact", request));
+			}, scheduler.maintenance(OperationFamily.COMPACTION))
+					.transform(this.onErrorMapMonoWithRequestInfo("compact", request));
 		}
 
 		@Override

@@ -75,6 +75,49 @@ profiles through the generated gRPC client and server, prove exact RPC terminal
 accounting and acknowledged-write round trips, and gate avoidable sleeping workers
 plus paired foreground confidence intervals. Neither harness replaces the canary.
 
+## Direct high-contention scheduler suite
+
+`SchedulerHighContentionBenchmark` isolates `RWScheduler` from RocksDB and transport
+cost so admission, dispatch, arbitration, and cooperative transitions can be driven
+far harder than a disk-backed benchmark. Its default fresh-process run submits one
+million operations from at least 64 platform threads across twelve profile/family
+lanes, all seven profiles, and all four pools. It mixes:
+
+- normal and byte-weighted DRR work;
+- already-expired deadlines and bounded overload;
+- cancellation racing dispatch;
+- injected one-shot and `context.fail` failures;
+- cooperative `YIELD` and real `PARK`/resume cycles;
+- alternating storage pressure with concurrent read/write BATCH work.
+
+Correctness is not inferred from throughput. The process fails unless every attempt
+has exactly one terminal outcome, cancellation and deadline arbitration balances,
+every profile makes useful progress, failure telemetry matches injected failures,
+no command executes twice, every sampled queue/outstanding value stays inside the
+scheduler's explicit bounds, and every pool drains with exact conservation. The
+machine-readable report then records attempts/useful runs per second, per-profile
+queue and execution p50/p95/p99, peak pool depths, and whether pressured BATCH limits
+were observed.
+
+After obtaining `workload_classpath` below, run:
+
+```bash
+contention_main="it.cavallium.rockserver.core.impl.benchmark.SchedulerHighContentionBenchmark"
+java -cp "${workload_classpath}" "${contention_main}" \
+  1000000 64 16 16 65536 104376208116478 5
+```
+
+The positional values are operations, submitter threads, read workers, write workers,
+foreground/BATCH queue capacity, deterministic seed, and injected-failure percentage.
+Use zero injected failures only when comparing performance against a known older build
+whose failure telemetry is itself under test; correctness runs should retain injection.
+The main class performs an unreported deterministic warm-up (10% of the requested
+operation count, capped at 200,000) before creating a fresh measured scheduler.
+For performance decisions,
+run immutable baseline and candidate in fresh, serial, counterbalanced JVMs with the
+same arguments and host state. Absolute throughput from ordinary CI is only a smoke
+measurement; it is never proof of optimality or release acceptance.
+
 ## Obtain the direct-launch classpath
 
 N's consolidated Rockserver Maven gate compiles the harness and writes the test

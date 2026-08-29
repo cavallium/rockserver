@@ -67,17 +67,21 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
@@ -190,6 +194,32 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			= "it.cavallium.rockserver.grpc.client.max-inbound-message-size-bytes";
 	public static final int DEFAULT_MAX_INBOUND_MESSAGE_SIZE = 64 * 1024 * 1024;
 	public static final int MIN_MAX_INBOUND_MESSAGE_SIZE = 4 * 1024 * 1024;
+	/*
+	 * A retry can run after the server completed an operation but before its
+	 * response reached the client. Keep this allowlist to stateless unary reads:
+	 * transaction/update/iterator creation, mutations, maintenance, CDC polling
+	 * and every streaming method require caller-owned recovery instead.
+	 *
+	 * Generated descriptors bind the service-config names to the wire schema.
+	 */
+	private static final List<MethodDescriptor<?, ?>> AUTOMATIC_RETRY_METHOD_DESCRIPTORS = List.of(
+			RocksDBServiceGrpc.getGetCapabilitiesMethod(),
+			RocksDBServiceGrpc.getGetColumnIdMethod(),
+			RocksDBServiceGrpc.getEstimateNumKeysMethod(),
+			RocksDBServiceGrpc.getGetMethod(),
+			RocksDBServiceGrpc.getExistsMethod(),
+			RocksDBServiceGrpc.getExistsMultiMethod(),
+			RocksDBServiceGrpc.getReduceRangeFirstAndLastMethod(),
+			RocksDBServiceGrpc.getReduceRangeEntriesCountMethod(),
+			RocksDBServiceGrpc.getGetRangePageMethod(),
+			RocksDBServiceGrpc.getGetAllColumnDefinitionsMethod(),
+			RocksDBServiceGrpc.getCheckMergeOperatorMethod(),
+			RocksDBServiceGrpc.getCdcGetEarliestAvailableSequenceMethod(),
+			RocksDBServiceGrpc.getCdcGetLastCommittedSequenceMethod());
+	private static final List<Map<String, String>> AUTOMATIC_RETRY_METHOD_CONFIG_NAMES =
+			AUTOMATIC_RETRY_METHOD_DESCRIPTORS.stream()
+					.map(GrpcConnectionDelegate::serviceConfigName)
+					.toList();
 	final ManagedChannel channel;
 	final ExecutorService callbackExecutor;
 	final EventLoopGroup eventLoopGroup;
@@ -355,7 +385,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.maxRetryAttempts(maxAttempts)
 				.defaultServiceConfig(Map.of(
 						"methodConfig", List.of(Map.of(
-								"name", List.of(Map.of()),
+								"name", AUTOMATIC_RETRY_METHOD_CONFIG_NAMES,
 								"retryPolicy", Map.of(
 										"maxAttempts", (double) maxAttempts,
 										"initialBackoff", System.getProperty(INITIAL_RETRY_BACKOFF_PROPERTY, "0.5s"),
@@ -369,6 +399,31 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 								)
 						))
 				));
+	}
+
+	private static Map<String, String> serviceConfigName(MethodDescriptor<?, ?> method) {
+		if (method.getType() != MethodDescriptor.MethodType.UNARY) {
+			throw new IllegalArgumentException("Automatic gRPC retry requires a unary method: "
+					+ method.getFullMethodName());
+		}
+		String fullMethodName = method.getFullMethodName();
+		int separator = fullMethodName.lastIndexOf('/');
+		if (separator <= 0 || separator == fullMethodName.length() - 1) {
+			throw new IllegalArgumentException("Invalid generated gRPC method name: " + fullMethodName);
+		}
+		return Map.of(
+				"service", fullMethodName.substring(0, separator),
+				"method", fullMethodName.substring(separator + 1));
+	}
+
+	private static List<MethodDescriptor<?, ?>> automaticRetryMethodDescriptors() {
+		return AUTOMATIC_RETRY_METHOD_DESCRIPTORS;
+	}
+
+	private static Set<String> automaticRetryMethodFullNames() {
+		return AUTOMATIC_RETRY_METHOD_DESCRIPTORS.stream()
+				.map(MethodDescriptor::getFullMethodName)
+				.collect(Collectors.toUnmodifiableSet());
 	}
 
 	private static int intProperty(String name, int defaultValue, int minValue) {
@@ -802,12 +857,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@Override
 	public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
-		return reactiveStubWithRequestDeadline().scanRaw(ScanRawRequest.newBuilder()
+		return toResponse(reactiveStubWithRequestDeadline().scanRaw(ScanRawRequest.newBuilder()
 						.setColumnId(columnId)
 						.setShardIndex(shardIndex)
 						.setShardCount(shardCount)
 						.setContext(currentWireRequestContext())
-						.build())
+						.build()))
 				.map(batch -> new SerializedKVBatchRef(Buf.wrap(batch.getSerialized().toByteArray())));
 	}
 
@@ -832,7 +887,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		for (RawSstToken completedSst : completedSsts) {
 			request.addCompletedSstTokens(completedSst.value());
 		}
-		return reactiveStubWithRequestDeadline().scanRaw(request.build())
+		return toResponse(reactiveStubWithRequestDeadline().scanRaw(request.build()))
 				.map(event -> switch (event.getEventCase()) {
 					case SERIALIZED -> new RawScanEvent.Batch(
 							Buf.wrap(event.getSerialized().toByteArray()),
@@ -1590,6 +1645,13 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private <T, U> CompletableFuture<U> toResponse(ListenableFuture<T> listenableFuture,
 			Function<T, U> mapper,
 			Function<Throwable, Throwable> errorMapper) {
+		return bridgeResponse(listenableFuture, mapper, errorMapper, callbackExecutor);
+	}
+
+	static <T, U> CompletableFuture<U> bridgeResponse(ListenableFuture<T> listenableFuture,
+			Function<T, U> mapper,
+			Function<Throwable, Throwable> errorMapper,
+			Executor callbackExecutor) {
 		var response = new GrpcResponseFuture<>(listenableFuture, mapper, errorMapper);
 		Futures.addCallback(listenableFuture, response, callbackExecutor);
 		return response;
@@ -1604,7 +1666,26 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		return AUTOMATIC_RETRYABLE_STATUS_CODES.contains(code);
 	}
 
-	private static class RetryLoggingInterceptor implements ClientInterceptor {
+	private static final class RetryLoggingInterceptor implements ClientInterceptor {
+
+		private final Consumer<String> warningLogger;
+
+		private RetryLoggingInterceptor() {
+			this(LOG::warn);
+		}
+
+		private RetryLoggingInterceptor(Consumer<String> warningLogger) {
+			this.warningLogger = Objects.requireNonNull(warningLogger, "warningLogger");
+		}
+
+		private static String terminalStatusWarning(MethodDescriptor<?, ?> method, Status status) {
+			// A client interceptor observes the logical call's final close after any
+			// transparent or configured retries, not each individual transport attempt.
+			return "gRPC call to " + method.getFullMethodName()
+					+ " reached terminal status " + status.getCode()
+					+ ". No further automatic retry will be attempted by gRPC.";
+		}
+
 		@Override
 		public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
 				MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
@@ -1615,8 +1696,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 						@Override
 						public void onClose(Status status, Metadata trailers) {
 							if (!status.isOk() && isAutomaticallyRetryableStatus(status.getCode())) {
-								LOG.warn("gRPC call to {} failed with retryable status {}: {}. Retry will be attempted automatically.",
-										method.getFullMethodName(), status.getCode(), status.getDescription());
+								warningLogger.accept(terminalStatusWarning(method, status));
 							}
 							super.onClose(status, trailers);
 						}
@@ -1679,6 +1759,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		private final ListenableFuture<T> listenableFuture;
 		private final Function<T, U> mapper;
 		private final Function<Throwable, Throwable> errorMapper;
+		private final AtomicBoolean callbackClaimed = new AtomicBoolean();
 
 		private GrpcResponseFuture(ListenableFuture<T> listenableFuture,
 				Function<T, U> mapper,
@@ -1691,18 +1772,67 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		@Override
 		public boolean cancel(boolean mayInterruptIfRunning) {
 			boolean cancelled = listenableFuture.cancel(mayInterruptIfRunning);
-			super.cancel(cancelled);
+			if (!cancelled) {
+				return false;
+			}
+			super.cancel(mayInterruptIfRunning);
 			return cancelled;
 		}
 
 		@Override
 		public void onSuccess(T result) {
-			complete(mapper.apply(result));
+			if (!tryClaimCallback()) {
+				return;
+			}
+			try {
+				complete(mapper.apply(result));
+			} catch (VirtualMachineError fatal) {
+				completeExceptionally(fatal);
+				throw fatal;
+			} catch (Throwable mapperFailure) {
+				completeExceptionally(mapperFailure);
+			}
 		}
 
 		@Override
 		public void onFailure(@NotNull Throwable failure) {
-			completeExceptionally(errorMapper.apply(failure));
+			if (failure instanceof CancellationException && listenableFuture.isCancelled()) {
+				super.cancel(false);
+				return;
+			}
+			if (!tryClaimCallback()) {
+				return;
+			}
+			final Throwable mappedFailure;
+			try {
+				mappedFailure = errorMapper.apply(failure);
+			} catch (VirtualMachineError fatal) {
+				preserveOriginalFailure(fatal, failure);
+				completeExceptionally(fatal);
+				throw fatal;
+			} catch (Throwable mapperFailure) {
+				preserveOriginalFailure(mapperFailure, failure);
+				completeExceptionally(mapperFailure);
+				return;
+			}
+
+			if (mappedFailure == null) {
+				var invalidResult = new NullPointerException("The gRPC error mapper returned null");
+				preserveOriginalFailure(invalidResult, failure);
+				completeExceptionally(invalidResult);
+			} else {
+				completeExceptionally(mappedFailure);
+			}
+		}
+
+		private boolean tryClaimCallback() {
+			return !isDone() && callbackClaimed.compareAndSet(false, true) && !isDone();
+		}
+
+		private static void preserveOriginalFailure(Throwable mapperFailure, Throwable originalFailure) {
+			if (mapperFailure != originalFailure && mapperFailure.getCause() != originalFailure) {
+				mapperFailure.addSuppressed(originalFailure);
+			}
 		}
 	}
 

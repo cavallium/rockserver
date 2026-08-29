@@ -20,14 +20,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -41,6 +45,222 @@ class ScanRawCompactionSafetyTest {
 	private static final int GENERATIONS = 4;
 	private static final int KEYS_PER_GENERATION = 32;
 	private static final int COOPERATIVE_SCAN_KEYS = 5_000;
+
+	@Test
+	void blockedConcurrentPinCapturesDoNotStarveLatencyLookups(@TempDir Path tempDir) throws Exception {
+		final int readParallelism = 3;
+		Path configFile = tempDir.resolve("scan-raw-capture-isolation.conf");
+		Files.writeString(configFile, """
+				database.parallelism.read = %d
+				database.parallelism.write = 3
+				database.parallelism.workload.competing-batch-read-maximum-active = %d
+				""".formatted(readParallelism, readParallelism));
+		String databaseName = "scan-raw-capture-isolation";
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), databaseName, configFile)) {
+			RocksDBSyncAPI batch = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = batch.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			Buf expected = value(0, 1);
+			batch.put(0, columnId, key(1), expected, RequestType.none());
+			batch.flush();
+
+			var firstHardLinkEntered = new CountDownLatch(1);
+			var releaseHardLink = new CountDownLatch(1);
+			var allScansAdmitted = new CountDownLatch(readParallelism);
+			var blockFirstHardLink = new AtomicBoolean(true);
+			internal.setColumnUseAcquiredObserverForTesting(_ -> allScansAdmitted.countDown());
+			internal.setRawScanHardLinkObserverForTesting(() -> {
+				if (blockFirstHardLink.compareAndSet(true, false)) {
+					firstHardLinkEntered.countDown();
+					awaitLatch(releaseHardLink);
+				}
+			});
+
+			List<CompletableFuture<List<SerializedKVBatch>>> scans = java.util.stream.IntStream
+					.range(0, readParallelism)
+					.mapToObj(_ -> internal.scanRawAsyncInternal(columnId, 0, 1).collectList().toFuture())
+					.toList();
+			try {
+				assertTrue(firstHardLinkEntered.await(10, TimeUnit.SECONDS),
+						"the first raw scan never entered hard-link capture");
+				assertTrue(allScansAdmitted.await(10, TimeUnit.SECONDS),
+						"the regression needs at least readParallelism scans waiting to capture pins");
+
+				Buf actual = connection.getAsyncApi(RequestContext.latency(Duration.ofSeconds(10)))
+						.getAsync(0, columnId, key(1), RequestType.current())
+						.get(2, TimeUnit.SECONDS);
+				assertEquals(expected, actual,
+						"serialized raw-scan capture must not prevent admitted LATENCY reads from dispatching");
+			} finally {
+				releaseHardLink.countDown();
+				internal.setColumnUseAcquiredObserverForTesting(null);
+				internal.setRawScanHardLinkObserverForTesting(null);
+			}
+
+			for (CompletableFuture<List<SerializedKVBatch>> scan : scans) {
+				List<SerializedKVBatch> batches = scan.get(30, TimeUnit.SECONDS);
+				assertEquals(1, batches.size());
+				assertEquals(1L, batches.getFirst().decode().count());
+			}
+			assertTrue(awaitCondition(() -> {
+				var snapshot = internal.getScheduler().poolSnapshot(RWScheduler.Pool.READ);
+				return snapshot.activeTasks() == 0 && snapshot.queuedTasks() == 0;
+			}, Duration.ofSeconds(10)), "all raw-scan and LATENCY scheduler tasks must drain");
+			assertEquals(0L, internal.getPendingOpsCount());
+			assertTrue(internal.getRawScanPinnedFilesForTesting().isEmpty());
+			assertFileDeletionsEnabled(internal);
+		}
+	}
+
+	@Test
+	void cancellingQueuedPinCaptureDoesNotRunOrLeakItsResources(@TempDir Path tempDir) throws Exception {
+		Path configFile = tempDir.resolve("scan-raw-capture-cancel.conf");
+		Files.writeString(configFile, """
+				database.parallelism.read = 3
+				database.parallelism.write = 3
+				database.parallelism.workload.batch-queue-capacity = 1
+				database.parallelism.workload.competing-batch-read-maximum-active = 3
+				""");
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"), "scan-raw-capture-cancel", configFile)) {
+			RocksDBSyncAPI batch = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = batch.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			batch.put(0, columnId, key(1), value(0, 1), RequestType.none());
+			batch.flush();
+
+			var firstHardLinkEntered = new CountDownLatch(1);
+			var releaseHardLink = new CountDownLatch(1);
+			var hardLinkAttempts = new AtomicInteger();
+			internal.setRawScanHardLinkObserverForTesting(() -> {
+				if (hardLinkAttempts.incrementAndGet() == 1) {
+					firstHardLinkEntered.countDown();
+					awaitLatch(releaseHardLink);
+				}
+			});
+
+			CompletableFuture<List<SerializedKVBatch>> active = internal
+					.scanRawAsyncInternal(columnId, 0, 1).collectList().toFuture();
+			CompletableFuture<List<SerializedKVBatch>> queued;
+			CompletableFuture<List<SerializedKVBatch>> replacement;
+			try {
+				assertTrue(firstHardLinkEntered.await(10, TimeUnit.SECONDS));
+				queued = internal.scanRawAsyncInternal(columnId, 0, 1).collectList().toFuture();
+				assertTrue(awaitCondition(
+						() -> internal.getRawScanPinCaptureQueueSizeForTesting() == 1,
+						Duration.ofSeconds(2)), "the second capture did not enter the bounded queue");
+				assertEquals(1L, internal.getRawScanPinCaptureQueueCapacityForTesting());
+				assertTrue(queued.cancel(true), "the queued scan should still be cancellable before pin capture");
+				assertTrue(queued.isCancelled());
+				assertTrue(awaitCondition(
+						() -> internal.getRawScanPinCaptureQueueSizeForTesting() == 0,
+						Duration.ofSeconds(2)), "cancellation must physically remove the queued capture");
+				replacement = internal.scanRawAsyncInternal(columnId, 0, 1).collectList().toFuture();
+				assertTrue(awaitCondition(
+						() -> internal.getRawScanPinCaptureQueueSizeForTesting() == 1,
+						Duration.ofSeconds(2)), "the canceled slot must accept a replacement without waiting for capture");
+			} finally {
+				releaseHardLink.countDown();
+			}
+
+			assertEquals(1, active.get(30, TimeUnit.SECONDS).size());
+			assertEquals(1, replacement.get(30, TimeUnit.SECONDS).size());
+			internal.setRawScanHardLinkObserverForTesting(null);
+			assertTrue(awaitCondition(() -> internal.getPendingOpsCount() == 0L, Duration.ofSeconds(10)),
+					"cancelling a queued capture must release its operation and column lease");
+			assertEquals(2, hardLinkAttempts.get(),
+					"only the active capture and its admitted replacement may enter the critical section");
+			assertTrue(internal.getRawScanPinnedFilesForTesting().isEmpty());
+			assertFileDeletionsEnabled(internal);
+			batch.deleteColumn(columnId);
+		}
+	}
+
+	@Test
+	void pinCaptureQueueIsBoundedAndRejectsOverflowWithoutBlockingReadWorkers(@TempDir Path tempDir)
+			throws Exception {
+		final int queueCapacity = 2;
+		Path configFile = tempDir.resolve("scan-raw-capture-saturation.conf");
+		Files.writeString(configFile, """
+				database.parallelism.read = 3
+				database.parallelism.write = 3
+				database.parallelism.workload.batch-queue-capacity = %d
+				database.parallelism.workload.competing-batch-read-maximum-active = 3
+				""".formatted(queueCapacity));
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"),
+				"scan-raw-capture-saturation",
+				configFile)) {
+			RocksDBSyncAPI batch = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = batch.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			Buf expected = value(0, 1);
+			batch.put(0, columnId, key(1), expected, RequestType.none());
+			batch.flush();
+
+			var firstHardLinkEntered = new CountDownLatch(1);
+			var releaseHardLink = new CountDownLatch(1);
+			var initialScansAdmitted = new CountDownLatch(queueCapacity + 1);
+			var hardLinkAttempts = new AtomicInteger();
+			internal.setColumnUseAcquiredObserverForTesting(_ -> initialScansAdmitted.countDown());
+			internal.setRawScanHardLinkObserverForTesting(() -> {
+				if (hardLinkAttempts.incrementAndGet() == 1) {
+					firstHardLinkEntered.countDown();
+					awaitLatch(releaseHardLink);
+				}
+			});
+
+			List<CompletableFuture<List<SerializedKVBatch>>> accepted = java.util.stream.IntStream
+					.range(0, queueCapacity + 1)
+					.mapToObj(_ -> internal.scanRawAsyncInternal(columnId, 0, 1).collectList().toFuture())
+					.toList();
+			CompletableFuture<List<SerializedKVBatch>> overflow = null;
+			try {
+				assertTrue(firstHardLinkEntered.await(10, TimeUnit.SECONDS));
+				assertTrue(initialScansAdmitted.await(10, TimeUnit.SECONDS));
+				assertTrue(awaitCondition(
+						() -> internal.getRawScanPinCaptureQueueSizeForTesting() == queueCapacity,
+						Duration.ofSeconds(10)), "the capture lane did not reach its configured queue bound");
+				assertEquals(queueCapacity, internal.getRawScanPinCaptureQueueCapacityForTesting(),
+						"capture waiting must inherit the bounded BATCH admission capacity");
+
+				Buf actual = connection.getAsyncApi(RequestContext.latency(Duration.ofSeconds(10)))
+						.getAsync(0, columnId, key(1), RequestType.current())
+						.get(2, TimeUnit.SECONDS);
+				assertEquals(expected, actual, "a saturated capture lane must not consume read workers");
+
+				var rejectedCapture = internal.scanRawAsyncInternal(columnId, 0, 1).collectList().toFuture();
+				overflow = rejectedCapture;
+				ExecutionException rejected = assertThrows(ExecutionException.class,
+						() -> rejectedCapture.get(2, TimeUnit.SECONDS));
+				assertTrue(rejected.getCause() instanceof RocksDBException rocksFailure
+						&& rocksFailure.getErrorUniqueId() == RocksDBException.RocksDBErrorType.SERVER_OVERLOADED
+						&& rocksFailure.getMessage().contains("Raw-scan pin capture queue is full"),
+						"capture saturation must fail promptly through the typed overload contract: " + rejected);
+				assertEquals(queueCapacity, internal.getRawScanPinCaptureQueueSizeForTesting(),
+						"rejected capture must not exceed the configured queue bound");
+				assertEquals(1, hardLinkAttempts.get(),
+						"rejected capture must not enter the file-deletion critical section");
+			} finally {
+				if (overflow != null && !overflow.isDone()) {
+					overflow.cancel(true);
+				}
+				releaseHardLink.countDown();
+				internal.setColumnUseAcquiredObserverForTesting(null);
+				internal.setRawScanHardLinkObserverForTesting(null);
+			}
+
+			for (CompletableFuture<List<SerializedKVBatch>> scan : accepted) {
+				assertEquals(1, scan.get(30, TimeUnit.SECONDS).size());
+			}
+			assertTrue(awaitCondition(() -> internal.getPendingOpsCount() == 0L, Duration.ofSeconds(10)));
+			assertEquals(0, internal.getRawScanPinCaptureQueueSizeForTesting());
+			assertTrue(internal.getRawScanPinnedFilesForTesting().isEmpty());
+			assertFileDeletionsEnabled(internal);
+			batch.deleteColumn(columnId);
+		}
+	}
 
 	@Test
 	void competingReadWorkYieldsWithoutShorteningWireBatches(@TempDir Path tempDir) throws Exception {
@@ -366,38 +586,117 @@ class ScanRawCompactionSafetyTest {
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			writeOverlappingSsts(api, columnId);
 
-			var readerOpened = new CountDownLatch(1);
-			var allowNativeReaderToReturn = new CountDownLatch(1);
+			for (int attempt = 0; attempt < 8; attempt++) {
+				var readerOpened = new CountDownLatch(1);
+				var allowNativeReaderToReturn = new CountDownLatch(1);
+				internal.setRawScanReaderOpenedObserverForTesting(() -> {
+					readerOpened.countDown();
+					awaitLatch(allowNativeReaderToReturn);
+				});
+				CompletableFuture<? extends java.util.List<?>> scan = internal
+						.scanRawAsyncInternal(columnId, 0, 1)
+						.collectList()
+						.toFuture();
+				try {
+					assertTrue(readerOpened.await(10, TimeUnit.SECONDS),
+							"raw-scan reader did not open on cancellation attempt " + attempt);
+					Set<Path> allPinnedFiles = internal.getRawScanPinnedFilesForTesting();
+					assertEquals(GENERATIONS, allPinnedFiles.size(),
+							"the real multi-SST fixture must pin every captured generation");
+					Set<Path> scanDirectories = scanDirectories(allPinnedFiles);
+					assertEquals(1, scanDirectories.size());
+					assertEquals(GENERATIONS, rawScanPinnedFilesGauge(internal));
+					assertTrue(rawScanPinnedBytesGauge(internal) > 0.0d);
+					assertTrue(scan.cancel(true));
+
+					Set<Path> claimedPins = awaitExistingRawScanPins(internal, Duration.ofSeconds(5));
+					assertFalse(claimedPins.isEmpty(),
+							"active native readers must retain their pin after outer stream cancellation");
+					assertTrue(claimedPins.stream().allMatch(Files::exists));
+					assertTrue(scanDirectories.stream().allMatch(Files::isDirectory),
+							"a scan directory must outlive its active claimed pins");
+					assertTrue(internal.getDb().get().isOwningHandle(),
+							"database handle must remain owned while cancelled native readers drain");
+
+					allowNativeReaderToReturn.countDown();
+					awaitRawScanDrained(internal, allPinnedFiles, scanDirectories, Duration.ofSeconds(10));
+					assertTrue(api.estimateNumKeys(columnId) > 0L,
+							"database must remain usable after active raw-scan cancellation");
+				} finally {
+					internal.setRawScanReaderOpenedObserverForTesting(null);
+					allowNativeReaderToReturn.countDown();
+					if (!scan.isDone()) {
+						scan.cancel(true);
+					}
+				}
+			}
+		}
+	}
+
+	@Test
+	void oneInnerFailurePreservesCauseAndDeletesDirectoriesAfterActiveSiblingsDrain(@TempDir Path tempDir)
+			throws Exception {
+		Path configFile = tempDir.resolve("scan-raw-sibling-failure.conf");
+		Files.writeString(configFile, """
+				database: {
+				  parallelism: { workload: { raw-scan-file-concurrency: 4 } }
+				  global: {
+				    ingest-behind: false
+				    optimistic: false
+				    disable-auto-compactions: true
+				    disable-write-slowdown: true
+				  }
+				}
+				""");
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db"),
+				"scan-raw-sibling-failure",
+				configFile)) {
+			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
+			EmbeddedDB internal = connection.getInternalDB();
+			long columnId = api.createColumn(COLUMN_NAME,
+					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			writeOverlappingSsts(api, columnId);
+			assertEquals(GENERATIONS, liveColumnSsts(internal).size());
+
+			var readersOpened = new AtomicInteger();
+			var injectedFailure = new CountDownLatch(1);
+			var allowActiveSiblingsToReturn = new CountDownLatch(1);
 			internal.setRawScanReaderOpenedObserverForTesting(() -> {
-				readerOpened.countDown();
-				awaitLatch(allowNativeReaderToReturn);
+				int readerNumber = readersOpened.incrementAndGet();
+				if (readerNumber == GENERATIONS) {
+					injectedFailure.countDown();
+					throw new IllegalStateException("synthetic inner raw-scan failure");
+				}
+				awaitLatch(allowActiveSiblingsToReturn);
 			});
 			CompletableFuture<? extends java.util.List<?>> scan = internal
 					.scanRawAsyncInternal(columnId, 0, 1)
 					.collectList()
 					.toFuture();
+			Set<Path> pinnedFiles = Set.of();
+			Set<Path> scanDirectories = Set.of();
 			try {
-				assertTrue(readerOpened.await(10, TimeUnit.SECONDS));
-				Set<Path> allPinnedFiles = internal.getRawScanPinnedFilesForTesting();
-				assertFalse(allPinnedFiles.isEmpty());
-				assertTrue(scan.cancel(true));
+				assertTrue(injectedFailure.await(10, TimeUnit.SECONDS),
+						"four real SST readers did not enter the failure barrier");
+				pinnedFiles = internal.getRawScanPinnedFilesForTesting();
+				scanDirectories = scanDirectories(pinnedFiles);
+				assertEquals(1, scanDirectories.size());
 
-				Set<Path> claimedPins = internal.getRawScanPinnedFilesForTesting();
-				assertFalse(claimedPins.isEmpty(),
-						"active native readers must retain their pin after outer stream cancellation");
-				assertTrue(claimedPins.stream().allMatch(Files::exists));
-				assertTrue(internal.getDb().get().isOwningHandle(),
-						"database handle must remain owned while cancelled native readers drain");
-
-				allowNativeReaderToReturn.countDown();
-				awaitFilesDeleted(allPinnedFiles, Duration.ofSeconds(10));
-				assertTrue(internal.getRawScanPinnedFilesForTesting().isEmpty());
-				assertTrue(api.estimateNumKeys(columnId) > 0L,
-						"database must remain usable after active raw-scan cancellation");
+				ExecutionException terminal = assertThrows(ExecutionException.class,
+						() -> scan.get(10, TimeUnit.SECONDS));
+				assertEquals("synthetic inner raw-scan failure", terminal.getCause().getMessage(),
+						"eager outer cleanup must not replace the first inner terminal cause");
+				assertTrue(scanDirectories.stream().allMatch(Files::isDirectory),
+						"the directory must remain while cancelled sibling readers still own pins");
 			} finally {
 				internal.setRawScanReaderOpenedObserverForTesting(null);
-				allowNativeReaderToReturn.countDown();
+				allowActiveSiblingsToReturn.countDown();
+				if (!scan.isDone()) {
+					scan.cancel(true);
+				}
 			}
+			awaitRawScanDrained(internal, pinnedFiles, scanDirectories, Duration.ofSeconds(10));
+			assertTrue(api.estimateNumKeys(columnId) > 0L);
 		}
 	}
 
@@ -625,6 +924,63 @@ class ScanRawCompactionSafetyTest {
 				"Obsolete SSTs must be deleted after the raw-scan lease is released: " + files);
 	}
 
+	private static Set<Path> scanDirectories(Set<Path> pinnedFiles) {
+		return pinnedFiles.stream()
+				.map(Path::getParent)
+				.collect(java.util.stream.Collectors.toUnmodifiableSet());
+	}
+
+	private static double rawScanPinnedFilesGauge(EmbeddedDB db) {
+		return db.getMetricsRegistry().get("rockserver.raw.scan.pinned.files").gauge().value();
+	}
+
+	private static double rawScanPinnedBytesGauge(EmbeddedDB db) {
+		return db.getMetricsRegistry().get("rockserver.raw.scan.pinned.bytes").gauge().value();
+	}
+
+	private static void awaitRawScanDrained(EmbeddedDB db,
+			Set<Path> pinnedFiles,
+			Set<Path> scanDirectories,
+			Duration timeout) throws InterruptedException {
+		long deadline = System.nanoTime() + timeout.toNanos();
+		do {
+			if (pinnedFiles.stream().noneMatch(Files::exists)
+					&& scanDirectories.stream().noneMatch(Files::exists)
+					&& db.getRawScanPinnedFilesForTesting().isEmpty()
+					&& rawScanPinnedFilesGauge(db) == 0.0d
+					&& rawScanPinnedBytesGauge(db) == 0.0d
+					&& db.getPendingOpsCount() == 0L) {
+				return;
+			}
+			Thread.sleep(20L);
+		} while (System.nanoTime() < deadline);
+		assertTrue(pinnedFiles.stream().noneMatch(Files::exists),
+				"raw-scan hard links did not drain: " + pinnedFiles);
+		assertTrue(scanDirectories.stream().noneMatch(Files::exists),
+				"raw-scan UUID directories leaked after their last pin drained: " + scanDirectories);
+		assertTrue(db.getRawScanPinnedFilesForTesting().isEmpty());
+		assertEquals(0.0d, rawScanPinnedFilesGauge(db));
+		assertEquals(0.0d, rawScanPinnedBytesGauge(db));
+		assertEquals(0L, db.getPendingOpsCount());
+	}
+
+	private static Set<Path> awaitExistingRawScanPins(EmbeddedDB db, Duration timeout)
+			throws InterruptedException {
+		long deadline = System.nanoTime() + timeout.toNanos();
+		do {
+			Set<Path> pins = db.getRawScanPinnedFilesForTesting();
+			if (!pins.isEmpty() && pins.stream().allMatch(Files::exists)) {
+				return pins;
+			}
+			Thread.sleep(10L);
+		} while (System.nanoTime() < deadline);
+		Set<Path> pins = db.getRawScanPinnedFilesForTesting();
+		assertFalse(pins.isEmpty(), "active native readers did not retain any raw-scan pin");
+		assertTrue(pins.stream().allMatch(Files::exists),
+				"active pin accounting did not converge to files still owned by readers: " + pins);
+		return pins;
+	}
+
 	private static void awaitLatch(CountDownLatch latch) {
 		try {
 			if (!latch.await(30, TimeUnit.SECONDS)) {
@@ -634,6 +990,17 @@ class ScanRawCompactionSafetyTest {
 			Thread.currentThread().interrupt();
 			throw new AssertionError("Interrupted while waiting to continue raw scan", e);
 		}
+	}
+
+	private static boolean awaitCondition(BooleanSupplier condition, Duration timeout) throws InterruptedException {
+		long deadline = System.nanoTime() + timeout.toNanos();
+		do {
+			if (condition.getAsBoolean()) {
+				return true;
+			}
+			Thread.sleep(10L);
+		} while (System.nanoTime() < deadline);
+		return condition.getAsBoolean();
 	}
 
 	private static Keys key(int value) {
