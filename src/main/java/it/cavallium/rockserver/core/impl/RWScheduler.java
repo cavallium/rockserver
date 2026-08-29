@@ -299,9 +299,12 @@ public final class RWScheduler {
 	}
 
 	public Scheduler maintenance() {
-		return scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE,
-				OperationFamily.COMPACTION,
-				RequestContext.NO_DEADLINE);
+		return maintenance(OperationFamily.COMPACTION);
+	}
+
+	/** Physical-maintenance scheduling with the concrete operation retained for telemetry. */
+	public Scheduler maintenance(OperationFamily family) {
+		return scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, family, RequestContext.NO_DEADLINE);
 	}
 
 	public Scheduler control() {
@@ -327,9 +330,12 @@ public final class RWScheduler {
 	}
 
 	public WorkloadExecutor maintenanceExecutor() {
-		return executor(WorkloadProfile.PHYSICAL_MAINTENANCE,
-				OperationFamily.COMPACTION,
-				RequestContext.NO_DEADLINE);
+		return maintenanceExecutor(OperationFamily.COMPACTION);
+	}
+
+	/** Physical-maintenance execution with the concrete operation retained for telemetry. */
+	public WorkloadExecutor maintenanceExecutor(OperationFamily family) {
+		return executor(WorkloadProfile.PHYSICAL_MAINTENANCE, family, RequestContext.NO_DEADLINE);
 	}
 
 	public WorkloadExecutor controlExecutor() {
