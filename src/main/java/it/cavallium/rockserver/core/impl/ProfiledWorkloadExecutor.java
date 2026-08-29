@@ -646,14 +646,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						terminalActions);
 				continue;
 			}
-			WorkloadPressureController.BatchPermit batchPermit = null;
+			long batchPermit = WorkloadPressureController.NO_BATCH_PERMIT;
 			if (task.hasProfile(WorkloadProfile.BATCH)) {
 				var observer = beforeBatchPermitAcquisitionObserver;
 				if (observer != null) {
 					observer.run();
 				}
 				batchPermit = pressureController.tryStartBatch(shutdown, resourcePool, System.nanoTime());
-				if (batchPermit == null) {
+				if (batchPermit == WorkloadPressureController.NO_BATCH_PERMIT) {
 					// Eligibility is only a snapshot: the other data pool can claim the
 					// final shared permit before this pool reaches the atomic start. Keep
 					// dispatch work-conserving by re-selecting queued foreground work, but
@@ -667,7 +667,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			// can therefore either remove queued ownership or lose to execution ownership;
 			// it can never consume a pacing interval without running a quantum.
 			if (dispatchCancellation != null && !dispatchCancellation.claimWorkloadDispatch()) {
-				if (batchPermit != null) {
+				if (batchPermit != WorkloadPressureController.NO_BATCH_PERMIT) {
 					pressureController.abortBatch(batchPermit, resourcePool);
 				}
 				if (!cancelSelectedUnsafe(task, dispatchCancellation, terminalActions)) {
@@ -676,7 +676,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				continue;
 			}
 			unlinkUnsafe(task);
-			if (batchPermit != null) {
+			if (batchPermit != WorkloadPressureController.NO_BATCH_PERMIT) {
 				task.batchPermit(batchPermit);
 			}
 			commitSelectionUnsafe(task);
@@ -857,7 +857,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private void finishActive(WorkloadTask task, RWScheduler.TerminalOutcome outcome) {
 		var batchPermit = task.takeBatchPermit();
-		if (batchPermit != null) {
+		if (batchPermit != WorkloadPressureController.NO_BATCH_PERMIT) {
 			pressureController.finishBatch(batchPermit, resourcePool);
 		}
 		lock.lock();
@@ -884,7 +884,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private @Nullable TerminalAction finishCooperative(WorkloadTask task,
 	                                                   RWScheduler.CooperativeResult result) {
 		var batchPermit = task.takeBatchPermit();
-		if (batchPermit != null) {
+		if (batchPermit != WorkloadPressureController.NO_BATCH_PERMIT) {
 			pressureController.finishBatch(batchPermit, resourcePool);
 		}
 		TerminalAction terminalAction = null;
@@ -2550,7 +2550,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private @Nullable WorkloadTask nextCancellation;
 		private @Nullable WorkloadTask previousQueue;
 		private @Nullable WorkloadTask nextQueue;
-		private byte batchPermit;
+		private long batchPermit;
 		private byte outcome = -1;
 		private byte state;
 		private boolean cancellationLinked;
@@ -2737,18 +2737,17 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			throw new IllegalStateException("Normal workload task has no cooperative state");
 		}
 
-		private void batchPermit(WorkloadPressureController.BatchPermit batchPermit) {
-			this.batchPermit = (byte) (1
-					| (batchPermit.startedUnderPressure() ? 2 : 0)
-					| (batchPermit.startedUnderCompetition() ? 4 : 0));
+		private void batchPermit(long batchPermit) {
+			if (batchPermit == WorkloadPressureController.NO_BATCH_PERMIT) {
+				throw new IllegalArgumentException("Missing BATCH permit");
+			}
+			this.batchPermit = batchPermit;
 		}
 
-		private @Nullable WorkloadPressureController.BatchPermit takeBatchPermit() {
-			int flags = batchPermit;
-			batchPermit = 0;
-			return flags == 0
-					? null
-					: WorkloadPressureController.batchPermit((flags & 2) != 0, (flags & 4) != 0);
+		private long takeBatchPermit() {
+			long permit = batchPermit;
+			batchPermit = WorkloadPressureController.NO_BATCH_PERMIT;
+			return permit;
 		}
 
 		private @Nullable RWScheduler.TerminalOutcome outcome() {
@@ -3672,10 +3671,14 @@ interface CooperativeTerminationHandle extends RWScheduler.CooperativeHandle {
 
 final class WorkloadPressureController {
 
-	private static final BatchPermit UNRESTRICTED_PERMIT = new BatchPermit(false, false);
-	private static final BatchPermit PRESSURED_PERMIT = new BatchPermit(true, false);
-	private static final BatchPermit COMPETING_PERMIT = new BatchPermit(false, true);
-	private static final BatchPermit PRESSURED_AND_COMPETING_PERMIT = new BatchPermit(true, true);
+	static final long NO_BATCH_PERMIT = 0L;
+	// Allocation-free permit token: flags, then two independent 30-bit episode generations.
+	private static final long ACQUIRED_FLAG = 1L;
+	private static final long PRESSURED_FLAG = 1L << 1;
+	private static final long COMPETING_FLAG = 1L << 2;
+	private static final int PRESSURE_GENERATION_SHIFT = 3;
+	private static final int COMPETITION_GENERATION_SHIFT = 33;
+	private static final int GENERATION_MASK = (1 << 30) - 1;
 	private final int competingMaximumActiveReadBatches;
 	private final int competingMaximumActiveWriteBatches;
 	private final long competingWriteIntervalNanos;
@@ -3691,6 +3694,9 @@ final class WorkloadPressureController {
 	private int preemptionPoolMask;
 	private int competitionPoolMask;
 	private int queuedBatchPoolMask;
+	private int lastCompletedPressuredBatchPoolBit;
+	private int pressureGeneration;
+	private int competitionGeneration;
 	private long competitionUntilNanos = Long.MIN_VALUE;
 	private volatile boolean preemptionRequested;
 	private volatile boolean notificationPending;
@@ -3747,28 +3753,49 @@ final class WorkloadPressureController {
 	}
 
 	synchronized void setPoolCompetition(RWScheduler.Pool pool, boolean competing) {
+		long nowNanos = System.nanoTime();
+		competitionActiveUnsafe(nowNanos);
 		int bit = poolBit(pool);
 		boolean wasCompeting = competitionPoolMask != 0;
 		competitionPoolMask = competing ? competitionPoolMask | bit : competitionPoolMask & ~bit;
 		if (competitionPoolMask != 0) {
 			competitionUntilNanos = Long.MAX_VALUE;
 		} else if (wasCompeting) {
-			competitionUntilNanos = saturatingDeadline(System.nanoTime(), competitionHoldNanos);
+			competitionUntilNanos = saturatingDeadline(nowNanos, competitionHoldNanos);
 			notificationPending = true;
 		}
 	}
 
 	synchronized void setBatchQueued(RWScheduler.Pool pool, boolean queued) {
 		int bit = poolBit(pool);
+		boolean releasedFairnessWait = !queued
+				&& pressured
+				&& lastCompletedPressuredBatchPoolBit != 0
+				&& bit != lastCompletedPressuredBatchPoolBit
+				&& (queuedBatchPoolMask & bit) != 0
+				&& (queuedBatchPoolMask & lastCompletedPressuredBatchPoolBit) != 0;
 		queuedBatchPoolMask = queued ? queuedBatchPoolMask | bit : queuedBatchPoolMask & ~bit;
+		if (releasedFairnessWait) {
+			// Queue transitions happen under an executor lock. Defer the cross-pool
+			// wakeup until that executor calls signalPendingAvailability after unlock.
+			notificationPending = true;
+		}
 	}
 
 	private boolean competitionActiveUnsafe(long nowNanos) {
 		if (competitionPoolMask != 0 || nowNanos < competitionUntilNanos) {
 			return true;
 		}
-		competitionUntilNanos = Long.MIN_VALUE;
+		if (competitionUntilNanos != Long.MIN_VALUE) {
+			competitionUntilNanos = Long.MIN_VALUE;
+			nextCompetingWriteNanos = Long.MIN_VALUE;
+			competitionGeneration = nextGeneration(competitionGeneration);
+		}
 		return false;
+	}
+
+	private static int nextGeneration(int generation) {
+		return generation == GENERATION_MASK ? 0 : generation + 1;
 	}
 
 	private static long saturatingDeadline(long nowNanos, long delayNanos) {
@@ -3799,9 +3826,13 @@ final class WorkloadPressureController {
 
 	void setPressured(boolean pressured) {
 		synchronized (this) {
+			if (this.pressured != pressured) {
+				pressureGeneration = nextGeneration(pressureGeneration);
+			}
 			this.pressured = pressured;
 			if (!pressured) {
 				nextBatchNanos = Long.MIN_VALUE;
+				lastCompletedPressuredBatchPoolBit = 0;
 			}
 		}
 		notifier.run();
@@ -3842,18 +3873,21 @@ final class WorkloadPressureController {
 			if (nowNanos < nextBatchNanos) {
 				return 0;
 			}
+			if (!hasFairPressureTurnUnsafe(dataPool)) {
+				return 0;
+			}
 			allowance = Math.min(allowance,
 					Math.max(0, pressuredMaximumActiveBatches - activeBatches));
 		}
 		return allowance;
 	}
 
-	synchronized @Nullable BatchPermit tryStartBatch(boolean ignoreLimits,
-	                                                RWScheduler.Pool pool,
-	                                                long nowNanos) {
+	synchronized long tryStartBatch(boolean ignoreLimits,
+	                                RWScheduler.Pool pool,
+	                                long nowNanos) {
 		Objects.requireNonNull(pool, "pool");
 		if (pool != RWScheduler.Pool.READ && pool != RWScheduler.Pool.WRITE) {
-			return null;
+			return NO_BATCH_PERMIT;
 		}
 		var dataPool = resourcePool(pool);
 		boolean startedUnderCompetition = false;
@@ -3863,41 +3897,60 @@ final class WorkloadPressureController {
 			if (startedUnderCompetition) {
 				if (activeBatches(dataPool) >= competingMaximumActiveBatches(dataPool)
 						|| dataPool == RWScheduler.Pool.WRITE && nowNanos < nextCompetingWriteNanos) {
-					return null;
+					return NO_BATCH_PERMIT;
 				}
 			}
 			startedUnderPressure = pressured;
 			if (startedUnderPressure
-					&& (nowNanos < nextBatchNanos || activeBatches >= pressuredMaximumActiveBatches)) {
-				return null;
+					&& (nowNanos < nextBatchNanos
+					|| !hasFairPressureTurnUnsafe(dataPool)
+					|| activeBatches >= pressuredMaximumActiveBatches)) {
+				return NO_BATCH_PERMIT;
 			}
 		}
 		activeBatches++;
 		incrementActiveBatches(dataPool);
-		return batchPermit(startedUnderPressure, startedUnderCompetition);
+		return batchPermit(startedUnderPressure,
+				startedUnderCompetition,
+				pressureGeneration,
+				competitionGeneration);
 	}
 
-	static BatchPermit batchPermit(boolean startedUnderPressure, boolean startedUnderCompetition) {
+	private static long batchPermit(boolean startedUnderPressure,
+	                                boolean startedUnderCompetition,
+	                                int pressureGeneration,
+	                                int competitionGeneration) {
+		long permit = ACQUIRED_FLAG;
 		if (startedUnderPressure) {
-			return startedUnderCompetition ? PRESSURED_AND_COMPETING_PERMIT : PRESSURED_PERMIT;
+			permit |= PRESSURED_FLAG | (long) pressureGeneration << PRESSURE_GENERATION_SHIFT;
 		}
-		return startedUnderCompetition ? COMPETING_PERMIT : UNRESTRICTED_PERMIT;
+		if (startedUnderCompetition) {
+			permit |= COMPETING_FLAG | (long) competitionGeneration << COMPETITION_GENERATION_SHIFT;
+		}
+		return permit;
 	}
 
-	void finishBatch(BatchPermit permit, RWScheduler.Pool completedPool) {
+	void finishBatch(long permit, RWScheduler.Pool completedPool) {
+		if (permit == NO_BATCH_PERMIT) {
+			throw new IllegalArgumentException("Missing BATCH permit");
+		}
 		int otherQueuedBatchPools;
 		synchronized (this) {
 			releaseActiveBatchUnsafe(completedPool);
 			otherQueuedBatchPools = queuedBatchPoolMask & ~poolBit(completedPool);
-			if (completedPool == RWScheduler.Pool.WRITE && permit.startedUnderCompetition()) {
-				nextCompetingWriteNanos = saturatingDeadline(System.nanoTime(), competingWriteIntervalNanos);
-			}
-			if (permit.startedUnderPressure() && pressured) {
+			boolean competitionCompletion = completedPool == RWScheduler.Pool.WRITE
+					&& startedUnderCompetition(permit);
+			boolean pressureCompletion = startedUnderPressure(permit) && pressured;
+			if (competitionCompletion || pressureCompletion) {
 				long nowNanos = System.nanoTime();
-				try {
-					nextBatchNanos = Math.addExact(nowNanos, batchIntervalNanos);
-				} catch (ArithmeticException overflow) {
-					nextBatchNanos = Long.MAX_VALUE;
+				if (competitionCompletion
+						&& competitionActiveUnsafe(nowNanos)
+						&& competitionGeneration(permit) == competitionGeneration) {
+					nextCompetingWriteNanos = saturatingDeadline(nowNanos, competingWriteIntervalNanos);
+				}
+				if (pressureCompletion && pressureGeneration(permit) == pressureGeneration) {
+				lastCompletedPressuredBatchPoolBit = poolBit(completedPool);
+					nextBatchNanos = saturatingDeadline(nowNanos, batchIntervalNanos);
 				}
 			}
 		}
@@ -3906,8 +3959,10 @@ final class WorkloadPressureController {
 		}
 	}
 
-	void abortBatch(BatchPermit permit, RWScheduler.Pool abortedPool) {
-		Objects.requireNonNull(permit, "permit");
+	void abortBatch(long permit, RWScheduler.Pool abortedPool) {
+		if (permit == NO_BATCH_PERMIT) {
+			throw new IllegalArgumentException("Missing BATCH permit");
+		}
 		synchronized (this) {
 			releaseActiveBatchUnsafe(abortedPool);
 			// Aborting a pre-dispatch permit deliberately leaves both pacing clocks
@@ -3951,13 +4006,41 @@ final class WorkloadPressureController {
 		if (activeBatches >= pressuredMaximumActiveBatches) {
 			return Long.MAX_VALUE;
 		}
+		if (!hasFairPressureTurnUnsafe(dataPool)) {
+			return Long.MAX_VALUE;
+		}
 		if (nowNanos < nextBatchNanos) {
 			waitNanos = Math.max(waitNanos, nextBatchNanos - nowNanos);
 		}
 		return waitNanos;
 	}
 
-	record BatchPermit(boolean startedUnderPressure, boolean startedUnderCompetition) {
+	private boolean hasFairPressureTurnUnsafe(RWScheduler.Pool pool) {
+		int currentPoolBit = poolBit(pool);
+		if (lastCompletedPressuredBatchPoolBit == 0
+				|| lastCompletedPressuredBatchPoolBit != currentPoolBit) {
+			return true;
+		}
+		int otherDataPoolBit = currentPoolBit == poolBit(RWScheduler.Pool.READ)
+				? poolBit(RWScheduler.Pool.WRITE)
+				: poolBit(RWScheduler.Pool.READ);
+		return (queuedBatchPoolMask & otherDataPoolBit) == 0;
+	}
+
+	private static boolean startedUnderPressure(long permit) {
+		return (permit & PRESSURED_FLAG) != 0L;
+	}
+
+	private static boolean startedUnderCompetition(long permit) {
+		return (permit & COMPETING_FLAG) != 0L;
+	}
+
+	private static int pressureGeneration(long permit) {
+		return (int) (permit >>> PRESSURE_GENERATION_SHIFT) & GENERATION_MASK;
+	}
+
+	private static int competitionGeneration(long permit) {
+		return (int) (permit >>> COMPETITION_GENERATION_SHIFT) & GENERATION_MASK;
 	}
 
 	private static RWScheduler.Pool resourcePool(RWScheduler.Pool pool) {

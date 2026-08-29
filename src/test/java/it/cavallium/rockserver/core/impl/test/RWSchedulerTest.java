@@ -862,10 +862,8 @@ class RWSchedulerTest {
 				"tryStartBatch", boolean.class, RWScheduler.Pool.class, long.class);
 		var batchStartAllowance = controllerType.getDeclaredMethod(
 				"batchStartAllowance", boolean.class, RWScheduler.Pool.class, long.class);
-		var permitType = Class.forName(
-				"it.cavallium.rockserver.core.impl.WorkloadPressureController$BatchPermit");
 		var abortBatch = controllerType.getDeclaredMethod(
-				"abortBatch", permitType, RWScheduler.Pool.class);
+				"abortBatch", long.class, RWScheduler.Pool.class);
 		for (var method : List.of(
 				setPressured,
 				setNotifier,
@@ -885,8 +883,8 @@ class RWSchedulerTest {
 		setBatchNotifier.invoke(controller, (IntConsumer) _ -> directBatchNotifications.incrementAndGet());
 		setBatchQueued.invoke(controller, RWScheduler.Pool.WRITE, true);
 		long fixedNow = System.nanoTime();
-		var firstPermit = tryStartBatch.invoke(controller, false, RWScheduler.Pool.READ, fixedNow);
-		assertTrue(firstPermit != null);
+		long firstPermit = (long) tryStartBatch.invoke(controller, false, RWScheduler.Pool.READ, fixedNow);
+		assertTrue(firstPermit != 0L);
 		assertEquals(0,
 				batchStartAllowance.invoke(controller, false, RWScheduler.Pool.READ, fixedNow));
 
@@ -901,8 +899,8 @@ class RWSchedulerTest {
 		assertEquals(1, deferredNotifications.get(),
 				"the other queued pool must be woken only through the post-unlock notifier");
 
-		var replacementPermit = tryStartBatch.invoke(controller, false, RWScheduler.Pool.READ, fixedNow);
-		assertTrue(replacementPermit != null,
+		long replacementPermit = (long) tryStartBatch.invoke(controller, false, RWScheduler.Pool.READ, fixedNow);
+		assertTrue(replacementPermit != 0L,
 				"capacity must reopen immediately at the same scheduler timestamp");
 		abortBatch.invoke(controller, replacementPermit, RWScheduler.Pool.READ);
 		assertEquals(0, directBatchNotifications.get());

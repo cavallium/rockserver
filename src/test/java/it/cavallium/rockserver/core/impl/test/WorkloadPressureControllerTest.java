@@ -1,8 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.lang.reflect.Field;
@@ -33,12 +32,12 @@ class WorkloadPressureControllerTest {
 		for (int round = 0; round < 32; round++) {
 			var read = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
 			controller.finish(read, RWScheduler.Pool.READ);
-			assertNull(controller.tryStart(RWScheduler.Pool.READ, ELIGIBLE_TIME),
+			assertEquals(0L, controller.tryStart(RWScheduler.Pool.READ, ELIGIBLE_TIME),
 					"a continuously queued pool must not reacquire the only permit before its peer");
 
 			var write = controller.requireStart(RWScheduler.Pool.WRITE, ELIGIBLE_TIME);
 			controller.finish(write, RWScheduler.Pool.WRITE);
-			assertNull(controller.tryStart(RWScheduler.Pool.WRITE, ELIGIBLE_TIME),
+			assertEquals(0L, controller.tryStart(RWScheduler.Pool.WRITE, ELIGIBLE_TIME),
 					"cross-pool fairness must be symmetric");
 		}
 
@@ -61,7 +60,7 @@ class WorkloadPressureControllerTest {
 		var read = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
 		controller.finish(read, RWScheduler.Pool.READ);
 		assertEquals(1, directBatchWakeups.get(), "completion must directly wake the peer pool");
-		assertNull(controller.tryStart(RWScheduler.Pool.READ, ELIGIBLE_TIME));
+		assertEquals(0L, controller.tryStart(RWScheduler.Pool.READ, ELIGIBLE_TIME));
 		assertEquals(Long.MAX_VALUE, controller.waitNanos(RWScheduler.Pool.READ, ELIGIBLE_TIME),
 				"a fair handoff has no timer deadline and must park instead of spin");
 
@@ -88,7 +87,7 @@ class WorkloadPressureControllerTest {
 		long deadline = controller.longField("nextBatchNanos");
 
 		assertEquals(0, controller.allowance(RWScheduler.Pool.READ, deadline - 1L));
-		assertNull(controller.tryStart(RWScheduler.Pool.READ, deadline - 1L));
+		assertEquals(0L, controller.tryStart(RWScheduler.Pool.READ, deadline - 1L));
 		assertEquals(1, controller.allowance(RWScheduler.Pool.READ, deadline));
 		var boundaryPermit = controller.requireStart(RWScheduler.Pool.READ, deadline);
 		controller.finish(boundaryPermit, RWScheduler.Pool.READ);
@@ -102,7 +101,7 @@ class WorkloadPressureControllerTest {
 
 		var unpressured = controller.requireStart(RWScheduler.Pool.READ, 1L);
 		controller.setPressured(true);
-		assertNull(controller.tryStart(RWScheduler.Pool.WRITE, 1L),
+		assertEquals(0L, controller.tryStart(RWScheduler.Pool.WRITE, 1L),
 				"pressure onset must account for an already active unpressured permit");
 		controller.finish(unpressured, RWScheduler.Pool.READ);
 		var firstPressured = controller.requireStart(RWScheduler.Pool.WRITE, 1L,
@@ -168,7 +167,7 @@ class WorkloadPressureControllerTest {
 		assertEquals(0, controller.allowance(RWScheduler.Pool.WRITE, ELIGIBLE_TIME));
 
 		controller.finish(firstRead, RWScheduler.Pool.READ);
-		assertNull(controller.tryStart(RWScheduler.Pool.READ, ELIGIBLE_TIME),
+		assertEquals(0L, controller.tryStart(RWScheduler.Pool.READ, ELIGIBLE_TIME),
 				"after a completion, the continuously queued peer owns the released slot");
 		var firstWrite = controller.requireStart(RWScheduler.Pool.WRITE, ELIGIBLE_TIME);
 		assertEquals(0, controller.allowance(RWScheduler.Pool.READ, ELIGIBLE_TIME));
@@ -181,7 +180,6 @@ class WorkloadPressureControllerTest {
 
 		private final Object instance;
 		private final Class<?> type;
-		private final Class<?> permitType;
 		private final Method setPressured;
 		private final Method setQueued;
 		private final Method setCompeting;
@@ -196,7 +194,6 @@ class WorkloadPressureControllerTest {
 		private Controller(Object instance, Class<?> type) throws ReflectiveOperationException {
 			this.instance = instance;
 			this.type = type;
-			this.permitType = Class.forName(type.getName() + "$BatchPermit");
 			this.setPressured = accessible(type.getDeclaredMethod("setPressured", boolean.class));
 			this.setQueued = accessible(type.getDeclaredMethod(
 					"setBatchQueued", RWScheduler.Pool.class, boolean.class));
@@ -208,7 +205,7 @@ class WorkloadPressureControllerTest {
 			this.tryStart = accessible(type.getDeclaredMethod(
 					"tryStartBatch", boolean.class, RWScheduler.Pool.class, long.class));
 			this.finish = accessible(type.getDeclaredMethod(
-					"finishBatch", permitType, RWScheduler.Pool.class));
+					"finishBatch", long.class, RWScheduler.Pool.class));
 			this.allowance = accessible(type.getDeclaredMethod(
 					"batchStartAllowance", boolean.class, RWScheduler.Pool.class, long.class));
 			this.waitNanos = accessible(type.getDeclaredMethod(
@@ -270,23 +267,23 @@ class WorkloadPressureControllerTest {
 			signalPendingAvailability.invoke(instance);
 		}
 
-		Object tryStart(RWScheduler.Pool pool, long nowNanos) throws ReflectiveOperationException {
-			return tryStart.invoke(instance, false, pool, nowNanos);
+		long tryStart(RWScheduler.Pool pool, long nowNanos) throws ReflectiveOperationException {
+			return (long) tryStart.invoke(instance, false, pool, nowNanos);
 		}
 
-		Object requireStart(RWScheduler.Pool pool, long nowNanos) throws ReflectiveOperationException {
+		long requireStart(RWScheduler.Pool pool, long nowNanos) throws ReflectiveOperationException {
 			return requireStart(pool, nowNanos, "expected BATCH permit for " + pool);
 		}
 
-		Object requireStart(RWScheduler.Pool pool, long nowNanos, String message)
+		long requireStart(RWScheduler.Pool pool, long nowNanos, String message)
 				throws ReflectiveOperationException {
-			var permit = tryStart(pool, nowNanos);
-			assertNotNull(permit, message);
+			long permit = tryStart(pool, nowNanos);
+			assertNotEquals(0L, permit, message);
 			return permit;
 		}
 
-		void finish(Object permit, RWScheduler.Pool pool) throws ReflectiveOperationException {
-			finish.invoke(instance, permitType.cast(permit), pool);
+		void finish(long permit, RWScheduler.Pool pool) throws ReflectiveOperationException {
+			finish.invoke(instance, permit, pool);
 		}
 
 		int allowance(RWScheduler.Pool pool, long nowNanos) throws ReflectiveOperationException {
