@@ -11812,14 +11812,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long maxEvents,
 			long maxBytes,
 			boolean allowOversizedFirstEvent) {
+		long quantumBytes = Math.min(maxBytes, workloadSettings.cdcQuantumMaxBytes());
 		return scheduleTracked(this.scheduler.cdc(), () -> {
 			var cursor = openCdcPollCursor(window.subscription(),
 					window.startSeq(),
 					window.maxWalSequenceInclusive());
 			try {
 				return new CdcPollCursorStart(cursor,
-							cursor.readPage(maxEvents,
-									Math.min(maxBytes, workloadSettings.cdcQuantumMaxBytes()),
+						cursor.readPage(maxEvents,
+								quantumBytes,
 									allowOversizedFirstEvent,
 									workloadSettings.cdcQuantumMaxMutations(),
 									workloadSettings.cdcQuantumMaxBytes(),
@@ -11828,7 +11829,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				cursor.close();
 				throw error;
 			}
-		}, cursorStart -> cursorStart.cursor().close());
+		}, cursorStart -> cursorStart.cursor().close(), quantumBytes);
 	}
 
 	private Mono<CdcPollPage> readCdcPollCursorPageAsync(CdcPollCursor cursor,
@@ -11839,13 +11840,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		if (continuationObserver != null) {
 			continuationObserver.run();
 		}
+		long quantumBytes = Math.min(maxBytes, workloadSettings.cdcQuantumMaxBytes());
 		return scheduleTracked(this.scheduler.cdc(),
 				() -> cursor.readPage(maxEvents,
-						Math.min(maxBytes, workloadSettings.cdcQuantumMaxBytes()),
+						quantumBytes,
 						allowOversizedFirstEvent,
 						workloadSettings.cdcQuantumMaxMutations(),
 						workloadSettings.cdcQuantumMaxBytes(),
-						workloadSettings.cdcQuantumMaxDuration().toNanos()));
+						workloadSettings.cdcQuantumMaxDuration().toNanos()),
+				null,
+				quantumBytes);
 	}
 
 	private Mono<Void> closeCdcPollCursorAsync(CdcPollCursor cursor) {
@@ -11866,12 +11870,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * not pretend that an already queued or running JNI call has finished.
 	 */
 	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target, Callable<T> callable) {
-		return scheduleTracked(target, callable, null);
+		return scheduleTracked(target, callable, null, 0L);
 	}
 
 	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target,
 			Callable<T> callable,
 			@Nullable Consumer<? super T> lateSuccessCleanup) {
+		return scheduleTracked(target, callable, lateSuccessCleanup, 0L);
+	}
+
+	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target,
+			Callable<T> callable,
+			@Nullable Consumer<? super T> lateSuccessCleanup,
+			long estimatedBytes) {
+		if (estimatedBytes < 0L) {
+			throw new IllegalArgumentException("estimatedBytes must not be negative");
+		}
 		return Mono.create(sink -> {
 			final int queued = 0;
 			final int running = 1;
@@ -11881,27 +11895,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var cancelled = new AtomicBoolean();
 			var state = new AtomicInteger(queued);
 			var task = Disposables.swap();
-			try {
-				ops.beginOp();
-			} catch (Throwable error) {
-				sink.error(error);
-				return;
-			}
-			sink.onCancel(() -> {
-				synchronized (emissionLock) {
-					cancelled.set(true);
+			final class TrackedNativeTask implements Runnable, RWScheduler.EstimatedWork {
+
+				@Override
+				public long estimatedBytes() {
+					return estimatedBytes;
 				}
-				if (state.compareAndSet(queued, cancelledBeforeStart)) {
-					// The queued callable will never own the SafeShutdown lease.
-					task.dispose();
-					ops.endOp();
-				} else {
-					// A running native call owns the lease until its finally block.
-					task.dispose();
-				}
-			});
-			try {
-				task.replace(target.schedule(() -> {
+
+				@Override
+				public void run() {
 					if (!state.compareAndSet(queued, running)) {
 						return;
 					}
@@ -11937,7 +11939,29 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						state.set(finished);
 						ops.endOp();
 					}
-				}));
+				}
+			}
+			try {
+				ops.beginOp();
+			} catch (Throwable error) {
+				sink.error(error);
+				return;
+			}
+			sink.onCancel(() -> {
+				synchronized (emissionLock) {
+					cancelled.set(true);
+				}
+				if (state.compareAndSet(queued, cancelledBeforeStart)) {
+					// The queued callable will never own the SafeShutdown lease.
+					task.dispose();
+					ops.endOp();
+				} else {
+					// A running native call owns the lease until its finally block.
+					task.dispose();
+				}
+			});
+			try {
+				task.replace(target.schedule(new TrackedNativeTask()));
 			} catch (Throwable error) {
 				if (state.compareAndSet(queued, finished)) {
 					ops.endOp();
