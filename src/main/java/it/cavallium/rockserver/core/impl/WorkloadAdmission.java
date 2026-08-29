@@ -248,6 +248,12 @@ public final class WorkloadAdmission {
 					encodedBytes(exists.keys()),
 					maximumLatencyItems,
 					maximumLatencyEncodedInputBytes);
+			case RocksDBAPICommandSingle.Get<?> get -> validateLatencyInput(profile,
+					command,
+					1,
+					encodedBytes(get.keys()),
+					maximumLatencyItems,
+					maximumLatencyEncodedInputBytes);
 			case RocksDBAPICommandSingle.Subsequent<?> subsequent -> {
 				if (profile == LATENCY && exceedsIteratorLimit(subsequent.skipCount(), subsequent.takeCount())) {
 					throw mismatch(profile, command,
@@ -262,7 +268,6 @@ public final class WorkloadAdmission {
 			case RocksDBAPICommandSingle.OpenTransaction _, RocksDBAPICommandSingle.CloseTransaction _,
 					RocksDBAPICommandSingle.CloseFailedUpdate _, RocksDBAPICommandSingle.CheckMergeOperator _,
 					RocksDBAPICommandSingle.GetColumnId _, RocksDBAPICommandSingle.EstimateNumKeys _,
-					RocksDBAPICommandSingle.Get<?> _,
 					RocksDBAPICommandSingle.OpenIterator _,
 					RocksDBAPICommandSingle.CloseIterator _, RocksDBAPICommandSingle.SeekTo _,
 					RocksDBAPICommandSingle.ReduceRange<?> _, RocksDBAPICommandStream.CdcPoll _,

@@ -518,7 +518,15 @@ public class GrpcServer extends Server {
 				try {
 					requestContext = grpc.mapRequestContext(currentRequest.getContext());
 					keys = GrpcServerImpl.mapKeys(currentRequest.getKeysList());
-					scheduled = scheduler.scheduler(requestContext, OperationFamily.POINT_LOOKUP)
+					var command = new RocksDBAPICommand.RocksDBAPICommandSingle.Get<>(
+							currentRequest.getTransactionOrUpdateId(),
+							currentRequest.getColumnId(),
+							keys,
+							RequestType.current());
+					var profile = grpc.preAdmit(requestContext, OperationFamily.POINT_LOOKUP, command);
+					scheduled = scheduler.scheduler(profile,
+							command.operationFamily(),
+							requestContext.deadlineEpochMillis())
 							.schedule(this);
 				} catch (Throwable schedulingError) {
 					closeFastGetFailure(call, currentRequest, schedulingError, this);
@@ -1977,7 +1985,7 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<UpdateBegin> getForUpdate(GetRequest request) {
-			return executeSync(request.getContext(), OperationFamily.POINT_LOOKUP, contextualApi -> {
+			return executeSync(request.getContext(), OperationFamily.MUTATION, contextualApi -> {
 				var forUpdate = contextualApi.get(request.getTransactionOrUpdateId(),
 						request.getColumnId(),
 						mapKeys(request.getKeysList()),

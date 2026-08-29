@@ -143,6 +143,35 @@ class WorkloadAdmissionTest {
 	}
 
 	@Test
+	void getForUpdateUsesMutationResourcesAndRejectsAnalyticalCallers() {
+		var forUpdate = new RocksDBAPICommandSingle.Get<>(
+				0, 1, EMPTY_KEYS, RequestType.forUpdate());
+
+		assertEquals(OperationFamily.MUTATION, forUpdate.operationFamily());
+		assertEquals(LATENCY, WorkloadAdmission.resolve(context(LATENCY), forUpdate));
+		assertEquals(INGEST, WorkloadAdmission.resolve(context(INGEST), forUpdate));
+		assertEquals(BATCH, WorkloadAdmission.resolve(context(BATCH), forUpdate));
+		assertThrows(RocksDBException.class,
+				() -> WorkloadAdmission.resolve(context(ANALYTICAL), forUpdate));
+	}
+
+	@Test
+	void everyLatencyPointReadChecksEncodedBytesBelowAtAndAboveLimit() {
+		List<java.util.function.Function<Keys, RocksDBAPICommand<?, ?, ?>>> commands = List.of(
+				key -> new RocksDBAPICommandSingle.Get<>(0, 1, key, RequestType.current()),
+				key -> new RocksDBAPICommandSingle.Get<>(0, 1, key, RequestType.exists()),
+				key -> new RocksDBAPICommandSingle.Get<>(0, 1, key, RequestType.forUpdate()));
+		for (var command : commands) {
+			assertLatencyAllowed(command.apply(
+					keys((int) WorkloadAdmission.MAX_LATENCY_ENCODED_INPUT_BYTES - 1)));
+			assertLatencyAllowed(command.apply(
+					keys((int) WorkloadAdmission.MAX_LATENCY_ENCODED_INPUT_BYTES)));
+			assertLatencyRejected(command.apply(
+					keys((int) WorkloadAdmission.MAX_LATENCY_ENCODED_INPUT_BYTES + 1)));
+		}
+	}
+
+	@Test
 	void everyLatencyFixedMultiAndExistsChecksItemAndEncodedByteLimits() {
 		List<BiFunction<Integer, Integer, RocksDBAPICommand<?, ?, ?>>> commands = List.of(
 				(count, bytes) -> new RocksDBAPICommandSingle.DeleteMulti<>(

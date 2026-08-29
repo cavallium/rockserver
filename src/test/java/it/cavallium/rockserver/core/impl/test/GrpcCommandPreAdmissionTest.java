@@ -8,12 +8,14 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import com.google.protobuf.ByteString;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.api.proto.DeleteRangeRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetRangeRequest;
+import it.cavallium.rockserver.core.common.api.proto.GetRequest;
 import it.cavallium.rockserver.core.common.api.proto.PutBatchInitialRequest;
 import it.cavallium.rockserver.core.common.api.proto.PutBatchMode;
 import it.cavallium.rockserver.core.common.api.proto.PutBatchRequest;
@@ -127,6 +129,61 @@ class GrpcCommandPreAdmissionTest {
 			Utils.deleteDirectory(root.toString());
 			Files.deleteIfExists(config);
 		}
+	}
+
+	@Test
+	void getForUpdateAndFastGetUseConcretePreAdmissionBeforeScheduling() throws Exception {
+		Path root = Files.createTempDirectory("rockserver-grpc-get-pre-admission");
+		EmbeddedConnection embedded = null;
+		GrpcServer server = null;
+		ManagedChannel channel = null;
+		try {
+			embedded = new EmbeddedConnection(root, "grpc-get-pre-admission", null);
+			server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0));
+			server.start();
+			channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort())
+					.usePlaintext()
+					.build();
+			var stub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
+
+			var analytical = wireContext(
+					it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.ANALYTICAL);
+			assertInvalid(stub.getForUpdate(GetRequest.newBuilder()
+					.setColumnId(1)
+					.addKeys(ByteString.copyFrom(new byte[] {1}))
+					.setContext(analytical)
+					.build()));
+
+			var latency = wireContext(
+					it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY);
+			assertInvalid(stub.get(GetRequest.newBuilder()
+					.setColumnId(1)
+					.addKeys(ByteString.copyFrom(new byte[
+							(int) it.cavallium.rockserver.core.impl.WorkloadAdmission
+									.MAX_LATENCY_ENCODED_INPUT_BYTES + 1]))
+					.setContext(latency)
+					.build()));
+		} finally {
+			if (channel != null) {
+				channel.shutdownNow();
+				channel.awaitTermination(5, TimeUnit.SECONDS);
+			}
+			if (server != null) {
+				server.close();
+			}
+			if (embedded != null) {
+				embedded.closeTesting();
+			}
+			Utils.deleteDirectory(root.toString());
+		}
+	}
+
+	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext(
+			it.cavallium.rockserver.core.common.api.proto.WorkloadProfile profile) {
+		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+				.setProfile(profile)
+				.setDeadlineEpochMillis(System.currentTimeMillis() + Duration.ofSeconds(10).toMillis())
+				.build();
 	}
 
 	private static void assertInvalid(Mono<?> response) {

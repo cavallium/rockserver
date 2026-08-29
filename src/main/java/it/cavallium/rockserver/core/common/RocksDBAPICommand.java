@@ -52,7 +52,10 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			case RocksDBAPICommandSingle.Merge<?> _ -> OperationFamily.MUTATION;
 			case RocksDBAPICommandSingle.MergeMulti<?> _ -> OperationFamily.MUTATION;
 			case RocksDBAPICommandSingle.MergeBatch _ -> OperationFamily.MUTATION;
-			case RocksDBAPICommandSingle.Get<?> _ -> OperationFamily.POINT_LOOKUP;
+			case RocksDBAPICommandSingle.Get<?> get ->
+					get.requestType().getRequestTypeId() == RequestTypeId.FOR_UPDATE
+							? OperationFamily.MUTATION
+							: OperationFamily.POINT_LOOKUP;
 			case RocksDBAPICommandSingle.ExistsMulti _ -> OperationFamily.BOUNDED_FAN_OUT;
 			case RocksDBAPICommandSingle.OpenIterator _ -> OperationFamily.BOUNDARY_SEEK;
 			case RocksDBAPICommandSingle.CloseIterator _ -> OperationFamily.CONTROL;
