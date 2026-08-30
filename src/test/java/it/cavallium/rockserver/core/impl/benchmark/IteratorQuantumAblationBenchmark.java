@@ -34,7 +34,7 @@ import reactor.core.publisher.Flux;
  *
  * <p>The idle arm compares the old fixed-page primitive with the bounded primitive while no peer
  * requests preemption. It isolates the per-item context polling cost on the same iterator, values,
- * checksum, thread, and counterbalanced ten-pair schedule. Allocation is diagnostic only: scheduler
+ * checksum, thread, and counterbalanced forty-pair schedule. Allocation is diagnostic only: scheduler
  * quality, rather than a resource-only gain, is the reason for this change.</p>
  *
  * <p>The competitive arm uses a real single-worker {@link RWScheduler}. A BATCH scan is held after
