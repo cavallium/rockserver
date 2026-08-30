@@ -6420,7 +6420,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				long advanced = 0L;
 				boolean exhausted = false;
 				boolean checkpoint = false;
-				while (advanced < maxCount && !context.terminationRequested()) {
+				// Cancellation keeps the established item-quantum granularity. The continuation
+				// checks again after this call; polling it for every item would add a second
+				// volatile signal read to the peer-preemption hot path without improving the
+				// non-preemptible native-step bound.
+				if (context.terminationRequested()) {
+					return new IteratorAdvanceQuantum(0L, false, false);
+				}
+				while (advanced < maxCount) {
 					if (!advanceIterator(state, false).present()) {
 						exhausted = true;
 						break;
@@ -6468,7 +6475,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				long decodedBytes = 0L;
 				boolean exhausted = false;
 				boolean checkpoint = false;
-				while (values.size() < maxCount && !context.terminationRequested()) {
+				// See advanceIteratorQuantumInternal: cancellation is rechecked by the logical
+				// continuation at this item-quantum boundary; peer preemption remains per item.
+				if (context.terminationRequested()) {
+					return new IteratorMultiQuantum(values, 0L, false, false);
+				}
+				while (values.size() < maxCount) {
 					var step = advanceIterator(state, true);
 					if (!step.present()) {
 						exhausted = true;
