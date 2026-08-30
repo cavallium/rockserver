@@ -132,6 +132,15 @@ simultaneous execution is also bounded by READ-pool admission. Higher concurrenc
 readahead increase per-scan native reader and I/O memory pressure, so tune them together
 on representative storage. Sharded scans retain their ordered two-item prefetch behavior.
 
+Non-LATENCY explicit-iterator requests spanning more than one logical iterator step also keep one
+cooperative scheduler task. Item, decoded-value byte, and monotonic-duration settings come from the
+embedded database and are preserved through the local gRPC server. With no peer competition the
+iterator remains work-conserving. Once another profile needs the READ pool, it yields at the first
+configured service checkpoint; the only unavoidable overshoot is the current indivisible RocksDB
+iterator step. A checkpoint already reached is sticky until that dispatch yields, even if pressure
+clears concurrently. One-step requests use the ordinary path because no scheduler can preempt the
+single native step safely.
+
 Cooperative queue-wait and execution timers are published once per logical SST task at
 terminal completion. Queue wait remains admission-to-first-dispatch latency; it does not
 misclassify downstream backpressure or later cooperative redispatch as initial queueing.

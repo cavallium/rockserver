@@ -88,6 +88,9 @@ log-space confidence bounds to throughput, latency, CPU, allocation, and memory.
 The release-only workflow is documented in
 [`docs/grpc-retained-read-benchmark.md`](docs/grpc-retained-read-benchmark.md).
 
+The same-build explicit-iterator service-bound mechanism and its idle/non-idle causal ablation are
+documented in [`docs/iterator-quantum-ablation.md`](docs/iterator-quantum-ablation.md).
+
 Both read gates and the paired seven-profile gate share the v1.3.11 Pareto rules and
 versioned result schemas documented in
 [`docs/v1.3.11-performance-contract.md`](docs/v1.3.11-performance-contract.md).
