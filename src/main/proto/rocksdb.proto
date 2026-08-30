@@ -365,7 +365,7 @@ message CdcCreateRequest {
   // If true, CDC will emit the resolved current values as seen by readers (post-merge),
   // instead of raw operands for MERGE operations. Defaults to false if not set.
   optional bool resolvedValues = 4;
-  // Optional atomic checkpoint precondition. Not setting either field preserves unchecked legacy behavior.
+  // Required atomic checkpoint precondition. The server rejects PRECONDITION_NOT_SET.
   oneof expectedLastCommitted {
     // Require that the subscription metadata does not exist.
     google.protobuf.Empty expectAbsent = 5;

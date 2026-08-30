@@ -21,7 +21,6 @@ public final class LeaseTtl {
 
 	public static long toMillisCeil(Duration leaseTtl, String name) {
 		long nanos = toNanos(leaseTtl, name);
-		if (nanos == Long.MAX_VALUE) return Long.MAX_VALUE;
 		long millis = nanos / 1_000_000L;
 		return nanos % 1_000_000L == 0L ? millis : millis + 1L;
 	}
