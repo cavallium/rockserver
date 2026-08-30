@@ -1,0 +1,7 @@
+# Each byte is high-nibble action plus low-nibble argument. Names are stable replay IDs.
+all-actions=00102030405060708090a0b0c0d0e0f000112233445566778899aabbccddeeff
+deadline-cancel-resume=080018101131405161207f1061712030407010f0
+pressure-fair-handoff=819293a3b2b3c2a1b0c3b2c2b3c3b2c2
+competition-episodes=9eae8fbfdedfbeced1d0bfced0c0
+shutdown-conservation=001001102030e00110f0202f
+max-cost-drr=0f0e0d0c0b0a0910111111112020202020202020

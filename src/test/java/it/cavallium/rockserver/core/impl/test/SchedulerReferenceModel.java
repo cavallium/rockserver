@@ -273,6 +273,13 @@ final class SchedulerReferenceModel {
 		return job == null ? Phase.TERMINAL : job.phase;
 	}
 
+	List<Long> ids(Phase phase) {
+		return jobs.values().stream()
+				.filter(job -> job.phase == phase)
+				.map(job -> job.spec.id())
+				.toList();
+	}
+
 	long attempts() {
 		return attempts;
 	}
