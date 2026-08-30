@@ -70,6 +70,9 @@ class PressurePerformancePairedBenchmarkTest {
 		assertTrue(json.contains("\"fixed_pairs\": 10"));
 		assertTrue(json.contains("\"fresh_processes\": 40"));
 		assertTrue(json.contains("\"passed\": true"));
+		assertTrue(json.contains("\"host_sha256\": \"" + "1".repeat(64) + "\""));
+		assertTrue(json.contains("\"baseline\":[100.000000000,100.000000000"));
+		assertTrue(json.contains("\"candidate\":[103.000000000,103.000000000"));
 		assertTrue(markdown.contains("Overall: **PASS**"));
 	}
 

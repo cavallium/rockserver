@@ -142,6 +142,7 @@ public final class PressurePerformancePairedBenchmark {
 				PressureBenchmarkArtifact.Suite.class);
 		String baselineProduction = null;
 		String candidateProduction = null;
+		boolean workersEnforced = true;
 		for (ScheduledRun run : schedule(prepared)) {
 			Set<String> expectedMetrics = metricNames(run.suite(), prepared.signalColumnFamilyCounts());
 			var artifact = PressureBenchmarkArtifact.read(run.artifact(), run.suite(), expectedMetrics);
@@ -158,6 +159,7 @@ public final class PressurePerformancePairedBenchmark {
 			if (prepared.enforce() && (!artifact.enforcedHardwareRun() || !artifact.correctnessPassed())) {
 				failures.add("unenforced or incorrect worker at ordinal " + run.ordinal());
 			}
+			workersEnforced &= artifact.enforcedHardwareRun() && artifact.correctnessPassed();
 			if (!processIds.add(artifact.processId())) failures.add("process id reused at ordinal " + run.ordinal());
 			if (artifact.startedEpochMillis() < previousFinished) failures.add("worker order overlapped at ordinal " + run.ordinal());
 			previousFinished = artifact.finishedEpochMillis();
@@ -191,8 +193,12 @@ public final class PressurePerformancePairedBenchmark {
 				baselineBySuite.get(PressureBenchmarkArtifact.Suite.SIGNAL),
 				candidateBySuite.get(PressureBenchmarkArtifact.Suite.SIGNAL), failures);
 		boolean passed = scheduler.automaticAcceptancePassed() && signal.automaticAcceptancePassed();
+		var provenance = new EvaluationProvenance(runtimeSha, hostSha, hardware,
+				Map.copyOf(baselineClasspath), Map.copyOf(candidateClasspath),
+				baselineProduction, candidateProduction, workersEnforced);
 		Instant finished = Instant.now();
-		Files.writeString(root.resolve("results.json"), resultJson(prepared, finished, scheduler, signal, passed),
+		Files.writeString(root.resolve("results.json"), resultJson(prepared, finished,
+				scheduler, signal, baselineBySuite, candidateBySuite, provenance, passed),
 				StandardOpenOption.CREATE_NEW);
 		Files.writeString(root.resolve("results.md"), resultMarkdown(prepared, finished, scheduler, signal, passed),
 				StandardOpenOption.CREATE_NEW);
@@ -275,19 +281,43 @@ public final class PressurePerformancePairedBenchmark {
 			Instant finished,
 			PairedPerformanceContract.Evaluation scheduler,
 			PairedPerformanceContract.Evaluation signal,
+			Map<PressureBenchmarkArtifact.Suite, List<Map<String, Double>>> baseline,
+			Map<PressureBenchmarkArtifact.Suite, List<Map<String, Double>>> candidate,
+			EvaluationProvenance provenance,
 			boolean passed) {
 		return "{\n  \"schema\": \"" + RESULT_SCHEMA + "\",\n"
 				+ "  \"finished\": \"" + finished + "\",\n"
 				+ "  \"baseline_sha\": \"" + prepared.baselineSha() + "\",\n"
 				+ "  \"candidate_sha\": \"" + prepared.candidateSha() + "\",\n"
 				+ "  \"configuration_sha256\": \"" + prepared.configurationSha256() + "\",\n"
+				+ "  \"host_state\": \"" + json(prepared.hostState()) + "\",\n"
+				+ "  \"host_sha256\": \"" + provenance.hostSha256() + "\",\n"
+				+ "  \"hardware_description\": \"" + json(provenance.hardwareDescription()) + "\",\n"
+				+ "  \"runtime_sha256\": \"" + provenance.runtimeSha256() + "\",\n"
+				+ "  \"baseline_production_sha256\": \"" + provenance.baselineProductionSha256() + "\",\n"
+				+ "  \"candidate_production_sha256\": \"" + provenance.candidateProductionSha256() + "\",\n"
+				+ "  \"workers_enforced\": " + provenance.workersEnforced() + ",\n"
 				+ "  \"fixed_pairs\": 10,\n  \"fresh_processes\": 40,\n"
 				+ "  \"adaptive_stopping\": false,\n  \"passed\": " + passed + ",\n"
-				+ "  \"scheduler\": " + evaluationJson(scheduler) + ",\n"
-				+ "  \"signal\": " + evaluationJson(signal) + "\n}\n";
+				+ "  \"classpath_sha256\": {\"baseline_scheduler\":\""
+				+ provenance.baselineClasspaths().get(PressureBenchmarkArtifact.Suite.SCHEDULER)
+				+ "\",\"candidate_scheduler\":\""
+				+ provenance.candidateClasspaths().get(PressureBenchmarkArtifact.Suite.SCHEDULER)
+				+ "\",\"baseline_signal\":\""
+				+ provenance.baselineClasspaths().get(PressureBenchmarkArtifact.Suite.SIGNAL)
+				+ "\",\"candidate_signal\":\""
+				+ provenance.candidateClasspaths().get(PressureBenchmarkArtifact.Suite.SIGNAL) + "\"},\n"
+				+ "  \"scheduler\": " + evaluationJson(scheduler,
+						baseline.get(PressureBenchmarkArtifact.Suite.SCHEDULER),
+						candidate.get(PressureBenchmarkArtifact.Suite.SCHEDULER)) + ",\n"
+				+ "  \"signal\": " + evaluationJson(signal,
+						baseline.get(PressureBenchmarkArtifact.Suite.SIGNAL),
+						candidate.get(PressureBenchmarkArtifact.Suite.SIGNAL)) + "\n}\n";
 	}
 
-	private static String evaluationJson(PairedPerformanceContract.Evaluation evaluation) {
+	private static String evaluationJson(PairedPerformanceContract.Evaluation evaluation,
+			List<Map<String, Double>> baseline,
+			List<Map<String, Double>> candidate) {
 		var text = new StringBuilder("{\"passed\":").append(evaluation.automaticAcceptancePassed())
 				.append(",\"failures\":").append(stringArrayJson(evaluation.failures()))
 				.append(",\"metrics\":{");
@@ -296,13 +326,24 @@ public final class PressurePerformancePairedBenchmark {
 			if (index++ > 0) text.append(',');
 			var metric = entry.getValue();
 			text.append('"').append(json(entry.getKey())).append("\":{")
-					.append("\"ratio_mean\":").append(formatOrNull(metric.interval().mean()))
+					.append("\"baseline\":").append(metricArray(baseline, entry.getKey()))
+					.append(",\"candidate\":").append(metricArray(candidate, entry.getKey()))
+					.append(",\"ratio_mean\":").append(formatOrNull(metric.interval().mean()))
 					.append(",\"lower_95\":").append(formatOrNull(metric.interval().lower95()))
 					.append(",\"upper_95\":").append(formatOrNull(metric.interval().upper95()))
 					.append(",\"passed\":").append(metric.automaticNonRegressionPassed())
 					.append(",\"material\":").append(metric.materialImprovement()).append('}');
 		}
 		return text.append("}}").toString();
+	}
+
+	private static String metricArray(List<Map<String, Double>> runs, String metric) {
+		var text = new StringBuilder("[");
+		for (int index = 0; index < runs.size(); index++) {
+			if (index > 0) text.append(',');
+			text.append(String.format(Locale.ROOT, "%.9f", runs.get(index).get(metric)));
+		}
+		return text.append(']').toString();
 	}
 
 	private static String resultMarkdown(Prepared prepared,
@@ -447,6 +488,16 @@ public final class PressurePerformancePairedBenchmark {
 			PressureBenchmarkArtifact.Suite suite,
 			PressureBenchmarkArtifact.Implementation implementation,
 			Path artifact) {
+	}
+
+	record EvaluationProvenance(String runtimeSha256,
+			String hostSha256,
+			String hardwareDescription,
+			Map<PressureBenchmarkArtifact.Suite, String> baselineClasspaths,
+			Map<PressureBenchmarkArtifact.Suite, String> candidateClasspaths,
+			String baselineProductionSha256,
+			String candidateProductionSha256,
+			boolean workersEnforced) {
 	}
 
 	record Prepared(Path root,
