@@ -391,7 +391,7 @@ class SchedulerStateModelPropertyTest {
 		for (var pool : SchedulerReferenceModel.BatchGate.Pool.values()) {
 			assertEquals(model.isDispatchable(pool), subject.isDispatchable(pool),
 					trace(seed, actionIndex, "dispatchability " + pool));
-			assertEquals(model.fairTurn(pool), subject.fairTurn(pool),
+			assertEquals(model.fairTurn(pool, now), subject.fairTurn(pool),
 					trace(seed, actionIndex, "fair turn " + pool));
 			assertEquals(model.canStart(pool, now), subject.allowance(pool, now) > 0,
 					trace(seed, actionIndex, "eligibility " + pool) + "; model={" + model.describe()

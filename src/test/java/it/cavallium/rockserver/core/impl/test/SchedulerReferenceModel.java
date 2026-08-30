@@ -583,8 +583,8 @@ final class SchedulerReferenceModel {
 			}
 		}
 
-		boolean fairTurn(Pool pool) {
-			return !pressured || lastCompleted == null || lastCompleted != pool || !dispatchable.get(other(pool));
+		boolean fairTurn(Pool pool, long now) {
+			return fairTurn(pool, now, competitionActive(now));
 		}
 
 		boolean isDispatchable(Pool pool) {
@@ -596,7 +596,9 @@ final class SchedulerReferenceModel {
 			if (competing && (active.get(pool) >= competingMaximum(pool)
 					|| pool == Pool.WRITE && now < nextCompetingWrite)) return false;
 			return !pressured
-					|| activeTotal < pressureMaximum && now >= nextPressureStart && fairTurn(pool);
+					|| activeTotal < pressureMaximum
+					&& now >= nextPressureStart
+					&& fairTurn(pool, now, competing);
 		}
 
 		int activeTotal() {
@@ -622,6 +624,21 @@ final class SchedulerReferenceModel {
 		private boolean competitionActive(long now) {
 			expireCompetition(now);
 			return competitionCount() > 0 || now < competitionUntil;
+		}
+
+		private boolean fairTurn(Pool pool, long now, boolean competing) {
+			if (!pressured || lastCompleted == null || lastCompleted != pool) return true;
+			int available = pressureMaximum - activeTotal;
+			if (available > 1) return true;
+			var peer = other(pool);
+			if (!dispatchable.get(peer)) return true;
+			return available == 1 && !competitionAllowsStart(peer, now, competing);
+		}
+
+		private boolean competitionAllowsStart(Pool pool, long now, boolean competing) {
+			return !competing
+					|| active.get(pool) < competingMaximum(pool)
+					&& (pool != Pool.WRITE || now >= nextCompetingWrite);
 		}
 
 		private void expireCompetition(long now) {
