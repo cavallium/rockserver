@@ -877,6 +877,8 @@ public class GrpcServer extends Server {
 
 		private static final long ITERATOR_VALUE_PAGE_SIZE = 64L;
 		private static final long ITERATOR_ADVANCE_STEP_SIZE = 4_096L;
+		private static final long DEFAULT_ITERATOR_QUANTUM_BYTES = 8L * 1_024L * 1_024L;
+		private static final long DEFAULT_ITERATOR_QUANTUM_NANOS = TimeUnit.MILLISECONDS.toNanos(8L);
 		private static final int WRITE_ELISION_MULTI_STEP_SIZE = 4_096;
 		private static final it.cavallium.rockserver.core.common.RequestContext[] NO_DEADLINE_CONTEXTS
 				= createNoDeadlineContexts();
@@ -2580,10 +2582,26 @@ public class GrpcServer extends Server {
 		private boolean requiresCooperativeIteratorContinuation(SubsequentRequest request) {
 			long skipCount = request.getSkipCount();
 			long takeCount = request.getTakeCount();
+			long maximumItems = iteratorQuantumLimits().maximumItems();
 			return mapRequestContext(request.getContext()).profile() != WorkloadProfile.LATENCY
-					&& (skipCount > ITERATOR_ADVANCE_STEP_SIZE
-							|| takeCount > ITERATOR_ADVANCE_STEP_SIZE
-							|| skipCount > ITERATOR_ADVANCE_STEP_SIZE - takeCount);
+					&& (skipCount > maximumItems
+							|| takeCount > maximumItems
+							|| skipCount > maximumItems - takeCount);
+		}
+
+		private IteratorQuantumLimits iteratorQuantumLimits() {
+			var database = embeddedDatabase;
+			if (database == null) {
+				return new IteratorQuantumLimits(
+						ITERATOR_ADVANCE_STEP_SIZE,
+						DEFAULT_ITERATOR_QUANTUM_BYTES,
+						DEFAULT_ITERATOR_QUANTUM_NANOS);
+			}
+			var settings = database.getWorkloadSettings();
+			return new IteratorQuantumLimits(
+					settings.rangeQuantumMaxItems(),
+					settings.rangeQuantumMaxBytes(),
+					settings.rangeQuantumMaxDuration().toNanos());
 		}
 
 		/**
@@ -2605,6 +2623,7 @@ public class GrpcServer extends Server {
 				final WorkloadProfile profile;
 				final RocksDBSyncAPI contextualApi;
 				final RWScheduler.WorkloadExecutor workloadExecutor;
+				final IteratorQuantumLimits quantumLimits;
 				try {
 					requestContext = mapRequestContext(request.getContext());
 					command = new RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<>(
@@ -2616,6 +2635,7 @@ public class GrpcServer extends Server {
 					contextualApi = syncApi(requestContext);
 					workloadExecutor = scheduler.executor(
 							profile, command.operationFamily(), requestContext.deadlineEpochMillis());
+					quantumLimits = iteratorQuantumLimits();
 				} catch (Throwable failure) {
 					iteratorLease.operationTerminated();
 					return Flux.error(failure);
@@ -2635,6 +2655,7 @@ public class GrpcServer extends Server {
 								request.getSkipCount(),
 								request.getTakeCount(),
 								contextualApi,
+								quantumLimits,
 								iteratorLease,
 								sink,
 								lateErrorHandler(contextView));
@@ -2646,7 +2667,9 @@ public class GrpcServer extends Server {
 						return;
 					}
 					try {
-						state.attach(workloadExecutor.executeCooperatively(state, 0L));
+						state.attach(workloadExecutor.executeCooperatively(
+								state,
+								state.estimatedBytes()));
 						state.start();
 					} catch (Throwable admissionFailure) {
 						state.admissionFailed(admissionFailure);
@@ -2835,6 +2858,7 @@ public class GrpcServer extends Server {
 
 			private final long iteratorId;
 			private final RocksDBSyncAPI contextualApi;
+			private final IteratorQuantumLimits quantumLimits;
 			private final IteratorOperationLease iteratorLease;
 			private final FluxSink<KV> sink;
 			private final Consumer<Throwable> lateErrors;
@@ -2848,12 +2872,14 @@ public class GrpcServer extends Server {
 			private @Nullable List<Buf> page;
 			private int pageIndex;
 			private boolean sourceExhausted;
+			private boolean checkpointAfterPage;
 			private boolean completionPrepared;
 
 			private CooperativeIteratorMultiStream(long iteratorId,
 					long skipCount,
 					long takeCount,
 					RocksDBSyncAPI contextualApi,
+					IteratorQuantumLimits quantumLimits,
 					IteratorOperationLease iteratorLease,
 					FluxSink<KV> sink,
 					Consumer<Throwable> lateErrors) {
@@ -2861,6 +2887,7 @@ public class GrpcServer extends Server {
 				this.remainingSkip = skipCount;
 				this.remainingTake = takeCount;
 				this.contextualApi = contextualApi;
+				this.quantumLimits = quantumLimits;
 				this.iteratorLease = iteratorLease;
 				this.sink = sink;
 				this.lateErrors = lateErrors;
@@ -2923,6 +2950,8 @@ public class GrpcServer extends Server {
 							if (!emitPage()) {
 								return RWScheduler.CooperativeResult.PARK;
 							}
+							boolean checkpointReached = checkpointAfterPage;
+							checkpointAfterPage = false;
 							if (sourceExhausted || remainingTake == 0L) {
 								prepareCompletion();
 								return RWScheduler.CooperativeResult.COMPLETE;
@@ -2930,7 +2959,7 @@ public class GrpcServer extends Server {
 							if (demand == 0L) {
 								return RWScheduler.CooperativeResult.PARK;
 							}
-							if (context.preemptionRequested()) {
+							if (checkpointReached || context.preemptionRequested()) {
 								return RWScheduler.CooperativeResult.YIELD;
 							}
 							continue;
@@ -2945,11 +2974,25 @@ public class GrpcServer extends Server {
 						}
 
 						if (remainingSkip > 0L) {
-							long step = Math.min(remainingSkip, ITERATOR_ADVANCE_STEP_SIZE);
-							boolean advanced = contextualApi.subsequent(
-									iteratorId, 0L, step, RequestType.exists());
-							remainingSkip -= step;
-							if (!advanced) {
+							long step = Math.min(remainingSkip, quantumLimits.maximumItems());
+							boolean exhausted = false;
+							boolean checkpointReached = false;
+							if (embeddedDatabase != null) {
+								var quantum = embeddedDatabase.advanceIteratorQuantumInternal(
+										iteratorId,
+										step,
+										quantumLimits.maximumDurationNanos(),
+										context);
+								remainingSkip -= quantum.advanced();
+								exhausted = quantum.exhausted();
+								checkpointReached = quantum.checkpointRequested();
+							} else {
+								boolean advanced = contextualApi.subsequent(
+										iteratorId, 0L, step, RequestType.exists());
+								remainingSkip -= step;
+								exhausted = !advanced;
+							}
+							if (exhausted) {
 								sourceExhausted = true;
 								remainingSkip = 0L;
 								remainingTake = 0L;
@@ -2959,21 +3002,36 @@ public class GrpcServer extends Server {
 							if (cancellationRequested || context.terminationRequested()) {
 								return RWScheduler.CooperativeResult.COMPLETE;
 							}
-							if (context.preemptionRequested()) {
+							if (checkpointReached || context.preemptionRequested()) {
 								return RWScheduler.CooperativeResult.YIELD;
 							}
 							continue;
 						}
 
-						long step = Math.min(remainingTake, ITERATOR_VALUE_PAGE_SIZE);
-						var values = Objects.requireNonNull(contextualApi.subsequent(
-								iteratorId, 0L, step, RequestType.<Buf>multi()),
-								"Iterator MULTI page");
+						long step = Math.min(remainingTake,
+								Math.min(ITERATOR_VALUE_PAGE_SIZE, quantumLimits.maximumItems()));
+						final List<Buf> values;
+						if (embeddedDatabase != null) {
+							var quantum = embeddedDatabase.readIteratorQuantumInternal(
+									iteratorId,
+									step,
+									quantumLimits.maximumBytes(),
+									quantumLimits.maximumDurationNanos(),
+									context);
+							values = quantum.values();
+							sourceExhausted = quantum.exhausted();
+							checkpointAfterPage = quantum.checkpointRequested();
+						} else {
+							values = Objects.requireNonNull(contextualApi.subsequent(
+									iteratorId, 0L, step, RequestType.<Buf>multi()),
+									"Iterator MULTI page");
+							sourceExhausted = values.size() < step;
+							checkpointAfterPage = context.preemptionRequested();
+						}
 						if (values.size() > step) {
 							throw new IllegalStateException("Iterator MULTI page exceeded its requested size");
 						}
 						remainingTake -= values.size();
-						sourceExhausted = values.size() < step;
 						if (values.isEmpty()) {
 							prepareCompletion();
 							return RWScheduler.CooperativeResult.COMPLETE;
@@ -2986,6 +3044,10 @@ public class GrpcServer extends Server {
 					context.fail(failure);
 					return RWScheduler.CooperativeResult.COMPLETE;
 				}
+			}
+
+			private long estimatedBytes() {
+				return quantumLimits.maximumBytes();
 			}
 
 			private boolean emitPage() {
@@ -3113,6 +3175,11 @@ public class GrpcServer extends Server {
 			public boolean isDisposed() {
 				return terminated;
 			}
+		}
+
+		private record IteratorQuantumLimits(long maximumItems,
+				long maximumBytes,
+				long maximumDurationNanos) {
 		}
 
 		/** Tracks whether cancellation won before a scheduled callable began running. */
