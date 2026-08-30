@@ -158,6 +158,36 @@ class RWSchedulerMetricsTest {
 	}
 
 	@Test
+	void taskMetricCardinalityContainsEachAllowedPairOnlyInItsPhysicalPool() {
+		var registry = new SimpleMeterRegistry();
+		var scheduler = scheduler(registry, "metric-task-routing-cardinality");
+		try {
+			var routes = new java.util.HashSet<String>();
+			for (var meter : registry.getMeters()) {
+				String operationTag = meter.getId().getTag(OPERATION);
+				if (operationTag == null) continue;
+				var profile = WorkloadProfile.valueOf(
+						meter.getId().getTag(PROFILE).toUpperCase(java.util.Locale.ROOT));
+				var family = OperationFamily.valueOf(operationTag.toUpperCase(java.util.Locale.ROOT));
+				String expectedResource = RWScheduler.resourcePool(profile, family)
+						.name().toLowerCase(java.util.Locale.ROOT);
+				assertEquals(expectedResource, meter.getId().getTag(RESOURCE), meter.getId().toString());
+				routes.add(profile + "/" + family + "/" + expectedResource);
+			}
+			long allowedPairs = 0L;
+			for (var profile : WorkloadProfile.values()) {
+				for (var family : OperationFamily.values()) {
+					if (WorkloadAdmission.isAllowed(profile, family)) allowedPairs++;
+				}
+			}
+			assertEquals(allowedPairs, routes.size());
+		} finally {
+			scheduler.dispose();
+			registry.close();
+		}
+	}
+
+	@Test
 	void recordsExistingTimersCountersAndTerminalMetrics() throws Exception {
 		var registry = new SimpleMeterRegistry();
 		var scheduler = scheduler(registry, "metric-values");

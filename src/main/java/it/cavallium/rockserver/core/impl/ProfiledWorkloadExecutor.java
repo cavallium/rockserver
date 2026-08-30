@@ -2027,7 +2027,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				continue;
 			}
 			for (var family : FAMILIES) {
-				if (WorkloadAdmission.isAllowed(profile, family)) {
+				if (WorkloadAdmission.isAllowed(profile, family)
+						&& RWScheduler.resourcePool(profile, family) == resourcePool) {
 					result[profile.ordinal()][family.ordinal()] = registerTaskMetrics(registry, profile, family);
 				}
 			}
