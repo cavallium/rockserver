@@ -25,6 +25,9 @@ public final class PressurePerformancePairedBenchmark {
 	static final String SCHEDULE_SCHEMA = "rockserver-pressure-performance-schedule-v1";
 	static final String RESULT_SCHEMA = "rockserver-pressure-performance-comparison-v1";
 	static final String METADATA_SCHEMA = "rockserver-pressure-performance-metadata-v1";
+	static final String SCHEDULE_SCHEMA_V2 = "rockserver-pressure-performance-schedule-v2";
+	static final String RESULT_SCHEMA_V2 = "rockserver-pressure-performance-comparison-v2";
+	static final String METADATA_SCHEMA_V2 = "rockserver-pressure-performance-metadata-v2";
 	private static final String SCHEDULE_FILE = "schedule.tsv";
 	private static final String METADATA_FILE = "metadata.properties";
 	private static final Set<String> METADATA_KEYS = Set.of(
@@ -34,6 +37,13 @@ public final class PressurePerformancePairedBenchmark {
 			"scheduler-batch-capacity", "scheduler-work-tokens", "scheduler-warmup-operations",
 			"scheduler-seed", "signal-cf-counts", "signal-warmup-columns", "signal-measured-columns",
 			"signal-minimum-evaluations", "signal-maximum-evaluations", "signal-latency-sample-stride");
+	private static final Set<String> METADATA_KEYS_V2;
+
+	static {
+		var keys = new LinkedHashSet<>(METADATA_KEYS);
+		keys.add("contract-version");
+		METADATA_KEYS_V2 = Set.copyOf(keys);
+	}
 
 	private PressurePerformancePairedBenchmark() {
 	}
@@ -193,25 +203,58 @@ public final class PressurePerformancePairedBenchmark {
 				candidateBySuite.get(run.suite()).add(artifact.metrics());
 			}
 		}
-		var scheduler = PressurePerformanceContract.evaluateScheduler(
-				baselineBySuite.get(PressureBenchmarkArtifact.Suite.SCHEDULER),
-				candidateBySuite.get(PressureBenchmarkArtifact.Suite.SCHEDULER), failures);
-		var signal = PressurePerformanceContract.evaluateSignal(prepared.signalColumnFamilyCounts(),
-				baselineBySuite.get(PressureBenchmarkArtifact.Suite.SIGNAL),
-				candidateBySuite.get(PressureBenchmarkArtifact.Suite.SIGNAL), failures);
-		boolean passed = scheduler.automaticAcceptancePassed() && signal.automaticAcceptancePassed();
 		var provenance = new EvaluationProvenance(runtimeSha, hostSha, hardware,
 				Map.copyOf(baselineClasspath), Map.copyOf(candidateClasspath),
 				baselineProduction, candidateProduction, workersEnforced);
 		Instant finished = Instant.now();
-		Files.writeString(root.resolve("results.json"), resultJson(prepared, finished,
-				scheduler, signal, baselineBySuite, candidateBySuite, provenance, passed),
-				StandardOpenOption.CREATE_NEW);
-		Files.writeString(root.resolve("results.md"), resultMarkdown(prepared, finished, scheduler, signal, passed),
-				StandardOpenOption.CREATE_NEW);
-		if (prepared.enforce() && !passed) {
-			throw new IllegalStateException("Pressure performance comparison failed");
+		if (prepared.contractVersion() == ContractVersion.V1) {
+			var scheduler = PressurePerformanceContract.evaluateScheduler(
+					baselineBySuite.get(PressureBenchmarkArtifact.Suite.SCHEDULER),
+					candidateBySuite.get(PressureBenchmarkArtifact.Suite.SCHEDULER), failures);
+			var signal = PressurePerformanceContract.evaluateSignal(prepared.signalColumnFamilyCounts(),
+					baselineBySuite.get(PressureBenchmarkArtifact.Suite.SIGNAL),
+					candidateBySuite.get(PressureBenchmarkArtifact.Suite.SIGNAL), failures);
+			boolean passed = scheduler.automaticAcceptancePassed() && signal.automaticAcceptancePassed();
+			Files.writeString(root.resolve("results.json"), resultJson(prepared, finished,
+					scheduler, signal, baselineBySuite, candidateBySuite, provenance, passed),
+					StandardOpenOption.CREATE_NEW);
+			Files.writeString(root.resolve("results.md"), resultMarkdown(
+					prepared, finished, scheduler, signal, passed), StandardOpenOption.CREATE_NEW);
+			if (prepared.enforce() && !passed) {
+				throw new IllegalStateException("Pressure performance comparison failed");
+			}
+		} else {
+			var scheduler = PressurePerformanceContractV2.evaluateScheduler(
+					baselineBySuite.get(PressureBenchmarkArtifact.Suite.SCHEDULER),
+					candidateBySuite.get(PressureBenchmarkArtifact.Suite.SCHEDULER), failures);
+			var signal = PressurePerformanceContractV2.evaluateSignal(prepared.signalColumnFamilyCounts(),
+					baselineBySuite.get(PressureBenchmarkArtifact.Suite.SIGNAL),
+					candidateBySuite.get(PressureBenchmarkArtifact.Suite.SIGNAL), failures);
+			var decision = combinedDecision(scheduler.decision(), signal.decision());
+			Files.writeString(root.resolve("results.json"), resultJsonV2(prepared, finished,
+					scheduler, signal, baselineBySuite, candidateBySuite, provenance, decision),
+					StandardOpenOption.CREATE_NEW);
+			Files.writeString(root.resolve("results.md"), resultMarkdownV2(
+					prepared, finished, scheduler, signal, decision), StandardOpenOption.CREATE_NEW);
+			if (prepared.enforce() && decision != PairedPerformanceContractV2.Decision.PASS) {
+				throw new IllegalStateException("Pressure performance comparison v2 "
+						+ decision.name().toLowerCase(Locale.ROOT));
+			}
 		}
+	}
+
+	private static PairedPerformanceContractV2.Decision combinedDecision(
+			PairedPerformanceContractV2.Decision first,
+			PairedPerformanceContractV2.Decision second) {
+		if (first == PairedPerformanceContractV2.Decision.FAIL
+				|| second == PairedPerformanceContractV2.Decision.FAIL) {
+			return PairedPerformanceContractV2.Decision.FAIL;
+		}
+		if (first == PairedPerformanceContractV2.Decision.INCONCLUSIVE
+				|| second == PairedPerformanceContractV2.Decision.INCONCLUSIVE) {
+			return PairedPerformanceContractV2.Decision.INCONCLUSIVE;
+		}
+		return PairedPerformanceContractV2.Decision.PASS;
 	}
 
 	private static void assertWorkerOrder(Prepared prepared, ScheduledRun target) {
@@ -262,7 +305,7 @@ public final class PressurePerformancePairedBenchmark {
 	}
 
 	private static String scheduleText(Prepared prepared) {
-		var text = new StringBuilder("schema\t").append(SCHEDULE_SCHEMA).append('\n')
+		var text = new StringBuilder("schema\t").append(prepared.contractVersion().scheduleSchema).append('\n')
 				.append("configuration-sha256\t").append(prepared.configurationSha256()).append('\n')
 				.append("pairs\t").append(PairedPerformanceContract.REQUIRED_PAIRS).append('\n')
 				.append("adaptive-stopping\tfalse\n")
@@ -391,6 +434,138 @@ public final class PressurePerformancePairedBenchmark {
 		text.append('\n');
 	}
 
+	private static String resultJsonV2(Prepared prepared,
+			Instant finished,
+			PairedPerformanceContractV2.Evaluation scheduler,
+			PairedPerformanceContractV2.Evaluation signal,
+			Map<PressureBenchmarkArtifact.Suite, List<Map<String, Double>>> baseline,
+			Map<PressureBenchmarkArtifact.Suite, List<Map<String, Double>>> candidate,
+			EvaluationProvenance provenance,
+			PairedPerformanceContractV2.Decision decision) {
+		return "{\n  \"schema\": \"" + RESULT_SCHEMA_V2 + "\",\n"
+				+ "  \"contract_version\": \"v2\",\n"
+				+ "  \"finished\": \"" + finished + "\",\n"
+				+ "  \"baseline_sha\": \"" + prepared.baselineSha() + "\",\n"
+				+ "  \"candidate_sha\": \"" + prepared.candidateSha() + "\",\n"
+				+ "  \"configuration_sha256\": \"" + prepared.configurationSha256() + "\",\n"
+				+ "  \"host_state\": \"" + json(prepared.hostState()) + "\",\n"
+				+ "  \"host_sha256\": \"" + provenance.hostSha256() + "\",\n"
+				+ "  \"hardware_description\": \"" + json(provenance.hardwareDescription()) + "\",\n"
+				+ "  \"runtime_sha256\": \"" + provenance.runtimeSha256() + "\",\n"
+				+ "  \"baseline_production_sha256\": \"" + provenance.baselineProductionSha256() + "\",\n"
+				+ "  \"candidate_production_sha256\": \"" + provenance.candidateProductionSha256() + "\",\n"
+				+ "  \"workers_enforced\": " + provenance.workersEnforced() + ",\n"
+				+ "  \"fixed_pairs\": 10,\n  \"fresh_processes\": 40,\n"
+				+ "  \"adaptive_stopping\": false,\n"
+				+ "  \"family_wise_alpha\": " + PairedPerformanceContractV2.FAMILY_WISE_ALPHA + ",\n"
+				+ "  \"throughput_minimum_ratio\": "
+				+ PairedPerformanceContractV2.THROUGHPUT_MINIMUM_RATIO + ",\n"
+				+ "  \"cost_maximum_ratio\": " + PairedPerformanceContractV2.COST_MAXIMUM_RATIO + ",\n"
+				+ "  \"multiplicity\": \"holm-bonferroni\",\n"
+				+ "  \"decision\": \"" + decision.name().toLowerCase(Locale.ROOT) + "\",\n"
+				+ "  \"passed\": " + (decision == PairedPerformanceContractV2.Decision.PASS) + ",\n"
+				+ "  \"classpath_sha256\": {\"baseline_scheduler\":\""
+				+ provenance.baselineClasspaths().get(PressureBenchmarkArtifact.Suite.SCHEDULER)
+				+ "\",\"candidate_scheduler\":\""
+				+ provenance.candidateClasspaths().get(PressureBenchmarkArtifact.Suite.SCHEDULER)
+				+ "\",\"baseline_signal\":\""
+				+ provenance.baselineClasspaths().get(PressureBenchmarkArtifact.Suite.SIGNAL)
+				+ "\",\"candidate_signal\":\""
+				+ provenance.candidateClasspaths().get(PressureBenchmarkArtifact.Suite.SIGNAL) + "\"},\n"
+				+ "  \"scheduler\": " + evaluationJsonV2(scheduler,
+						baseline.get(PressureBenchmarkArtifact.Suite.SCHEDULER),
+						candidate.get(PressureBenchmarkArtifact.Suite.SCHEDULER)) + ",\n"
+				+ "  \"signal\": " + evaluationJsonV2(signal,
+						baseline.get(PressureBenchmarkArtifact.Suite.SIGNAL),
+						candidate.get(PressureBenchmarkArtifact.Suite.SIGNAL)) + "\n}\n";
+	}
+
+	private static String evaluationJsonV2(PairedPerformanceContractV2.Evaluation evaluation,
+			List<Map<String, Double>> baseline,
+			List<Map<String, Double>> candidate) {
+		var text = new StringBuilder("{\"decision\":\"")
+				.append(evaluation.decision().name().toLowerCase(Locale.ROOT))
+				.append("\",\"failures\":").append(stringArrayJson(evaluation.failures()))
+				.append(",\"inconclusive_metrics\":")
+				.append(stringArrayJson(evaluation.inconclusiveMetrics()))
+				.append(",\"material_improvements\":")
+				.append(stringArrayJson(evaluation.materialImprovements()))
+				.append(",\"stochastic_hypotheses\":").append(evaluation.stochasticHypotheses())
+				.append(",\"metrics\":{");
+		int index = 0;
+		for (var entry : evaluation.metrics().entrySet()) {
+			if (index++ > 0) text.append(',');
+			var metric = entry.getValue();
+			text.append('"').append(json(entry.getKey())).append("\":{")
+					.append("\"baseline\":").append(metricArray(baseline, entry.getKey()))
+					.append(",\"candidate\":").append(metricArray(candidate, entry.getKey()))
+					.append(",\"ratio_mean\":").append(formatOrNull(metric.interval().mean()))
+					.append(",\"lower_95\":").append(formatOrNull(metric.interval().lower95()))
+					.append(",\"upper_95\":").append(formatOrNull(metric.interval().upper95()))
+					.append(",\"noninferiority_margin\":").append(metric.nonInferiorityMargin())
+					.append(",\"regression_p\":").append(formatOrNull(metric.regressionPValue()))
+					.append(",\"regression_holm_p\":")
+					.append(formatOrNull(metric.regressionHolmAdjustedPValue()))
+					.append(",\"regression_demonstrated\":").append(metric.regressionDemonstrated())
+					.append(",\"noninferiority_p\":").append(formatOrNull(metric.nonInferiorityPValue()))
+					.append(",\"noninferiority_proven\":").append(metric.nonInferiorityProven())
+					.append(",\"equivalence_proven\":").append(metric.equivalenceProven())
+					.append(",\"material_p\":").append(formatOrNull(metric.materialImprovementPValue()))
+					.append(",\"material_holm_p\":")
+					.append(formatOrNull(metric.materialHolmAdjustedPValue()))
+					.append(",\"material_proven\":").append(metric.materialImprovementProven())
+					.append(",\"deterministic_ceiling_passed\":")
+					.append(metric.deterministicCeilingPassed()).append('}');
+		}
+		return text.append("}}").toString();
+	}
+
+	private static String resultMarkdownV2(Prepared prepared,
+			Instant finished,
+			PairedPerformanceContractV2.Evaluation scheduler,
+			PairedPerformanceContractV2.Evaluation signal,
+			PairedPerformanceContractV2.Decision decision) {
+		var text = new StringBuilder("# Pressure performance comparison v2\n\n")
+				.append("- Finished: `").append(finished).append("`\n")
+				.append("- Baseline / candidate: `").append(prepared.baselineSha()).append("` / `")
+				.append(prepared.candidateSha()).append("`\n")
+				.append("- Fresh fixed schedule: `10` pairs per suite (`40` JVMs)\n")
+				.append("- Holm family-wise alpha: `0.05`\n")
+				.append("- Operational margins: throughput `0.99`, cost `1.02`\n")
+				.append("- Overall decision: **").append(decision).append("**\n\n");
+		appendEvaluationMarkdownV2(text, "Scheduler high contention", scheduler);
+		appendEvaluationMarkdownV2(text, "Storage-pressure signal", signal);
+		return text.toString();
+	}
+
+	private static void appendEvaluationMarkdownV2(StringBuilder text,
+			String title,
+			PairedPerformanceContractV2.Evaluation evaluation) {
+		text.append("## ").append(title).append("\n\nDecision: `")
+				.append(evaluation.decision()).append("`\n\n")
+				.append("| Metric | Ratio | Holm regression p | NI p | NI | Equivalent | Material |\n")
+				.append("| --- | ---: | ---: | ---: | --- | --- | --- |\n");
+		for (var entry : evaluation.metrics().entrySet()) {
+			var metric = entry.getValue();
+			text.append("| `").append(entry.getKey()).append("` | ")
+					.append(formatOrNull(metric.interval().mean())).append(" | ")
+					.append(formatOrNull(metric.regressionHolmAdjustedPValue())).append(" | ")
+					.append(formatOrNull(metric.nonInferiorityPValue())).append(" | ")
+					.append(metric.nonInferiorityProven()).append(" | ")
+					.append(metric.equivalenceProven()).append(" | ")
+					.append(metric.materialImprovementProven()).append(" |\n");
+		}
+		if (!evaluation.failures().isEmpty()) {
+			text.append("\nFailures:\n");
+			for (String failure : evaluation.failures()) text.append("- ").append(failure).append('\n');
+		}
+		if (!evaluation.inconclusiveMetrics().isEmpty()) {
+			text.append("\nInsufficient precision:\n");
+			for (String metric : evaluation.inconclusiveMetrics()) text.append("- ").append(metric).append('\n');
+		}
+		text.append('\n');
+	}
+
 	private static String formatOrNull(double value) {
 		return Double.isFinite(value) ? String.format(Locale.ROOT, "%.6f", value) : "null";
 	}
@@ -490,6 +665,43 @@ public final class PressurePerformancePairedBenchmark {
 		}
 	}
 
+	enum ContractVersion {
+		V1("v1", SCHEDULE_SCHEMA, RESULT_SCHEMA, METADATA_SCHEMA, METADATA_KEYS),
+		V2("v2", SCHEDULE_SCHEMA_V2, RESULT_SCHEMA_V2, METADATA_SCHEMA_V2, METADATA_KEYS_V2);
+
+		final String value;
+		final String scheduleSchema;
+		final String resultSchema;
+		final String metadataSchema;
+		final Set<String> metadataKeys;
+
+		ContractVersion(String value,
+				String scheduleSchema,
+				String resultSchema,
+				String metadataSchema,
+				Set<String> metadataKeys) {
+			this.value = value;
+			this.scheduleSchema = scheduleSchema;
+			this.resultSchema = resultSchema;
+			this.metadataSchema = metadataSchema;
+			this.metadataKeys = metadataKeys;
+		}
+
+		static ContractVersion parse(String value) {
+			return switch (value) {
+				case "v1" -> V1;
+				case "v2" -> V2;
+				default -> throw new IllegalArgumentException("contract-version must be v1 or v2");
+			};
+		}
+
+		static ContractVersion fromMetadataSchema(String schema) {
+			if (METADATA_SCHEMA.equals(schema)) return V1;
+			if (METADATA_SCHEMA_V2.equals(schema)) return V2;
+			throw new IllegalArgumentException("Unsupported pressure metadata schema");
+		}
+	}
+
 	record ScheduledRun(int ordinal,
 			int round,
 			PressureBenchmarkArtifact.Suite suite,
@@ -508,6 +720,7 @@ public final class PressurePerformancePairedBenchmark {
 	}
 
 	record Prepared(Path root,
+			ContractVersion contractVersion,
 			String baselineSha,
 			String candidateSha,
 			String hostState,
@@ -532,6 +745,7 @@ public final class PressurePerformancePairedBenchmark {
 
 		Prepared {
 			root = root.toAbsolutePath().normalize();
+			if (contractVersion == null) throw new IllegalArgumentException("contract version is required");
 			signalColumnFamilyCounts = signalColumnFamilyCounts.clone();
 			for (int index = 0; index < signalColumnFamilyCounts.length; index++) {
 				if (signalColumnFamilyCounts[index] < 1
@@ -585,7 +799,7 @@ public final class PressurePerformancePairedBenchmark {
 		}
 
 		String configurationText() {
-			return "scheduler-operations=" + schedulerOperations + '\n'
+			String workload = "scheduler-operations=" + schedulerOperations + '\n'
 					+ "scheduler-submitters=" + schedulerSubmitters + '\n'
 					+ "scheduler-read-workers=" + schedulerReadWorkers + '\n'
 					+ "scheduler-write-workers=" + schedulerWriteWorkers + '\n'
@@ -601,23 +815,36 @@ public final class PressurePerformancePairedBenchmark {
 					+ "signal-minimum-evaluations=" + signalMinimumEvaluations + '\n'
 					+ "signal-maximum-evaluations=" + signalMaximumEvaluations + '\n'
 					+ "signal-latency-sample-stride=" + signalLatencySampleStride + '\n';
+			if (contractVersion == ContractVersion.V1) return workload;
+			return "contract-version=v2\n"
+					+ "family-wise-alpha=" + PairedPerformanceContractV2.FAMILY_WISE_ALPHA + '\n'
+					+ "throughput-minimum-ratio=" + PairedPerformanceContractV2.THROUGHPUT_MINIMUM_RATIO + '\n'
+					+ "cost-maximum-ratio=" + PairedPerformanceContractV2.COST_MAXIMUM_RATIO + '\n'
+					+ "multiplicity=holm-bonferroni\n"
+					+ "adaptive-stopping=false\n"
+					+ workload;
 		}
 
 		String configurationSha256() { return sha256(configurationText()); }
 
 		String metadataText() {
-			return "schema=" + METADATA_SCHEMA + '\n'
+			String header = "schema=" + contractVersion.metadataSchema + '\n'
+					+ (contractVersion == ContractVersion.V2 ? "contract-version=v2\n" : "")
 					+ "baseline-sha=" + baselineSha + '\n'
 					+ "candidate-sha=" + candidateSha + '\n'
 					+ "host-state=" + hostState + '\n'
 					+ "hardware-description=" + hardwareDescription + '\n'
-					+ "enforce=" + enforce + '\n' + configurationText();
+					+ "enforce=" + enforce + '\n';
+			return header + (contractVersion == ContractVersion.V2
+					? configurationText().substring(configurationText().indexOf("scheduler-operations="))
+					: configurationText());
 		}
 
 		static Prepared fromArguments(Map<String, String> arguments) {
-			var allowed = new LinkedHashSet<>(METADATA_KEYS);
+			var version = ContractVersion.parse(arguments.getOrDefault("contract-version", "v1"));
+			var allowed = new LinkedHashSet<>(version.metadataKeys);
 			allowed.remove("schema");
-			allowed.add("mode"); allowed.add("root");
+			allowed.add("mode"); allowed.add("root"); allowed.add("contract-version");
 			for (String key : arguments.keySet()) if (!allowed.contains(key)) throw new IllegalArgumentException("Unknown option --" + key);
 			Path root = Path.of(require(arguments, "root"));
 			return fromValues(root, arguments, true);
@@ -630,7 +857,13 @@ public final class PressurePerformancePairedBenchmark {
 		}
 
 		private static Prepared fromValues(Path root, Map<String, String> values, boolean options) {
-			return new Prepared(root,
+			var version = options
+					? ContractVersion.parse(values.getOrDefault("contract-version", "v1"))
+					: ContractVersion.fromMetadataSchema(value(values, "schema", null));
+			if (version == ContractVersion.V2 && !"v2".equals(value(values, "contract-version", null))) {
+				throw new IllegalArgumentException("v2 metadata requires contract-version=v2");
+			}
+			return new Prepared(root, version,
 					value(values, "baseline-sha", null), value(values, "candidate-sha", null),
 					value(values, "host-state", "dedicated"), value(values, "hardware-description", "unspecified"),
 					bool(values, "enforce", false), intValue(values, "scheduler-operations", 1_000_000),
@@ -653,12 +886,17 @@ public final class PressurePerformancePairedBenchmark {
 				int separator = line.indexOf('=');
 				if (separator <= 0 || separator != line.lastIndexOf('=')) throw new IllegalArgumentException("Malformed pressure metadata");
 				String key = line.substring(0, separator);
-				if (!METADATA_KEYS.contains(key) || values.put(key, line.substring(separator + 1)) != null) {
+				if (!METADATA_KEYS_V2.contains(key) || values.put(key, line.substring(separator + 1)) != null) {
 					throw new IllegalArgumentException("Unknown or duplicate pressure metadata " + key);
 				}
 			}
-			if (!values.keySet().equals(METADATA_KEYS)) throw new IllegalArgumentException("Missing pressure metadata keys");
-			if (!METADATA_SCHEMA.equals(values.get("schema"))) throw new IllegalArgumentException("Unsupported pressure metadata schema");
+			var version = ContractVersion.fromMetadataSchema(values.get("schema"));
+			if (!values.keySet().equals(version.metadataKeys)) {
+				throw new IllegalArgumentException("Missing or extra pressure metadata keys");
+			}
+			if (version == ContractVersion.V2 && !"v2".equals(values.get("contract-version"))) {
+				throw new IllegalArgumentException("v2 metadata requires contract-version=v2");
+			}
 			return Map.copyOf(values);
 		}
 
