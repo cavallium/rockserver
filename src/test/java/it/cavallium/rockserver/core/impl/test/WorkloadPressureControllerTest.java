@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntConsumer;
 import org.junit.jupiter.api.Test;
@@ -23,6 +24,25 @@ import org.junit.jupiter.api.Test;
 class WorkloadPressureControllerTest {
 
 	private static final long ELIGIBLE_TIME = Long.MAX_VALUE;
+
+	@Test
+	void dispatchabilitySourcesRemainIndependentAcrossAdversarialTransitions()
+			throws Exception {
+		var controller = Controller.create(1, Duration.ofNanos(1));
+
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, true);
+		controller.setDispatchable(RWScheduler.Pool.READ, false);
+		assertFalse(controller.isDispatchable(RWScheduler.Pool.READ));
+		assertTrue(controller.isDispatchable(RWScheduler.Pool.WRITE),
+				"publishing READ must not overwrite WRITE's independently owned state");
+
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, false);
+		assertTrue(controller.isDispatchable(RWScheduler.Pool.READ),
+				"publishing WRITE must not overwrite READ's independently owned state");
+		assertFalse(controller.isDispatchable(RWScheduler.Pool.WRITE));
+	}
 
 	@Test
 	void pressureHandsEveryReleasedPermitToTheOtherContinuouslyQueuedPool() throws Exception {
@@ -234,10 +254,12 @@ class WorkloadPressureControllerTest {
 
 		private final Object instance;
 		private final Class<?> type;
+		private final AtomicBoolean readDispatchable = new AtomicBoolean();
+		private final AtomicBoolean writeDispatchable = new AtomicBoolean();
 		private final Method setPressured;
 		private final Method setQueued;
-		private final Method setDispatchable;
 		private final Method isDispatchable;
+		private final Method dispatchabilityLost;
 		private final Method setCompeting;
 		private final Method setNotifier;
 		private final Method setBatchNotifier;
@@ -253,10 +275,17 @@ class WorkloadPressureControllerTest {
 			this.setPressured = accessible(type.getDeclaredMethod("setPressured", boolean.class));
 			this.setQueued = accessible(type.getDeclaredMethod(
 					"setBatchQueued", RWScheduler.Pool.class, boolean.class));
-			this.setDispatchable = accessible(type.getDeclaredMethod(
-					"setBatchDispatchable", RWScheduler.Pool.class, boolean.class));
+			var setDispatchabilitySources = accessible(type.getDeclaredMethod(
+					"setBatchDispatchabilitySources",
+					java.util.function.BooleanSupplier.class,
+					java.util.function.BooleanSupplier.class));
+			setDispatchabilitySources.invoke(instance,
+					(java.util.function.BooleanSupplier) readDispatchable::get,
+					(java.util.function.BooleanSupplier) writeDispatchable::get);
 			this.isDispatchable = accessible(type.getDeclaredMethod(
 					"isBatchDispatchable", RWScheduler.Pool.class));
+			this.dispatchabilityLost = accessible(type.getDeclaredMethod(
+					"batchDispatchabilityLost", RWScheduler.Pool.class));
 			this.setCompeting = accessible(type.getDeclaredMethod(
 					"setPoolCompetition", RWScheduler.Pool.class, boolean.class));
 			this.setNotifier = accessible(type.getDeclaredMethod("setNotifier", Runnable.class));
@@ -311,8 +340,12 @@ class WorkloadPressureControllerTest {
 			setQueued.invoke(instance, pool, queued);
 		}
 
-		void setDispatchable(RWScheduler.Pool pool, boolean dispatchable) throws ReflectiveOperationException {
-			setDispatchable.invoke(instance, pool, dispatchable);
+		void setDispatchable(RWScheduler.Pool pool, boolean dispatchable)
+				throws ReflectiveOperationException {
+			(pool == RWScheduler.Pool.READ ? readDispatchable : writeDispatchable).set(dispatchable);
+			if (!dispatchable) {
+				dispatchabilityLost.invoke(instance, pool);
+			}
 		}
 
 		boolean isDispatchable(RWScheduler.Pool pool) throws ReflectiveOperationException {

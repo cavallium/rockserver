@@ -146,6 +146,9 @@ public final class RWScheduler {
 				databaseName);
 		this.pools = List.of(readPool, writePool, controlPool, physicalPool);
 		this.noDeadlineExecutors = createNoDeadlineExecutors();
+		pressureController.setBatchDispatchabilitySources(
+				readPool::batchDispatchable,
+				writePool::batchDispatchable);
 		pressureController.setNotifier(this::signalAllPools);
 		pressureController.setBatchNotifier(this::signalBatchPools);
 		registerStoragePressureGauge(registry, databaseName);
@@ -483,8 +486,18 @@ public final class RWScheduler {
 		return false;
 	}
 
-	public void setStoragePressure(boolean pressured) {
-		pressureController.setPressured(pressured);
+	public synchronized void setStoragePressure(boolean pressured) {
+		if (pressured) {
+			// Enable publication and take each pool's lock-protected snapshot before pressure
+			// becomes observable. Subsequent pool transitions publish until pressure is cleared.
+			readPool.setBatchDispatchabilityTracking(true);
+			writePool.setBatchDispatchabilityTracking(true);
+			pressureController.setPressured(true);
+		} else {
+			pressureController.setPressured(false);
+			readPool.setBatchDispatchabilityTracking(false);
+			writePool.setBatchDispatchabilityTracking(false);
+		}
 	}
 
 	public boolean isStoragePressure() {

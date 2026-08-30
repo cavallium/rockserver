@@ -31,6 +31,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.ToDoubleFunction;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -117,7 +118,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	// Updated under the scheduler lock on empty/nonempty queue transitions and read by running quantums.
 	private volatile boolean localQueuedCompetition;
 	private boolean publishedPreemption;
-	private boolean publishedBatchDispatchable;
+	private boolean batchDispatchabilityTracking;
+	private volatile boolean publishedBatchDispatchable;
 	private int latencyBurst;
 	private int guaranteedCursor;
 	private boolean guaranteedNeedsQuantum = true;
@@ -1009,18 +1011,38 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void refreshPreemptionUnsafe() {
-		boolean batchDispatchable = !shutdown
-				&& queuedUnsafe(WorkloadProfile.BATCH) > 0
-				&& activeTotal < workerCount;
-		if (batchDispatchable != publishedBatchDispatchable) {
-			publishedBatchDispatchable = batchDispatchable;
-			pressureController.setBatchDispatchable(resourcePool, batchDispatchable);
+		if (batchDispatchabilityTracking) {
+			boolean batchDispatchable = !shutdown
+					&& queuedUnsafe(WorkloadProfile.BATCH) > 0
+					&& activeTotal < workerCount;
+			if (batchDispatchable != publishedBatchDispatchable) {
+				publishedBatchDispatchable = batchDispatchable;
+				if (!batchDispatchable && pressureController.pressureActive()) {
+					pressureController.batchDispatchabilityLost(resourcePool);
+				}
+			}
 		}
 		boolean requested = localQueuedCompetition
 				|| activeTotal > activeUnsafe(WorkloadProfile.BATCH);
 		if (requested != publishedPreemption) {
 			publishedPreemption = requested;
 			pressureController.setPoolPreemption(resourcePool, requested);
+		}
+	}
+
+	boolean batchDispatchable() {
+		return publishedBatchDispatchable;
+	}
+
+	void setBatchDispatchabilityTracking(boolean tracking) {
+		lock.lock();
+		try {
+			batchDispatchabilityTracking = tracking;
+			if (tracking) {
+				refreshPreemptionUnsafe();
+			}
+		} finally {
+			lock.unlock();
 		}
 	}
 
@@ -3697,7 +3719,7 @@ final class WorkloadPressureController {
 	private final int pressuredMaximumActiveBatches;
 	private final long competitionHoldNanos;
 	private final long batchIntervalNanos;
-	private boolean pressured;
+	private volatile boolean pressured;
 	private int activeBatches;
 	private int activeReadBatches;
 	private int activeWriteBatches;
@@ -3706,7 +3728,8 @@ final class WorkloadPressureController {
 	private int preemptionPoolMask;
 	private int competitionPoolMask;
 	private int queuedBatchPoolMask;
-	private int dispatchableBatchPoolMask;
+	private volatile BooleanSupplier readBatchDispatchable = () -> false;
+	private volatile BooleanSupplier writeBatchDispatchable = () -> false;
 	private int lastCompletedPressuredBatchPoolBit;
 	private int pressureGeneration;
 	private int competitionGeneration;
@@ -3755,6 +3778,18 @@ final class WorkloadPressureController {
 		this.batchNotifier = Objects.requireNonNull(batchNotifier, "batchNotifier");
 	}
 
+	void setBatchDispatchabilitySources(BooleanSupplier readBatchDispatchable,
+	                                   BooleanSupplier writeBatchDispatchable) {
+		this.readBatchDispatchable = Objects.requireNonNull(readBatchDispatchable,
+				"readBatchDispatchable");
+		this.writeBatchDispatchable = Objects.requireNonNull(writeBatchDispatchable,
+				"writeBatchDispatchable");
+	}
+
+	boolean pressureActive() {
+		return pressured;
+	}
+
 	boolean preemptionRequested() {
 		return preemptionRequested;
 	}
@@ -3795,27 +3830,23 @@ final class WorkloadPressureController {
 		}
 	}
 
-	synchronized void setBatchDispatchable(RWScheduler.Pool pool, boolean dispatchable) {
-		int bit = poolBit(resourcePool(pool));
-		boolean wasDispatchable = (dispatchableBatchPoolMask & bit) != 0;
-		if (wasDispatchable == dispatchable) return;
-		int previousMask = dispatchableBatchPoolMask;
-		dispatchableBatchPoolMask = dispatchable
-				? dispatchableBatchPoolMask | bit
-				: dispatchableBatchPoolMask & ~bit;
-		if (!dispatchable
-				&& pressured
-				&& lastCompletedPressuredBatchPoolBit != 0
-				&& bit != lastCompletedPressuredBatchPoolBit
-				&& (previousMask & lastCompletedPressuredBatchPoolBit) != 0) {
-			// The last pool may be asleep indefinitely waiting for this peer's turn.
-			// The caller owns an executor lock, so defer cross-pool signaling until unlock.
-			notificationPending = true;
+	void batchDispatchabilityLost(RWScheduler.Pool pool) {
+		if (!pressured) return;
+		synchronized (this) {
+			int bit = poolBit(resourcePool(pool));
+			if (pressured
+					&& lastCompletedPressuredBatchPoolBit != 0
+					&& bit != lastCompletedPressuredBatchPoolBit
+					&& batchDispatchable(lastCompletedPressuredBatchPoolBit)) {
+				// The last pool may be asleep indefinitely waiting for this peer's turn.
+				// The caller owns an executor lock, so defer cross-pool signaling until unlock.
+				notificationPending = true;
+			}
 		}
 	}
 
 	synchronized boolean isBatchDispatchable(RWScheduler.Pool pool) {
-		return (dispatchableBatchPoolMask & poolBit(resourcePool(pool))) != 0;
+		return batchDispatchable(resourcePool(pool));
 	}
 
 	synchronized boolean hasFairPressureTurn(RWScheduler.Pool pool) {
@@ -4064,7 +4095,19 @@ final class WorkloadPressureController {
 		int otherDataPoolBit = currentPoolBit == poolBit(RWScheduler.Pool.READ)
 				? poolBit(RWScheduler.Pool.WRITE)
 				: poolBit(RWScheduler.Pool.READ);
-		return (dispatchableBatchPoolMask & otherDataPoolBit) == 0;
+		return !batchDispatchable(otherDataPoolBit);
+	}
+
+	private boolean batchDispatchable(RWScheduler.Pool pool) {
+		return pool == RWScheduler.Pool.READ
+				? readBatchDispatchable.getAsBoolean()
+				: writeBatchDispatchable.getAsBoolean();
+	}
+
+	private boolean batchDispatchable(int poolBit) {
+		return poolBit == poolBit(RWScheduler.Pool.READ)
+				? readBatchDispatchable.getAsBoolean()
+				: writeBatchDispatchable.getAsBoolean();
 	}
 
 	private static boolean startedUnderPressure(long permit) {
