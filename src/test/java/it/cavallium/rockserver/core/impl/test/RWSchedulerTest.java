@@ -482,6 +482,46 @@ class RWSchedulerTest {
 	}
 
 	@Test
+	void pressuredFairTurnSkipsQueuedPeerUntilThatPoolHasAFreeWorker() throws Exception {
+		var scheduler = scheduler(1, "pressure-dispatchable-peer");
+		var writeForegroundStarted = new CountDownLatch(1);
+		var releaseWriteForeground = new CountDownLatch(1);
+		var readBatchStarts = new CountDownLatch(2);
+		var writeBatchStarted = new CountDownLatch(1);
+		try {
+			scheduler.setStoragePressure(true);
+			scheduler.executor(WorkloadProfile.INGEST,
+					OperationFamily.MUTATION,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				writeForegroundStarted.countDown();
+				awaitUninterruptibly(releaseWriteForeground);
+			});
+			assertTrue(writeForegroundStarted.await(5, SECONDS));
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.MUTATION,
+					RequestContext.NO_DEADLINE).execute(writeBatchStarted::countDown);
+
+			var readBatch = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE);
+			readBatch.execute(readBatchStarts::countDown);
+			readBatch.execute(readBatchStarts::countDown);
+
+			assertTrue(readBatchStarts.await(2_500L, TimeUnit.MILLISECONDS),
+					"READ must keep its pressure turn while queued WRITE has no available worker");
+			assertEquals(1L, writeBatchStarted.getCount());
+
+			releaseWriteForeground.countDown();
+			assertTrue(writeBatchStarted.await(2_500L, TimeUnit.MILLISECONDS),
+					"WRITE must receive a bounded turn as soon as it becomes dispatchable");
+		} finally {
+			releaseWriteForeground.countDown();
+			scheduler.setStoragePressure(false);
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void cancellationImmediatelyBeforeRunDoesNotConsumeAPressureInterval() throws Exception {
 		var scheduler = scheduler(1, "pressure-cancel-test");
 		var blockerStarted = new CountDownLatch(1);

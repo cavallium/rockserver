@@ -118,6 +118,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	// Updated under the scheduler lock on empty/nonempty queue transitions and read by running quantums.
 	private volatile boolean localQueuedCompetition;
 	private boolean publishedPreemption;
+	private boolean publishedBatchDispatchable;
 	private int latencyBurst;
 	private int guaranteedCursor;
 	private boolean guaranteedNeedsQuantum = true;
@@ -888,7 +889,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			pressureController.finishBatch(batchPermit, resourcePool);
 		}
 		TerminalAction terminalAction = null;
-		boolean notifyCompetitionChanged = false;
 		lock.lock();
 		try {
 			if (task.state() != TaskState.ACTIVE) {
@@ -924,14 +924,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			refreshPreemptionUnsafe();
 			signalWorkerUnsafe();
-			notifyCompetitionChanged = !task.hasProfile(WorkloadProfile.BATCH)
-					&& (task.state() == TaskState.PARKED || task.state() == TaskState.TERMINAL);
 		} finally {
 			lock.unlock();
 		}
-		if (notifyCompetitionChanged) {
-			pressureController.signalPendingAvailability();
-		}
+		pressureController.signalPendingAvailability();
 		return terminalAction;
 	}
 
@@ -962,6 +958,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} finally {
 			lock.unlock();
 		}
+		pressureController.signalPendingAvailability();
 	}
 
 	private boolean cancelCooperative(WorkloadTask task) {
@@ -1005,9 +1002,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		} finally {
 			lock.unlock();
 		}
-		if (terminalAction != null && !task.hasProfile(WorkloadProfile.BATCH)) {
-			pressureController.signalPendingAvailability();
-		}
+		pressureController.signalPendingAvailability();
 		if (terminalAction != null) {
 			completeTerminalAction(terminalAction);
 		}
@@ -1015,6 +1010,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void refreshPreemptionUnsafe() {
+		boolean batchDispatchable = !shutdown
+				&& queuedUnsafe(WorkloadProfile.BATCH) > 0
+				&& activeTotal < workerCount;
+		if (batchDispatchable != publishedBatchDispatchable) {
+			publishedBatchDispatchable = batchDispatchable;
+			pressureController.setBatchDispatchable(resourcePool, batchDispatchable);
+		}
 		boolean requested = localQueuedCompetition
 				|| activeTotal > activeUnsafe(WorkloadProfile.BATCH);
 		if (requested != publishedPreemption) {
@@ -2232,6 +2234,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		lock.lock();
 		try {
 			shutdown = true;
+			refreshPreemptionUnsafe();
 			rejectDeferredUnsafe(new RejectedExecutionException(poolName + " is shutting down"),
 					RWScheduler.TerminalOutcome.SHUTDOWN,
 					terminalActions);
@@ -3697,6 +3700,7 @@ final class WorkloadPressureController {
 	private int preemptionPoolMask;
 	private int competitionPoolMask;
 	private int queuedBatchPoolMask;
+	private int dispatchableBatchPoolMask;
 	private int lastCompletedPressuredBatchPoolBit;
 	private int pressureGeneration;
 	private int competitionGeneration;
@@ -3781,6 +3785,25 @@ final class WorkloadPressureController {
 		if (releasedFairnessWait) {
 			// Queue transitions happen under an executor lock. Defer the cross-pool
 			// wakeup until that executor calls signalPendingAvailability after unlock.
+			notificationPending = true;
+		}
+	}
+
+	synchronized void setBatchDispatchable(RWScheduler.Pool pool, boolean dispatchable) {
+		int bit = poolBit(resourcePool(pool));
+		boolean wasDispatchable = (dispatchableBatchPoolMask & bit) != 0;
+		if (wasDispatchable == dispatchable) return;
+		int previousMask = dispatchableBatchPoolMask;
+		dispatchableBatchPoolMask = dispatchable
+				? dispatchableBatchPoolMask | bit
+				: dispatchableBatchPoolMask & ~bit;
+		if (!dispatchable
+				&& pressured
+				&& lastCompletedPressuredBatchPoolBit != 0
+				&& bit != lastCompletedPressuredBatchPoolBit
+				&& (previousMask & lastCompletedPressuredBatchPoolBit) != 0) {
+			// The last pool may be asleep indefinitely waiting for this peer's turn.
+			// The caller owns an executor lock, so defer cross-pool signaling until unlock.
 			notificationPending = true;
 		}
 	}
@@ -4027,7 +4050,7 @@ final class WorkloadPressureController {
 		int otherDataPoolBit = currentPoolBit == poolBit(RWScheduler.Pool.READ)
 				? poolBit(RWScheduler.Pool.WRITE)
 				: poolBit(RWScheduler.Pool.READ);
-		return (queuedBatchPoolMask & otherDataPoolBit) == 0;
+		return (dispatchableBatchPoolMask & otherDataPoolBit) == 0;
 	}
 
 	private static boolean startedUnderPressure(long permit) {
