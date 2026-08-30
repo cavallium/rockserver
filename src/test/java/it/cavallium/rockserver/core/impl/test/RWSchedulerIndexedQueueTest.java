@@ -134,7 +134,8 @@ class RWSchedulerIndexedQueueTest {
 			});
 			assertTrue(blockerStarted.await(5, SECONDS));
 			view.schedule(expired);
-			while (System.currentTimeMillis() < deadline) Thread.onSpinWait();
+			// Cross the millisecond wall-to-monotonic binding quantization window.
+			while (System.currentTimeMillis() < deadline + 2L) Thread.onSpinWait();
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
 					RequestContext.NO_DEADLINE).execute(() -> {});

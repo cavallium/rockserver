@@ -12,7 +12,11 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
@@ -129,6 +133,144 @@ class SchedulerWallClockDiscontinuityTest {
 			assertEquals(0L, earlierEpochLaterExpiry.order,
 					"EDF must use the absolute epoch even when that task has the later local expiry");
 			assertEquals(1L, laterEpochEarlierExpiry.order);
+		} finally {
+			release.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void alignedEpochBindingsUseOnlyTheEdfHeapAndResetWhenDrained() throws Exception {
+		var clock = new MutableClock(1_000L, 0L);
+		var scheduler = scheduler(clock, "deadline-aligned-single-index");
+		var release = occupyReadWorker(scheduler);
+		var first = new TerminalProbe();
+		var second = new TerminalProbe();
+		try {
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					2_000L).execute(first);
+			clock.advanceNanos(MILLISECONDS.toNanos(10L));
+			clock.jumpWallMillis(10L);
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					3_000L).execute(second);
+
+			assertTrue(readPoolBoolean(scheduler, "latencyBindingPresent"));
+			assertFalse(readPoolBoolean(scheduler, "latencyExpiryIndexed"));
+			assertEquals(0, readPoolDeadlineHeapSize(scheduler),
+					"aligned LATENCY work must not enter the secondary expiry heap");
+			assertEquals(List.of("deadlineEpochMillis", "latencyHeapIndex"),
+					queuedLatencyTaskFields(scheduler),
+					"ordinary LATENCY task shape must stay at the single-heap baseline");
+
+			release.countDown();
+			assertTrue(first.ranSignal.await(5, SECONDS));
+			assertTrue(second.ranSignal.await(5, SECONDS));
+			assertTrue(awaitCondition(() -> {
+				try {
+					return !readPoolBoolean(scheduler, "latencyBindingPresent")
+							&& !readPoolBoolean(scheduler, "latencyExpiryIndexed");
+				} catch (ReflectiveOperationException failure) {
+					throw new AssertionError(failure);
+				}
+			}, 5_000L));
+		} finally {
+			release.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void equalEpochAcrossClockGenerationsKeepsFifoAndAdaptiveIndexResets() throws Exception {
+		var clock = new MutableClock(1_000L, 0L);
+		var scheduler = scheduler(clock, "deadline-equal-epoch-adaptive");
+		var release = occupyReadWorker(scheduler);
+		var nextOrder = new AtomicLong();
+		var first = new OrderedProbe(nextOrder);
+		var second = new OrderedProbe(nextOrder);
+		try {
+			long commonEpochDeadline = 20_000L;
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					commonEpochDeadline).execute(first);
+			clock.advanceNanos(MILLISECONDS.toNanos(100L));
+			clock.jumpWallMillis(-10_000L);
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					commonEpochDeadline).execute(second);
+
+			assertTrue(readPoolBoolean(scheduler, "latencyExpiryIndexed"));
+			assertEquals(2, readPoolDeadlineHeapSize(scheduler));
+			release.countDown();
+
+			assertTrue(first.ranSignal.await(5, SECONDS));
+			assertTrue(second.ranSignal.await(5, SECONDS));
+			assertEquals(0L, first.order,
+					"equal absolute epochs must remain FIFO even when local expiry generations differ");
+			assertEquals(1L, second.order);
+			assertTrue(awaitCondition(() -> {
+				try {
+					return !readPoolBoolean(scheduler, "latencyBindingPresent")
+							&& !readPoolBoolean(scheduler, "latencyExpiryIndexed")
+							&& readPoolDeadlineHeapSize(scheduler) == 0;
+				} catch (ReflectiveOperationException failure) {
+					throw new AssertionError(failure);
+				}
+			}, 5_000L));
+		} finally {
+			release.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void adaptiveExpiryIndexSurvivesHeapMovementAndIndexedCancellation() throws Exception {
+		var clock = new MutableClock(1_000_000L, 0L);
+		var scheduler = scheduler(clock, "deadline-adaptive-index-stress", 128, 8);
+		var release = occupyReadWorker(scheduler);
+		var probes = new ArrayList<TerminalProbe>();
+		var disposables = new ArrayList<reactor.core.Disposable>();
+		try {
+			for (int index = 0; index < 96; index++) {
+				var probe = new TerminalProbe();
+				probes.add(probe);
+				long deadline = 2_000_000L + (index * 17L) % 101L;
+				disposables.add(scheduler.scheduler(WorkloadProfile.LATENCY,
+						OperationFamily.POINT_LOOKUP,
+						deadline).schedule(probe));
+				clock.advanceNanos(MILLISECONDS.toNanos(1L));
+				clock.jumpWallMillis((index & 1) == 0 ? 10_000L : -10_000L);
+			}
+			assertTrue(readPoolBoolean(scheduler, "latencyExpiryIndexed"));
+			assertEquals(96, readPoolDeadlineHeapSize(scheduler));
+			for (int index = 0; index < disposables.size(); index += 3) {
+				disposables.get(index).dispose();
+			}
+			assertTrue(awaitCondition(() -> {
+				try {
+					return readPoolDeadlineHeapSize(scheduler) == 64;
+				} catch (ReflectiveOperationException failure) {
+					throw new AssertionError(failure);
+				}
+			}, 5_000L));
+
+			release.countDown();
+			for (int index = 0; index < probes.size(); index++) {
+				if (index % 3 == 0) {
+					assertFalse(probes.get(index).ranSignal.await(10, MILLISECONDS));
+				} else {
+					assertTrue(probes.get(index).ranSignal.await(5, SECONDS));
+				}
+			}
+			assertTrue(awaitCondition(() -> {
+				try {
+					return !readPoolBoolean(scheduler, "latencyExpiryIndexed")
+							&& readPoolDeadlineHeapSize(scheduler) == 0;
+				} catch (ReflectiveOperationException failure) {
+					throw new AssertionError(failure);
+				}
+			}, 5_000L));
 		} finally {
 			release.countDown();
 			scheduler.disposeNow();
@@ -323,6 +465,52 @@ class SchedulerWallClockDiscontinuityTest {
 		var deadline = assertInstanceOf(RocksDBException.class, failure);
 		assertTrue(deadline.getErrorUniqueId()
 				== RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED);
+	}
+
+	private static boolean readPoolBoolean(RWScheduler scheduler, String fieldName)
+			throws ReflectiveOperationException {
+		Object readPool = readPool(scheduler);
+		Field field = readPool.getClass().getDeclaredField(fieldName);
+		field.setAccessible(true);
+		return field.getBoolean(readPool);
+	}
+
+	private static int readPoolDeadlineHeapSize(RWScheduler scheduler) throws ReflectiveOperationException {
+		Object readPool = readPool(scheduler);
+		Field queueField = readPool.getClass().getDeclaredField("deadlineQueue");
+		queueField.setAccessible(true);
+		Object queue = queueField.get(readPool);
+		Field size = queue.getClass().getDeclaredField("size");
+		size.setAccessible(true);
+		return size.getInt(queue);
+	}
+
+	private static List<String> queuedLatencyTaskFields(RWScheduler scheduler)
+			throws ReflectiveOperationException {
+		Object readPool = readPool(scheduler);
+		Field queueField = readPool.getClass().getDeclaredField("latencyQueue");
+		queueField.setAccessible(true);
+		Object queue = queueField.get(readPool);
+		Field elementsField = queue.getClass().getDeclaredField("elements");
+		elementsField.setAccessible(true);
+		Object[] elements = (Object[]) elementsField.get(queue);
+		Object task = Arrays.stream(elements).filter(java.util.Objects::nonNull).findFirst().orElseThrow();
+		return Arrays.stream(task.getClass().getDeclaredFields()).map(Field::getName).sorted().toList();
+	}
+
+	private static Object readPool(RWScheduler scheduler) throws ReflectiveOperationException {
+		Field field = RWScheduler.class.getDeclaredField("readPool");
+		field.setAccessible(true);
+		return field.get(scheduler);
+	}
+
+	private static boolean awaitCondition(java.util.function.BooleanSupplier condition, long timeoutMillis)
+			throws InterruptedException {
+		long deadline = System.nanoTime() + MILLISECONDS.toNanos(timeoutMillis);
+		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+			Thread.sleep(5L);
+		}
+		return condition.getAsBoolean();
 	}
 
 	private static void awaitUninterruptibly(CountDownLatch latch) {
