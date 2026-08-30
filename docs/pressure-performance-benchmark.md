@@ -62,6 +62,11 @@ backfill and ingest throughput, maximum zero-progress gap, CDC lag, LATENCY p99,
 queue/parked/outstanding peaks, heap/direct/RSS/thread/handle peaks, final drain, clean shutdown, and
 native leaks. A bounded smoke run is part of Maven; a representative run is opt-in:
 
+The driver precomputes and reuses the entire immutable key space and value payload, so measured
+allocation is not dominated by key construction. Allocations intentionally left in the contract are
+the real API/scheduler task wrappers, raw-scan event and wire-batch objects, CDC event/page objects,
+and RocksDB/JNI result ownership needed by the production paths.
+
 ```bash
 java -cp "${workload_classpath}" \
   it.cavallium.rockserver.core.impl.benchmark.MixedBackfillPressureBenchmark \

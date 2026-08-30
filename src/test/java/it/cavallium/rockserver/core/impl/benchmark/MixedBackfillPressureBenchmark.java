@@ -8,6 +8,7 @@ import it.cavallium.rockserver.core.common.RawScanEvent;
 import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
@@ -68,6 +69,7 @@ public final class MixedBackfillPressureBenchmark {
 		Path config = root.resolve("rockserver.conf");
 		Files.writeString(config, configText(options), StandardOpenOption.CREATE_NEW);
 		Path database = root.resolve("db");
+		Keys[] keySpace = keys(options.preloadKeys());
 		Set<RawSstToken> checkpoints = Collections.synchronizedSet(new HashSet<>());
 		long leaksBefore = RocksLeakDetector.detectedLeakCount();
 		long columnId;
@@ -77,7 +79,7 @@ public final class MixedBackfillPressureBenchmark {
 			var batch = connection.getSyncApi(RequestContext.batch());
 			columnId = batch.createColumn(COLUMN,
 					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
-			preload(batch, columnId, options);
+			preload(batch, columnId, options, keySpace);
 			var cancelled = cancelAfterFirstCheckpoint(connection, columnId, checkpoints, root.resolve("checkpoint.txt"));
 			firstRows = cancelled.rows();
 			resumedRows = consumeScan(batch.scanRawResumable(columnId, 0, 1, Set.copyOf(checkpoints)),
@@ -101,7 +103,8 @@ public final class MixedBackfillPressureBenchmark {
 					new HashSet<>(), null, null);
 			if (skippedRows != 0L) throw new IllegalStateException("reopen did not skip completed SSTs: " + skippedRows);
 			batch.cdcCreate(CDC, null, List.of(reopenedColumn), false);
-			result = measure(reopened, reopenedColumn, options, firstRows, resumedRows, checkpoints.size());
+			result = measure(reopened, reopenedColumn, options, keySpace,
+					firstRows, resumedRows, checkpoints.size());
 			awaitDrain(reopened);
 		}
 		long leaks = awaitLeaks(leaksBefore);
@@ -112,6 +115,7 @@ public final class MixedBackfillPressureBenchmark {
 	private static Result measure(EmbeddedConnection connection,
 			long columnId,
 			Options options,
+			Keys[] keySpace,
 			long firstRows,
 			long resumedRows,
 			int checkpoints) throws Exception {
@@ -158,7 +162,7 @@ public final class MixedBackfillPressureBenchmark {
 					long sequence = lane;
 					Buf value = Buf.wrap(value(options.valueBytes()));
 					while (!stop.get()) {
-						api.put(0L, columnId, key(Math.floorMod(sequence, options.preloadKeys())), value,
+						api.put(0L, columnId, keySpace[Math.floorMod((int) sequence, keySpace.length)], value,
 								RequestType.none());
 						ingestWrites.increment(); sequence += options.writers();
 					}
@@ -168,11 +172,12 @@ public final class MixedBackfillPressureBenchmark {
 				int lane = reader;
 				futures.add(submit(executor, failures, () -> {
 					ready.countDown(); await(start);
-					var api = connection.getSyncApi(RequestContext.latency(Duration.ofSeconds(5)));
+					var api = connection.getSyncApi(new RequestContext(WorkloadProfile.LATENCY,
+							latencyDeadlineEpochMillis(System.currentTimeMillis(), options.measureDuration())));
 					long sequence = lane;
 					while (!stop.get()) {
 						long before = System.nanoTime();
-						api.get(0L, columnId, key(Math.floorMod(sequence, options.preloadKeys())),
+						api.get(0L, columnId, keySpace[Math.floorMod((int) sequence, keySpace.length)],
 								RequestType.current());
 						latencies.record(System.nanoTime() - before); latencyReads.increment();
 						sequence += options.latencyReaders();
@@ -344,17 +349,24 @@ public final class MixedBackfillPressureBenchmark {
 
 	private static void preload(it.cavallium.rockserver.core.common.RocksDBSyncAPI api,
 			long columnId,
-			Options options) {
+			Options options,
+			Keys[] keySpace) {
 		Buf value = Buf.wrap(value(options.valueBytes()));
 		for (int index = 0; index < options.preloadKeys(); index++) {
-			api.put(0L, columnId, key(index), value, RequestType.none());
+			api.put(0L, columnId, keySpace[index], value, RequestType.none());
 			if ((index + 1) % options.flushEvery() == 0) api.flush();
 		}
 		api.flush();
 	}
 
-	private static Keys key(long value) {
-		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(value).array()));
+	private static Keys[] keys(int count) {
+		Keys[] keys = new Keys[count];
+		for (int index = 0; index < count; index++) {
+			byte[] bytes = new byte[Long.BYTES];
+			ByteBuffer.wrap(bytes).putLong(index);
+			keys[index] = new Keys(Buf.wrap(bytes));
+		}
+		return keys;
 	}
 
 	private static byte[] value(int bytes) {
@@ -374,15 +386,12 @@ public final class MixedBackfillPressureBenchmark {
 		throw new IllegalStateException("mixed benchmark scheduler did not drain");
 	}
 
-	private static long awaitLeaks(long before) {
-		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-		long leaks;
-		do {
-			leaks = RocksLeakDetector.detectedLeakCount() - before;
-			if (leaks == 0L) return 0L;
-			System.gc(); LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
-		} while (System.nanoTime() < deadline);
-		return leaks;
+	private static long awaitLeaks(long before) throws InterruptedException {
+		for (int attempt = 0; attempt < 3; attempt++) {
+			System.gc();
+			Thread.sleep(100L);
+		}
+		return Math.max(0L, RocksLeakDetector.detectedLeakCount() - before);
 	}
 
 	private static Path rootResult(Path root) { return root.resolve("mixed-results.properties"); }
@@ -404,6 +413,15 @@ public final class MixedBackfillPressureBenchmark {
 				database.parallelism.workload.raw-scan-file-concurrency = %d
 				database.parallelism.workload.pressured-batch-interval = PT0.05S
 				""".formatted(options.readWorkers(), options.writeWorkers(), options.rawScanConcurrency());
+	}
+
+	static long latencyDeadlineEpochMillis(long nowEpochMillis, Duration measurement) {
+		try {
+			long budget = Math.addExact(measurement.toMillis(), TimeUnit.SECONDS.toMillis(30));
+			return Math.addExact(nowEpochMillis, budget);
+		} catch (ArithmeticException overflow) {
+			return Long.MAX_VALUE;
+		}
 	}
 
 	@FunctionalInterface private interface ThrowingRunnable { void run() throws Exception; }
