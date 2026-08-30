@@ -28,6 +28,12 @@ class PressurePerformancePairedBenchmarkTest {
 		assertTrue(schedule.contains("5\t2\tscheduler\tcandidate"));
 		assertTrue(schedule.contains("6\t2\tscheduler\tbaseline"));
 		assertThrows(IllegalArgumentException.class, () -> prepare(root, false));
+		Path duplicateCounts = temporary.resolve("duplicate-counts");
+		assertThrows(IllegalArgumentException.class, () -> PressurePerformancePairedBenchmark.main(new String[] {
+				"--mode=prepare", "--root=" + duplicateCounts,
+				"--baseline-sha=" + "a".repeat(40), "--candidate-sha=" + "b".repeat(40),
+				"--signal-cf-counts=1,64,64"
+		}));
 	}
 
 	@Test

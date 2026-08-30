@@ -156,8 +156,9 @@ public final class PressurePerformancePairedBenchmark {
 			if (!artifact.configurationSha256().equals(prepared.configurationSha256())) {
 				failures.add("configuration mismatch at ordinal " + run.ordinal());
 			}
-			if (prepared.enforce() && (!artifact.enforcedHardwareRun() || !artifact.correctnessPassed())) {
-				failures.add("unenforced or incorrect worker at ordinal " + run.ordinal());
+			if (!artifact.correctnessPassed()) failures.add("worker correctness failed at ordinal " + run.ordinal());
+			if (prepared.enforce() && !artifact.enforcedHardwareRun()) {
+				failures.add("unenforced worker at ordinal " + run.ordinal());
 			}
 			workersEnforced &= artifact.enforcedHardwareRun() && artifact.correctnessPassed();
 			if (!processIds.add(artifact.processId())) failures.add("process id reused at ordinal " + run.ordinal());
@@ -526,6 +527,12 @@ public final class PressurePerformancePairedBenchmark {
 		Prepared {
 			root = root.toAbsolutePath().normalize();
 			signalColumnFamilyCounts = signalColumnFamilyCounts.clone();
+			for (int index = 0; index < signalColumnFamilyCounts.length; index++) {
+				if (signalColumnFamilyCounts[index] < 1
+						|| index > 0 && signalColumnFamilyCounts[index] <= signalColumnFamilyCounts[index - 1]) {
+					throw new IllegalArgumentException("signal CF counts must be positive, unique, and increasing");
+				}
+			}
 			if (!baselineSha.matches("[0-9a-f]{40}") || !candidateSha.matches("[0-9a-f]{40}")
 					|| baselineSha.equals(candidateSha)) throw new IllegalArgumentException("distinct full Git SHAs required");
 			if (hostState.isBlank() || hardwareDescription.isBlank()
