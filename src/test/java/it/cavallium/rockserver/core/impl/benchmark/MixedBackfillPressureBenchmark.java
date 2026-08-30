@@ -406,14 +406,16 @@ public final class MixedBackfillPressureBenchmark {
 		try { latch.await(); } catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new IllegalStateException(failure); }
 	}
 
-	private static String configText(Options options) {
+	static String configText(Options options) {
 		return """
 				database.global.disable-auto-compactions = true
 				database.parallelism.read = %d
 				database.parallelism.write = %d
 				database.parallelism.workload.raw-scan-file-concurrency = %d
+				database.parallelism.workload.pressured-batch-maximum-active = %d
 				database.parallelism.workload.pressured-batch-interval = PT0.05S
-				""".formatted(options.readWorkers(), options.writeWorkers(), options.rawScanConcurrency());
+				""".formatted(options.readWorkers(), options.writeWorkers(), options.rawScanConcurrency(),
+				options.pressuredBatchMaximumActive());
 	}
 
 	static long latencyDeadlineEpochMillis(long nowEpochMillis, Duration measurement) {
@@ -450,6 +452,7 @@ public final class MixedBackfillPressureBenchmark {
 			int readWorkers,
 			int writeWorkers,
 			int rawScanConcurrency,
+			int pressuredBatchMaximumActive,
 			long cdcBatchSize,
 			Duration pressurePeriod,
 			Duration maximumZeroProgressGap,
@@ -463,7 +466,10 @@ public final class MixedBackfillPressureBenchmark {
 			if (root == null || preloadKeys < 1 || valueBytes < 1 || flushEvery < 1 || flushEvery > preloadKeys
 					|| measureDuration == null || measureDuration.isZero() || measureDuration.isNegative()
 					|| writers < 1 || latencyReaders < 1 || readWorkers < 3 || writeWorkers < 3
-					|| rawScanConcurrency < 1 || rawScanConcurrency > 64 || cdcBatchSize < 1
+					|| rawScanConcurrency < 1 || rawScanConcurrency > 64
+					|| pressuredBatchMaximumActive < 1
+					|| pressuredBatchMaximumActive > (long) readWorkers + writeWorkers
+					|| cdcBatchSize < 1
 					|| pressurePeriod == null || pressurePeriod.isZero() || pressurePeriod.isNegative()
 					|| maximumZeroProgressGap == null || maximumZeroProgressGap.isZero() || maximumZeroProgressGap.isNegative()
 					|| maximumCdcLag < 1 || maximumLatencyP99 == null || maximumLatencyP99.isZero()
@@ -483,21 +489,25 @@ public final class MixedBackfillPressureBenchmark {
 			}
 			Set<String> allowed = Set.of("root", "preload-keys", "value-bytes", "flush-every", "measure-ms",
 					"writers", "latency-readers", "read-workers", "write-workers", "raw-scan-concurrency",
+					"pressured-batch-maximum-active",
 					"cdc-batch-size", "pressure-period-ms", "maximum-zero-gap-ms", "maximum-cdc-lag",
 					"maximum-latency-p99-ms", "maximum-latency-samples", "minimum-backfill-rows-per-second",
 					"minimum-ingest-writes-per-second");
 			for (String key : values.keySet()) if (!allowed.contains(key)) throw new IllegalArgumentException("Unknown option --" + key);
 			String root = values.get("root"); if (root == null) throw new IllegalArgumentException("--root is required");
-			return new Options(Path.of(root), integer(values, "preload-keys", 50_000), integer(values, "value-bytes", 256),
+			var options = new Options(Path.of(root), integer(values, "preload-keys", 50_000), integer(values, "value-bytes", 256),
 					integer(values, "flush-every", 5_000), Duration.ofMillis(longValue(values, "measure-ms", 10_000)),
 					integer(values, "writers", 2), integer(values, "latency-readers", 2), integer(values, "read-workers", 8),
 					integer(values, "write-workers", 8), integer(values, "raw-scan-concurrency", 4),
+					integer(values, "pressured-batch-maximum-active", 1),
 					longValue(values, "cdc-batch-size", 8_192), Duration.ofMillis(longValue(values, "pressure-period-ms", 100)),
 					Duration.ofMillis(longValue(values, "maximum-zero-gap-ms", 2_000)),
 					longValue(values, "maximum-cdc-lag", 100_000), Duration.ofMillis(longValue(values, "maximum-latency-p99-ms", 5_000)),
 					integer(values, "maximum-latency-samples", 100_000),
 					doubleValue(values, "minimum-backfill-rows-per-second", 100.0d),
 					doubleValue(values, "minimum-ingest-writes-per-second", 100.0d));
+			options.validate();
+			return options;
 		}
 		private static int integer(Map<String, String> values, String key, int fallback) { return Integer.parseInt(values.getOrDefault(key, Integer.toString(fallback))); }
 		private static long longValue(Map<String, String> values, String key, long fallback) { return Long.parseLong(values.getOrDefault(key, Long.toString(fallback))); }

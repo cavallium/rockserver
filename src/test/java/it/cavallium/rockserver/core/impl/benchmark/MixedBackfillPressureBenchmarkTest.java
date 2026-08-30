@@ -22,7 +22,7 @@ class MixedBackfillPressureBenchmarkTest {
 	void realRocksDbSmokeCancelsResumesReopensAndRunsEveryMixedLane() throws Exception {
 		Path root = temporary.resolve("mixed");
 		var options = new MixedBackfillPressureBenchmark.Options(root,
-				512, 64, 128, Duration.ofSeconds(1), 1, 1, 4, 4, 2, 128,
+				512, 64, 128, Duration.ofSeconds(1), 1, 1, 4, 4, 2, 2, 128,
 				Duration.ofMillis(50), Duration.ofSeconds(3), 20_000,
 				Duration.ofSeconds(5), 10_000, 1.0d, 1.0d);
 
@@ -40,13 +40,40 @@ class MixedBackfillPressureBenchmarkTest {
 	}
 
 	@Test
-	void invalidOrUnknownOptionsFailBeforeCreatingRoot() {
+	void parserDefaultsToOneAndAcceptsOnlySafeExplicitPressuredCaps() {
 		Path root = temporary.resolve("invalid");
-		assertEquals(8_192L, MixedBackfillPressureBenchmark.Options.parse(
-				new String[] {"--root=" + root}).cdcBatchSize());
+		var defaults = MixedBackfillPressureBenchmark.Options.parse(new String[] {"--root=" + root});
+		assertEquals(8_192L, defaults.cdcBatchSize());
+		assertEquals(1, defaults.pressuredBatchMaximumActive(),
+				"omitting the option must preserve the historical single-permit behavior");
+		var explicit = MixedBackfillPressureBenchmark.Options.parse(new String[] {"--root=" + root,
+				"--read-workers=3", "--write-workers=3", "--pressured-batch-maximum-active=6"});
+		assertEquals(6, explicit.pressuredBatchMaximumActive(),
+				"the combined data-pool capacity is the inclusive safe upper bound");
 		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.Options.parse(
 				new String[] {"--root=" + root, "--unknown=true"}));
+		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.Options.parse(
+				new String[] {"--root=" + root, "--pressured-batch-maximum-active=0"}));
+		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.Options.parse(
+				new String[] {"--root=" + root, "--pressured-batch-maximum-active=-1"}));
+		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.Options.parse(
+				new String[] {"--root=" + root, "--read-workers=3", "--write-workers=3",
+						"--pressured-batch-maximum-active=7"}));
+		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.Options.parse(
+				new String[] {"--root=" + root, "--pressured-batch-maximum-active=2",
+						"--pressured-batch-maximum-active=3"}));
 		assertTrue(Files.notExists(root));
+	}
+
+	@Test
+	void generatedConfigRecordsTheExactPressuredBatchCapOnce() {
+		var options = MixedBackfillPressureBenchmark.Options.parse(new String[] {
+				"--root=" + temporary.resolve("config"), "--pressured-batch-maximum-active=3"});
+		String config = MixedBackfillPressureBenchmark.configText(options);
+		assertEquals(1L, config.lines()
+				.filter(line -> line.startsWith("database.parallelism.workload.pressured-batch-maximum-active"))
+				.count());
+		assertTrue(config.contains("database.parallelism.workload.pressured-batch-maximum-active = 3"));
 	}
 
 	@Test
