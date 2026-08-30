@@ -70,7 +70,8 @@ public final class FiniteDeadlineContentionBenchmark {
 	public static void main(String[] args) throws Exception {
 		Map<String, String> arguments = arguments(args);
 		switch (Mode.parse(arguments.getOrDefault("mode", "evaluate"))) {
-			case PREPARE -> prepare(Prepared.fromArguments(arguments));
+			case PREPARE -> prepare(Prepared.fromArguments(
+					FiniteDeadlineContentionPrecisionPlanner.expandPlannedPrepare(arguments)));
 			case EXECUTE -> execute(requiredRoot(arguments, Set.of("mode", "root")));
 			case WORKER -> worker(arguments);
 			case EVALUATE -> evaluate(requiredRoot(arguments, Set.of("mode", "root")));
@@ -164,7 +165,8 @@ public final class FiniteDeadlineContentionBenchmark {
 	static Result evaluate(Path root) throws IOException {
 		Prepared prepared = Prepared.read(root);
 		Result result = inspect(prepared);
-		Files.writeString(root.resolve(RESULTS_JSON), resultJson(prepared, result),
+		Instant evaluatedAt = Instant.now();
+		Files.writeString(root.resolve(RESULTS_JSON), resultJson(prepared, result, evaluatedAt),
 				StandardOpenOption.CREATE_NEW);
 		Files.writeString(root.resolve(RESULTS_MARKDOWN), resultMarkdown(prepared, result),
 				StandardOpenOption.CREATE_NEW);
@@ -333,10 +335,10 @@ public final class FiniteDeadlineContentionBenchmark {
 		}
 	}
 
-	private static String resultJson(Prepared prepared, Result result) {
+	static String resultJson(Prepared prepared, Result result, Instant evaluatedAt) {
 		var out = new StringBuilder("{\n")
 				.append("  \"schema\": \"").append(RESULT_SCHEMA).append("\",\n")
-				.append("  \"evaluated_at\": \"").append(Instant.now()).append("\",\n")
+				.append("  \"evaluated_at\": \"").append(evaluatedAt).append("\",\n")
 				.append("  \"baseline_sha\": \"").append(prepared.baselineSha()).append("\",\n")
 				.append("  \"candidate_sha\": \"").append(prepared.candidateSha()).append("\",\n")
 				.append("  \"configuration_sha256\": \"").append(prepared.configurationSha256()).append("\",\n")
@@ -348,13 +350,13 @@ public final class FiniteDeadlineContentionBenchmark {
 				.append("  \"throughput_minimum_ratio\": ").append(PairedPerformanceContractV2.THROUGHPUT_MINIMUM_RATIO).append(",\n")
 				.append("  \"cost_maximum_ratio\": ").append(PairedPerformanceContractV2.COST_MAXIMUM_RATIO).append(",\n")
 				.append("  \"multiplicity\": \"holm-bonferroni\",\n")
-				.append("  \"runtime_sha256\": \"").append(nullToEmpty(result.runtimeSha256())).append("\",\n")
-				.append("  \"host_sha256\": \"").append(nullToEmpty(result.hostSha256())).append("\",\n")
-				.append("  \"harness_sha256\": \"").append(nullToEmpty(result.harnessSha256())).append("\",\n")
+				.append("  \"runtime_sha256\": ").append(jsonStringOrNull(result.runtimeSha256())).append(",\n")
+				.append("  \"host_sha256\": ").append(jsonStringOrNull(result.hostSha256())).append(",\n")
+				.append("  \"harness_sha256\": ").append(jsonStringOrNull(result.harnessSha256())).append(",\n")
 				.append("  \"baseline_production_sha256\": \"").append(prepared.baselineProductionSha256()).append("\",\n")
 				.append("  \"candidate_production_sha256\": \"").append(prepared.candidateProductionSha256()).append("\",\n")
-				.append("  \"baseline_classpath_sha256\": \"").append(nullToEmpty(result.baselineClassPathSha256())).append("\",\n")
-				.append("  \"candidate_classpath_sha256\": \"").append(nullToEmpty(result.candidateClassPathSha256())).append("\",\n")
+				.append("  \"baseline_classpath_sha256\": ").append(jsonStringOrNull(result.baselineClassPathSha256())).append(",\n")
+				.append("  \"candidate_classpath_sha256\": ").append(jsonStringOrNull(result.candidateClassPathSha256())).append(",\n")
 				.append("  \"decision\": \"").append(result.evaluation().decision().name().toLowerCase(Locale.ROOT)).append("\",\n")
 				.append("  \"failures\": ").append(jsonArray(result.evaluation().failures())).append(",\n")
 				.append("  \"inconclusive_metrics\": ").append(jsonArray(result.evaluation().inconclusiveMetrics())).append(",\n")
@@ -385,7 +387,7 @@ public final class FiniteDeadlineContentionBenchmark {
 		return out.append("  }\n}\n").toString();
 	}
 
-	private static String resultMarkdown(Prepared prepared, Result result) {
+	static String resultMarkdown(Prepared prepared, Result result) {
 		var out = new StringBuilder("# Finite-deadline contention comparison\n\n")
 				.append("- Decision: **").append(result.evaluation().decision()).append("**\n")
 				.append("- Baseline: `").append(prepared.baselineSha()).append("`\n")
@@ -603,6 +605,11 @@ public final class FiniteDeadlineContentionBenchmark {
 		return Boolean.parseBoolean(value);
 	}
 
+	private static boolean argumentBoolean(Map<String, String> values, String key, boolean fallback) {
+		if (!values.containsKey(key)) return fallback;
+		return booleanValue(values, key);
+	}
+
 	private static Map<String, String> exactProperties(Path path, Set<String> expected) throws IOException {
 		if (!Files.isRegularFile(path)) throw new IllegalArgumentException("Missing file " + path);
 		var values = new LinkedHashMap<String, String>();
@@ -643,7 +650,7 @@ public final class FiniteDeadlineContentionBenchmark {
 
 	private static String jsonNumber(double value) { return Double.isFinite(value) ? Double.toString(value) : "null"; }
 	private static String json(String value) { return value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n"); }
-	private static String nullToEmpty(String value) { return value == null ? "" : value; }
+	private static String jsonStringOrNull(String value) { return value == null ? "null" : "\"" + json(value) + "\""; }
 	private static String format(double value) { return Double.isFinite(value) ? String.format(Locale.ROOT, "%.6f", value) : "n/a"; }
 
 	enum Mode { PREPARE, EXECUTE, WORKER, EVALUATE;
@@ -731,7 +738,7 @@ public final class FiniteDeadlineContentionBenchmark {
 					Path.of(require(arguments, "candidate-worktree")),
 					baselineClasses, candidateClasses, contentSha(baselineClasses), contentSha(candidateClasses),
 					arguments.getOrDefault("hardware-description", "unspecified"),
-					Boolean.parseBoolean(arguments.getOrDefault("enforce", "true")),
+					argumentBoolean(arguments, "enforce", true),
 					Integer.parseInt(arguments.getOrDefault("pairs", Integer.toString(DEFAULT_PAIRS))),
 					Integer.parseInt(arguments.getOrDefault("operations", "1000000")),
 					Integer.parseInt(arguments.getOrDefault("warmup-operations", "100000")),
@@ -748,7 +755,7 @@ public final class FiniteDeadlineContentionBenchmark {
 					Integer.parseInt(arguments.getOrDefault("cancellation-percent", "10")),
 					Integer.parseInt(arguments.getOrDefault("failure-percent", "5")),
 					Integer.parseInt(arguments.getOrDefault("cooperative-percent", "30")),
-					Boolean.parseBoolean(arguments.getOrDefault("alternate-storage-pressure", "true")),
+					argumentBoolean(arguments, "alternate-storage-pressure", true),
 					Long.parseLong(arguments.getOrDefault("seed", "104372305701837")),
 					Duration.ofSeconds(Long.parseLong(arguments.getOrDefault("timeout-seconds", "180"))));
 		}
