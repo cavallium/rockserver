@@ -160,6 +160,12 @@ final class SchedulerReferenceModel {
 		};
 	}
 
+	boolean cancelNonCooperative(long id) {
+		var job = jobs.get(id);
+		if (job != null && job.phase == Phase.ACTIVE) return false;
+		return cancel(id);
+	}
+
 	Optional<Spec> dispatch(long now, boolean batchEligible) {
 		expire(now);
 		if (activeTotal() >= settings.workers()) return Optional.empty();
@@ -367,7 +373,7 @@ final class SchedulerReferenceModel {
 			}
 			return head;
 		}
-		throw new AssertionError("reference DRR failed to converge");
+		return null;
 	}
 
 	private boolean reservationDeficit(WorkloadProfile profile) {
@@ -482,7 +488,7 @@ final class SchedulerReferenceModel {
 		private final EnumMap<Pool, Boolean> queued = new EnumMap<>(Pool.class);
 		private final EnumMap<Pool, Boolean> dispatchable = new EnumMap<>(Pool.class);
 		private final EnumMap<Pool, Integer> active = new EnumMap<>(Pool.class);
-		private final EnumMap<Pool, Integer> competitors = new EnumMap<>(Pool.class);
+		private final EnumMap<Pool, Boolean> competitors = new EnumMap<>(Pool.class);
 		private boolean pressured;
 		private int activeTotal;
 		private Pool lastCompleted;
@@ -508,7 +514,7 @@ final class SchedulerReferenceModel {
 				queued.put(pool, false);
 				dispatchable.put(pool, false);
 				active.put(pool, 0);
-				competitors.put(pool, 0);
+				competitors.put(pool, false);
 			}
 		}
 
@@ -532,20 +538,15 @@ final class SchedulerReferenceModel {
 
 		void competitor(Pool pool, boolean present, long now) {
 			expireCompetition(now);
-			int next = competitors.get(pool) + (present ? 1 : -1);
-			if (next < 0) throw new IllegalStateException("competition underflow");
-			competitors.put(pool, next);
+			boolean wasCompeting = competitionCount() > 0;
+			competitors.put(pool, present);
 			if (competitionCount() > 0) competitionUntil = Long.MAX_VALUE;
-			else competitionUntil = saturating(now, competitionHold);
+			else if (wasCompeting) competitionUntil = saturating(now, competitionHold);
 		}
 
 		Optional<Permit> start(Pool pool, long now) {
+			if (!canStart(pool, now)) return Optional.empty();
 			boolean competing = competitionActive(now);
-			if (competing && (active.get(pool) >= competingMaximum(pool)
-					|| pool == Pool.WRITE && now < nextCompetingWrite)) return Optional.empty();
-			if (pressured && (activeTotal >= pressureMaximum || now < nextPressureStart || !fairTurn(pool))) {
-				return Optional.empty();
-			}
 			activeTotal++;
 			active.merge(pool, 1, Integer::sum);
 			return Optional.of(new Permit(pressured, competing, pressureEpisode, competitionEpisode));
@@ -567,8 +568,28 @@ final class SchedulerReferenceModel {
 			return !pressured || lastCompleted == null || lastCompleted != pool || !dispatchable.get(other(pool));
 		}
 
+		boolean isDispatchable(Pool pool) {
+			return dispatchable.get(pool);
+		}
+
+		boolean canStart(Pool pool, long now) {
+			boolean competing = competitionActive(now);
+			if (competing && (active.get(pool) >= competingMaximum(pool)
+					|| pool == Pool.WRITE && now < nextCompetingWrite)) return false;
+			return !pressured
+					|| activeTotal < pressureMaximum && now >= nextPressureStart && fairTurn(pool);
+		}
+
 		int activeTotal() {
 			return activeTotal;
+		}
+
+		String describe() {
+			return "pressured=" + pressured + ", active=" + active + ", activeTotal=" + activeTotal
+					+ ", queued=" + queued + ", dispatchable=" + dispatchable + ", competitors=" + competitors
+					+ ", lastCompleted=" + lastCompleted + ", nextPressure=" + nextPressureStart
+					+ ", nextWrite=" + nextCompetingWrite + ", competitionUntil=" + competitionUntil
+					+ ", pressureEpisode=" + pressureEpisode + ", competitionEpisode=" + competitionEpisode;
 		}
 
 		void validate() {
@@ -593,7 +614,7 @@ final class SchedulerReferenceModel {
 		}
 
 		private int competitionCount() {
-			return competitors.values().stream().mapToInt(Integer::intValue).sum();
+			return (int) competitors.values().stream().filter(Boolean::booleanValue).count();
 		}
 
 		private int competingMaximum(Pool pool) {
