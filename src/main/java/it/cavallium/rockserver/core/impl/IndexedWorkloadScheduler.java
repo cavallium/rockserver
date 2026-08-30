@@ -86,23 +86,28 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 			throw Exceptions.failWithRejected();
 		}
 		Runnable original = Objects.requireNonNull(task, "task");
-		var scheduledTask = new IndexedScheduledTask(this,
+		var scheduledTask = scheduledTask(this,
 				Schedulers.onSchedule(original),
 				null,
-				estimatedBytes(original),
-				rejectionAware(original));
+				metadata(original));
 		scheduledTask.submit();
 		return scheduledTask;
 	}
 
-	private static long estimatedBytes(Runnable task) {
-		return task instanceof RWScheduler.EstimatedWork estimatedWork
-				? estimatedWork.estimatedBytes()
-				: 0L;
+	private static @Nullable Runnable metadata(Runnable task) {
+		return task instanceof RWScheduler.EstimatedWork
+				|| task instanceof RWScheduler.RejectionAwareTask
+				? task
+				: null;
 	}
 
-	private static @Nullable RWScheduler.RejectionAwareTask rejectionAware(Runnable task) {
-		return task instanceof RWScheduler.RejectionAwareTask rejectionAware ? rejectionAware : null;
+	private static IndexedScheduledTask scheduledTask(IndexedWorkloadScheduler scheduler,
+	                                                  Runnable task,
+	                                                  @Nullable IndexedWorker parent,
+	                                                  @Nullable Runnable originalMetadata) {
+		return originalMetadata instanceof RWScheduler.EstimatedWork
+				? new EstimatedIndexedScheduledTask(scheduler, task, parent, originalMetadata)
+				: new IndexedScheduledTask(scheduler, task, parent, originalMetadata);
 	}
 
 	@Override
@@ -151,11 +156,10 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 				throw Exceptions.failWithRejected();
 			}
 			Runnable original = Objects.requireNonNull(task, "task");
-			var scheduledTask = new IndexedScheduledTask(scheduler,
+			var scheduledTask = scheduledTask(scheduler,
 					Schedulers.onSchedule(original),
 					this,
-					estimatedBytes(original),
-					rejectionAware(original));
+					metadata(original));
 			if (!tasks.add(scheduledTask)) {
 				throw Exceptions.failWithRejected();
 			}
@@ -184,10 +188,9 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		}
 	}
 
-	private static final class IndexedScheduledTask implements Runnable,
+	private static class IndexedScheduledTask implements Runnable,
 			Disposable,
 			ProfiledWorkloadExecutor.CancellationTrackedTask,
-			RWScheduler.EstimatedWork,
 			RWScheduler.RejectionAwareTask {
 
 		private static final int QUEUED = 0;
@@ -197,17 +200,15 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		private static final int DISPATCH_PENDING = 0;
 		private static final int DISPATCH_CLAIMED = 1;
 		private static final int DISPATCH_CANCELLED = 2;
+		private static final int TERMINAL_FAILURE_PUBLISHED_FLAG = 1 << 2;
 		private static final VarHandle STATE;
 		private static final VarHandle DISPATCH_STATE;
-		private static final VarHandle TERMINAL_FAILURE_PUBLISHED;
 
 		static {
 			try {
 				STATE = MethodHandles.lookup().findVarHandle(IndexedScheduledTask.class, "state", int.class);
 				DISPATCH_STATE = MethodHandles.lookup()
 						.findVarHandle(IndexedScheduledTask.class, "dispatchState", int.class);
-				TERMINAL_FAILURE_PUBLISHED = MethodHandles.lookup()
-						.findVarHandle(IndexedScheduledTask.class, "terminalFailurePublished", int.class);
 			} catch (NoSuchFieldException | IllegalAccessException failure) {
 				throw new ExceptionInInitializerError(failure);
 			}
@@ -216,38 +217,31 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		private final IndexedWorkloadScheduler scheduler;
 		private final Runnable task;
 		private final @Nullable IndexedWorker parent;
-		private final long estimatedBytes;
-		private final @Nullable RWScheduler.RejectionAwareTask rejectionAwareTask;
+		private final @Nullable Runnable originalMetadata;
 		private volatile int state = QUEUED;
 		private volatile int dispatchState = DISPATCH_PENDING;
-		private volatile int terminalFailurePublished;
 		private boolean submitted;
 
 		private IndexedScheduledTask(IndexedWorkloadScheduler scheduler,
 				Runnable task,
 				@Nullable IndexedWorker parent,
-				long estimatedBytes,
-				@Nullable RWScheduler.RejectionAwareTask rejectionAwareTask) {
+				@Nullable Runnable originalMetadata) {
 			this.scheduler = scheduler;
 			this.task = task;
 			this.parent = parent;
-			this.estimatedBytes = estimatedBytes;
-			this.rejectionAwareTask = rejectionAwareTask;
+			this.originalMetadata = originalMetadata;
 		}
 
 		@Override
-		public long estimatedBytes() {
-			return estimatedBytes;
-		}
-
-		@Override
-		public void reject(RuntimeException failure) {
+		public final void reject(RuntimeException failure) {
 			Objects.requireNonNull(failure, "failure");
-			if (!TERMINAL_FAILURE_PUBLISHED.compareAndSet(this, 0, 1)) {
+			int priorDispatchState = (int) DISPATCH_STATE.getAndBitwiseOr(
+					this, TERMINAL_FAILURE_PUBLISHED_FLAG);
+			if ((priorDispatchState & TERMINAL_FAILURE_PUBLISHED_FLAG) != 0) {
 				return;
 			}
 			finishRejectedState();
-			if (rejectionAwareTask != null) {
+			if (originalMetadata instanceof RWScheduler.RejectionAwareTask rejectionAwareTask) {
 				rejectionAwareTask.reject(failure);
 			}
 		}
@@ -278,7 +272,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		}
 
 		@Override
-		public void run() {
+		public final void run() {
 			int currentState = state;
 			if (currentState == QUEUED) {
 				if (!STATE.compareAndSet(this, QUEUED, RUNNING)) {
@@ -300,7 +294,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		}
 
 		@Override
-		public void dispose() {
+		public final void dispose() {
 			boolean cancelledBeforeDispatch = DISPATCH_STATE.compareAndSet(
 					this, DISPATCH_PENDING, DISPATCH_CANCELLED);
 			boolean removeQueued = false;
@@ -320,17 +314,17 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		}
 
 		@Override
-		public boolean isDisposed() {
+		public final boolean isDisposed() {
 			return state >= FINISHED;
 		}
 
 		@Override
-		public boolean workloadCancellationRequested() {
+		public final boolean workloadCancellationRequested() {
 			return dispatchState == DISPATCH_CANCELLED;
 		}
 
 		@Override
-		public boolean claimWorkloadDispatch() {
+		public final boolean claimWorkloadDispatch() {
 			return DISPATCH_STATE.compareAndSet(this, DISPATCH_PENDING, DISPATCH_CLAIMED)
 					|| dispatchState == DISPATCH_CLAIMED;
 		}
@@ -339,6 +333,26 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 			if (parent != null) {
 				parent.delete(this);
 			}
+		}
+
+		final @Nullable Runnable originalMetadata() {
+			return originalMetadata;
+		}
+	}
+
+	private static final class EstimatedIndexedScheduledTask extends IndexedScheduledTask
+			implements RWScheduler.EstimatedWork {
+
+		private EstimatedIndexedScheduledTask(IndexedWorkloadScheduler scheduler,
+				Runnable task,
+				@Nullable IndexedWorker parent,
+				Runnable originalMetadata) {
+			super(scheduler, task, parent, originalMetadata);
+		}
+
+		@Override
+		public long estimatedBytes() {
+			return ((RWScheduler.EstimatedWork) Objects.requireNonNull(originalMetadata())).estimatedBytes();
 		}
 	}
 }
