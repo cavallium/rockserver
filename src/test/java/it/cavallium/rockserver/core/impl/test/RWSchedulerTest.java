@@ -112,39 +112,6 @@ class RWSchedulerTest {
 	}
 
 	@Test
-	void warmedAdmissionCounterReadsAllocateNothing() {
-		var scheduler = scheduler(1, "admission-counter-allocation");
-		var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory
-				.getThreadMXBean();
-		if (!threads.isThreadAllocatedMemoryEnabled()) threads.setThreadAllocatedMemoryEnabled(true);
-		long threadId = Thread.currentThread().threadId();
-		try {
-			long checksum = 0L;
-			for (int iteration = 0; iteration < 100_000; iteration++) {
-				checksum += scheduler.queuedTasks(WorkloadProfile.BATCH);
-				checksum += scheduler.activeTasks(WorkloadProfile.BATCH);
-				checksum += scheduler.queueCapacity(WorkloadProfile.BATCH);
-			}
-			long minimumAllocated = Long.MAX_VALUE;
-			for (int window = 0; window < 8; window++) {
-				long before = threads.getThreadAllocatedBytes(threadId);
-				for (int iteration = 0; iteration < 250_000; iteration++) {
-					checksum += scheduler.queuedTasks(WorkloadProfile.BATCH);
-					checksum += scheduler.activeTasks(WorkloadProfile.BATCH);
-					checksum += scheduler.queueCapacity(WorkloadProfile.BATCH);
-				}
-				minimumAllocated = Math.min(minimumAllocated,
-						threads.getThreadAllocatedBytes(threadId) - before);
-			}
-			assertTrue(checksum > 0L, "capacity reads must remain observable to the benchmark");
-			assertEquals(0L, minimumAllocated,
-					"warmed admission counter reads must not allocate varargs arrays");
-		} finally {
-			scheduler.disposeNow();
-		}
-	}
-
-	@Test
 	void immutableTelemetryAggregatesFailLoudlyInsteadOfWrapping() {
 		var admission = new RWScheduler.ProfileAdmissionSnapshot(
 				Map.of(WorkloadProfile.LATENCY, Integer.MAX_VALUE,

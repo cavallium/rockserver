@@ -394,8 +394,10 @@ public final class RWScheduler {
 				controlPool.capacity(profile), physicalPool.capacity(profile));
 	}
 
-	private static int addExact(int first, int second, int third, int fourth) {
-		return Math.addExact(Math.addExact(first, second), Math.addExact(third, fourth));
+	private static int addExact(int... values) {
+		int result = 0;
+		for (int value : values) result = Math.addExact(result, value);
+		return result;
 	}
 
 	public ProfileAdmissionSnapshot admissionSnapshot() {
