@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-pressure-performance-worker-v2",
+  "title": "Rockserver pressure performance worker v2 variable-pair evidence",
+  "type": "object",
+  "required": [
+    "schema", "suite", "round", "ordinal", "implementation", "build-sha",
+    "configuration-sha256", "host-sha256", "hardware-description", "runtime-sha256",
+    "classpath-sha256", "production-classes-sha256", "process-id",
+    "started-epoch-millis", "finished-epoch-millis", "enforced-hardware-run",
+    "correctness-passed"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-pressure-performance-worker-v2" },
+    "suite": { "enum": ["scheduler", "signal"] },
+    "round": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+    "ordinal": { "type": "integer", "minimum": 1, "maximum": 4000000 },
+    "implementation": { "enum": ["baseline", "candidate"] },
+    "build-sha": { "$ref": "#/$defs/gitSha" },
+    "configuration-sha256": { "$ref": "#/$defs/sha256" },
+    "host-sha256": { "$ref": "#/$defs/sha256" },
+    "hardware-description": { "type": "string", "minLength": 1 },
+    "runtime-sha256": { "$ref": "#/$defs/sha256" },
+    "classpath-sha256": { "$ref": "#/$defs/sha256" },
+    "production-classes-sha256": { "$ref": "#/$defs/sha256" },
+    "process-id": { "type": "integer", "minimum": 1 },
+    "started-epoch-millis": { "type": "integer", "minimum": 1 },
+    "finished-epoch-millis": { "type": "integer", "minimum": 1 },
+    "enforced-hardware-run": { "type": "boolean" },
+    "correctness-passed": { "type": "boolean" }
+  },
+  "patternProperties": {
+    "^metric\\.[a-z0-9_.-]+$": { "type": "number", "minimum": 0 }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

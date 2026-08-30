@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-pressure-performance-schedule-v2.1",
+  "title": "Rockserver pressure schedule TSV v2.1",
+  "type": "string",
+  "contentMediaType": "text/tab-separated-values",
+  "pattern": "^schema\\trockserver-pressure-performance-schedule-v2\\.1\\nconfiguration-sha256\\t[0-9a-f]{64}\\npairs\\t(?:1[0-9]|[2-9][0-9]|[1-9][0-9]{2,5}|1000000)\\nadaptive-stopping\\tfalse\\nordinal\\tround\\tsuite\\timplementation\\tartifact\\n"
+}

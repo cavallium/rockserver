@@ -126,14 +126,27 @@ their per-metric target is stricter. Deadline accounting, terminal conservation,
 shutdown, and leaks remain hard correctness gates rather than variance-planned metrics. The
 planner never recommends relaxing the `0.99`/`1.02` margins.
 
-The executable next-run alternative keeps ten fixed pairs and no adaptive stopping. It scales
-`scheduler-operations`; and, independently, signal measured column observations plus minimum and
-maximum evaluations by the ceiling of the worst required duration factor in each suite. It writes:
+The original planner's duration-only recommendation could overflow the scheduler's integer
+operation count on real evidence. Precision-plan v2 therefore caps each worker at a predeclared
+`64x` measured-duration scale, additionally bounded by every integer field. It then recomputes each
+metric's required pair count using `s / sqrt(chosen-duration-scale)` and selects the maximum. This
+mixed design never pretends the capped duration alone reaches target power. The cap is recorded in
+v2.1 metadata and its configuration hash.
+
+The executable next run uses contract version `v2.1`, the bounded scheduler/signal duration scales,
+and enough fixed pairs to satisfy every predeclared metric under the planning approximation. It
+still has no adaptive stopping. Existing v1 and v2 metadata remain unchanged; v2 without a
+`fixed-pairs` field continues to mean exactly ten. It writes:
 
 - `precision-plan.json`, schema
-  `benchmarks/schemas/pressure-performance-precision-plan-v1.schema.json`;
+  `benchmarks/schemas/pressure-performance-precision-plan-v2.schema.json`;
 - `precision-plan.md`, with the limiting metrics first;
 - `next-run-v2.properties`, the complete predeclared fixed configuration.
+
+The v2.1 schedule, metadata, worker, and comparison formats are separately versioned as
+`pressure-performance-{schedule,metadata}-v2.1`, `pressure-performance-worker-v2`, and
+`pressure-performance-comparison-v2.1`. Pair count, round, ordinal, vector length, and the total
+`4 * pairs` fresh-process count remain exact and tamper-checked.
 
 Run it against the baseline and candidate production class roots:
 
@@ -149,6 +162,14 @@ The planner hashes exactly
 `it/cavallium/rockserver/core/impl/StoragePressureSignal.class` in both roots. Equality is recorded
 only as component-byte provenance for the unchanged signal evaluator. It never changes the source
 decision, removes signal metrics, reduces required evidence, or supplies a statistical PASS.
+
+Prepare the recommended root directly from the emitted option file:
+
+```bash
+mapfile -t planned_options < <(sed 's/^/--/' /mnt/bench/pressure-paired-v2/next-run-v2.properties)
+java -cp "${workload_classpath}" "${main}" \
+  --mode=prepare --root=/mnt/bench/pressure-paired-v2.1 "${planned_options[@]}"
+```
 
 Metrics-on/off is not folded into this controller: the high-contention harness currently constructs
 an unmetered scheduler, and changing the measured workload to register Micrometer only on one side

@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-pressure-performance-precision-plan-v2",
+  "title": "Rockserver pressure precision plan v2",
+  "type": "object",
+  "required": [
+    "schema", "source_contract", "source_decision", "source_configuration_sha256",
+    "source_results_sha256", "source_schedule_sha256", "source_metadata_sha256",
+    "planning_effect", "power_method", "global_pass_power", "stochastic_metrics",
+    "critical_scheduling_metrics", "critical_beta_budget", "standard_beta_budget",
+    "critical_target_per_metric_power", "standard_target_per_metric_power",
+    "required_fixed_pairs_same_duration", "maximum_per_worker_duration_scale",
+    "source_fixed_pairs", "adaptive_stopping", "throughput_minimum_ratio",
+    "cost_maximum_ratio", "scheduler_duration_scale", "signal_duration_scale",
+    "signal_component", "next_run", "limiting_metrics", "metrics"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-pressure-performance-precision-plan-v2" },
+    "source_contract": { "const": "v2" },
+    "source_decision": { "const": "inconclusive" },
+    "source_configuration_sha256": { "$ref": "#/$defs/sha256" },
+    "source_results_sha256": { "$ref": "#/$defs/sha256" },
+    "source_schedule_sha256": { "$ref": "#/$defs/sha256" },
+    "source_metadata_sha256": { "$ref": "#/$defs/sha256" },
+    "planning_effect": { "const": "exact-equality" },
+    "power_method": { "const": "student-critical-normal-approximation-v1" },
+    "global_pass_power": { "const": 0.9 },
+    "stochastic_metrics": { "type": "integer", "minimum": 1 },
+    "critical_scheduling_metrics": { "type": "integer", "minimum": 1 },
+    "critical_beta_budget": { "const": 0.03 },
+    "standard_beta_budget": { "const": 0.07 },
+    "critical_target_per_metric_power": { "type": "number", "exclusiveMinimum": 0.9, "exclusiveMaximum": 1 },
+    "standard_target_per_metric_power": { "type": "number", "exclusiveMinimum": 0.9, "exclusiveMaximum": 1 },
+    "required_fixed_pairs_same_duration": { "type": "integer", "minimum": 10 },
+    "maximum_per_worker_duration_scale": { "const": 64 },
+    "source_fixed_pairs": { "const": 10 },
+    "adaptive_stopping": { "const": false },
+    "throughput_minimum_ratio": { "const": 0.99 },
+    "cost_maximum_ratio": { "const": 1.02 },
+    "scheduler_duration_scale": { "type": "number", "minimum": 1 },
+    "signal_duration_scale": { "type": "number", "minimum": 1 },
+    "signal_component": {
+      "type": "object",
+      "required": ["path", "baseline_sha256", "candidate_sha256", "equal", "used_for_decision"],
+      "properties": {
+        "path": { "const": "it/cavallium/rockserver/core/impl/StoragePressureSignal.class" },
+        "baseline_sha256": { "$ref": "#/$defs/sha256" },
+        "candidate_sha256": { "$ref": "#/$defs/sha256" },
+        "equal": { "type": "boolean" },
+        "used_for_decision": { "const": false }
+      },
+      "additionalProperties": false
+    },
+    "next_run": {
+      "type": "object",
+      "required": [
+        "contract_version", "fixed_pairs", "fresh_processes", "adaptive_stopping",
+        "scheduler_duration_scale", "signal_duration_scale", "scheduler_operations",
+        "signal_measured_columns", "signal_minimum_evaluations", "signal_maximum_evaluations"
+      ],
+      "properties": {
+        "contract_version": { "const": "v2.1" },
+        "fixed_pairs": { "type": "integer", "minimum": 10, "maximum": 1000000 },
+        "fresh_processes": { "type": "integer", "minimum": 40, "maximum": 4000000 },
+        "adaptive_stopping": { "const": false },
+        "scheduler_duration_scale": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "signal_duration_scale": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "scheduler_operations": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "signal_measured_columns": { "type": "integer", "minimum": 1 },
+        "signal_minimum_evaluations": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "signal_maximum_evaluations": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+      },
+      "additionalProperties": false
+    },
+    "limiting_metrics": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "type": "string" } },
+    "metrics": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/metric" } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "metric": {
+      "type": "object",
+      "required": [
+        "suite", "name", "critical", "direction", "ratio_offset", "paired_log_sd",
+        "margin_log", "current_ni_power", "target_power", "required_fixed_pairs",
+        "fixed_pair_duration_scale", "recommended_duration_scale",
+        "required_pairs_at_recommended_duration"
+      ],
+      "properties": {
+        "suite": { "enum": ["scheduler", "signal"] },
+        "name": { "type": "string", "minLength": 1 },
+        "critical": { "type": "boolean" },
+        "direction": { "enum": ["higher_is_better", "lower_is_better"] },
+        "ratio_offset": { "type": "number", "minimum": 0 },
+        "paired_log_sd": { "type": "number", "minimum": 0 },
+        "margin_log": { "type": "number", "exclusiveMinimum": 0 },
+        "current_ni_power": { "type": "number", "minimum": 0, "maximum": 1 },
+        "target_power": { "type": "number", "minimum": 0, "maximum": 1 },
+        "required_fixed_pairs": { "type": "integer", "minimum": 10 },
+        "fixed_pair_duration_scale": { "type": "number", "minimum": 1 },
+        "recommended_duration_scale": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "required_pairs_at_recommended_duration": { "type": "integer", "minimum": 10 }
+      },
+      "additionalProperties": false
+    }
+  }
+}
