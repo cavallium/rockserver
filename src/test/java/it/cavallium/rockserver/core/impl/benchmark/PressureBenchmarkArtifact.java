@@ -14,6 +14,8 @@ import java.util.Set;
 final class PressureBenchmarkArtifact {
 
 	static final String SCHEMA = "rockserver-pressure-performance-worker-v1";
+	static final String SCHEMA_V2 = "rockserver-pressure-performance-worker-v2";
+	private static final int MAXIMUM_ROUND = 1_000_000;
 	private static final String METRIC_PREFIX = "metric.";
 	private static final Set<String> FIXED_KEYS = Set.of(
 			"schema", "suite", "round", "ordinal", "implementation", "build-sha",
@@ -76,7 +78,7 @@ final class PressureBenchmarkArtifact {
 			Map<String, Double> metrics) {
 
 		Artifact {
-			if (round < 1 || round > PairedPerformanceContract.REQUIRED_PAIRS || ordinal < 1) {
+			if (round < 1 || round > MAXIMUM_ROUND || ordinal < 1) {
 				throw new IllegalArgumentException("round and ordinal must be in the prepared schedule");
 			}
 			if (suite == null || implementation == null) {
@@ -106,14 +108,23 @@ final class PressureBenchmarkArtifact {
 	}
 
 	static void write(Path output, Artifact artifact, Set<String> expectedMetrics) throws IOException {
+		write(output, artifact, expectedMetrics, SCHEMA);
+	}
+
+	static void write(Path output, Artifact artifact, Set<String> expectedMetrics, String schema) throws IOException {
 		Files.createDirectories(output.toAbsolutePath().normalize().getParent());
-		Files.writeString(output, encode(artifact, expectedMetrics), StandardOpenOption.CREATE_NEW);
+		Files.writeString(output, encode(artifact, expectedMetrics, schema), StandardOpenOption.CREATE_NEW);
 	}
 
 	static String encode(Artifact artifact, Set<String> expectedMetrics) {
+		return encode(artifact, expectedMetrics, SCHEMA);
+	}
+
+	static String encode(Artifact artifact, Set<String> expectedMetrics, String schema) {
+		validateSchema(schema);
 		validateMetricSet(artifact.metrics(), expectedMetrics);
 		var lines = new StringBuilder();
-		property(lines, "schema", SCHEMA);
+		property(lines, "schema", schema);
 		property(lines, "suite", artifact.suite().value);
 		property(lines, "round", artifact.round());
 		property(lines, "ordinal", artifact.ordinal());
@@ -136,11 +147,17 @@ final class PressureBenchmarkArtifact {
 	}
 
 	static Artifact read(Path input, Suite expectedSuite, Set<String> expectedMetrics) throws IOException {
+		return read(input, expectedSuite, expectedMetrics, SCHEMA);
+	}
+
+	static Artifact read(Path input, Suite expectedSuite, Set<String> expectedMetrics, String schema)
+			throws IOException {
+		validateSchema(schema);
 		if (!Files.isRegularFile(input)) {
 			throw new IllegalArgumentException("Missing pressure benchmark artifact: " + input);
 		}
 		Map<String, String> values = strictProperties(Files.readString(input), expectedMetrics);
-		require(values, "schema", SCHEMA);
+		require(values, "schema", schema);
 		require(values, "suite", expectedSuite.value);
 		var metrics = new LinkedHashMap<String, Double>();
 		for (String metric : expectedMetrics) {
@@ -163,6 +180,12 @@ final class PressureBenchmarkArtifact {
 				bool(values, "enforced-hardware-run"),
 				bool(values, "correctness-passed"),
 				metrics);
+	}
+
+	private static void validateSchema(String schema) {
+		if (!SCHEMA.equals(schema) && !SCHEMA_V2.equals(schema)) {
+			throw new IllegalArgumentException("Unsupported pressure worker schema " + schema);
+		}
 	}
 
 	private static Map<String, String> strictProperties(String text, Set<String> expectedMetrics) {

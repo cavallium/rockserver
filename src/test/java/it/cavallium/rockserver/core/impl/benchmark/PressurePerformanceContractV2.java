@@ -22,6 +22,14 @@ public final class PressurePerformanceContractV2 {
 		return evaluate(schedulerSpecifications(), baseline, candidate, structuralFailures);
 	}
 
+	public static PairedPerformanceContractV2.Evaluation evaluateScheduler(
+			List<Map<String, Double>> baseline,
+			List<Map<String, Double>> candidate,
+			List<String> structuralFailures,
+			int requiredPairs) {
+		return evaluate(schedulerSpecifications(), baseline, candidate, structuralFailures, requiredPairs);
+	}
+
 	static List<PairedPerformanceContractV2.MetricSpec> schedulerSpecifications() {
 		var specifications = new ArrayList<PairedPerformanceContractV2.MetricSpec>();
 		specifications.add(PairedPerformanceContractV2.MetricSpec.throughput(
@@ -66,6 +74,16 @@ public final class PressurePerformanceContractV2 {
 		return evaluate(signalSpecifications(columnFamilyCounts), baseline, candidate, structuralFailures);
 	}
 
+	public static PairedPerformanceContractV2.Evaluation evaluateSignal(
+			int[] columnFamilyCounts,
+			List<Map<String, Double>> baseline,
+			List<Map<String, Double>> candidate,
+			List<String> structuralFailures,
+			int requiredPairs) {
+		return evaluate(signalSpecifications(columnFamilyCounts), baseline, candidate,
+				structuralFailures, requiredPairs);
+	}
+
 	static List<PairedPerformanceContractV2.MetricSpec> signalSpecifications(int[] columnFamilyCounts) {
 		var specifications = new ArrayList<PairedPerformanceContractV2.MetricSpec>();
 		for (int columnFamilies : columnFamilyCounts) {
@@ -98,11 +116,20 @@ public final class PressurePerformanceContractV2 {
 			List<Map<String, Double>> baseline,
 			List<Map<String, Double>> candidate,
 			List<String> structuralFailures) {
+		return evaluate(specifications, baseline, candidate, structuralFailures,
+				PairedPerformanceContractV2.REQUIRED_PAIRS);
+	}
+
+	private static PairedPerformanceContractV2.Evaluation evaluate(
+			List<PairedPerformanceContractV2.MetricSpec> specifications,
+			List<Map<String, Double>> baseline,
+			List<Map<String, Double>> candidate,
+			List<String> structuralFailures,
+			int requiredPairs) {
 		var failures = new ArrayList<>(structuralFailures);
-		boolean validPairCount = baseline.size() == PairedPerformanceContractV2.REQUIRED_PAIRS
-				&& candidate.size() == PairedPerformanceContractV2.REQUIRED_PAIRS;
+		boolean validPairCount = baseline.size() == requiredPairs && candidate.size() == requiredPairs;
 		if (!validPairCount) {
-			failures.add("exactly " + PairedPerformanceContractV2.REQUIRED_PAIRS
+			failures.add("exactly " + requiredPairs
 					+ " fresh counterbalanced v2 pairs are required");
 		}
 		var samples = new LinkedHashMap<String, PairedPerformanceContractV2.MetricSamples>();
@@ -118,7 +145,7 @@ public final class PressurePerformanceContractV2 {
 				}
 			}
 		}
-		return PairedPerformanceContractV2.evaluate(specifications, samples, failures);
+		return PairedPerformanceContractV2.evaluate(specifications, samples, failures, requiredPairs);
 	}
 
 	private static double[] values(List<Map<String, Double>> runs, String metric) {

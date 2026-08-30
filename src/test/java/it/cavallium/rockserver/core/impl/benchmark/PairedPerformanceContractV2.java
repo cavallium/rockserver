@@ -146,6 +146,16 @@ public final class PairedPerformanceContractV2 {
 	public static Evaluation evaluate(List<MetricSpec> specifications,
 			Map<String, MetricSamples> samples,
 			List<String> structuralFailures) {
+		return evaluate(specifications, samples, structuralFailures, REQUIRED_PAIRS);
+	}
+
+	public static Evaluation evaluate(List<MetricSpec> specifications,
+			Map<String, MetricSamples> samples,
+			List<String> structuralFailures,
+			int requiredPairs) {
+		if (requiredPairs < REQUIRED_PAIRS) {
+			throw new IllegalArgumentException("v2 evidence requires at least " + REQUIRED_PAIRS + " fixed pairs");
+		}
 		var failures = new ArrayList<>(structuralFailures);
 		var preliminary = new LinkedHashMap<String, MetricEvaluation>();
 		for (var specification : specifications) {
@@ -156,8 +166,8 @@ public final class PairedPerformanceContractV2 {
 			}
 			double[] baseline = metricSamples.baseline();
 			double[] candidate = metricSamples.candidate();
-			if (baseline.length != REQUIRED_PAIRS || candidate.length != REQUIRED_PAIRS) {
-				failures.add(specification.name() + " requires exactly " + REQUIRED_PAIRS + " pairs");
+			if (baseline.length != requiredPairs || candidate.length != requiredPairs) {
+				failures.add(specification.name() + " requires exactly " + requiredPairs + " pairs");
 				continue;
 			}
 			try {

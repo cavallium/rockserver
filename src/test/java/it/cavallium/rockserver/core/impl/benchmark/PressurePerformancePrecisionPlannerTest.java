@@ -61,7 +61,7 @@ class PressurePerformancePrecisionPlannerTest {
 		String json = Files.readString(root.resolve("precision-plan.json"));
 		String markdown = Files.readString(root.resolve("precision-plan.md"));
 		String next = Files.readString(root.resolve("next-run-v2.properties"));
-		assertTrue(json.contains("\"schema\": \"rockserver-pressure-performance-precision-plan-v1\""));
+		assertTrue(json.contains("\"schema\": \"rockserver-pressure-performance-precision-plan-v2\""));
 		assertTrue(json.contains("\"source_decision\": \"inconclusive\""));
 		assertTrue(json.contains("\"planning_effect\": \"exact-equality\""));
 		assertTrue(json.contains("\"stochastic_metrics\": 143"));
@@ -74,12 +74,23 @@ class PressurePerformancePrecisionPlannerTest {
 		assertEquals(143L, json.lines().filter(line -> line.contains("\"suite\":")).count());
 		assertTrue(markdown.contains("Source decision: `INCONCLUSIVE` (unchanged)"));
 		assertTrue(markdown.contains("provenance only; never used for PASS"));
-		assertTrue(next.contains("schema=rockserver-pressure-performance-next-run-v1"));
-		assertTrue(next.contains("fixed-pairs=10\nadaptive-stopping=false"));
-		assertTrue(next.contains("planning-effect=exact-equality"));
-		assertTrue(next.contains("planning-critical-beta-budget=0.03"));
+		assertTrue(next.contains("contract-version=v2.1"));
+		assertTrue(next.contains("planning-duration-scale-cap=64"));
+		assertTrue(nextConfigurationValue(next, "fixed-pairs") > 10L);
 		assertTrue(nextConfigurationValue(next, "scheduler-operations") > 1_024L);
+		assertTrue(nextConfigurationValue(next, "scheduler-operations") <= Integer.MAX_VALUE);
 		assertEquals(2_000L, nextConfigurationValue(next, "signal-measured-columns"));
+		Path plannedRoot = temporary.resolve("planned-root");
+		var prepareArguments = new java.util.ArrayList<String>();
+		prepareArguments.add("--mode=prepare");
+		prepareArguments.add("--root=" + plannedRoot);
+		next.lines().filter(line -> !line.isBlank()).map(line -> "--" + line).forEach(prepareArguments::add);
+		PressurePerformancePairedBenchmark.main(prepareArguments.toArray(String[]::new));
+		var planned = PressurePerformancePairedBenchmark.Prepared.read(plannedRoot);
+		assertEquals(PressurePerformancePairedBenchmark.ContractVersion.V2_PLANNED,
+				planned.contractVersion());
+		assertEquals(Math.toIntExact(nextConfigurationValue(next, "fixed-pairs")), planned.fixedPairs());
+		assertEquals(64, planned.planningDurationScaleCap());
 		assertThrows(IllegalArgumentException.class,
 				() -> PressurePerformancePrecisionPlanner.main(new String[] {
 						"--root=" + root,
@@ -106,7 +117,30 @@ class PressurePerformancePrecisionPlannerTest {
 		assertTrue(json.contains("\"equal\":false"));
 		assertTrue(json.contains("\"used_for_decision\":false"));
 		assertTrue(Files.readString(root.resolve("next-run-v2.properties"))
-				.contains("contract-version=v2"));
+				.contains("contract-version=v2.1"));
+	}
+
+	@Test
+	void tenMillionOperationOverflowShapeUsesBoundedDurationPlusMorePairs() throws Exception {
+		Path root = temporary.resolve("ten-million-overflow-shape");
+		prepare(root, 10_000_000);
+		writeSyntheticArtifacts(root, true);
+		PressurePerformancePairedBenchmark.main(new String[] {"--mode=evaluate", "--root=" + root});
+		var classes = componentRoots("overflow-shape", true);
+
+		PressurePerformancePrecisionPlanner.main(new String[] {
+				"--root=" + root,
+				"--baseline-classes=" + classes.baseline(),
+				"--candidate-classes=" + classes.candidate()
+		});
+
+		String next = Files.readString(root.resolve("next-run-v2.properties"));
+		assertEquals(64L, nextConfigurationValue(next, "planning-duration-scale-cap"));
+		assertEquals(640_000_000L, nextConfigurationValue(next, "scheduler-operations"));
+		assertTrue(nextConfigurationValue(next, "fixed-pairs") > 10L,
+				"bounded per-run work must be complemented by more independent pairs");
+		assertTrue(Files.readString(root.resolve("precision-plan.json"))
+				.contains("\"maximum_per_worker_duration_scale\": 64"));
 	}
 
 	@Test
@@ -141,11 +175,16 @@ class PressurePerformancePrecisionPlannerTest {
 	}
 
 	private static void prepare(Path root) throws Exception {
+		prepare(root, 1_024);
+	}
+
+	private static void prepare(Path root, int schedulerOperations) throws Exception {
 		PressurePerformancePairedBenchmark.main(new String[] {
 				"--mode=prepare", "--root=" + root, "--contract-version=v2",
 				"--baseline-sha=" + "a".repeat(40), "--candidate-sha=" + "b".repeat(40),
 				"--host-state=dedicated", "--hardware-description=test-host", "--enforce=false",
-				"--scheduler-operations=1024", "--scheduler-warmup-operations=512",
+				"--scheduler-operations=" + schedulerOperations,
+				"--scheduler-warmup-operations=" + Math.max(512, schedulerOperations / 10),
 				"--scheduler-submitters=4", "--scheduler-read-workers=2", "--scheduler-write-workers=2",
 				"--scheduler-analytical-limit=1", "--scheduler-foreground-capacity=128",
 				"--scheduler-batch-capacity=128", "--scheduler-work-tokens=8",

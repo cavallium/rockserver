@@ -26,12 +26,12 @@ import java.util.regex.Pattern;
  */
 public final class PressurePerformancePrecisionPlanner {
 
-	static final String SCHEMA = "rockserver-pressure-performance-precision-plan-v1";
-	static final String NEXT_RUN_SCHEMA = "rockserver-pressure-performance-next-run-v1";
+	static final String SCHEMA = "rockserver-pressure-performance-precision-plan-v2";
 	static final double GLOBAL_PASS_POWER = 0.90d;
 	static final double CRITICAL_BETA_BUDGET = 0.03d;
 	static final double STANDARD_BETA_BUDGET = 0.07d;
 	static final int MAXIMUM_PLANNED_PAIRS = 1_000_000;
+	static final long MAXIMUM_PER_WORKER_DURATION_SCALE = 64L;
 	private static final String JSON_FILE = "precision-plan.json";
 	private static final String MARKDOWN_FILE = "precision-plan.md";
 	private static final String NEXT_RUN_FILE = "next-run-v2.properties";
@@ -109,18 +109,26 @@ public final class PressurePerformancePrecisionPlanner {
 			metrics.add(metricPlan(item.suite(), item.specification(), baseline, candidate,
 					critical, critical ? criticalTargetPower : standardTargetPower));
 		}
-		metrics.sort(Comparator.comparingInt(MetricPlan::requiredFixedPairs).reversed()
-				.thenComparing(Comparator.comparingDouble(MetricPlan::fixedPairDurationScale).reversed())
+		double schedulerRequestedScale = maximumScale(metrics, PressureBenchmarkArtifact.Suite.SCHEDULER);
+		double signalRequestedScale = maximumScale(metrics, PressureBenchmarkArtifact.Suite.SIGNAL);
+		long schedulerScaleInteger = boundedDurationScale(prepared,
+				PressureBenchmarkArtifact.Suite.SCHEDULER, schedulerRequestedScale);
+		long signalScaleInteger = boundedDurationScale(prepared,
+				PressureBenchmarkArtifact.Suite.SIGNAL, signalRequestedScale);
+		metrics = metrics.stream().map(metric -> metric.withRecommendedDuration(
+				metric.suite().equals(PressureBenchmarkArtifact.Suite.SCHEDULER.value)
+						? schedulerScaleInteger : signalScaleInteger)).collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+		metrics.sort(Comparator.comparingInt(MetricPlan::requiredPairsAtRecommendedDuration).reversed()
+				.thenComparing(Comparator.comparingInt(MetricPlan::requiredFixedPairs).reversed())
 				.thenComparing(Comparator.comparing(MetricPlan::critical).reversed())
 				.thenComparing(MetricPlan::name));
 
-		double schedulerScale = maximumScale(metrics, PressureBenchmarkArtifact.Suite.SCHEDULER);
-		double signalScale = maximumScale(metrics, PressureBenchmarkArtifact.Suite.SIGNAL);
 		int requiredFixedPairs = metrics.stream().mapToInt(MetricPlan::requiredFixedPairs).max()
 				.orElse(PairedPerformanceContractV2.REQUIRED_PAIRS);
-		long schedulerScaleInteger = ceilingScale(schedulerScale);
-		long signalScaleInteger = ceilingScale(signalScale);
-		var next = NextRun.from(prepared, schedulerScaleInteger, signalScaleInteger);
+		int recommendedFixedPairs = metrics.stream().mapToInt(MetricPlan::requiredPairsAtRecommendedDuration)
+				.max().orElse(PairedPerformanceContractV2.REQUIRED_PAIRS);
+		var next = NextRun.from(prepared, recommendedFixedPairs,
+				schedulerScaleInteger, signalScaleInteger);
 		var component = componentEvidence(baselineClasses, candidateClasses);
 		String resultsSha = sha256(Files.readAllBytes(root.resolve("results.json")));
 		String scheduleSha = sha256(Files.readAllBytes(root.resolve("schedule.tsv")));
@@ -128,14 +136,13 @@ public final class PressurePerformancePrecisionPlanner {
 
 		Files.writeString(root.resolve(JSON_FILE), json(prepared, metrics, stochasticMetrics,
 				criticalMetrics, criticalTargetPower, standardTargetPower,
-				requiredFixedPairs, schedulerScale, signalScale, next, component,
+				requiredFixedPairs, schedulerRequestedScale, signalRequestedScale, next, component,
 				resultsSha, scheduleSha, metadataSha), StandardOpenOption.CREATE_NEW);
 		Files.writeString(root.resolve(MARKDOWN_FILE), markdown(metrics, stochasticMetrics,
 				criticalMetrics, criticalTargetPower, standardTargetPower,
-				requiredFixedPairs, schedulerScale, signalScale, next, component),
+				requiredFixedPairs, schedulerRequestedScale, signalRequestedScale, next, component),
 				StandardOpenOption.CREATE_NEW);
-		Files.writeString(root.resolve(NEXT_RUN_FILE), next.properties(prepared.configurationSha256(),
-				resultsSha), StandardOpenOption.CREATE_NEW);
+		Files.writeString(root.resolve(NEXT_RUN_FILE), next.properties(), StandardOpenOption.CREATE_NEW);
 	}
 
 	private static Measurements readMeasurements(PressurePerformancePairedBenchmark.Prepared prepared)
@@ -244,7 +251,9 @@ public final class PressurePerformancePrecisionPlanner {
 				currentPower,
 				targetPower,
 				requiredPairs,
-				durationScale);
+				durationScale,
+				1L,
+				requiredPairs);
 	}
 
 	private static boolean isSchedulingQualityMetric(String name) {
@@ -346,11 +355,19 @@ public final class PressurePerformancePrecisionPlanner {
 				.mapToDouble(MetricPlan::fixedPairDurationScale).max().orElse(1.0d);
 	}
 
-	private static long ceilingScale(double scale) {
-		if (!Double.isFinite(scale) || scale > Long.MAX_VALUE) {
+	private static long boundedDurationScale(PressurePerformancePairedBenchmark.Prepared prepared,
+			PressureBenchmarkArtifact.Suite suite,
+			double requestedScale) {
+		if (!Double.isFinite(requestedScale) || requestedScale > Long.MAX_VALUE) {
 			throw new IllegalArgumentException("Required duration scaling is not executable");
 		}
-		return Math.max(1L, (long) Math.ceil(scale));
+		long fieldLimit = suite == PressureBenchmarkArtifact.Suite.SCHEDULER
+				? Integer.MAX_VALUE / (long) prepared.schedulerOperations()
+				: Math.min(Long.MAX_VALUE / prepared.signalMeasuredColumns(),
+						Math.min(Integer.MAX_VALUE / (long) prepared.signalMinimumEvaluations(),
+								Integer.MAX_VALUE / (long) prepared.signalMaximumEvaluations()));
+		long maximum = Math.max(1L, Math.min(MAXIMUM_PER_WORKER_DURATION_SCALE, fieldLimit));
+		return Math.max(1L, Math.min(maximum, (long) Math.ceil(requestedScale)));
 	}
 
 	private static double[] values(List<Map<String, Double>> runs, String metric) {
@@ -414,7 +431,10 @@ public final class PressurePerformancePrecisionPlanner {
 				.append("  \"critical_target_per_metric_power\": ").append(format(criticalTargetPower)).append(",\n")
 				.append("  \"standard_target_per_metric_power\": ").append(format(standardTargetPower)).append(",\n")
 				.append("  \"required_fixed_pairs_same_duration\": ").append(requiredFixedPairs).append(",\n")
-				.append("  \"fixed_pairs\": 10,\n  \"adaptive_stopping\": false,\n")
+				.append("  \"maximum_per_worker_duration_scale\": ")
+				.append(MAXIMUM_PER_WORKER_DURATION_SCALE).append(",\n")
+				.append("  \"source_fixed_pairs\": ").append(prepared.fixedPairs())
+				.append(",\n  \"adaptive_stopping\": false,\n")
 				.append("  \"throughput_minimum_ratio\": 0.99,\n  \"cost_maximum_ratio\": 1.02,\n")
 				.append("  \"scheduler_duration_scale\": ").append(format(schedulerScale)).append(",\n")
 				.append("  \"signal_duration_scale\": ").append(format(signalScale)).append(",\n")
@@ -456,15 +476,21 @@ public final class PressurePerformancePrecisionPlanner {
 				.append("- Critical / standard beta budgets: `0.03` / `0.07`\n")
 				.append("- Critical / standard per-metric power: `").append(format(criticalTargetPower))
 				.append("` / `").append(format(standardTargetPower)).append("`\n")
-				.append("- Fixed pairs / adaptive stopping: `10` / `false`\n")
+				.append("- Source fixed pairs / adaptive stopping: `10` / `false`\n")
+				.append("- Maximum per-worker duration scale: `")
+				.append(MAXIMUM_PER_WORKER_DURATION_SCALE).append("`\n")
 				.append("- Required fixed pairs at unchanged duration: `").append(requiredFixedPairs).append("`\n")
-				.append("- Scheduler / signal duration scale: `").append(format(schedulerScale))
+				.append("- Requested scheduler / signal duration scale: `").append(format(schedulerScale))
 				.append("` / `").append(format(signalScale)).append("`\n")
+				.append("- Recommended fixed pairs: `").append(next.fixedPairs()).append("`\n")
+				.append("- Bounded scheduler / signal duration scale: `")
+				.append(next.schedulerDurationScale()).append("` / `")
+				.append(next.signalDurationScale()).append("`\n")
 				.append("- Signal evaluator component bytes equal: `").append(component.equal())
 				.append("` (provenance only; never used for PASS)\n\n")
 				.append("## Limiting metrics\n\n")
-				.append("| Metric | Suite | Critical | Paired-log SD | Current NI power | Required pairs | Duration scale |\n")
-				.append("| --- | --- | --- | ---: | ---: | ---: | ---: |\n");
+				.append("| Metric | Suite | Critical | Paired-log SD | Current NI power | Same-duration pairs | Bounded duration | Final pairs |\n")
+				.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
 		for (int index = 0; index < Math.min(20, metrics.size()); index++) {
 			var metric = metrics.get(index);
 			text.append("| `").append(metric.name()).append("` | ").append(metric.suite()).append(" | ")
@@ -472,10 +498,11 @@ public final class PressurePerformancePrecisionPlanner {
 					.append(format(metric.pairedLogStandardDeviation())).append(" | ")
 					.append(format(metric.currentNonInferiorityPower())).append(" | ")
 					.append(metric.requiredFixedPairs()).append(" | ")
-					.append(format(metric.fixedPairDurationScale())).append(" |\n");
+					.append(metric.recommendedDurationScale()).append(" | ")
+					.append(metric.requiredPairsAtRecommendedDuration()).append(" |\n");
 		}
 		return text.append("\n## Fixed next run\n\n```properties\n")
-				.append(next.properties("<source-configuration-sha256>", "<source-results-sha256>"))
+				.append(next.properties())
 				.append("```\n").toString();
 	}
 
@@ -531,7 +558,17 @@ public final class PressurePerformancePrecisionPlanner {
 	                  double currentNonInferiorityPower,
 	                  double targetPower,
 	                  int requiredFixedPairs,
-	                  double fixedPairDurationScale) {
+	                  double fixedPairDurationScale,
+	                  long recommendedDurationScale,
+	                  int requiredPairsAtRecommendedDuration) {
+
+		private MetricPlan withRecommendedDuration(long durationScale) {
+			int pairs = requiredPairs(pairedLogStandardDeviation / Math.sqrt(durationScale),
+					marginLog, targetPower);
+			return new MetricPlan(suite, name, critical, direction, ratioOffset,
+					pairedLogStandardDeviation, marginLog, currentNonInferiorityPower, targetPower,
+					requiredFixedPairs, fixedPairDurationScale, durationScale, pairs);
+		}
 
 		private String json() {
 			return "{\"suite\":\"" + suite + "\",\"name\":\"" + name
@@ -542,7 +579,10 @@ public final class PressurePerformancePrecisionPlanner {
 					+ ",\"current_ni_power\":" + format(currentNonInferiorityPower)
 					+ ",\"target_power\":" + format(targetPower)
 					+ ",\"required_fixed_pairs\":" + requiredFixedPairs
-					+ ",\"fixed_pair_duration_scale\":" + format(fixedPairDurationScale) + '}';
+					+ ",\"fixed_pair_duration_scale\":" + format(fixedPairDurationScale)
+					+ ",\"recommended_duration_scale\":" + recommendedDurationScale
+					+ ",\"required_pairs_at_recommended_duration\":"
+					+ requiredPairsAtRecommendedDuration + '}';
 		}
 	}
 
@@ -553,7 +593,8 @@ public final class PressurePerformancePrecisionPlanner {
 			boolean usedForDecision) {
 	}
 
-	private record NextRun(long schedulerOperations,
+	private record NextRun(int fixedPairs,
+			long schedulerOperations,
 			long signalMeasuredColumns,
 			long signalMinimumEvaluations,
 			long signalMaximumEvaluations,
@@ -562,6 +603,7 @@ public final class PressurePerformancePrecisionPlanner {
 			PressurePerformancePairedBenchmark.Prepared source) {
 
 		private static NextRun from(PressurePerformancePairedBenchmark.Prepared source,
+				int fixedPairs,
 				long schedulerScale,
 				long signalScale) {
 			long schedulerOperations = Math.multiplyExact((long) source.schedulerOperations(), schedulerScale);
@@ -570,7 +612,8 @@ public final class PressurePerformancePrecisionPlanner {
 			Math.toIntExact(schedulerOperations);
 			Math.toIntExact(signalMinimum);
 			Math.toIntExact(signalMaximum);
-			return new NextRun(schedulerOperations,
+			return new NextRun(fixedPairs,
+					schedulerOperations,
 					Math.multiplyExact(source.signalMeasuredColumns(), signalScale),
 					signalMinimum,
 					signalMaximum,
@@ -580,7 +623,9 @@ public final class PressurePerformancePrecisionPlanner {
 		}
 
 		private String json() {
-			return "{\"contract_version\":\"v2\",\"fixed_pairs\":10,\"adaptive_stopping\":false"
+			return "{\"contract_version\":\"v2.1\",\"fixed_pairs\":" + fixedPairs
+					+ ",\"fresh_processes\":" + Math.multiplyExact(fixedPairs, 4)
+					+ ",\"adaptive_stopping\":false"
 					+ ",\"scheduler_duration_scale\":" + schedulerDurationScale
 					+ ",\"signal_duration_scale\":" + signalDurationScale
 					+ ",\"scheduler_operations\":" + schedulerOperations
@@ -589,18 +634,14 @@ public final class PressurePerformancePrecisionPlanner {
 					+ ",\"signal_maximum_evaluations\":" + signalMaximumEvaluations + '}';
 		}
 
-		private String properties(String sourceConfigurationSha, String sourceResultsSha) {
-			return "schema=" + NEXT_RUN_SCHEMA + '\n'
-					+ "source-configuration-sha256=" + sourceConfigurationSha + '\n'
-					+ "source-results-sha256=" + sourceResultsSha + '\n'
-					+ "contract-version=v2\nfixed-pairs=10\nadaptive-stopping=false\n"
-					+ "family-wise-alpha=0.05\nthroughput-minimum-ratio=0.99\ncost-maximum-ratio=1.02\n"
-					+ "planning-global-power=0.90\nplanning-critical-beta-budget=0.03\n"
-					+ "planning-standard-beta-budget=0.07\n"
-					+ "planning-critical-metrics=queue-p99,end-to-end-p99,maximum-progress-gap\n"
-					+ "planning-effect=exact-equality\n"
-					+ "scheduler-duration-scale=" + schedulerDurationScale + '\n'
-					+ "signal-duration-scale=" + signalDurationScale + '\n'
+		private String properties() {
+			return "contract-version=v2.1\nfixed-pairs=" + fixedPairs + '\n'
+					+ "planning-duration-scale-cap=" + MAXIMUM_PER_WORKER_DURATION_SCALE + '\n'
+					+ "baseline-sha=" + source.baselineSha() + '\n'
+					+ "candidate-sha=" + source.candidateSha() + '\n'
+					+ "host-state=" + source.hostState() + '\n'
+					+ "hardware-description=" + source.hardwareDescription() + '\n'
+					+ "enforce=" + source.enforce() + '\n'
 					+ "scheduler-operations=" + schedulerOperations + '\n'
 					+ "scheduler-submitters=" + source.schedulerSubmitters() + '\n'
 					+ "scheduler-read-workers=" + source.schedulerReadWorkers() + '\n'
