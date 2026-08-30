@@ -64,7 +64,7 @@ public final class RWScheduler {
 	private final List<ProfiledWorkloadExecutor> pools;
 	private final WorkloadPressureController pressureController;
 	private final SchedulerDeadlineClock deadlineClock;
-	private final ThreadLocal<DeadlineBinding> localDeadlineBinding = new ThreadLocal<>();
+	private final ThreadLocal<DeadlineBindingSlot> localDeadlineBinding = new ThreadLocal<>();
 	private final WorkloadExecutor[][] noDeadlineExecutors;
 
 	public RWScheduler(int readCap, int writeCap, String name) {
@@ -446,16 +446,20 @@ public final class RWScheduler {
 		if (localMonotonicDeadlineNanos == UNBOUND_MONOTONIC_DEADLINE) {
 			throw new IllegalArgumentException("A deadline binding must be resolved before dispatch");
 		}
-		var previous = localDeadlineBinding.get();
-		localDeadlineBinding.set(new DeadlineBinding(context, localMonotonicDeadlineNanos));
+		var slot = localDeadlineBinding.get();
+		if (slot == null) {
+			slot = new DeadlineBindingSlot();
+			localDeadlineBinding.set(slot);
+		}
+		RequestContext previousContext = slot.context;
+		long previousDeadline = slot.localMonotonicDeadlineNanos;
+		slot.context = context;
+		slot.localMonotonicDeadlineNanos = localMonotonicDeadlineNanos;
 		try {
 			return dispatch.get();
 		} finally {
-			if (previous == null) {
-				localDeadlineBinding.remove();
-			} else {
-				localDeadlineBinding.set(previous);
-			}
+			slot.context = previousContext;
+			slot.localMonotonicDeadlineNanos = previousDeadline;
 		}
 	}
 
@@ -466,7 +470,10 @@ public final class RWScheduler {
 				: UNBOUND_MONOTONIC_DEADLINE;
 	}
 
-	private record DeadlineBinding(RequestContext context, long localMonotonicDeadlineNanos) {
+	private static final class DeadlineBindingSlot {
+
+		private @Nullable RequestContext context;
+		private long localMonotonicDeadlineNanos = UNBOUND_MONOTONIC_DEADLINE;
 	}
 
 	private ProfiledWorkloadExecutor pool(WorkloadProfile profile, OperationFamily family) {
