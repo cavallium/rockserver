@@ -242,6 +242,23 @@ public final class AdversarialBatchLivenessBenchmark {
 			long nondispatchablePhaseNanos,
 			long pressureIntervalNanos) {
 
+		public Result {
+			if (usefulReadCompletions < 0L || maximumReadZeroProgressGapNanos <= 0L
+					|| writeFairTurnDelayNanos < 0L || nondispatchablePhaseNanos <= 0L
+					|| pressureIntervalNanos <= 0L
+					|| maximumReadZeroProgressGapNanos > nondispatchablePhaseNanos
+					|| !Double.isFinite(usefulReadThroughputPerSecond)
+					|| usefulReadThroughputPerSecond < 0.0d) {
+				throw new IllegalArgumentException("invalid adversarial liveness result");
+			}
+			double expectedThroughput = usefulReadCompletions * 1_000_000_000.0d
+					/ nondispatchablePhaseNanos;
+			double tolerance = Math.max(1.0e-9d, expectedThroughput * 1.0e-12d);
+			if (Math.abs(usefulReadThroughputPerSecond - expectedThroughput) > tolerance) {
+				throw new IllegalArgumentException("throughput does not match completed useful work");
+			}
+		}
+
 		public void assertBaselineStall() {
 			require(topologyProven, "adversarial topology was not proven");
 			require(usefulReadCompletions == 0L,
@@ -251,6 +268,10 @@ public final class AdversarialBatchLivenessBenchmark {
 		}
 
 		public void assertCandidateWorkConserving(Duration maximumGap, double minimumThroughput) {
+			if (maximumGap == null || maximumGap.isZero() || maximumGap.isNegative()
+					|| !Double.isFinite(minimumThroughput) || minimumThroughput <= 0.0d) {
+				throw new IllegalArgumentException("positive candidate liveness bounds are required");
+			}
 			require(topologyProven, "adversarial topology was not proven");
 			require(usefulReadCompletions >= 2L,
 					"candidate did not make repeated READ progress while WRITE was nondispatchable");
