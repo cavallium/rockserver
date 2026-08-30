@@ -26,17 +26,20 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 	private final it.cavallium.rockserver.core.common.WorkloadProfile profile;
 	private final it.cavallium.rockserver.core.common.OperationFamily family;
 	private final long deadlineEpochMillis;
+	private final long localMonotonicDeadlineNanos;
 	private final Set<IndexedWorker> workers = new HashSet<>();
 	private volatile boolean disposed;
 
 	IndexedWorkloadScheduler(ProfiledWorkloadExecutor executor,
 			it.cavallium.rockserver.core.common.WorkloadProfile profile,
 			it.cavallium.rockserver.core.common.OperationFamily family,
-			long deadlineEpochMillis) {
+			long deadlineEpochMillis,
+			long localMonotonicDeadlineNanos) {
 		this.executor = Objects.requireNonNull(executor, "executor");
 		this.profile = Objects.requireNonNull(profile, "profile");
 		this.family = Objects.requireNonNull(family, "family");
 		this.deadlineEpochMillis = deadlineEpochMillis;
+		this.localMonotonicDeadlineNanos = localMonotonicDeadlineNanos;
 	}
 
 	RWScheduler.WorkloadExecutor workloadExecutor() {
@@ -53,6 +56,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		return executor.executeWhenCapacity(profile,
 				family,
 				deadlineEpochMillis,
+				localMonotonicDeadlineNanos,
 				estimatedBytes,
 				command);
 	}
@@ -67,13 +71,23 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 
 	@Override
 	public void execute(Runnable command, long estimatedBytes) {
-		executor.execute(profile, family, deadlineEpochMillis, estimatedBytes, command);
+		executor.execute(profile,
+				family,
+				deadlineEpochMillis,
+				localMonotonicDeadlineNanos,
+				estimatedBytes,
+				command);
 	}
 
 	@Override
 	public RWScheduler.CooperativeHandle executeCooperatively(RWScheduler.CooperativeTask command,
 			long estimatedBytes) {
-		return executor.executeCooperatively(profile, family, deadlineEpochMillis, estimatedBytes, command);
+		return executor.executeCooperatively(profile,
+				family,
+				deadlineEpochMillis,
+				localMonotonicDeadlineNanos,
+				estimatedBytes,
+				command);
 	}
 
 	private boolean removeQueuedTask(Runnable command) {

@@ -63,8 +63,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			WorkloadProfile.CONTROL,
 			WorkloadProfile.PHYSICAL_MAINTENANCE
 	};
-	private static final Comparator<WorkloadTask> DEADLINE_ORDER = Comparator
+	private static final Comparator<WorkloadTask> EDF_ORDER = Comparator
 			.comparingLong(WorkloadTask::deadlineEpochMillis)
+			.thenComparingLong(WorkloadTask::deadlineSequence);
+	private static final Comparator<WorkloadTask> EXPIRY_ORDER = Comparator
+			.comparingLong(WorkloadTask::monotonicDeadlineNanos)
 			.thenComparingLong(WorkloadTask::deadlineSequence);
 	private static final CounterHandle INERT_COUNTER = _ -> {};
 	private static final TimerHandle INERT_TIMER = _ -> {};
@@ -82,7 +85,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final TaskHeap deadlineQueue = new TaskHeap(true);
 	private final ArrayDeque<DeferredAdmission> deferredAdmissions = new ArrayDeque<>();
 	private final PriorityQueue<DeferredAdmission> deferredDeadlines = new PriorityQueue<>(Comparator
-			.comparingLong((DeferredAdmission deferred) -> deferred.deadlineEpochMillis)
+			.comparingLong((DeferredAdmission deferred) -> deferred.monotonicDeadlineNanos)
 			.thenComparingLong(deferred -> deferred.sequence));
 	private final CancellationIndex cancellationIndex = new CancellationIndex();
 	private int indexedDeadlineCount;
@@ -217,6 +220,20 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	                               long deadlineEpochMillis,
 	                               long estimatedBytes,
 	                               Runnable command) {
+		return executeWhenCapacity(profile,
+				family,
+				deadlineEpochMillis,
+				RWScheduler.UNBOUND_MONOTONIC_DEADLINE,
+				estimatedBytes,
+				command);
+	}
+
+	Disposable executeWhenCapacity(WorkloadProfile profile,
+	                               OperationFamily family,
+	                               long deadlineEpochMillis,
+	                               long localMonotonicDeadlineNanos,
+	                               long estimatedBytes,
+	                               Runnable command) {
 		Objects.requireNonNull(command, "command");
 		if (profile != WorkloadProfile.BATCH) {
 			throw new IllegalArgumentException("Deferred admission is reserved for restartable BATCH work");
@@ -225,16 +242,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			throw new IllegalArgumentException("Deferred workload tasks must handle asynchronous rejection");
 		}
 		int cost = taskCost(estimatedBytes);
+		long monotonicDeadlineNanos = deadlineEpochMillis == RequestContext.NO_DEADLINE
+				? Long.MAX_VALUE
+				: boundOrComputeDeadline(deadlineEpochMillis, localMonotonicDeadlineNanos);
 		var taskMetrics = metrics(profile, family);
 		DeferredAdmission deferred = null;
 		RuntimeException admissionFailure = null;
 		RWScheduler.TerminalOutcome admissionOutcome = null;
 		lock.lock();
 		try {
-			long nowMillis = deadlineEpochMillis == RequestContext.NO_DEADLINE
+			long nowNanos = deadlineEpochMillis == RequestContext.NO_DEADLINE
 					? 0L
-					: deadlineClock.epochMillis();
-			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
+					: deadlineClock.monotonicNanos();
+			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowNanos >= monotonicDeadlineNanos) {
 				admissionFailure = deadlineFailure("Workload deadline expired before deferred admission");
 				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
 			} else if (shutdown) {
@@ -251,6 +271,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 							profile,
 							family,
 							deadlineEpochMillis,
+							monotonicDeadlineNanos,
 								nextSequenceUnsafe(),
 							metricsTimestamp(taskMetrics),
 							cost,
@@ -281,17 +302,48 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return Objects.requireNonNull(deferred, "Accepted deferred workload task");
 	}
 
+	private long boundOrComputeDeadline(long deadlineEpochMillis, long localMonotonicDeadlineNanos) {
+		return localMonotonicDeadlineNanos == RWScheduler.UNBOUND_MONOTONIC_DEADLINE
+				? deadlineClock.monotonicDeadlineNanos(deadlineEpochMillis)
+				: localMonotonicDeadlineNanos;
+	}
+
 	RWScheduler.WorkloadExecutor view(WorkloadProfile profile,
 	                                  OperationFamily family,
 	                                  long deadlineEpochMillis) {
+		return view(profile, family, deadlineEpochMillis, RWScheduler.UNBOUND_MONOTONIC_DEADLINE);
+	}
+
+	RWScheduler.WorkloadExecutor view(WorkloadProfile profile,
+	                                  OperationFamily family,
+	                                  long deadlineEpochMillis,
+	                                  long localMonotonicDeadlineNanos) {
 		Objects.requireNonNull(profile, "profile");
 		Objects.requireNonNull(family, "family");
-		return new WorkloadExecutorView(this, profile, family, deadlineEpochMillis);
+		return new WorkloadExecutorView(this,
+				profile,
+				family,
+				deadlineEpochMillis,
+				localMonotonicDeadlineNanos);
 	}
 
 	RWScheduler.CooperativeHandle executeCooperatively(WorkloadProfile profile,
 	                                                   OperationFamily family,
 	                                                   long deadlineEpochMillis,
+	                                                   long estimatedBytes,
+	                                                   RWScheduler.CooperativeTask command) {
+		return executeCooperatively(profile,
+				family,
+				deadlineEpochMillis,
+				RWScheduler.UNBOUND_MONOTONIC_DEADLINE,
+				estimatedBytes,
+				command);
+	}
+
+	RWScheduler.CooperativeHandle executeCooperatively(WorkloadProfile profile,
+	                                                   OperationFamily family,
+	                                                   long deadlineEpochMillis,
+	                                                   long localMonotonicDeadlineNanos,
 	                                                   long estimatedBytes,
 	                                                   RWScheduler.CooperativeTask command) {
 		Objects.requireNonNull(command, "command");
@@ -302,6 +354,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					"Cooperative execution requires ANALYTICAL, INGEST, or BATCH work");
 		}
 		int cost = taskCost(estimatedBytes);
+		long monotonicDeadlineNanos = deadlineEpochMillis == RequestContext.NO_DEADLINE
+				? Long.MAX_VALUE
+				: boundOrComputeDeadline(deadlineEpochMillis, localMonotonicDeadlineNanos);
 		var taskMetrics = metrics(profile, family);
 		WorkloadTask task = null;
 		RuntimeException admissionFailure = null;
@@ -311,14 +366,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		lock.lock();
 		try {
 			boolean hasQueuedDeadlines = indexedDeadlineCount != 0;
-			long nowMillis = deadlineEpochMillis != RequestContext.NO_DEADLINE || hasQueuedDeadlines
-					? deadlineClock.epochMillis()
+			long nowNanos = deadlineEpochMillis != RequestContext.NO_DEADLINE || hasQueuedDeadlines
+					? deadlineClock.monotonicNanos()
 					: 0L;
 			if (hasQueuedDeadlines) {
-				terminalActions = expireDueUnsafe(nowMillis, terminalActions);
+				terminalActions = expireDueUnsafe(nowNanos, terminalActions);
 			}
 			recordSubmissionAttemptUnsafe(profile);
-			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
+			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowNanos >= monotonicDeadlineNanos) {
 				admissionFailure = deadlineFailure("Workload deadline expired before admission");
 				admissionResult = AdmissionResult.DEADLINE;
 				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
@@ -345,6 +400,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						profile,
 						family,
 						deadlineEpochMillis,
+						monotonicDeadlineNanos,
 							nextSequenceUnsafe(),
 						metricsTimestamp(taskMetrics),
 						cost,
@@ -386,8 +442,25 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	             long deadlineEpochMillis,
 	             long estimatedBytes,
 	             Runnable command) {
+		execute(profile,
+				family,
+				deadlineEpochMillis,
+				RWScheduler.UNBOUND_MONOTONIC_DEADLINE,
+				estimatedBytes,
+				command);
+	}
+
+	void execute(WorkloadProfile profile,
+	             OperationFamily family,
+	             long deadlineEpochMillis,
+	             long localMonotonicDeadlineNanos,
+	             long estimatedBytes,
+	             Runnable command) {
 		Objects.requireNonNull(command, "command");
 		int cost = taskCost(estimatedBytes);
+		long monotonicDeadlineNanos = deadlineEpochMillis == RequestContext.NO_DEADLINE
+				? Long.MAX_VALUE
+				: boundOrComputeDeadline(deadlineEpochMillis, localMonotonicDeadlineNanos);
 		var taskMetrics = metrics(profile, family);
 		var cancellationTask = command instanceof CancellationTrackedTask trackedTask
 				? trackedTask
@@ -399,14 +472,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		lock.lock();
 		try {
 			boolean hasQueuedDeadlines = indexedDeadlineCount != 0;
-			long nowMillis = deadlineEpochMillis != RequestContext.NO_DEADLINE || hasQueuedDeadlines
-					? deadlineClock.epochMillis()
+			long nowNanos = deadlineEpochMillis != RequestContext.NO_DEADLINE || hasQueuedDeadlines
+					? deadlineClock.monotonicNanos()
 					: 0L;
 			if (hasQueuedDeadlines) {
-				terminalActions = expireDueUnsafe(nowMillis, terminalActions);
+				terminalActions = expireDueUnsafe(nowNanos, terminalActions);
 			}
 			recordSubmissionAttemptUnsafe(profile);
-			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
+			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowNanos >= monotonicDeadlineNanos) {
 				admissionFailure = deadlineFailure("Workload deadline expired before admission");
 				admissionResult = AdmissionResult.DEADLINE;
 				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
@@ -432,6 +505,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				var task = WorkloadTask.normal(profile,
 						family,
 						deadlineEpochMillis,
+						monotonicDeadlineNanos,
 							nextSequenceUnsafe(),
 						metricsTimestamp(taskMetrics),
 						cost,
@@ -440,7 +514,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						taskMetrics);
 				boolean becomesDeadlineHead = task.hasDeadline()
 						&& (indexedDeadlineCount == 0
-						|| DEADLINE_ORDER.compare(task, earliestDeadlineUnsafe()) < 0);
+						|| EXPIRY_ORDER.compare(task, earliestDeadlineUnsafe()) < 0);
 				enqueueUnsafe(task);
 				incrementOutstandingUnsafe(profile);
 				admitCompetitionUnsafe(task);
@@ -621,17 +695,17 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				boolean stop = false;
 				lock.lock();
 				try {
-					long nowMillis = 0L;
+					long nowNanos = 0L;
 					if (indexedDeadlineCount != 0 || !deferredDeadlines.isEmpty()) {
-						nowMillis = deadlineClock.epochMillis();
+						nowNanos = deadlineClock.monotonicNanos();
 					}
 					if (indexedDeadlineCount != 0) {
-						expireDueUnsafe(nowMillis, terminalActions);
+						expireDueUnsafe(nowNanos, terminalActions);
 					}
 					if (!deferredDeadlines.isEmpty()) {
-						expireDeferredDueUnsafe(nowMillis, terminalActions);
+						expireDeferredDueUnsafe(nowNanos, terminalActions);
 					}
-					task = dispatchUnsafe(nowMillis, terminalActions);
+					task = dispatchUnsafe(nowNanos, terminalActions);
 					if (task == null && shutdown && queuedTotal == 0 && cooperativeTaskCount == 0) {
 						stop = true;
 					} else if (task == null && terminalActions.isEmpty()) {
@@ -703,30 +777,21 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (indexedDeadlineCount == 0 && deferredDeadlines.isEmpty()) {
 			return Long.MAX_VALUE;
 		}
-		long earliestDeadlineMillis = indexedDeadlineCount == 0
+		long earliestDeadlineNanos = indexedDeadlineCount == 0
 				? Long.MAX_VALUE
-				: earliestDeadlineUnsafe().deadlineEpochMillis();
+				: earliestDeadlineUnsafe().monotonicDeadlineNanos();
 		if (!deferredDeadlines.isEmpty()) {
-			earliestDeadlineMillis = Math.min(earliestDeadlineMillis,
-					Objects.requireNonNull(deferredDeadlines.peek()).deadlineEpochMillis);
+			earliestDeadlineNanos = Math.min(earliestDeadlineNanos,
+					Objects.requireNonNull(deferredDeadlines.peek()).monotonicDeadlineNanos);
 		}
-		long remainingMillis = earliestDeadlineMillis - deadlineClock.epochMillis();
-		return remainingMillis <= 0L ? 0L : TimeUnit.MILLISECONDS.toNanos(remainingMillis);
+		return deadlineClock.remainingNanos(earliestDeadlineNanos);
 	}
 
 	private WorkloadTask earliestDeadlineUnsafe() {
 		if (indexedDeadlineCount == 0) {
 			throw new IllegalStateException("No indexed workload deadline");
 		}
-		var latencyTask = latencyQueue.isEmpty() ? null : latencyQueue.first();
-		var otherTask = deadlineQueue.isEmpty() ? null : deadlineQueue.first();
-		if (latencyTask == null) {
-			return Objects.requireNonNull(otherTask, "Missing indexed workload deadline");
-		}
-		if (otherTask == null) {
-			return latencyTask;
-		}
-		return DEADLINE_ORDER.compare(latencyTask, otherTask) < 0 ? latencyTask : otherTask;
+		return deadlineQueue.first();
 	}
 
 	private void incrementIndexedDeadlineCountUnsafe() {
@@ -743,7 +808,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		indexedDeadlineCount--;
 	}
 
-	private @Nullable WorkloadTask dispatchUnsafe(long nowMillis,
+	private @Nullable WorkloadTask dispatchUnsafe(long nowNanos,
 	                                              List<TerminalAction> terminalActions) {
 		boolean batchEligible = true;
 		while (queuedTotal > 0) {
@@ -756,7 +821,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					&& cancelSelectedUnsafe(task, dispatchCancellation, terminalActions)) {
 				continue;
 			}
-			if (task.hasDeadline() && nowMillis >= task.deadlineEpochMillis()) {
+			if (task.hasDeadline() && nowNanos >= task.monotonicDeadlineNanos()) {
 				unlinkUnsafe(task);
 				discardSelectionUnsafe(task);
 				terminateUnsafe(task,
@@ -1606,12 +1671,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return capacities[profile.ordinal()];
 	}
 
-	private @Nullable List<TerminalAction> expireDueUnsafe(long nowMillis,
+	private @Nullable List<TerminalAction> expireDueUnsafe(long nowNanos,
 	                                                       @Nullable List<TerminalAction> terminalActions) {
 		boolean expired = false;
 		while (indexedDeadlineCount != 0) {
 			var task = earliestDeadlineUnsafe();
-			if (nowMillis < task.deadlineEpochMillis()) {
+			if (nowNanos < task.monotonicDeadlineNanos()) {
 				if (expired) {
 					refreshPreemptionUnsafe();
 				}
@@ -1658,10 +1723,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return terminalActions;
 	}
 
-	private void expireDeferredDueUnsafe(long nowMillis, List<TerminalAction> terminalActions) {
+	private void expireDeferredDueUnsafe(long nowNanos, List<TerminalAction> terminalActions) {
 		while (!deferredDeadlines.isEmpty()) {
 			var deferred = Objects.requireNonNull(deferredDeadlines.peek());
-			if (nowMillis < deferred.deadlineEpochMillis) {
+			if (nowNanos < deferred.monotonicDeadlineNanos) {
 				return;
 			}
 			deferredDeadlines.remove();
@@ -1698,6 +1763,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			var task = WorkloadTask.normal(profile,
 					deferred.family,
 					deferred.deadlineEpochMillis,
+					deferred.monotonicDeadlineNanos,
 					deferred.sequence,
 					deferred.enqueuedNanos,
 					deferred.cost,
@@ -1723,7 +1789,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			Objects.requireNonNull(queues[profileIndex], "Missing workload queue").addLast(task);
 		}
 		if (task.hasDeadline()) {
-			if (!task.hasProfile(WorkloadProfile.LATENCY) && !deadlineQueue.add(task)) {
+			if (!deadlineQueue.add(task)) {
 				throw new IllegalStateException("Duplicate workload deadline sequence " + task.sequence());
 			}
 			incrementIndexedDeadlineCountUnsafe();
@@ -1779,7 +1845,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			throw new IllegalStateException("Workload task is not queued: " + task.sequence());
 		}
 		if (task.hasDeadline()) {
-			if (!task.hasProfile(WorkloadProfile.LATENCY) && !deadlineQueue.remove(task)) {
+			if (!deadlineQueue.remove(task)) {
 				throw new IllegalStateException("Finite-deadline workload task is not deadline-indexed: "
 						+ task.sequence());
 			}
@@ -2502,7 +2568,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private record WorkloadExecutorView(ProfiledWorkloadExecutor owner,
 	                                    WorkloadProfile profile,
 	                                    OperationFamily family,
-	                                    long deadlineEpochMillis) implements RWScheduler.WorkloadExecutor {
+	                                    long deadlineEpochMillis,
+	                                    long localMonotonicDeadlineNanos) implements RWScheduler.WorkloadExecutor {
 
 		private WorkloadExecutorView {
 			Objects.requireNonNull(owner, "owner");
@@ -2520,13 +2587,23 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		@Override
 		public void execute(Runnable command, long estimatedBytes) {
-			owner.execute(profile, family, deadlineEpochMillis, estimatedBytes, command);
+			owner.execute(profile,
+					family,
+					deadlineEpochMillis,
+					localMonotonicDeadlineNanos,
+					estimatedBytes,
+					command);
 		}
 
 		@Override
 		public RWScheduler.CooperativeHandle executeCooperatively(RWScheduler.CooperativeTask command,
 		                                                          long estimatedBytes) {
-			return owner.executeCooperatively(profile, family, deadlineEpochMillis, estimatedBytes, command);
+			return owner.executeCooperatively(profile,
+					family,
+					deadlineEpochMillis,
+					localMonotonicDeadlineNanos,
+					estimatedBytes,
+					command);
 		}
 	}
 
@@ -2579,6 +2656,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private final WorkloadProfile profile;
 		private final OperationFamily family;
 		private final long deadlineEpochMillis;
+		private final long monotonicDeadlineNanos;
 		private long sequence;
 		private final long enqueuedNanos;
 		private final int cost;
@@ -2590,6 +2668,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				WorkloadProfile profile,
 				OperationFamily family,
 				long deadlineEpochMillis,
+				long monotonicDeadlineNanos,
 				long sequence,
 				long enqueuedNanos,
 				int cost,
@@ -2599,6 +2678,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			this.profile = profile;
 			this.family = family;
 			this.deadlineEpochMillis = deadlineEpochMillis;
+			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 			this.sequence = sequence;
 			this.enqueuedNanos = enqueuedNanos;
 			this.cost = cost;
@@ -2731,6 +2811,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private static WorkloadTask normal(WorkloadProfile profile,
 		                                   OperationFamily family,
 		                                   long deadlineEpochMillis,
+		                                   long monotonicDeadlineNanos,
 		                                   long sequence,
 		                                   long enqueuedNanos,
 		                                   int cost,
@@ -2741,6 +2822,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				return new LatencyWorkloadTask(profile,
 						family,
 						deadlineEpochMillis,
+						monotonicDeadlineNanos,
 						sequence,
 						enqueuedNanos,
 						cost,
@@ -2752,6 +2834,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				return new DeadlineWorkloadTask(profile,
 						family,
 						deadlineEpochMillis,
+						monotonicDeadlineNanos,
 						sequence,
 						enqueuedNanos,
 						cost,
@@ -2773,6 +2856,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                                                   WorkloadProfile profile,
 		                                                   OperationFamily family,
 		                                                   long deadlineEpochMillis,
+		                                                   long monotonicDeadlineNanos,
 		                                                   long sequence,
 		                                                   long enqueuedNanos,
 		                                                   int cost,
@@ -2783,6 +2867,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						profile,
 						family,
 						deadlineEpochMillis,
+						monotonicDeadlineNanos,
 						sequence,
 						enqueuedNanos,
 						cost,
@@ -2821,6 +2906,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		long deadlineEpochMillis() {
 			return RequestContext.NO_DEADLINE;
+		}
+
+		long monotonicDeadlineNanos() {
+			return Long.MAX_VALUE;
 		}
 
 		private boolean hasDeadline() {
@@ -3097,7 +3186,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (cooperativeTask.requestedTermination != null) {
 				return true;
 			}
-			if (hasDeadline() && cooperativeTask().owner.deadlineClock.epochMillis() >= deadlineEpochMillis()) {
+			if (hasDeadline()
+					&& cooperativeTask().owner.deadlineClock.monotonicNanos() >= monotonicDeadlineNanos()) {
 				CooperativeWorkloadTask.REQUESTED_TERMINATION.compareAndSet(
 						cooperativeTask, null, new RequestedTermination(
 						RWScheduler.TerminalOutcome.DEADLINE,
@@ -3151,11 +3241,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private static final class LatencyWorkloadTask extends WorkloadTask {
 
 		private final long deadlineEpochMillis;
+		private final long monotonicDeadlineNanos;
 		private int latencyHeapIndex = -1;
+		private int deadlineHeapIndex = -1;
 
 		private LatencyWorkloadTask(WorkloadProfile profile,
 		                                OperationFamily family,
 		                                long deadlineEpochMillis,
+		                                long monotonicDeadlineNanos,
 		                                long sequence,
 		                                long enqueuedNanos,
 		                                int cost,
@@ -3171,6 +3264,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					cancellationTask,
 					metrics);
 			this.deadlineEpochMillis = deadlineEpochMillis;
+			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 			if (deadlineEpochMillis != RequestContext.NO_DEADLINE) {
 				markHasDeadline();
 			}
@@ -3179,6 +3273,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		@Override
 		long deadlineEpochMillis() {
 			return deadlineEpochMillis;
+		}
+
+		@Override
+		long monotonicDeadlineNanos() {
+			return monotonicDeadlineNanos;
 		}
 
 		@Override
@@ -3191,16 +3290,28 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			latencyHeapIndex = index;
 		}
 
+		@Override
+		int deadlineHeapIndex() {
+			return deadlineHeapIndex;
+		}
+
+		@Override
+		void deadlineHeapIndex(int index) {
+			deadlineHeapIndex = index;
+		}
+
 	}
 
 	private static final class DeadlineWorkloadTask extends WorkloadTask {
 
 		private final long deadlineEpochMillis;
+		private final long monotonicDeadlineNanos;
 		private int deadlineHeapIndex = -1;
 
 		private DeadlineWorkloadTask(WorkloadProfile profile,
 		                                 OperationFamily family,
 		                                 long deadlineEpochMillis,
+		                                 long monotonicDeadlineNanos,
 		                                 long sequence,
 		                                 long enqueuedNanos,
 		                                 int cost,
@@ -3216,12 +3327,18 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					cancellationTask,
 					metrics);
 			this.deadlineEpochMillis = deadlineEpochMillis;
+			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 			markHasDeadline();
 		}
 
 		@Override
 		long deadlineEpochMillis() {
 			return deadlineEpochMillis;
+		}
+
+		@Override
+		long monotonicDeadlineNanos() {
+			return monotonicDeadlineNanos;
 		}
 
 		@Override
@@ -3299,12 +3416,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private static final class OrderedCooperativeWorkloadTask extends CooperativeWorkloadTask {
 
 		private final long deadlineEpochMillis;
+		private final long monotonicDeadlineNanos;
 		private int deadlineHeapIndex = -1;
 
 		private OrderedCooperativeWorkloadTask(ProfiledWorkloadExecutor owner,
 		                                           WorkloadProfile profile,
-		                                           OperationFamily family,
-		                                           long deadlineEpochMillis,
+		                                       OperationFamily family,
+		                                       long deadlineEpochMillis,
+		                                       long monotonicDeadlineNanos,
 		                                           long sequence,
 		                                           long enqueuedNanos,
 		                                           int cost,
@@ -3319,6 +3438,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					command,
 					metrics);
 			this.deadlineEpochMillis = deadlineEpochMillis;
+			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 			if (deadlineEpochMillis != RequestContext.NO_DEADLINE) {
 				markHasDeadline();
 			}
@@ -3327,6 +3447,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		@Override
 		long deadlineEpochMillis() {
 			return deadlineEpochMillis;
+		}
+
+		@Override
+		long monotonicDeadlineNanos() {
+			return monotonicDeadlineNanos;
 		}
 
 		@Override
@@ -3358,7 +3483,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	/**
-	 * Intrusive binary heap for EDF indexes. The backing reference array is contiguous and grows
+	 * Intrusive binary heap for dispatch or expiry indexes. The backing reference array is contiguous and grows
 	 * only at a new queue high-water mark; task insertion/removal allocates no per-entry tree node.
 	 */
 	private static final class TaskHeap {
@@ -3411,7 +3536,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			var movedTask = Objects.requireNonNull(moved);
 			int parentIndex = (index - 1) >>> 1;
-			if (index > 0 && DEADLINE_ORDER.compare(movedTask, elements[parentIndex]) < 0) {
+			if (index > 0 && compare(movedTask, elements[parentIndex]) < 0) {
 				siftUp(index, movedTask);
 			} else {
 				siftDown(index, movedTask);
@@ -3423,7 +3548,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			while (index > 0) {
 				int parentIndex = (index - 1) >>> 1;
 				var parent = Objects.requireNonNull(elements[parentIndex]);
-				if (DEADLINE_ORDER.compare(task, parent) >= 0) {
+				if (compare(task, parent) >= 0) {
 					break;
 				}
 				elements[index] = parent;
@@ -3442,12 +3567,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				int rightIndex = childIndex + 1;
 				if (rightIndex < size) {
 					var right = Objects.requireNonNull(elements[rightIndex]);
-					if (DEADLINE_ORDER.compare(right, child) < 0) {
+					if (compare(right, child) < 0) {
 						childIndex = rightIndex;
 						child = right;
 					}
 				}
-				if (DEADLINE_ORDER.compare(task, child) <= 0) {
+				if (compare(task, child) <= 0) {
 					break;
 				}
 				elements[index] = child;
@@ -3464,6 +3589,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			int grown = elements.length + (elements.length >>> 1);
 			elements = Arrays.copyOf(elements, Math.max(required, grown));
+		}
+
+		private int compare(WorkloadTask left, WorkloadTask right) {
+			return (deadlineIndex ? EXPIRY_ORDER : EDF_ORDER).compare(left, right);
 		}
 
 		private void collectSequenceOwners(IdentityHashMap<Object, Boolean> target) {

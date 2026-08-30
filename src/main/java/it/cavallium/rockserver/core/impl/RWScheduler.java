@@ -30,6 +30,7 @@ import reactor.core.scheduler.Scheduler;
  * hard worker cap. CONTROL and physical maintenance have isolated pools.</p>
  */
 public final class RWScheduler {
+	static final long UNBOUND_MONOTONIC_DEADLINE = Long.MIN_VALUE;
 
 	public static final int POOL_TELEMETRY_WORKER_COUNT = 0;
 	public static final int POOL_TELEMETRY_WAITING_WORKERS = 1;
@@ -61,6 +62,7 @@ public final class RWScheduler {
 	private final ProfiledWorkloadExecutor physicalPool;
 	private final List<ProfiledWorkloadExecutor> pools;
 	private final WorkloadPressureController pressureController;
+	private final SchedulerDeadlineClock deadlineClock;
 	private final WorkloadExecutor[][] noDeadlineExecutors;
 
 	public RWScheduler(int readCap, int writeCap, String name) {
@@ -85,6 +87,7 @@ public final class RWScheduler {
 		Objects.requireNonNull(name, "name");
 		Objects.requireNonNull(databaseName, "databaseName");
 		Objects.requireNonNull(deadlineClock, "deadlineClock");
+		this.deadlineClock = deadlineClock;
 		if (productionCapacities
 				&& (settings.readParallelism() < WorkloadSettings.MIN_PRODUCTION_DATA_THREADS
 				|| settings.writeParallelism() < WorkloadSettings.MIN_PRODUCTION_DATA_THREADS)) {
@@ -285,6 +288,30 @@ public final class RWScheduler {
 		return executorResolved(profile, family, context.deadlineEpochMillis());
 	}
 
+	/** Server adapter entry retaining an explicitly sidecar-bound monotonic deadline. */
+	public Scheduler scheduler(WorkloadProfile profile,
+			OperationFamily family,
+			long deadlineEpochMillis,
+			long localMonotonicDeadlineNanos) {
+		WorkloadAdmission.validate(profile, family);
+		return schedulerResolved(profile,
+				family,
+				deadlineEpochMillis,
+				localMonotonicDeadlineNanos);
+	}
+
+	/** Server adapter entry retaining an explicitly sidecar-bound monotonic deadline. */
+	public WorkloadExecutor executor(WorkloadProfile profile,
+			OperationFamily family,
+			long deadlineEpochMillis,
+			long localMonotonicDeadlineNanos) {
+		WorkloadAdmission.validate(profile, family);
+		return executorResolved(profile,
+				family,
+				deadlineEpochMillis,
+				localMonotonicDeadlineNanos);
+	}
+
 	/** Server-only scheduling entry for protected CDC/control/physical work. */
 	public Scheduler scheduler(WorkloadProfile profile,
 			OperationFamily family,
@@ -296,7 +323,21 @@ public final class RWScheduler {
 	private Scheduler schedulerResolved(WorkloadProfile profile,
 			OperationFamily family,
 			long deadlineEpochMillis) {
-		return new IndexedWorkloadScheduler(pool(profile, family), profile, family, deadlineEpochMillis);
+		return schedulerResolved(profile,
+				family,
+				deadlineEpochMillis,
+				UNBOUND_MONOTONIC_DEADLINE);
+	}
+
+	private Scheduler schedulerResolved(WorkloadProfile profile,
+			OperationFamily family,
+			long deadlineEpochMillis,
+			long localMonotonicDeadlineNanos) {
+		return new IndexedWorkloadScheduler(pool(profile, family),
+				profile,
+				family,
+				deadlineEpochMillis,
+				localMonotonicDeadlineNanos);
 	}
 
 	/** Server-only executor entry for protected CDC/control/physical work. */
@@ -310,10 +351,33 @@ public final class RWScheduler {
 	private WorkloadExecutor executorResolved(WorkloadProfile profile,
 			OperationFamily family,
 			long deadlineEpochMillis) {
+		return executorResolved(profile,
+				family,
+				deadlineEpochMillis,
+				UNBOUND_MONOTONIC_DEADLINE);
+	}
+
+	private WorkloadExecutor executorResolved(WorkloadProfile profile,
+			OperationFamily family,
+			long deadlineEpochMillis,
+			long localMonotonicDeadlineNanos) {
 		if (deadlineEpochMillis == RequestContext.NO_DEADLINE) {
 			return Objects.requireNonNull(noDeadlineExecutors[profile.ordinal()][family.ordinal()]);
 		}
-		return pool(profile, family).view(profile, family, deadlineEpochMillis);
+		return pool(profile, family).view(profile,
+				family,
+				deadlineEpochMillis,
+				localMonotonicDeadlineNanos);
+	}
+
+	/** Bind an external absolute epoch deadline to this scheduler's monotonic time domain. */
+	public long bindDeadlineEpochMillis(long deadlineEpochMillis) {
+		return deadlineClock.monotonicDeadlineNanos(deadlineEpochMillis);
+	}
+
+	/** Bind an already-monotonic transport budget to this scheduler's time domain. */
+	public long bindDeadlineAfterNanos(long remainingNanos) {
+		return deadlineClock.monotonicDeadlineAfterNanos(remainingNanos);
 	}
 
 	private ProfiledWorkloadExecutor pool(WorkloadProfile profile, OperationFamily family) {

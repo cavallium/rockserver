@@ -13,10 +13,12 @@ final class SchedulerDeadlineClock {
 
 	private final LongSupplier epochMillisSource;
 	private final LongSupplier nanoTimeSource;
+	private final long nanoOrigin;
 
 	private SchedulerDeadlineClock(LongSupplier epochMillisSource, LongSupplier nanoTimeSource) {
 		this.epochMillisSource = Objects.requireNonNull(epochMillisSource, "epochMillisSource");
 		this.nanoTimeSource = Objects.requireNonNull(nanoTimeSource, "nanoTimeSource");
+		this.nanoOrigin = nanoTimeSource.getAsLong();
 	}
 
 	static SchedulerDeadlineClock system() {
@@ -31,7 +33,46 @@ final class SchedulerDeadlineClock {
 		return epochMillisSource.getAsLong();
 	}
 
-	long nanoTime() {
-		return nanoTimeSource.getAsLong();
+	/** Monotonic elapsed nanoseconds since this scheduler clock was created. */
+	long monotonicNanos() {
+		long elapsed = nanoTimeSource.getAsLong() - nanoOrigin;
+		// nanoTime subtraction is valid across signed wrap for every representable interval below
+		// 2^63 ns. A regressing/beyond-lifetime source fails closed instead of granting runtime.
+		return elapsed < 0L ? Long.MAX_VALUE : elapsed;
+	}
+
+	/**
+	 * Bind one external absolute deadline to the monotonic budget visible at admission.
+	 * The returned value is immutable and safe to compare with {@link #monotonicNanos()}.
+	 */
+	long monotonicDeadlineNanos(long deadlineEpochMillis) {
+		long nowEpochMillis = epochMillis();
+		long nowNanos = monotonicNanos();
+		if (deadlineEpochMillis <= nowEpochMillis) {
+			return nowNanos;
+		}
+		long remainingMillis = deadlineEpochMillis - nowEpochMillis;
+		if (remainingMillis < 0L) {
+			remainingMillis = Long.MAX_VALUE;
+		}
+		long remainingNanos = remainingMillis >= Long.MAX_VALUE / 1_000_000L
+				? Long.MAX_VALUE
+				: remainingMillis * 1_000_000L;
+		return deadlineAfterNanos(nowNanos, remainingNanos);
+	}
+
+	long monotonicDeadlineAfterNanos(long remainingNanos) {
+		return deadlineAfterNanos(monotonicNanos(), Math.max(0L, remainingNanos));
+	}
+
+	private static long deadlineAfterNanos(long nowNanos, long remainingNanos) {
+		return remainingNanos >= Long.MAX_VALUE - nowNanos
+				? Long.MAX_VALUE
+				: nowNanos + remainingNanos;
+	}
+
+	long remainingNanos(long monotonicDeadlineNanos) {
+		long nowNanos = monotonicNanos();
+		return monotonicDeadlineNanos <= nowNanos ? 0L : monotonicDeadlineNanos - nowNanos;
 	}
 }
