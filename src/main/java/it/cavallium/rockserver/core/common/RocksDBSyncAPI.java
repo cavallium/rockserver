@@ -115,7 +115,7 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	 * Return RocksDB's unbounded estimate of physical keys in a column.
 	 *
 	 * <p>Unlike {@link #reduceRange(long, long, Keys, Keys, boolean,
-	 * RequestType.RequestReduceRange, long)} with {@link RequestType#entriesCount()}, this method
+	 * RequestType.RequestReduceRange)} with {@link RequestType#entriesCount()}, this method
 	 * is approximate, ignores transaction-local state, and cannot be bounded. For bucketed columns,
 	 * it estimates physical buckets rather than logical entries.</p>
 	 */
