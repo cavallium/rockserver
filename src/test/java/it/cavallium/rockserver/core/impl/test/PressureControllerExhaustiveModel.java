@@ -226,7 +226,12 @@ final class PressureControllerExhaustiveModel {
 				boolean oldValue = competing(action.pool());
 				boolean wasCompeting = readCompeting || writeCompeting;
 				competing(action.pool(), action.value());
-				if (oldValue != action.value()) competitionChanges++;
+				if (oldValue != action.value()) {
+					competitionChanges++;
+					if (pressured && lastCompleted != null && dispatchable(lastCompleted)) {
+						notificationPending = true;
+					}
+				}
 				if (readCompeting || writeCompeting) {
 					competitionPhase = CompetitionPhase.ACTIVE;
 				} else if (wasCompeting) {
@@ -308,8 +313,8 @@ final class PressureControllerExhaustiveModel {
 				pressurePacing,
 				competingWritePacing,
 				notificationPending,
-				fairTurn(Pool.READ),
-				fairTurn(Pool.WRITE));
+				fairTurn(Pool.READ, Time.EARLY),
+				fairTurn(Pool.WRITE, Time.EARLY));
 	}
 
 	void validate() {
@@ -390,7 +395,7 @@ final class PressureControllerExhaustiveModel {
 		if (!pressured) return activePermit == null;
 		return activePermit == null
 				&& (time == Time.LATE || !pressurePacing)
-				&& fairTurn(pool);
+				&& fairTurn(pool, time);
 	}
 
 	private int allowance(Pool pool, Time time) {
@@ -402,9 +407,15 @@ final class PressureControllerExhaustiveModel {
 		return canStart(pool, time) ? 1 : 0;
 	}
 
-	private boolean fairTurn(Pool pool) {
-		return !pressured || lastCompleted == null || lastCompleted != pool
-				|| !dispatchable(pool.other());
+	private boolean fairTurn(Pool pool, Time time) {
+		if (!pressured || lastCompleted == null || lastCompleted != pool
+				|| !dispatchable(pool.other())) {
+			return true;
+		}
+		return activePermit == null
+				&& pool.other() == Pool.WRITE
+				&& competingWritePacing
+				&& time == Time.EARLY;
 	}
 
 	private void expireCompetition() {

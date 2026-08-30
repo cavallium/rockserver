@@ -250,6 +250,33 @@ class WorkloadPressureControllerTest {
 		controller.finish(firstWrite, RWScheduler.Pool.WRITE);
 	}
 
+	@Test
+	void fairnessDoesNotReserveCapacityForACompetitionSaturatedPeer() throws Exception {
+		var controller = Controller.create(
+				2,
+				2,
+				1,
+				Duration.ofNanos(1),
+				Duration.ofSeconds(30),
+				Duration.ofSeconds(30));
+		controller.setPressured(true);
+		controller.setCompeting(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, true);
+
+		var write = controller.requireStart(RWScheduler.Pool.WRITE, ELIGIBLE_TIME);
+		var read = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
+		controller.finish(read, RWScheduler.Pool.READ);
+
+		assertEquals(1, controller.allowance(RWScheduler.Pool.READ, ELIGIBLE_TIME),
+				"fairness must not idle a global slot for a WRITE peer already at its competition cap");
+		assertEquals(0L, controller.waitNanos(RWScheduler.Pool.READ, ELIGIBLE_TIME),
+				"the eligible READ pool must not park behind an impossible handoff");
+		var replacement = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
+		controller.finish(replacement, RWScheduler.Pool.READ);
+		controller.finish(write, RWScheduler.Pool.WRITE);
+	}
+
 	private static final class Controller {
 
 		private final Object instance;
@@ -314,6 +341,20 @@ class WorkloadPressureControllerTest {
 		                         Duration pressureInterval,
 		                         Duration competitionInterval,
 		                         Duration competitionHold) throws ReflectiveOperationException {
+			return create(pressuredMaximumActive,
+					4,
+					4,
+					pressureInterval,
+					competitionInterval,
+					competitionHold);
+		}
+
+		static Controller create(int pressuredMaximumActive,
+		                         int competingMaximumActiveRead,
+		                         int competingMaximumActiveWrite,
+		                         Duration pressureInterval,
+		                         Duration competitionInterval,
+		                         Duration competitionHold) throws ReflectiveOperationException {
 			var type = Class.forName("it.cavallium.rockserver.core.impl.WorkloadPressureController");
 			var constructor = type.getDeclaredConstructor(
 					int.class,
@@ -324,8 +365,8 @@ class WorkloadPressureControllerTest {
 					Duration.class);
 			constructor.setAccessible(true);
 			return new Controller(constructor.newInstance(
-					4,
-					4,
+					competingMaximumActiveRead,
+					competingMaximumActiveWrite,
 					competitionInterval,
 					pressuredMaximumActive,
 					competitionHold,

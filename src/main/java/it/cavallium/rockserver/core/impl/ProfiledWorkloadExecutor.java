@@ -3958,12 +3958,22 @@ final class WorkloadPressureController {
 		long nowNanos = System.nanoTime();
 		competitionActiveUnsafe(nowNanos);
 		int bit = poolBit(pool);
+		int previousMask = competitionPoolMask;
 		boolean wasCompeting = competitionPoolMask != 0;
 		competitionPoolMask = competing ? competitionPoolMask | bit : competitionPoolMask & ~bit;
 		if (competitionPoolMask != 0) {
 			competitionUntilNanos = Long.MAX_VALUE;
 		} else if (wasCompeting) {
 			competitionUntilNanos = saturatingDeadline(nowNanos, competitionHoldNanos);
+			notificationPending = true;
+		}
+		if (competitionPoolMask != previousMask
+				&& pressured
+				&& lastCompletedPressuredBatchPoolBit != 0
+				&& batchDispatchable(lastCompletedPressuredBatchPoolBit)) {
+			// Entering or leaving competition can change whether the peer can consume a
+			// reserved pressure slot. The caller owns an executor lock, so publish the
+			// cross-pool wakeup only after it unlocks.
 			notificationPending = true;
 		}
 	}
@@ -4004,7 +4014,10 @@ final class WorkloadPressureController {
 	}
 
 	synchronized boolean hasFairPressureTurn(RWScheduler.Pool pool) {
-		return hasFairPressureTurnUnsafe(resourcePool(pool));
+		long nowNanos = System.nanoTime();
+		return hasFairPressureTurnUnsafe(resourcePool(pool),
+				nowNanos,
+				competitionActiveUnsafe(nowNanos));
 	}
 
 	private boolean competitionActiveUnsafe(long nowNanos) {
@@ -4098,7 +4111,7 @@ final class WorkloadPressureController {
 			if (nowNanos < nextBatchNanos) {
 				return 0;
 			}
-			if (!hasFairPressureTurnUnsafe(dataPool)) {
+			if (!hasFairPressureTurnUnsafe(dataPool, nowNanos, competing)) {
 				return 0;
 			}
 			allowance = Math.min(allowance,
@@ -4128,7 +4141,7 @@ final class WorkloadPressureController {
 			startedUnderPressure = pressured;
 			if (startedUnderPressure
 					&& (nowNanos < nextBatchNanos
-					|| !hasFairPressureTurnUnsafe(dataPool)
+					|| !hasFairPressureTurnUnsafe(dataPool, nowNanos, startedUnderCompetition)
 					|| activeBatches >= pressuredMaximumActiveBatches)) {
 				return NO_BATCH_PERMIT;
 			}
@@ -4231,7 +4244,7 @@ final class WorkloadPressureController {
 		if (activeBatches >= pressuredMaximumActiveBatches) {
 			return Long.MAX_VALUE;
 		}
-		if (!hasFairPressureTurnUnsafe(dataPool)) {
+		if (!hasFairPressureTurnUnsafe(dataPool, nowNanos, competing)) {
 			return Long.MAX_VALUE;
 		}
 		if (nowNanos < nextBatchNanos) {
@@ -4240,16 +4253,36 @@ final class WorkloadPressureController {
 		return waitNanos;
 	}
 
-	private boolean hasFairPressureTurnUnsafe(RWScheduler.Pool pool) {
+	private boolean hasFairPressureTurnUnsafe(RWScheduler.Pool pool,
+	                                          long nowNanos,
+	                                          boolean competing) {
 		int currentPoolBit = poolBit(pool);
 		if (lastCompletedPressuredBatchPoolBit == 0
 				|| lastCompletedPressuredBatchPoolBit != currentPoolBit) {
 			return true;
 		}
-		int otherDataPoolBit = currentPoolBit == poolBit(RWScheduler.Pool.READ)
-				? poolBit(RWScheduler.Pool.WRITE)
-				: poolBit(RWScheduler.Pool.READ);
-		return !batchDispatchable(otherDataPoolBit);
+		// With more than one free slot, admitting this pool still preserves a slot for
+		// the peer. Serialize only the final slot; this keeps the cap work-conserving.
+		int availableSlots = pressuredMaximumActiveBatches - activeBatches;
+		if (availableSlots > 1) {
+			return true;
+		}
+		var otherPool = pool == RWScheduler.Pool.READ
+				? RWScheduler.Pool.WRITE
+				: RWScheduler.Pool.READ;
+		if (!batchDispatchable(otherPool)) {
+			return true;
+		}
+		return availableSlots == 1
+				&& !competitionAllowsStartUnsafe(otherPool, nowNanos, competing);
+	}
+
+	private boolean competitionAllowsStartUnsafe(RWScheduler.Pool pool,
+	                                             long nowNanos,
+	                                             boolean competing) {
+		return !competing
+				|| activeBatches(pool) < competingMaximumActiveBatches(pool)
+				&& (pool != RWScheduler.Pool.WRITE || nowNanos >= nextCompetingWriteNanos);
 	}
 
 	private boolean batchDispatchable(RWScheduler.Pool pool) {
