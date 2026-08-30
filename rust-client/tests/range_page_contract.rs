@@ -6,16 +6,12 @@ use rockserver_client::proto::{
 use rockserver_client::REQUIRED_WORKLOAD_CONTRACT_VERSION;
 
 #[test]
-fn workload_v2_and_bounded_range_capability_are_mandatory() {
+fn workload_v3_capability_is_exact() {
     let capability = CapabilitiesResponse {
         workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-        bounded_range: true,
-		resumable_raw_scan: true,
     };
     let decoded = CapabilitiesResponse::decode(capability.encode_to_vec().as_slice()).unwrap();
-    assert_eq!(decoded.workload_contract_version, 2);
-    assert!(decoded.bounded_range);
-	assert!(decoded.resumable_raw_scan);
+    assert_eq!(decoded.workload_contract_version, 3);
 }
 
 #[test]
@@ -37,14 +33,14 @@ fn page_request_repeats_original_bounds_and_carries_an_exclusive_cursor() {
             keys: vec![vec![6]],
         }),
         request_type: RangeRequestType::AllInRange as i32,
-        timeout_ms: 5_000,
         budget: Some(RangeBudget {
             max_items: 4_096,
             max_bytes: 8 * 1024 * 1024,
         }),
         context: Some(RequestContext {
             profile: 2,
-            deadline_epoch_millis: 123_456,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+            timeout_nanos: 123_456,
         }),
     };
     let decoded = GetRangePageRequest::decode(request.encode_to_vec().as_slice()).unwrap();

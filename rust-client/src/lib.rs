@@ -23,11 +23,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = RockserverClient::connect(
 //!         "http://[::1]:50051",
-//!         rockserver_client::RequestContext::latency(
-//!             std::time::SystemTime::now()
-//!                 .duration_since(std::time::UNIX_EPOCH)?
-//!                 .as_millis() as i64 + 5_000,
-//!         ),
+//!         rockserver_client::RequestContext::latency(std::time::Duration::from_secs(5)),
 //!     ).await?;
 //!     
 //!     // Create a column
@@ -50,8 +46,8 @@ pub mod proto {
     tonic::include_proto!("it.cavallium.rockserver.core.common.api.proto");
 }
 
-mod types;
 mod client;
+mod types;
 
-pub use types::*;
 pub use client::*;
+pub use types::*;

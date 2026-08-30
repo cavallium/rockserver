@@ -1,39 +1,49 @@
-use std::fmt::{Display, Formatter};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tonic::transport::Channel;
-use tonic::{Request, Status};
-use futures::{Stream, StreamExt};
 use crate::proto::rocks_db_service_client::RocksDbServiceClient;
 use crate::proto::*; // For request/response types
 use crate::types::*;
-use crate::types::{Column, ColumnSchema}; // Disambiguate from proto
+use crate::types::{Column, ColumnSchema};
+use futures::{Stream, StreamExt};
+use std::fmt::{Display, Formatter};
+use std::time::Duration;
+use tonic::transport::Channel;
+use tonic::{Request, Status}; // Disambiguate from proto
 
 pub type Result<T> = std::result::Result<T, Status>;
 
-pub const REQUIRED_WORKLOAD_CONTRACT_VERSION: i32 = 2;
+pub const REQUIRED_WORKLOAD_CONTRACT_VERSION: i32 = 3;
+const DEFAULT_CDC_MAX_RESPONSE_BYTES: i32 = 4 * 1024 * 1024;
+
+fn duration_nanos(value: Duration) -> Result<i64> {
+    if value.is_zero() {
+        return Err(Status::invalid_argument("lease TTL must be positive"));
+    }
+    Ok(value.as_nanos().min(i64::MAX as u128) as i64)
+}
 
 #[derive(Debug)]
 pub enum RockserverConnectError {
-	Transport(tonic::transport::Error),
-	Capabilities(Status),
+    Transport(tonic::transport::Error),
+    Capabilities(Status),
 }
 
 impl Display for RockserverConnectError {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::Transport(error) => write!(formatter, "failed to connect to Rockserver: {error}"),
-			Self::Capabilities(error) => write!(formatter, "Rockserver capability handshake failed: {error}"),
-		}
-	}
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(formatter, "failed to connect to Rockserver: {error}"),
+            Self::Capabilities(error) => {
+                write!(formatter, "Rockserver capability handshake failed: {error}")
+            }
+        }
+    }
 }
 
 impl std::error::Error for RockserverConnectError {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		match self {
-			Self::Transport(error) => Some(error),
-			Self::Capabilities(error) => Some(error),
-		}
-	}
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Capabilities(error) => Some(error),
+        }
+    }
 }
 
 /// Client for interacting with the RockServer via gRPC.
@@ -46,8 +56,7 @@ impl std::error::Error for RockserverConnectError {
 #[derive(Clone, Debug)]
 pub struct RockserverClient {
     client: RocksDbServiceClient<Channel>,
-	context: RequestContext,
-	resumable_raw_scan: bool,
+    context: RequestContext,
 }
 
 impl RockserverClient {
@@ -58,119 +67,128 @@ impl RockserverClient {
     ///
     /// # Returns
     /// A `Result` containing the connected client or a transport/capability error.
-	pub async fn connect<D>(dst: D, context: RequestContext) -> std::result::Result<Self, RockserverConnectError>
+    pub async fn connect<D>(
+        dst: D,
+        context: RequestContext,
+    ) -> std::result::Result<Self, RockserverConnectError>
     where
         D: std::convert::TryInto<tonic::transport::Endpoint>,
         D::Error: Into<tonic::codegen::StdError>,
     {
-		let mut client = RocksDbServiceClient::connect(dst)
-			.await
-			.map_err(RockserverConnectError::Transport)?;
-		let resumable_raw_scan = Self::require_capabilities(&mut client)
-			.await
-			.map_err(RockserverConnectError::Capabilities)?;
-		Ok(Self { client, context, resumable_raw_scan })
+        let mut client = RocksDbServiceClient::connect(dst)
+            .await
+            .map_err(RockserverConnectError::Transport)?;
+        Self::require_capabilities(&mut client)
+            .await
+            .map_err(RockserverConnectError::Capabilities)?;
+        Ok(Self { client, context })
     }
 
-	/// Creates a new client from an existing Tonic `Channel` after the mandatory
-	/// workload-contract capability handshake.
-	pub async fn new(channel: Channel, context: RequestContext) -> Result<Self> {
-		let mut client = RocksDbServiceClient::new(channel);
-		let resumable_raw_scan = Self::require_capabilities(&mut client).await?;
-		Ok(Self { client, context, resumable_raw_scan })
-	}
+    /// Creates a new client from an existing Tonic `Channel` after the mandatory
+    /// workload-contract capability handshake.
+    pub async fn new(channel: Channel, context: RequestContext) -> Result<Self> {
+        let mut client = RocksDbServiceClient::new(channel);
+        Self::require_capabilities(&mut client).await?;
+        Ok(Self { client, context })
+    }
 
-	#[cfg(test)]
-	fn new_unchecked(channel: Channel, context: RequestContext) -> Self {
-		Self { client: RocksDbServiceClient::new(channel), context, resumable_raw_scan: false }
-	}
+    #[cfg(test)]
+    fn new_unchecked(channel: Channel, context: RequestContext) -> Self {
+        Self {
+            client: RocksDbServiceClient::new(channel),
+            context,
+        }
+    }
 
-	async fn require_capabilities(client: &mut RocksDbServiceClient<Channel>) -> Result<bool> {
-		let mut request = Request::new(CapabilitiesRequest {});
-		request.set_timeout(Duration::from_secs(10));
-		let capabilities = client.get_capabilities(request).await?.into_inner();
-		if capabilities.workload_contract_version != REQUIRED_WORKLOAD_CONTRACT_VERSION
-			|| !capabilities.bounded_range
-		{
-			return Err(Status::failed_precondition(format!(
-				"incompatible Rockserver workload contract: required version {} with bounded ranges, got version {} boundedRange={}",
+    async fn require_capabilities(client: &mut RocksDbServiceClient<Channel>) -> Result<()> {
+        let mut request = Request::new(CapabilitiesRequest {});
+        request.set_timeout(Duration::from_secs(10));
+        let capabilities = client.get_capabilities(request).await?.into_inner();
+        if capabilities.workload_contract_version != REQUIRED_WORKLOAD_CONTRACT_VERSION {
+            return Err(Status::failed_precondition(format!(
+				"incompatible Rockserver workload contract: required version {} with bounded ranges and resumable raw scans, got version {}",
 				REQUIRED_WORKLOAD_CONTRACT_VERSION,
 				capabilities.workload_contract_version,
-				capabilities.bounded_range,
 			)));
-		}
-		Ok(capabilities.resumable_raw_scan)
-	}
+        }
+        Ok(())
+    }
 
-	/// Returns a client view that applies one mandatory workload context to every generic request.
-	/// The underlying channel is shared and cloning this view is cheap.
-	pub fn with_context(&self, context: RequestContext) -> Self {
-		Self {
-			client: self.client.clone(),
-			context,
-			resumable_raw_scan: self.resumable_raw_scan,
-		}
-	}
+    /// Returns a client view that applies one mandatory workload context to every generic request.
+    /// The underlying channel is shared and cloning this view is cheap.
+    pub fn with_context(&self, context: RequestContext) -> Self {
+        Self {
+            client: self.client.clone(),
+            context,
+        }
+    }
 
-	fn contextual_request<T>(&self, message: T) -> Result<Request<T>> {
-		self.contextual_request_with_timeout(message, None)
-	}
+    fn contextual_request<T>(&self, message: T) -> Result<Request<T>> {
+        self.contextual_request_with_timeout(message, None)
+    }
 
-	fn contextual_request_with_timeout<T>(
-		&self,
-		message: T,
-		operation_timeout_ms: Option<i64>,
-	) -> Result<Request<T>> {
-		match self.context.profile {
-			2 | 3 | 4 | 6 => {}
-			0 => return Err(Status::invalid_argument("request workload profile is required")),
-			1 | 5 | 7 => {
-				return Err(Status::invalid_argument("workload profile is owned by Rockserver"));
-			}
-			value => {
-				return Err(Status::invalid_argument(format!(
-					"unknown workload profile: {value}"
-				)));
-			}
-		}
-		if self.context.deadline_epoch_millis <= 0 {
-			return Err(Status::invalid_argument("deadline_epoch_millis must be positive"));
-		}
-		if self.context.profile == 2 && self.context.deadline_epoch_millis == i64::MAX {
-			return Err(Status::invalid_argument("LATENCY requires a finite deadline"));
-		}
+    fn contextual_request_with_timeout<T>(
+        &self,
+        message: T,
+        operation_timeout_ms: Option<i64>,
+    ) -> Result<Request<T>> {
+        match self.context.profile {
+            2 | 3 | 4 | 6 => {}
+            0 => {
+                return Err(Status::invalid_argument(
+                    "request workload profile is required",
+                ))
+            }
+            1 | 5 | 7 => {
+                return Err(Status::invalid_argument(
+                    "workload profile is owned by Rockserver",
+                ));
+            }
+            value => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown workload profile: {value}"
+                )));
+            }
+        }
+        if self.context.workload_contract_version != REQUIRED_WORKLOAD_CONTRACT_VERSION {
+            return Err(Status::invalid_argument(
+                "request context must use workload contract version 3",
+            ));
+        }
+        if self.context.timeout_nanos <= 0 {
+            return Err(Status::invalid_argument("timeout_nanos must be positive"));
+        }
+        if self.context.profile == 2 && self.context.timeout_nanos == i64::MAX {
+            return Err(Status::invalid_argument(
+                "LATENCY requires a finite timeout",
+            ));
+        }
 
-		let mut timeout = if self.context.deadline_epoch_millis == i64::MAX {
-			None
-		} else {
-			let now_millis = SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.map_err(|_| Status::internal("system clock is before the Unix epoch"))?
-				.as_millis()
-				.min(i64::MAX as u128) as i64;
-			let remaining_millis = self.context.deadline_epoch_millis - now_millis;
-			if remaining_millis <= 0 {
-				return Err(Status::deadline_exceeded("request deadline already expired"));
-			}
-			Some(Duration::from_millis(remaining_millis as u64))
-		};
+        let mut timeout = if self.context.timeout_nanos == i64::MAX {
+            None
+        } else {
+            Some(Duration::from_nanos(self.context.timeout_nanos as u64))
+        };
 
-		if let Some(operation_timeout_ms) = operation_timeout_ms {
-			if operation_timeout_ms < 0 {
-				return Err(Status::invalid_argument("operation timeout must be non-negative"));
-			}
-			if operation_timeout_ms != i64::MAX {
-				let operation_timeout = Duration::from_millis(operation_timeout_ms as u64);
-				timeout = Some(timeout.map_or(operation_timeout, |value| value.min(operation_timeout)));
-			}
-		}
+        if let Some(operation_timeout_ms) = operation_timeout_ms {
+            if operation_timeout_ms < 0 {
+                return Err(Status::invalid_argument(
+                    "operation timeout must be non-negative",
+                ));
+            }
+            if operation_timeout_ms != i64::MAX {
+                let operation_timeout = Duration::from_millis(operation_timeout_ms as u64);
+                timeout =
+                    Some(timeout.map_or(operation_timeout, |value| value.min(operation_timeout)));
+            }
+        }
 
-		let mut request = Request::new(message);
-		if let Some(timeout) = timeout {
-			request.set_timeout(timeout);
-		}
-		Ok(request)
-	}
+        let mut request = Request::new(message);
+        if let Some(timeout) = timeout {
+            request.set_timeout(timeout);
+        }
+        Ok(request)
+    }
 
     // ============================================================================================
     // Transaction Management
@@ -183,9 +201,16 @@ impl RockserverClient {
     ///
     /// # Returns
     /// The transaction ID.
-    pub async fn open_transaction(&self, timeout_ms: i64) -> Result<i64> {
-		let req = OpenTransactionRequest { timeout_ms, context: Some(self.context.clone()) };
-		let resp = self.client.clone().open_transaction(self.contextual_request(req)?).await?;
+    pub async fn open_transaction(&self, transaction_lease_ttl: Duration) -> Result<i64> {
+        let req = OpenTransactionRequest {
+            transaction_lease_ttl_nanos: duration_nanos(transaction_lease_ttl)?,
+            context: Some(self.context.clone()),
+        };
+        let resp = self
+            .client
+            .clone()
+            .open_transaction(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().transaction_id)
     }
 
@@ -198,21 +223,27 @@ impl RockserverClient {
     ///
     /// # Returns
     /// `true` if the operation was successful.
-    pub async fn close_transaction(&self, transaction_id: i64, commit: bool, timeout_ms: i64) -> Result<bool> {
+    pub async fn close_transaction(&self, transaction_id: i64, commit: bool) -> Result<bool> {
         let req = CloseTransactionRequest {
             transaction_id,
-            timeout_ms,
             commit,
             context: Some(self.context.clone()),
         };
-		let request = if commit { self.contextual_request(req)? } else { Request::new(req) };
-		let resp = self.client.clone().close_transaction(request).await?;
+        let request = if commit {
+            self.contextual_request(req)?
+        } else {
+            Request::new(req)
+        };
+        let resp = self.client.clone().close_transaction(request).await?;
         Ok(resp.into_inner().successful)
     }
 
     /// Closes a failed update explicitly.
     pub async fn close_failed_update(&self, update_id: i64) -> Result<()> {
-        let req = CloseFailedUpdateRequest { update_id };
+        let req = CloseFailedUpdateRequest {
+            update_id,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        };
         self.client.clone().close_failed_update(req).await?;
         Ok(())
     }
@@ -228,14 +259,24 @@ impl RockserverClient {
             schema: Some(schema.into()),
             context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().create_column(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .create_column(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().column_id)
     }
 
     /// Deletes a column by its ID.
     pub async fn delete_column(&self, column_id: i64) -> Result<()> {
-        let req = DeleteColumnRequest { column_id, context: Some(self.context.clone()) };
-		self.client.clone().delete_column(self.contextual_request(req)?).await?;
+        let req = DeleteColumnRequest {
+            column_id,
+            context: Some(self.context.clone()),
+        };
+        self.client
+            .clone()
+            .delete_column(self.contextual_request(req)?)
+            .await?;
         Ok(())
     }
 
@@ -243,30 +284,62 @@ impl RockserverClient {
     ///
     /// Returns `true` when a physical column was deleted and `false` when it was already absent.
     pub async fn delete_column_if_exists(&self, name: String) -> Result<bool> {
-        let req = DeleteColumnIfExistsRequest { name, context: Some(self.context.clone()) };
-		let resp = self.client.clone().delete_column_if_exists(self.contextual_request(req)?).await?;
+        let req = DeleteColumnIfExistsRequest {
+            name,
+            context: Some(self.context.clone()),
+        };
+        let resp = self
+            .client
+            .clone()
+            .delete_column_if_exists(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().deleted)
     }
 
     /// Retrieves the ID of a column by its name.
     pub async fn get_column_id(&self, name: String) -> Result<i64> {
-		let req = GetColumnIdRequest { name, context: Some(self.context.clone()) };
-		let resp = self.client.clone().get_column_id(self.contextual_request(req)?).await?;
+        let req = GetColumnIdRequest {
+            name,
+            context: Some(self.context.clone()),
+        };
+        let resp = self
+            .client
+            .clone()
+            .get_column_id(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().column_id)
     }
 
     /// Returns RocksDB's unbounded estimate of physical keys in a column.
     pub async fn estimate_num_keys(&self, column_id: i64) -> Result<i64> {
-		let req = EstimateNumKeysRequest { column_id, context: Some(self.context.clone()) };
-		let resp = self.client.clone().estimate_num_keys(self.contextual_request(req)?).await?;
+        let req = EstimateNumKeysRequest {
+            column_id,
+            context: Some(self.context.clone()),
+        };
+        let resp = self
+            .client
+            .clone()
+            .estimate_num_keys(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().count)
     }
 
     /// Retrieves definitions for all existing columns.
     pub async fn get_all_column_definitions(&self) -> Result<Vec<Column>> {
-		let req = GetAllColumnDefinitionsRequest { context: Some(self.context.clone()) };
-		let resp = self.client.clone().get_all_column_definitions(self.contextual_request(req)?).await?;
-        Ok(resp.into_inner().columns.into_iter().map(|c| c.into()).collect())
+        let req = GetAllColumnDefinitionsRequest {
+            context: Some(self.context.clone()),
+        };
+        let resp = self
+            .client
+            .clone()
+            .get_all_column_definitions(self.contextual_request(req)?)
+            .await?;
+        Ok(resp
+            .into_inner()
+            .columns
+            .into_iter()
+            .map(|c| c.into())
+            .collect())
     }
 
     // ============================================================================================
@@ -274,74 +347,132 @@ impl RockserverClient {
     // ============================================================================================
 
     /// Puts a value for a specific key.
-    pub async fn put(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<()> {
+    pub async fn put(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<()> {
         let req = PutRequest {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-		self.client.clone().put(self.contextual_request(req)?).await?;
+        self.client
+            .clone()
+            .put(self.contextual_request(req)?)
+            .await?;
         Ok(())
     }
 
     /// Ensures a value exists, eliding the write only when RockServer proves equality from memory.
-    pub async fn put_ensure(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<()> {
+    pub async fn put_ensure(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<()> {
         let req = PutRequest {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-		self.client.clone().put_ensure(self.contextual_request(req)?).await?;
+        self.client
+            .clone()
+            .put_ensure(self.contextual_request(req)?)
+            .await?;
         Ok(())
     }
-    
+
     /// Puts a value and returns the previous value if it existed.
-    pub async fn put_get_previous(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    pub async fn put_get_previous(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>> {
         let req = PutRequest {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().put_get_previous(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .put_get_previous(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().previous)
     }
 
     /// Puts a value and returns the delta between previous and new value.
-    pub async fn put_get_delta(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<Delta> {
+    pub async fn put_get_delta(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<Delta> {
         let req = PutRequest {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().put_get_delta(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .put_get_delta(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
     /// Puts a value and returns whether the value actually changed.
-    pub async fn put_get_changed(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<bool> {
+    pub async fn put_get_changed(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<bool> {
         let req = PutRequest {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().put_get_changed(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .put_get_changed(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().changed)
     }
 
     /// Puts a value and returns whether a previous value was present.
-    pub async fn put_get_previous_presence(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<bool> {
+    pub async fn put_get_previous_presence(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<bool> {
         let req = PutRequest {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().put_get_previous_presence(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .put_get_previous_presence(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().present)
     }
 
@@ -371,10 +502,13 @@ impl RockserverClient {
             }
         };
 
-		self.client.clone().put_batch(self.contextual_request(request_stream)?).await?;
+        self.client
+            .clone()
+            .put_batch(self.contextual_request(request_stream)?)
+            .await?;
         Ok(())
     }
-    
+
     /// Streams a batch of KV pairs to be merged into the database.
     pub async fn merge_batch(
         &self,
@@ -383,13 +517,15 @@ impl RockserverClient {
         batches: impl Stream<Item = KvBatch> + Send + 'static,
     ) -> Result<()> {
         let initial = MergeBatchRequest {
-            merge_batch_request_type: Some(merge_batch_request::MergeBatchRequestType::InitialRequest(
-                MergeBatchInitialRequest {
-                    column_id,
-                    mode: mode.into(),
-                    context: Some(self.context.clone()),
-                },
-            )),
+            merge_batch_request_type: Some(
+                merge_batch_request::MergeBatchRequestType::InitialRequest(
+                    MergeBatchInitialRequest {
+                        column_id,
+                        mode: mode.into(),
+                        context: Some(self.context.clone()),
+                    },
+                ),
+            ),
         };
 
         let request_stream = async_stream::stream! {
@@ -401,7 +537,10 @@ impl RockserverClient {
             }
         };
 
-		self.client.clone().merge_batch(self.contextual_request(request_stream)?).await?;
+        self.client
+            .clone()
+            .merge_batch(self.contextual_request(request_stream)?)
+            .await?;
         Ok(())
     }
 
@@ -420,7 +559,10 @@ impl RockserverClient {
             }),
             data,
         };
-		self.client.clone().put_multi_list(self.contextual_request(req)?).await?;
+        self.client
+            .clone()
+            .put_multi_list(self.contextual_request(req)?)
+            .await?;
         Ok(())
     }
 
@@ -450,7 +592,10 @@ impl RockserverClient {
             }
         };
 
-		self.client.clone().put_multi(self.contextual_request(request_stream)?).await?;
+        self.client
+            .clone()
+            .put_multi(self.contextual_request(request_stream)?)
+            .await?;
         Ok(())
     }
 
@@ -480,7 +625,10 @@ impl RockserverClient {
             }
         };
 
-		self.client.clone().put_multi_ensure(self.contextual_request(request_stream)?).await?;
+        self.client
+            .clone()
+            .put_multi_ensure(self.contextual_request(request_stream)?)
+            .await?;
         Ok(())
     }
 
@@ -510,7 +658,11 @@ impl RockserverClient {
             }
         };
 
-		let resp = self.client.clone().put_multi_get_previous(self.contextual_request(request_stream)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .put_multi_get_previous(self.contextual_request(request_stream)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
@@ -540,7 +692,11 @@ impl RockserverClient {
             }
         };
 
-		let resp = self.client.clone().put_multi_get_delta(self.contextual_request(request_stream)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .put_multi_get_delta(self.contextual_request(request_stream)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
@@ -570,7 +726,11 @@ impl RockserverClient {
             }
         };
 
-		let resp = self.client.clone().put_multi_get_changed(self.contextual_request(request_stream)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .put_multi_get_changed(self.contextual_request(request_stream)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
@@ -600,7 +760,11 @@ impl RockserverClient {
             }
         };
 
-		let resp = self.client.clone().put_multi_get_previous_presence(self.contextual_request(request_stream)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .put_multi_get_previous_presence(self.contextual_request(request_stream)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
@@ -609,14 +773,22 @@ impl RockserverClient {
     // ============================================================================================
 
     /// Deletes a value for a specific key.
-    pub async fn delete(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>) -> Result<()> {
+    pub async fn delete(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<()> {
         let req = DeleteRequest {
             transaction_or_update_id,
             column_id,
             keys,
             context: Some(self.context.clone()),
         };
-		self.client.clone().delete(self.contextual_request(req)?).await?;
+        self.client
+            .clone()
+            .delete(self.contextual_request(req)?)
+            .await?;
         Ok(())
     }
 
@@ -633,7 +805,11 @@ impl RockserverClient {
             keys,
             context: Some(self.context.clone()),
         };
-		let response = self.client.clone().delete_get_previous(self.contextual_request(req)?).await?;
+        let response = self
+            .client
+            .clone()
+            .delete_get_previous(self.contextual_request(req)?)
+            .await?;
         Ok(response.into_inner().previous)
     }
 
@@ -650,7 +826,11 @@ impl RockserverClient {
             keys,
             context: Some(self.context.clone()),
         };
-		let response = self.client.clone().delete_get_previous_presence(self.contextual_request(req)?).await?;
+        let response = self
+            .client
+            .clone()
+            .delete_get_previous_presence(self.contextual_request(req)?)
+            .await?;
         Ok(response.into_inner().present)
     }
 
@@ -667,7 +847,10 @@ impl RockserverClient {
             end_keys_exclusive,
             context: Some(self.context.clone()),
         };
-		self.client.clone().delete_range(self.contextual_request(req)?).await?;
+        self.client
+            .clone()
+            .delete_range(self.contextual_request(req)?)
+            .await?;
         Ok(())
     }
 
@@ -679,7 +862,10 @@ impl RockserverClient {
         keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
     ) -> Result<()> {
         let requests = self.delete_multi_requests(transaction_or_update_id, column_id, keys);
-		self.client.clone().delete_multi(self.contextual_request(requests)?).await?;
+        self.client
+            .clone()
+            .delete_multi(self.contextual_request(requests)?)
+            .await?;
         Ok(())
     }
 
@@ -691,7 +877,11 @@ impl RockserverClient {
         keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
     ) -> Result<impl Stream<Item = Result<Previous>>> {
         let requests = self.delete_multi_requests(transaction_or_update_id, column_id, keys);
-		let response = self.client.clone().delete_multi_get_previous(self.contextual_request(requests)?).await?;
+        let response = self
+            .client
+            .clone()
+            .delete_multi_get_previous(self.contextual_request(requests)?)
+            .await?;
         Ok(response.into_inner())
     }
 
@@ -703,7 +893,11 @@ impl RockserverClient {
         keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static,
     ) -> Result<impl Stream<Item = Result<PreviousPresence>>> {
         let requests = self.delete_multi_requests(transaction_or_update_id, column_id, keys);
-		let response = self.client.clone().delete_multi_get_previous_presence(self.contextual_request(requests)?).await?;
+        let response = self
+            .client
+            .clone()
+            .delete_multi_get_previous_presence(self.contextual_request(requests)?)
+            .await?;
         Ok(response.into_inner())
     }
 
@@ -734,7 +928,7 @@ impl RockserverClient {
             }
         }
     }
-    
+
     // ============================================================================================
     // Data Operations - Merge
     // ============================================================================================
@@ -747,13 +941,15 @@ impl RockserverClient {
         items: impl Stream<Item = Kv> + Send + 'static,
     ) -> Result<()> {
         let initial = MergeMultiRequest {
-            merge_multi_request_type: Some(merge_multi_request::MergeMultiRequestType::InitialRequest(
-                MergeMultiInitialRequest {
-                    transaction_or_update_id,
-                    column_id,
-                    context: Some(self.context.clone()),
-                },
-            )),
+            merge_multi_request_type: Some(
+                merge_multi_request::MergeMultiRequestType::InitialRequest(
+                    MergeMultiInitialRequest {
+                        transaction_or_update_id,
+                        column_id,
+                        context: Some(self.context.clone()),
+                    },
+                ),
+            ),
         };
 
         let request_stream = async_stream::stream! {
@@ -765,7 +961,10 @@ impl RockserverClient {
             }
         };
 
-		self.client.clone().merge_multi(self.contextual_request(request_stream)?).await?;
+        self.client
+            .clone()
+            .merge_multi(self.contextual_request(request_stream)?)
+            .await?;
         Ok(())
     }
 
@@ -777,13 +976,15 @@ impl RockserverClient {
         items: impl Stream<Item = Kv> + Send + 'static,
     ) -> Result<impl Stream<Item = Result<Merged>>> {
         let initial = MergeMultiRequest {
-            merge_multi_request_type: Some(merge_multi_request::MergeMultiRequestType::InitialRequest(
-                MergeMultiInitialRequest {
-                    transaction_or_update_id,
-                    column_id,
-                    context: Some(self.context.clone()),
-                },
-            )),
+            merge_multi_request_type: Some(
+                merge_multi_request::MergeMultiRequestType::InitialRequest(
+                    MergeMultiInitialRequest {
+                        transaction_or_update_id,
+                        column_id,
+                        context: Some(self.context.clone()),
+                    },
+                ),
+            ),
         };
 
         let request_stream = async_stream::stream! {
@@ -795,31 +996,54 @@ impl RockserverClient {
             }
         };
 
-		let resp = self.client.clone().merge_multi_get_merged(self.contextual_request(request_stream)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .merge_multi_get_merged(self.contextual_request(request_stream)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
     /// Merges a value for a specific key.
-    pub async fn merge(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<()> {
+    pub async fn merge(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<()> {
         let req = MergeRequest {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-		self.client.clone().merge(self.contextual_request(req)?).await?;
+        self.client
+            .clone()
+            .merge(self.contextual_request(req)?)
+            .await?;
         Ok(())
     }
 
     /// Merges a value and returns the result.
-    pub async fn merge_get_merged(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    pub async fn merge_get_merged(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>> {
         let req = MergeRequest {
             transaction_or_update_id,
             column_id,
             data: Some(Kv { keys, value }),
             context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().merge_get_merged(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .merge_get_merged(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().merged)
     }
 
@@ -828,38 +1052,65 @@ impl RockserverClient {
     // ============================================================================================
 
     /// Gets a value by key.
-    pub async fn get(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>) -> Result<Option<Vec<u8>>> {
-		let req = GetRequest {
-			transaction_or_update_id,
-			column_id,
-			keys,
-			context: Some(self.context.clone()),
+    pub async fn get(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>> {
+        let req = GetRequest {
+            transaction_or_update_id,
+            column_id,
+            keys,
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().get(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .get(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().value)
     }
 
     /// Gets a value for update (locking).
-    pub async fn get_for_update(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>) -> Result<UpdateBegin> {
-		let req = GetRequest {
-			transaction_or_update_id,
-			column_id,
-			keys,
-			context: Some(self.context.clone()),
+    pub async fn get_for_update(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<UpdateBegin> {
+        let req = GetRequest {
+            transaction_or_update_id,
+            column_id,
+            keys,
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().get_for_update(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .get_for_update(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
     /// Checks if a key exists.
-    pub async fn exists(&self, transaction_or_update_id: i64, column_id: i64, keys: Vec<Vec<u8>>) -> Result<bool> {
-		let req = GetRequest {
-			transaction_or_update_id,
-			column_id,
-			keys,
-			context: Some(self.context.clone()),
+    pub async fn exists(
+        &self,
+        transaction_or_update_id: i64,
+        column_id: i64,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<bool> {
+        let req = GetRequest {
+            transaction_or_update_id,
+            column_id,
+            keys,
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().exists(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .exists(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().present)
     }
 
@@ -869,21 +1120,21 @@ impl RockserverClient {
         transaction_id: i64,
         column_id: i64,
         keys_multi: Vec<Vec<Vec<u8>>>,
-        timeout_ms: i64,
     ) -> Result<Vec<bool>> {
         let req = ExistsMultiRequest {
             transaction_id,
             column_id,
             keys_multi: keys_multi
                 .into_iter()
-				.map(|keys| KeyTuple { keys })
-				.collect(),
-			timeout_ms,
-			context: Some(self.context.clone()),
+                .map(|keys| KeyTuple { keys })
+                .collect(),
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().exists_multi(
-			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
-		).await?;
+        let resp = self
+            .client
+            .clone()
+            .exists_multi(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().present)
     }
 
@@ -899,56 +1150,87 @@ impl RockserverClient {
         start_keys_inclusive: Vec<Vec<u8>>,
         end_keys_exclusive: Vec<Vec<u8>>,
         reverse: bool,
-        timeout_ms: i64,
+        iterator_lease_ttl: Duration,
     ) -> Result<i64> {
         let req = OpenIteratorRequest {
             transaction_id,
             column_id,
             start_keys_inclusive,
             end_keys_exclusive,
-			reverse,
-			timeout_ms,
-			context: Some(self.context.clone()),
+            reverse,
+            iterator_lease_ttl_nanos: duration_nanos(iterator_lease_ttl)?,
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().open_iterator(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .open_iterator(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().iterator_id)
     }
 
     /// Closes an active iterator.
     pub async fn close_iterator(&self, iterator_id: i64) -> Result<()> {
-        let req = CloseIteratorRequest { iterator_id };
+        let req = CloseIteratorRequest {
+            iterator_id,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        };
         self.client.clone().close_iterator(req).await?;
         Ok(())
     }
 
     /// Seeks the iterator to a specific key.
     pub async fn seek_to(&self, iteration_id: i64, keys: Vec<Vec<u8>>) -> Result<()> {
-		let req = SeekToRequest { iteration_id, keys, context: Some(self.context.clone()) };
-		self.client.clone().seek_to(self.contextual_request(req)?).await?;
+        let req = SeekToRequest {
+            iteration_id,
+            keys,
+            context: Some(self.context.clone()),
+        };
+        self.client
+            .clone()
+            .seek_to(self.contextual_request(req)?)
+            .await?;
         Ok(())
     }
 
     /// Advances the iterator.
-    pub async fn subsequent(&self, iteration_id: i64, skip_count: i64, take_count: i64) -> Result<()> {
+    pub async fn subsequent(
+        &self,
+        iteration_id: i64,
+        skip_count: i64,
+        take_count: i64,
+    ) -> Result<()> {
         let req = SubsequentRequest {
-			iteration_id,
-			skip_count,
-			take_count,
-			context: Some(self.context.clone()),
+            iteration_id,
+            skip_count,
+            take_count,
+            context: Some(self.context.clone()),
         };
-		self.client.clone().subsequent(self.contextual_request(req)?).await?;
+        self.client
+            .clone()
+            .subsequent(self.contextual_request(req)?)
+            .await?;
         Ok(())
     }
-    
+
     /// Advances the iterator and checks existence.
-    pub async fn subsequent_exists(&self, iteration_id: i64, skip_count: i64, take_count: i64) -> Result<bool> {
+    pub async fn subsequent_exists(
+        &self,
+        iteration_id: i64,
+        skip_count: i64,
+        take_count: i64,
+    ) -> Result<bool> {
         let req = SubsequentRequest {
-			iteration_id,
-			skip_count,
-			take_count,
-			context: Some(self.context.clone()),
+            iteration_id,
+            skip_count,
+            take_count,
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().subsequent_exists(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .subsequent_exists(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().present)
     }
 
@@ -960,12 +1242,16 @@ impl RockserverClient {
         take_count: i64,
     ) -> Result<impl Stream<Item = Result<Kv>>> {
         let req = SubsequentRequest {
-			iteration_id,
-			skip_count,
-			take_count,
-			context: Some(self.context.clone()),
+            iteration_id,
+            skip_count,
+            take_count,
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().subsequent_multi_get(self.contextual_request(req)?).await?;
+        let resp = self
+            .client
+            .clone()
+            .subsequent_multi_get(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
@@ -981,20 +1267,20 @@ impl RockserverClient {
         start_keys_inclusive: Vec<Vec<u8>>,
         end_keys_exclusive: Vec<Vec<u8>>,
         reverse: bool,
-        timeout_ms: i64,
     ) -> Result<FirstAndLast> {
         let req = GetRangeRequest {
             transaction_id,
             column_id,
             start_keys_inclusive,
             end_keys_exclusive,
-			reverse,
-			timeout_ms,
-			context: Some(self.context.clone()),
+            reverse,
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().reduce_range_first_and_last(
-			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
-		).await?;
+        let resp = self
+            .client
+            .clone()
+            .reduce_range_first_and_last(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
@@ -1006,23 +1292,23 @@ impl RockserverClient {
         start_keys_inclusive: Vec<Vec<u8>>,
         end_keys_exclusive: Vec<Vec<u8>>,
         reverse: bool,
-        timeout_ms: i64,
     ) -> Result<i64> {
         let req = GetRangeRequest {
             transaction_id,
             column_id,
             start_keys_inclusive,
             end_keys_exclusive,
-			reverse,
-			timeout_ms,
-			context: Some(self.context.clone()),
+            reverse,
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().reduce_range_entries_count(
-			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
-		).await?;
+        let resp = self
+            .client
+            .clone()
+            .reduce_range_entries_count(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner().count)
     }
-    
+
     /// Retrieves all KV pairs in a range.
     pub async fn get_all_in_range(
         &self,
@@ -1031,116 +1317,129 @@ impl RockserverClient {
         start_keys_inclusive: Vec<Vec<u8>>,
         end_keys_exclusive: Vec<Vec<u8>>,
         reverse: bool,
-        timeout_ms: i64,
     ) -> Result<impl Stream<Item = Result<Kv>>> {
         let req = GetRangeRequest {
             transaction_id,
             column_id,
             start_keys_inclusive,
             end_keys_exclusive,
-			reverse,
-			timeout_ms,
-			context: Some(self.context.clone()),
+            reverse,
+            context: Some(self.context.clone()),
         };
-		let resp = self.client.clone().get_all_in_range(
-			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
-		).await?;
+        let resp = self
+            .client
+            .clone()
+            .get_all_in_range(self.contextual_request(req)?)
+            .await?;
         Ok(resp.into_inner())
     }
 
-	/// Retrieves one bounded page. `resume_after` is exclusive in both directions;
-	/// callers repeat the original bounds on every continuation.
-	pub async fn get_range_page(
-		&self,
-		transaction_id: i64,
-		column_id: i64,
-		start_keys_inclusive: Vec<Vec<u8>>,
-		end_keys_exclusive: Vec<Vec<u8>>,
-		reverse: bool,
-		resume_after: Option<Vec<Vec<u8>>>,
-		request_type: RangeRequestType,
-		timeout_ms: i64,
-		budget: RangeBudget,
-	) -> Result<RangePage> {
-		match request_type as i32 {
-			1 | 2 => {}
-			_ => return Err(Status::invalid_argument("range request type is required")),
-		}
-		if budget.max_items <= 0 {
-			return Err(Status::invalid_argument("range max_items must be positive"));
-		}
-		if budget.max_bytes <= 0 {
-			return Err(Status::invalid_argument("range max_bytes must be positive"));
-		}
-		let req = GetRangePageRequest {
-			transaction_id,
-			column_id,
-			start_keys_inclusive,
-			end_keys_exclusive,
-			reverse,
-			resume_after: resume_after.map(|keys| RangeKey { keys }),
-			request_type: request_type as i32,
-			timeout_ms,
-			budget: Some(budget),
-			context: Some(self.context.clone()),
-		};
-		let response = self.client.clone().get_range_page(
-			self.contextual_request_with_timeout(req, Some(timeout_ms))?,
-		).await?;
-		Ok(response.into_inner())
-	}
+    /// Retrieves one bounded page. `resume_after` is exclusive in both directions;
+    /// callers repeat the original bounds on every continuation.
+    pub async fn get_range_page(
+        &self,
+        transaction_id: i64,
+        column_id: i64,
+        start_keys_inclusive: Vec<Vec<u8>>,
+        end_keys_exclusive: Vec<Vec<u8>>,
+        reverse: bool,
+        resume_after: Option<Vec<Vec<u8>>>,
+        request_type: RangeRequestType,
+        budget: RangeBudget,
+    ) -> Result<RangePage> {
+        match request_type as i32 {
+            1 | 2 => {}
+            _ => return Err(Status::invalid_argument("range request type is required")),
+        }
+        if budget.max_items <= 0 {
+            return Err(Status::invalid_argument("range max_items must be positive"));
+        }
+        if budget.max_bytes <= 0 {
+            return Err(Status::invalid_argument("range max_bytes must be positive"));
+        }
+        let req = GetRangePageRequest {
+            transaction_id,
+            column_id,
+            start_keys_inclusive,
+            end_keys_exclusive,
+            reverse,
+            resume_after: resume_after.map(|keys| RangeKey { keys }),
+            request_type: request_type as i32,
+            budget: Some(budget),
+            context: Some(self.context.clone()),
+        };
+        let response = self
+            .client
+            .clone()
+            .get_range_page(self.contextual_request(req)?)
+            .await?;
+        Ok(response.into_inner())
+    }
 
     /// Scans the column raw (ignoring transactions, usually).
-    pub async fn scan_raw(&self, column_id: i64, shard_index: i32, shard_count: i32) -> Result<impl Stream<Item = Result<KvBatch>>> {
-		let req = ScanRawRequest {
-			column_id,
-			shard_index,
-			shard_count,
-			context: Some(self.context.clone()),
-			completed_sst_tokens: Vec::new(),
-			resumable: false,
-			coalesce_completed_sst_token: false,
-		};
-		let resp = self.client.clone().scan_raw(self.contextual_request(req)?).await?;
-        Ok(resp.into_inner().map(|res| {
-            match res {
-				Ok(response) => match response.event {
-					Some(scan_raw_response::Event::Serialized(serialized))
-							if response.completed_sst_token_after_batch.is_none() => decode_kv_batch(&serialized),
-					_ => Err(Status::internal("Rockserver returned a resumable event to a legacy raw scan")),
-				},
-                Err(e) => Err(e),
-            }
+    pub async fn scan_raw(
+        &self,
+        column_id: i64,
+        shard_index: i32,
+        shard_count: i32,
+    ) -> Result<impl Stream<Item = Result<KvBatch>>> {
+        let req = ScanRawRequest {
+            column_id,
+            shard_index,
+            shard_count,
+            context: Some(self.context.clone()),
+            completed_sst_tokens: Vec::new(),
+            resumable: false,
+        };
+        let resp = self
+            .client
+            .clone()
+            .scan_raw(self.contextual_request(req)?)
+            .await?;
+        Ok(resp.into_inner().map(|res| match res {
+            Ok(response) => match response.event {
+                Some(scan_raw_response::Event::Serialized(serialized))
+                    if response.completed_sst_token_after_batch.is_none() =>
+                {
+                    decode_kv_batch(&serialized)
+                }
+                _ => Err(Status::internal(
+                    "Rockserver returned a resumable event to a legacy raw scan",
+                )),
+            },
+            Err(e) => Err(e),
         }))
     }
 
-	/// Scans immutable SSTs with durable completion tokens. A caller may pass
-	/// tokens checkpointed by an earlier attempt; live matching SSTs are skipped.
-	pub async fn scan_raw_resumable(
-		&self,
-		column_id: i64,
-		shard_index: i32,
-		shard_count: i32,
-		completed_ssts: impl IntoIterator<Item = RawSstToken>,
-	) -> Result<impl Stream<Item = Result<RawScanEvent>>> {
-		if !self.resumable_raw_scan {
-			return Err(Status::unimplemented("connected Rockserver does not support resumable raw scans"));
-		}
-		let req = ScanRawRequest {
-			column_id,
-			shard_index,
-			shard_count,
-			context: Some(self.context.clone()),
-			completed_sst_tokens: completed_ssts
-				.into_iter()
-				.map(RawSstToken::into_string)
-				.collect(),
-			resumable: true,
-			coalesce_completed_sst_token: true,
-		};
-		let resp = self.client.clone().scan_raw(self.contextual_request(req)?).await?;
-		Ok(resp.into_inner().map(|result| result.and_then(decode_raw_scan_event)))
-	}
+    /// Scans immutable SSTs with durable completion tokens. A caller may pass
+    /// tokens checkpointed by an earlier attempt; live matching SSTs are skipped.
+    pub async fn scan_raw_resumable(
+        &self,
+        column_id: i64,
+        shard_index: i32,
+        shard_count: i32,
+        completed_ssts: impl IntoIterator<Item = RawSstToken>,
+    ) -> Result<impl Stream<Item = Result<RawScanEvent>>> {
+        let req = ScanRawRequest {
+            column_id,
+            shard_index,
+            shard_count,
+            context: Some(self.context.clone()),
+            completed_sst_tokens: completed_ssts
+                .into_iter()
+                .map(RawSstToken::into_string)
+                .collect(),
+            resumable: true,
+        };
+        let resp = self
+            .client
+            .clone()
+            .scan_raw(self.contextual_request(req)?)
+            .await?;
+        Ok(resp
+            .into_inner()
+            .map(|result| result.and_then(decode_raw_scan_event)))
+    }
 
     // ============================================================================================
     // Maintenance
@@ -1148,14 +1447,18 @@ impl RockserverClient {
 
     /// Flushes the database.
     pub async fn flush(&self) -> Result<()> {
-        let req = FlushRequest {};
+        let req = FlushRequest {
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        };
         self.client.clone().flush(req).await?;
         Ok(())
     }
 
     /// Compacts the database.
     pub async fn compact(&self) -> Result<()> {
-        let req = CompactRequest {};
+        let req = CompactRequest {
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        };
         self.client.clone().compact(req).await?;
         Ok(())
     }
@@ -1177,7 +1480,10 @@ impl RockserverClient {
             from_seq,
             column_ids,
             resolved_values,
-            expected_last_committed: None,
+            expected_last_committed: Some(cdc_create_request::ExpectedLastCommitted::ExpectAbsent(
+                (),
+            )),
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self.client.clone().cdc_create(req).await?;
         Ok(resp.into_inner().start_seq)
@@ -1193,7 +1499,6 @@ impl RockserverClient {
         precondition: CdcCreatePrecondition,
     ) -> std::result::Result<i64, CdcCreateError> {
         let expected_last_committed = match precondition {
-            CdcCreatePrecondition::Unchecked => None,
             CdcCreatePrecondition::Absent => {
                 Some(cdc_create_request::ExpectedLastCommitted::ExpectAbsent(()))
             }
@@ -1207,6 +1512,7 @@ impl RockserverClient {
             column_ids,
             resolved_values,
             expected_last_committed,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self
             .client
@@ -1219,7 +1525,10 @@ impl RockserverClient {
 
     /// Deletes a CDC stream.
     pub async fn cdc_delete(&self, id: String) -> Result<()> {
-        let req = CdcDeleteRequest { id };
+        let req = CdcDeleteRequest {
+            id,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        };
         self.client.clone().cdc_delete(req).await?;
         Ok(())
     }
@@ -1229,7 +1538,9 @@ impl RockserverClient {
         let resp = self
             .client
             .clone()
-            .cdc_get_earliest_available_sequence(())
+            .cdc_get_earliest_available_sequence(CdcGetEarliestAvailableSequenceRequest {
+                workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+            })
             .await?;
         Ok(resp.into_inner().sequence)
     }
@@ -1238,7 +1549,10 @@ impl RockserverClient {
     ///
     /// `None` means that the subscription metadata does not exist.
     pub async fn cdc_get_last_committed_sequence(&self, id: String) -> Result<Option<i64>> {
-        let req = CdcGetLastCommittedSequenceRequest { id };
+        let req = CdcGetLastCommittedSequenceRequest {
+            id,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        };
         let resp = self
             .client
             .clone()
@@ -1249,7 +1563,11 @@ impl RockserverClient {
 
     /// Commits a sequence number for a CDC stream.
     pub async fn cdc_commit(&self, id: String, seq: i64) -> Result<()> {
-        let req = CdcCommitRequest { id, seq };
+        let req = CdcCommitRequest {
+            id,
+            seq,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        };
         self.client.clone().cdc_commit(req).await?;
         Ok(())
     }
@@ -1260,7 +1578,11 @@ impl RockserverClient {
         id: String,
         seq: i64,
     ) -> std::result::Result<(), CdcError> {
-        let req = CdcCommitRequest { id, seq };
+        let req = CdcCommitRequest {
+            id,
+            seq,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        };
         self.client
             .clone()
             .cdc_commit(req)
@@ -1280,7 +1602,8 @@ impl RockserverClient {
             id,
             from_seq,
             max_events,
-            max_response_bytes: 0,
+            max_response_bytes: DEFAULT_CDC_MAX_RESPONSE_BYTES,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self.client.clone().cdc_poll(req).await?;
         Ok(resp.into_inner())
@@ -1298,7 +1621,8 @@ impl RockserverClient {
             id,
             from_seq,
             max_events,
-            max_response_bytes: 0,
+            max_response_bytes: DEFAULT_CDC_MAX_RESPONSE_BYTES,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self
             .client
@@ -1321,7 +1645,8 @@ impl RockserverClient {
             id,
             from_seq,
             max_events,
-            max_response_bytes: 0,
+            max_response_bytes: DEFAULT_CDC_MAX_RESPONSE_BYTES,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self.client.clone().cdc_poll_batch(req).await?;
         Ok(resp.into_inner())
@@ -1338,7 +1663,8 @@ impl RockserverClient {
             id,
             from_seq,
             max_events,
-            max_response_bytes: 0,
+            max_response_bytes: DEFAULT_CDC_MAX_RESPONSE_BYTES,
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self
             .client
@@ -1365,16 +1691,22 @@ impl RockserverClient {
     ) -> Result<()>
     where
         F: FnMut(CdcEvent) -> Fut,
-        Fut: std::future::Future<Output = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+        Fut: std::future::Future<
+            Output = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        >,
     {
         let mut seq = options.from_seq;
-        let batch_size = if options.batch_size > 0 { options.batch_size } else { 1000 };
+        let batch_size = if options.batch_size > 0 {
+            options.batch_size
+        } else {
+            1000
+        };
         let idle_delay = options.idle_delay;
-        
+
         loop {
             // TODO: Handle transport errors with retry backoff?
             let stream_result = self.cdc_poll(id.clone(), seq, batch_size).await;
-            
+
             let stream = match stream_result {
                 Ok(s) => s,
                 Err(e) => return Err(e),
@@ -1382,7 +1714,7 @@ impl RockserverClient {
 
             let mut events = Vec::new();
             let mut pinned_stream = Box::pin(stream);
-            
+
             while let Some(event_res) = pinned_stream.next().await {
                 match event_res {
                     Ok(event) => events.push(event),
@@ -1396,63 +1728,74 @@ impl RockserverClient {
             }
 
             let last_seq = events.last().unwrap().seq;
-            
-            for event in events {
-                 if let Err(e) = processor(event.clone()).await {
-                     return Err(Status::internal(format!("Processor error: {}", e)));
-                 }
 
-                 if options.commit_mode == CdcCommitMode::PerEvent {
-                     self.cdc_commit(id.clone(), event.seq).await?;
-                 }
+            for event in events {
+                if let Err(e) = processor(event.clone()).await {
+                    return Err(Status::internal(format!("Processor error: {}", e)));
+                }
+
+                if options.commit_mode == CdcCommitMode::PerEvent {
+                    self.cdc_commit(id.clone(), event.seq).await?;
+                }
             }
 
             if options.commit_mode == CdcCommitMode::Batch {
-                 self.cdc_commit(id.clone(), last_seq).await?;
+                self.cdc_commit(id.clone(), last_seq).await?;
             }
-            
+
             seq = Some(last_seq + 1);
         }
     }
 }
 
 fn decode_raw_scan_event(response: ScanRawResponse) -> Result<RawScanEvent> {
-	let ScanRawResponse { event, completed_sst_token_after_batch } = response;
-	match event {
-		Some(scan_raw_response::Event::Serialized(serialized)) => {
-			let completed_sst_token = completed_sst_token_after_batch
-				.map(RawSstToken::new)
-				.transpose()
-				.map_err(Status::internal)?;
-			Ok(RawScanEvent::Batch {
-				batch: decode_kv_batch(&serialized)?,
-				completed_sst_token,
-			})
-		}
-		Some(scan_raw_response::Event::CompletedSstToken(token)) => {
-			if completed_sst_token_after_batch.is_some() {
-				return Err(Status::internal("Rockserver returned two completion tokens in one raw-scan event"));
-			}
-			Ok(RawScanEvent::SstCompleted(
-				RawSstToken::new(token).map_err(Status::internal)?,
-			))
-		}
-		None => Err(Status::internal("Rockserver returned an empty resumable raw-scan event")),
-	}
+    let ScanRawResponse {
+        event,
+        completed_sst_token_after_batch,
+    } = response;
+    match event {
+        Some(scan_raw_response::Event::Serialized(serialized)) => {
+            let completed_sst_token = completed_sst_token_after_batch
+                .map(RawSstToken::new)
+                .transpose()
+                .map_err(Status::internal)?;
+            Ok(RawScanEvent::Batch {
+                batch: decode_kv_batch(&serialized)?,
+                completed_sst_token,
+            })
+        }
+        Some(scan_raw_response::Event::CompletedSstToken(token)) => {
+            if completed_sst_token_after_batch.is_some() {
+                return Err(Status::internal(
+                    "Rockserver returned two completion tokens in one raw-scan event",
+                ));
+            }
+            Ok(RawScanEvent::SstCompleted(
+                RawSstToken::new(token).map_err(Status::internal)?,
+            ))
+        }
+        None => Err(Status::internal(
+            "Rockserver returned an empty resumable raw-scan event",
+        )),
+    }
 }
 
 fn decode_kv_batch(mut buf: &[u8]) -> Result<KvBatch> {
     use std::convert::TryInto;
 
     let get_u32 = |b: &mut &[u8]| -> Result<u32> {
-        if b.len() < 4 { return Err(Status::internal("Buffer too short for u32")); }
+        if b.len() < 4 {
+            return Err(Status::internal("Buffer too short for u32"));
+        }
         let (int_bytes, rest) = b.split_at(4);
         *b = rest;
         Ok(u32::from_le_bytes(int_bytes.try_into().unwrap()))
     };
 
     let get_u8 = |b: &mut &[u8]| -> Result<u8> {
-        if b.len() < 1 { return Err(Status::internal("Buffer too short for u8")); }
+        if b.len() < 1 {
+            return Err(Status::internal("Buffer too short for u8"));
+        }
         let (byte, rest) = b.split_at(1);
         *b = rest;
         Ok(byte[0])
@@ -1467,14 +1810,18 @@ fn decode_kv_batch(mut buf: &[u8]) -> Result<KvBatch> {
 
         for _ in 0..keys_count {
             let key_len = get_u32(&mut buf)?;
-            if buf.len() < key_len as usize { return Err(Status::internal("Buffer too short for key")); }
+            if buf.len() < key_len as usize {
+                return Err(Status::internal("Buffer too short for key"));
+            }
             let (key_bytes, rest) = buf.split_at(key_len as usize);
             buf = rest;
             keys.push(key_bytes.to_vec());
         }
 
         let val_len = get_u32(&mut buf)?;
-        if buf.len() < val_len as usize { return Err(Status::internal("Buffer too short for value")); }
+        if buf.len() < val_len as usize {
+            return Err(Status::internal("Buffer too short for value"));
+        }
         let (val_bytes, rest) = buf.split_at(val_len as usize);
         buf = rest;
 
@@ -1493,81 +1840,100 @@ mod workload_context_tests {
     use tonic::transport::Endpoint;
 
     #[tokio::test]
-	async fn client_views_retain_independent_workload_contexts() {
-		let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-		let ingest = RockserverClient::new_unchecked(channel, RequestContext::ingest());
-		assert_eq!(ingest.context.profile, 4);
+    async fn client_views_retain_independent_workload_contexts() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let ingest = RockserverClient::new_unchecked(channel, RequestContext::ingest());
+        assert_eq!(ingest.context.profile, 4);
 
-		let analytical = ingest.with_context(RequestContext::analytical());
-		assert_eq!(analytical.context.profile, 3);
-		assert_eq!(ingest.context.profile, 4);
-	}
+        let analytical = ingest.with_context(RequestContext::analytical());
+        assert_eq!(analytical.context.profile, 3);
+        assert_eq!(ingest.context.profile, 4);
+    }
 
-	#[tokio::test]
-	async fn operation_timeout_is_applied_as_the_smaller_tonic_deadline() {
-		let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-		let context = RequestContext::for_profile(
-			WorkloadProfile::Batch,
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 + 10_000,
-		);
-		let client = RockserverClient::new_unchecked(channel, context);
-		let request = client.contextual_request_with_timeout((), Some(5)).unwrap();
-		assert_eq!(request.metadata().get("grpc-timeout").unwrap(), "5000000n");
-	}
+    #[tokio::test]
+    async fn operation_timeout_is_applied_as_the_smaller_tonic_deadline() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let context =
+            RequestContext::for_profile(WorkloadProfile::Batch, Some(Duration::from_secs(10)));
+        let client = RockserverClient::new_unchecked(channel, context);
+        let request = client.contextual_request_with_timeout((), Some(5)).unwrap();
+        assert_eq!(request.metadata().get("grpc-timeout").unwrap(), "5000000n");
+    }
 
-	#[tokio::test]
-	async fn expired_context_fails_before_transport() {
-		let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-		let context = RequestContext {
-			profile: 2,
-			deadline_epoch_millis: 1,
-		};
-		let error = RockserverClient::new_unchecked(channel, context)
-			.get_column_id("never-sent".to_owned())
-			.await
-			.unwrap_err();
-		assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-	}
+    #[tokio::test]
+    async fn wrong_contract_context_fails_before_transport() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let context = RequestContext {
+            profile: 2,
+            workload_contract_version: 2,
+            timeout_nanos: 1,
+        };
+        let error = RockserverClient::new_unchecked(channel, context)
+            .get_column_id("never-sent".to_owned())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
 
-	#[test]
-	fn resumable_raw_scan_decodes_coalesced_completion_without_extra_event() {
-		let event = decode_raw_scan_event(ScanRawResponse {
-			event: Some(scan_raw_response::Event::Serialized(vec![0, 0, 0, 0])),
-			completed_sst_token_after_batch: Some("/000123.sst".to_owned()),
-		}).unwrap();
+    #[test]
+    fn resumable_raw_scan_decodes_coalesced_completion_without_extra_event() {
+        let event = decode_raw_scan_event(ScanRawResponse {
+            event: Some(scan_raw_response::Event::Serialized(vec![0, 0, 0, 0])),
+            completed_sst_token_after_batch: Some("/000123.sst".to_owned()),
+        })
+        .unwrap();
 
-		assert_eq!(event, RawScanEvent::Batch {
-			batch: KvBatch { entries: Vec::new() },
-			completed_sst_token: Some(RawSstToken::new("/000123.sst".to_owned()).unwrap()),
-		});
-	}
+        assert_eq!(
+            event,
+            RawScanEvent::Batch {
+                batch: KvBatch {
+                    entries: Vec::new()
+                },
+                completed_sst_token: Some(RawSstToken::new("/000123.sst".to_owned()).unwrap()),
+            }
+        );
+    }
 
-	#[test]
-	fn resumable_raw_scan_decodes_empty_sst_completion() {
-		let event = decode_raw_scan_event(ScanRawResponse {
-			event: Some(scan_raw_response::Event::CompletedSstToken("000456.sst".to_owned())),
-			completed_sst_token_after_batch: None,
-		}).unwrap();
+    #[test]
+    fn resumable_raw_scan_decodes_empty_sst_completion() {
+        let event = decode_raw_scan_event(ScanRawResponse {
+            event: Some(scan_raw_response::Event::CompletedSstToken(
+                "000456.sst".to_owned(),
+            )),
+            completed_sst_token_after_batch: None,
+        })
+        .unwrap();
 
-		assert_eq!(event, RawScanEvent::SstCompleted(
-			RawSstToken::new("000456.sst".to_owned()).unwrap()
-		));
-	}
+        assert_eq!(
+            event,
+            RawScanEvent::SstCompleted(RawSstToken::new("000456.sst".to_owned()).unwrap())
+        );
+    }
 
-	#[test]
-	fn resumable_raw_scan_rejects_ambiguous_or_malformed_completion() {
-		for response in [
-			ScanRawResponse {
-				event: Some(scan_raw_response::Event::CompletedSstToken("000123.sst".to_owned())),
-				completed_sst_token_after_batch: Some("000124.sst".to_owned()),
-			},
-			ScanRawResponse {
-				event: Some(scan_raw_response::Event::CompletedSstToken("../000123.sst".to_owned())),
-				completed_sst_token_after_batch: None,
-			},
-			ScanRawResponse { event: None, completed_sst_token_after_batch: None },
-		] {
-			assert_eq!(decode_raw_scan_event(response).unwrap_err().code(), tonic::Code::Internal);
-		}
-	}
+    #[test]
+    fn resumable_raw_scan_rejects_ambiguous_or_malformed_completion() {
+        for response in [
+            ScanRawResponse {
+                event: Some(scan_raw_response::Event::CompletedSstToken(
+                    "000123.sst".to_owned(),
+                )),
+                completed_sst_token_after_batch: Some("000124.sst".to_owned()),
+            },
+            ScanRawResponse {
+                event: Some(scan_raw_response::Event::CompletedSstToken(
+                    "../000123.sst".to_owned(),
+                )),
+                completed_sst_token_after_batch: None,
+            },
+            ScanRawResponse {
+                event: None,
+                completed_sst_token_after_batch: None,
+            },
+        ] {
+            assert_eq!(
+                decode_raw_scan_event(response).unwrap_err().code(),
+                tonic::Code::Internal
+            );
+        }
+    }
 }

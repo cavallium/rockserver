@@ -1,11 +1,11 @@
-use std::time::Duration;
 use crate::proto;
+use std::time::Duration;
 
 // Re-export proto types that are part of the public API
 pub use crate::proto::{
-	ColumnHashType, Operation, PutBatchMode, MergeBatchMode, RequestContext, WorkloadProfile,
-    Kv, KvBatch, Delta, Previous, Changed, PreviousPresence, Merged, UpdateBegin,
-    FirstAndLast, CdcEvent,
+    CdcEvent, Changed, ColumnHashType, Delta, FirstAndLast, Kv, KvBatch, MergeBatchMode, Merged,
+    Operation, Previous, PreviousPresence, PutBatchMode, RequestContext, UpdateBegin,
+    WorkloadProfile,
 };
 
 /// Opaque, database-scoped identity of an immutable RocksDB SST file.
@@ -13,83 +13,110 @@ pub use crate::proto::{
 pub struct RawSstToken(String);
 
 impl RawSstToken {
-	pub fn new(value: String) -> Result<Self, &'static str> {
-		let without_slash = value.strip_prefix('/').unwrap_or(&value);
-		let digits = without_slash
-			.strip_suffix(".sst")
-			.ok_or("raw SST token must end in .sst")?;
-		if !(6..=20).contains(&digits.len())
-			|| (digits.len() > 6 && digits.starts_with('0'))
-			|| !digits.bytes().all(|byte| byte.is_ascii_digit())
-			|| digits.parse::<u64>().ok().filter(|number| *number != 0).is_none()
-		{
-			return Err("raw SST token must be a canonical RocksDB table filename");
-		}
-		Ok(Self(value))
-	}
+    pub fn new(value: String) -> Result<Self, &'static str> {
+        let without_slash = value.strip_prefix('/').unwrap_or(&value);
+        let digits = without_slash
+            .strip_suffix(".sst")
+            .ok_or("raw SST token must end in .sst")?;
+        if !(6..=20).contains(&digits.len())
+            || (digits.len() > 6 && digits.starts_with('0'))
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+            || digits
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number != 0)
+                .is_none()
+        {
+            return Err("raw SST token must be a canonical RocksDB table filename");
+        }
+        Ok(Self(value))
+    }
 
-	pub fn as_str(&self) -> &str {
-		&self.0
-	}
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 
-	pub fn into_string(self) -> String {
-		self.0
-	}
+    pub fn into_string(self) -> String {
+        self.0
+    }
 }
 
 /// One resumable raw-scan event. A completion token is safe to checkpoint only
 /// after the event carrying it has been consumed successfully.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RawScanEvent {
-	Batch {
-		batch: KvBatch,
-		completed_sst_token: Option<RawSstToken>,
-	},
-	SstCompleted(RawSstToken),
+    Batch {
+        batch: KvBatch,
+        completed_sst_token: Option<RawSstToken>,
+    },
+    SstCompleted(RawSstToken),
 }
 
 fn workload_profile_wire_value(profile: WorkloadProfile) -> i32 {
-	match profile {
-		WorkloadProfile::Unspecified => 0,
-		WorkloadProfile::Control => 1,
-		WorkloadProfile::Latency => 2,
-		WorkloadProfile::Analytical => 3,
-		WorkloadProfile::Ingest => 4,
-		WorkloadProfile::Cdc => 5,
-		WorkloadProfile::Batch => 6,
-		WorkloadProfile::PhysicalMaintenance => 7,
-	}
+    match profile {
+        WorkloadProfile::Unspecified => 0,
+        WorkloadProfile::Control => 1,
+        WorkloadProfile::Latency => 2,
+        WorkloadProfile::Analytical => 3,
+        WorkloadProfile::Ingest => 4,
+        WorkloadProfile::Cdc => 5,
+        WorkloadProfile::Batch => 6,
+        WorkloadProfile::PhysicalMaintenance => 7,
+    }
 }
 
 impl RequestContext {
-	/// Create a mandatory caller context. Protected profiles are rejected by Rockserver.
-	pub fn for_profile(profile: WorkloadProfile, deadline_epoch_millis: i64) -> Self {
-		let profile = workload_profile_wire_value(profile);
-		assert!(matches!(profile, 2 | 3 | 4 | 6), "workload profile is owned by Rockserver");
-		assert!(deadline_epoch_millis > 0, "deadline_epoch_millis must be positive");
-		assert!(
-			profile != 2 || deadline_epoch_millis != i64::MAX,
-			"LATENCY requires a finite deadline"
-		);
-		Self { profile, deadline_epoch_millis }
-	}
+    pub const NO_TIMEOUT: i64 = i64::MAX;
 
-	/// Context for request-bound work with an absolute Unix-epoch deadline.
-	pub fn latency(deadline_epoch_millis: i64) -> Self {
-		Self::for_profile(WorkloadProfile::Latency, deadline_epoch_millis)
-	}
+    /// Create a mandatory caller context. Protected profiles are rejected by Rockserver.
+    pub fn for_profile(profile: WorkloadProfile, timeout: Option<Duration>) -> Self {
+        let profile = workload_profile_wire_value(profile);
+        assert!(
+            matches!(profile, 2 | 3 | 4 | 6),
+            "workload profile is owned by Rockserver"
+        );
+        let timeout_nanos = timeout.map_or(Self::NO_TIMEOUT, |duration| {
+            assert!(!duration.is_zero(), "timeout must be positive");
+            duration.as_nanos().min((i64::MAX - 1) as u128) as i64
+        });
+        assert!(
+            profile != 2 || timeout_nanos != Self::NO_TIMEOUT,
+            "LATENCY requires a finite timeout"
+        );
+        Self {
+            profile,
+            workload_contract_version: crate::REQUIRED_WORKLOAD_CONTRACT_VERSION,
+            timeout_nanos,
+        }
+    }
 
-	pub fn analytical() -> Self {
-		Self::for_profile(WorkloadProfile::Analytical, i64::MAX)
-	}
+    pub fn latency(timeout: Duration) -> Self {
+        Self::for_profile(WorkloadProfile::Latency, Some(timeout))
+    }
 
-	pub fn ingest() -> Self {
-		Self::for_profile(WorkloadProfile::Ingest, i64::MAX)
-	}
+    pub fn analytical() -> Self {
+        Self::for_profile(WorkloadProfile::Analytical, None)
+    }
 
-	pub fn batch() -> Self {
-		Self::for_profile(WorkloadProfile::Batch, i64::MAX)
-	}
+    pub fn analytical_with_timeout(timeout: Duration) -> Self {
+        Self::for_profile(WorkloadProfile::Analytical, Some(timeout))
+    }
+
+    pub fn ingest() -> Self {
+        Self::for_profile(WorkloadProfile::Ingest, None)
+    }
+
+    pub fn ingest_with_timeout(timeout: Duration) -> Self {
+        Self::for_profile(WorkloadProfile::Ingest, Some(timeout))
+    }
+
+    pub fn batch() -> Self {
+        Self::for_profile(WorkloadProfile::Batch, None)
+    }
+
+    pub fn batch_with_timeout(timeout: Duration) -> Self {
+        Self::for_profile(WorkloadProfile::Batch, Some(timeout))
+    }
 }
 
 /// Schema definition for a column in RockServer.
@@ -114,7 +141,11 @@ impl From<ColumnSchema> for proto::ColumnSchema {
     fn from(val: ColumnSchema) -> Self {
         proto::ColumnSchema {
             fixed_keys: val.fixed_keys,
-            variable_tail_keys: val.variable_tail_keys.into_iter().map(|x| x as i32).collect(),
+            variable_tail_keys: val
+                .variable_tail_keys
+                .into_iter()
+                .map(|x| x as i32)
+                .collect(),
             has_value: val.has_value,
             merge_operator_name: val.merge_operator_name,
             merge_operator_version: val.merge_operator_version,
@@ -128,7 +159,9 @@ impl From<proto::ColumnSchema> for ColumnSchema {
     fn from(val: proto::ColumnSchema) -> Self {
         ColumnSchema {
             fixed_keys: val.fixed_keys,
-            variable_tail_keys: val.variable_tail_keys.into_iter()
+            variable_tail_keys: val
+                .variable_tail_keys
+                .into_iter()
                 .filter_map(|x| ColumnHashType::try_from(x).ok())
                 .collect(),
             has_value: val.has_value,
@@ -192,8 +225,6 @@ pub enum CdcCommitMode {
 /// Atomic precondition for creating or updating a CDC subscription.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CdcCreatePrecondition {
-    /// Preserve legacy behavior and do not compare the durable checkpoint.
-    Unchecked,
     /// Require that the subscription metadata does not exist.
     Absent,
     /// Require that the subscription exists at exactly this durable checkpoint.
