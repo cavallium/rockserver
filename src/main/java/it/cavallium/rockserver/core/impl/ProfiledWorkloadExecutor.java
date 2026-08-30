@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -62,9 +63,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			WorkloadProfile.CONTROL,
 			WorkloadProfile.PHYSICAL_MAINTENANCE
 	};
-	private static final Comparator<WorkloadTask> DEADLINE_ORDER = Comparator
-			.comparingLong(WorkloadTask::deadlineEpochMillis)
-			.thenComparingLong(WorkloadTask::deadlineSequence);
+	private static final Comparator<WorkloadTask> DEADLINE_ORDER = (left, right) -> {
+		int deadlineOrder = Long.compare(left.deadlineEpochMillis(), right.deadlineEpochMillis());
+		return deadlineOrder != 0
+				? deadlineOrder
+				: compareSequence(left.deadlineSequence(), right.deadlineSequence());
+	};
 	private static final CounterHandle INERT_COUNTER = _ -> {};
 	private static final TimerHandle INERT_TIMER = _ -> {};
 	private static final TaskMetrics INERT_TASK_METRICS = TaskMetrics.inert();
@@ -80,9 +84,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final TaskQueue[] cooperativeQueues = new TaskQueue[PROFILES.length];
 	private final TaskHeap deadlineQueue = new TaskHeap(true);
 	private final ArrayDeque<DeferredAdmission> deferredAdmissions = new ArrayDeque<>();
-	private final PriorityQueue<DeferredAdmission> deferredDeadlines = new PriorityQueue<>(Comparator
-			.comparingLong((DeferredAdmission deferred) -> deferred.deadlineEpochMillis)
-			.thenComparingLong(deferred -> deferred.sequence));
+	private final PriorityQueue<DeferredAdmission> deferredDeadlines = new PriorityQueue<>((left, right) -> {
+		int deadlineOrder = Long.compare(left.deadlineEpochMillis, right.deadlineEpochMillis);
+		return deadlineOrder != 0
+				? deadlineOrder
+				: compareSequence(left.sequence, right.sequence);
+	});
 	private final CancellationIndex cancellationIndex = new CancellationIndex();
 	private int indexedDeadlineCount;
 	private final int[] queued = new int[PROFILES.length];
@@ -247,7 +254,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 							profile,
 							family,
 							deadlineEpochMillis,
-							sequence++,
+								nextSequenceUnsafe(),
 							metricsTimestamp(taskMetrics),
 							cost,
 							command,
@@ -341,7 +348,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						profile,
 						family,
 						deadlineEpochMillis,
-						sequence++,
+							nextSequenceUnsafe(),
 						metricsTimestamp(taskMetrics),
 						cost,
 						command,
@@ -428,7 +435,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				var task = WorkloadTask.normal(profile,
 						family,
 						deadlineEpochMillis,
-						sequence++,
+							nextSequenceUnsafe(),
 						metricsTimestamp(taskMetrics),
 						cost,
 						command,
@@ -478,6 +485,123 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		long cost = 1L + (estimatedBytes - 1L) / WorkloadCost.QUANTUM_BYTES;
 		return (int) Math.max(1L, Math.min(WorkloadCost.MAX_UNITS, cost));
+	}
+
+	/**
+	 * Issue a lifetime ordering ticket without ever exposing signed wraparound to EDF or FIFO
+	 * comparisons. When the practically unreachable boundary is reached, every live object whose
+	 * ticket can still participate in ordering is renumbered under this executor's lock. The live
+	 * inventory is int-bounded by queue/outstanding limits, so its new maximum is strictly below
+	 * {@link Long#MAX_VALUE}. The increasing transform preserves every heap and queue order.
+	 *
+	 * <p>Serial-number arithmetic is deliberately not used here: bounded live cardinality does not
+	 * bound ticket distance when a far-future deadline or parked continuation survives arbitrarily
+	 * many later submissions.</p>
+	 */
+	private long nextSequenceUnsafe() {
+		if (sequence < 0L) {
+			throw new IllegalStateException("Workload ordering sequence wrapped without rebasing");
+		}
+		if (sequence == Long.MAX_VALUE) {
+			rebaseSequencesUnsafe();
+		}
+		return sequence++;
+	}
+
+	private void rebaseSequencesUnsafe() {
+		var live = new IdentityHashMap<Object, Boolean>();
+		latencyQueue.collectSequenceOwners(live);
+		deadlineQueue.collectSequenceOwners(live);
+		for (var queue : queues) {
+			if (queue != null) queue.collectSequenceOwners(live);
+		}
+		for (var queue : cooperativeQueues) {
+			if (queue != null) queue.collectSequenceOwners(live);
+		}
+		for (var task = firstCooperativeTask; task != null; task = task.nextLifetime) {
+			live.put(task, Boolean.TRUE);
+		}
+		for (var deferred : deferredAdmissions) live.put(deferred, Boolean.TRUE);
+		for (var deferred : deferredDeadlines) live.put(deferred, Boolean.TRUE);
+		cancellationIndex.collectSequenceOwners(live);
+
+		var ordered = new ArrayList<SequenceSlot>(live.size());
+		for (var owner : live.keySet()) {
+			switch (owner) {
+				case CooperativeWorkloadTask task -> {
+					var workloadTask = (WorkloadTask) task;
+					ordered.add(new SequenceSlot(task, false, workloadTask.sequence()));
+					if (workloadTask.hasDeadline()) {
+						ordered.add(new SequenceSlot(task, true, workloadTask.deadlineSequence()));
+					}
+				}
+				case WorkloadTask task -> ordered.add(new SequenceSlot(task, false, task.sequence()));
+				case DeferredAdmission deferred ->
+						ordered.add(new SequenceSlot(deferred, false, deferred.sequence));
+				default -> throw new IllegalStateException("Unrecognized workload ordering owner: "
+						+ owner.getClass().getName());
+			}
+		}
+		ordered.sort((left, right) -> compareSequence(left.current(), right.current()));
+		long replacement = 0L;
+		for (int start = 0; start < ordered.size();) {
+			var first = ordered.get(start);
+			long current = first.current();
+			if (current < 0L) {
+				throw new IllegalStateException("Wrapped live workload ordering sequence: " + current);
+			}
+			int end = start + 1;
+			while (end < ordered.size() && ordered.get(end).current() == current) end++;
+			validateSequenceAliases(ordered, start, end);
+			for (int index = start; index < end; index++) {
+				assignSequence(ordered.get(index), replacement);
+			}
+			replacement++;
+			start = end;
+		}
+		sequence = replacement;
+		if (sequence < 0L || sequence == Long.MAX_VALUE) {
+			throw new IllegalStateException("Live workload ordering inventory exceeds the ticket range");
+		}
+	}
+
+	private static void validateSequenceAliases(List<SequenceSlot> ordered, int start, int end) {
+		if (end - start == 1) {
+			return;
+		}
+		if (end - start != 2) {
+			throw new IllegalStateException("Workload ordering sequence has more than two live owners: "
+					+ ordered.get(start).current());
+		}
+		var first = ordered.get(start);
+		var second = ordered.get(start + 1);
+		if (first.owner() != second.owner()
+				|| !(first.owner() instanceof CooperativeWorkloadTask)
+				|| first.deadline() == second.deadline()) {
+			throw new IllegalStateException("Duplicate workload ordering sequence: " + first.current());
+		}
+	}
+
+	private static void assignSequence(SequenceSlot slot, long replacement) {
+		switch (slot.owner()) {
+			case WorkloadTask task -> {
+				if (slot.deadline()) {
+					task.deadlineSequence(replacement);
+				} else {
+					task.sequence(replacement);
+				}
+			}
+			case DeferredAdmission deferred -> deferred.sequence = replacement;
+			default -> throw new IllegalStateException("Unrecognized workload ordering owner: "
+					+ slot.owner().getClass().getName());
+		}
+	}
+
+	private static int compareSequence(long left, long right) {
+		return Long.compare(left, right);
+	}
+
+	private record SequenceSlot(Object owner, boolean deadline, long current) {
 	}
 
 	private void ensureWorkersStartedUnsafe() {
@@ -933,7 +1057,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private void refreshCooperativeSequenceUnsafe(WorkloadTask task) {
-		task.refreshSequence(sequence++);
+		task.refreshSequence(nextSequenceUnsafe());
 	}
 
 	private void resumeCooperative(WorkloadTask task) {
@@ -2026,7 +2150,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (cooperativeHead == null) {
 			return normalHead;
 		}
-		return normalHead.sequence() <= cooperativeHead.sequence() ? normalHead : cooperativeHead;
+		return compareSequence(normalHead.sequence(), cooperativeHead.sequence()) <= 0
+				? normalHead
+				: cooperativeHead;
 	}
 
 	private TaskMetrics metrics(WorkloadProfile profile, OperationFamily family) {
@@ -2462,7 +2588,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private final WorkloadProfile profile;
 		private final OperationFamily family;
 		private final long deadlineEpochMillis;
-		private final long sequence;
+		private long sequence;
 		private final long enqueuedNanos;
 		private final int cost;
 		private final Runnable command;
@@ -2573,7 +2699,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private static final int DISPATCH_CANCELLATION = 0b100;
 		private static final int HAS_DEADLINE = 0b1000;
 		private static final int COMPETITION_ACTIVE = 0b1_0000;
-		private final long deadlineSequence;
+		private long deadlineSequence;
 		private final long enqueuedNanos;
 		private final int cost;
 		private final byte profile;
@@ -2722,6 +2848,24 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			return this instanceof CooperativeWorkloadTask cooperativeTask
 					? cooperativeTask.sequence
 					: deadlineSequence;
+		}
+
+		private void sequence(long replacement) {
+			if (replacement < 0L) {
+				throw new IllegalArgumentException("Workload ordering sequence must not be negative");
+			}
+			if (this instanceof CooperativeWorkloadTask cooperativeTask) {
+				cooperativeTask.sequence = replacement;
+			} else {
+				deadlineSequence = replacement;
+			}
+		}
+
+		private void deadlineSequence(long replacement) {
+			if (replacement < 0L) {
+				throw new IllegalArgumentException("Workload deadline sequence must not be negative");
+			}
+			deadlineSequence = replacement;
 		}
 
 		private long enqueuedNanos() {
@@ -3331,6 +3475,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			elements = Arrays.copyOf(elements, Math.max(required, grown));
 		}
 
+		private void collectSequenceOwners(IdentityHashMap<Object, Boolean> target) {
+			for (int index = 0; index < size; index++) {
+				target.put(Objects.requireNonNull(elements[index]), Boolean.TRUE);
+			}
+		}
+
 		private int indexOf(WorkloadTask task) {
 			return deadlineIndex ? task.deadlineHeapIndex() : task.latencyHeapIndex();
 		}
@@ -3394,6 +3544,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private @Nullable WorkloadTask peekFirst() {
 			return first;
 		}
+
+		private void collectSequenceOwners(IdentityHashMap<Object, Boolean> target) {
+			for (var task = first; task != null; task = task.nextQueue) {
+				target.put(task, Boolean.TRUE);
+			}
+		}
 	}
 
 	/**
@@ -3418,6 +3574,16 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		                                             OperationFamily family) {
 			var entry = findEntry(command, profile.ordinal(), family.ordinal());
 			return entry == null ? null : entry.firstQueued;
+		}
+
+		private void collectSequenceOwners(IdentityHashMap<Object, Boolean> target) {
+			for (var bucket : buckets) {
+				for (var entry = bucket; entry != null; entry = entry.bucketNext) {
+					for (var task = entry.firstQueued; task != null; task = task.nextCancellation) {
+						target.put(task, Boolean.TRUE);
+					}
+				}
+			}
 		}
 
 		private void map(WorkloadTask task) {
