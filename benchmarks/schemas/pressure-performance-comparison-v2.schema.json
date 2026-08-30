@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-pressure-performance-comparison-v2",
+  "title": "Rockserver paired pressure performance comparison v2",
+  "type": "object",
+  "required": [
+    "schema", "contract_version", "finished", "baseline_sha", "candidate_sha",
+    "configuration_sha256", "host_state", "host_sha256", "hardware_description",
+    "runtime_sha256", "baseline_production_sha256", "candidate_production_sha256",
+    "workers_enforced", "fixed_pairs", "fresh_processes", "adaptive_stopping",
+    "family_wise_alpha", "throughput_minimum_ratio", "cost_maximum_ratio",
+    "multiplicity", "decision", "passed", "classpath_sha256", "scheduler", "signal"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-pressure-performance-comparison-v2" },
+    "contract_version": { "const": "v2" },
+    "finished": { "type": "string", "format": "date-time" },
+    "baseline_sha": { "$ref": "#/$defs/gitSha" },
+    "candidate_sha": { "$ref": "#/$defs/gitSha" },
+    "configuration_sha256": { "$ref": "#/$defs/sha256" },
+    "host_state": { "type": "string", "minLength": 1 },
+    "host_sha256": { "$ref": "#/$defs/sha256" },
+    "hardware_description": { "type": "string", "minLength": 1 },
+    "runtime_sha256": { "$ref": "#/$defs/sha256" },
+    "baseline_production_sha256": { "$ref": "#/$defs/sha256" },
+    "candidate_production_sha256": { "$ref": "#/$defs/sha256" },
+    "workers_enforced": { "type": "boolean" },
+    "fixed_pairs": { "const": 10 },
+    "fresh_processes": { "const": 40 },
+    "adaptive_stopping": { "const": false },
+    "family_wise_alpha": { "const": 0.05 },
+    "throughput_minimum_ratio": { "const": 0.99 },
+    "cost_maximum_ratio": { "const": 1.02 },
+    "multiplicity": { "const": "holm-bonferroni" },
+    "decision": { "enum": ["pass", "fail", "inconclusive"] },
+    "passed": { "type": "boolean" },
+    "classpath_sha256": {
+      "type": "object",
+      "required": ["baseline_scheduler", "candidate_scheduler", "baseline_signal", "candidate_signal"],
+      "properties": {
+        "baseline_scheduler": { "$ref": "#/$defs/sha256" },
+        "candidate_scheduler": { "$ref": "#/$defs/sha256" },
+        "baseline_signal": { "$ref": "#/$defs/sha256" },
+        "candidate_signal": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "scheduler": { "$ref": "#/$defs/suite" },
+    "signal": { "$ref": "#/$defs/suite" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "vector": {
+      "type": "array", "minItems": 10, "maxItems": 10,
+      "items": { "type": "number", "minimum": 0 }
+    },
+    "nullableNumber": { "type": ["number", "null"] },
+    "metric": {
+      "type": "object",
+      "required": [
+        "baseline", "candidate", "ratio_mean", "lower_95", "upper_95",
+        "noninferiority_margin", "regression_p", "regression_holm_p",
+        "regression_demonstrated", "noninferiority_p", "noninferiority_proven",
+        "equivalence_proven", "material_p", "material_holm_p", "material_proven",
+        "deterministic_ceiling_passed"
+      ],
+      "properties": {
+        "baseline": { "$ref": "#/$defs/vector" },
+        "candidate": { "$ref": "#/$defs/vector" },
+        "ratio_mean": { "$ref": "#/$defs/nullableNumber" },
+        "lower_95": { "$ref": "#/$defs/nullableNumber" },
+        "upper_95": { "$ref": "#/$defs/nullableNumber" },
+        "noninferiority_margin": { "type": "number", "exclusiveMinimum": 0 },
+        "regression_p": { "$ref": "#/$defs/nullableNumber" },
+        "regression_holm_p": { "$ref": "#/$defs/nullableNumber" },
+        "regression_demonstrated": { "type": "boolean" },
+        "noninferiority_p": { "$ref": "#/$defs/nullableNumber" },
+        "noninferiority_proven": { "type": "boolean" },
+        "equivalence_proven": { "type": "boolean" },
+        "material_p": { "$ref": "#/$defs/nullableNumber" },
+        "material_holm_p": { "$ref": "#/$defs/nullableNumber" },
+        "material_proven": { "type": "boolean" },
+        "deterministic_ceiling_passed": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "suite": {
+      "type": "object",
+      "required": [
+        "decision", "failures", "inconclusive_metrics", "material_improvements",
+        "stochastic_hypotheses", "metrics"
+      ],
+      "properties": {
+        "decision": { "enum": ["pass", "fail", "inconclusive"] },
+        "failures": { "type": "array", "items": { "type": "string" } },
+        "inconclusive_metrics": { "type": "array", "items": { "type": "string" } },
+        "material_improvements": { "type": "array", "items": { "type": "string" } },
+        "stochastic_hypotheses": { "type": "integer", "minimum": 0 },
+        "metrics": { "type": "object", "additionalProperties": { "$ref": "#/$defs/metric" } }
+      },
+      "additionalProperties": false
+    }
+  }
+}
