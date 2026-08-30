@@ -201,6 +201,84 @@ class CooperativeIteratorContinuationTest {
 	}
 
 	@Test
+	void configuredItemAndByteQuantumBoundsSplitLargeMultiUnderCompetition() throws Exception {
+		final int entries = 20;
+		final int valueBytes = 8 * 1_024;
+		String database = "iterator-configured-quantum";
+		try (var connection = connection(database, """
+				range-quantum-max-items: 16
+				range-quantum-max-bytes: 16KiB
+				range-quantum-max-duration: PT0.008S
+				""")) {
+			var sync = connection.getSyncApi(RequestContext.batch());
+			var async = connection.getAsyncApi(RequestContext.batch());
+			long columnId = populateFixedColumn(sync, "entries", entries, valueBytes);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			var scheduler = connection.getScheduler();
+			var blockersEntered = new CountDownLatch(READ_WORKERS - 1);
+			var releaseBlockers = new CountDownLatch(1);
+			try {
+				occupyLatencyWorkers(scheduler, READ_WORKERS - 1, blockersEntered, releaseBlockers);
+				assertTrue(blockersEntered.await(5, SECONDS));
+				double quantumsBefore = rangeQuantums(connection, database);
+
+				var values = async.subsequentAsync(iteratorId, 0L, entries, RequestType.<Buf>multi())
+						.get(10, SECONDS);
+
+				assertEquals(entries, values.size());
+				assertTrue(rangeQuantums(connection, database) - quantumsBefore >= 10.0,
+						"16KiB of service per competitive quantum permits at most two 8KiB values");
+			} finally {
+				releaseBlockers.countDown();
+				sync.closeIterator(iteratorId);
+			}
+		}
+	}
+
+	@Test
+	void iteratorQuantumStopsAtByteOrTimeBudgetButRemainsWorkConservingWhenIdle() throws Exception {
+		final int entries = 20;
+		final int valueBytes = 8 * 1_024;
+		try (var connection = connection("iterator-quantum-control")) {
+			var sync = connection.getSyncApi(RequestContext.batch());
+			long columnId = populateFixedColumn(sync, "entries", entries, valueBytes);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			try {
+				var competing = new FixedCooperativeContext(true, false);
+				var byteBounded = connection.getInternalDB().readIteratorQuantumInternal(
+						iteratorId, entries, 16L * 1_024L, Long.MAX_VALUE, competing);
+				assertEquals(2, byteBounded.values().size());
+				assertEquals(16L * 1_024L, byteBounded.decodedBytes());
+				assertTrue(byteBounded.checkpointRequested());
+				assertFalse(byteBounded.exhausted());
+
+				sync.seekTo(iteratorId, key(0));
+				var timeBounded = connection.getInternalDB().readIteratorQuantumInternal(
+						iteratorId, entries, Long.MAX_VALUE, 1L, competing);
+				assertEquals(1, timeBounded.values().size(),
+						"the duration bound may overshoot by only the current logical iterator step");
+				assertTrue(timeBounded.checkpointRequested());
+
+				sync.seekTo(iteratorId, key(0));
+				var idle = connection.getInternalDB().readIteratorQuantumInternal(
+						iteratorId, entries, 1L, 1L, new FixedCooperativeContext(false, false));
+				assertEquals(entries, idle.values().size(),
+						"byte/time slicing must not pace a worker when no peer needs it");
+				assertFalse(idle.checkpointRequested());
+
+				sync.seekTo(iteratorId, key(0));
+				var terminated = connection.getInternalDB().readIteratorQuantumInternal(
+						iteratorId, entries, Long.MAX_VALUE, Long.MAX_VALUE,
+						new FixedCooperativeContext(true, true));
+				assertTrue(terminated.values().isEmpty());
+				assertFalse(terminated.checkpointRequested());
+			} finally {
+				sync.closeIterator(iteratorId);
+			}
+		}
+	}
+
+	@Test
 	void batchCancellationReleasesTheGateAndLeavesIteratorReusable() throws Exception {
 		final int entries = ITERATOR_STEP * 16 + 1;
 		try (var connection = connection("iterator-cancel")) {
@@ -470,28 +548,41 @@ class CooperativeIteratorContinuationTest {
 	}
 
 	private EmbeddedConnection connection(String name) throws Exception {
+		return connection(name, "");
+	}
+
+	private EmbeddedConnection connection(String name, String workloadOverrides) throws Exception {
 		var config = tempDir.resolve(name + ".conf");
 		Files.writeString(config, """
 				database: {
 				  parallelism: {
 				    read: 3
 				    write: 3
-				    workload: { competing-batch-read-maximum-active: 3 }
+				    workload: {
+				      competing-batch-read-maximum-active: 3
+				%s
+				    }
 				  }
 				  global: { enable-fast-get: false, ingest-behind: false, optimistic: false }
 				}
-				""");
+				""".formatted(workloadOverrides.indent(6)));
 		return new EmbeddedConnection(tempDir.resolve(name + "-db"), name, config);
 	}
 
 	private static long populateFixedColumn(RocksDBSyncAPI sync, String name, int count) {
+		return populateFixedColumn(sync, name, count, Integer.BYTES);
+	}
+
+	private static long populateFixedColumn(RocksDBSyncAPI sync, String name, int count, int valueBytes) {
 		long columnId = sync.createColumn(name,
 				ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 		var keys = new ArrayList<Keys>(count);
 		var values = new ArrayList<Buf>(count);
 		for (int i = 0; i < count; i++) {
 			keys.add(key(i));
-			values.add(value(i));
+			var value = new byte[valueBytes];
+			ByteBuffer.wrap(value).putInt(i);
+			values.add(Buf.wrap(value));
 		}
 		sync.putBatch(columnId, Flux.just(new KVBatchRef(keys, values)), PutBatchMode.WRITE_BATCH_NO_WAL);
 		return columnId;
@@ -589,6 +680,20 @@ class CooperativeIteratorContinuationTest {
 		}
 		if (interrupted) {
 			Thread.currentThread().interrupt();
+		}
+	}
+
+	private record FixedCooperativeContext(boolean preemptionRequested,
+			boolean terminationRequested) implements RWScheduler.CooperativeContext {
+
+		@Override
+		public RuntimeException terminationFailure() {
+			return terminationRequested ? new CancellationException("test termination") : null;
+		}
+
+		@Override
+		public boolean fail(RuntimeException failure) {
+			throw new AssertionError("test context must not fail", failure);
 		}
 	}
 

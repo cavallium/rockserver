@@ -602,7 +602,9 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			var continuation = new CooperativeIteratorContinuation<T>(
 					iterationId, skipCount, takeCount, requestType, iteratorOperation);
 			try {
-				continuation.attach(workloadExecutor.executeCooperatively(continuation, 0L));
+				continuation.attach(workloadExecutor.executeCooperatively(
+						continuation,
+						continuation.estimatedBytes()));
 				// A first dispatch parks until both the scheduler handle and the connection-
 				// shutdown cancellation bridge are installed. This closes the admission race
 				// where shutdown was pending before the handle became cancellable.
@@ -665,13 +667,14 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		return result;
 	}
 
-	private static boolean requiresCooperativeIteratorContinuation(WorkloadProfile profile,
+	private boolean requiresCooperativeIteratorContinuation(WorkloadProfile profile,
 			long skipCount,
 			long takeCount) {
+		long maximumItems = db.getWorkloadSettings().rangeQuantumMaxItems();
 		return profile != WorkloadProfile.LATENCY
-				&& (skipCount > ITERATOR_READ_STEP_SIZE
-						|| takeCount > ITERATOR_READ_STEP_SIZE
-						|| skipCount > ITERATOR_READ_STEP_SIZE - takeCount);
+				&& (skipCount > maximumItems
+						|| takeCount > maximumItems
+						|| skipCount > maximumItems - takeCount);
 	}
 
 	@Override
@@ -828,6 +831,9 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		private final AsyncIteratorOperation iteratorOperation;
 		private final IteratorRequestMode mode;
 		private final @Nullable ArrayList<Buf> values;
+		private final int maximumItems;
+		private final long maximumBytes;
+		private final long maximumDurationNanos;
 		private final Object completionLock = new Object();
 		private volatile boolean terminated;
 		private volatile boolean cancellationRequested;
@@ -856,6 +862,10 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			this.values = mode == IteratorRequestMode.MULTI
 					? new ArrayList<>((int) Math.min(takeCount, 1_024L))
 					: null;
+			var workloadSettings = db.getWorkloadSettings();
+			this.maximumItems = workloadSettings.rangeQuantumMaxItems();
+			this.maximumBytes = workloadSettings.rangeQuantumMaxBytes();
+			this.maximumDurationNanos = workloadSettings.rangeQuantumMaxDuration().toNanos();
 			this.remainingSkip = skipCount;
 			this.remainingTake = takeCount;
 			this.stage = skipCount == 0L
@@ -900,8 +910,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					}
 
 					switch (stage) {
-						case SKIP -> runSkipStep();
-						case TAKE -> runTakeStep();
+						case SKIP -> runSkipStep(context);
+						case TAKE -> runTakeStep(context);
 						case DONE -> throw new IllegalStateException("Completed iterator stage was dispatched");
 					}
 
@@ -924,11 +934,15 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			}
 		}
 
-		private void runSkipStep() {
-			long step = Math.min(remainingSkip, ITERATOR_READ_STEP_SIZE);
-			long advanced = db.advanceIteratorInternal(iterationId, step);
-			remainingSkip -= advanced;
-			if (advanced < step) {
+		private void runSkipStep(RWScheduler.CooperativeContext context) {
+			long step = Math.min(remainingSkip, maximumItems);
+			var quantum = db.advanceIteratorQuantumInternal(
+					iterationId,
+					step,
+					maximumDurationNanos,
+					context);
+			remainingSkip -= quantum.advanced();
+			if (quantum.exhausted()) {
 				exhausted = true;
 				stage = IteratorContinuationStage.DONE;
 			} else if (remainingSkip == 0L) {
@@ -938,16 +952,20 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			}
 		}
 
-		private void runTakeStep() {
-			long step = Math.min(remainingTake, ITERATOR_READ_STEP_SIZE);
+		private void runTakeStep(RWScheduler.CooperativeContext context) {
+			long step = Math.min(remainingTake, maximumItems);
 			switch (mode) {
 				case NONE, EXISTS -> {
-					long advanced = db.advanceIteratorInternal(iterationId, step);
-					remainingTake -= advanced;
+					var quantum = db.advanceIteratorQuantumInternal(
+							iterationId,
+							step,
+							maximumDurationNanos,
+							context);
+					remainingTake -= quantum.advanced();
 					if (mode == IteratorRequestMode.EXISTS) {
-						found |= advanced > 0L;
+						found |= quantum.advanced() > 0L;
 					}
-					if (advanced < step) {
+					if (quantum.exhausted()) {
 						exhausted = true;
 						stage = IteratorContinuationStage.DONE;
 					} else if (remainingTake == 0L) {
@@ -955,10 +973,15 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					}
 				}
 				case MULTI -> {
-					List<Buf> page = db.subsequent(iterationId, 0L, step, RequestType.multi());
-					Objects.requireNonNull(values, "values").addAll(page);
-					remainingTake -= page.size();
-					if (page.size() < step) {
+					var quantum = db.readIteratorQuantumInternal(
+							iterationId,
+							step,
+							maximumBytes,
+							maximumDurationNanos,
+							context);
+					Objects.requireNonNull(values, "values").addAll(quantum.values());
+					remainingTake -= quantum.values().size();
+					if (quantum.exhausted()) {
 						exhausted = true;
 						stage = IteratorContinuationStage.DONE;
 					} else if (remainingTake == 0L) {
@@ -966,6 +989,10 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					}
 				}
 			}
+		}
+
+		private long estimatedBytes() {
+			return mode == IteratorRequestMode.MULTI ? maximumBytes : 0L;
 		}
 
 		private T completedValue() {

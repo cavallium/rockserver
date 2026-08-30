@@ -6395,6 +6395,120 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	/**
+	 * Advance one cooperative iterator slice. With no scheduler competition this retains the
+	 * configured item-sized fast path. Once a peer needs the worker, elapsed service is checked
+	 * after every logical iterator step, so the non-preemptible tail is one RocksDB iterator step
+	 * rather than an entire fixed 4,096-entry call.
+	 */
+	public IteratorAdvanceQuantum advanceIteratorQuantumInternal(long iterationId,
+			long maxCount,
+			long maximumDurationNanos,
+			RWScheduler.CooperativeContext context) {
+		Objects.requireNonNull(context, "context");
+		if (maxCount < 0L) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Iterator quantum count must be non-negative");
+		}
+		if (maximumDurationNanos <= 0L) {
+			throw new IllegalArgumentException("Iterator quantum duration must be positive");
+		}
+		var start = System.nanoTime();
+		ops.beginOp();
+		try {
+			return withIterator(iterationId, state -> {
+				long advanced = 0L;
+				boolean exhausted = false;
+				boolean checkpoint = false;
+				while (advanced < maxCount && !context.terminationRequested()) {
+					if (!advanceIterator(state, false).present()) {
+						exhausted = true;
+						break;
+					}
+					advanced++;
+					if (context.preemptionRequested()
+							&& System.nanoTime() - start >= maximumDurationNanos) {
+						checkpoint = true;
+						break;
+					}
+				}
+				notifyIteratorQuantumCompleted();
+				return new IteratorAdvanceQuantum(advanced, exhausted, checkpoint);
+			});
+		} finally {
+			ops.endOp();
+			subsequentTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	/**
+	 * Materialize one cooperative MULTI slice. Item count is always bounded. Byte and monotonic
+	 * time limits become active only while another scheduler profile competes, preserving idle
+	 * throughput while bounding peer delay to the configured budget plus one indivisible value
+	 * decode/iterator advance.
+	 */
+	public IteratorMultiQuantum readIteratorQuantumInternal(long iterationId,
+			long maxCount,
+			long maximumBytes,
+			long maximumDurationNanos,
+			RWScheduler.CooperativeContext context) {
+		Objects.requireNonNull(context, "context");
+		if (maxCount < 0L) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Iterator quantum count must be non-negative");
+		}
+		if (maximumBytes <= 0L || maximumDurationNanos <= 0L) {
+			throw new IllegalArgumentException("Iterator quantum byte and duration limits must be positive");
+		}
+		var start = System.nanoTime();
+		ops.beginOp();
+		try {
+			return withIterator(iterationId, state -> {
+				var values = new ArrayList<Buf>((int) Math.min(maxCount, 1_024L));
+				long decodedBytes = 0L;
+				boolean exhausted = false;
+				boolean checkpoint = false;
+				while (values.size() < maxCount && !context.terminationRequested()) {
+					var step = advanceIterator(state, true);
+					if (!step.present()) {
+						exhausted = true;
+						break;
+					}
+					var value = Objects.requireNonNull(step.value());
+					values.add(value);
+					decodedBytes = saturatingAdd(decodedBytes, value.size());
+					if (context.preemptionRequested()
+							&& (decodedBytes >= maximumBytes
+							|| System.nanoTime() - start >= maximumDurationNanos)) {
+						checkpoint = true;
+						break;
+					}
+				}
+				notifyIteratorQuantumCompleted();
+				return new IteratorMultiQuantum(values, decodedBytes, exhausted, checkpoint);
+			});
+		} finally {
+			ops.endOp();
+			subsequentTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	private void notifyIteratorQuantumCompleted() {
+		var observer = iteratorAdvanceStepCompletedObserver;
+		if (observer != null) {
+			observer.run();
+		}
+	}
+
+	public record IteratorAdvanceQuantum(long advanced, boolean exhausted, boolean checkpointRequested) {
+	}
+
+	public record IteratorMultiQuantum(List<Buf> values,
+			long decodedBytes,
+			boolean exhausted,
+			boolean checkpointRequested) {
+	}
+
 	private <T> T withIterator(long iteratorId, Function<IteratorState, T> action) {
 		var entry = its.get(iteratorId);
 		if (entry == null || !(entry.objs() instanceof IteratorState state)) {
