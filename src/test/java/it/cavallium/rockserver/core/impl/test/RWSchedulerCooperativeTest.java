@@ -877,7 +877,10 @@ class RWSchedulerCooperativeTest {
 					OperationFamily.RANGE_PAGE,
 					deadline).executeCooperatively(task, 1L);
 			assertTrue(task.entered.await(5, SECONDS));
-			while (System.currentTimeMillis() < deadline) {
+			// The immutable budget is bound from a millisecond wall-clock sample to
+			// nanoseconds. Cross the full quantization window before asking the active
+			// cooperative task to observe expiry.
+			while (System.currentTimeMillis() < deadline + 2L) {
 				Thread.onSpinWait();
 			}
 			task.release.countDown();
