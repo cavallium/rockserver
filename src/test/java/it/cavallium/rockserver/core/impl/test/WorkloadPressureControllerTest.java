@@ -1,7 +1,9 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.lang.reflect.Field;
@@ -28,6 +30,8 @@ class WorkloadPressureControllerTest {
 		controller.setPressured(true);
 		controller.setQueued(RWScheduler.Pool.READ, true);
 		controller.setQueued(RWScheduler.Pool.WRITE, true);
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, true);
 
 		for (int round = 0; round < 32; round++) {
 			var read = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
@@ -56,6 +60,8 @@ class WorkloadPressureControllerTest {
 		controller.setBatchNotifier(_ -> directBatchWakeups.incrementAndGet());
 		controller.setQueued(RWScheduler.Pool.READ, true);
 		controller.setQueued(RWScheduler.Pool.WRITE, true);
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, true);
 
 		var read = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
 		controller.finish(read, RWScheduler.Pool.READ);
@@ -64,13 +70,19 @@ class WorkloadPressureControllerTest {
 		assertEquals(Long.MAX_VALUE, controller.waitNanos(RWScheduler.Pool.READ, ELIGIBLE_TIME),
 				"a fair handoff has no timer deadline and must park instead of spin");
 
-		controller.setQueued(RWScheduler.Pool.WRITE, false);
+		assertTrue(controller.isQueued(RWScheduler.Pool.WRITE));
+		assertTrue(controller.isDispatchable(RWScheduler.Pool.WRITE));
+		controller.setDispatchable(RWScheduler.Pool.WRITE, false);
+		assertTrue(controller.isQueued(RWScheduler.Pool.WRITE),
+				"a queued peer can remain backlogged after losing all dispatch capacity");
+		assertFalse(controller.isDispatchable(RWScheduler.Pool.WRITE));
 		assertEquals(0, deferredWakeups.get(),
-				"queue transitions run under an executor lock and must not invoke another pool");
+				"dispatchability transitions run under an executor lock and must not invoke another pool");
 		controller.signalPendingAvailability();
 		assertEquals(1, deferredWakeups.get(),
-				"dropping the handed-off queue must wake the remaining eligible pool after unlock");
+				"an undispatchable handed-off peer must wake the remaining eligible pool after unlock");
 		assertEquals(0L, controller.waitNanos(RWScheduler.Pool.READ, ELIGIBLE_TIME));
+		controller.setQueued(RWScheduler.Pool.WRITE, false);
 
 		var replacement = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
 		controller.finish(replacement, RWScheduler.Pool.READ);
@@ -81,6 +93,7 @@ class WorkloadPressureControllerTest {
 		var controller = Controller.create(1, Duration.ofSeconds(30));
 		controller.setPressured(true);
 		controller.setQueued(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
 
 		var permit = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
 		controller.finish(permit, RWScheduler.Pool.READ);
@@ -98,6 +111,7 @@ class WorkloadPressureControllerTest {
 		var controller = Controller.create(1, Duration.ofSeconds(30));
 		controller.setPressured(true);
 		controller.setQueued(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
 		var permit = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
 
 		controller.setPressured(true);
@@ -116,6 +130,7 @@ class WorkloadPressureControllerTest {
 				Duration.ofSeconds(30),
 				Duration.ofSeconds(30));
 		controller.setQueued(RWScheduler.Pool.WRITE, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, true);
 		controller.setCompeting(RWScheduler.Pool.READ, true);
 		var permit = controller.requireStart(RWScheduler.Pool.WRITE, ELIGIBLE_TIME);
 		controller.finish(permit, RWScheduler.Pool.WRITE);
@@ -130,6 +145,8 @@ class WorkloadPressureControllerTest {
 		var controller = Controller.create(1, Duration.ofSeconds(30));
 		controller.setQueued(RWScheduler.Pool.READ, true);
 		controller.setQueued(RWScheduler.Pool.WRITE, true);
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, true);
 
 		var unpressured = controller.requireStart(RWScheduler.Pool.READ, 1L);
 		controller.setPressured(true);
@@ -152,6 +169,8 @@ class WorkloadPressureControllerTest {
 		var controller = Controller.create(1, Duration.ofSeconds(30));
 		controller.setQueued(RWScheduler.Pool.READ, true);
 		controller.setQueued(RWScheduler.Pool.WRITE, true);
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, true);
 		controller.setPressured(true);
 		var staleRead = controller.requireStart(RWScheduler.Pool.READ, 1L);
 
@@ -172,6 +191,7 @@ class WorkloadPressureControllerTest {
 				Duration.ofSeconds(30),
 				Duration.ofNanos(1));
 		controller.setQueued(RWScheduler.Pool.WRITE, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, true);
 		controller.setCompeting(RWScheduler.Pool.READ, true);
 		var staleWrite = controller.requireStart(RWScheduler.Pool.WRITE, 1L);
 
@@ -191,6 +211,8 @@ class WorkloadPressureControllerTest {
 		controller.setPressured(true);
 		controller.setQueued(RWScheduler.Pool.READ, true);
 		controller.setQueued(RWScheduler.Pool.WRITE, true);
+		controller.setDispatchable(RWScheduler.Pool.READ, true);
+		controller.setDispatchable(RWScheduler.Pool.WRITE, true);
 
 		var firstRead = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME);
 		var secondRead = controller.requireStart(RWScheduler.Pool.READ, ELIGIBLE_TIME,
@@ -214,6 +236,8 @@ class WorkloadPressureControllerTest {
 		private final Class<?> type;
 		private final Method setPressured;
 		private final Method setQueued;
+		private final Method setDispatchable;
+		private final Method isDispatchable;
 		private final Method setCompeting;
 		private final Method setNotifier;
 		private final Method setBatchNotifier;
@@ -229,6 +253,10 @@ class WorkloadPressureControllerTest {
 			this.setPressured = accessible(type.getDeclaredMethod("setPressured", boolean.class));
 			this.setQueued = accessible(type.getDeclaredMethod(
 					"setBatchQueued", RWScheduler.Pool.class, boolean.class));
+			this.setDispatchable = accessible(type.getDeclaredMethod(
+					"setBatchDispatchable", RWScheduler.Pool.class, boolean.class));
+			this.isDispatchable = accessible(type.getDeclaredMethod(
+					"isBatchDispatchable", RWScheduler.Pool.class));
 			this.setCompeting = accessible(type.getDeclaredMethod(
 					"setPoolCompetition", RWScheduler.Pool.class, boolean.class));
 			this.setNotifier = accessible(type.getDeclaredMethod("setNotifier", Runnable.class));
@@ -281,6 +309,20 @@ class WorkloadPressureControllerTest {
 
 		void setQueued(RWScheduler.Pool pool, boolean queued) throws ReflectiveOperationException {
 			setQueued.invoke(instance, pool, queued);
+		}
+
+		void setDispatchable(RWScheduler.Pool pool, boolean dispatchable) throws ReflectiveOperationException {
+			setDispatchable.invoke(instance, pool, dispatchable);
+		}
+
+		boolean isDispatchable(RWScheduler.Pool pool) throws ReflectiveOperationException {
+			return (boolean) isDispatchable.invoke(instance, pool);
+		}
+
+		boolean isQueued(RWScheduler.Pool pool) throws ReflectiveOperationException {
+			Field field = type.getDeclaredField("queuedBatchPoolMask");
+			field.setAccessible(true);
+			return (field.getInt(instance) & 1 << pool.ordinal()) != 0;
 		}
 
 		void setCompeting(RWScheduler.Pool pool, boolean competing) throws ReflectiveOperationException {
