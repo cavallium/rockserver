@@ -76,6 +76,12 @@ The pressured interval must be a positive, representable duration and begins
 after each pressured BATCH completion. Physical maintenance remains parked while
 storage pressure is active.
 
+Pressure fairness alternates only between data pools that can dispatch BATCH at that moment.
+A peer with queued BATCH but every worker occupied by foreground work does not receive a turn and
+cannot place the other pool into an indefinite wait. Worker and queue transitions publish
+dispatchability while holding the owning pool lock; cross-pool wakeups are deferred until after
+unlock. Once the peer has a free worker it becomes eligible for the next bounded fair turn.
+
 ## Retained analytical work
 
 | Workload key | Default | Meaning |

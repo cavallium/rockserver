@@ -125,3 +125,21 @@ offsets then contain queued and active counts. Immutable pool snapshots remain a
 for per-outcome, parked, outstanding, drain, and conservation diagnosis. Gauges are created
 only for profile/pool pairs that can actually route work, keeping permanent metric cardinality
 bounded. Profile/family timers and counters must likewise use the single physical route above.
+
+## Reactor scheduling and terminal ownership
+
+The Reactor adapter retains two identities for each indexed submission: the original task owns
+cost and terminal callbacks, while the `Schedulers.onSchedule` result owns execution context.
+Instrumentation hooks may wrap the runnable but cannot erase `EstimatedWork` byte cost or redirect
+`RejectionAwareTask` failures. Immediate overload and queued deadline, cancellation, or shutdown
+are delegated to the original task exactly once, outside the executor lock, before generic disposal.
+Cancellation that loses the dispatch claim cannot rewrite running ownership.
+
+Workers created from an indexed scheduler are children of that scheduler. Disposing the parent
+atomically rejects new workers and new worker submissions, disposes every registered worker, and
+removes its queued tasks through the same indexed cancellation path. A submission that linearizes
+before parent disposal may run or be cancelled; one attempted after disposal is never admitted.
+
+The LATENCY burst counter is a bounded state, not a lifetime completion counter. It saturates at
+the configured burst limit and resets when guaranteed work is selected, so multi-year LATENCY-only
+uptime cannot wrap the counter and starve newly arriving INGEST, CDC, ANALYTICAL, or BATCH work.
