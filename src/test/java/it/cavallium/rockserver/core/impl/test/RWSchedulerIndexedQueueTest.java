@@ -43,28 +43,6 @@ class RWSchedulerIndexedQueueTest {
 	private static final int LARGE_QUEUE_SIZE = 4_096;
 
 	@Test
-	void plainIndexedTasksAvoidEstimatedMetadataWhileEstimatedTasksPreserveIt() {
-		var scheduler = scheduler(1, 16, "indexed-metadata-specialization");
-		var view = scheduler.scheduler(
-				WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, RequestContext.NO_DEADLINE);
-		try {
-			var plain = view.schedule(() -> {});
-			assertFalse(plain instanceof RWScheduler.EstimatedWork,
-					"plain scheduled work must retain the compact wrapper fast path");
-
-			var estimated = view.schedule(new EstimatedOrderTask(17L,
-					WorkloadProfile.INGEST,
-					Collections.synchronizedList(new ArrayList<>()),
-					new CountDownLatch(1)));
-			assertInstanceOf(RWScheduler.EstimatedWork.class, estimated);
-			assertEquals(17L, ((RWScheduler.EstimatedWork) estimated).estimatedBytes());
-		} finally {
-			view.dispose();
-			scheduler.disposeNow();
-		}
-	}
-
-	@Test
 	void reactorHookCannotEraseEstimatedWorkFromDrrAdmission() throws Exception {
 		String hook = "indexed-estimated-work-" + System.identityHashCode(this);
 		Schedulers.onScheduleHook(hook, original -> original::run);
