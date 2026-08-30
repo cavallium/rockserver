@@ -85,7 +85,8 @@ class PressurePerformancePairedBenchmarkTest {
 	@Test
 	void evaluatorRejectsBuildConfigHostProcessAndOrderDrift() throws Exception {
 		for (Mutation mutation : new Mutation[] {
-				Mutation.BUILD, Mutation.CONFIGURATION, Mutation.HOST, Mutation.PROCESS, Mutation.ORDER
+				Mutation.BUILD, Mutation.CONFIGURATION, Mutation.HOST, Mutation.CLASSPATH,
+				Mutation.PROCESS, Mutation.ORDER
 		}) {
 			Path root = temporary.resolve("reject-" + mutation.name().toLowerCase());
 			prepare(root, true);
@@ -134,9 +135,11 @@ class PressurePerformancePairedBenchmarkTest {
 			String host = mutate && mutation == Mutation.HOST ? "e".repeat(64) : "1".repeat(64);
 			if (mutate && mutation == Mutation.PROCESS) processId = 10_001L;
 			if (mutate && mutation == Mutation.ORDER) started = previousFinish - 1L;
+			String classpath = (run.implementation() == PressureBenchmarkArtifact.Implementation.BASELINE ? "3" : "4").repeat(64);
+			if (mutate && mutation == Mutation.CLASSPATH) classpath = "f".repeat(64);
 			var artifact = new PressureBenchmarkArtifact.Artifact(run.suite(), run.round(), run.ordinal(),
 					run.implementation(), build, configuration, host, "test-host", "2".repeat(64),
-					(run.implementation() == PressureBenchmarkArtifact.Implementation.BASELINE ? "3" : "4").repeat(64),
+					classpath,
 					(run.implementation() == PressureBenchmarkArtifact.Implementation.BASELINE ? "5" : "6").repeat(64),
 					processId, started, finished, true, true, Map.copyOf(metrics));
 			PressureBenchmarkArtifact.write(run.artifact(), artifact, names);
@@ -144,5 +147,5 @@ class PressurePerformancePairedBenchmarkTest {
 		}
 	}
 
-	private enum Mutation { NONE, BUILD, CONFIGURATION, HOST, PROCESS, ORDER }
+	private enum Mutation { NONE, BUILD, CONFIGURATION, HOST, CLASSPATH, PROCESS, ORDER }
 }

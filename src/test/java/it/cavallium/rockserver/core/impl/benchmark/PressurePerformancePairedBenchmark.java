@@ -142,6 +142,8 @@ public final class PressurePerformancePairedBenchmark {
 				PressureBenchmarkArtifact.Suite.class);
 		String baselineProduction = null;
 		String candidateProduction = null;
+		String baselineClasspathSha = null;
+		String candidateClasspathSha = null;
 		boolean workersEnforced = true;
 		for (ScheduledRun run : schedule(prepared)) {
 			Set<String> expectedMetrics = metricNames(run.suite(), prepared.signalColumnFamilyCounts());
@@ -178,10 +180,14 @@ public final class PressurePerformancePairedBenchmark {
 				failures.add(run.implementation().value + " classpath changed for " + run.suite().value);
 			}
 			if (run.implementation() == PressureBenchmarkArtifact.Implementation.BASELINE) {
+				if (baselineClasspathSha == null) baselineClasspathSha = artifact.classpathSha256();
+				else if (!baselineClasspathSha.equals(artifact.classpathSha256())) failures.add("baseline classpath changed across suites");
 				if (baselineProduction == null) baselineProduction = artifact.productionClassesSha256();
 				else if (!baselineProduction.equals(artifact.productionClassesSha256())) failures.add("baseline production bytes changed");
 				baselineBySuite.get(run.suite()).add(artifact.metrics());
 			} else {
+				if (candidateClasspathSha == null) candidateClasspathSha = artifact.classpathSha256();
+				else if (!candidateClasspathSha.equals(artifact.classpathSha256())) failures.add("candidate classpath changed across suites");
 				if (candidateProduction == null) candidateProduction = artifact.productionClassesSha256();
 				else if (!candidateProduction.equals(artifact.productionClassesSha256())) failures.add("candidate production bytes changed");
 				candidateBySuite.get(run.suite()).add(artifact.metrics());
