@@ -408,6 +408,7 @@ public final class MixedBackfillPressureBenchmark {
 
 	private static String configText(Options options) {
 		return """
+				database.global.disable-auto-compactions = true
 				database.parallelism.read = %d
 				database.parallelism.write = %d
 				database.parallelism.workload.raw-scan-file-concurrency = %d
@@ -491,7 +492,7 @@ public final class MixedBackfillPressureBenchmark {
 					integer(values, "flush-every", 5_000), Duration.ofMillis(longValue(values, "measure-ms", 10_000)),
 					integer(values, "writers", 2), integer(values, "latency-readers", 2), integer(values, "read-workers", 8),
 					integer(values, "write-workers", 8), integer(values, "raw-scan-concurrency", 4),
-					longValue(values, "cdc-batch-size", 1_024), Duration.ofMillis(longValue(values, "pressure-period-ms", 100)),
+					longValue(values, "cdc-batch-size", 8_192), Duration.ofMillis(longValue(values, "pressure-period-ms", 100)),
 					Duration.ofMillis(longValue(values, "maximum-zero-gap-ms", 2_000)),
 					longValue(values, "maximum-cdc-lag", 100_000), Duration.ofMillis(longValue(values, "maximum-latency-p99-ms", 5_000)),
 					integer(values, "maximum-latency-samples", 100_000),

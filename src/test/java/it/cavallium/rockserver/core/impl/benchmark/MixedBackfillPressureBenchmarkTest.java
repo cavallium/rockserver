@@ -42,6 +42,8 @@ class MixedBackfillPressureBenchmarkTest {
 	@Test
 	void invalidOrUnknownOptionsFailBeforeCreatingRoot() {
 		Path root = temporary.resolve("invalid");
+		assertEquals(8_192L, MixedBackfillPressureBenchmark.Options.parse(
+				new String[] {"--root=" + root}).cdcBatchSize());
 		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.Options.parse(
 				new String[] {"--root=" + root, "--unknown=true"}));
 		assertTrue(Files.notExists(root));
