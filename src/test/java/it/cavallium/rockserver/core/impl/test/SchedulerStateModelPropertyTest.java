@@ -122,7 +122,11 @@ class SchedulerStateModelPropertyTest {
 			blockerPermits.release();
 			assertTrue(completed.await(20, SECONDS),
 					"generated tasks did not drain; seed=" + seed + ", remaining=" + completed.getCount());
-			assertEquals(expectedOrder, List.copyOf(actualOrder), "dispatch order mismatch; seed=" + seed);
+			List<Long> observedOrder = List.copyOf(actualOrder);
+			assertEquals(expectedOrder,
+					observedOrder,
+					"dispatch order mismatch; seed=" + seed + ", actionIndex="
+							+ firstDifference(expectedOrder, observedOrder));
 
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).terminalOutcomes()
 					== model.outcomes());
@@ -441,6 +445,14 @@ class SchedulerStateModelPropertyTest {
 
 	private static long estimatedBytes(int cost) {
 		return cost == 1 ? 1L : (cost - 1L) * WorkloadCost.QUANTUM_BYTES + 1L;
+	}
+
+	private static int firstDifference(List<?> expected, List<?> actual) {
+		int shared = Math.min(expected.size(), actual.size());
+		for (int index = 0; index < shared; index++) {
+			if (!java.util.Objects.equals(expected.get(index), actual.get(index))) return index;
+		}
+		return shared;
 	}
 
 	private record OrderedTask(SchedulerReferenceModel.Spec spec,
