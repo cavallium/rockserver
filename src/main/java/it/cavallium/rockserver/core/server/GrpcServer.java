@@ -56,6 +56,7 @@ import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.impl.ReactorResultOwnership;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import it.unimi.dsi.fastutil.ints.Int2IntFunction;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
@@ -3278,6 +3279,7 @@ public class GrpcServer extends Server {
 			private final @Nullable String protectedOperation;
 			private final long estimatedBytes;
 			private @Nullable Disposable task;
+			private @Nullable Object pendingResult;
 			private boolean cancelled;
 			private boolean running;
 			private boolean terminated;
@@ -3328,13 +3330,17 @@ public class GrpcServer extends Server {
 			@Override
 			public void dispose() {
 				final Disposable submitted;
+				final @Nullable Object cancelledResult;
 				synchronized (this) {
 					if (cancelled) {
 						return;
 					}
 					cancelled = true;
+					cancelledResult = pendingResult;
+					pendingResult = null;
 					submitted = mustComplete ? null : task;
 				}
+				cleanupCancelledResult(cancelledResult);
 				if (mustComplete) {
 					cancelledMustCompleteOperations.incrementAndGet();
 				} else {
@@ -3365,16 +3371,7 @@ public class GrpcServer extends Server {
 					return;
 				}
 				runningTaskTerminated();
-				boolean lateSuccess;
-				synchronized (this) {
-					lateSuccess = cancelled;
-					if (!lateSuccess) {
-						sink.success(result);
-					}
-				}
-				if (lateSuccess && lateSuccessCleanup != null) {
-					runLateSuccessCleanup(result);
-				}
+				publishResult(result);
 			}
 
 			private void runningTaskTerminated() {
@@ -3412,6 +3409,45 @@ public class GrpcServer extends Server {
 							+ "running iterator cleanup inline", schedulingError);
 					cleanup.run();
 				}
+			}
+
+			private void publishResult(T result) {
+				Object cancelledResult = null;
+				boolean emit;
+				synchronized (this) {
+					if (pendingResult != null) {
+						throw new IllegalStateException("Scheduled call already owns a pending result");
+					}
+					pendingResult = ReactorResultOwnership.encode(result);
+					emit = !cancelled;
+					if (!emit) {
+						cancelledResult = pendingResult;
+						pendingResult = null;
+					}
+				}
+				if (emit) {
+					sink.success(result);
+				} else {
+					cleanupCancelledResult(cancelledResult);
+				}
+			}
+
+			private void resultDisposed() {
+				Object cancelledResult = null;
+				synchronized (this) {
+					if (cancelled) {
+						cancelledResult = pendingResult;
+					}
+					pendingResult = null;
+				}
+				cleanupCancelledResult(cancelledResult);
+			}
+
+			private void cleanupCancelledResult(@Nullable Object encodedResult) {
+				if (encodedResult == null || lateSuccessCleanup == null) {
+					return;
+				}
+				runLateSuccessCleanup(ReactorResultOwnership.decode(encodedResult));
 			}
 
 			private void schedulingFailed(Throwable schedulingError) {
@@ -3583,6 +3619,7 @@ public class GrpcServer extends Server {
 								protectedOperation,
 								estimatedBytes);
 					sink.onCancel(scheduledCall);
+					sink.onDispose(scheduledCall::resultDisposed);
 					scheduledCall.schedule();
 				});
 			});

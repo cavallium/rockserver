@@ -1152,6 +1152,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return Mono.create(sink -> {
 			var task = new RawScanPinCaptureTask(capture, sink);
 			sink.onCancel(task::cancelDelivery);
+			sink.onDispose(task::deliveryDisposed);
 			try {
 				rawScanPinCaptureExecutor.execute(task);
 				// Cancellation may win before execute() publishes the task to the
@@ -1173,8 +1174,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private final Callable<RawScanPinnedSstSet> capture;
 		private final reactor.core.publisher.MonoSink<RawScanPinnedSstSet> sink;
-		private final Object emissionLock = new Object();
 		private final AtomicInteger state = new AtomicInteger(QUEUED);
+		private @Nullable Object pendingResult;
 		private boolean deliveryCancelled;
 
 		private RawScanPinCaptureTask(Callable<RawScanPinnedSstSet> capture,
@@ -1184,12 +1185,27 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		private void cancelDelivery() {
-			synchronized (emissionLock) {
+			Object cancelledResult;
+			synchronized (this) {
 				deliveryCancelled = true;
+				cancelledResult = pendingResult;
+				pendingResult = null;
 			}
+			cleanupCancelledResult(cancelledResult);
 			if (state.compareAndSet(QUEUED, CANCELLED)) {
 				rawScanPinCaptureExecutor.remove(this);
 			}
+		}
+
+		private void deliveryDisposed() {
+			Object cancelledResult = null;
+			synchronized (this) {
+				if (deliveryCancelled) {
+					cancelledResult = pendingResult;
+				}
+				pendingResult = null;
+			}
+			cleanupCancelledResult(cancelledResult);
 		}
 
 		private void removeIfCancelled() {
@@ -1202,15 +1218,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (!state.compareAndSet(QUEUED, FINISHED)) {
 				return;
 			}
-			synchronized (emissionLock) {
-				if (!deliveryCancelled) {
-					sink.error(RocksDBException.of(
+			if (!isDeliveryCancelled()) {
+				sink.error(RocksDBException.of(
 							RocksDBErrorType.SERVER_OVERLOADED,
 							rawScanPinCaptureExecutor.isShutdown()
 									? "Raw-scan pin capture executor is shutting down"
 									: "Raw-scan pin capture queue is full",
 							rejection));
-				}
 			}
 		}
 
@@ -1221,34 +1235,49 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			try {
 				RawScanPinnedSstSet result = capture.call();
-				boolean late;
-				synchronized (emissionLock) {
-					late = deliveryCancelled;
-					if (!late) {
-						sink.success(result);
-					}
-				}
-				if (late) {
-					try {
-						result.close();
-					} catch (Throwable cleanupFailure) {
-						logger.warn("Failed to clean raw-scan pins captured after subscriber cancellation",
-								cleanupFailure);
-					}
-				}
+				publishResult(result);
 			} catch (Throwable captureFailure) {
-				boolean late;
-				synchronized (emissionLock) {
-					late = deliveryCancelled;
-					if (!late) {
-						sink.error(captureFailure);
-					}
-				}
-				if (late) {
+				if (!isDeliveryCancelled()) {
+					sink.error(captureFailure);
+				} else {
 					logger.debug("Raw-scan pin capture failed after subscriber cancellation", captureFailure);
 				}
 			} finally {
 				state.set(FINISHED);
+			}
+		}
+
+		private boolean isDeliveryCancelled() {
+			synchronized (this) {
+				return deliveryCancelled;
+			}
+		}
+
+		private void publishResult(RawScanPinnedSstSet result) {
+			Object cancelledResult = null;
+			boolean emit;
+			synchronized (this) {
+				pendingResult = ReactorResultOwnership.encode(result);
+				emit = !deliveryCancelled;
+				if (!emit) {
+					cancelledResult = pendingResult;
+					pendingResult = null;
+				}
+			}
+			if (emit) {
+				sink.success(result);
+			} else {
+				cleanupCancelledResult(cancelledResult);
+			}
+		}
+
+		private void cleanupCancelledResult(@Nullable Object encodedResult) {
+			if (encodedResult == null) return;
+			try {
+				ReactorResultOwnership.<RawScanPinnedSstSet>decode(encodedResult).close();
+			} catch (Throwable cleanupFailure) {
+				logger.warn("Failed to clean raw-scan pins captured after subscriber cancellation",
+						cleanupFailure);
 			}
 		}
 	}
@@ -7041,6 +7070,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return Mono.create(sink -> {
 			var task = new OrdinaryRetainedRangeTask<>(target, callable, lateSuccessCleanup, sink);
 			sink.onCancel(task::cancelDelivery);
+			sink.onDispose(task::deliveryDisposed);
 			try {
 				target.execute(task);
 			} catch (Throwable error) {
@@ -7066,7 +7096,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final @Nullable Consumer<? super T> lateSuccessCleanup;
 		private final reactor.core.publisher.MonoSink<T> sink;
 		private volatile int state = QUEUED;
-		private volatile boolean deliveryCancelled;
+		private @Nullable Object pendingResult;
+		private boolean deliveryCancelled;
 
 		private OrdinaryRetainedRangeTask(RWScheduler.WorkloadExecutor target,
 				Callable<T> callable,
@@ -7079,11 +7110,28 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		private void cancelDelivery() {
-			deliveryCancelled = true;
+			Object cancelledResult;
+			synchronized (this) {
+				deliveryCancelled = true;
+				cancelledResult = pendingResult;
+				pendingResult = null;
+			}
+			cleanupCancelledResult(cancelledResult);
 			if (STATE.compareAndSet(this, QUEUED, CANCELLED)) {
 				super.cancel(false);
 				scheduler.removeQueuedTask(target, this);
 			}
+		}
+
+		private void deliveryDisposed() {
+			Object cancelledResult = null;
+			synchronized (this) {
+				if (deliveryCancelled) {
+					cancelledResult = pendingResult;
+				}
+				pendingResult = null;
+			}
+			cleanupCancelledResult(cancelledResult);
 		}
 
 		@Override
@@ -7094,14 +7142,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			try {
 				var result = callable.call();
 				complete(result);
-				if (deliveryCancelled) {
-					cleanupLateSuccess(result);
-				} else {
-					sink.success(result);
-				}
+				publishResult(result);
 			} catch (Throwable error) {
 				completeExceptionally(error);
-				if (!deliveryCancelled) {
+				if (!isDeliveryCancelled()) {
 					sink.error(error);
 				} else {
 					logger.debug("Range quantum failed after subscriber cancellation", error);
@@ -7111,12 +7155,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 		}
 
-		private void cleanupLateSuccess(T result) {
-			if (lateSuccessCleanup == null) {
-				return;
+		private boolean isDeliveryCancelled() {
+			synchronized (this) {
+				return deliveryCancelled;
 			}
+		}
+
+		private void publishResult(T result) {
+			Object cancelledResult = null;
+			boolean emit;
+			synchronized (this) {
+				pendingResult = ReactorResultOwnership.encode(result);
+				emit = !deliveryCancelled;
+				if (!emit) {
+					cancelledResult = pendingResult;
+					pendingResult = null;
+				}
+			}
+			if (emit) {
+				sink.success(result);
+			} else {
+				cleanupCancelledResult(cancelledResult);
+			}
+		}
+
+		private void cleanupCancelledResult(@Nullable Object encodedResult) {
+			if (encodedResult == null || lateSuccessCleanup == null) return;
 			try {
-				lateSuccessCleanup.accept(result);
+				lateSuccessCleanup.accept(ReactorResultOwnership.decode(encodedResult));
 			} catch (Throwable cleanupError) {
 				logger.warn("Failed to clean a retained range result after cancellation", cleanupError);
 			}
@@ -7128,7 +7194,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return;
 			}
 			completeExceptionally(failure);
-			if (!deliveryCancelled) {
+			if (!isDeliveryCancelled()) {
 				sink.error(failure);
 			}
 		}
@@ -7851,6 +7917,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				synchronized (this) {
 					waiter = new RetainedQueryWaiter(nextTicket++, deadlineMicros, sink);
 					sink.onCancel(waiter::cancel);
+					sink.onDispose(waiter::deliveryDisposed);
 					long nowMicros = currentEpochMicros();
 					if (closed) {
 						waiter.state = TERMINAL;
@@ -7983,6 +8050,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			private int state = WAITING;
 			private @Nullable RetainedQueryPermit permit;
 			private @Nullable ScheduledFuture<?> expiration;
+			private @Nullable Object pendingResult;
+			private boolean deliveryCancelled;
 
 			private RetainedQueryWaiter(long ticket,
 					long deadlineMicros,
@@ -8018,15 +8087,61 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (observer != null) {
 						observer.accept(ticket);
 					}
-					sink.success(granted);
 				} catch (Throwable error) {
 					granted.close();
 					sink.error(error);
+					return;
 				}
+				publishResult(granted);
 			}
 
 			private void cancel() {
+				Object cancelledResult;
+				synchronized (this) {
+					deliveryCancelled = true;
+					cancelledResult = pendingResult;
+					pendingResult = null;
+				}
+				cleanupCancelledResult(cancelledResult);
 				RetainedQueryLimiter.this.cancel(this);
+			}
+
+			private void deliveryDisposed() {
+				Object cancelledResult = null;
+				synchronized (this) {
+					if (deliveryCancelled) {
+						cancelledResult = pendingResult;
+					}
+					pendingResult = null;
+				}
+				cleanupCancelledResult(cancelledResult);
+			}
+
+			private void publishResult(RetainedQueryPermit result) {
+				Object cancelledResult = null;
+				boolean emit;
+				synchronized (this) {
+					pendingResult = ReactorResultOwnership.encode(result);
+					emit = !deliveryCancelled;
+					if (!emit) {
+						cancelledResult = pendingResult;
+						pendingResult = null;
+					}
+				}
+				if (emit) {
+					sink.success(result);
+				} else {
+					cleanupCancelledResult(cancelledResult);
+				}
+			}
+
+			private void cleanupCancelledResult(@Nullable Object encodedResult) {
+				if (encodedResult == null) return;
+				try {
+					ReactorResultOwnership.<RetainedQueryPermit>decode(encodedResult).close();
+				} catch (Throwable cleanupFailure) {
+					logger.warn("Failed to release a retained range permit after cancellation", cleanupFailure);
+				}
 			}
 
 			private void expire() {
@@ -11895,13 +12010,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			final int running = 1;
 			final int finished = 2;
 			final int cancelledBeforeStart = 3;
-			var emissionLock = new Object();
-			var cancelled = new AtomicBoolean();
 			var state = new AtomicInteger(queued);
 			var task = Disposables.swap();
 			final class TrackedNativeTask implements Runnable,
 					RWScheduler.EstimatedWork,
 					RWScheduler.RejectionAwareTask {
+
+				private @Nullable Object pendingResult;
+				private boolean deliveryCancelled;
 
 				@Override
 				public long estimatedBytes() {
@@ -11915,30 +12031,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					try {
 						var result = callable.call();
-						boolean late;
-						synchronized (emissionLock) {
-							late = cancelled.get();
-							if (!late) {
-								sink.success(result);
-							}
-						}
-						if (late && lateSuccessCleanup != null) {
-							try {
-								lateSuccessCleanup.accept(result);
-							} catch (Throwable cleanupError) {
-								logger.warn("Failed to clean a CDC native result after subscriber cancellation",
-										cleanupError);
-							}
-						}
+						publishResult(result);
 					} catch (Throwable error) {
-						boolean late;
-						synchronized (emissionLock) {
-							late = cancelled.get();
-							if (!late) {
-								sink.error(error);
-							}
-						}
-						if (late) {
+						if (!isDeliveryCancelled()) {
+							sink.error(error);
+						} else {
 							logger.debug("CDC native task failed after subscriber cancellation", error);
 						}
 					} finally {
@@ -11957,15 +12054,63 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						return;
 					}
 					ops.endOp();
-					boolean late;
-					synchronized (emissionLock) {
-						late = cancelled.get();
-						if (!late) {
-							sink.error(failure);
+					if (!isDeliveryCancelled()) {
+						sink.error(failure);
+					} else {
+						logger.debug(lateMessage, failure);
+					}
+				}
+
+				private void cancelDelivery() {
+					Object cancelledResult;
+					synchronized (this) {
+						deliveryCancelled = true;
+						cancelledResult = pendingResult;
+						pendingResult = null;
+					}
+					cleanupCancelledResult(cancelledResult);
+				}
+
+				private void deliveryDisposed() {
+					Object cancelledResult = null;
+					synchronized (this) {
+						if (deliveryCancelled) {
+							cancelledResult = pendingResult;
+						}
+						pendingResult = null;
+					}
+					cleanupCancelledResult(cancelledResult);
+				}
+
+				private synchronized boolean isDeliveryCancelled() {
+					return deliveryCancelled;
+				}
+
+				private void publishResult(T result) {
+					Object cancelledResult = null;
+					boolean emit;
+					synchronized (this) {
+						pendingResult = ReactorResultOwnership.encode(result);
+						emit = !deliveryCancelled;
+						if (!emit) {
+							cancelledResult = pendingResult;
+							pendingResult = null;
 						}
 					}
-					if (late) {
-						logger.debug(lateMessage, failure);
+					if (emit) {
+						sink.success(result);
+					} else {
+						cleanupCancelledResult(cancelledResult);
+					}
+				}
+
+				private void cleanupCancelledResult(@Nullable Object encodedResult) {
+					if (encodedResult == null || lateSuccessCleanup == null) return;
+					try {
+						lateSuccessCleanup.accept(ReactorResultOwnership.decode(encodedResult));
+					} catch (Throwable cleanupError) {
+						logger.warn("Failed to clean a CDC native result after subscriber cancellation",
+								cleanupError);
 					}
 				}
 			}
@@ -11977,9 +12122,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return;
 			}
 			sink.onCancel(() -> {
-				synchronized (emissionLock) {
-					cancelled.set(true);
-				}
+				trackedTask.cancelDelivery();
 				if (state.compareAndSet(queued, cancelledBeforeStart)) {
 					// The queued callable will never own the SafeShutdown lease.
 					task.dispose();
@@ -11989,6 +12132,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					task.dispose();
 				}
 			});
+			sink.onDispose(trackedTask::deliveryDisposed);
 			try {
 				task.replace(target.schedule(trackedTask));
 			} catch (Throwable error) {
