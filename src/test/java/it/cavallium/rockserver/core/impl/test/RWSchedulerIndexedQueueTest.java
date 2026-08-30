@@ -23,6 +23,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
@@ -263,6 +264,93 @@ class RWSchedulerIndexedQueueTest {
 				view.dispose();
 				scheduler.disposeNow();
 			}
+		}
+	}
+
+	@Test
+	void queuedReactorTerminalRaceCrossProductSelectsOneCauseOutsideThePoolLock() throws Exception {
+		var pairs = List.of(
+				new TerminalRacePair(TerminalTrigger.CANCELLATION, TerminalTrigger.DEADLINE),
+				new TerminalRacePair(TerminalTrigger.CANCELLATION, TerminalTrigger.SHUTDOWN),
+				new TerminalRacePair(TerminalTrigger.DEADLINE, TerminalTrigger.SHUTDOWN));
+		for (var pair : pairs) {
+			for (int repetition = 0; repetition < 8; repetition++) {
+				assertQueuedReactorTerminalRace(pair, repetition);
+			}
+		}
+	}
+
+	private static void assertQueuedReactorTerminalRace(TerminalRacePair pair,
+			int repetition) throws Exception {
+		String suffix = pair.first() + "-" + pair.second() + "-" + repetition;
+		var scheduler = scheduler(1, 8, "indexed-reactor-terminal-matrix-" + suffix);
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var blockerReturned = new CountDownLatch(1);
+		long raceMillis = System.currentTimeMillis() + 100L;
+		long deadline = pair.has(TerminalTrigger.DEADLINE)
+				? raceMillis
+				: RequestContext.NO_DEADLINE;
+		var view = scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, deadline);
+		var terminal = new LockCheckingTask(scheduler);
+		try {
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				blockerStarted.countDown();
+				try {
+					releaseBlocker.await();
+				} catch (InterruptedException expectedDuringForcedShutdown) {
+					Thread.currentThread().interrupt();
+				} finally {
+					blockerReturned.countDown();
+				}
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			Disposable handle = view.schedule(terminal);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+
+			var raceStart = new CountDownLatch(1);
+			var first = CompletableFuture.runAsync(() -> runTerminalTrigger(
+					pair.first(), raceStart, raceMillis, handle, scheduler, releaseBlocker));
+			var second = CompletableFuture.runAsync(() -> runTerminalTrigger(
+					pair.second(), raceStart, raceMillis, handle, scheduler, releaseBlocker));
+			raceStart.countDown();
+			first.get(15, SECONDS);
+			second.get(15, SECONDS);
+			releaseBlocker.countDown();
+			assertTrue(blockerReturned.await(5, SECONDS), "blocker did not return for " + suffix);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
+
+			assertEquals(1, terminal.rejectionCount(), "duplicate terminal callback for " + suffix);
+			assertEquals(0, terminal.disposeCount(),
+					"the indexed wrapper, not the original command, owns disposal for " + suffix);
+			assertTrue(terminal.callbackOutsideLock(), "terminal callback held the pool lock for " + suffix);
+			assertNull(terminal.callbackFailure(), "terminal callback could not re-enter telemetry for " + suffix);
+			var outcomes = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
+			long selected = pair.allowedOutcomes().stream().mapToLong(outcomes::get).sum();
+			assertEquals(1L, selected, "terminal cause was not selected exactly once for " + suffix);
+		} finally {
+			releaseBlocker.countDown();
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	private static void runTerminalTrigger(TerminalTrigger trigger,
+			CountDownLatch raceStart,
+			long raceMillis,
+			Disposable handle,
+			RWScheduler scheduler,
+			CountDownLatch releaseBlocker) {
+		awaitUninterruptibly(raceStart);
+		while (System.currentTimeMillis() < raceMillis) {
+			Thread.onSpinWait();
+		}
+		switch (trigger) {
+			case CANCELLATION -> handle.dispose();
+			case DEADLINE -> releaseBlocker.countDown();
+			case SHUTDOWN -> scheduler.disposeNow();
 		}
 	}
 
@@ -1459,6 +1547,31 @@ class RWSchedulerIndexedQueueTest {
 
 		private Throwable callbackFailure() {
 			return callbackFailure.get();
+		}
+	}
+
+	private enum TerminalTrigger {
+		CANCELLATION,
+		DEADLINE,
+		SHUTDOWN
+	}
+
+	private record TerminalRacePair(TerminalTrigger first, TerminalTrigger second) {
+
+		private boolean has(TerminalTrigger trigger) {
+			return first == trigger || second == trigger;
+		}
+
+		private Set<RWScheduler.TerminalOutcome> allowedOutcomes() {
+			var outcomes = java.util.EnumSet.noneOf(RWScheduler.TerminalOutcome.class);
+			for (var trigger : List.of(first, second)) {
+				outcomes.add(switch (trigger) {
+					case CANCELLATION -> RWScheduler.TerminalOutcome.CANCELLATION;
+					case DEADLINE -> RWScheduler.TerminalOutcome.DEADLINE;
+					case SHUTDOWN -> RWScheduler.TerminalOutcome.SHUTDOWN;
+				});
+			}
+			return outcomes;
 		}
 	}
 

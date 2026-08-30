@@ -83,6 +83,64 @@ class EmbeddedTrackedSchedulingCostTest {
 		}
 	}
 
+	@Test
+	void trackedNativeRunCancelRejectionCrossProductReleasesOneLeaseAndOneResult(@TempDir Path tempDir)
+			throws Exception {
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db-terminal-race"),
+				"tracked-native-terminal-race", null)) {
+			for (int repetition = 0; repetition < 64; repetition++) {
+				var scheduler = new CapturingScheduler();
+				var calls = new AtomicLong();
+				var cleanups = new AtomicLong();
+				var successes = new AtomicLong();
+				var errors = new AtomicLong();
+				Mono<String> result = invokeTracked(
+						connection.getInternalDB(),
+						scheduler,
+						() -> {
+							calls.incrementAndGet();
+							return "value";
+						},
+						ignored -> cleanups.incrementAndGet(),
+						1024L);
+				Disposable subscription = result.subscribe(
+						ignored -> successes.incrementAndGet(),
+						ignored -> errors.incrementAndGet());
+				Runnable task = scheduler.task();
+				var rejectionAware = (RWScheduler.RejectionAwareTask) task;
+				var raceStart = new CountDownLatch(1);
+				var run = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					task.run();
+				});
+				var cancel = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					subscription.dispose();
+				});
+				var reject = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					rejectionAware.reject(new RejectedExecutionException("synthetic tracked race"));
+				});
+				raceStart.countDown();
+				run.get(5, TimeUnit.SECONDS);
+				cancel.get(5, TimeUnit.SECONDS);
+				reject.get(5, TimeUnit.SECONDS);
+
+				// Duplicate late transitions must neither re-run native work nor release accounting twice.
+				task.run();
+				rejectionAware.reject(new RejectedExecutionException("late duplicate"));
+				subscription.dispose();
+				assertEquals(0L, connection.getInternalDB().getPendingOpsCount());
+				assertEventually(() -> calls.get() == successes.get() + cleanups.get());
+				assertEquals(calls.get(), successes.get() + cleanups.get(),
+						"each native result must be delivered or cleaned exactly once");
+				org.junit.jupiter.api.Assertions.assertTrue(calls.get() <= 1L, "native callable ran twice");
+				org.junit.jupiter.api.Assertions.assertTrue(successes.get() + errors.get() <= 1L,
+						"subscriber saw duplicate terminal signals");
+			}
+		}
+	}
+
 	@SuppressWarnings("unchecked")
 	private static <T> Mono<T> invokeTracked(EmbeddedDB database,
 			Scheduler scheduler,
@@ -96,6 +154,22 @@ class EmbeddedTrackedSchedulingCostTest {
 				long.class);
 		method.setAccessible(true);
 		return (Mono<T>) method.invoke(database, scheduler, callable, null, estimatedBytes);
+	}
+
+	@SuppressWarnings("unchecked")
+	private static <T> Mono<T> invokeTracked(EmbeddedDB database,
+			Scheduler scheduler,
+			Callable<T> callable,
+			Consumer<T> cleanup,
+			long estimatedBytes) throws Exception {
+		Method method = EmbeddedDB.class.getDeclaredMethod(
+				"scheduleTracked",
+				Scheduler.class,
+				Callable.class,
+				Consumer.class,
+				long.class);
+		method.setAccessible(true);
+		return (Mono<T>) method.invoke(database, scheduler, callable, cleanup, estimatedBytes);
 	}
 
 	private static final class ImmediateCostProbeScheduler implements Scheduler {
@@ -159,6 +233,59 @@ class EmbeddedTrackedSchedulingCostTest {
 		@Override
 		public boolean isDisposed() {
 			return false;
+		}
+	}
+
+	private static final class CapturingScheduler implements Scheduler {
+
+		private final AtomicReference<Runnable> task = new AtomicReference<>();
+
+		@Override
+		public Disposable schedule(Runnable command) {
+			if (!task.compareAndSet(null, command)) {
+				throw new AssertionError("tracked scheduling submitted more than one task");
+			}
+			return Disposables.disposed();
+		}
+
+		private Runnable task() {
+			return assertInstanceOf(Runnable.class, task.get());
+		}
+
+		@Override
+		public Worker createWorker() {
+			throw new AssertionError("tracked scheduling must use the direct scheduler path");
+		}
+
+		@Override
+		public void dispose() {
+		}
+
+		@Override
+		public boolean isDisposed() {
+			return false;
+		}
+	}
+
+	private static void awaitUninterruptibly(CountDownLatch latch) {
+		boolean interrupted = false;
+		while (true) {
+			try {
+				latch.await();
+				break;
+			} catch (InterruptedException ignored) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static void assertEventually(java.util.function.BooleanSupplier condition) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+			Thread.sleep(1L);
 		}
 	}
 }

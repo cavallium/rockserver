@@ -289,6 +289,47 @@ class RWSchedulerCooperativeTest {
 	}
 
 	@Test
+	void parkedCooperativeCancellationRacingShutdownSelectsOneCauseOutsideThePoolLock() throws Exception {
+		for (int repetition = 0; repetition < 16; repetition++) {
+			var scheduler = RWScheduler.forTesting(
+					1, 1, 1, 8, 8, "cooperative-terminal-race-" + repetition);
+			var task = new LockCheckingParkedTask(scheduler);
+			try {
+				var handle = scheduler.executor(WorkloadProfile.BATCH,
+						OperationFamily.RANGE_PAGE,
+						RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+				assertTrue(task.parked.await(5, SECONDS));
+				assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).parkedTasks() == 1);
+
+				var raceStart = new CountDownLatch(1);
+				var cancellation = java.util.concurrent.CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					handle.cancel();
+				});
+				var shutdown = java.util.concurrent.CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					scheduler.disposeNow();
+				});
+				raceStart.countDown();
+				cancellation.get(15, SECONDS);
+				shutdown.get(15, SECONDS);
+
+				assertTrue(task.terminal.await(5, SECONDS));
+				assertEquals(1, task.rejections.get());
+				assertTrue(task.callbackOutsideLock.get());
+				assertNull(task.callbackFailure.get());
+				var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L,
+						snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION)
+								+ snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
+				assertTrue(snapshot.drainedAndConserved());
+			} finally {
+				scheduler.disposeNow();
+			}
+		}
+	}
+
+	@Test
 	void cooperativeAnalyticalWorkYieldsForSameProfileQueuedWork() throws Exception {
 		assertYieldsForQueuedCompetition(WorkloadProfile.ANALYTICAL,
 				WorkloadProfile.ANALYTICAL,
@@ -1194,6 +1235,39 @@ class RWSchedulerCooperativeTest {
 		public void reject(RuntimeException failure) {
 			this.failure.compareAndSet(null, failure);
 			completed.countDown();
+		}
+	}
+
+	private static final class LockCheckingParkedTask implements RWScheduler.CooperativeTask {
+
+		private final RWScheduler scheduler;
+		private final CountDownLatch parked = new CountDownLatch(1);
+		private final CountDownLatch terminal = new CountDownLatch(1);
+		private final AtomicInteger rejections = new AtomicInteger();
+		private final AtomicBoolean callbackOutsideLock = new AtomicBoolean();
+		private final AtomicReference<Throwable> callbackFailure = new AtomicReference<>();
+
+		private LockCheckingParkedTask(RWScheduler scheduler) {
+			this.scheduler = scheduler;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			parked.countDown();
+			return RWScheduler.CooperativeResult.PARK;
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			try {
+				java.util.concurrent.CompletableFuture.runAsync(
+						() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)).get(2, SECONDS);
+				callbackOutsideLock.set(true);
+			} catch (Throwable callbackError) {
+				callbackFailure.set(callbackError);
+			}
+			rejections.incrementAndGet();
+			terminal.countDown();
 		}
 	}
 

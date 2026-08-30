@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.impl.test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -22,6 +23,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -222,6 +224,59 @@ class ProfiledWorkloadDeferredAdmissionTest {
 		assertShutdownRejectsWaitingAdmission(true);
 	}
 
+	@Test
+	void promotedDeferredCancellationRacingShutdownSelectsOneCauseOutsideThePoolLock() throws Exception {
+		for (int repetition = 0; repetition < 16; repetition++) {
+			var scheduler = RWScheduler.forTesting(
+					1, 1, 1, 1, 1, "deferred-terminal-race-" + repetition);
+			var activeRelease = new CountDownLatch(1);
+			var activeStarted = new CountDownLatch(1);
+			var probe = new LockCheckingDeferredProbe(scheduler);
+			try {
+				scheduler.readExecutor().execute(() -> {
+					activeStarted.countDown();
+					try {
+						activeRelease.await();
+					} catch (InterruptedException expectedDuringForcedShutdown) {
+						Thread.currentThread().interrupt();
+					}
+				});
+				assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
+				var handle = executeWhenCapacity(scheduler.scheduler(
+						WorkloadProfile.BATCH,
+						OperationFamily.RANGE_PAGE,
+						System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(1)), probe);
+				assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+
+				var raceStart = new CountDownLatch(1);
+				var cancellation = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					handle.dispose();
+				});
+				var shutdown = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					scheduler.disposeNow();
+				});
+				raceStart.countDown();
+				cancellation.get(15, TimeUnit.SECONDS);
+				shutdown.get(15, TimeUnit.SECONDS);
+
+				assertEquals(1, probe.rejectionCount.get());
+				assertFalse(probe.ran.await(20, TimeUnit.MILLISECONDS));
+				assertTrue(probe.callbackOutsideLock.get());
+				assertNull(probe.callbackFailure.get());
+				var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L,
+						snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION)
+								+ snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
+				assertTrue(snapshot.drainedAndConserved());
+			} finally {
+				activeRelease.countDown();
+				scheduler.disposeNow();
+			}
+		}
+	}
+
 	private static void assertShutdownRejectsWaitingAdmission(boolean forced) throws Exception {
 		var scheduler = RWScheduler.forTesting(1, 1, 1, 1, 1, "deferred-shutdown-" + forced);
 		var activeRelease = new CountDownLatch(1);
@@ -342,6 +397,36 @@ class ProfiledWorkloadDeferredAdmissionTest {
 			rejectionEntered.countDown();
 			awaitUninterruptibly(releaseRejection);
 			this.failure.complete(failure);
+		}
+	}
+
+	private static final class LockCheckingDeferredProbe implements Runnable, RWScheduler.RejectionAwareTask {
+
+		private final RWScheduler scheduler;
+		private final CountDownLatch ran = new CountDownLatch(1);
+		private final AtomicInteger rejectionCount = new AtomicInteger();
+		private final AtomicBoolean callbackOutsideLock = new AtomicBoolean();
+		private final AtomicReference<Throwable> callbackFailure = new AtomicReference<>();
+
+		private LockCheckingDeferredProbe(RWScheduler scheduler) {
+			this.scheduler = scheduler;
+		}
+
+		@Override
+		public void run() {
+			ran.countDown();
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			try {
+				CompletableFuture.runAsync(
+						() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)).get(2, TimeUnit.SECONDS);
+				callbackOutsideLock.set(true);
+			} catch (Throwable callbackError) {
+				callbackFailure.set(callbackError);
+			}
+			rejectionCount.incrementAndGet();
 		}
 	}
 }

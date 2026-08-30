@@ -4,6 +4,7 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -28,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.IntConsumer;
 import org.junit.jupiter.api.Test;
@@ -665,6 +667,57 @@ class RWSchedulerTest {
 			release.countDown();
 			scheduler.dispose();
 			registry.close();
+		}
+	}
+
+	@Test
+	void directQueuedCancellationRacingShutdownPublishesOneCallbackOutsideThePoolLock() throws Exception {
+		for (int repetition = 0; repetition < 32; repetition++) {
+			var scheduler = scheduler(1, "direct-terminal-race-" + repetition);
+			var blockerStarted = new CountDownLatch(1);
+			var releaseBlocker = new CountDownLatch(1);
+			var task = new LockCheckingLifecycleTask(scheduler);
+			var view = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
+			try {
+				view.execute(() -> {
+					blockerStarted.countDown();
+					try {
+						releaseBlocker.await();
+					} catch (InterruptedException expectedDuringForcedShutdown) {
+						Thread.currentThread().interrupt();
+					}
+				});
+				assertTrue(blockerStarted.await(5, SECONDS));
+				view.execute(task);
+				assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+
+				var raceStart = new CountDownLatch(1);
+				var cancellation = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					scheduler.removeQueuedTask(view, task);
+				});
+				var shutdown = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					scheduler.disposeNow();
+				});
+				raceStart.countDown();
+				cancellation.get(15, SECONDS);
+				shutdown.get(15, SECONDS);
+
+				assertEquals(1, task.rejectionCount());
+				assertEquals(1, task.disposeCount());
+				assertFalse(task.ran());
+				assertTrue(task.callbackOutsideLock());
+				assertNull(task.callbackFailure());
+				var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L,
+						snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION)
+								+ snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
+				assertTrue(snapshot.drainedAndConserved());
+			} finally {
+				releaseBlocker.countDown();
+				scheduler.disposeNow();
+			}
 		}
 	}
 
@@ -1319,6 +1372,70 @@ class RWSchedulerTest {
 
 		private int disposeCount() {
 			return disposeCount.get();
+		}
+	}
+
+	private static final class LockCheckingLifecycleTask extends CompletableFuture<Void>
+			implements Runnable, Disposable, RWScheduler.RejectionAwareTask {
+
+		private final RWScheduler scheduler;
+		private final AtomicBoolean ran = new AtomicBoolean();
+		private final AtomicInteger rejectionCount = new AtomicInteger();
+		private final AtomicInteger disposeCount = new AtomicInteger();
+		private final AtomicBoolean callbackOutsideLock = new AtomicBoolean();
+		private final AtomicReference<Throwable> callbackFailure = new AtomicReference<>();
+
+		private LockCheckingLifecycleTask(RWScheduler scheduler) {
+			this.scheduler = scheduler;
+		}
+
+		@Override
+		public void run() {
+			ran.set(true);
+			complete(null);
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			try {
+				CompletableFuture.runAsync(
+						() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)).get(2, SECONDS);
+				callbackOutsideLock.set(true);
+			} catch (Throwable callbackError) {
+				callbackFailure.set(callbackError);
+			}
+			rejectionCount.incrementAndGet();
+			completeExceptionally(failure);
+		}
+
+		@Override
+		public void dispose() {
+			disposeCount.incrementAndGet();
+		}
+
+		@Override
+		public boolean isDisposed() {
+			return disposeCount.get() > 0;
+		}
+
+		private boolean ran() {
+			return ran.get();
+		}
+
+		private int rejectionCount() {
+			return rejectionCount.get();
+		}
+
+		private int disposeCount() {
+			return disposeCount.get();
+		}
+
+		private boolean callbackOutsideLock() {
+			return callbackOutsideLock.get();
+		}
+
+		private Throwable callbackFailure() {
+			return callbackFailure.get();
 		}
 	}
 

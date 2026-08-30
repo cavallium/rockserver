@@ -1,11 +1,15 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
+import io.grpc.ServerCall;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import com.google.protobuf.ByteString;
@@ -35,6 +39,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import reactor.core.Disposable;
@@ -251,6 +256,184 @@ class GrpcCommandPreAdmissionTest {
 		}
 	}
 
+	@Test
+	void grpcScheduledCallRunCancelRejectionCrossProductOwnsOneTerminalAndOneCleanup() throws Exception {
+		Path root = Files.createTempDirectory("rockserver-grpc-scheduled-race");
+		try (var embedded = new EmbeddedConnection(root, "grpc-scheduled-race", null);
+				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			Object grpc = field(GrpcServer.class, "grpc").get(server);
+			Method execute = grpc.getClass().getDeclaredMethod(
+					"executeScheduled",
+					Callable.class,
+					Scheduler.class,
+					Consumer.class,
+					Scheduler.class,
+					long.class);
+			execute.setAccessible(true);
+
+			for (int repetition = 0; repetition < 64; repetition++) {
+				int raceIndex = repetition;
+				var scheduler = new CapturingScheduler();
+				var calls = new AtomicInteger();
+				var cleanups = new AtomicInteger();
+				var successes = new AtomicInteger();
+				var errors = new AtomicInteger();
+				Mono<Integer> result = invokeScheduledWithCleanup(
+						execute,
+						grpc,
+						scheduler,
+						calls::incrementAndGet,
+						ignored -> cleanups.incrementAndGet(),
+						16L);
+				Disposable subscription = result.subscribe(
+						ignored -> successes.incrementAndGet(),
+						ignored -> errors.incrementAndGet());
+				Runnable task = scheduler.task();
+				var rejectionAware = (it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask) task;
+				var raceStart = new CountDownLatch(1);
+				var run = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					task.run();
+				});
+				var cancel = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					subscription.dispose();
+				});
+				var reject = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					rejectionAware.reject(new java.util.concurrent.RejectedExecutionException(
+							"synthetic terminal race " + raceIndex));
+				});
+				raceStart.countDown();
+				run.get(5, TimeUnit.SECONDS);
+				cancel.get(5, TimeUnit.SECONDS);
+				reject.get(5, TimeUnit.SECONDS);
+
+				// Late/duplicate contenders must remain inert after the first state transition.
+				task.run();
+				rejectionAware.reject(new java.util.concurrent.RejectedExecutionException("late duplicate"));
+				subscription.dispose();
+				assertEventually(() -> calls.get() == successes.get() + cleanups.get());
+				assertTrue(booleanField(task, "terminated"), "task did not reach a terminal state");
+				assertFalse(booleanField(task, "running"), "task retained running ownership");
+				assertTrue(calls.get() <= 1, "callable ran more than once");
+				assertTrue(successes.get() + errors.get() <= 1, "subscriber saw duplicate terminal signals");
+				assertEquals(calls.get(), successes.get() + cleanups.get(),
+						"each produced result must be delivered or cleaned exactly once");
+			}
+		} finally {
+			Utils.deleteDirectory(root.toString());
+		}
+	}
+
+	@Test
+	@SuppressWarnings({"rawtypes", "unchecked"})
+	void fastGetQueuedCancelDeadlineDispatchRaceOwnsOneTerminalOutsideThePoolLock() throws Exception {
+		Path root = Files.createTempDirectory("rockserver-fast-get-terminal-race");
+		Path config = Files.createTempFile("rockserver-fast-get-terminal-race", ".conf");
+		Files.writeString(config, """
+				database: {
+				  parallelism: {
+				    read: 3
+				    write: 3
+				    workload: { competing-batch-read-maximum-active: 3 }
+				  }
+				  global: { enable-fast-get: true, ingest-behind: false, optimistic: false }
+				}
+				""");
+		try (var embedded = new EmbeddedConnection(root, "fast-get-terminal-race", config);
+				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+			var scheduler = embedded.getScheduler();
+			Class<?> handlerType = Class.forName(
+					"it.cavallium.rockserver.core.server.GrpcServer$FastGetCallHandler");
+			var constructor = handlerType.getDeclaredConstructor(GrpcServer.class);
+			constructor.setAccessible(true);
+			Object handler = constructor.newInstance(server);
+			Method startCall = handlerType.getDeclaredMethod("startCall", ServerCall.class, Metadata.class);
+			startCall.setAccessible(true);
+
+			for (int repetition = 0; repetition < 24; repetition++) {
+				boolean forceDeadlineWinner = repetition % 4 == 0;
+				var blockersStarted = new CountDownLatch(3);
+				var releaseBlockers = new CountDownLatch(1);
+				for (int worker = 0; worker < 3; worker++) {
+					scheduler.executor(WorkloadProfile.BATCH,
+							OperationFamily.POINT_LOOKUP,
+							it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE).execute(() -> {
+						blockersStarted.countDown();
+						awaitUninterruptibly(releaseBlockers);
+					});
+				}
+				assertTrue(blockersStarted.await(5, TimeUnit.SECONDS));
+				var before = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ);
+				long deadline = System.currentTimeMillis() + 100L;
+				var call = new RecordingServerCall(scheduler);
+				ServerCall.Listener<GetRequest> listener = (ServerCall.Listener<GetRequest>) startCall.invoke(
+						handler, call, new Metadata());
+				listener.onMessage(GetRequest.newBuilder()
+						.setColumnId(Long.MAX_VALUE)
+						.addKeys(ByteString.copyFrom(new byte[] {1}))
+						.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+								.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+								.setDeadlineEpochMillis(deadline))
+						.build());
+				listener.onHalfClose();
+				assertTrue(field(listener.getClass(), "task").get(listener) instanceof Disposable);
+				assertEventually(() -> scheduler.queuedTasks(WorkloadProfile.BATCH) == 1);
+
+				var raceStart = new CountDownLatch(1);
+				var cancel = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					while (System.currentTimeMillis() < deadline) Thread.onSpinWait();
+					if (forceDeadlineWinner) {
+						long closeDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+						while (call.closeCount.get() == 0 && System.nanoTime() < closeDeadline) {
+							Thread.onSpinWait();
+						}
+					}
+					call.cancel();
+					listener.onCancel();
+				});
+				var dispatchOrDeadline = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(raceStart);
+					while (System.currentTimeMillis() < deadline) Thread.onSpinWait();
+					releaseBlockers.countDown();
+				});
+				raceStart.countDown();
+				cancel.get(5, TimeUnit.SECONDS);
+				dispatchOrDeadline.get(5, TimeUnit.SECONDS);
+				assertEventually(() -> scheduler.poolSnapshot(
+						it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ).drainedAndConserved());
+
+				listener.onCancel();
+				listener.onHalfClose();
+				assertTrue(call.closeCount.get() <= 1, "Fast Get closed the call twice");
+				if (forceDeadlineWinner) {
+					assertEquals(1, call.closeCount.get(), "forced deadline did not reach Fast Get rejection");
+				}
+				assertTrue(call.callbackFailure.get() == null,
+						() -> "Fast Get terminal callback held the scheduler lock: " + call.callbackFailure.get());
+				var after = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ);
+				assertEquals(1L, after.submissionAttempts() - before.submissionAttempts());
+				assertEquals(4L, after.terminalOutcomes() - before.terminalOutcomes());
+				long targetRun = after.outcomes().get(
+						it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.RUN)
+						- before.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.RUN)
+						- 3L;
+				long selected = targetRun
+						+ after.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.DEADLINE)
+						- before.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.DEADLINE)
+						+ after.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.CANCELLATION)
+						- before.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.CANCELLATION);
+				assertEquals(1L, selected, "Fast Get did not select exactly one scheduler terminal cause");
+			}
+		} finally {
+			Utils.deleteDirectory(root.toString());
+			Files.deleteIfExists(config);
+		}
+	}
+
 	@SuppressWarnings("unchecked")
 	private static <T> CompletableFuture<T> invokeScheduled(Method method,
 			Object grpc,
@@ -258,6 +441,22 @@ class GrpcCommandPreAdmissionTest {
 			Callable<T> callable,
 			long estimatedBytes) throws Exception {
 		return ((Mono<T>) method.invoke(grpc, callable, scheduler, estimatedBytes)).toFuture();
+	}
+
+	@SuppressWarnings("unchecked")
+	private static <T> Mono<T> invokeScheduledWithCleanup(Method method,
+			Object grpc,
+			Scheduler scheduler,
+			Callable<T> callable,
+			Consumer<T> cleanup,
+			long estimatedBytes) throws Exception {
+		return (Mono<T>) method.invoke(
+				grpc, callable, scheduler, cleanup, reactor.core.scheduler.Schedulers.immediate(), estimatedBytes);
+	}
+
+	private static boolean booleanField(Object owner, String name) throws Exception {
+		var field = field(owner.getClass(), name);
+		return field.getBoolean(owner);
 	}
 
 	private static Field field(Class<?> owner, String name) throws Exception {
@@ -296,6 +495,81 @@ class GrpcCommandPreAdmissionTest {
 			var captured = task.get();
 			org.junit.jupiter.api.Assertions.assertNotNull(captured);
 			return captured;
+		}
+	}
+
+	private static final class RecordingServerCall extends ServerCall<GetRequest, Object> {
+
+		private final it.cavallium.rockserver.core.impl.RWScheduler scheduler;
+		private final AtomicInteger closeCount = new AtomicInteger();
+		private final AtomicReference<Throwable> callbackFailure = new AtomicReference<>();
+		private volatile boolean cancelled;
+
+		private RecordingServerCall(it.cavallium.rockserver.core.impl.RWScheduler scheduler) {
+			this.scheduler = scheduler;
+		}
+
+		private void cancel() {
+			cancelled = true;
+		}
+
+		@Override
+		public void request(int numMessages) {
+			if (numMessages <= 0) throw new AssertionError("invalid requested message count");
+		}
+
+		@Override
+		public void sendHeaders(Metadata headers) {
+		}
+
+		@Override
+		public void sendMessage(Object message) {
+		}
+
+		@Override
+		public void close(Status status, Metadata trailers) {
+			closeCount.incrementAndGet();
+			try {
+				CompletableFuture.runAsync(() -> scheduler.poolSnapshot(
+						it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ)).get(2, TimeUnit.SECONDS);
+			} catch (Throwable failure) {
+				callbackFailure.set(failure);
+			}
+		}
+
+		@Override
+		public boolean isCancelled() {
+			return cancelled;
+		}
+
+		@Override
+		@SuppressWarnings({"unchecked", "rawtypes"})
+		public MethodDescriptor<GetRequest, Object> getMethodDescriptor() {
+			return (MethodDescriptor) it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc
+					.getGetMethod();
+		}
+	}
+
+	private static void assertEventually(java.util.function.BooleanSupplier condition) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+			Thread.sleep(5L);
+		}
+		assertTrue(condition.getAsBoolean(), "condition did not become true before timeout");
+	}
+
+	private static void awaitUninterruptibly(CountDownLatch latch) {
+		boolean interrupted = false;
+		while (true) {
+			try {
+				latch.await();
+				break;
+			} catch (InterruptedException ignored) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
 		}
 	}
 
