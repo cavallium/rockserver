@@ -28,6 +28,8 @@ import it.cavallium.rockserver.core.common.api.RocksDB.Iface;
 import it.cavallium.rockserver.core.common.api.RocksDB.Processor;
 import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
+import it.cavallium.rockserver.core.impl.InternalConnection;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import java.io.IOException;
@@ -77,6 +79,9 @@ public class ThriftServer extends Server {
 		super(client);
 		int validatedMaxFrameSize = ThriftTransportLimits.validateServerMaxFrameSize(maxFrameSize);
 		var handler = new ThriftHandler(this.getClient(),
+				client instanceof InternalConnection internalConnection
+						? internalConnection.getScheduler()
+						: null,
 				ThriftTransportLimits.safeCdcResponseSize(validatedMaxFrameSize));
 
 		try {
@@ -196,6 +201,30 @@ public class ThriftServer extends Server {
 
 	private static RequestContext mapRequestContext(
 			it.cavallium.rockserver.core.common.api.RequestContext wireContext) {
+		var context = parseRequestContext(wireContext);
+		if (context.deadlineEpochMillis() != RequestContext.NO_DEADLINE
+				&& context.deadlineEpochMillis() <= System.currentTimeMillis()) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(
+					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					"Request deadline already expired");
+		}
+		return context;
+	}
+
+	private static ResolvedRequestContext mapRequestContext(
+			it.cavallium.rockserver.core.common.api.RequestContext wireContext,
+			@Nullable RWScheduler scheduler) {
+		if (scheduler == null) {
+			var context = mapRequestContext(wireContext);
+			return new ResolvedRequestContext(context, 0L);
+		}
+		var context = parseRequestContext(wireContext);
+		return new ResolvedRequestContext(context,
+				scheduler.bindDeadlineEpochMillis(context.deadlineEpochMillis()));
+	}
+
+	private static RequestContext parseRequestContext(
+			it.cavallium.rockserver.core.common.api.RequestContext wireContext) {
 		if (wireContext == null || wireContext.profile == null) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(
 					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -216,19 +245,15 @@ public class ThriftServer extends Server {
 					"Workload profile " + profile + " is owned by Rockserver");
 		}
 		try {
-			var context = new RequestContext(profile, wireContext.deadlineEpochMillis);
-			if (context.deadlineEpochMillis() != RequestContext.NO_DEADLINE
-					&& context.deadlineEpochMillis() <= System.currentTimeMillis()) {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(
-						it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
-						"Request deadline already expired");
-			}
-			return context;
+			return new RequestContext(profile, wireContext.deadlineEpochMillis);
 		} catch (IllegalArgumentException invalid) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(
 					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Invalid request context: " + invalid.getMessage(), invalid);
 		}
+	}
+
+	private record ResolvedRequestContext(RequestContext value, long localMonotonicDeadlineNanos) {
 	}
 
 	private static UpdateBegin mapResult(UpdateContext<Buf> context) {
@@ -269,10 +294,14 @@ public class ThriftServer extends Server {
 	private static class ThriftHandler implements Iface {
 
 		private final RocksDBConnection client;
+		private final @Nullable RWScheduler scheduler;
 		private final int maxCdcResponseSize;
 
-		public ThriftHandler(RocksDBConnection client, int maxCdcResponseSize) {
+		public ThriftHandler(RocksDBConnection client,
+				@Nullable RWScheduler scheduler,
+				int maxCdcResponseSize) {
 			this.client = client;
+			this.scheduler = scheduler;
 			this.maxCdcResponseSize = maxCdcResponseSize;
 		}
 
@@ -313,7 +342,19 @@ public class ThriftServer extends Server {
 		}
 
 		private RocksDBSyncAPI api(it.cavallium.rockserver.core.common.api.RequestContext context) {
-			return dispatchingSyncApi(client, mapRequestContext(context));
+			var resolved = mapRequestContext(context, scheduler);
+			var api = dispatchingSyncApi(client, resolved.value());
+			if (scheduler == null) {
+				return api;
+			}
+			return new RocksDBSyncAPI() {
+				@Override
+				public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
+					return scheduler.withDeadlineBinding(resolved.value(),
+							resolved.localMonotonicDeadlineNanos(),
+							() -> api.requestSync(request));
+				}
+			};
 		}
 
 		private RocksDBSyncAPI protectedApi() {

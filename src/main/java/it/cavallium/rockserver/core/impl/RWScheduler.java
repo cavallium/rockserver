@@ -15,6 +15,7 @@ import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,6 +64,7 @@ public final class RWScheduler {
 	private final List<ProfiledWorkloadExecutor> pools;
 	private final WorkloadPressureController pressureController;
 	private final SchedulerDeadlineClock deadlineClock;
+	private final ThreadLocal<DeadlineBinding> localDeadlineBinding = new ThreadLocal<>();
 	private final WorkloadExecutor[][] noDeadlineExecutors;
 
 	public RWScheduler(int readCap, int writeCap, String name) {
@@ -280,12 +282,42 @@ public final class RWScheduler {
 	/** Resolve and validate the caller context, then return its resource-specific view. */
 	public Scheduler scheduler(RequestContext context, OperationFamily family) {
 		var profile = WorkloadAdmission.resolve(context, family);
-		return schedulerResolved(profile, family, context.deadlineEpochMillis());
+		return schedulerResolved(profile,
+				family,
+				context.deadlineEpochMillis(),
+				localMonotonicDeadline(context));
 	}
 
 	public WorkloadExecutor executor(RequestContext context, OperationFamily family) {
 		var profile = WorkloadAdmission.resolve(context, family);
-		return executorResolved(profile, family, context.deadlineEpochMillis());
+		return executorResolved(profile,
+				family,
+				context.deadlineEpochMillis(),
+				localMonotonicDeadline(context));
+	}
+
+	/** Internal adapter for a pre-resolved command while retaining a server-bound deadline. */
+	public Scheduler scheduler(WorkloadProfile profile,
+			OperationFamily family,
+			RequestContext context) {
+		Objects.requireNonNull(context, "context");
+		WorkloadAdmission.validate(profile, family);
+		return schedulerResolved(profile,
+				family,
+				context.deadlineEpochMillis(),
+				localMonotonicDeadline(context));
+	}
+
+	/** Internal adapter for a pre-resolved command while retaining a server-bound deadline. */
+	public WorkloadExecutor executor(WorkloadProfile profile,
+			OperationFamily family,
+			RequestContext context) {
+		Objects.requireNonNull(context, "context");
+		WorkloadAdmission.validate(profile, family);
+		return executorResolved(profile,
+				family,
+				context.deadlineEpochMillis(),
+				localMonotonicDeadline(context));
 	}
 
 	/** Server adapter entry retaining an explicitly sidecar-bound monotonic deadline. */
@@ -378,6 +410,63 @@ public final class RWScheduler {
 	/** Bind an already-monotonic transport budget to this scheduler's time domain. */
 	public long bindDeadlineAfterNanos(long remainingNanos) {
 		return deadlineClock.monotonicDeadlineAfterNanos(remainingNanos);
+	}
+
+	/** Resolve a caller epoch against an active server sidecar, or bind it exactly once here. */
+	public long resolveMonotonicDeadline(RequestContext context) {
+		Objects.requireNonNull(context, "context");
+		if (context.deadlineEpochMillis() == RequestContext.NO_DEADLINE) {
+			return Long.MAX_VALUE;
+		}
+		long bound = localMonotonicDeadline(context);
+		return bound == UNBOUND_MONOTONIC_DEADLINE
+				? deadlineClock.monotonicDeadlineNanos(context.deadlineEpochMillis())
+				: bound;
+	}
+
+	/** True once an immutable local deadline has elapsed. */
+	public boolean isMonotonicDeadlineExpired(long localMonotonicDeadlineNanos) {
+		return deadlineClock.monotonicNanos() >= localMonotonicDeadlineNanos;
+	}
+
+	/** Remaining time for an immutable local deadline, saturated at zero. */
+	public long remainingMonotonicDeadlineNanos(long localMonotonicDeadlineNanos) {
+		return deadlineClock.remainingNanos(localMonotonicDeadlineNanos);
+	}
+
+	/**
+	 * Run a server-bound API dispatch with one immutable local deadline sidecar. Scheduler views
+	 * created by the dispatch retain the sidecar after this lexical scope exits.
+	 */
+	public <T> T withDeadlineBinding(RequestContext context,
+			long localMonotonicDeadlineNanos,
+			Supplier<T> dispatch) {
+		Objects.requireNonNull(context, "context");
+		Objects.requireNonNull(dispatch, "dispatch");
+		if (localMonotonicDeadlineNanos == UNBOUND_MONOTONIC_DEADLINE) {
+			throw new IllegalArgumentException("A deadline binding must be resolved before dispatch");
+		}
+		var previous = localDeadlineBinding.get();
+		localDeadlineBinding.set(new DeadlineBinding(context, localMonotonicDeadlineNanos));
+		try {
+			return dispatch.get();
+		} finally {
+			if (previous == null) {
+				localDeadlineBinding.remove();
+			} else {
+				localDeadlineBinding.set(previous);
+			}
+		}
+	}
+
+	private long localMonotonicDeadline(RequestContext context) {
+		var binding = localDeadlineBinding.get();
+		return binding != null && binding.context == context
+				? binding.localMonotonicDeadlineNanos
+				: UNBOUND_MONOTONIC_DEADLINE;
+	}
+
+	private record DeadlineBinding(RequestContext context, long localMonotonicDeadlineNanos) {
 	}
 
 	private ProfiledWorkloadExecutor pool(WorkloadProfile profile, OperationFamily family) {

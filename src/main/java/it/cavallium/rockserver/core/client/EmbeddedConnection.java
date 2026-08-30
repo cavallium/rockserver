@@ -310,7 +310,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		var profile = resolveCommand(context, command);
 		return db.getScheduler().executor(profile,
 				command.operationFamily(),
-				context.deadlineEpochMillis());
+				context);
 	}
 
 	private Scheduler commandScheduler(RocksDBAPICommand<?, ?, ?> command) {
@@ -318,7 +318,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		var profile = resolveCommand(context, command);
 		return db.getScheduler().scheduler(profile,
 				command.operationFamily(),
-				context.deadlineEpochMillis());
+				context);
 	}
 
 	private WorkloadProfile resolveCommand(RequestContext context,
@@ -592,7 +592,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		try {
 			profile = resolveCommand(context, command);
 			workloadExecutor = db.getScheduler().executor(
-					profile, command.operationFamily(), context.deadlineEpochMillis());
+					profile, command.operationFamily(), context);
 		} catch (Throwable error) {
 			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
 			return CompletableFuture.failedFuture(error);

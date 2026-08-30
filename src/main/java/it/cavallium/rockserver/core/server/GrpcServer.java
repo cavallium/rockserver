@@ -127,6 +127,19 @@ public class GrpcServer extends Server {
 	private static final ConcurrentMap<String, LateReadDeadlineLogState> LATE_READ_DEADLINE_LOG_STATES
 			= new ConcurrentHashMap<>();
 
+	private record ResolvedRequestContext(
+			it.cavallium.rockserver.core.common.RequestContext value,
+			long localMonotonicDeadlineNanos) {
+
+		private WorkloadProfile profile() {
+			return value.profile();
+		}
+
+		private long deadlineEpochMillis() {
+			return value.deadlineEpochMillis();
+		}
+	}
+
 	private final GrpcServerImpl grpc;
 	private final EventLoopGroup elg;
 	private final io.grpc.Server server;
@@ -486,7 +499,7 @@ public class GrpcServer extends Server {
 			private volatile int state;
 			private volatile @Nullable Disposable task;
 			private @Nullable GetRequest request;
-			private @Nullable it.cavallium.rockserver.core.common.RequestContext requestContext;
+			private @Nullable ResolvedRequestContext requestContext;
 			private @Nullable Keys keys;
 			private long estimatedBytes;
 
@@ -532,7 +545,8 @@ public class GrpcServer extends Server {
 					estimatedBytes = command.estimatedBytes();
 					scheduled = scheduler.scheduler(profile,
 							command.operationFamily(),
-							requestContext.deadlineEpochMillis())
+							requestContext.deadlineEpochMillis(),
+							requestContext.localMonotonicDeadlineNanos())
 							.schedule(this);
 				} catch (Throwable schedulingError) {
 					if (tryTerminate()) {
@@ -621,7 +635,7 @@ public class GrpcServer extends Server {
 
 	private void runFastGetCall(ServerCall<GetRequest, FastGetResponse> call,
 			GetRequest request,
-			it.cavallium.rockserver.core.common.RequestContext context,
+			ResolvedRequestContext context,
 			Keys keys,
 			FastGetCallHandler.FastGetListener listener) {
 		FastGetResponse response = null;
@@ -629,7 +643,11 @@ public class GrpcServer extends Server {
 			if (listener.isCancelled() || call.isCancelled()) {
 				return;
 			}
-			response = grpc.createFastGetResponse(request, context, keys, grpcGetStrategy, embeddedDatabase);
+			response = grpc.createFastGetResponse(request,
+					context.value(),
+					keys,
+					grpcGetStrategy,
+					embeddedDatabase);
 			if (listener.isCancelled() || call.isCancelled()) {
 				return;
 			}
@@ -926,7 +944,7 @@ public class GrpcServer extends Server {
 			return contexts;
 		}
 
-		private it.cavallium.rockserver.core.common.RequestContext mapRequestContext(
+		private ResolvedRequestContext mapRequestContext(
 				it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext) {
 			if (wireContext == null || wireContext.getProfileValue() == 0) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -940,10 +958,14 @@ public class GrpcServer extends Server {
 						unknown.getMessage(), unknown);
 			}
 			long deadlineEpochMillis = wireContext.getDeadlineEpochMillis();
+			long localMonotonicDeadlineNanos = scheduler.bindDeadlineEpochMillis(deadlineEpochMillis);
 			var transportDeadline = Context.current().getDeadline();
 			if (transportDeadline != null) {
-				long remainingMillis = Math.max(0L,
-						transportDeadline.timeRemaining(TimeUnit.MILLISECONDS));
+				long remainingNanos = Math.max(0L,
+						transportDeadline.timeRemaining(TimeUnit.NANOSECONDS));
+				localMonotonicDeadlineNanos = Math.min(localMonotonicDeadlineNanos,
+						scheduler.bindDeadlineAfterNanos(remainingNanos));
+				long remainingMillis = TimeUnit.NANOSECONDS.toMillis(remainingNanos);
 				long now = System.currentTimeMillis();
 				long transportEpochMillis = remainingMillis >= Long.MAX_VALUE - now
 						? Long.MAX_VALUE
@@ -955,13 +977,19 @@ public class GrpcServer extends Server {
 						"Workload profile " + profile + " is owned by Rockserver");
 			}
 			try {
+				it.cavallium.rockserver.core.common.RequestContext context;
 				if (deadlineEpochMillis == it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE) {
 					var cached = NO_DEADLINE_CONTEXTS[profile.ordinal()];
 					if (cached != null) {
-						return cached;
+						context = cached;
+					} else {
+						context = new it.cavallium.rockserver.core.common.RequestContext(profile,
+								deadlineEpochMillis);
 					}
+				} else {
+					context = new it.cavallium.rockserver.core.common.RequestContext(profile, deadlineEpochMillis);
 				}
-				return new it.cavallium.rockserver.core.common.RequestContext(profile, deadlineEpochMillis);
+				return new ResolvedRequestContext(context, localMonotonicDeadlineNanos);
 			} catch (IllegalArgumentException invalid) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Invalid request context: " + invalid.getMessage(), invalid);
@@ -971,6 +999,39 @@ public class GrpcServer extends Server {
 		private RocksDBAsyncAPI asyncApi(
 				it.cavallium.rockserver.core.common.api.proto.RequestContext context) {
 			return asyncApi(mapRequestContext(context));
+		}
+
+		private RocksDBSyncAPI syncApi(ResolvedRequestContext context) {
+			var api = syncApi(context.value());
+			return new RocksDBSyncAPI() {
+				@Override
+				public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
+					return scheduler.withDeadlineBinding(context.value(),
+							context.localMonotonicDeadlineNanos(),
+							() -> api.requestSync(request));
+				}
+			};
+		}
+
+		private RocksDBAsyncAPI asyncApi(ResolvedRequestContext context) {
+			var api = asyncApi(context.value());
+			return new RocksDBAsyncAPI() {
+				@Override
+				public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
+					return scheduler.withDeadlineBinding(context.value(),
+							context.localMonotonicDeadlineNanos(),
+							() -> api.requestAsync(request));
+				}
+			};
+		}
+
+		private reactor.core.scheduler.Scheduler contextualScheduler(
+				ResolvedRequestContext context,
+				OperationFamily family) {
+			return scheduler.scheduler(context.profile(),
+					family,
+					context.deadlineEpochMillis(),
+					context.localMonotonicDeadlineNanos());
 		}
 
 		private RocksDBSyncAPI syncApi(it.cavallium.rockserver.core.common.RequestContext context) {
@@ -1037,6 +1098,12 @@ public class GrpcServer extends Server {
 						+ command.getClass().getSimpleName());
 			}
 			return resolveCommand(context, command);
+		}
+
+		private WorkloadProfile preAdmit(ResolvedRequestContext context,
+				OperationFamily expectedFamily,
+				RocksDBAPICommand<?, ?, ?> command) {
+			return preAdmit(context.value(), expectedFamily, command);
 		}
 
 		// functions
@@ -1371,7 +1438,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+					.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
 					.doOnNext(data -> contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 							initialRequest.getColumnId(),
 							mapKeys(data.getKeysList()),
@@ -1422,7 +1489,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+							.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
 							.map(data -> mapper.apply(contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysList()),
@@ -1544,7 +1611,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+							.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
 							.map(data -> {
 								var merged = contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 										initialRequest.getColumnId(),
@@ -1583,7 +1650,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+					.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
 					.doOnNext(data -> {
 						contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
@@ -1734,7 +1801,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+							.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
 							.map(data -> mapper.apply(contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysList()),
@@ -1768,7 +1835,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+					.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
 					.doOnNext(data -> {
 						contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
@@ -1802,7 +1869,7 @@ public class GrpcServer extends Server {
 			var contextualApi = syncApi(context);
 			return dataFlux
 					.buffer(WRITE_ELISION_MULTI_STEP_SIZE)
-					.publishOn(scheduler.scheduler(context, OperationFamily.MUTATION))
+					.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
 					.doOnNext(data -> {
 						var batch = mapKVBatch(data);
 						contextualApi.putMulti(initialRequest.getTransactionOrUpdateId(),
@@ -2520,9 +2587,12 @@ public class GrpcServer extends Server {
 			return Mono.defer(() -> {
 				var context = mapRequestContext(wireContext);
 				var command = captureCommand(operation);
-				var profile = preAdmit(context, family, command);
-				return executeScheduled(() -> operation.apply(syncApi(context)),
-						scheduler.scheduler(profile, command.operationFamily(), context.deadlineEpochMillis()),
+					var profile = preAdmit(context, family, command);
+					return executeScheduled(() -> operation.apply(syncApi(context)),
+							scheduler.scheduler(profile,
+									command.operationFamily(),
+									context.deadlineEpochMillis(),
+									context.localMonotonicDeadlineNanos()),
 						command.estimatedBytes());
 			});
 		}
@@ -2536,9 +2606,12 @@ public class GrpcServer extends Server {
 			return Mono.defer(() -> {
 				var context = mapRequestContext(wireContext);
 				var command = captureCommand(operation);
-				var profile = preAdmit(context, family, command);
-				return executeScheduled(() -> operation.apply(syncApi(context)),
-						scheduler.scheduler(profile, command.operationFamily(), context.deadlineEpochMillis()),
+					var profile = preAdmit(context, family, command);
+					return executeScheduled(() -> operation.apply(syncApi(context)),
+							scheduler.scheduler(profile,
+									command.operationFamily(),
+									context.deadlineEpochMillis(),
+									context.localMonotonicDeadlineNanos()),
 						lateSuccessCleanup,
 						lateSuccessCleanupScheduler,
 						command.estimatedBytes());
@@ -2617,7 +2690,7 @@ public class GrpcServer extends Server {
 							"Cooperative iterator stream was started without an operation lease"));
 				}
 
-				final it.cavallium.rockserver.core.common.RequestContext requestContext;
+				final ResolvedRequestContext requestContext;
 				final RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<List<Buf>> command;
 				final WorkloadProfile profile;
 				final RocksDBSyncAPI contextualApi;
@@ -2633,7 +2706,10 @@ public class GrpcServer extends Server {
 					profile = preAdmit(requestContext, OperationFamily.RANGE_PAGE, command);
 					contextualApi = syncApi(requestContext);
 					workloadExecutor = scheduler.executor(
-							profile, command.operationFamily(), requestContext.deadlineEpochMillis());
+							profile,
+							command.operationFamily(),
+							requestContext.deadlineEpochMillis(),
+							requestContext.localMonotonicDeadlineNanos());
 					quantumLimits = iteratorQuantumLimits();
 				} catch (Throwable failure) {
 					iteratorLease.operationTerminated();
