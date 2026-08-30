@@ -22,6 +22,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -85,6 +86,48 @@ class SchedulerWallClockDiscontinuityTest {
 			assertFalse(readPoolBoolean(scheduler, "latencyExpiryIndexed"));
 		} finally {
 			release.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void contendedAdmissionRefreshesMonotonicNowWithoutRebindingWallTime() throws Exception {
+		var clock = new MutableClock(1_000_000L, 0L);
+		var scheduler = scheduler(clock, "deadline-contended-admission-refresh");
+		var poolLock = readPoolLock(scheduler);
+		var failure = new AtomicReference<Throwable>();
+		var probe = new TerminalProbe();
+		Thread submitter = null;
+		poolLock.lock();
+		try {
+			clock.resetReadCounts();
+			submitter = Thread.ofPlatform().start(() -> {
+				try {
+					scheduler.executor(WorkloadProfile.LATENCY,
+							OperationFamily.POINT_LOOKUP,
+							clock.rawEpochMillis() + 100L).execute(probe);
+					failure.set(new AssertionError("expired contended admission was accepted"));
+				} catch (Throwable terminal) {
+					failure.set(terminal);
+				}
+			});
+			assertTrue(awaitCondition(() -> clock.epochMillisReads() == 1L
+					&& clock.nanoTimeReads() == 1L, 5_000L),
+					"the immutable deadline must be bound before waiting for the pool lock");
+			clock.advanceNanos(MILLISECONDS.toNanos(101L));
+			clock.jumpWallMillis(-SECONDS.toMillis(30L));
+		} finally {
+			poolLock.unlock();
+		}
+		try {
+			if (submitter != null) {
+				submitter.join(5_000L);
+				assertFalse(submitter.isAlive());
+			}
+			assertInstanceOf(RocksDBException.class, failure.get());
+			assertClockReads(clock, 1L, 2L);
+			assertFalse(probe.ran(), "lock waiting must consume the original monotonic budget");
+		} finally {
 			scheduler.disposeNow();
 		}
 	}
@@ -563,6 +606,13 @@ class SchedulerWallClockDiscontinuityTest {
 		Field field = RWScheduler.class.getDeclaredField("readPool");
 		field.setAccessible(true);
 		return field.get(scheduler);
+	}
+
+	private static ReentrantLock readPoolLock(RWScheduler scheduler) throws ReflectiveOperationException {
+		Object readPool = readPool(scheduler);
+		Field field = readPool.getClass().getDeclaredField("lock");
+		field.setAccessible(true);
+		return (ReentrantLock) field.get(readPool);
 	}
 
 	private static boolean awaitCondition(java.util.function.BooleanSupplier condition, long timeoutMillis)

@@ -102,8 +102,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final List<Thread> workers = new ArrayList<>();
 	private final WorkloadPressureController pressureController;
 	private final SchedulerDeadlineClock deadlineClock;
-	private final SchedulerDeadlineClock.DeadlineSample admissionDeadlineSample =
-			new SchedulerDeadlineClock.DeadlineSample();
 	private final String databaseName;
 	private final String resourceKind;
 	private final RWScheduler.Pool resourcePool;
@@ -245,23 +243,22 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			throw new IllegalArgumentException("Deferred workload tasks must handle asynchronous rejection");
 		}
 		int cost = taskCost(estimatedBytes);
+		boolean hasDeadline = deadlineEpochMillis != RequestContext.NO_DEADLINE;
+		long bindingNowNanos = hasDeadline ? deadlineClock.monotonicNanos() : 0L;
+		long monotonicDeadlineNanos = hasDeadline
+				? boundOrComputeDeadline(deadlineEpochMillis, localMonotonicDeadlineNanos, bindingNowNanos)
+				: Long.MAX_VALUE;
 		var taskMetrics = metrics(profile, family);
 		DeferredAdmission deferred = null;
 		RuntimeException admissionFailure = null;
 		RWScheduler.TerminalOutcome admissionOutcome = null;
-		lock.lock();
+		boolean acquiredWithoutWaiting = hasDeadline && lock.tryLock();
+		if (!acquiredWithoutWaiting) lock.lock();
 		try {
-			long nowNanos;
-			long monotonicDeadlineNanos;
-			if (deadlineEpochMillis == RequestContext.NO_DEADLINE) {
-				nowNanos = 0L;
-				monotonicDeadlineNanos = Long.MAX_VALUE;
-			} else {
-				var sample = sampleAdmissionDeadlineUnsafe(deadlineEpochMillis, localMonotonicDeadlineNanos);
-				nowNanos = sample.nowNanos();
-				monotonicDeadlineNanos = sample.deadlineNanos();
-			}
-			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowNanos >= monotonicDeadlineNanos) {
+			long nowNanos = hasDeadline && !acquiredWithoutWaiting
+					? deadlineClock.monotonicNanos()
+					: bindingNowNanos;
+			if (hasDeadline && nowNanos >= monotonicDeadlineNanos) {
 				admissionFailure = deadlineFailure("Workload deadline expired before deferred admission");
 				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
 			} else if (shutdown) {
@@ -309,14 +306,12 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		return Objects.requireNonNull(deferred, "Accepted deferred workload task");
 	}
 
-	private SchedulerDeadlineClock.DeadlineSample sampleAdmissionDeadlineUnsafe(long deadlineEpochMillis,
-	                                                                           long localMonotonicDeadlineNanos) {
-		if (localMonotonicDeadlineNanos == RWScheduler.UNBOUND_MONOTONIC_DEADLINE) {
-			deadlineClock.bindDeadlineEpochMillis(deadlineEpochMillis, admissionDeadlineSample);
-		} else {
-			deadlineClock.sampleBoundDeadlineNanos(localMonotonicDeadlineNanos, admissionDeadlineSample);
-		}
-		return admissionDeadlineSample;
+	private long boundOrComputeDeadline(long deadlineEpochMillis,
+	                                    long localMonotonicDeadlineNanos,
+	                                    long bindingNowNanos) {
+		return localMonotonicDeadlineNanos == RWScheduler.UNBOUND_MONOTONIC_DEADLINE
+				? deadlineClock.monotonicDeadlineNanos(deadlineEpochMillis, bindingNowNanos)
+				: localMonotonicDeadlineNanos;
 	}
 
 	RWScheduler.WorkloadExecutor view(WorkloadProfile profile,
@@ -365,30 +360,29 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					"Cooperative execution requires ANALYTICAL, INGEST, or BATCH work");
 		}
 		int cost = taskCost(estimatedBytes);
+		boolean hasDeadline = deadlineEpochMillis != RequestContext.NO_DEADLINE;
+		long bindingNowNanos = hasDeadline ? deadlineClock.monotonicNanos() : 0L;
+		long monotonicDeadlineNanos = hasDeadline
+				? boundOrComputeDeadline(deadlineEpochMillis, localMonotonicDeadlineNanos, bindingNowNanos)
+				: Long.MAX_VALUE;
 		var taskMetrics = metrics(profile, family);
 		WorkloadTask task = null;
 		RuntimeException admissionFailure = null;
 		RWScheduler.TerminalOutcome admissionOutcome = null;
 		AdmissionResult admissionResult;
 		List<TerminalAction> terminalActions = null;
-		lock.lock();
+		boolean acquiredWithoutWaiting = hasDeadline && lock.tryLock();
+		if (!acquiredWithoutWaiting) lock.lock();
 		try {
 			boolean hasQueuedDeadlines = indexedDeadlineCount != 0;
-			long nowNanos;
-			long monotonicDeadlineNanos;
-			if (deadlineEpochMillis == RequestContext.NO_DEADLINE) {
-				nowNanos = hasQueuedDeadlines ? deadlineClock.monotonicNanos() : 0L;
-				monotonicDeadlineNanos = Long.MAX_VALUE;
-			} else {
-				var sample = sampleAdmissionDeadlineUnsafe(deadlineEpochMillis, localMonotonicDeadlineNanos);
-				nowNanos = sample.nowNanos();
-				monotonicDeadlineNanos = sample.deadlineNanos();
-			}
+			long nowNanos = hasDeadline
+					? acquiredWithoutWaiting ? bindingNowNanos : deadlineClock.monotonicNanos()
+					: hasQueuedDeadlines ? deadlineClock.monotonicNanos() : 0L;
 			if (hasQueuedDeadlines) {
 				terminalActions = expireDueUnsafe(nowNanos, terminalActions);
 			}
 			recordSubmissionAttemptUnsafe(profile);
-			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowNanos >= monotonicDeadlineNanos) {
+			if (hasDeadline && nowNanos >= monotonicDeadlineNanos) {
 				admissionFailure = deadlineFailure("Workload deadline expired before admission");
 				admissionResult = AdmissionResult.DEADLINE;
 				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
@@ -473,6 +467,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	             Runnable command) {
 		Objects.requireNonNull(command, "command");
 		int cost = taskCost(estimatedBytes);
+		boolean hasDeadline = deadlineEpochMillis != RequestContext.NO_DEADLINE;
+		long bindingNowNanos = hasDeadline ? deadlineClock.monotonicNanos() : 0L;
+		long monotonicDeadlineNanos = hasDeadline
+				? boundOrComputeDeadline(deadlineEpochMillis, localMonotonicDeadlineNanos, bindingNowNanos)
+				: Long.MAX_VALUE;
 		var taskMetrics = metrics(profile, family);
 		var cancellationTask = command instanceof CancellationTrackedTask trackedTask
 				? trackedTask
@@ -481,24 +480,18 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		RuntimeException admissionFailure = null;
 		RWScheduler.TerminalOutcome admissionOutcome = null;
 		AdmissionResult admissionResult;
-		lock.lock();
+		boolean acquiredWithoutWaiting = hasDeadline && lock.tryLock();
+		if (!acquiredWithoutWaiting) lock.lock();
 		try {
 			boolean hasQueuedDeadlines = indexedDeadlineCount != 0;
-			long nowNanos;
-			long monotonicDeadlineNanos;
-			if (deadlineEpochMillis == RequestContext.NO_DEADLINE) {
-				nowNanos = hasQueuedDeadlines ? deadlineClock.monotonicNanos() : 0L;
-				monotonicDeadlineNanos = Long.MAX_VALUE;
-			} else {
-				var sample = sampleAdmissionDeadlineUnsafe(deadlineEpochMillis, localMonotonicDeadlineNanos);
-				nowNanos = sample.nowNanos();
-				monotonicDeadlineNanos = sample.deadlineNanos();
-			}
+			long nowNanos = hasDeadline
+					? acquiredWithoutWaiting ? bindingNowNanos : deadlineClock.monotonicNanos()
+					: hasQueuedDeadlines ? deadlineClock.monotonicNanos() : 0L;
 			if (hasQueuedDeadlines) {
 				terminalActions = expireDueUnsafe(nowNanos, terminalActions);
 			}
 			recordSubmissionAttemptUnsafe(profile);
-			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowNanos >= monotonicDeadlineNanos) {
+			if (hasDeadline && nowNanos >= monotonicDeadlineNanos) {
 				admissionFailure = deadlineFailure("Workload deadline expired before admission");
 				admissionResult = AdmissionResult.DEADLINE;
 				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
