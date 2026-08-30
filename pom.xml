@@ -617,6 +617,39 @@
       </build>
     </profile>
 
+	<profile>
+	  <id>rust-client-verification</id>
+	  <build>
+		<plugins>
+		  <plugin>
+			<groupId>org.codehaus.mojo</groupId>
+			<artifactId>exec-maven-plugin</artifactId>
+			<version>3.5.0</version>
+			<executions>
+			  <execution>
+				<id>cargo-test-rust-client-workspace</id>
+				<phase>verify</phase>
+				<goals>
+				  <goal>exec</goal>
+				</goals>
+				<configuration>
+				  <executable>cargo</executable>
+				  <workingDirectory>${project.basedir}/rust-client</workingDirectory>
+				  <arguments>
+					<argument>test</argument>
+					<argument>--locked</argument>
+					<argument>--package</argument>
+					<argument>rockserver-client</argument>
+					<argument>--all-targets</argument>
+				  </arguments>
+				</configuration>
+			  </execution>
+			</executions>
+		  </plugin>
+		</plugins>
+	  </build>
+	</profile>
+
     <profile>
       <id>fatjar</id>
       <dependencies>
