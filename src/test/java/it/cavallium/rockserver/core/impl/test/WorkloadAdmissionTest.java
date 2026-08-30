@@ -27,12 +27,14 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.common.WorkloadCost;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.AbstractList;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
@@ -150,7 +152,30 @@ class WorkloadAdmissionTest {
 		var saturated = new RocksDBAPICommandSingle.GetRangePage<>(
 				0, 1, keys(1), null, false, null,
 				RequestType.allInRange(), 1_000, new RangeBudget(1, Long.MAX_VALUE));
-		assertEquals(Long.MAX_VALUE, saturated.estimatedBytes());
+		assertEquals(WorkloadCost.MAX_ESTIMATED_BYTES, saturated.estimatedBytes());
+	}
+
+	@Test
+	void schedulerByteEstimateStopsReadingOnceMaximumCostIsKnown() {
+		var quantum = buffer((int) WorkloadCost.QUANTUM_BYTES);
+		List<Buf> values = new AbstractList<>() {
+			@Override
+			public Buf get(int index) {
+				if (index >= WorkloadCost.MAX_UNITS) {
+					throw new AssertionError("estimator read beyond the scheduler cost ceiling");
+				}
+				return quantum;
+			}
+
+			@Override
+			public int size() {
+				return WorkloadCost.MAX_UNITS + 1;
+			}
+		};
+		var command = new RocksDBAPICommandSingle.PutMulti<>(
+				0, 1, List.of(), values, RequestType.none());
+
+		assertEquals(WorkloadCost.MAX_ESTIMATED_BYTES, command.estimatedBytes());
 	}
 
 	@Test

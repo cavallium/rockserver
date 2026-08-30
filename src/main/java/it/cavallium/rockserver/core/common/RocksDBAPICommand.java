@@ -76,6 +76,9 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		}
 		for (Buf segment : logicalKey.keys()) {
 			total = saturatedAdd(total, segment.size());
+			if (total == WorkloadCost.MAX_ESTIMATED_BYTES) {
+				break;
+			}
 		}
 		return total;
 	}
@@ -94,6 +97,9 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		long total = 0L;
 		for (Keys logicalKey : keys) {
 			total = saturatedAdd(total, estimatedBytes(logicalKey));
+			if (total == WorkloadCost.MAX_ESTIMATED_BYTES) {
+				break;
+			}
 		}
 		return total;
 	}
@@ -104,18 +110,29 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 
 	private static long estimatedBytes(List<Keys> keys, List<Buf> values) {
 		long total = estimatedBytes(keys);
+		if (total == WorkloadCost.MAX_ESTIMATED_BYTES) {
+			return total;
+		}
 		for (Buf value : values) {
 			total = saturatedAdd(total, value.size());
+			if (total == WorkloadCost.MAX_ESTIMATED_BYTES) {
+				break;
+			}
 		}
 		return total;
 	}
 
 	private static long saturatedMultiply(long left, long right) {
-		return left != 0L && right > Long.MAX_VALUE / left ? Long.MAX_VALUE : left * right;
+		return left != 0L && right > WorkloadCost.MAX_ESTIMATED_BYTES / left
+				? WorkloadCost.MAX_ESTIMATED_BYTES
+				: Math.min(WorkloadCost.MAX_ESTIMATED_BYTES, left * right);
 	}
 
 	private static long saturatedAdd(long left, long right) {
-		return right > Long.MAX_VALUE - left ? Long.MAX_VALUE : left + right;
+		return left >= WorkloadCost.MAX_ESTIMATED_BYTES
+				|| right >= WorkloadCost.MAX_ESTIMATED_BYTES - left
+				? WorkloadCost.MAX_ESTIMATED_BYTES
+				: left + right;
 	}
 
 	/**
