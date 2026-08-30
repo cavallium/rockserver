@@ -1,11 +1,13 @@
 package it.cavallium.rockserver.core.impl.benchmark;
 
 import it.cavallium.rockserver.core.common.OperationFamily;
-import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -504,10 +506,15 @@ public final class SchedulerHighContentionBenchmark {
 	}
 
 	static long latencyDeadlineBudgetNanos(Duration timeout) {
-		long timeoutNanos = RequestContext.latency(timeout).timeoutNanos();
+		long timeoutNanos;
+		try {
+			timeoutNanos = timeout.toNanos();
+		} catch (ArithmeticException overflow) {
+			timeoutNanos = Long.MAX_VALUE - 1L;
+		}
 		long marginNanos = TimeUnit.MINUTES.toNanos(1L);
-		return timeoutNanos >= RequestContext.NO_TIMEOUT - 1L - marginNanos
-				? RequestContext.NO_TIMEOUT - 1L
+		return timeoutNanos >= Long.MAX_VALUE - 1L - marginNanos
+				? Long.MAX_VALUE - 1L
 				: timeoutNanos + marginNanos;
 	}
 
@@ -548,7 +555,9 @@ public final class SchedulerHighContentionBenchmark {
 		private final byte[] familyOrdinals;
 		private final PoolObservation[] poolObservations = new PoolObservation[POOLS.length];
 		private final AtomicLong monitorSamples = new AtomicLong();
-		private final long futureLatencyDeadlineNanos;
+		private final SchedulerDeadlineApi deadlineApi;
+		private final SchedulerDeadlineApi.Deadline futureLatencyDeadline;
+		private final SchedulerDeadlineApi.Deadline expiredLatencyDeadline;
 		private BenchmarkProcessTelemetry.PeakSampler peaks;
 		private volatile long startedNanos;
 		private volatile long elapsedNanos;
@@ -556,8 +565,9 @@ public final class SchedulerHighContentionBenchmark {
 		private RunState(Config config, RWScheduler scheduler) {
 			this.config = config;
 			this.scheduler = scheduler;
-			this.futureLatencyDeadlineNanos = scheduler.bindTimeoutNanos(
-					latencyDeadlineBudgetNanos(config.timeout()));
+			this.deadlineApi = SchedulerDeadlineApi.create(scheduler);
+			this.futureLatencyDeadline = deadlineApi.bind(latencyDeadlineBudgetNanos(config.timeout()));
+			this.expiredLatencyDeadline = deadlineApi.expired();
 			this.queueLatencyNanos = new long[config.operations()];
 			this.executionNanos = new long[config.operations()];
 			this.endToEndNanos = new long[config.operations()];
@@ -587,41 +597,41 @@ public final class SchedulerHighContentionBenchmark {
 			long submittedNanos = System.nanoTime();
 			long estimatedBytes = 1L << (10 + Math.floorMod((int) (hash >>> 8), 16));
 			int tokens = config.workTokens() * (1 + Math.floorMod((int) (hash >>> 29), 4));
-			long deadline = expired
-					? 0L
+			var deadline = expired
+					? expiredLatencyDeadline
 					: lane.profile() == WorkloadProfile.LATENCY
-							? futureLatencyDeadlineNanos
-							: Long.MAX_VALUE;
+							? futureLatencyDeadline
+							: SchedulerDeadlineApi.NO_DEADLINE;
 			try {
 				if (fail) {
 					var task = new FailingTask(this, index, lane, submittedNanos, tokens);
 					if (lane.cooperative()) {
-						scheduler.executor(lane.profile(), lane.family(), deadline)
+						deadlineApi.executor(lane.profile(), lane.family(), deadline)
 								.executeCooperatively(task, estimatedBytes);
 					} else {
-						scheduler.executor(lane.profile(), lane.family(), deadline).execute(task, estimatedBytes);
+						deadlineApi.executor(lane.profile(), lane.family(), deadline).execute(task, estimatedBytes);
 					}
 				} else if (cancel) {
 					var task = new NormalTask(this, index, lane, submittedNanos, tokens, true);
-					Disposable disposable = scheduler.scheduler(lane.profile(), lane.family(), deadline).schedule(task);
+					Disposable disposable = deadlineApi.scheduler(lane.profile(), lane.family(), deadline).schedule(task);
 					cancellationRequests.increment();
 					disposable.dispose();
 				} else if (cooperative) {
 					if (park) {
 						var task = new ParkTask(this, index, lane, submittedNanos, tokens,
 								config.cooperativeParks());
-						var handle = scheduler.executor(lane.profile(), lane.family(), deadline)
+						var handle = deadlineApi.executor(lane.profile(), lane.family(), deadline)
 								.executeCooperatively(task, estimatedBytes);
 						parked.add(new ParkRegistration(task, handle));
 					} else {
 						var task = new YieldTask(this, index, lane, submittedNanos, tokens,
 								config.cooperativeYields());
-						scheduler.executor(lane.profile(), lane.family(), deadline)
+						deadlineApi.executor(lane.profile(), lane.family(), deadline)
 								.executeCooperatively(task, estimatedBytes);
 					}
 				} else {
 					var task = new NormalTask(this, index, lane, submittedNanos, tokens, false);
-					scheduler.executor(lane.profile(), lane.family(), deadline).execute(task, estimatedBytes);
+					deadlineApi.executor(lane.profile(), lane.family(), deadline).execute(task, estimatedBytes);
 				}
 			} catch (Throwable failure) {
 				if (!expectedAdmissionFailure(failure)) {
@@ -631,6 +641,128 @@ public final class SchedulerHighContentionBenchmark {
 					expectedDeadlines.increment();
 				}
 			}
+		}
+
+		/**
+		 * Test-harness bridge for comparing the last epoch-deadline production build with the
+		 * breaking monotonic-only build. Resolution happens once per run; hot submissions use
+		 * pre-linked MethodHandles and allocate no deadline objects.
+		 */
+		private static final class SchedulerDeadlineApi {
+
+			private static final Deadline NO_DEADLINE = new Deadline(Long.MAX_VALUE, Long.MAX_VALUE);
+			private static final MethodType BIND_TYPE = MethodType.methodType(long.class, long.class);
+			private static final MethodType V3_VIEW_TYPE = MethodType.methodType(RWScheduler.WorkloadExecutor.class,
+					WorkloadProfile.class, OperationFamily.class, long.class);
+			private static final MethodType V2_VIEW_TYPE = MethodType.methodType(RWScheduler.WorkloadExecutor.class,
+					WorkloadProfile.class, OperationFamily.class, long.class, long.class);
+			private static final MethodType V3_SCHEDULER_TYPE = MethodType.methodType(reactor.core.scheduler.Scheduler.class,
+					WorkloadProfile.class, OperationFamily.class, long.class);
+			private static final MethodType V2_SCHEDULER_TYPE = MethodType.methodType(reactor.core.scheduler.Scheduler.class,
+					WorkloadProfile.class, OperationFamily.class, long.class, long.class);
+
+			private final RWScheduler owner;
+			private final boolean relativeContract;
+			private final MethodHandle bind;
+			private final MethodHandle executor;
+			private final MethodHandle scheduler;
+
+			private SchedulerDeadlineApi(RWScheduler owner,
+					boolean relativeContract,
+					MethodHandle bind,
+					MethodHandle executor,
+					MethodHandle scheduler) {
+				this.owner = owner;
+				this.relativeContract = relativeContract;
+				this.bind = bind;
+				this.executor = executor;
+				this.scheduler = scheduler;
+			}
+
+			private static SchedulerDeadlineApi create(RWScheduler owner) {
+				Objects.requireNonNull(owner, "owner");
+				var lookup = MethodHandles.publicLookup();
+				try {
+					var bind = lookup.findVirtual(RWScheduler.class, "bindTimeoutNanos", BIND_TYPE);
+					return new SchedulerDeadlineApi(owner,
+							true,
+							bind,
+							lookup.findVirtual(RWScheduler.class, "executor", V3_VIEW_TYPE),
+							lookup.findVirtual(RWScheduler.class, "scheduler", V3_SCHEDULER_TYPE));
+				} catch (NoSuchMethodException missingV3) {
+					try {
+						return new SchedulerDeadlineApi(owner,
+								false,
+								lookup.findVirtual(RWScheduler.class, "bindDeadlineAfterNanos", BIND_TYPE),
+								lookup.findVirtual(RWScheduler.class, "executor", V2_VIEW_TYPE),
+								lookup.findVirtual(RWScheduler.class, "scheduler", V2_SCHEDULER_TYPE));
+					} catch (NoSuchMethodException | IllegalAccessException missingV2) {
+						missingV2.addSuppressed(missingV3);
+						throw new IllegalStateException("Unsupported scheduler deadline API", missingV2);
+					}
+				} catch (IllegalAccessException inaccessibleV3) {
+					throw new IllegalStateException("Inaccessible scheduler deadline API", inaccessibleV3);
+				}
+			}
+
+			private Deadline bind(long timeoutNanos) {
+				try {
+					long monotonic = (long) bind.invokeExact(owner, timeoutNanos);
+					return new Deadline(relativeContract ? 0L : epochDeadline(timeoutNanos), monotonic);
+				} catch (Throwable failure) {
+					throw rethrow(failure);
+				}
+			}
+
+			private Deadline expired() {
+				if (relativeContract) return new Deadline(0L, 0L);
+				try {
+					long monotonic = (long) bind.invokeExact(owner, 0L);
+					return new Deadline(Math.max(1L, System.currentTimeMillis() - 1L), monotonic);
+				} catch (Throwable failure) {
+					throw rethrow(failure);
+				}
+			}
+
+			private RWScheduler.WorkloadExecutor executor(WorkloadProfile profile,
+					OperationFamily family,
+					Deadline deadline) {
+				try {
+					if (relativeContract) {
+						return (RWScheduler.WorkloadExecutor) executor.invokeExact(owner,
+								profile, family, deadline.monotonicNanos());
+					}
+					return (RWScheduler.WorkloadExecutor) executor.invokeExact(owner,
+							profile, family, deadline.epochMillis(), deadline.monotonicNanos());
+				} catch (Throwable failure) {
+					throw rethrow(failure);
+				}
+			}
+
+			private reactor.core.scheduler.Scheduler scheduler(WorkloadProfile profile,
+					OperationFamily family,
+					Deadline deadline) {
+				try {
+					if (relativeContract) {
+						return (reactor.core.scheduler.Scheduler) scheduler.invokeExact(owner,
+								profile, family, deadline.monotonicNanos());
+					}
+					return (reactor.core.scheduler.Scheduler) scheduler.invokeExact(owner,
+							profile, family, deadline.epochMillis(), deadline.monotonicNanos());
+				} catch (Throwable failure) {
+					throw rethrow(failure);
+				}
+			}
+
+			private static long epochDeadline(long timeoutNanos) {
+				long timeoutMillis = TimeUnit.NANOSECONDS.toMillis(timeoutNanos);
+				long nowMillis = System.currentTimeMillis();
+				return timeoutMillis >= Long.MAX_VALUE - 1L - nowMillis
+						? Long.MAX_VALUE - 1L
+						: nowMillis + timeoutMillis;
+			}
+
+			private record Deadline(long epochMillis, long monotonicNanos) {}
 		}
 
 		private void monitor() {
