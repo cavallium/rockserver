@@ -191,7 +191,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private static final int PUT_MULTI_LIST_MAX_ITEMS = 65_536;
 	private static final long PUT_MULTI_LIST_MAX_LOGICAL_BYTES =
 			it.cavallium.rockserver.core.common.RangeBudget.DEFAULT_MAX_BYTES;
-	private static final it.cavallium.rockserver.core.common.api.proto.RequestContext[] NO_DEADLINE_WIRE_CONTEXTS
+	private static final it.cavallium.rockserver.core.common.api.proto.RequestContext[] NO_TIMEOUT_WIRE_CONTEXTS
 			= createNoDeadlineWireContexts();
 	public static final String MAX_INBOUND_MESSAGE_SIZE_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.max-inbound-message-size-bytes";
@@ -1428,7 +1428,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 					"Request deadline already expired");
 		}
 		if (remainingNanos == RequestContext.NO_TIMEOUT) {
-			var cached = NO_DEADLINE_WIRE_CONTEXTS[context.profile().ordinal()];
+			var cached = NO_TIMEOUT_WIRE_CONTEXTS[context.profile().ordinal()];
 			if (cached != null) {
 				return cached;
 			}

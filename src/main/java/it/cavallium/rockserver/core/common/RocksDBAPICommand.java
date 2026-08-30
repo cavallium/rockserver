@@ -1042,7 +1042,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param endKeysExclusive end keys, exclusive. Null means "the end"
 		 * @param reverse if true, seek in reverse direction
 		 * @param requestType the request type determines which type of data will be returned.
-		 * @param timeoutMs timeout in milliseconds
 		 */
 		record ReduceRange<T>(long transactionId,
 							  long columnId,
