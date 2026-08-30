@@ -2582,11 +2582,10 @@ public class GrpcServer extends Server {
 		private boolean requiresCooperativeIteratorContinuation(SubsequentRequest request) {
 			long skipCount = request.getSkipCount();
 			long takeCount = request.getTakeCount();
-			long maximumItems = iteratorQuantumLimits().maximumItems();
 			return mapRequestContext(request.getContext()).profile() != WorkloadProfile.LATENCY
-					&& (skipCount > maximumItems
-							|| takeCount > maximumItems
-							|| skipCount > maximumItems - takeCount);
+					&& (skipCount > 1L
+							|| takeCount > 1L
+							|| (skipCount != 0L && takeCount != 0L));
 		}
 
 		private IteratorQuantumLimits iteratorQuantumLimits() {

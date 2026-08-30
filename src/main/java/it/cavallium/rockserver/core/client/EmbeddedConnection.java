@@ -670,11 +670,10 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	private boolean requiresCooperativeIteratorContinuation(WorkloadProfile profile,
 			long skipCount,
 			long takeCount) {
-		long maximumItems = db.getWorkloadSettings().rangeQuantumMaxItems();
 		return profile != WorkloadProfile.LATENCY
-				&& (skipCount > maximumItems
-						|| takeCount > maximumItems
-						|| skipCount > maximumItems - takeCount);
+				&& (skipCount > 1L
+						|| takeCount > 1L
+						|| (skipCount != 0L && takeCount != 0L));
 	}
 
 	@Override

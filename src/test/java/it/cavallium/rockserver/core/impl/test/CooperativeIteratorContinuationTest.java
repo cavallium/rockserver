@@ -206,7 +206,7 @@ class CooperativeIteratorContinuationTest {
 		final int valueBytes = 8 * 1_024;
 		String database = "iterator-configured-quantum";
 		try (var connection = connection(database, """
-				range-quantum-max-items: 16
+				range-quantum-max-items: 4096
 				range-quantum-max-bytes: 16KiB
 				range-quantum-max-duration: PT0.008S
 				""")) {
@@ -227,7 +227,7 @@ class CooperativeIteratorContinuationTest {
 
 				assertEquals(entries, values.size());
 				assertTrue(rangeQuantums(connection, database) - quantumsBefore >= 10.0,
-						"16KiB of service per competitive quantum permits at most two 8KiB values");
+						"byte service bounds must select cooperative execution even below the item limit");
 			} finally {
 				releaseBlockers.countDown();
 				sync.closeIterator(iteratorId);

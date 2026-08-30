@@ -90,7 +90,7 @@ class GrpcIteratorSchedulingTest {
 				    write: 3
 				    workload: {
 				      competing-batch-read-maximum-active: 3
-				      range-quantum-max-items: 16
+				      range-quantum-max-items: 4096
 				      range-quantum-max-bytes: 16KiB
 				      range-quantum-max-duration: PT0.008S
 				    }
@@ -124,7 +124,7 @@ class GrpcIteratorSchedulingTest {
 
 						assertEquals(entries, values.size());
 						assertTrue(rangeQuantums(embedded, database) - quantumsBefore >= 10.0,
-								"gRPC must preserve the embedded 16KiB service bound across transport delivery");
+								"gRPC must preserve byte service bounds below the configured item limit");
 					} finally {
 						releaseBlockers.countDown();
 						api.closeIterator(iteratorId);
