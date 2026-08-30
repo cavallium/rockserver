@@ -279,6 +279,52 @@ class CooperativeIteratorContinuationTest {
 	}
 
 	@Test
+	void reachedCheckpointSurvivesPressureClearingAtTheQuantumBoundary() throws Exception {
+		final int entries = 20;
+		final int valueBytes = 8 * 1_024;
+		String database = "iterator-checkpoint-race";
+		try (var connection = connection(database, """
+				range-quantum-max-items: 16
+				range-quantum-max-bytes: 16KiB
+				range-quantum-max-duration: PT0.008S
+				""")) {
+			var sync = connection.getSyncApi(RequestContext.batch());
+			var async = connection.getAsyncApi(RequestContext.batch());
+			long columnId = populateFixedColumn(sync, "entries", entries, valueBytes);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			var scheduler = connection.getScheduler();
+			var blockersEntered = new CountDownLatch(READ_WORKERS - 1);
+			var releaseBlockers = new CountDownLatch(1);
+			var firstBoundary = new java.util.concurrent.atomic.AtomicBoolean();
+			var quantumsAtBoundary = new AtomicReference<Double>();
+			try {
+				occupyLatencyWorkers(scheduler, READ_WORKERS - 1, blockersEntered, releaseBlockers);
+				assertTrue(blockersEntered.await(5, SECONDS));
+				connection.getInternalDB().setIteratorAdvanceStepCompletedObserverForTesting(() -> {
+					if (firstBoundary.compareAndSet(false, true)) {
+						quantumsAtBoundary.set(rangeQuantums(connection, database));
+						releaseBlockers.countDown();
+						awaitConditionUninterruptibly(() -> readSnapshot(scheduler)
+								.activeByProfile().get(WorkloadProfile.LATENCY) == 0);
+					}
+				});
+
+				var values = async.subsequentAsync(iteratorId, 0L, entries, RequestType.<Buf>multi())
+						.get(10, SECONDS);
+
+				assertEquals(entries, values.size());
+				assertNotNull(quantumsAtBoundary.get());
+				assertTrue(rangeQuantums(connection, database) - quantumsAtBoundary.get() >= 2.0,
+						"a reached service checkpoint must end its dispatch even if pressure clears before return");
+			} finally {
+				releaseBlockers.countDown();
+				connection.getInternalDB().setIteratorAdvanceStepCompletedObserverForTesting(null);
+				sync.closeIterator(iteratorId);
+			}
+		}
+	}
+
+	@Test
 	void batchCancellationReleasesTheGateAndLeavesIteratorReusable() throws Exception {
 		final int entries = ITERATOR_STEP * 16 + 1;
 		try (var connection = connection("iterator-cancel")) {
@@ -674,6 +720,20 @@ class CooperativeIteratorContinuationTest {
 			try {
 				latch.await();
 				break;
+			} catch (InterruptedException _) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static void awaitConditionUninterruptibly(BooleanSupplier condition) {
+		boolean interrupted = false;
+		while (!condition.getAsBoolean()) {
+			try {
+				Thread.sleep(1L);
 			} catch (InterruptedException _) {
 				interrupted = true;
 			}

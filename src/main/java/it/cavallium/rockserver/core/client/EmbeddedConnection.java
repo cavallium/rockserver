@@ -909,11 +909,11 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
 
-					switch (stage) {
+					boolean checkpointReached = switch (stage) {
 						case SKIP -> runSkipStep(context);
 						case TAKE -> runTakeStep(context);
 						case DONE -> throw new IllegalStateException("Completed iterator stage was dispatched");
-					}
+					};
 
 					if (context.terminationRequested()) {
 						return RWScheduler.CooperativeResult.COMPLETE;
@@ -922,7 +922,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 						prepareCompletion(completedValue());
 						return RWScheduler.CooperativeResult.COMPLETE;
 					}
-					if (context.preemptionRequested()) {
+					if (checkpointReached || context.preemptionRequested()) {
 						return RWScheduler.CooperativeResult.YIELD;
 					}
 				}
@@ -934,7 +934,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			}
 		}
 
-		private void runSkipStep(RWScheduler.CooperativeContext context) {
+		private boolean runSkipStep(RWScheduler.CooperativeContext context) {
 			long step = Math.min(remainingSkip, maximumItems);
 			var quantum = db.advanceIteratorQuantumInternal(
 					iterationId,
@@ -950,11 +950,12 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 						? IteratorContinuationStage.DONE
 						: IteratorContinuationStage.TAKE;
 			}
+			return quantum.checkpointRequested();
 		}
 
-		private void runTakeStep(RWScheduler.CooperativeContext context) {
+		private boolean runTakeStep(RWScheduler.CooperativeContext context) {
 			long step = Math.min(remainingTake, maximumItems);
-			switch (mode) {
+			return switch (mode) {
 				case NONE, EXISTS -> {
 					var quantum = db.advanceIteratorQuantumInternal(
 							iterationId,
@@ -971,6 +972,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					} else if (remainingTake == 0L) {
 						stage = IteratorContinuationStage.DONE;
 					}
+					yield quantum.checkpointRequested();
 				}
 				case MULTI -> {
 					var quantum = db.readIteratorQuantumInternal(
@@ -987,8 +989,9 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					} else if (remainingTake == 0L) {
 						stage = IteratorContinuationStage.DONE;
 					}
+					yield quantum.checkpointRequested();
 				}
-			}
+			};
 		}
 
 		private long estimatedBytes() {
