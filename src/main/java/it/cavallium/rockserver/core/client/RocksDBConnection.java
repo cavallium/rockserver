@@ -16,15 +16,8 @@ public interface RocksDBConnection extends Closeable {
 	 */
 	URI getUrl();
 
-	/**
-	 * Return capabilities implemented by the ultimate backend.
-	 *
-	 * <p>The conservative default keeps third-party wrappers source compatible
-	 * without advertising optional operations that they may not delegate.</p>
-	 */
-	default RockserverCapabilities getCapabilities() {
-		return RockserverCapabilities.COMPATIBLE_BASELINE;
-	}
+	/** Return the exact mandatory workload contract implemented by the ultimate backend. */
+	RockserverCapabilities getCapabilities();
 
 	/** Return a sync view permanently bound to the mandatory request context. */
 	RocksDBSyncAPI getSyncApi(RequestContext context);

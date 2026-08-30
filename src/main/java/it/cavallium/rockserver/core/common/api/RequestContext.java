@@ -11,7 +11,8 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
   private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("RequestContext");
 
   private static final org.apache.thrift.protocol.TField PROFILE_FIELD_DESC = new org.apache.thrift.protocol.TField("profile", org.apache.thrift.protocol.TType.I32, (short)1);
-  private static final org.apache.thrift.protocol.TField DEADLINE_EPOCH_MILLIS_FIELD_DESC = new org.apache.thrift.protocol.TField("deadlineEpochMillis", org.apache.thrift.protocol.TType.I64, (short)2);
+  private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)3);
+  private static final org.apache.thrift.protocol.TField TIMEOUT_NANOS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutNanos", org.apache.thrift.protocol.TType.I64, (short)4);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new RequestContextStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new RequestContextTupleSchemeFactory();
@@ -21,7 +22,8 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
    * @see WorkloadProfile
    */
   public @org.apache.thrift.annotation.Nullable WorkloadProfile profile; // required
-  public long deadlineEpochMillis; // required
+  public int workloadContractVersion; // required
+  public long timeoutNanos; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -30,7 +32,8 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
      * @see WorkloadProfile
      */
     PROFILE((short)1, "profile"),
-    DEADLINE_EPOCH_MILLIS((short)2, "deadlineEpochMillis");
+    WORKLOAD_CONTRACT_VERSION((short)3, "workloadContractVersion"),
+    TIMEOUT_NANOS((short)4, "timeoutNanos");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -48,8 +51,10 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
       switch(fieldId) {
         case 1: // PROFILE
           return PROFILE;
-        case 2: // DEADLINE_EPOCH_MILLIS
-          return DEADLINE_EPOCH_MILLIS;
+        case 3: // WORKLOAD_CONTRACT_VERSION
+          return WORKLOAD_CONTRACT_VERSION;
+        case 4: // TIMEOUT_NANOS
+          return TIMEOUT_NANOS;
         default:
           return null;
       }
@@ -93,14 +98,17 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
   }
 
   // isset id assignments
-  private static final int __DEADLINEEPOCHMILLIS_ISSET_ID = 0;
+  private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 0;
+  private static final int __TIMEOUTNANOS_ISSET_ID = 1;
   private byte __isset_bitfield = 0;
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
     tmpMap.put(_Fields.PROFILE, new org.apache.thrift.meta_data.FieldMetaData("profile", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, WorkloadProfile.class)));
-    tmpMap.put(_Fields.DEADLINE_EPOCH_MILLIS, new org.apache.thrift.meta_data.FieldMetaData("deadlineEpochMillis", org.apache.thrift.TFieldRequirementType.REQUIRED,
+    tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
+    tmpMap.put(_Fields.TIMEOUT_NANOS, new org.apache.thrift.meta_data.FieldMetaData("timeoutNanos", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(RequestContext.class, metaDataMap);
@@ -111,12 +119,15 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
 
   public RequestContext(
     WorkloadProfile profile,
-    long deadlineEpochMillis)
+    int workloadContractVersion,
+    long timeoutNanos)
   {
     this();
     this.profile = profile;
-    this.deadlineEpochMillis = deadlineEpochMillis;
-    setDeadlineEpochMillisIsSet(true);
+    this.workloadContractVersion = workloadContractVersion;
+    setWorkloadContractVersionIsSet(true);
+    this.timeoutNanos = timeoutNanos;
+    setTimeoutNanosIsSet(true);
   }
 
   /**
@@ -127,7 +138,8 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     if (other.isSetProfile()) {
       this.profile = other.profile;
     }
-    this.deadlineEpochMillis = other.deadlineEpochMillis;
+    this.workloadContractVersion = other.workloadContractVersion;
+    this.timeoutNanos = other.timeoutNanos;
   }
 
   @Override
@@ -138,8 +150,10 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
   @Override
   public void clear() {
     this.profile = null;
-    setDeadlineEpochMillisIsSet(false);
-    this.deadlineEpochMillis = 0;
+    setWorkloadContractVersionIsSet(false);
+    this.workloadContractVersion = 0;
+    setTimeoutNanosIsSet(false);
+    this.timeoutNanos = 0;
   }
 
   /**
@@ -175,27 +189,50 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     }
   }
 
-  public long getDeadlineEpochMillis() {
-    return this.deadlineEpochMillis;
+  public int getWorkloadContractVersion() {
+    return this.workloadContractVersion;
   }
 
-  public RequestContext setDeadlineEpochMillis(long deadlineEpochMillis) {
-    this.deadlineEpochMillis = deadlineEpochMillis;
-    setDeadlineEpochMillisIsSet(true);
+  public RequestContext setWorkloadContractVersion(int workloadContractVersion) {
+    this.workloadContractVersion = workloadContractVersion;
+    setWorkloadContractVersionIsSet(true);
     return this;
   }
 
-  public void unsetDeadlineEpochMillis() {
-    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __DEADLINEEPOCHMILLIS_ISSET_ID);
+  public void unsetWorkloadContractVersion() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
   }
 
-  /** Returns true if field deadlineEpochMillis is set (has been assigned a value) and false otherwise */
-  public boolean isSetDeadlineEpochMillis() {
-    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __DEADLINEEPOCHMILLIS_ISSET_ID);
+  /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+  public boolean isSetWorkloadContractVersion() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
   }
 
-  public void setDeadlineEpochMillisIsSet(boolean value) {
-    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __DEADLINEEPOCHMILLIS_ISSET_ID, value);
+  public void setWorkloadContractVersionIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
+  }
+
+  public long getTimeoutNanos() {
+    return this.timeoutNanos;
+  }
+
+  public RequestContext setTimeoutNanos(long timeoutNanos) {
+    this.timeoutNanos = timeoutNanos;
+    setTimeoutNanosIsSet(true);
+    return this;
+  }
+
+  public void unsetTimeoutNanos() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __TIMEOUTNANOS_ISSET_ID);
+  }
+
+  /** Returns true if field timeoutNanos is set (has been assigned a value) and false otherwise */
+  public boolean isSetTimeoutNanos() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __TIMEOUTNANOS_ISSET_ID);
+  }
+
+  public void setTimeoutNanosIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TIMEOUTNANOS_ISSET_ID, value);
   }
 
   @Override
@@ -209,11 +246,19 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
       }
       break;
 
-    case DEADLINE_EPOCH_MILLIS:
+    case WORKLOAD_CONTRACT_VERSION:
       if (value == null) {
-        unsetDeadlineEpochMillis();
+        unsetWorkloadContractVersion();
       } else {
-        setDeadlineEpochMillis((java.lang.Long)value);
+        setWorkloadContractVersion((java.lang.Integer)value);
+      }
+      break;
+
+    case TIMEOUT_NANOS:
+      if (value == null) {
+        unsetTimeoutNanos();
+      } else {
+        setTimeoutNanos((java.lang.Long)value);
       }
       break;
 
@@ -227,8 +272,11 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     case PROFILE:
       return getProfile();
 
-    case DEADLINE_EPOCH_MILLIS:
-      return getDeadlineEpochMillis();
+    case WORKLOAD_CONTRACT_VERSION:
+      return getWorkloadContractVersion();
+
+    case TIMEOUT_NANOS:
+      return getTimeoutNanos();
 
     }
     throw new java.lang.IllegalStateException();
@@ -244,8 +292,10 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     switch (field) {
     case PROFILE:
       return isSetProfile();
-    case DEADLINE_EPOCH_MILLIS:
-      return isSetDeadlineEpochMillis();
+    case WORKLOAD_CONTRACT_VERSION:
+      return isSetWorkloadContractVersion();
+    case TIMEOUT_NANOS:
+      return isSetTimeoutNanos();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -272,12 +322,21 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
         return false;
     }
 
-    boolean this_present_deadlineEpochMillis = true;
-    boolean that_present_deadlineEpochMillis = true;
-    if (this_present_deadlineEpochMillis || that_present_deadlineEpochMillis) {
-      if (!(this_present_deadlineEpochMillis && that_present_deadlineEpochMillis))
+    boolean this_present_workloadContractVersion = true;
+    boolean that_present_workloadContractVersion = true;
+    if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+      if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
         return false;
-      if (this.deadlineEpochMillis != that.deadlineEpochMillis)
+      if (this.workloadContractVersion != that.workloadContractVersion)
+        return false;
+    }
+
+    boolean this_present_timeoutNanos = true;
+    boolean that_present_timeoutNanos = true;
+    if (this_present_timeoutNanos || that_present_timeoutNanos) {
+      if (!(this_present_timeoutNanos && that_present_timeoutNanos))
+        return false;
+      if (this.timeoutNanos != that.timeoutNanos)
         return false;
     }
 
@@ -292,7 +351,9 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     if (isSetProfile())
       hashCode = hashCode * 8191 + profile.getValue();
 
-    hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(deadlineEpochMillis);
+    hashCode = hashCode * 8191 + workloadContractVersion;
+
+    hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(timeoutNanos);
 
     return hashCode;
   }
@@ -315,12 +376,22 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
         return lastComparison;
       }
     }
-    lastComparison = java.lang.Boolean.compare(isSetDeadlineEpochMillis(), other.isSetDeadlineEpochMillis());
+    lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
     if (lastComparison != 0) {
       return lastComparison;
     }
-    if (isSetDeadlineEpochMillis()) {
-      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.deadlineEpochMillis, other.deadlineEpochMillis);
+    if (isSetWorkloadContractVersion()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetTimeoutNanos(), other.isSetTimeoutNanos());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetTimeoutNanos()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.timeoutNanos, other.timeoutNanos);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -357,8 +428,12 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     }
     first = false;
     if (!first) sb.append(", ");
-    sb.append("deadlineEpochMillis:");
-    sb.append(this.deadlineEpochMillis);
+    sb.append("workloadContractVersion:");
+    sb.append(this.workloadContractVersion);
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("timeoutNanos:");
+    sb.append(this.timeoutNanos);
     first = false;
     sb.append(")");
     return sb.toString();
@@ -369,7 +444,8 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     if (profile == null) {
       throw new org.apache.thrift.protocol.TProtocolException("Required field 'profile' was not present! Struct: " + toString());
     }
-    // alas, we cannot check 'deadlineEpochMillis' because it's a primitive and you chose the non-beans generator.
+    // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
+    // alas, we cannot check 'timeoutNanos' because it's a primitive and you chose the non-beans generator.
     // check for sub-struct validity
   }
 
@@ -419,10 +495,18 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
-          case 2: // DEADLINE_EPOCH_MILLIS
+          case 3: // WORKLOAD_CONTRACT_VERSION
+            if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+              struct.workloadContractVersion = iprot.readI32();
+              struct.setWorkloadContractVersionIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 4: // TIMEOUT_NANOS
             if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
-              struct.deadlineEpochMillis = iprot.readI64();
-              struct.setDeadlineEpochMillisIsSet(true);
+              struct.timeoutNanos = iprot.readI64();
+              struct.setTimeoutNanosIsSet(true);
             } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
@@ -435,8 +519,11 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
       iprot.readStructEnd();
 
       // check for required fields of primitive type, which can't be checked in the validate method
-      if (!struct.isSetDeadlineEpochMillis()) {
-        throw new org.apache.thrift.protocol.TProtocolException("Required field 'deadlineEpochMillis' was not found in serialized data! Struct: " + toString());
+      if (!struct.isSetWorkloadContractVersion()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+      }
+      if (!struct.isSetTimeoutNanos()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'timeoutNanos' was not found in serialized data! Struct: " + toString());
       }
       struct.validate();
     }
@@ -451,8 +538,11 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
         oprot.writeI32(struct.profile.getValue());
         oprot.writeFieldEnd();
       }
-      oprot.writeFieldBegin(DEADLINE_EPOCH_MILLIS_FIELD_DESC);
-      oprot.writeI64(struct.deadlineEpochMillis);
+      oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+      oprot.writeI32(struct.workloadContractVersion);
+      oprot.writeFieldEnd();
+      oprot.writeFieldBegin(TIMEOUT_NANOS_FIELD_DESC);
+      oprot.writeI64(struct.timeoutNanos);
       oprot.writeFieldEnd();
       oprot.writeFieldStop();
       oprot.writeStructEnd();
@@ -473,7 +563,8 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     public void write(org.apache.thrift.protocol.TProtocol prot, RequestContext struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       oprot.writeI32(struct.profile.getValue());
-      oprot.writeI64(struct.deadlineEpochMillis);
+      oprot.writeI32(struct.workloadContractVersion);
+      oprot.writeI64(struct.timeoutNanos);
     }
 
     @Override
@@ -481,8 +572,10 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       struct.profile = it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(iprot.readI32());
       struct.setProfileIsSet(true);
-      struct.deadlineEpochMillis = iprot.readI64();
-      struct.setDeadlineEpochMillisIsSet(true);
+      struct.workloadContractVersion = iprot.readI32();
+      struct.setWorkloadContractVersionIsSet(true);
+      struct.timeoutNanos = iprot.readI64();
+      struct.setTimeoutNanosIsSet(true);
     }
   }
 

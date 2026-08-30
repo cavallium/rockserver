@@ -7,7 +7,6 @@ import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.config.WorkloadSettings;
-import java.time.Duration;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -25,13 +24,13 @@ import reactor.core.scheduler.Scheduler;
 /**
  * Workload-aware shared read/write admission for one database.
  *
- * <p>LATENCY requests are ordered by absolute deadline. INGEST, CDC, ANALYTICAL,
+ * <p>LATENCY requests are ordered by an immutable local monotonic deadline. INGEST, CDC, ANALYTICAL,
  * and BATCH use byte-cost deficit round-robin. Read and write pools each reserve
  * one borrowable slot for LATENCY, INGEST, and CDC by default while retaining a
  * hard worker cap. CONTROL and physical maintenance have isolated pools.</p>
  */
 public final class RWScheduler {
-	static final long UNBOUND_MONOTONIC_DEADLINE = Long.MIN_VALUE;
+	private static final long UNBOUND_MONOTONIC_DEADLINE = Long.MIN_VALUE;
 
 	public static final int POOL_TELEMETRY_WORKER_COUNT = 0;
 	public static final int POOL_TELEMETRY_WAITING_WORKERS = 1;
@@ -173,7 +172,7 @@ public final class RWScheduler {
 			for (var family : OperationFamily.values()) {
 				if (WorkloadAdmission.isAllowed(profile, family)) {
 					result[profile.ordinal()][family.ordinal()] = pool(profile, family)
-							.view(profile, family, RequestContext.NO_DEADLINE);
+							.view(profile, family, Long.MAX_VALUE);
 				}
 			}
 		}
@@ -265,7 +264,6 @@ public final class RWScheduler {
 			int foregroundQueueCapacity,
 			int batchQueueCapacity,
 			String name,
-			LongSupplier epochMillisSource,
 			LongSupplier nanoTimeSource) {
 		return new RWScheduler(WorkloadSettings.testingDefaults(readCap,
 				writeCap,
@@ -276,7 +274,7 @@ public final class RWScheduler {
 				null,
 				name,
 				false,
-				SchedulerDeadlineClock.testing(epochMillisSource, nanoTimeSource));
+				SchedulerDeadlineClock.testing(nanoTimeSource));
 	}
 
 	/** Resolve and validate the caller context, then return its resource-specific view. */
@@ -284,16 +282,14 @@ public final class RWScheduler {
 		var profile = WorkloadAdmission.resolve(context, family);
 		return schedulerResolved(profile,
 				family,
-				context.deadlineEpochMillis(),
-				localMonotonicDeadline(context));
+				resolveMonotonicDeadline(context));
 	}
 
 	public WorkloadExecutor executor(RequestContext context, OperationFamily family) {
 		var profile = WorkloadAdmission.resolve(context, family);
 		return executorResolved(profile,
 				family,
-				context.deadlineEpochMillis(),
-				localMonotonicDeadline(context));
+				resolveMonotonicDeadline(context));
 	}
 
 	/** Internal adapter for a pre-resolved command while retaining a server-bound deadline. */
@@ -304,8 +300,7 @@ public final class RWScheduler {
 		WorkloadAdmission.validate(profile, family);
 		return schedulerResolved(profile,
 				family,
-				context.deadlineEpochMillis(),
-				localMonotonicDeadline(context));
+				resolveMonotonicDeadline(context));
 	}
 
 	/** Internal adapter for a pre-resolved command while retaining a server-bound deadline. */
@@ -316,111 +311,62 @@ public final class RWScheduler {
 		WorkloadAdmission.validate(profile, family);
 		return executorResolved(profile,
 				family,
-				context.deadlineEpochMillis(),
-				localMonotonicDeadline(context));
+				resolveMonotonicDeadline(context));
 	}
 
-	/** Server adapter entry retaining an explicitly sidecar-bound monotonic deadline. */
+	/** Internal/server adapter retaining an explicitly bound monotonic deadline. */
 	public Scheduler scheduler(WorkloadProfile profile,
 			OperationFamily family,
-			long deadlineEpochMillis,
 			long localMonotonicDeadlineNanos) {
 		WorkloadAdmission.validate(profile, family);
-		return schedulerResolved(profile,
-				family,
-				deadlineEpochMillis,
-				localMonotonicDeadlineNanos);
+		return schedulerResolved(profile, family, localMonotonicDeadlineNanos);
 	}
 
-	/** Server adapter entry retaining an explicitly sidecar-bound monotonic deadline. */
+	/** Internal/server adapter retaining an explicitly bound monotonic deadline. */
 	public WorkloadExecutor executor(WorkloadProfile profile,
 			OperationFamily family,
-			long deadlineEpochMillis,
 			long localMonotonicDeadlineNanos) {
 		WorkloadAdmission.validate(profile, family);
-		return executorResolved(profile,
-				family,
-				deadlineEpochMillis,
-				localMonotonicDeadlineNanos);
-	}
-
-	/** Server-only scheduling entry for protected CDC/control/physical work. */
-	public Scheduler scheduler(WorkloadProfile profile,
-			OperationFamily family,
-			long deadlineEpochMillis) {
-		WorkloadAdmission.validate(profile, family);
-		return schedulerResolved(profile, family, deadlineEpochMillis);
+		return executorResolved(profile, family, localMonotonicDeadlineNanos);
 	}
 
 	private Scheduler schedulerResolved(WorkloadProfile profile,
 			OperationFamily family,
-			long deadlineEpochMillis) {
-		return schedulerResolved(profile,
-				family,
-				deadlineEpochMillis,
-				UNBOUND_MONOTONIC_DEADLINE);
-	}
-
-	private Scheduler schedulerResolved(WorkloadProfile profile,
-			OperationFamily family,
-			long deadlineEpochMillis,
 			long localMonotonicDeadlineNanos) {
 		return new IndexedWorkloadScheduler(pool(profile, family),
 				profile,
 				family,
-				deadlineEpochMillis,
 				localMonotonicDeadlineNanos);
 	}
 
-	/** Server-only executor entry for protected CDC/control/physical work. */
-	public WorkloadExecutor executor(WorkloadProfile profile,
-			OperationFamily family,
-			long deadlineEpochMillis) {
-		WorkloadAdmission.validate(profile, family);
-		return executorResolved(profile, family, deadlineEpochMillis);
-	}
-
 	private WorkloadExecutor executorResolved(WorkloadProfile profile,
 			OperationFamily family,
-			long deadlineEpochMillis) {
-		return executorResolved(profile,
-				family,
-				deadlineEpochMillis,
-				UNBOUND_MONOTONIC_DEADLINE);
-	}
-
-	private WorkloadExecutor executorResolved(WorkloadProfile profile,
-			OperationFamily family,
-			long deadlineEpochMillis,
 			long localMonotonicDeadlineNanos) {
-		if (deadlineEpochMillis == RequestContext.NO_DEADLINE) {
+		if (localMonotonicDeadlineNanos == Long.MAX_VALUE) {
 			return Objects.requireNonNull(noDeadlineExecutors[profile.ordinal()][family.ordinal()]);
 		}
 		return pool(profile, family).view(profile,
 				family,
-				deadlineEpochMillis,
 				localMonotonicDeadlineNanos);
 	}
 
-	/** Bind an external absolute epoch deadline to this scheduler's monotonic time domain. */
-	public long bindDeadlineEpochMillis(long deadlineEpochMillis) {
-		return deadlineClock.monotonicDeadlineNanos(deadlineEpochMillis);
-	}
-
-	/** Bind an already-monotonic transport budget to this scheduler's time domain. */
-	public long bindDeadlineAfterNanos(long remainingNanos) {
-		return deadlineClock.monotonicDeadlineAfterNanos(remainingNanos);
-	}
-
-	/** Resolve a caller epoch against an active server sidecar, or bind it exactly once here. */
-	public long resolveMonotonicDeadline(RequestContext context) {
-		Objects.requireNonNull(context, "context");
-		if (context.deadlineEpochMillis() == RequestContext.NO_DEADLINE) {
+	/** Bind a positive relative budget to this scheduler's monotonic time domain. */
+	public long bindTimeoutNanos(long timeoutNanos) {
+		if (timeoutNanos == RequestContext.NO_TIMEOUT) {
 			return Long.MAX_VALUE;
 		}
+		if (timeoutNanos <= 0L) {
+			return deadlineClock.monotonicNanos();
+		}
+		return deadlineClock.monotonicDeadlineAfterNanos(timeoutNanos);
+	}
+
+	/** Resolve a server sidecar, or bind a direct embedded request exactly once here. */
+	public long resolveMonotonicDeadline(RequestContext context) {
+		Objects.requireNonNull(context, "context");
 		long bound = localMonotonicDeadline(context);
 		return bound == UNBOUND_MONOTONIC_DEADLINE
-				? deadlineClock.monotonicDeadlineNanos(context.deadlineEpochMillis())
+				? bindTimeoutNanos(context.timeoutNanos())
 				: bound;
 	}
 
@@ -505,69 +451,6 @@ public final class RWScheduler {
 			case METADATA, POINT_LOOKUP, BOUNDARY_SEEK, BOUNDED_FAN_OUT,
 					RANGE_PAGE, FULL_SCAN_AGGREGATE, WAL_PAGE -> Pool.READ;
 		};
-	}
-
-	/** Legacy internal aliases. Generic public requests must use a contextual view. */
-	public Scheduler read() {
-		return scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
-	}
-
-	public Scheduler interactiveRead() {
-		return scheduler(WorkloadProfile.LATENCY,
-				OperationFamily.POINT_LOOKUP,
-				System.currentTimeMillis() + Duration.ofMinutes(1).toMillis());
-	}
-
-	public Scheduler write() {
-		return scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
-	}
-
-	public Scheduler maintenance() {
-		return maintenance(OperationFamily.COMPACTION);
-	}
-
-	/** Physical-maintenance scheduling with the concrete operation retained for telemetry. */
-	public Scheduler maintenance(OperationFamily family) {
-		return scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, family, RequestContext.NO_DEADLINE);
-	}
-
-	public Scheduler control() {
-		return scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, RequestContext.NO_DEADLINE);
-	}
-
-	public Scheduler cdc() {
-		return scheduler(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, RequestContext.NO_DEADLINE);
-	}
-
-	public WorkloadExecutor readExecutor() {
-		return executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
-	}
-
-	public WorkloadExecutor interactiveReadExecutor() {
-		return executor(WorkloadProfile.LATENCY,
-				OperationFamily.POINT_LOOKUP,
-				System.currentTimeMillis() + Duration.ofMinutes(1).toMillis());
-	}
-
-	public WorkloadExecutor writeExecutor() {
-		return executor(WorkloadProfile.INGEST, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
-	}
-
-	public WorkloadExecutor maintenanceExecutor() {
-		return maintenanceExecutor(OperationFamily.COMPACTION);
-	}
-
-	/** Physical-maintenance execution with the concrete operation retained for telemetry. */
-	public WorkloadExecutor maintenanceExecutor(OperationFamily family) {
-		return executor(WorkloadProfile.PHYSICAL_MAINTENANCE, family, RequestContext.NO_DEADLINE);
-	}
-
-	public WorkloadExecutor controlExecutor() {
-		return executor(WorkloadProfile.CONTROL, OperationFamily.CONTROL, RequestContext.NO_DEADLINE);
-	}
-
-	public WorkloadExecutor cdcExecutor() {
-		return executor(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, RequestContext.NO_DEADLINE);
 	}
 
 	public int queuedTasks(WorkloadProfile profile) {
@@ -879,22 +762,8 @@ public final class RWScheduler {
 
 		void resume();
 
-		/**
-		 * Atomically request scheduler cancellation.
-		 *
-		 * <p>The scheduler-provided handle overrides this default with exact terminal-cause
-		 * arbitration. The default preserves compatibility for pre-existing external and
-		 * test handle implementations that only implemented {@link #dispose()}.</p>
-		 *
-		 * @return {@code true} when this handle was not already disposed
-		 */
-		default boolean cancel() {
-			if (isDisposed()) {
-				return false;
-			}
-			dispose();
-			return true;
-		}
+		/** Atomically request scheduler cancellation. */
+		boolean cancel();
 	}
 
 	public enum CooperativeResult {

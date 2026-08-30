@@ -45,12 +45,12 @@ enum WorkloadProfile {
 
 struct RequestContext {
   1: required WorkloadProfile profile,
-  2: required i64 deadlineEpochMillis
+  3: required i32 workloadContractVersion,
+  4: required i64 timeoutNanos
 }
 
 struct Capabilities {
-  1: required i32 workloadContractVersion,
-  2: required bool boundedRange
+  1: required i32 workloadContractVersion
 }
 
 enum PutBatchMode {

@@ -149,17 +149,17 @@ public final class GrpcConnection extends BaseConnection {
 	}
 
 	@Override
-	<R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+	<R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestSync(context, request);
 	}
 
 	@Override
-	<R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+	<R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestAsync(context, request);
 	}
 
 	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
 			@NotNull String id,
 			@Nullable Long fromSeq,
 			long maxEvents) {
@@ -227,7 +227,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	final EventLoopGroup eventLoopGroup;
 	private final RocksDBServiceFutureStub futureStub;
 	private final ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStub;
-	private final AtomicBoolean legacyCdcPollBatchWarningLogged = new AtomicBoolean();
 	private final URI address;
 	private final int maxInboundMessageSize;
 	private final RockserverCapabilities capabilities;
@@ -240,7 +239,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				WorkloadProfile.BATCH)) {
 			contexts[profile.ordinal()] = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfileValue(profile.wireValue())
-					.setDeadlineEpochMillis(RequestContext.NO_DEADLINE)
+					.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
+					.setTimeoutNanos(RequestContext.NO_TIMEOUT)
 					.build();
 		}
 		return contexts;
@@ -302,9 +302,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 					.withDeadlineAfter(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
 					.getCapabilities(CapabilitiesRequest.getDefaultInstance())
 					.get(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-			capabilities = new RockserverCapabilities(response.getWorkloadContractVersion(),
-					response.getBoundedRange(),
-					response.getResumableRawScan());
+			capabilities = new RockserverCapabilities(response.getWorkloadContractVersion());
 			capabilities.requireCompatible();
 		} catch (InterruptedException interrupted) {
 			Thread.currentThread().interrupt();
@@ -461,7 +459,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@SuppressWarnings("unchecked")
 	@Override
-	public <R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+	public <R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> req) {
 		return withRequestContext(context, () -> (RS) switch (req) {
 			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> {
 				try {
@@ -484,7 +482,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	@Override
-	public <R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+	public <R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> req) {
 		return withRequestContext(context, () -> req.handleAsync(this));
 	}
 
@@ -873,19 +871,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			int shardIndex,
 			int shardCount,
 			Set<RawSstToken> completedSsts) {
-		if (!capabilities.resumableRawScan()) {
-			return Flux.error(RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
-					"The connected Rockserver does not support resumable raw SST scans"));
-		}
 		var request = ScanRawRequest.newBuilder()
 				.setColumnId(columnId)
 				.setShardIndex(shardIndex)
 				.setShardCount(shardCount)
 				.setContext(currentWireRequestContext())
-				.setResumable(true)
-				// This flag is the rolling-upgrade negotiation. Older servers ignore it
-				// and continue returning completion-only events.
-				.setCoalesceCompletedSstToken(true);
+				.setResumable(true);
 		for (RawSstToken completedSst : completedSsts) {
 			request.addCompletedSstTokens(completedSst.value());
 		}
@@ -1151,46 +1142,50 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	private RocksDBServiceFutureStub futureStubWithRequestDeadline() {
-		long remainingMillis = remainingRequestDeadlineMillis();
-		return remainingMillis == RequestContext.NO_DEADLINE
+		long remainingNanos = remainingRequestDeadlineNanos();
+		return remainingNanos == RequestContext.NO_TIMEOUT
 				? futureStub
-				: futureStub.withDeadlineAfter(remainingMillis, TimeUnit.MILLISECONDS);
+				: futureStub.withDeadlineAfter(remainingNanos, TimeUnit.NANOSECONDS);
 	}
 
 	private ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStubWithRequestDeadline() {
-		long remainingMillis = remainingRequestDeadlineMillis();
-		return remainingMillis == RequestContext.NO_DEADLINE
+		long remainingNanos = remainingRequestDeadlineNanos();
+		return remainingNanos == RequestContext.NO_TIMEOUT
 				? reactiveStub
-				: reactiveStub.withDeadlineAfter(remainingMillis, TimeUnit.MILLISECONDS);
+				: reactiveStub.withDeadlineAfter(remainingNanos, TimeUnit.NANOSECONDS);
 	}
 
-	private long remainingRequestDeadlineMillis() {
-		long deadlineEpochMillis = currentRequestContext().deadlineEpochMillis();
-		if (deadlineEpochMillis == RequestContext.NO_DEADLINE) {
-			return RequestContext.NO_DEADLINE;
-		}
-		long remainingMillis = deadlineEpochMillis - System.currentTimeMillis();
-		if (remainingMillis <= 0L) {
+	private long remainingRequestDeadlineNanos() {
+		long remainingNanos = currentBoundRequestContext().remainingNanos();
+		if (remainingNanos == 0L) {
 			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline already expired");
 		}
-		return remainingMillis;
+		return remainingNanos;
 	}
 
 	private RocksDBServiceFutureStub futureStubWithReadDeadline(long timeoutMs) {
 		validateReadTimeout(timeoutMs);
-		long effectiveTimeoutMs = Math.min(timeoutMs, remainingRequestDeadlineMillis());
-		return effectiveTimeoutMs == Long.MAX_VALUE
+		long requestTimeoutNanos = remainingRequestDeadlineNanos();
+		long operationTimeoutNanos = timeoutMs >= Long.MAX_VALUE / 1_000_000L
+				? Long.MAX_VALUE
+				: TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+		long effectiveTimeoutNanos = Math.min(operationTimeoutNanos, requestTimeoutNanos);
+		return effectiveTimeoutNanos == Long.MAX_VALUE
 				? futureStub
-				: futureStub.withDeadlineAfter(effectiveTimeoutMs, TimeUnit.MILLISECONDS);
+				: futureStub.withDeadlineAfter(effectiveTimeoutNanos, TimeUnit.NANOSECONDS);
 	}
 
 	private ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStubWithReadDeadline(long timeoutMs) {
 		validateReadTimeout(timeoutMs);
-		long effectiveTimeoutMs = Math.min(timeoutMs, remainingRequestDeadlineMillis());
-		return effectiveTimeoutMs == Long.MAX_VALUE
+		long requestTimeoutNanos = remainingRequestDeadlineNanos();
+		long operationTimeoutNanos = timeoutMs >= Long.MAX_VALUE / 1_000_000L
+				? Long.MAX_VALUE
+				: TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+		long effectiveTimeoutNanos = Math.min(operationTimeoutNanos, requestTimeoutNanos);
+		return effectiveTimeoutNanos == Long.MAX_VALUE
 				? reactiveStub
-				: reactiveStub.withDeadlineAfter(effectiveTimeoutMs, TimeUnit.MILLISECONDS);
+				: reactiveStub.withDeadlineAfter(effectiveTimeoutNanos, TimeUnit.NANOSECONDS);
 	}
 
 	private static void validateReadTimeout(long timeoutMs) {
@@ -1280,18 +1275,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			case RequestType.RequestGetAllInRange<?> _ -> toReadResponse(deadlineStub.getAllInRange(request)
 					.map(kv -> mapKV(kv)));
 			case RequestType.RequestGetAllInRangeNoCache<?> _ -> toReadResponse(deadlineStub.getAllInRangeNoCache(request)
-					.map(GrpcConnectionDelegate::mapKV))
-					.onErrorMap(GrpcConnectionDelegate::mapNoCacheRangeCompatibilityError);
+					.map(GrpcConnectionDelegate::mapKV));
 		};
-	}
-
-	private static Throwable mapNoCacheRangeCompatibilityError(Throwable error) {
-		if (Status.fromThrowable(error).getCode() == Code.UNIMPLEMENTED) {
-			return RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
-					"The connected Rockserver does not support RequestType.allInRangeNoCache(); "
-							+ "upgrade the peer to version 1.2.8 or newer");
-		}
-		return error;
 	}
 
     // ============ CDC Async API ============
@@ -1363,7 +1348,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
     }
 
 	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
 			@NotNull String id,
 			@Nullable Long fromSeq,
 			long maxEvents) {
@@ -1377,28 +1362,10 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.setMaxEvents(maxEvents)
 				.setMaxResponseBytes(maxInboundMessageSize);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
-        return toResponse(reactiveStub.cdcPollBatch(builder.build()))
-                .map(response -> new CdcBatch(
-                        response.getEventsList().stream().map(GrpcConnectionDelegate::mapCDCEvent).toList(),
-                        response.getNextSeq()))
-                .onErrorResume(
-                        error -> Status.fromThrowable(error).getCode() == Code.UNIMPLEMENTED,
-                        error -> {
-                            if (legacyCdcPollBatchWarningLogged.compareAndSet(false, true)) {
-                                LOG.warn("The connected Rockserver does not support exact CDC batch cursors; "
-                                        + "falling back to legacy event-stream cursor reconstruction. "
-                                        + "Upgrade the server to 1.2.1 or newer for filtered-empty progress.");
-                            }
-                            return legacyCdcPollBatchAsync(id, fromSeq, maxEvents);
-                        });
-    }
-
-    private Mono<CdcBatch> legacyCdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
-        return Mono.defer(() -> Flux.from(cdcPollAsync(id, fromSeq, maxEvents))
-                .collectList()
-                .map(events -> new CdcBatch(
-                        events,
-                        events.isEmpty() ? (fromSeq != null ? fromSeq : 0L) : events.getLast().seq() + 1)));
+		return toResponse(reactiveStub.cdcPollBatch(builder.build()))
+				.map(response -> new CdcBatch(
+						response.getEventsList().stream().map(GrpcConnectionDelegate::mapCDCEvent).toList(),
+						response.getNextSeq()));
     }
 
     private static CDCEvent mapCDCEvent(it.cavallium.rockserver.core.common.api.proto.CDCEvent ev) {
@@ -1474,8 +1441,14 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	private it.cavallium.rockserver.core.common.api.proto.RequestContext currentWireRequestContext() {
-		var context = currentRequestContext();
-		if (context.deadlineEpochMillis() == RequestContext.NO_DEADLINE) {
+		var boundContext = currentBoundRequestContext();
+		var context = boundContext.value();
+		long remainingNanos = boundContext.remainingNanos();
+		if (remainingNanos == 0L) {
+			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					"Request deadline already expired");
+		}
+		if (remainingNanos == RequestContext.NO_TIMEOUT) {
 			var cached = NO_DEADLINE_WIRE_CONTEXTS[context.profile().ordinal()];
 			if (cached != null) {
 				return cached;
@@ -1483,7 +1456,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		}
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfileValue(context.profile().wireValue())
-				.setDeadlineEpochMillis(context.deadlineEpochMillis())
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
+				.setTimeoutNanos(remainingNanos)
 				.build();
 	}
 
@@ -1537,7 +1511,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			builder.setMergeOperatorVersion(schema.mergeOperatorVersion());
 		}
 		if (schema.mergeOperatorClass() != null) {
-			invokeMergeOperatorClass(builder, schema.mergeOperatorClass());
+			builder.setMergeOperatorClass(schema.mergeOperatorClass());
 		}
 		return builder.build();
 	}
@@ -1548,36 +1522,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				schema.getHasValue(),
 				schema.hasMergeOperatorName() ? schema.getMergeOperatorName() : null,
 				schema.hasMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null,
-				getMergeOperatorClass(schema)
+				schema.hasMergeOperatorClass() ? schema.getMergeOperatorClass() : null
 		);
-	}
-
-	@Nullable
-	private static String getMergeOperatorClass(Object schema) {
-		try {
-			var hasMethod = schema.getClass().getMethod("hasMergeOperatorClass");
-			Boolean has = (Boolean) hasMethod.invoke(schema);
-			if (Boolean.TRUE.equals(has)) {
-				var getter = schema.getClass().getMethod("getMergeOperatorClass");
-				return (String) getter.invoke(schema);
-			}
-		} catch (NoSuchMethodException e) {
-			return null;
-		} catch (ReflectiveOperationException e) {
-			throw new RuntimeException(e);
-		}
-		return null;
-	}
-
-	private static void invokeMergeOperatorClass(Object builder, String mergeOperatorClass) {
-		try {
-			var setter = builder.getClass().getMethod("setMergeOperatorClass", String.class);
-			setter.invoke(builder, mergeOperatorClass);
-		} catch (NoSuchMethodException ignored) {
-			// Older generated protos do not expose mergeOperatorClass; ignore to stay backward compatible
-		} catch (ReflectiveOperationException e) {
-			throw new RuntimeException(e);
-		}
 	}
 	private static IntList unmapKeysLength(int count, Int2IntFunction keyGetterAt) {
 		var l = new IntArrayList(count);

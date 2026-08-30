@@ -11,18 +11,15 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("Capabilities");
 
   private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)1);
-  private static final org.apache.thrift.protocol.TField BOUNDED_RANGE_FIELD_DESC = new org.apache.thrift.protocol.TField("boundedRange", org.apache.thrift.protocol.TType.BOOL, (short)2);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new CapabilitiesStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new CapabilitiesTupleSchemeFactory();
 
   public int workloadContractVersion; // required
-  public boolean boundedRange; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-    WORKLOAD_CONTRACT_VERSION((short)1, "workloadContractVersion"),
-    BOUNDED_RANGE((short)2, "boundedRange");
+    WORKLOAD_CONTRACT_VERSION((short)1, "workloadContractVersion");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -40,8 +37,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       switch(fieldId) {
         case 1: // WORKLOAD_CONTRACT_VERSION
           return WORKLOAD_CONTRACT_VERSION;
-        case 2: // BOUNDED_RANGE
-          return BOUNDED_RANGE;
         default:
           return null;
       }
@@ -86,15 +81,12 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
 
   // isset id assignments
   private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 0;
-  private static final int __BOUNDEDRANGE_ISSET_ID = 1;
   private byte __isset_bitfield = 0;
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
     tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
-    tmpMap.put(_Fields.BOUNDED_RANGE, new org.apache.thrift.meta_data.FieldMetaData("boundedRange", org.apache.thrift.TFieldRequirementType.REQUIRED,
-        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(Capabilities.class, metaDataMap);
   }
@@ -103,14 +95,11 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   }
 
   public Capabilities(
-    int workloadContractVersion,
-    boolean boundedRange)
+    int workloadContractVersion)
   {
     this();
     this.workloadContractVersion = workloadContractVersion;
     setWorkloadContractVersionIsSet(true);
-    this.boundedRange = boundedRange;
-    setBoundedRangeIsSet(true);
   }
 
   /**
@@ -119,7 +108,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   public Capabilities(Capabilities other) {
     __isset_bitfield = other.__isset_bitfield;
     this.workloadContractVersion = other.workloadContractVersion;
-    this.boundedRange = other.boundedRange;
   }
 
   @Override
@@ -131,8 +119,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   public void clear() {
     setWorkloadContractVersionIsSet(false);
     this.workloadContractVersion = 0;
-    setBoundedRangeIsSet(false);
-    this.boundedRange = false;
   }
 
   public int getWorkloadContractVersion() {
@@ -158,29 +144,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
   }
 
-  public boolean isBoundedRange() {
-    return this.boundedRange;
-  }
-
-  public Capabilities setBoundedRange(boolean boundedRange) {
-    this.boundedRange = boundedRange;
-    setBoundedRangeIsSet(true);
-    return this;
-  }
-
-  public void unsetBoundedRange() {
-    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __BOUNDEDRANGE_ISSET_ID);
-  }
-
-  /** Returns true if field boundedRange is set (has been assigned a value) and false otherwise */
-  public boolean isSetBoundedRange() {
-    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __BOUNDEDRANGE_ISSET_ID);
-  }
-
-  public void setBoundedRangeIsSet(boolean value) {
-    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __BOUNDEDRANGE_ISSET_ID, value);
-  }
-
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
@@ -189,14 +152,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
         unsetWorkloadContractVersion();
       } else {
         setWorkloadContractVersion((java.lang.Integer)value);
-      }
-      break;
-
-    case BOUNDED_RANGE:
-      if (value == null) {
-        unsetBoundedRange();
-      } else {
-        setBoundedRange((java.lang.Boolean)value);
       }
       break;
 
@@ -209,9 +164,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     switch (field) {
     case WORKLOAD_CONTRACT_VERSION:
       return getWorkloadContractVersion();
-
-    case BOUNDED_RANGE:
-      return isBoundedRange();
 
     }
     throw new java.lang.IllegalStateException();
@@ -227,8 +179,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     switch (field) {
     case WORKLOAD_CONTRACT_VERSION:
       return isSetWorkloadContractVersion();
-    case BOUNDED_RANGE:
-      return isSetBoundedRange();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -255,15 +205,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
         return false;
     }
 
-    boolean this_present_boundedRange = true;
-    boolean that_present_boundedRange = true;
-    if (this_present_boundedRange || that_present_boundedRange) {
-      if (!(this_present_boundedRange && that_present_boundedRange))
-        return false;
-      if (this.boundedRange != that.boundedRange)
-        return false;
-    }
-
     return true;
   }
 
@@ -272,8 +213,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     int hashCode = 1;
 
     hashCode = hashCode * 8191 + workloadContractVersion;
-
-    hashCode = hashCode * 8191 + ((boundedRange) ? 131071 : 524287);
 
     return hashCode;
   }
@@ -292,16 +231,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     }
     if (isSetWorkloadContractVersion()) {
       lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
-      if (lastComparison != 0) {
-        return lastComparison;
-      }
-    }
-    lastComparison = java.lang.Boolean.compare(isSetBoundedRange(), other.isSetBoundedRange());
-    if (lastComparison != 0) {
-      return lastComparison;
-    }
-    if (isSetBoundedRange()) {
-      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.boundedRange, other.boundedRange);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -333,10 +262,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     sb.append("workloadContractVersion:");
     sb.append(this.workloadContractVersion);
     first = false;
-    if (!first) sb.append(", ");
-    sb.append("boundedRange:");
-    sb.append(this.boundedRange);
-    first = false;
     sb.append(")");
     return sb.toString();
   }
@@ -344,7 +269,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   public void validate() throws org.apache.thrift.TException {
     // check for required fields
     // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
-    // alas, we cannot check 'boundedRange' because it's a primitive and you chose the non-beans generator.
     // check for sub-struct validity
   }
 
@@ -394,14 +318,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
-          case 2: // BOUNDED_RANGE
-            if (schemeField.type == org.apache.thrift.protocol.TType.BOOL) {
-              struct.boundedRange = iprot.readBool();
-              struct.setBoundedRangeIsSet(true);
-            } else {
-              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
-            }
-            break;
           default:
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
         }
@@ -413,9 +329,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       if (!struct.isSetWorkloadContractVersion()) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
       }
-      if (!struct.isSetBoundedRange()) {
-        throw new org.apache.thrift.protocol.TProtocolException("Required field 'boundedRange' was not found in serialized data! Struct: " + toString());
-      }
       struct.validate();
     }
 
@@ -426,9 +339,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       oprot.writeStructBegin(STRUCT_DESC);
       oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
       oprot.writeI32(struct.workloadContractVersion);
-      oprot.writeFieldEnd();
-      oprot.writeFieldBegin(BOUNDED_RANGE_FIELD_DESC);
-      oprot.writeBool(struct.boundedRange);
       oprot.writeFieldEnd();
       oprot.writeFieldStop();
       oprot.writeStructEnd();
@@ -449,7 +359,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     public void write(org.apache.thrift.protocol.TProtocol prot, Capabilities struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       oprot.writeI32(struct.workloadContractVersion);
-      oprot.writeBool(struct.boundedRange);
     }
 
     @Override
@@ -457,8 +366,6 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       struct.workloadContractVersion = iprot.readI32();
       struct.setWorkloadContractVersionIsSet(true);
-      struct.boundedRange = iprot.readBool();
-      struct.setBoundedRangeIsSet(true);
     }
   }
 

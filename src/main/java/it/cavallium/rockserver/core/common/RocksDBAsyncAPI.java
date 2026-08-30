@@ -562,19 +562,7 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
         });
     }
 
-    default Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
-        return Flux.from(cdcPollAsync(id, fromSeq, maxEvents))
-                .collectList()
-                .map(events -> {
-                    long nextSeq;
-                    if (events.isEmpty()) {
-                        nextSeq = fromSeq != null ? fromSeq : 0;
-                    } else {
-                        nextSeq = events.get(events.size() - 1).seq() + 1;
-                    }
-                    return new CdcBatch(events, nextSeq);
-                });
-    }
+	Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents);
 
     /**
      * Default retry policy used by {@link #cdcStream} to make polling/commit resilient to transient failures.

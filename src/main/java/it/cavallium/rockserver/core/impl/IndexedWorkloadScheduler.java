@@ -25,21 +25,18 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 	private final ProfiledWorkloadExecutor executor;
 	private final it.cavallium.rockserver.core.common.WorkloadProfile profile;
 	private final it.cavallium.rockserver.core.common.OperationFamily family;
-	private final long deadlineEpochMillis;
-	private final long localMonotonicDeadlineNanos;
+	private final long monotonicDeadlineNanos;
 	private final Set<IndexedWorker> workers = new HashSet<>();
 	private volatile boolean disposed;
 
 	IndexedWorkloadScheduler(ProfiledWorkloadExecutor executor,
 			it.cavallium.rockserver.core.common.WorkloadProfile profile,
 			it.cavallium.rockserver.core.common.OperationFamily family,
-			long deadlineEpochMillis,
-			long localMonotonicDeadlineNanos) {
+			long monotonicDeadlineNanos) {
 		this.executor = Objects.requireNonNull(executor, "executor");
 		this.profile = Objects.requireNonNull(profile, "profile");
 		this.family = Objects.requireNonNull(family, "family");
-		this.deadlineEpochMillis = deadlineEpochMillis;
-		this.localMonotonicDeadlineNanos = localMonotonicDeadlineNanos;
+		this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 	}
 
 	RWScheduler.WorkloadExecutor workloadExecutor() {
@@ -55,8 +52,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 				: 0L;
 		return executor.executeWhenCapacity(profile,
 				family,
-				deadlineEpochMillis,
-				localMonotonicDeadlineNanos,
+				monotonicDeadlineNanos,
 				estimatedBytes,
 				command);
 	}
@@ -73,8 +69,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 	public void execute(Runnable command, long estimatedBytes) {
 		executor.execute(profile,
 				family,
-				deadlineEpochMillis,
-				localMonotonicDeadlineNanos,
+				monotonicDeadlineNanos,
 				estimatedBytes,
 				command);
 	}
@@ -84,8 +79,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 			long estimatedBytes) {
 		return executor.executeCooperatively(profile,
 				family,
-				deadlineEpochMillis,
-				localMonotonicDeadlineNanos,
+				monotonicDeadlineNanos,
 				estimatedBytes,
 				command);
 	}

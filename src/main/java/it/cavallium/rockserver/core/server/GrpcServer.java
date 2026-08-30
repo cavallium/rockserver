@@ -39,6 +39,7 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.OperationFamily;
@@ -112,7 +113,6 @@ import reactor.util.context.ContextView;
 public class GrpcServer extends Server {
 
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcServer.class.getName());
-	private static final int LEGACY_GRPC_MAX_INBOUND_MESSAGE_SIZE = 4 * 1024 * 1024;
 	private static final String GRPC_LATE_ERROR_HANDLER_CONTEXT_KEY
 			= GrpcServer.class.getName() + ".lateErrorHandler";
 	private static final Object ITERATOR_OPERATION_LEASE_CONTEXT_KEY = new Object();
@@ -135,9 +135,6 @@ public class GrpcServer extends Server {
 			return value.profile();
 		}
 
-		private long deadlineEpochMillis() {
-			return value.deadlineEpochMillis();
-		}
 	}
 
 	private final GrpcServerImpl grpc;
@@ -545,7 +542,6 @@ public class GrpcServer extends Server {
 					estimatedBytes = command.estimatedBytes();
 					scheduled = scheduler.scheduler(profile,
 							command.operationFamily(),
-							requestContext.deadlineEpochMillis(),
 							requestContext.localMonotonicDeadlineNanos())
 							.schedule(this);
 				} catch (Throwable schedulingError) {
@@ -950,6 +946,12 @@ public class GrpcServer extends Server {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Request context and workload profile are required");
 			}
+			if (wireContext.getWorkloadContractVersion()
+					!= RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Request context requires workload contract version "
+								+ RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			}
 			final WorkloadProfile profile;
 			try {
 				profile = WorkloadProfile.fromWireValue(wireContext.getProfileValue());
@@ -957,20 +959,20 @@ public class GrpcServer extends Server {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						unknown.getMessage(), unknown);
 			}
-			long deadlineEpochMillis = wireContext.getDeadlineEpochMillis();
-			long localMonotonicDeadlineNanos = scheduler.bindDeadlineEpochMillis(deadlineEpochMillis);
+			long timeoutNanos = wireContext.getTimeoutNanos();
+			if (timeoutNanos <= 0L) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+						"Request timeoutNanos must be positive");
+			}
 			var transportDeadline = Context.current().getDeadline();
 			if (transportDeadline != null) {
-				long remainingNanos = Math.max(0L,
+				long transportRemainingNanos = Math.max(0L,
 						transportDeadline.timeRemaining(TimeUnit.NANOSECONDS));
-				localMonotonicDeadlineNanos = Math.min(localMonotonicDeadlineNanos,
-						scheduler.bindDeadlineAfterNanos(remainingNanos));
-				long remainingMillis = TimeUnit.NANOSECONDS.toMillis(remainingNanos);
-				long now = System.currentTimeMillis();
-				long transportEpochMillis = remainingMillis >= Long.MAX_VALUE - now
-						? Long.MAX_VALUE
-						: now + remainingMillis;
-				deadlineEpochMillis = Math.min(deadlineEpochMillis, transportEpochMillis);
+				timeoutNanos = Math.min(timeoutNanos, transportRemainingNanos);
+			}
+			if (timeoutNanos == 0L) {
+				throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						"Request deadline already expired");
 			}
 			if (!profile.isClientSelectable()) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -978,18 +980,18 @@ public class GrpcServer extends Server {
 			}
 			try {
 				it.cavallium.rockserver.core.common.RequestContext context;
-				if (deadlineEpochMillis == it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE) {
+				if (timeoutNanos == it.cavallium.rockserver.core.common.RequestContext.NO_TIMEOUT) {
 					var cached = NO_DEADLINE_CONTEXTS[profile.ordinal()];
 					if (cached != null) {
 						context = cached;
 					} else {
 						context = new it.cavallium.rockserver.core.common.RequestContext(profile,
-								deadlineEpochMillis);
+								timeoutNanos);
 					}
 				} else {
-					context = new it.cavallium.rockserver.core.common.RequestContext(profile, deadlineEpochMillis);
+					context = new it.cavallium.rockserver.core.common.RequestContext(profile, timeoutNanos);
 				}
-				return new ResolvedRequestContext(context, localMonotonicDeadlineNanos);
+				return new ResolvedRequestContext(context, scheduler.bindTimeoutNanos(timeoutNanos));
 			} catch (IllegalArgumentException invalid) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Invalid request context: " + invalid.getMessage(), invalid);
@@ -1002,27 +1004,50 @@ public class GrpcServer extends Server {
 		}
 
 		private RocksDBSyncAPI syncApi(ResolvedRequestContext context) {
-			var api = syncApi(context.value());
 			return new RocksDBSyncAPI() {
 				@Override
 				public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
-					return scheduler.withDeadlineBinding(context.value(),
+					var downstreamContext = remainingContext(context);
+					return scheduler.withDeadlineBinding(downstreamContext,
 							context.localMonotonicDeadlineNanos(),
-							() -> api.requestSync(request));
+							() -> syncApi(downstreamContext).requestSync(request));
 				}
 			};
 		}
 
 		private RocksDBAsyncAPI asyncApi(ResolvedRequestContext context) {
-			var api = asyncApi(context.value());
 			return new RocksDBAsyncAPI() {
 				@Override
 				public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
-					return scheduler.withDeadlineBinding(context.value(),
+					var downstreamContext = remainingContext(context);
+					return scheduler.withDeadlineBinding(downstreamContext,
 							context.localMonotonicDeadlineNanos(),
-							() -> api.requestAsync(request));
+							() -> asyncApi(downstreamContext).requestAsync(request));
+				}
+
+				@Override
+				public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+					var downstreamContext = remainingContext(context);
+					return scheduler.withDeadlineBinding(downstreamContext,
+							context.localMonotonicDeadlineNanos(),
+							() -> asyncApi(downstreamContext).cdcPollBatchAsync(id, fromSeq, maxEvents));
 				}
 			};
+		}
+
+		private it.cavallium.rockserver.core.common.RequestContext remainingContext(
+				ResolvedRequestContext context) {
+			long deadlineNanos = context.localMonotonicDeadlineNanos();
+			if (deadlineNanos == Long.MAX_VALUE) {
+				return context.value();
+			}
+			long remainingNanos = scheduler.remainingMonotonicDeadlineNanos(deadlineNanos);
+			if (remainingNanos == 0L) {
+				throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						"Request deadline expired before downstream dispatch");
+			}
+			return new it.cavallium.rockserver.core.common.RequestContext(
+					context.profile(), remainingNanos);
 		}
 
 		private reactor.core.scheduler.Scheduler contextualScheduler(
@@ -1030,13 +1055,11 @@ public class GrpcServer extends Server {
 				OperationFamily family) {
 			return scheduler.scheduler(context.profile(),
 					family,
-					context.deadlineEpochMillis(),
 					context.localMonotonicDeadlineNanos());
 		}
 
 		private RocksDBSyncAPI syncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			if (context.deadlineEpochMillis()
-					== it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE) {
+			if (!context.hasTimeout()) {
 				var cached = noDeadlineSyncApis[context.profile().ordinal()];
 				if (cached != null) {
 					return cached;
@@ -1046,8 +1069,7 @@ public class GrpcServer extends Server {
 		}
 
 		private RocksDBAsyncAPI asyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			if (context.deadlineEpochMillis()
-					== it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE) {
+			if (!context.hasTimeout()) {
 				var cached = noDeadlineAsyncApis[context.profile().ordinal()];
 				if (cached != null) {
 					return cached;
@@ -1113,8 +1135,6 @@ public class GrpcServer extends Server {
 			var capabilities = client.getCapabilities();
 			return Mono.just(CapabilitiesResponse.newBuilder()
 					.setWorkloadContractVersion(capabilities.workloadContractVersion())
-					.setBoundedRange(capabilities.boundedRange())
-					.setResumableRawScan(capabilities.resumableRawScan())
 					.build());
 		}
 
@@ -1141,7 +1161,7 @@ public class GrpcServer extends Server {
 							return CloseTransactionResponse.newBuilder().setSuccessful(rolledBack).build();
 						},
 						scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL,
-								it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE));
+								Long.MAX_VALUE));
 			}).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
 		}
 
@@ -1150,7 +1170,8 @@ public class GrpcServer extends Server {
 			return executeMustComplete("closeFailedUpdate", () -> {
 				protectedApi().closeFailedUpdate(request.getUpdateId());
 				return Empty.getDefaultInstance();
-			}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
+			}, scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
+					.transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
 		}
 
 		@Override
@@ -2132,7 +2153,8 @@ public class GrpcServer extends Server {
 			}, response -> {
 				long iteratorId = response.getIteratorId();
 				protectedApi().closeIterator(iteratorId);
-			}, scheduler.control()).transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
+			}, scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
+					.transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
 		}
 
 		@Override
@@ -2140,7 +2162,7 @@ public class GrpcServer extends Server {
 			return executeMustComplete("closeIterator", () -> {
 					protectedApi().closeIterator(request.getIteratorId());
 					return Empty.getDefaultInstance();
-				}, scheduler.control())
+				}, scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("closeIterator", request));
 		}
 
@@ -2365,34 +2387,18 @@ public class GrpcServer extends Server {
 					}
 					var events = Flux.from(api.scanRawResumableAsync(request.getColumnId(),
 							request.getShardIndex(), request.getShardCount(), completedSsts));
-					if (request.getCoalesceCompletedSstToken()) {
-						return events.map(event -> switch (event) {
-							case RawScanEvent.Batch batch -> rawScanBatchResponse(
-									batch.serialized(), batch.completedSstToken());
-							case RawScanEvent.SstCompleted completed -> rawScanCompletionResponse(completed.token());
-						});
-					}
-					// Preserve the original response shape for rolling upgrades: clients that
-					// did not opt in still receive a distinct completion event.
-					return events.concatMap(event -> switch (event) {
-						case RawScanEvent.Batch batch when batch.completedSstToken() != null -> Flux.just(
-								rawScanBatchResponse(batch.serialized()),
-								rawScanCompletionResponse(batch.completedSstToken()));
-						case RawScanEvent.Batch batch -> Mono.just(rawScanBatchResponse(batch.serialized()));
-						case RawScanEvent.SstCompleted completed -> Mono.just(rawScanCompletionResponse(completed.token()));
-					}, 1);
+					return events.map(event -> switch (event) {
+						case RawScanEvent.Batch batch -> rawScanBatchResponse(
+								batch.serialized(), batch.completedSstToken());
+						case RawScanEvent.SstCompleted completed -> rawScanCompletionResponse(completed.token());
+					});
 				}
 				if (request.getCompletedSstTokensCount() != 0) {
 					return Flux.error(Status.INVALID_ARGUMENT
 							.withDescription("completed SST tokens require resumable raw scan mode")
 							.asRuntimeException());
 				}
-				if (request.getCoalesceCompletedSstToken()) {
-					return Flux.error(Status.INVALID_ARGUMENT
-							.withDescription("coalesced SST completion requires resumable raw scan mode")
-							.asRuntimeException());
-				}
-				// Keep the established legacy path allocation-neutral: only resumable scans
+				// Keep the plain path allocation-neutral: only resumable scans
 				// need RawScanEvent wrappers.
 				return Flux.from(api.scanRawAsync(
 						request.getColumnId(), request.getShardIndex(), request.getShardCount()))
@@ -2434,7 +2440,7 @@ public class GrpcServer extends Server {
 			return executeScheduled(() -> {
 				protectedApi().flush();
 				return Empty.getDefaultInstance();
-			}, scheduler.maintenance(OperationFamily.FLUSH))
+			}, scheduler.scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.FLUSH, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("flush", request));
 		}
 
@@ -2443,7 +2449,7 @@ public class GrpcServer extends Server {
 			return executeScheduled(() -> {
 				protectedApi().compact();
 				return Empty.getDefaultInstance();
-			}, scheduler.maintenance(OperationFamily.COMPACTION))
+			}, scheduler.scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("compact", request));
 		}
 
@@ -2496,7 +2502,7 @@ public class GrpcServer extends Server {
 							request.getId(), fromSeq, cols, resolvedValues, expectedLastCommitted);
 					return CdcCreateResponse.newBuilder().setStartSeq(startSeq).build();
 				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
-						it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE))
+						Long.MAX_VALUE))
 						.transform(this.onErrorMapMonoWithRequestInfo("cdcCreate", request));
 			}
 
@@ -2506,7 +2512,7 @@ public class GrpcServer extends Server {
 					protectedApi().cdcDelete(request.getId());
 					return Empty.getDefaultInstance();
 				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
-						it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE))
+						Long.MAX_VALUE))
 						.transform(this.onErrorMapMonoWithRequestInfo("cdcDelete", request));
             }
 
@@ -2514,7 +2520,7 @@ public class GrpcServer extends Server {
 			public Mono<CdcGetEarliestAvailableSequenceResponse> cdcGetEarliestAvailableSequence(Empty request) {
 				return executeScheduled(() -> CdcGetEarliestAvailableSequenceResponse.newBuilder()
 						.setSequence(protectedApi().cdcGetEarliestAvailableSequence())
-						.build(), scheduler.cdc())
+						.build(), scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE))
 						.transform(this.onErrorMapMonoWithRequestInfo(
 								"cdcGetEarliestAvailableSequence", request));
 			}
@@ -2527,7 +2533,8 @@ public class GrpcServer extends Server {
                     var response = CdcGetLastCommittedSequenceResponse.newBuilder();
                     sequence.ifPresent(response::setLastCommittedSeq);
                     return response.build();
-				}, scheduler.cdc()).transform(this.onErrorMapMonoWithRequestInfo(
+				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE))
+						.transform(this.onErrorMapMonoWithRequestInfo(
                         "cdcGetLastCommittedSequence", request));
             }
 
@@ -2557,15 +2564,13 @@ public class GrpcServer extends Server {
 
             private static int requestedMaxResponseBytes(CdcPollRequest request) {
                 int requestedMaxResponseBytes = request.getMaxResponseBytes();
-                if (requestedMaxResponseBytes < 0) {
-                    throw Status.INVALID_ARGUMENT
-                            .withDescription("maxResponseBytes must not be negative: "
-                                    + requestedMaxResponseBytes)
-                            .asRuntimeException();
-                }
-                return requestedMaxResponseBytes > 0
-                        ? requestedMaxResponseBytes
-                        : LEGACY_GRPC_MAX_INBOUND_MESSAGE_SIZE;
+				if (requestedMaxResponseBytes <= 0) {
+					throw Status.INVALID_ARGUMENT
+							.withDescription("maxResponseBytes must be positive: "
+									+ requestedMaxResponseBytes)
+							.asRuntimeException();
+				}
+				return requestedMaxResponseBytes;
             }
 
 			@Override
@@ -2574,7 +2579,7 @@ public class GrpcServer extends Server {
 					protectedApi().cdcCommit(request.getId(), request.getSeq());
 					return Empty.getDefaultInstance();
 				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
-						it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE))
+						Long.MAX_VALUE))
 						.transform(this.onErrorMapMonoWithRequestInfo("cdcCommit", request));
             }
 
@@ -2591,7 +2596,6 @@ public class GrpcServer extends Server {
 					return executeScheduled(() -> operation.apply(syncApi(context)),
 							scheduler.scheduler(profile,
 									command.operationFamily(),
-									context.deadlineEpochMillis(),
 									context.localMonotonicDeadlineNanos()),
 						command.estimatedBytes());
 			});
@@ -2610,7 +2614,6 @@ public class GrpcServer extends Server {
 					return executeScheduled(() -> operation.apply(syncApi(context)),
 							scheduler.scheduler(profile,
 									command.operationFamily(),
-									context.deadlineEpochMillis(),
 									context.localMonotonicDeadlineNanos()),
 						lateSuccessCleanup,
 						lateSuccessCleanupScheduler,
@@ -2708,7 +2711,6 @@ public class GrpcServer extends Server {
 					workloadExecutor = scheduler.executor(
 							profile,
 							command.operationFamily(),
-							requestContext.deadlineEpochMillis(),
 							requestContext.localMonotonicDeadlineNanos());
 					quantumLimits = iteratorQuantumLimits();
 				} catch (Throwable failure) {
@@ -3985,7 +3987,7 @@ public class GrpcServer extends Server {
 					schema.getHasValue(),
 					schema.hasMergeOperatorName() ? schema.getMergeOperatorName() : null,
 					schema.hasMergeOperatorVersion() ? schema.getMergeOperatorVersion() : null,
-					getMergeOperatorClass(schema)
+					schema.hasMergeOperatorClass() ? schema.getMergeOperatorClass() : null
 			);
 		}
 
@@ -4001,37 +4003,9 @@ public class GrpcServer extends Server {
 				builder.setMergeOperatorVersion(schema.mergeOperatorVersion());
 			}
 			if (schema.mergeOperatorClass() != null) {
-				invokeMergeOperatorClass(builder, schema.mergeOperatorClass());
+				builder.setMergeOperatorClass(schema.mergeOperatorClass());
 			}
 			return builder.build();
-		}
-
-		@Nullable
-		private static String getMergeOperatorClass(Object schema) {
-			try {
-				var hasMethod = schema.getClass().getMethod("hasMergeOperatorClass");
-				Boolean has = (Boolean) hasMethod.invoke(schema);
-				if (Boolean.TRUE.equals(has)) {
-					var getter = schema.getClass().getMethod("getMergeOperatorClass");
-					return (String) getter.invoke(schema);
-				}
-			} catch (NoSuchMethodException e) {
-				return null;
-			} catch (ReflectiveOperationException e) {
-				throw new RuntimeException(e);
-			}
-			return null;
-		}
-
-		private static void invokeMergeOperatorClass(Object builder, String mergeOperatorClass) {
-			try {
-				var setter = builder.getClass().getMethod("setMergeOperatorClass", String.class);
-				setter.invoke(builder, mergeOperatorClass);
-			} catch (NoSuchMethodException ignored) {
-				// Older generated protos do not expose mergeOperatorClass; ignore to stay backward compatible
-			} catch (ReflectiveOperationException e) {
-				throw new RuntimeException(e);
-			}
 		}
 
 		private static Iterable<Integer> unmapFixedKeys(@NotNull ColumnSchema schema) {
@@ -4106,7 +4080,7 @@ public class GrpcServer extends Server {
 				return switch (rocksError.getErrorUniqueId()) {
 						case PUT_INVALID_REQUEST -> Status.INVALID_ARGUMENT
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
-						case CDC_SUBSCRIPTION_NOT_FOUND -> Status.NOT_FOUND
+						case CDC_SUBSCRIPTION_NOT_FOUND, TRANSACTION_NOT_FOUND -> Status.NOT_FOUND
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case CDC_RESPONSE_TOO_LARGE -> Status.FAILED_PRECONDITION
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);

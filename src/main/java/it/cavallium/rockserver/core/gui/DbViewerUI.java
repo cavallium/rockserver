@@ -10,7 +10,6 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Map;
@@ -352,7 +351,7 @@ public class DbViewerUI extends JFrame {
 		new SwingWorker<TableData, Void>() {
 			@Override
 			protected TableData doInBackground() throws Exception {
-				var analyticalApi = apiClient.getSyncApi(RequestContext.analytical(Instant.now().plusSeconds(5)));
+				var analyticalApi = apiClient.getSyncApi(RequestContext.analytical(Duration.ofSeconds(5)));
 				var colId = analyticalApi.getColumnId(selectedTable.name());
 				var column = new Column(selectedTable.name(), colId, selectedTable.schema());
 

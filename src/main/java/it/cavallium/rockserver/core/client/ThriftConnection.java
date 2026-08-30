@@ -115,23 +115,28 @@ public final class ThriftConnection extends BaseConnection {
 	}
 
 	@Override
+	public RockserverCapabilities getCapabilities() {
+		return delegate.getCapabilities();
+	}
+
+	@Override
 	public void close() throws IOException {
 		delegate.close();
 		super.close();
 	}
 
 	@Override
-	<R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+	<R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestSync(context, request);
 	}
 
 	@Override
-	<R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+	<R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestAsync(context, request);
 	}
 
 	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
 			String id,
 			Long fromSeq,
 			long maxEvents) {
@@ -152,6 +157,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	private final RocksDB.Iface client;
 	private final ThreadPoolExecutor executor;
 	private final Scheduler executorScheduler;
+	private final RockserverCapabilities capabilities;
 	private final AtomicBoolean closed = new AtomicBoolean();
 
 	ThriftConnectionDelegate(String name, String host, int port) throws TException {
@@ -190,8 +196,8 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		// are opened lazily as actual concurrency requires them.
 		try {
 			var capabilities = allClientSlots.getFirst().client().getCapabilities();
-			new RockserverCapabilities(capabilities.getWorkloadContractVersion(), capabilities.isBoundedRange())
-					.requireCompatible();
+			this.capabilities = new RockserverCapabilities(capabilities.getWorkloadContractVersion());
+			this.capabilities.requireCompatible();
 		} catch (TException | RuntimeException | Error failure) {
 			for (var slot : allClientSlots) {
 				slot.close();
@@ -205,6 +211,11 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		this.executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(poolSize,
 				Thread.ofPlatform().name("rockserver-thrift-client-", 0).factory());
 		this.executorScheduler = Schedulers.fromExecutorService(executor);
+	}
+
+	@Override
+	public RockserverCapabilities getCapabilities() {
+		return capabilities;
 	}
 
 	@Override
@@ -993,7 +1004,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		// downstream delivery can still obey demand and cancellation. Flux.fromStream
 		// also closes the stream on cancellation; the previous sink::next loop eagerly
 		// pushed every item and kept running after the subscriber went away.
-		var context = currentRequestContext();
+		var context = currentBoundRequestContext();
 		return Flux.fromStream(() -> withRequestContext(context, () -> getRange(transactionId,
 				columnId,
 				startKeysInclusive,
@@ -1079,7 +1090,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
 			String id,
 			Long fromSeq,
 			long maxEvents) {
@@ -1088,7 +1099,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	@Override
 	public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-		var context = currentRequestContext();
+		var context = currentBoundRequestContext();
 		return Mono.fromCallable(() -> withRequestContext(context, () -> cdcPollBatch(id, fromSeq, maxEvents)))
 				.subscribeOn(executorScheduler);
 	}
@@ -1099,13 +1110,13 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	public <R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+	public <R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> req) {
 		validateRequestDeadline(context, req);
 		return withRequestContext(context, () -> req.handleSync(this));
 	}
 
 	@Override
-	public <R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+	public <R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> req) {
 		validateRequestDeadline(context, req);
         if (req instanceof RocksDBAPICommand.RocksDBAPICommandStream) {
              // Let handleAsync dispatch to getRangeAsync etc
@@ -1248,25 +1259,18 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 					re.getMessage()
 			);
 		}
-		if (e instanceof TApplicationException applicationException
-				&& applicationException.getType() == TApplicationException.UNKNOWN_METHOD) {
-			return RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
-					"The Thrift peer does not support the requested method: " + applicationException.getMessage(),
-					e);
-		}
 		return RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
 	}
 
-	private static void validateRequestDeadline(RequestContext context,
+	private static void validateRequestDeadline(BoundRequestContext context,
 			RocksDBAPICommand<?, ?, ?> request) {
 		if (request.protectedProfile() == null) {
 			validateRequestDeadline(context);
 		}
 	}
 
-	private static void validateRequestDeadline(RequestContext context) {
-		if (context.deadlineEpochMillis() != RequestContext.NO_DEADLINE
-				&& context.deadlineEpochMillis() <= System.currentTimeMillis()) {
+	private static void validateRequestDeadline(BoundRequestContext context) {
+		if (context.remainingNanos() == 0L) {
 			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline already expired");
 		}
@@ -1278,19 +1282,22 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	private it.cavallium.rockserver.core.common.api.RequestContext currentWireRequestContext(
 			boolean enforceCallerDeadline) {
-		var context = currentRequestContext();
+		var boundContext = currentBoundRequestContext();
 		if (enforceCallerDeadline) {
-			validateRequestDeadline(context);
+			validateRequestDeadline(boundContext);
 		}
+		var context = boundContext.value();
+		long remainingNanos = boundContext.remainingNanos();
 		return new it.cavallium.rockserver.core.common.api.RequestContext(
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(
 						context.profile().wireValue()),
-				context.deadlineEpochMillis());
+				RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION,
+				remainingNanos);
 	}
 
 	private <T> CompletableFuture<T> supplyAsyncContextual(java.util.function.Supplier<T> operation,
 			java.util.concurrent.Executor ignoredExecutor) {
-		var context = currentRequestContext();
+		var context = currentBoundRequestContext();
 		var future = new ThriftCallFuture<>(context, operation);
 		try {
 			executor.execute(future);
@@ -1320,11 +1327,11 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		private static final int FINISHED = 2;
 		private static final int CANCELLED = 3;
 
-		private final RequestContext context;
+		private final BoundRequestContext context;
 		private final java.util.function.Supplier<T> operation;
 		private final AtomicInteger state = new AtomicInteger(QUEUED);
 
-		private ThriftCallFuture(RequestContext context, java.util.function.Supplier<T> operation) {
+		private ThriftCallFuture(BoundRequestContext context, java.util.function.Supplier<T> operation) {
 			this.context = context;
 			this.operation = operation;
 		}

@@ -95,17 +95,17 @@ public final class EmbeddedConnection extends BaseConnection implements Internal
 	}
 
 	@Override
-	<R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+	<R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestSync(context, request);
 	}
 
 	@Override
-	<R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+	<R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestAsync(context, request);
 	}
 
 	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
 			@NotNull String id,
 			@Nullable Long fromSeq,
 			long maxEvents) {
@@ -123,6 +123,11 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	private static final int ASYNC_TASK_RUNNING = 1;
 	private static final int ASYNC_TASK_FINISHED = 2;
 	private static final int ASYNC_TASK_CANCELLED = 3;
+
+	@Override
+	public RockserverCapabilities getCapabilities() {
+		return RockserverCapabilities.CURRENT;
+	}
 	private final EmbeddedDB db;
 	private final BiPredicate<Executor, Runnable> queuedTaskRemover;
 	private final Map<Long, AsyncIteratorOperation> asyncIteratorOperations = new ConcurrentHashMap<>();
@@ -220,13 +225,13 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	}
 
 	@Override
-	public <R, RS, RA> RS requestSync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
-		resolveCommand(context, req);
-		if (db.getScheduler().isExecutingWorkloadTask()) {
-			return withRequestContext(context, () -> req.handleSync(this));
-		}
-		return withRequestContext(context, () -> {
-			Object asyncResult = requestAsync(context, req);
+	public <R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		resolveCommand(context.value(), req);
+		return withEmbeddedContext(context, () -> {
+			if (db.getScheduler().isExecutingWorkloadTask()) {
+				return req.handleSync(this);
+			}
+			Object asyncResult = requestAsyncBound(req);
 			if (asyncResult instanceof CompletableFuture<?> future) {
 				try {
 					@SuppressWarnings("unchecked")
@@ -256,10 +261,16 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	}
 
 	@SuppressWarnings("unchecked")
-    @Override
-	public <R, RS, RA> RA requestAsync(RequestContext context, RocksDBAPICommand<R, RS, RA> req) {
-		resolveCommand(context, req);
-		return withRequestContext(context, () -> (RA) switch (req) {
+	@Override
+	public <R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		resolveCommand(context.value(), req);
+		return withEmbeddedContext(context, () -> requestAsyncBound(req));
+	}
+
+	@SuppressWarnings("unchecked")
+	private <R, RS, RA> RA requestAsyncBound(RocksDBAPICommand<R, RS, RA> req) {
+		var context = currentBoundRequestContext();
+		return (RA) switch (req) {
             case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch putBatch -> this.putBatchAsync(
 					putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch mergeBatch -> this.mergeBatchAsync(
@@ -302,8 +313,21 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					commandExecutor(req),
 					req.estimatedBytes());
             case RocksDBAPICommand.RocksDBAPICommandStream<?> _ -> throw RocksDBException.of(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, "The request of type " + req.getClass().getName() + " is not implemented in class " + this.getClass().getName());
-		});
+		};
     }
+
+	private <T> T withEmbeddedContext(BoundRequestContext context, java.util.function.Supplier<T> operation) {
+		long remainingNanos = context.remainingNanos();
+		if (remainingNanos == 0L) {
+			throw RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					"Request deadline already expired");
+		}
+		var requestContext = context.value();
+		long monotonicDeadlineNanos = db.getScheduler().bindTimeoutNanos(remainingNanos);
+		return db.getScheduler().withDeadlineBinding(requestContext,
+				monotonicDeadlineNanos,
+				() -> withRequestContext(context, operation));
+	}
 
 	private RWScheduler.WorkloadExecutor commandExecutor(RocksDBAPICommand<?, ?, ?> command) {
 		var context = currentRequestContext();
@@ -442,7 +466,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			@NotNull List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
 		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContext().profile());
-		var executor = db.getScheduler().writeExecutor();
+		var executor = db.getScheduler().executor(currentRequestContext(), OperationFamily.MUTATION);
 		return supplyAsyncPreservingRunningCompletion(
 				() -> db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType), executor);
 	}
@@ -506,7 +530,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				keys,
 				timeoutMs,
 				context.profile(),
-				context.deadlineEpochMillis());
+				db.getScheduler().resolveMonotonicDeadline(context));
 	}
 
 	@Override
@@ -521,7 +545,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				timeoutMs,
 				context.profile(),
 				db.getScheduler().executor(context, OperationFamily.BOUNDED_FAN_OUT),
-				context.deadlineEpochMillis());
+				db.getScheduler().resolveMonotonicDeadline(context));
 	}
 
 	@Override
@@ -740,7 +764,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		return supplyAsyncPreservingRunningCompletion(() -> {
 			db.closeIterator(iteratorId);
 			return null;
-		}, db.getScheduler().controlExecutor());
+		}, db.getScheduler().executor(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE));
 	}
 
 	private @Nullable AsyncIteratorOperation acquireAsyncIteratorOperation(long iteratorId) {
@@ -1577,7 +1601,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
     }
 
 	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
 			@NotNull String id,
 			@Nullable Long fromSeq,
 			long maxEvents) {

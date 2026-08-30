@@ -1,102 +1,87 @@
 package it.cavallium.rockserver.core.common;
 
-import java.time.Clock;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Objects;
 
 /**
  * Mandatory caller-supplied workload contract for generic Rockserver operations.
  *
  * <p>The profile selects a service guarantee. Rockserver separately derives the
- * operation family and rejects incompatible combinations. Latency work must carry a
- * finite absolute deadline so the admission queue can use earliest-deadline-first
- * ordering; other client profiles may use {@link #NO_DEADLINE}.</p>
+ * operation family and rejects incompatible combinations. The timeout is a reusable
+ * policy: every public operation binds it once to a local monotonic deadline before
+ * client-side queueing. Latency work must carry a finite timeout; other client profiles
+ * may use {@link #NO_TIMEOUT}.</p>
  *
  * @param profile client-selectable service profile
- * @param deadlineEpochMillis absolute Unix-epoch deadline in milliseconds, or
- *                            {@link #NO_DEADLINE}
+ * @param timeoutNanos positive relative timeout in nanoseconds, or {@link #NO_TIMEOUT}
  */
-public record RequestContext(WorkloadProfile profile, long deadlineEpochMillis) {
+public record RequestContext(WorkloadProfile profile, long timeoutNanos) {
 
-	public static final long NO_DEADLINE = Long.MAX_VALUE;
+	public static final long NO_TIMEOUT = Long.MAX_VALUE;
+	private static final long MAX_FINITE_TIMEOUT_NANOS = Long.MAX_VALUE - 1L;
+	private static final RequestContext ANALYTICAL_NO_TIMEOUT =
+			new RequestContext(WorkloadProfile.ANALYTICAL, NO_TIMEOUT);
+	private static final RequestContext INGEST_NO_TIMEOUT =
+			new RequestContext(WorkloadProfile.INGEST, NO_TIMEOUT);
+	private static final RequestContext BATCH_NO_TIMEOUT =
+			new RequestContext(WorkloadProfile.BATCH, NO_TIMEOUT);
 
 	public RequestContext {
 		Objects.requireNonNull(profile, "profile");
 		if (!profile.isClientSelectable()) {
 			throw new IllegalArgumentException("Profile " + profile + " is owned by Rockserver");
 		}
-		if (deadlineEpochMillis <= 0L) {
-			throw new IllegalArgumentException("deadlineEpochMillis must be positive");
+		if (timeoutNanos <= 0L) {
+			throw new IllegalArgumentException("timeoutNanos must be positive");
 		}
-		if (profile == WorkloadProfile.LATENCY && deadlineEpochMillis == NO_DEADLINE) {
-			throw new IllegalArgumentException("LATENCY requires a finite deadline");
+		if (profile == WorkloadProfile.LATENCY && timeoutNanos == NO_TIMEOUT) {
+			throw new IllegalArgumentException("LATENCY requires a finite timeout");
 		}
-	}
-
-	public static RequestContext latency(Instant deadline) {
-		Objects.requireNonNull(deadline, "deadline");
-		return new RequestContext(WorkloadProfile.LATENCY, deadline.toEpochMilli());
 	}
 
 	public static RequestContext latency(Duration timeout) {
-		return latency(timeout, Clock.systemUTC());
-	}
-
-	static RequestContext latency(Duration timeout, Clock clock) {
-		Objects.requireNonNull(timeout, "timeout");
-		Objects.requireNonNull(clock, "clock");
-		if (timeout.isNegative() || timeout.isZero()) {
-			throw new IllegalArgumentException("LATENCY timeout must be positive");
-		}
-		long now = clock.millis();
-		long timeoutMillis;
-		try {
-			timeoutMillis = timeout.toMillis();
-		} catch (ArithmeticException overflow) {
-			timeoutMillis = Long.MAX_VALUE;
-		}
-		if (timeoutMillis <= 0L) {
-			timeoutMillis = 1L;
-		}
-		long deadline = timeoutMillis >= Long.MAX_VALUE - now
-				? Long.MAX_VALUE - 1L
-				: now + timeoutMillis;
-		return new RequestContext(WorkloadProfile.LATENCY, deadline);
+		return withTimeout(WorkloadProfile.LATENCY, timeout);
 	}
 
 	public static RequestContext analytical() {
-		return new RequestContext(WorkloadProfile.ANALYTICAL, NO_DEADLINE);
+		return ANALYTICAL_NO_TIMEOUT;
 	}
 
-	public static RequestContext analytical(Instant deadline) {
-		return withDeadline(WorkloadProfile.ANALYTICAL, deadline);
+	public static RequestContext analytical(Duration timeout) {
+		return withTimeout(WorkloadProfile.ANALYTICAL, timeout);
 	}
 
 	public static RequestContext ingest() {
-		return new RequestContext(WorkloadProfile.INGEST, NO_DEADLINE);
+		return INGEST_NO_TIMEOUT;
 	}
 
-	public static RequestContext ingest(Instant deadline) {
-		return withDeadline(WorkloadProfile.INGEST, deadline);
+	public static RequestContext ingest(Duration timeout) {
+		return withTimeout(WorkloadProfile.INGEST, timeout);
 	}
 
 	public static RequestContext batch() {
-		return new RequestContext(WorkloadProfile.BATCH, NO_DEADLINE);
+		return BATCH_NO_TIMEOUT;
 	}
 
-	public static RequestContext batch(Instant deadline) {
-		return withDeadline(WorkloadProfile.BATCH, deadline);
+	public static RequestContext batch(Duration timeout) {
+		return withTimeout(WorkloadProfile.BATCH, timeout);
 	}
 
-	private static RequestContext withDeadline(WorkloadProfile profile, Instant deadline) {
-		Objects.requireNonNull(deadline, "deadline");
-		return new RequestContext(profile, deadline.toEpochMilli());
+	private static RequestContext withTimeout(WorkloadProfile profile, Duration timeout) {
+		Objects.requireNonNull(timeout, "timeout");
+		if (timeout.isNegative() || timeout.isZero()) {
+			throw new IllegalArgumentException(profile + " timeout must be positive");
+		}
+		long timeoutNanos;
+		try {
+			timeoutNanos = timeout.toNanos();
+		} catch (ArithmeticException overflow) {
+			timeoutNanos = MAX_FINITE_TIMEOUT_NANOS;
+		}
+		return new RequestContext(profile, Math.min(timeoutNanos, MAX_FINITE_TIMEOUT_NANOS));
 	}
 
-	/** True when the absolute request deadline has been reached. */
-	public boolean isExpired(Clock clock) {
-		Objects.requireNonNull(clock, "clock");
-		return deadlineEpochMillis != NO_DEADLINE && clock.millis() >= deadlineEpochMillis;
+	public boolean hasTimeout() {
+		return timeoutNanos != NO_TIMEOUT;
 	}
 }

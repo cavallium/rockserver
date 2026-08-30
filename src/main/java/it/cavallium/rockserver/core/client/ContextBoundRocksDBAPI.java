@@ -8,6 +8,8 @@ import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import java.util.Objects;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /** Public API view with one mandatory immutable workload context. */
@@ -25,14 +27,19 @@ final class ContextBoundRocksDBAPI implements RocksDBAPI {
 	public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
 		Objects.requireNonNull(request, "request");
 		WorkloadAdmission.resolve(context, request);
-		return dispatcher.requestSync(context, request);
+		return dispatcher.requestSync(BoundRequestContext.bind(context), request);
 	}
 
 	@Override
+	@SuppressWarnings("unchecked")
 	public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
 		Objects.requireNonNull(request, "request");
 		WorkloadAdmission.resolve(context, request);
-		return dispatcher.requestAsync(context, request);
+		if (request instanceof RocksDBAPICommand.RocksDBAPICommandStream) {
+			return (RA) Flux.defer(() -> Flux.from((Publisher<?>) dispatcher.requestAsync(
+					BoundRequestContext.bind(context), request)));
+		}
+		return dispatcher.requestAsync(BoundRequestContext.bind(context), request);
 	}
 
 	@Override
@@ -41,6 +48,7 @@ final class ContextBoundRocksDBAPI implements RocksDBAPI {
 		// filtered-empty pages still advance and transports enforce a response budget.
 		// Preserve the concrete connection implementation while binding the protected
 		// CDC dispatch to this immutable API view.
-		return dispatcher.cdcPollBatchAsync(context, id, fromSeq, maxEvents);
+		return Mono.defer(() -> dispatcher.cdcPollBatchAsync(
+				BoundRequestContext.bind(context), id, fromSeq, maxEvents));
 	}
 }

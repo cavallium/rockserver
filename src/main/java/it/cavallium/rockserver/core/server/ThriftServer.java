@@ -39,6 +39,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -201,14 +202,7 @@ public class ThriftServer extends Server {
 
 	private static RequestContext mapRequestContext(
 			it.cavallium.rockserver.core.common.api.RequestContext wireContext) {
-		var context = parseRequestContext(wireContext);
-		if (context.deadlineEpochMillis() != RequestContext.NO_DEADLINE
-				&& context.deadlineEpochMillis() <= System.currentTimeMillis()) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
-					"Request deadline already expired");
-		}
-		return context;
+		return parseRequestContext(wireContext);
 	}
 
 	private static ResolvedRequestContext mapRequestContext(
@@ -220,7 +214,7 @@ public class ThriftServer extends Server {
 		}
 		var context = parseRequestContext(wireContext);
 		return new ResolvedRequestContext(context,
-				scheduler.bindDeadlineEpochMillis(context.deadlineEpochMillis()));
+				scheduler.bindTimeoutNanos(context.timeoutNanos()));
 	}
 
 	private static RequestContext parseRequestContext(
@@ -229,6 +223,13 @@ public class ThriftServer extends Server {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(
 					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Request context and workload profile are required");
+		}
+		if (wireContext.workloadContractVersion
+				!= RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(
+					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Request context requires workload contract version "
+							+ RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		}
 		final it.cavallium.rockserver.core.common.WorkloadProfile profile;
 		try {
@@ -245,7 +246,7 @@ public class ThriftServer extends Server {
 					"Workload profile " + profile + " is owned by Rockserver");
 		}
 		try {
-			return new RequestContext(profile, wireContext.deadlineEpochMillis);
+			return new RequestContext(profile, wireContext.timeoutNanos);
 		} catch (IllegalArgumentException invalid) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(
 					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -343,18 +344,33 @@ public class ThriftServer extends Server {
 
 		private RocksDBSyncAPI api(it.cavallium.rockserver.core.common.api.RequestContext context) {
 			var resolved = mapRequestContext(context, scheduler);
-			var api = dispatchingSyncApi(client, resolved.value());
 			if (scheduler == null) {
-				return api;
+				return dispatchingSyncApi(client, resolved.value());
 			}
 			return new RocksDBSyncAPI() {
 				@Override
 				public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
-					return scheduler.withDeadlineBinding(resolved.value(),
+					var downstreamContext = remainingContext(resolved);
+					return scheduler.withDeadlineBinding(downstreamContext,
 							resolved.localMonotonicDeadlineNanos(),
-							() -> api.requestSync(request));
+							() -> dispatchingSyncApi(client, downstreamContext).requestSync(request));
 				}
 			};
+		}
+
+		private RequestContext remainingContext(ResolvedRequestContext context) {
+			long deadlineNanos = context.localMonotonicDeadlineNanos();
+			if (deadlineNanos == Long.MAX_VALUE) {
+				return context.value();
+			}
+			long remainingNanos = Objects.requireNonNull(scheduler)
+					.remainingMonotonicDeadlineNanos(deadlineNanos);
+			if (remainingNanos == 0L) {
+				throw it.cavallium.rockserver.core.common.RocksDBException.of(
+						it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						"Request deadline expired before downstream dispatch");
+			}
+			return new RequestContext(context.value().profile(), remainingNanos);
 		}
 
 		private RocksDBSyncAPI protectedApi() {
@@ -535,7 +551,7 @@ public class ThriftServer extends Server {
 		public it.cavallium.rockserver.core.common.api.Capabilities getCapabilities() {
 			var capabilities = RockserverCapabilities.CURRENT;
 			return new it.cavallium.rockserver.core.common.api.Capabilities(
-					capabilities.workloadContractVersion(), capabilities.boundedRange());
+					capabilities.workloadContractVersion());
 		}
 
 		@Override

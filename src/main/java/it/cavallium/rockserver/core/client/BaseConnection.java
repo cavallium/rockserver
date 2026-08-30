@@ -15,7 +15,7 @@ import reactor.core.publisher.Mono;
 abstract class BaseConnection implements RocksDBConnection {
 
 	private final String name;
-	private final ThreadLocal<RequestContext> dispatchContext = new ThreadLocal<>();
+	private final ThreadLocal<BoundRequestContext> dispatchContext = new ThreadLocal<>();
 
 	public BaseConnection(String name) {
 		this.name = name;
@@ -32,10 +32,14 @@ abstract class BaseConnection implements RocksDBConnection {
 	}
 
 	protected final RequestContext currentRequestContext() {
+		return currentBoundRequestContext().value();
+	}
+
+	protected final BoundRequestContext currentBoundRequestContext() {
 		return Objects.requireNonNull(dispatchContext.get(), "No workload context is bound to this dispatch");
 	}
 
-	protected final <T> T withRequestContext(RequestContext context, Supplier<T> operation) {
+	protected final <T> T withRequestContext(BoundRequestContext context, Supplier<T> operation) {
 		Objects.requireNonNull(context, "context");
 		Objects.requireNonNull(operation, "operation");
 		var previous = dispatchContext.get();
@@ -51,13 +55,13 @@ abstract class BaseConnection implements RocksDBConnection {
 		}
 	}
 
-	abstract <R, RS, RA> RS requestSync(RequestContext context,
+	abstract <R, RS, RA> RS requestSync(BoundRequestContext context,
 			RocksDBAPICommand<R, RS, RA> request);
 
-	abstract <R, RS, RA> RA requestAsync(RequestContext context,
+	abstract <R, RS, RA> RA requestAsync(BoundRequestContext context,
 			RocksDBAPICommand<R, RS, RA> request);
 
-	abstract Mono<CdcBatch> cdcPollBatchAsync(RequestContext context,
+	abstract Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
 			@NotNull String id,
 			@Nullable Long fromSeq,
 			long maxEvents);

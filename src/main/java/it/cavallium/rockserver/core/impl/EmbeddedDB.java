@@ -3867,7 +3867,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public CompletableFuture<Void> putBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode) throws RocksDBException {
-		return putBatchInternal(columnId, batchPublisher, mode, scheduler.write());
+		return putBatchInternal(columnId, batchPublisher, mode,
+				scheduler.scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, Long.MAX_VALUE));
 	}
 
 	public CompletableFuture<Void> putBatchInternal(long columnId,
@@ -3904,7 +3905,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public CompletableFuture<Void> mergeBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode) throws RocksDBException {
-		return mergeBatchInternal(columnId, batchPublisher, mode, scheduler.write());
+		return mergeBatchInternal(columnId, batchPublisher, mode,
+				scheduler.scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, Long.MAX_VALUE));
 	}
 
 	public CompletableFuture<Void> mergeBatchInternal(long columnId,
@@ -5168,7 +5170,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				keys,
 				timeoutMs,
 				WorkloadProfile.BATCH,
-				RequestContext.NO_DEADLINE);
+				Long.MAX_VALUE);
 	}
 
 	public List<Boolean> existsMulti(long transactionId,
@@ -5176,7 +5178,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull List<@NotNull Keys> keys,
 			long timeoutMs,
 			WorkloadProfile workloadProfile,
-			long contextDeadlineEpochMillis) throws RocksDBException {
+			long contextMonotonicDeadlineNanos) throws RocksDBException {
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
@@ -5194,7 +5196,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					null
 			);
 
-			var deadlineMicros = readDeadlineMicros(timeoutMs, contextDeadlineEpochMillis);
+			var deadlineMicros = readDeadlineMicros(timeoutMs, contextMonotonicDeadlineNanos);
 			var columnUse = acquireColumnUse(columnId);
 			try (columnUse) {
 				Tx tx = transactionId != 0
@@ -5227,7 +5229,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long timeoutMs,
 			WorkloadProfile workloadProfile,
 			Executor executor,
-			long contextDeadlineEpochMillis) {
+			long contextMonotonicDeadlineNanos) {
 		long requestStartNanos = System.nanoTime();
 		if (keys == null) {
 			return CompletableFuture.failedFuture(
@@ -5237,7 +5239,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			// Establish the request deadline before validation/copying so admission work
 			// for a very large logical request cannot grant the native reads fresh time.
-			deadlineMicros = readDeadlineMicros(timeoutMs, contextDeadlineEpochMillis);
+			deadlineMicros = readDeadlineMicros(timeoutMs, contextMonotonicDeadlineNanos);
 		} catch (Throwable error) {
 			return CompletableFuture.failedFuture(error);
 		}
@@ -6175,14 +6177,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return timeoutMicros >= Long.MAX_VALUE - nowMicros ? Long.MAX_VALUE : nowMicros + timeoutMicros;
 	}
 
-	private static long readDeadlineMicros(long timeoutMs, long contextDeadlineEpochMillis) {
+	private long readDeadlineMicros(long timeoutMs, long contextMonotonicDeadlineNanos) {
 		long operationDeadlineMicros = readDeadlineMicros(timeoutMs);
-		if (contextDeadlineEpochMillis == RequestContext.NO_DEADLINE) {
+		if (contextMonotonicDeadlineNanos == Long.MAX_VALUE) {
 			return operationDeadlineMicros;
 		}
-		long contextDeadlineMicros = contextDeadlineEpochMillis >= Long.MAX_VALUE / 1_000L
+		long nowMicros = TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
+		long remainingNanos = scheduler.remainingMonotonicDeadlineNanos(contextMonotonicDeadlineNanos);
+		long remainingMicros = TimeUnit.NANOSECONDS.toMicros(remainingNanos);
+		long contextDeadlineMicros = remainingMicros >= Long.MAX_VALUE - nowMicros
 				? Long.MAX_VALUE
-				: TimeUnit.MILLISECONDS.toMicros(contextDeadlineEpochMillis);
+				: nowMicros + remainingMicros;
 		return Math.min(operationDeadlineMicros, contextDeadlineMicros);
 	}
 
@@ -6194,26 +6199,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 					timeoutLabel + " must be non-negative");
 		}
-		long nowMillis = System.currentTimeMillis();
-		long operationDeadlineMillis = timeoutMs >= Long.MAX_VALUE - nowMillis
-				? Long.MAX_VALUE
-				: nowMillis + timeoutMs;
-		long ageDeadlineMillis = maxRetainedSnapshotAgeMs >= Long.MAX_VALUE - nowMillis
-				? Long.MAX_VALUE
-				: nowMillis + maxRetainedSnapshotAgeMs;
-		long deadlineMillis = Math.min(operationDeadlineMillis, ageDeadlineMillis);
-		if (context.deadlineEpochMillis() != RequestContext.NO_DEADLINE) {
-			deadlineMillis = Math.min(deadlineMillis, context.deadlineEpochMillis());
-		}
-		long deadlineMicros = deadlineMillis >= Long.MAX_VALUE / 1_000L
-				? Long.MAX_VALUE
-				: TimeUnit.MILLISECONDS.toMicros(deadlineMillis);
 		long localBudgetNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(timeoutMs),
 				TimeUnit.MILLISECONDS.toNanos(maxRetainedSnapshotAgeMs));
-		long localDeadlineNanos = scheduler.bindDeadlineAfterNanos(localBudgetNanos);
+		long localDeadlineNanos = scheduler.bindTimeoutNanos(localBudgetNanos);
 		long contextDeadlineNanos = scheduler.resolveMonotonicDeadline(context);
 		long monotonicDeadlineNanos = Math.min(localDeadlineNanos, contextDeadlineNanos);
-		return new ReadDeadline(deadlineMillis, deadlineMicros, monotonicDeadlineNanos);
+		long deadlineMicros = readDeadlineMicros(Long.MAX_VALUE, monotonicDeadlineNanos);
+		return new ReadDeadline(deadlineMicros, monotonicDeadlineNanos);
 	}
 
 	private final class IteratorState extends RocksDBObjects {
@@ -6865,7 +6857,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
 		long deadlineMicros = readDeadlineMicros(timeoutMs);
-		long monotonicDeadlineNanos = scheduler.bindDeadlineAfterNanos(
+		long monotonicDeadlineNanos = scheduler.bindTimeoutNanos(
 				TimeUnit.MILLISECONDS.toNanos(timeoutMs));
 		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
 		actionLogger.logAction("GetRangePage",
@@ -6961,7 +6953,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var deadline = retainedReadDeadline(timeoutMs, context, "Range timeout");
 		var workloadExecutor = scheduler.executor(workloadProfile,
 				OperationFamily.RANGE_PAGE,
-				deadline.epochMillis(),
 				deadline.monotonicNanos());
 		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
 		actionLogger.logAction("GetRange (begin)",
@@ -7076,7 +7067,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var deadline = retainedReadDeadline(timeoutMs, context, "Exact count timeout");
 		var workloadExecutor = scheduler.executor(workloadProfile,
 				OperationFamily.FULL_SCAN_AGGREGATE,
-				deadline.epochMillis(),
 				deadline.monotonicNanos());
 		actionLogger.logAction("ReduceRange (begin)",
 				start,
@@ -8355,7 +8345,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private record RangeReadChunk(List<KV> items, boolean exhausted) {
 	}
 
-	private record ReadDeadline(long epochMillis, long micros, long monotonicNanos) {
+	private record ReadDeadline(long micros, long monotonicNanos) {
 	}
 
 	private final class RangeCursor implements ActiveRangeResource {
@@ -9882,8 +9872,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				null,
 				Function.identity(),
 				null,
-				scheduler.read(),
-				scheduler.readExecutor());
+				scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE),
+				scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE));
 	}
 
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId,
@@ -9892,7 +9882,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Scheduler workloadScheduler) {
 		var workloadExecutor = workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler
 				? indexedScheduler.workloadExecutor()
-				: scheduler.readExecutor();
+				: scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		return scanRawAsyncInternal(columnId,
 				shardIndex,
 				shardCount,
@@ -10035,7 +10025,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Scheduler workloadScheduler) {
 		var workloadExecutor = workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler
 				? indexedScheduler.workloadExecutor()
-				: scheduler.readExecutor();
+				: scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		return scanRawAsyncInternal(columnId,
 				shardIndex,
 				shardCount,
@@ -10865,7 +10855,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private Mono<CdcWalPublication> publishCdcWalAsync() {
 		return scheduleTracked(scheduler.scheduler(WorkloadProfile.CDC,
 				OperationFamily.FLUSH,
-				RequestContext.NO_DEADLINE), this::publishCdcWal);
+				Long.MAX_VALUE), this::publishCdcWal);
 	}
 
 	private Mono<CdcWalDiscovery> findEarliestAvailableWalAsync() {
@@ -10877,7 +10867,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return Mono.error(new RocksDBRetryException());
 		}
 		return publishCdcWalAsync()
-				.flatMap(publication -> scheduleTracked(scheduler.cdc(),
+				.flatMap(publication -> scheduleTracked(
+						scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE),
 						() -> probeEarliestAvailableWal(publication)))
 				.flatMap(result -> result.<Mono<CdcWalDiscovery>>map(Mono::just)
 						.orElseGet(() -> findEarliestAvailableWalAsync(attempt + 1)))
@@ -11083,7 +11074,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public CompletableFuture<Void> cdcCommitAsyncInternal(@NotNull String id, long seq) {
 		return scheduleMustCompleteTracked(scheduler.scheduler(WorkloadProfile.CDC,
 				OperationFamily.MUTATION,
-				RequestContext.NO_DEADLINE), () -> {
+				Long.MAX_VALUE), () -> {
 			Objects.requireNonNull(id, "id");
 			try {
 				commitCdcMetadata(id, seq);
@@ -12049,7 +12040,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private Mono<CdcPollWindow> prepareCdcPollStartAsync(@NotNull String id, @Nullable Long fromSeq) {
-		return scheduleTracked(this.scheduler.cdc(), () -> {
+		return scheduleTracked(this.scheduler.scheduler(
+				WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE), () -> {
 			var meta = loadCdcMeta(id);
 			if (meta == null) {
 				throw cdcSubscriptionNotFound(id);
@@ -12079,7 +12071,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long maxBytes,
 			boolean allowOversizedFirstEvent) {
 		long quantumBytes = Math.min(maxBytes, workloadSettings.cdcQuantumMaxBytes());
-		return scheduleTracked(this.scheduler.cdc(), () -> {
+		return scheduleTracked(this.scheduler.scheduler(
+				WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE), () -> {
 			var cursor = openCdcPollCursor(window.subscription(),
 					window.startSeq(),
 					window.maxWalSequenceInclusive());
@@ -12107,7 +12100,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			continuationObserver.run();
 		}
 		long quantumBytes = Math.min(maxBytes, workloadSettings.cdcQuantumMaxBytes());
-		return scheduleTracked(this.scheduler.cdc(),
+		return scheduleTracked(this.scheduler.scheduler(
+				WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE),
 				() -> cursor.readPage(maxEvents,
 						quantumBytes,
 						allowOversizedFirstEvent,
@@ -12119,7 +12113,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private Mono<Void> closeCdcPollCursorAsync(CdcPollCursor cursor) {
-		return scheduleTracked(this.scheduler.control(), () -> {
+		return scheduleTracked(this.scheduler.scheduler(
+				WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE), () -> {
 			cursor.close();
 			return (Void) null;
 		}).onErrorResume(_ -> {
