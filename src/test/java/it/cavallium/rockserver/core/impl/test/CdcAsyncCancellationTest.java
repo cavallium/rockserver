@@ -46,7 +46,7 @@ class CdcAsyncCancellationTest {
 			var cdcStarted = new CountDownLatch(readWorkers);
 			var releaseCdc = new CountDownLatch(1);
 			for (int i = 0; i < readWorkers; i++) {
-				db.getScheduler().cdc().schedule(() -> {
+				db.getScheduler().scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.CDC, it.cavallium.rockserver.core.common.OperationFamily.WAL_PAGE, Long.MAX_VALUE).schedule(() -> {
 					cdcStarted.countDown();
 					awaitUninterruptibly(releaseCdc);
 				});
@@ -70,7 +70,7 @@ class CdcAsyncCancellationTest {
 				releaseCdc.countDown();
 			}
 			var laneDrained = new CountDownLatch(1);
-			db.getScheduler().cdc().schedule(laneDrained::countDown);
+			db.getScheduler().scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.CDC, it.cavallium.rockserver.core.common.OperationFamily.WAL_PAGE, Long.MAX_VALUE).schedule(laneDrained::countDown);
 			assertTrue(laneDrained.await(5, TimeUnit.SECONDS));
 			assertEquals(0L, db.getPendingOpsCount(),
 					"a cancelled queued task ran later and released the lease twice");
@@ -88,7 +88,7 @@ class CdcAsyncCancellationTest {
 					null,
 					null,
 					null));
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			db.put(0,
 					columnId,
 					new Keys(new Buf[] {Buf.wrap(new byte[] {0, 0, 0, 1})}),
@@ -97,7 +97,7 @@ class CdcAsyncCancellationTest {
 
 			var cleanupStarted = new CountDownLatch(1);
 			var releaseCleanup = new CountDownLatch(1);
-			db.getScheduler().control().schedule(() -> {
+			db.getScheduler().scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL, it.cavallium.rockserver.core.common.OperationFamily.CONTROL, Long.MAX_VALUE).schedule(() -> {
 				cleanupStarted.countDown();
 				awaitUninterruptibly(releaseCleanup);
 			});
@@ -124,7 +124,7 @@ class CdcAsyncCancellationTest {
 					null,
 					null,
 					null));
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			db.put(0,
 					columnId,
 					new Keys(new Buf[] {Buf.wrap(new byte[] {0, 0, 0, 1})}),
@@ -158,7 +158,7 @@ class CdcAsyncCancellationTest {
 	void cancellationDuringWalPublicationKeepsTheNativeLeaseUntilFlushExits() throws Exception {
 		try (var db = new BlockingStageEmbeddedDB(tempDir.resolve("publication"), "cdc-cancel-publication")) {
 			long columnId = createColumn(db, "data");
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			db.put(0, columnId, key(1), Buf.wrap(new byte[] {1}), RequestType.none());
 			db.blockPublication.set(true);
 
@@ -185,7 +185,7 @@ class CdcAsyncCancellationTest {
 	void writeAfterFlushBoundaryIsDeferredToTheNextFixedTailPoll() throws Exception {
 		try (var db = new BlockingStageEmbeddedDB(tempDir.resolve("flush-boundary"), "cdc-flush-boundary")) {
 			long columnId = createColumn(db, "data");
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			db.blockPublication.set(true);
 
 			var firstPoll = db.cdcPollBatchAsyncInternal("sub", startSeq, 10).toFuture();
@@ -207,7 +207,7 @@ class CdcAsyncCancellationTest {
 	void cancellationDuringPrefixlessDiscoveryClosesWithoutOpeningAPollCursor() throws Exception {
 		try (var db = new BlockingStageEmbeddedDB(tempDir.resolve("discovery"), "cdc-cancel-discovery")) {
 			long columnId = createColumn(db, "data");
-			db.cdcCreate("sub", null, List.of(columnId), false);
+			db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			db.blockDiscovery.set(true);
 
 			var subscription = db.cdcPollBatchAsyncInternal("sub", 0L, 10).subscribe();
@@ -232,7 +232,7 @@ class CdcAsyncCancellationTest {
 	void cancellationDuringLatestValueFanOutClosesCursorAfterNativeResolution() throws Exception {
 		try (var db = new EmbeddedDB(tempDir.resolve("latest-values"), "cdc-cancel-latest-values", null)) {
 			long columnId = createColumn(db, "data");
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), true);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), true, java.util.OptionalLong.empty());
 			db.put(0, columnId, key(1), Buf.wrap(new byte[] {1}), RequestType.none());
 			var resolutionStarted = new CountDownLatch(1);
 			var releaseResolution = new CountDownLatch(1);
@@ -269,8 +269,8 @@ class CdcAsyncCancellationTest {
 		try (var db = new EmbeddedDB(tempDir.resolve("continuation"), "cdc-cancel-continuation", config)) {
 			long selected = createColumn(db, "selected");
 			long ignored = createColumn(db, "ignored");
-			long startSeq = db.cdcCreate("sub", null, List.of(selected), false);
-			long tx = db.openTransaction(10_000);
+			long startSeq = db.cdcCreate("sub", null, List.of(selected), false, java.util.OptionalLong.empty());
+			long tx = db.openTransaction( java.time.Duration.ofMillis(10_000));
 			for (int i = 0; i < 3; i++) {
 				db.put(tx, ignored, key(i), Buf.wrap(new byte[] {1}), RequestType.none());
 			}
@@ -301,7 +301,7 @@ class CdcAsyncCancellationTest {
 	void cancelledCommitRemainsMustCompleteAndHasNoCallerDeadline() throws Exception {
 		try (var db = new EmbeddedDB(tempDir.resolve("commit"), "cdc-cancel-commit", null)) {
 			long columnId = createColumn(db, "data");
-			db.cdcCreate("sub", 1L, List.of(columnId), false);
+			db.cdcCreate("sub", 1L, List.of(columnId), false, java.util.OptionalLong.empty());
 			var commitLoaded = new CountDownLatch(1);
 			var releaseCommit = new CountDownLatch(1);
 			db.setCdcMetadataLoadedObserverForTesting((operation, id) -> {
@@ -340,7 +340,7 @@ class CdcAsyncCancellationTest {
 		var databaseClosed = new AtomicBoolean();
 		try {
 			long columnId = createColumn(db, "data");
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			db.put(0, columnId, key(1), Buf.wrap(new byte[] {1}), RequestType.none());
 			subscription.set(db.cdcPollBatchAsyncInternal("sub", startSeq, 10).subscribe());
 			assertTrue(db.parserStarted.await(5, TimeUnit.SECONDS));

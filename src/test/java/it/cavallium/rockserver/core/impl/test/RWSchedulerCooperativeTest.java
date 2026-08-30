@@ -39,7 +39,7 @@ class RWSchedulerCooperativeTest {
 				var task = new FixedYieldTask(0);
 				var handle = scheduler.executor(profile,
 						OperationFamily.RANGE_PAGE,
-						RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+						Long.MAX_VALUE).executeCooperatively(task, 1L);
 				assertTrue(task.completed.await(5, SECONDS), profile + " task did not complete");
 				assertEventually(handle::isDisposed);
 				assertNull(task.failure.get());
@@ -60,7 +60,7 @@ class RWSchedulerCooperativeTest {
 			for (int i = 0; i < rejectedProfiles.length; i++) {
 				var executor = scheduler.executor(rejectedProfiles[i],
 						rejectedFamilies[i],
-						RequestContext.NO_DEADLINE);
+						Long.MAX_VALUE);
 				var failure = assertThrows(IllegalArgumentException.class,
 						() -> executor.executeCooperatively(new FixedYieldTask(0), 1L));
 				assertTrue(failure.getMessage().contains("ANALYTICAL, INGEST, or BATCH"));
@@ -82,7 +82,7 @@ class RWSchedulerCooperativeTest {
 				var task = new UncontendedChunkTask(32);
 				scheduler.executor(profile,
 						OperationFamily.RANGE_PAGE,
-						RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+						Long.MAX_VALUE).executeCooperatively(task, 1L);
 				assertTrue(task.completed.await(5, SECONDS), profile + " task did not complete");
 				assertEquals(32, task.completedChunks);
 				assertEquals(1, task.invocations,
@@ -102,7 +102,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			scheduler.executor(WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+					Long.MAX_VALUE).executeCooperatively(task, 1L);
 			assertTrue(task.completed.await(5, SECONDS));
 			assertFalse(task.preemptionObserved,
 					"the active ANALYTICAL task itself must not publish local queued competition");
@@ -121,14 +121,14 @@ class RWSchedulerCooperativeTest {
 		try {
 			var handle = scheduler.executor(WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,
-					RequestContext.NO_DEADLINE).executeCooperatively(analytical, 1L);
+					Long.MAX_VALUE).executeCooperatively(analytical, 1L);
 			assertTrue(analytical.parked.await(5, SECONDS));
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).parkedTasks() == 1);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).batchStartAllowance() >= 6);
 
 			var firstWaveStarted = new CountDownLatch(6);
 			var batch = scheduler.executor(
-					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			for (int i = 0; i < 6; i++) {
 				batch.execute(() -> {
 					firstWaveStarted.countDown();
@@ -190,7 +190,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			var analytical = scheduler.executor(WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			var parkedHandle = analytical.executeCooperatively(parked, 1L);
 			assertTrue(parked.parked.await(5, SECONDS));
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).batchStartAllowance() >= 6);
@@ -212,7 +212,7 @@ class RWSchedulerCooperativeTest {
 
 			var allBatchStarted = new CountDownLatch(6);
 			var batch = scheduler.executor(
-					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			for (int i = 0; i < 6; i++) {
 				batch.execute(() -> {
 					allBatchStarted.countDown();
@@ -243,7 +243,8 @@ class RWSchedulerCooperativeTest {
 		try {
 			var handle = scheduler.executor(WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,
-					System.currentTimeMillis() + 250L).executeCooperatively(task, 1L);
+					scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(250L)))
+					.executeCooperatively(task, 1L);
 			assertTrue(task.parked.await(5, SECONDS));
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).batchStartAllowance() >= 6);
 			assertTrue(task.completed.await(5, SECONDS));
@@ -269,7 +270,7 @@ class RWSchedulerCooperativeTest {
 		var task = new ParkThenBlockTask();
 		var handle = scheduler.executor(WorkloadProfile.ANALYTICAL,
 				OperationFamily.FULL_SCAN_AGGREGATE,
-				RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+				Long.MAX_VALUE).executeCooperatively(task, 1L);
 		try {
 			assertTrue(task.parked.await(5, SECONDS));
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).batchStartAllowance() >= 6);
@@ -297,7 +298,7 @@ class RWSchedulerCooperativeTest {
 			try {
 				var handle = scheduler.executor(WorkloadProfile.BATCH,
 						OperationFamily.RANGE_PAGE,
-						RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+						Long.MAX_VALUE).executeCooperatively(task, 1L);
 				assertTrue(task.parked.await(5, SECONDS));
 				assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).parkedTasks() == 1);
 
@@ -356,7 +357,7 @@ class RWSchedulerCooperativeTest {
 		var handles = new ArrayList<RWScheduler.CooperativeHandle>();
 		try {
 			var batch = scheduler.executor(
-					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			for (int i = 0; i < 4; i++) {
 				var scan = new SaturatingScanTask(
 						allScansStarted, scansCompleted, firstYieldedScanReclaimed, stop);
@@ -380,13 +381,13 @@ class RWSchedulerCooperativeTest {
 					System.currentTimeMillis() + SECONDS.toMillis(5)).execute(foreground);
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.POINT_LOOKUP,
-					RequestContext.NO_DEADLINE).execute(foreground);
+					Long.MAX_VALUE).execute(foreground);
 			scheduler.executor(WorkloadProfile.CDC,
 					OperationFamily.WAL_PAGE,
-					RequestContext.NO_DEADLINE).execute(foreground);
+					Long.MAX_VALUE).execute(foreground);
 			scheduler.executor(WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,
-					RequestContext.NO_DEADLINE).execute(foreground);
+					Long.MAX_VALUE).execute(foreground);
 			batch.execute(foreground);
 
 			assertTrue(foregroundStarted.await(2, SECONDS));
@@ -422,7 +423,7 @@ class RWSchedulerCooperativeTest {
 		var releaseWrite = new CountDownLatch(1);
 		try {
 			var batch = scheduler.executor(
-					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			for (int i = 0; i < 4; i++) {
 				var scan = new SaturatingScanTask(
 						allScansStarted, scansCompleted, new CountDownLatch(0), stop);
@@ -436,7 +437,7 @@ class RWSchedulerCooperativeTest {
 
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				writeStarted.countDown();
 				awaitUninterruptibly(releaseWrite);
 			});
@@ -475,11 +476,11 @@ class RWSchedulerCooperativeTest {
 		try {
 			var foregroundHandle = scheduler.executor(WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,
-					RequestContext.NO_DEADLINE).executeCooperatively(foreground, 1L);
+					Long.MAX_VALUE).executeCooperatively(foreground, 1L);
 			assertTrue(foreground.started.await(5, SECONDS));
 
 			var batch = scheduler.executor(
-					WorkloadProfile.BATCH, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.MUTATION, Long.MAX_VALUE);
 			for (int i = 0; i < 6; i++) {
 				batch.execute(() -> {
 					batchStarts.incrementAndGet();
@@ -511,14 +512,14 @@ class RWSchedulerCooperativeTest {
 	void parkedTaskResumesTheSameLogicalSubmissionAndCachesNoDeadlineViews() throws Exception {
 		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-park");
 		var executor = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		var task = new ParkOnceTask();
 		try {
 			assertSame(executor,
 					scheduler.executor(WorkloadProfile.BATCH,
 							OperationFamily.RANGE_PAGE,
-							RequestContext.NO_DEADLINE));
-			assertSame(scheduler.readExecutor(), scheduler.readExecutor());
+							Long.MAX_VALUE));
+			assertSame(scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE));
 
 			var handle = executor.executeCooperatively(task, 2L * 1024L * 1024L);
 			assertTrue(task.parked.await(5, SECONDS));
@@ -547,7 +548,7 @@ class RWSchedulerCooperativeTest {
 			var handle = scheduler.executor(
 					WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 2L * 1024L * 1024L);
+					Long.MAX_VALUE).executeCooperatively(task, 2L * 1024L * 1024L);
 			assertTrue(task.parked.await(5, SECONDS));
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).activeTasks() == 0);
 
@@ -570,7 +571,7 @@ class RWSchedulerCooperativeTest {
 	void duplicateCooperativeIdentityRemainsMappedAcrossParkCancelAndResume() throws Exception {
 		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "cooperative-duplicate-identity");
 		var executor = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		var task = new AlwaysParkTask();
 		try {
 			var first = executor.executeCooperatively(task, 1L);
@@ -605,7 +606,7 @@ class RWSchedulerCooperativeTest {
 		var tasks = new ArrayList<ParkOnceTask>();
 		var handles = new ArrayList<RWScheduler.CooperativeHandle>();
 		var executor = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			for (int i = 0; i < 2; i++) {
 				var task = new ParkOnceTask();
@@ -689,7 +690,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			var executor = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			executor.executeCooperatively(active, 1L);
 			assertTrue(active.started.await(5, SECONDS));
 			executor.executeCooperatively(parked, 1L);
@@ -710,11 +711,16 @@ class RWSchedulerCooperativeTest {
 	}
 
 	@Test
-	void cooperativeHandleDefaultCancelPreservesLegacyImplementors() {
+	void cooperativeHandleRequiresExplicitAtomicCancellation() {
 		var disposed = new AtomicBoolean();
 		RWScheduler.CooperativeHandle legacyHandle = new RWScheduler.CooperativeHandle() {
 			@Override
 			public void resume() {
+			}
+
+			@Override
+			public boolean cancel() {
+				return disposed.compareAndSet(false, true);
 			}
 
 			@Override
@@ -740,7 +746,7 @@ class RWSchedulerCooperativeTest {
 			var cancelled = new TerminalAuthorityTask(false);
 			var cancelledHandle = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(cancelled, 1L);
+					Long.MAX_VALUE).executeCooperatively(cancelled, 1L);
 			assertTrue(cancelled.entered.await(5, SECONDS));
 			assertTrue(cancelledHandle.cancel());
 			cancelled.release.countDown();
@@ -752,7 +758,7 @@ class RWSchedulerCooperativeTest {
 			var completed = new TerminalAuthorityTask(true);
 			var completedHandle = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(completed, 1L);
+					Long.MAX_VALUE).executeCooperatively(completed, 1L);
 			assertTrue(completed.entered.await(5, SECONDS));
 			completed.release.countDown();
 			assertTrue(completed.completionEntered.await(5, SECONDS));
@@ -786,7 +792,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			var handle = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+					Long.MAX_VALUE).executeCooperatively(task, 1L);
 
 			assertTrue(task.terminal.await(5, SECONDS));
 			assertTrue(task.failureSelected);
@@ -815,7 +821,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			var handle = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+					Long.MAX_VALUE).executeCooperatively(task, 1L);
 			task.release.countDown();
 
 			assertTrue(task.terminal.await(5, SECONDS));
@@ -844,7 +850,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			var handle = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+					Long.MAX_VALUE).executeCooperatively(task, 1L);
 			assertTrue(task.entered.await(5, SECONDS));
 			assertTrue(handle.cancel());
 			task.release.countDown();
@@ -872,17 +878,12 @@ class RWSchedulerCooperativeTest {
 		var task = new ThrowAfterTerminationTask(
 				new IllegalStateException("thrown after deadline"), true);
 		try {
-			long deadline = System.currentTimeMillis() + 100L;
+			long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(100L));
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
 					deadline).executeCooperatively(task, 1L);
 			assertTrue(task.entered.await(5, SECONDS));
-			// The immutable budget is bound from a millisecond wall-clock sample to
-			// nanoseconds. Cross the full quantization window before asking the active
-			// cooperative task to observe expiry.
-			while (System.currentTimeMillis() < deadline + 2L) {
-				Thread.onSpinWait();
-			}
+			Thread.sleep(105L);
 			task.release.countDown();
 
 			assertTrue(task.terminal.await(5, SECONDS));
@@ -912,7 +913,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			var handle = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+					Long.MAX_VALUE).executeCooperatively(task, 1L);
 			assertTrue(task.entered.await(5, SECONDS));
 			var shutdownThread = Thread.ofPlatform().start(scheduler::disposeNow);
 			shutdown.set(shutdownThread);
@@ -954,7 +955,7 @@ class RWSchedulerCooperativeTest {
 		var completed = new CountDownLatch(1);
 		scheduler.executor(WorkloadProfile.BATCH,
 				OperationFamily.RANGE_PAGE,
-				RequestContext.NO_DEADLINE).execute(completed::countDown);
+				Long.MAX_VALUE).execute(completed::countDown);
 		assertTrue(completed.await(5, SECONDS));
 	}
 
@@ -968,7 +969,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			var handle = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+					Long.MAX_VALUE).executeCooperatively(task, 1L);
 			assertTrue(task.failureSelected.await(5, SECONDS));
 			assertTrue(task.firstFailureSelected);
 			assertFalse(task.laterFailureSelected);
@@ -1017,7 +1018,7 @@ class RWSchedulerCooperativeTest {
 			assertTrue(blockerStarted.await(5, SECONDS));
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(probe, 2L * 1024L * 1024L);
+					Long.MAX_VALUE).executeCooperatively(probe, 2L * 1024L * 1024L);
 
 			probe.measureSchedulerIntervals(threads);
 			assertTrue(probe.completed.await(20, SECONDS));
@@ -1051,7 +1052,7 @@ class RWSchedulerCooperativeTest {
 				var task = new FixedYieldTask(7);
 				scheduler.executor(profile,
 						OperationFamily.RANGE_PAGE,
-						RequestContext.NO_DEADLINE).executeCooperatively(task, 2L * 1024L * 1024L);
+						Long.MAX_VALUE).executeCooperatively(task, 2L * 1024L * 1024L);
 				assertTrue(task.completed.await(5, SECONDS));
 				var profileTag = profile.name().toLowerCase(java.util.Locale.ROOT);
 				assertEventually(() -> registry.get("rockserver.workload.quantums")
@@ -1094,7 +1095,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			var handle = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 2L * 1024L * 1024L);
+					Long.MAX_VALUE).executeCooperatively(task, 2L * 1024L * 1024L);
 			assertTrue(task.parked.await(5, SECONDS));
 
 			scheduler.executor(WorkloadProfile.LATENCY,
@@ -1134,7 +1135,8 @@ class RWSchedulerCooperativeTest {
 		try {
 			scheduler.executor(WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,
-					System.currentTimeMillis() + 1_000L).executeCooperatively(task, 2L * 1024L * 1024L);
+					scheduler.bindTimeoutNanos(SECONDS.toNanos(1L)))
+					.executeCooperatively(task, 2L * 1024L * 1024L);
 			assertTrue(task.started.await(5, SECONDS));
 			assertTrue(task.completed.await(5, SECONDS));
 			assertTrue(task.failure.get() instanceof it.cavallium.rockserver.core.common.RocksDBException);
@@ -1170,12 +1172,12 @@ class RWSchedulerCooperativeTest {
 		try {
 			scheduler.executor(cooperativeProfile,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).executeCooperatively(task, 1L);
+					Long.MAX_VALUE).executeCooperatively(task, 1L);
 			assertTrue(task.started.await(5, SECONDS));
 
 			scheduler.executor(contenderProfile,
 					contenderFamily,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				contenderRan.set(true);
 				contenderCompleted.countDown();
 			});

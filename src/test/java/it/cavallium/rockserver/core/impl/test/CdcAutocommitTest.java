@@ -33,7 +33,7 @@ public class CdcAutocommitTest {
         try (var db = new EmbeddedConnection(dbDir, "cdc-autocommit", configFile)) {
             var colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
             var subId = "sub1";
-            long startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, null);
+            long startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, null, null, java.util.OptionalLong.empty());
 
             // Put 10 items
             for (int i = 0; i < 10; i++) {
@@ -122,7 +122,7 @@ public class CdcAutocommitTest {
 					ObjectList.of(ColumnHashType.ALLSAME8),
 					true));
 			String subscriptionId = "resolved-group";
-			long startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subscriptionId, null, List.of(columnId), true);
+			long startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subscriptionId, null, List.of(columnId), true, java.util.OptionalLong.empty());
 			putBucketSiblings(db, columnId);
 
 			var firstSequence = new java.util.concurrent.atomic.AtomicReference<Long>();
@@ -161,7 +161,7 @@ public class CdcAutocommitTest {
 					ObjectList.of(ColumnHashType.ALLSAME8),
 					true));
 			String subscriptionId = "resolved-group-ack";
-			long startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subscriptionId, null, List.of(columnId), true);
+			long startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subscriptionId, null, List.of(columnId), true, java.util.OptionalLong.empty());
 			putBucketSiblings(db, columnId);
 
 			var acknowledgments = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcStreamAck(

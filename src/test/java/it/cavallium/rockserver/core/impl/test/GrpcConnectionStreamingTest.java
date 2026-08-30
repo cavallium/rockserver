@@ -160,14 +160,12 @@ class GrpcConnectionStreamingTest {
 	@Test
 	void rangeVariantsUseTransportDeadlineAndTypedErrorMapping() throws InterruptedException {
 		expectReadDeadline(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
-				0, 29, null, null, false, RequestType.allInRange(), RANGE_TIMEOUT_MS));
+				0, 29, null, null, false, RequestType.allInRange()));
 		expectReadDeadline(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
-				0, 31, null, null, false, RequestType.allInRangeNoCache(), RANGE_TIMEOUT_MS));
+				0, 31, null, null, false, RequestType.allInRangeNoCache()));
 
 		assertEquals(1, service.rangeCalls.get());
 		assertEquals(1, service.noCacheRangeCalls.get());
-		assertEquals(RANGE_TIMEOUT_MS, service.rangePayloadTimeoutMs.get());
-		assertEquals(RANGE_TIMEOUT_MS, service.noCacheRangePayloadTimeoutMs.get());
 		assertTrue(service.rangeCancellations.await(5, TimeUnit.SECONDS),
 				"the server did not observe both streaming RPC deadline cancellations");
 	}
@@ -178,7 +176,7 @@ class GrpcConnectionStreamingTest {
 		var callbackCount = new AtomicInteger();
 		Flux<it.cavallium.rockserver.core.common.KV> range = Flux.from(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
 				0, STREAMING_RANGE_COLUMN_ID, null, null, false,
-				RequestType.allInRange(), Long.MAX_VALUE));
+				RequestType.allInRange()));
 		var cleanup = range
 				.doOnNext(_ -> {
 					callbackCount.incrementAndGet();
@@ -223,7 +221,7 @@ class GrpcConnectionStreamingTest {
 	void backpressuredCancellationReachesServerAndLeavesConnectionHealthy() throws Exception {
 		var range = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
 				0, CANCELLABLE_RANGE_COLUMN_ID, null, null, false,
-				RequestType.allInRange(), Long.MAX_VALUE);
+				RequestType.allInRange());
 
 		StepVerifier.create(range, 0)
 				.thenRequest(1)
@@ -315,8 +313,7 @@ class GrpcConnectionStreamingTest {
 		@Override
 		public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
 			return Mono.just(CapabilitiesResponse.newBuilder()
-					.setWorkloadContractVersion(2)
-					.setBoundedRange(true)
+					.setWorkloadContractVersion(3)
 					.build());
 		}
 
@@ -334,8 +331,6 @@ class GrpcConnectionStreamingTest {
 		private final AtomicInteger mergeDataFrames = new AtomicInteger();
 		private final AtomicInteger rangeCalls = new AtomicInteger();
 		private final AtomicInteger noCacheRangeCalls = new AtomicInteger();
-		private final AtomicLong rangePayloadTimeoutMs = new AtomicLong(-1);
-		private final AtomicLong noCacheRangePayloadTimeoutMs = new AtomicLong(-1);
 		private final CountDownLatch rangeCancellations = new CountDownLatch(2);
 		private final CountDownLatch cancellableRangeCancellation = new CountDownLatch(1);
 		private final CountDownLatch firstCleanupWriteStarted = new CountDownLatch(1);
@@ -398,7 +393,6 @@ class GrpcConnectionStreamingTest {
 		@Override
 		public Flux<KV> getAllInRange(GetRangeRequest request) {
 			rangeCalls.incrementAndGet();
-			rangePayloadTimeoutMs.set(request.getTimeoutMs());
 			if (request.getColumnId() == STREAMING_RANGE_COLUMN_ID) {
 				return Flux.range(0, RANGE_SIZE).map(RecordingService::kv);
 			}
@@ -414,7 +408,6 @@ class GrpcConnectionStreamingTest {
 		@Override
 		public Flux<KV> getAllInRangeNoCache(GetRangeRequest request) {
 			noCacheRangeCalls.incrementAndGet();
-			noCacheRangePayloadTimeoutMs.set(request.getTimeoutMs());
 			return neverCompletingRange();
 		}
 

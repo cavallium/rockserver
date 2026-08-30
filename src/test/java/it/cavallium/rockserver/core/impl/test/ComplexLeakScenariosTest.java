@@ -87,7 +87,7 @@ database: {
     void many_concurrent_ranges_with_random_cancellation_have_no_leaks() {
         List<Disposable> subs = new ArrayList<>();
         for (int i = 0; i < 32; i++) {
-            var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, (i % 2) == 0, RequestType.allInRange(), Duration.ofSeconds(5).toMillis());
+            var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, (i % 2) == 0, RequestType.allInRange());
             var sub = Flux.from(pub).take(1 + (i % 4)).subscribe();
             subs.add(sub);
         }
@@ -105,10 +105,10 @@ database: {
     void expired_tx_and_iterators_are_cleaned_up_without_waiting_scheduler() {
         var internal = db.getInternalDB();
         // Open a tx with tiny timeout so it expires immediately
-        long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(1);
+        long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(1));
         // Open an iterator with tiny timeout
         var key = new Keys(new Buf[]{Buf.wrap(intKey(1))});
-        long itId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(txId, colId, key, null, false, 1);
+        long itId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(txId, colId, key, null, false, java.time.Duration.ofMillis( 1));
         // Do not close them. Let them expire, then run immediate cleanup.
         sleep(5);
         invokeCleanup(internal);

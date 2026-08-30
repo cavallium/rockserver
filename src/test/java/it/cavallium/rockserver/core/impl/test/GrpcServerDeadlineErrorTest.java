@@ -79,7 +79,7 @@ class GrpcServerDeadlineErrorTest {
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				try {
 					var response = client.getAsyncApi(
-							it.cavallium.rockserver.core.common.RequestContext.batch(Instant.now().plusSeconds(2)))
+							it.cavallium.rockserver.core.common.RequestContext.batch(java.time.Duration.ofSeconds(2)))
 							.getColumnIdAsync("blocked");
 					assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 
@@ -107,7 +107,7 @@ class GrpcServerDeadlineErrorTest {
 						it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, 1L);
 				var api = client.getSyncApi(expired);
 				assertTrue(api.closeTransaction(11L, false));
-				assertEquals(it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE,
+				assertEquals(Long.MAX_VALUE,
 						backend.rollbackContextDeadline.get());
 				api.closeFailedUpdate(12L);
 				api.closeIterator(13L);
@@ -140,7 +140,8 @@ class GrpcServerDeadlineErrorTest {
 									.setValue(com.google.protobuf.ByteString.copyFrom(new byte[] {2})))
 							.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 									.setProfile(profile)
-									.setDeadlineEpochMillis(Long.MAX_VALUE))
+									.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE))
 							.build();
 					var error = assertThrows(io.grpc.StatusRuntimeException.class,
 							() -> it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc
@@ -167,8 +168,7 @@ class GrpcServerDeadlineErrorTest {
 							null,
 							null,
 							false,
-							RequestType.allInRangeNoCache(),
-							1_000)) {
+							RequestType.allInRangeNoCache())) {
 						range.toList();
 					}
 				});
@@ -198,8 +198,7 @@ class GrpcServerDeadlineErrorTest {
 						null,
 						null,
 						false,
-						RequestType.firstAndLast(),
-						1_000);
+						RequestType.firstAndLast());
 
 				assertTrue(backend.entered.await(5, java.util.concurrent.TimeUnit.SECONDS));
 				assertTrue(response.cancel(true));
@@ -241,8 +240,7 @@ class GrpcServerDeadlineErrorTest {
 						null,
 						null,
 						false,
-						RequestType.firstAndLast(),
-						1_000));
+						RequestType.firstAndLast()));
 
 				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
 			}
@@ -261,7 +259,6 @@ class GrpcServerDeadlineErrorTest {
 					.build();
 			try {
 				var request = it.cavallium.rockserver.core.common.api.proto.GetRangeRequest.newBuilder()
-						.setTimeoutMs(10_000)
 						.setContext(wireBatchContext())
 						.build();
 				it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newFutureStub(channel)
@@ -291,7 +288,6 @@ class GrpcServerDeadlineErrorTest {
 					.build();
 			try {
 				var request = it.cavallium.rockserver.core.common.api.proto.GetRangeRequest.newBuilder()
-						.setTimeoutMs(10_000)
 						.setContext(wireBatchContext())
 						.build();
 				it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc
@@ -343,11 +339,8 @@ class GrpcServerDeadlineErrorTest {
 				}
 			});
 
-			Method epochAccessor = resolved.getClass().getDeclaredMethod("deadlineEpochMillis");
-			epochAccessor.setAccessible(true);
 			Method monotonicAccessor = resolved.getClass().getDeclaredMethod("localMonotonicDeadlineNanos");
 			monotonicAccessor.setAccessible(true);
-			long deadlineEpochMillis = (long) epochAccessor.invoke(resolved);
 			long monotonicDeadlineNanos = (long) monotonicAccessor.invoke(resolved);
 			assertEquals(transportBudgetNanos, monotonicDeadlineNanos,
 					"the 123ns remainder must not be lost through an epoch-millisecond round trip");
@@ -357,7 +350,6 @@ class GrpcServerDeadlineErrorTest {
 			var failure = assertThrows(RocksDBException.class,
 					() -> scheduler.executor(WorkloadProfile.BATCH,
 							OperationFamily.METADATA,
-							deadlineEpochMillis,
 							monotonicDeadlineNanos).execute(() -> ran.set(true)));
 			assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, failure.getErrorUniqueId());
 			assertFalse(ran.get());
@@ -379,8 +371,7 @@ class GrpcServerDeadlineErrorTest {
 						null,
 						null,
 						false,
-						RequestType.firstAndLast(),
-						1_000);
+						RequestType.firstAndLast());
 				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 
 				var failure = assertThrows(ExecutionException.class,
@@ -403,7 +394,7 @@ class GrpcServerDeadlineErrorTest {
 			try (var client = GrpcConnection.forHostAndPort("grpc-exists-multi-deadline",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
-						0, 0, List.of(new it.cavallium.rockserver.core.common.Keys()), 1_000);
+						0, 0, List.of(new it.cavallium.rockserver.core.common.Keys()));
 				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 
 				var failure = assertThrows(ExecutionException.class,
@@ -427,9 +418,9 @@ class GrpcServerDeadlineErrorTest {
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var response = client.getAsyncApi(
 						it.cavallium.rockserver.core.common.RequestContext.batch(
-								Instant.now().plusMillis(500)))
+								java.time.Duration.ofMillis(500)))
 						.reduceRangeAsync(0, 0, null, null, false,
-								RequestType.firstAndLast(), 10_000);
+								RequestType.firstAndLast());
 				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 
 				var failure = assertThrows(ExecutionException.class,
@@ -448,7 +439,8 @@ class GrpcServerDeadlineErrorTest {
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireBatchContext() {
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-				.setDeadlineEpochMillis(it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE)
+				.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE)
 				.build();
 	}
 
@@ -461,7 +453,6 @@ class GrpcServerDeadlineErrorTest {
 					int.class,
 					int.class,
 					String.class,
-					LongSupplier.class,
 					LongSupplier.class);
 			factory.setAccessible(true);
 			return (RWScheduler) factory.invoke(null,
@@ -471,7 +462,6 @@ class GrpcServerDeadlineErrorTest {
 					8,
 					8,
 					name,
-					(LongSupplier) clock::epochMillis,
 					(LongSupplier) clock::nanoTime);
 		} catch (ReflectiveOperationException reflectionFailure) {
 			throw new AssertionError(reflectionFailure);
@@ -498,6 +488,8 @@ class GrpcServerDeadlineErrorTest {
 	}
 
 	private static final class SchedulerBackedConnection implements RocksDBConnection, InternalConnection {
+		@Override
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
 
 		private final RWScheduler scheduler;
 
@@ -522,7 +514,12 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {};
+			return new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+};
 		}
 
 		@Override
@@ -532,8 +529,18 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class DeadlineBackendConnection implements RocksDBConnection {
 
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
+
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {};
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
@@ -567,6 +574,11 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class CountingBackendConnection implements RocksDBConnection {
 
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
+
 		private final AtomicInteger operations = new AtomicInteger();
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
 			@Override
@@ -588,7 +600,12 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {};
+			return new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+};
 		}
 
 		@Override
@@ -598,11 +615,21 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class BlockingDeadlineBackendConnection implements RocksDBConnection {
 
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
+
 		private final CountDownLatch entered = new CountDownLatch(1);
 		private final CountDownLatch cancelObserved = new CountDownLatch(1);
 		private final CountDownLatch release = new CountDownLatch(1);
 		private final CountDownLatch finished = new CountDownLatch(1);
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
@@ -652,18 +679,26 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class RecordingTimeoutBackendConnection implements RocksDBConnection {
 
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
+
 		private final AtomicLong observedTimeoutMs = new AtomicLong(-1);
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
-				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?> range) {
-					observedTimeoutMs.set(range.timeoutMs());
+				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?>) {
 					return (RA) CompletableFuture.completedFuture(
 							new it.cavallium.rockserver.core.common.FirstAndLast<>(null, null));
 				}
-				if (request instanceof RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> range) {
-					observedTimeoutMs.set(range.timeoutMs());
+				if (request instanceof RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?>) {
 					return (RA) Flux.empty();
 				}
 				throw new UnsupportedOperationException("Unexpected request: " + request);
@@ -682,6 +717,7 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			observedTimeoutMs.set(TimeUnit.NANOSECONDS.toMillis(context.timeoutNanos()));
 			return asyncApi;
 		}
 
@@ -692,22 +728,27 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class CancellableNeverCompletingBackendConnection implements RocksDBConnection {
 
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
+
 		private final CountDownLatch entered = new CountDownLatch(1);
 		private final CountDownLatch cancelObserved = new CountDownLatch(1);
 		private final AtomicLong observedTimeoutMs = new AtomicLong(-1);
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
-				long timeoutMs;
-				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?> range) {
-					timeoutMs = range.timeoutMs();
-				} else if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti existsMulti) {
-					timeoutMs = existsMulti.timeoutMs();
-				} else {
+				if (!(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?>)
+						&& !(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti)) {
 					throw new UnsupportedOperationException("Unexpected request: " + request);
 				}
-				observedTimeoutMs.set(timeoutMs);
 				entered.countDown();
 				return (RA) new CompletableFuture<>() {
 					@Override
@@ -731,6 +772,7 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			observedTimeoutMs.set(TimeUnit.NANOSECONDS.toMillis(context.timeoutNanos()));
 			return asyncApi;
 		}
 
@@ -740,6 +782,11 @@ class GrpcServerDeadlineErrorTest {
 	}
 
 	private static final class ProtectedOperationBackendConnection implements RocksDBConnection {
+
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
 
 		private final AtomicBoolean rollback = new AtomicBoolean();
 		private final AtomicLong rollbackContextDeadline = new AtomicLong(-1L);
@@ -757,7 +804,7 @@ class GrpcServerDeadlineErrorTest {
 			return new RocksDBSyncAPI() {
 				@Override
 				public boolean closeTransaction(long transactionId, boolean commit) {
-					rollbackContextDeadline.set(context.deadlineEpochMillis());
+					rollbackContextDeadline.set(context.timeoutNanos());
 					rollback.set(transactionId == 11L && !commit);
 					return true;
 				}
@@ -781,7 +828,12 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {};
+			return new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+};
 		}
 
 		@Override
@@ -790,6 +842,11 @@ class GrpcServerDeadlineErrorTest {
 	}
 
 	private static final class GenericBlockingBackendConnection implements RocksDBConnection {
+
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
 
 		private final CountDownLatch entered = new CountDownLatch(1);
 		private final CountDownLatch release = new CountDownLatch(1);
@@ -820,7 +877,12 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {};
+			return new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+};
 		}
 
 		@Override

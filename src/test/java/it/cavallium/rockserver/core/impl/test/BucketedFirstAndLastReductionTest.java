@@ -59,10 +59,10 @@ class BucketedFirstAndLastReductionTest {
 			api.flush();
 
 			assertEndpoints(first, last,
-					api.reduceRange(0, columnId, null, null, false, RequestType.firstAndLast(), 10_000),
+					api.reduceRange(0, columnId, null, null, false, RequestType.firstAndLast()),
 					name + ", forward full range");
 			assertEndpoints(last, first,
-					api.reduceRange(0, columnId, null, null, true, RequestType.firstAndLast(), 10_000),
+					api.reduceRange(0, columnId, null, null, true, RequestType.firstAndLast()),
 					name + ", reverse full range");
 
 			assertEmpty(api.reduceRange(0,
@@ -70,8 +70,7 @@ class BucketedFirstAndLastReductionTest {
 					deletedTail.keys(),
 					afterDeletedTail,
 					false,
-					RequestType.firstAndLast(),
-					10_000), name + ", bounded empty physical bucket");
+					RequestType.firstAndLast()), name + ", bounded empty physical bucket");
 
 			api.delete(0, columnId, first.keys(), RequestType.none());
 			api.delete(0, columnId, last.keys(), RequestType.none());
@@ -82,8 +81,7 @@ class BucketedFirstAndLastReductionTest {
 					null,
 					null,
 					false,
-					RequestType.firstAndLast(),
-					10_000), name + ", logically empty full range");
+					RequestType.firstAndLast()), name + ", logically empty full range");
 		}
 	}
 

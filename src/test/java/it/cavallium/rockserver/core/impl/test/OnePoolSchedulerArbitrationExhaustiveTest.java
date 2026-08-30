@@ -90,7 +90,7 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 			}
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				observed.add(99);
 				completed.countDown();
 			});
@@ -188,7 +188,7 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 		var completed = new CountDownLatch(tasks.size());
 		try {
 			for (Task task : tasks) {
-				scheduler.executor(task.profile(), family(task.profile()), RequestContext.NO_DEADLINE)
+				scheduler.executor(task.profile(), family(task.profile()), Long.MAX_VALUE)
 						.execute(() -> {
 							observed.add(task.id());
 							completed.countDown();
@@ -256,7 +256,7 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 		var release = new CountDownLatch(1);
 		scheduler.executor(WorkloadProfile.BATCH,
 				OperationFamily.RANGE_PAGE,
-				RequestContext.NO_DEADLINE).execute(() -> {
+				Long.MAX_VALUE).execute(() -> {
 			started.countDown();
 			awaitUninterruptibly(release);
 		});

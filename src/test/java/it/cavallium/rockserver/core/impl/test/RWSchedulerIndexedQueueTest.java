@@ -54,16 +54,16 @@ class RWSchedulerIndexedQueueTest {
 		try {
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				blockerStarted.countDown();
 				awaitUninterruptibly(releaseBlocker);
 			});
 			assertTrue(blockerStarted.await(5, SECONDS));
 
 			var ingest = scheduler.scheduler(
-					WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, RequestContext.NO_DEADLINE);
+					WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, Long.MAX_VALUE);
 			var batch = scheduler.scheduler(
-					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			for (int i = 0; i < 4; i++) {
 				ingest.schedule(new EstimatedOrderTask(8L * 1024L * 1024L,
 						WorkloadProfile.INGEST, order, completed));
@@ -90,7 +90,7 @@ class RWSchedulerIndexedQueueTest {
 		var blockerStarted = new CountDownLatch(1);
 		var releaseBlocker = new CountDownLatch(1);
 		var view = scheduler.scheduler(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		var queued = new TerminalTask(() -> {});
 		var overloaded = new TerminalTask(() -> {});
 		try {
@@ -128,7 +128,7 @@ class RWSchedulerIndexedQueueTest {
 		try {
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				blockerStarted.countDown();
 				awaitUninterruptibly(releaseBlocker);
 			});
@@ -138,7 +138,7 @@ class RWSchedulerIndexedQueueTest {
 			while (System.currentTimeMillis() < deadline + 2L) Thread.onSpinWait();
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(() -> {});
+					Long.MAX_VALUE).execute(() -> {});
 
 			assertDeadlineFailure(expired);
 			assertEquals(1, expired.rejectionCount());
@@ -158,7 +158,7 @@ class RWSchedulerIndexedQueueTest {
 		var blockerStarted = new CountDownLatch(1);
 		var releaseBlocker = new CountDownLatch(1);
 		var view = scheduler.scheduler(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		var cancelled = new TerminalTask(() -> {});
 		try {
 			view.schedule(() -> {
@@ -187,7 +187,7 @@ class RWSchedulerIndexedQueueTest {
 		var blockerStarted = new CountDownLatch(1);
 		var interrupted = new CountDownLatch(1);
 		var view = scheduler.scheduler(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		var shutdown = new TerminalTask(() -> {});
 		try {
 			view.schedule(() -> {
@@ -225,7 +225,7 @@ class RWSchedulerIndexedQueueTest {
 			var blockerStarted = new CountDownLatch(1);
 			var releaseRace = new CountDownLatch(1);
 			var view = scheduler.scheduler(
-					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var terminal = new TerminalTask(() -> {});
 			try {
 				view.schedule(() -> {
@@ -291,13 +291,13 @@ class RWSchedulerIndexedQueueTest {
 		long raceMillis = System.currentTimeMillis() + 100L;
 		long deadline = pair.has(TerminalTrigger.DEADLINE)
 				? raceMillis
-				: RequestContext.NO_DEADLINE;
+				: Long.MAX_VALUE;
 		var view = scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, deadline);
 		var terminal = new LockCheckingTask(scheduler);
 		try {
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				blockerStarted.countDown();
 				try {
 					releaseBlocker.await();
@@ -365,7 +365,7 @@ class RWSchedulerIndexedQueueTest {
 		var releaseBlocker = new CountDownLatch(1);
 		var cancellationChecks = new AtomicInteger();
 		var view = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			view.execute(() -> {
 				blockerStarted.countDown();
@@ -414,7 +414,7 @@ class RWSchedulerIndexedQueueTest {
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		try {
 			scheduler.executor(
-						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
@@ -450,7 +450,7 @@ class RWSchedulerIndexedQueueTest {
 		try {
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				blockerStarted.countDown();
 				awaitUninterruptibly(releaseBlocker);
 			});
@@ -458,13 +458,13 @@ class RWSchedulerIndexedQueueTest {
 
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				order.add(WorkloadProfile.LATENCY);
 				completed.countDown();
 			});
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.POINT_LOOKUP,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				order.add(WorkloadProfile.INGEST);
 				completed.countDown();
 			});
@@ -503,7 +503,7 @@ class RWSchedulerIndexedQueueTest {
 				WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP, deadlineBase);
 		try {
 			scheduler.executor(
-						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
@@ -549,7 +549,7 @@ class RWSchedulerIndexedQueueTest {
 		var order = Collections.synchronizedList(new ArrayList<Integer>());
 		try {
 			scheduler.executor(
-						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
@@ -557,7 +557,7 @@ class RWSchedulerIndexedQueueTest {
 			assertTrue(blockerStarted.await(5, SECONDS));
 
 			var ingest = scheduler.executor(
-					WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, RequestContext.NO_DEADLINE);
+					WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, Long.MAX_VALUE);
 			for (int i = 0; i < 16; i++) {
 				int value = i;
 				ingest.execute(() -> {
@@ -586,7 +586,7 @@ class RWSchedulerIndexedQueueTest {
 			scheduler.executor(
 						WorkloadProfile.ANALYTICAL,
 						OperationFamily.FULL_SCAN_AGGREGATE,
-						RequestContext.NO_DEADLINE)
+						Long.MAX_VALUE)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
@@ -622,7 +622,7 @@ class RWSchedulerIndexedQueueTest {
 		var earlier = new TerminalTask(() -> {});
 		try {
 			scheduler.executor(
-						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
@@ -643,7 +643,7 @@ class RWSchedulerIndexedQueueTest {
 
 			Thread.sleep(350L);
 			scheduler.executor(
-						WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, RequestContext.NO_DEADLINE)
+						WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, Long.MAX_VALUE)
 					.execute(() -> {});
 
 			assertDeadlineFailure(earlier);
@@ -668,7 +668,7 @@ class RWSchedulerIndexedQueueTest {
 			scheduler.executor(
 						WorkloadProfile.ANALYTICAL,
 						OperationFamily.FULL_SCAN_AGGREGATE,
-						RequestContext.NO_DEADLINE)
+						Long.MAX_VALUE)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
@@ -709,7 +709,7 @@ class RWSchedulerIndexedQueueTest {
 		var order = Collections.synchronizedList(new ArrayList<WorkloadProfile>());
 		try {
 			scheduler.executor(
-						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
@@ -751,7 +751,7 @@ class RWSchedulerIndexedQueueTest {
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		try {
 			var batch = scheduler.executor(
-					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			for (int i = 0; i < 2; i++) {
 				batch.execute(() -> {
 					batchStarted.countDown();
@@ -762,7 +762,7 @@ class RWSchedulerIndexedQueueTest {
 			scheduler.executor(
 						WorkloadProfile.ANALYTICAL,
 						OperationFamily.FULL_SCAN_AGGREGATE,
-						RequestContext.NO_DEADLINE)
+						Long.MAX_VALUE)
 					.execute(() -> {
 						analyticalStarted.countDown();
 						awaitUninterruptibly(releaseAnalytical);
@@ -776,10 +776,10 @@ class RWSchedulerIndexedQueueTest {
 						System.currentTimeMillis() + SECONDS.toMillis(30))
 					.execute(() -> record("latency", order, reservedDone));
 			scheduler.executor(
-						WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, RequestContext.NO_DEADLINE)
+						WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, Long.MAX_VALUE)
 					.execute(() -> record("ingest", order, reservedDone));
 			scheduler.executor(
-						WorkloadProfile.CDC, OperationFamily.WAL_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE)
 					.execute(() -> record("cdc", order, reservedDone));
 
 			releaseAnalytical.countDown();
@@ -808,7 +808,7 @@ class RWSchedulerIndexedQueueTest {
 		try {
 			pressured.setStoragePressure(true);
 			var batch = pressured.executor(
-					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			batch.execute(() -> {
 				firstStarted.countDown();
 				awaitUninterruptibly(releaseFirst);
@@ -838,7 +838,7 @@ class RWSchedulerIndexedQueueTest {
 		var queued = new TerminalTask(() -> {});
 		var overloaded = new TerminalTask(() -> {});
 		var view = overloadedScheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			view.execute(() -> {
 				blockerStarted.countDown();
@@ -876,7 +876,7 @@ class RWSchedulerIndexedQueueTest {
 		var first = new EqualTerminalTask();
 		var second = new EqualTerminalTask();
 		var view = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			view.execute(() -> {
 				blockerStarted.countDown();
@@ -911,11 +911,11 @@ class RWSchedulerIndexedQueueTest {
 		var releaseBlocker = new CountDownLatch(1);
 		var repeated = new RepeatedTask(2);
 		var batchRange = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		var batchPoint = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.POINT_LOOKUP, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.POINT_LOOKUP, Long.MAX_VALUE);
 		var ingestPoint = scheduler.executor(
-				WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, RequestContext.NO_DEADLINE);
+				WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, Long.MAX_VALUE);
 		try {
 			batchRange.execute(() -> {
 				blockerStarted.countDown();
@@ -987,7 +987,7 @@ class RWSchedulerIndexedQueueTest {
 		var releaseBlocker = new CountDownLatch(1);
 		var task = new LockCheckingTask(scheduler);
 		var view = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			view.execute(() -> {
 				blockerStarted.countDown();
@@ -1017,7 +1017,7 @@ class RWSchedulerIndexedQueueTest {
 		var releaseBlocker = new CountDownLatch(1);
 		var ran = new AtomicBoolean();
 		var view = scheduler.scheduler(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			view.schedule(() -> {
 				blockerStarted.countDown();
@@ -1050,7 +1050,7 @@ class RWSchedulerIndexedQueueTest {
 		var release = new CountDownLatch(1);
 		var completed = new CountDownLatch(1);
 		var view = scheduler.scheduler(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			var running = view.schedule(() -> {
 				started.countDown();
@@ -1089,7 +1089,7 @@ class RWSchedulerIndexedQueueTest {
 		var firstRan = new AtomicBoolean();
 		var secondRan = new AtomicBoolean();
 		var view = scheduler.scheduler(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		var worker = view.createWorker();
 		try {
 			view.schedule(() -> {
@@ -1129,7 +1129,7 @@ class RWSchedulerIndexedQueueTest {
 		var blockerStarted = new CountDownLatch(1);
 		var releaseBlocker = new CountDownLatch(1);
 		var view = scheduler.scheduler(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		var worker = view.createWorker();
 		var queued = new TerminalTask(() -> {});
 		try {
@@ -1169,7 +1169,7 @@ class RWSchedulerIndexedQueueTest {
 		var cancellationChecks = new AtomicInteger();
 		var task = new InspectionProbeTask(cancellationChecks, ran);
 		var view = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			view.execute(() -> {
 				blockerStarted.countDown();
@@ -1206,14 +1206,14 @@ class RWSchedulerIndexedQueueTest {
 		CompletableFuture<Void> shutdown = null;
 		try {
 			scheduler.executor(
-						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
 					});
 			assertTrue(blockerStarted.await(5, SECONDS));
 			scheduler.executor(
-						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(queued);
 
 			shutdown = CompletableFuture.runAsync(scheduler::dispose);
@@ -1248,7 +1248,7 @@ class RWSchedulerIndexedQueueTest {
 		var ran = new CountDownLatch(1);
 		scheduler.executor(WorkloadProfile.BATCH,
 				OperationFamily.RANGE_PAGE,
-				RequestContext.NO_DEADLINE).execute(ran::countDown);
+				Long.MAX_VALUE).execute(ran::countDown);
 		assertTrue(ran.await(5, SECONDS));
 		scheduler.disposeNow();
 
@@ -1267,7 +1267,7 @@ class RWSchedulerIndexedQueueTest {
 		var queued = new TerminalTask(() -> {});
 		try {
 			scheduler.executor(
-						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(() -> {
 						started.countDown();
 						try {
@@ -1279,7 +1279,7 @@ class RWSchedulerIndexedQueueTest {
 					});
 			assertTrue(started.await(5, SECONDS));
 			scheduler.executor(
-						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE)
+						WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(queued);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
 
@@ -1310,7 +1310,7 @@ class RWSchedulerIndexedQueueTest {
 			int count,
 			List<WorkloadProfile> order,
 			CountDownLatch completed) {
-		var executor = scheduler.executor(profile, family, RequestContext.NO_DEADLINE);
+		var executor = scheduler.executor(profile, family, Long.MAX_VALUE);
 		for (int i = 0; i < count; i++) {
 			executor.execute(() -> {
 				order.add(profile);

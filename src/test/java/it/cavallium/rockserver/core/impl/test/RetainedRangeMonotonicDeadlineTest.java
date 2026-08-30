@@ -72,7 +72,6 @@ class RetainedRangeMonotonicDeadlineTest {
 					null,
 					false,
 					RequestType.allInRange(),
-					120_000L,
 					context,
 					WorkloadProfile.BATCH)).collectList().toFuture();
 			assertTrue(firstChunk.await(5, SECONDS));
@@ -88,7 +87,6 @@ class RetainedRangeMonotonicDeadlineTest {
 					null,
 					false,
 					RequestType.allInRange(),
-					120_000L,
 					context,
 					WorkloadProfile.BATCH)).collectList().toFuture();
 			assertTrue(awaitCondition(() -> db.getRetainedRangeWaiterCount() == 1, 5_000L));
@@ -140,7 +138,6 @@ class RetainedRangeMonotonicDeadlineTest {
 					null,
 					false,
 					RequestType.allInRange(),
-					120_000L,
 					context,
 					WorkloadProfile.BATCH)).collectList().toFuture();
 			assertTrue(firstChunk.await(5, SECONDS));
@@ -196,7 +193,6 @@ class RetainedRangeMonotonicDeadlineTest {
 					int.class,
 					int.class,
 					String.class,
-					LongSupplier.class,
 					LongSupplier.class);
 			factory.setAccessible(true);
 			return (RWScheduler) factory.invoke(null,
@@ -206,7 +202,6 @@ class RetainedRangeMonotonicDeadlineTest {
 					8,
 					8,
 					name,
-					(LongSupplier) clock::epochMillis,
 					(LongSupplier) clock::nanoTime);
 		} catch (ReflectiveOperationException reflectionFailure) {
 			throw new AssertionError(reflectionFailure);

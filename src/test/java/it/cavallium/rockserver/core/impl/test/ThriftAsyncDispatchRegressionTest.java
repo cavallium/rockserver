@@ -30,6 +30,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.ServerSocket;
+import java.time.Duration;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -67,7 +68,7 @@ class ThriftAsyncDispatchRegressionTest {
 
 		assertEquals(expected, api.get(0, 1, key(1), RequestType.current()));
 		api.put(0, 1, key(1), expected, RequestType.none());
-		assertEquals(41L, api.openTransaction(10_000));
+		assertEquals(41L, api.openTransaction( java.time.Duration.ofMillis(10_000)));
 		assertEquals(3, connection.syncRequests.size());
 		assertEquals(0, connection.asyncRequests.size());
 
@@ -75,7 +76,7 @@ class ThriftAsyncDispatchRegressionTest {
 		assertEquals(42L, api.createColumn("classified", ColumnSchema.of(
 				IntList.of(Integer.BYTES), ObjectList.of(), true)));
 		api.deleteRange(1, key(1), key(2));
-		assertEquals(List.of(false), api.existsMulti(0, 1, List.of(key(1)), 10_000));
+		assertEquals(List.of(false), api.existsMulti(0, 1, List.of(key(1))));
 		api.mergeBatch(1, Flux.empty(), MergeBatchMode.MERGE_WRITE_BATCH);
 
 		assertEquals(4, connection.syncRequests.size(),
@@ -96,7 +97,7 @@ class ThriftAsyncDispatchRegressionTest {
 		assertEquals(it.cavallium.rockserver.core.common.OperationFamily.WAL_PAGE,
 				new RocksDBAPICommand.CdcGetEarliestAvailableSequence().operationFamily());
 		assertEquals(37L, api.cdcGetEarliestAvailableSequence());
-		assertEquals(41L, api.cdcCreate("prefixless", 0L, null, false));
+		assertEquals(41L, api.cdcCreate("prefixless", 0L, null, false, java.util.OptionalLong.empty()));
 
 		assertTrue(connection.syncRequests.isEmpty());
 		assertEquals(List.of(
@@ -136,11 +137,12 @@ class ThriftAsyncDispatchRegressionTest {
 						error.getErrorUniqueId());
 
 				var finite = it.cavallium.rockserver.core.common.RequestContext.batch(
-						java.time.Instant.now().plusSeconds(30));
-				long transactionId = client.getSyncApi(finite).openTransaction(10_000L);
-				assertEquals(finite.deadlineEpochMillis(), connection.lastApiContextDeadline.get());
+						java.time.Duration.ofSeconds(30));
+				long transactionId = client.getSyncApi(finite).openTransaction( java.time.Duration.ofMillis(10_000L));
+				assertTrue(connection.lastApiContextDeadline.get() > 0L);
+				assertTrue(connection.lastApiContextDeadline.get() <= finite.timeoutNanos());
 				assertTrue(client.getSyncApi(expired).closeTransaction(transactionId, false));
-				assertEquals(it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE,
+				assertEquals(Long.MAX_VALUE,
 						connection.lastApiContextDeadline.get());
 			}
 		}
@@ -213,12 +215,12 @@ class ThriftAsyncDispatchRegressionTest {
 			try (var client = new ThriftConnection("thrift-running-cancel", "127.0.0.1", port)) {
 				var api = client.getAsyncApi(
 						it.cavallium.rockserver.core.common.RequestContext.batch());
-				var opened = api.openIteratorAsync(0, 1, key(0), null, false, 10_000);
+				var opened = api.openIteratorAsync(0, 1, key(0), null, false, java.time.Duration.ofMillis( 10_000));
 				boolean cancelled;
 				try {
 					assertTrue(connection.openIteratorRequested.await(5, SECONDS));
 					cancelled = opened.cancel(true);
-					var queued = api.openTransactionAsync(10_000);
+					var queued = api.openTransactionAsync( java.time.Duration.ofMillis(10_000));
 					assertTrue(queued.cancel(true),
 							"a queued transport call must be removable before it acquires a socket");
 				} finally {
@@ -349,7 +351,7 @@ class ThriftAsyncDispatchRegressionTest {
 		var connection = new TrackingConnection();
 		var api = ThriftServer.createDispatchingSyncApiForTesting(connection);
 		var request = new RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator(
-				0, 1, key(0), null, false, 10_000);
+				0, 1, key(0), null, false, Duration.ofSeconds(10));
 
 		var invocation = new AtomicReference<InterruptedInvocation>();
 		var thread = Thread.ofPlatform().name("interrupted-thrift-open-iterator").unstarted(() ->
@@ -418,7 +420,6 @@ class ThriftAsyncDispatchRegressionTest {
 					int.class,
 					int.class,
 					String.class,
-					LongSupplier.class,
 					LongSupplier.class);
 			factory.setAccessible(true);
 			return (RWScheduler) factory.invoke(null,
@@ -428,7 +429,6 @@ class ThriftAsyncDispatchRegressionTest {
 					8,
 					8,
 					name,
-					(LongSupplier) clock::epochMillis,
 					(LongSupplier) clock::nanoTime);
 		} catch (ReflectiveOperationException reflectionFailure) {
 			throw new AssertionError(reflectionFailure);
@@ -466,6 +466,8 @@ class ThriftAsyncDispatchRegressionTest {
 	}
 
 	private static final class BoundaryJumpConnection implements RocksDBConnection, InternalConnection {
+		@Override
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
 
 		private final RWScheduler scheduler;
 		private final MutableClock clock;
@@ -502,7 +504,12 @@ class ThriftAsyncDispatchRegressionTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {};
+			return new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+};
 		}
 
 		@Override
@@ -517,6 +524,11 @@ class ThriftAsyncDispatchRegressionTest {
 	}
 
 	private static final class TrackingConnection implements RocksDBConnection {
+
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
 
 		private final List<Class<?>> syncRequests = new CopyOnWriteArrayList<>();
 		private final List<Class<?>> asyncRequests = new CopyOnWriteArrayList<>();
@@ -546,6 +558,11 @@ class ThriftAsyncDispatchRegressionTest {
 		};
 
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
@@ -595,13 +612,13 @@ class ThriftAsyncDispatchRegressionTest {
 
 		@Override
 		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			lastApiContextDeadline.set(context.deadlineEpochMillis());
+			lastApiContextDeadline.set(context.timeoutNanos());
 			return syncApi;
 		}
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			lastApiContextDeadline.set(context.deadlineEpochMillis());
+			lastApiContextDeadline.set(context.timeoutNanos());
 			return asyncApi;
 		}
 

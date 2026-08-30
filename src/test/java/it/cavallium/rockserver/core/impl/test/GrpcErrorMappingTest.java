@@ -124,8 +124,7 @@ class GrpcErrorMappingTest {
 					null,
 					null,
 					false,
-					RequestType.allInRangeNoCache(),
-					1_000)) {
+					RequestType.allInRangeNoCache())) {
 				range.toList();
 			}
 		});
@@ -140,8 +139,7 @@ class GrpcErrorMappingTest {
 		@Override
 		public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
 			return Mono.just(CapabilitiesResponse.newBuilder()
-					.setWorkloadContractVersion(2)
-					.setBoundedRange(true)
+					.setWorkloadContractVersion(3)
 					.build());
 		}
 

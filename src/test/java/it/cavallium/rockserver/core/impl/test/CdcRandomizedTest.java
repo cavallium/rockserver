@@ -56,7 +56,7 @@ class CdcRandomizedTest {
 				null
 		);
 		columnId = db.createColumn("data", schema);
-		subscriptionStart = db.cdcCreate(subId, null, List.of(columnId), false);
+		subscriptionStart = db.cdcCreate(subId, null, List.of(columnId), false, java.util.OptionalLong.empty());
 	}
 
 	@AfterEach
@@ -135,7 +135,7 @@ class CdcRandomizedTest {
 	                                List<Mutation> expectedEvents,
 	                                Map<Integer, byte[]> expectedState,
 	                                long seed) {
-		long transactionId = db.openTransaction(5_000);
+		long transactionId = db.openTransaction( java.time.Duration.ofMillis(5_000));
 		boolean closed = false;
 		try {
 			for (Mutation mutation : mutations) {

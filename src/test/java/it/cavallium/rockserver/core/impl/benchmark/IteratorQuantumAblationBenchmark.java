@@ -106,9 +106,9 @@ public final class IteratorQuantumAblationBenchmark {
 				long idleColumn = populate(sync, "idle", entries, valueBytes);
 				long competitiveColumn = populate(sync,
 						"competitive", PAGE_ITEMS, COMPETITIVE_VALUE_BYTES);
-				long idleIterator = sync.openIterator(0L, idleColumn, new Keys(), null, false, 60_000L);
+				long idleIterator = sync.openIterator(0L, idleColumn, new Keys(), null, false, java.time.Duration.ofMillis( 60_000L));
 				long competitiveIterator = sync.openIterator(
-						0L, competitiveColumn, new Keys(), null, false, 60_000L);
+						0L, competitiveColumn, new Keys(), null, false, java.time.Duration.ofMillis( 60_000L));
 				try {
 					var idle = measureIdle(connection,
 							sync,
@@ -483,7 +483,7 @@ public final class IteratorQuantumAblationBenchmark {
 			var blockersCompleted = new CountDownLatch(2);
 			var latencyExecutor = scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			for (int blocker = 0; blocker < 2; blocker++) {
 				latencyExecutor.execute(() -> {
 					blockersStarted.countDown();
@@ -501,7 +501,7 @@ public final class IteratorQuantumAblationBenchmark {
 				var completed = new CompletableFuture<Long>();
 				if (mechanism == CompetitiveMechanism.LEGACY) {
 					scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE,
-							RequestContext.NO_DEADLINE).execute(() -> {
+							Long.MAX_VALUE).execute(() -> {
 						try {
 							started.countDown();
 							await(release);
@@ -517,7 +517,7 @@ public final class IteratorQuantumAblationBenchmark {
 					long nanos = mechanism == CompetitiveMechanism.ONE_STEP ? ONE_STEP_NANOS : PAGE_NANOS;
 					var task = new BoundedScanTask(started, release, completed, bytes, nanos, mechanism);
 					scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE,
-							RequestContext.NO_DEADLINE).executeCooperatively(task, bytes);
+							Long.MAX_VALUE).executeCooperatively(task, bytes);
 				}
 
 				await(started);

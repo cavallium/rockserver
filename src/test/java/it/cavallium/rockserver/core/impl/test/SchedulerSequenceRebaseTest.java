@@ -97,7 +97,7 @@ class SchedulerSequenceRebaseTest {
 			forceNextSequence(scheduler, Long.MAX_VALUE - 1L);
 			var ingest = scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			ingest.execute(() -> record(0, observed, completed));
 			ingest.executeCooperatively(new CompletingCooperativeTask(1, observed, completed), 1L);
 			ingest.execute(() -> record(2, observed, completed));
@@ -155,7 +155,7 @@ class SchedulerSequenceRebaseTest {
 		try {
 			var batch = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			batch.execute(queuedCompleted::countDown);
 			batch.execute(queuedCompleted::countDown);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)
@@ -282,7 +282,7 @@ class SchedulerSequenceRebaseTest {
 			ingest.executeCooperatively(cooperative, 1L);
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				foregroundStarted.countDown();
 				awaitUninterruptibly(releaseForeground);
 			});
@@ -352,7 +352,7 @@ class SchedulerSequenceRebaseTest {
 		var release = new CountDownLatch(1);
 		scheduler.executor(WorkloadProfile.BATCH,
 				OperationFamily.RANGE_PAGE,
-				RequestContext.NO_DEADLINE).execute(() -> {
+				Long.MAX_VALUE).execute(() -> {
 			started.countDown();
 			awaitUninterruptibly(release);
 		});

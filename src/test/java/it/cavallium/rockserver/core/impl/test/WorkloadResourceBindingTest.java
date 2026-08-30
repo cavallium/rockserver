@@ -169,7 +169,7 @@ class WorkloadResourceBindingTest {
 				}
 			});
 			try {
-				var request = async.existsMultiAsync(0, columnId, keys, 30_000);
+				var request = async.existsMultiAsync(0, columnId, keys);
 				assertTrue(firstChunkFinished.await(5, TimeUnit.SECONDS));
 				assertFalse(request.cancel(true),
 						"a running native chunk must finish cleanup before cancellation becomes terminal");
@@ -193,8 +193,8 @@ class WorkloadResourceBindingTest {
 			var batch = embedded.getSyncApi(RequestContext.batch());
 			long columnId = batch.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			long transactionId = latency.openTransaction(1);
-			long iteratorId = latency.openIterator(0, columnId, null, null, false, 1);
+			long transactionId = latency.openTransaction(Duration.ofMillis(1));
+			long iteratorId = latency.openIterator(0, columnId, null, null, false, Duration.ofMillis(1));
 			Thread.sleep(20);
 
 			var cleanupTransactions = fixtureMethod("cleanupExpiredTransactionsNow");
@@ -207,8 +207,8 @@ class WorkloadResourceBindingTest {
 			assertRocksFailure(() -> latency.get(transactionId, columnId, key(1), RequestType.current()));
 			assertRocksFailure(() -> latency.seekTo(iteratorId, key(1)));
 
-			latency.openTransaction(30_000);
-			latency.openIterator(0, columnId, null, null, false, 30_000);
+			latency.openTransaction(Duration.ofSeconds(30));
+			latency.openIterator(0, columnId, null, null, false, Duration.ofSeconds(30));
 		} finally {
 			// closeTesting asserts that shutdown leaves no transactions, iterators, or
 			// resource leases behind. Profiles are fields of those registrations, so
@@ -380,7 +380,8 @@ class WorkloadResourceBindingTest {
 		}
 
 		long openTransaction(long timeoutMs) {
-			return asyncMode ? async.openTransactionAsync(timeoutMs).join() : sync.openTransaction(timeoutMs);
+			var leaseTtl = Duration.ofMillis(timeoutMs);
+			return asyncMode ? async.openTransactionAsync(leaseTtl).join() : sync.openTransaction(leaseTtl);
 		}
 
 		boolean closeTransaction(long transactionId, boolean commit) {
@@ -435,14 +436,15 @@ class WorkloadResourceBindingTest {
 
 		List<Boolean> existsMulti(long transactionId, long columnId, List<Keys> keys) {
 			return asyncMode
-					? async.existsMultiAsync(transactionId, columnId, keys, 10_000).join()
-					: sync.existsMulti(transactionId, columnId, keys, 10_000);
+					? async.existsMultiAsync(transactionId, columnId, keys).join()
+					: sync.existsMulti(transactionId, columnId, keys);
 		}
 
 		long openIterator(long transactionId, long columnId) {
 			return asyncMode
-					? async.openIteratorAsync(transactionId, columnId, null, null, false, 30_000).join()
-					: sync.openIterator(transactionId, columnId, null, null, false, 30_000);
+					? async.openIteratorAsync(transactionId, columnId, null, null, false,
+							Duration.ofSeconds(30)).join()
+					: sync.openIterator(transactionId, columnId, null, null, false, Duration.ofSeconds(30));
 		}
 
 		void closeIterator(long iteratorId) {

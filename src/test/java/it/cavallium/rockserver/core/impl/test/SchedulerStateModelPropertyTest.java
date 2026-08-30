@@ -68,7 +68,7 @@ class SchedulerStateModelPropertyTest {
 		var blockerPermits = new Semaphore(0);
 		var blockersStarted = new CountDownLatch(3);
 		var batchExecutor = scheduler.executor(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			for (int index = 0; index < 3; index++) {
 				long id = -1L - index;
@@ -106,7 +106,7 @@ class SchedulerStateModelPropertyTest {
 			for (var spec : specs) {
 				assertEquals(SchedulerReferenceModel.Admission.ACCEPTED, model.submit(spec, 0L));
 				long actualDeadline = spec.deadline() == Long.MAX_VALUE
-						? RequestContext.NO_DEADLINE
+						? Long.MAX_VALUE
 						: actualDeadlineBase + spec.deadline();
 				var task = new OrderedTask(spec, actualOrder, completed);
 				handles.add(scheduler.scheduler(spec.profile(), family(spec.profile()), actualDeadline).schedule(task));
@@ -160,7 +160,7 @@ class SchedulerStateModelPropertyTest {
 			model.submit(new SchedulerReferenceModel.Spec(-1L,
 					WorkloadProfile.BATCH, Long.MAX_VALUE, 1, false), 0L);
 			model.dispatch(0L, true);
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				started.countDown();
 				await(release);
 			});
@@ -170,12 +170,12 @@ class SchedulerStateModelPropertyTest {
 				assertEquals(SchedulerReferenceModel.Admission.ACCEPTED,
 						model.submit(new SchedulerReferenceModel.Spec(
 								id, WorkloadProfile.BATCH, Long.MAX_VALUE, 1, false), 0L));
-				scheduler.readExecutor().execute(() -> {});
+				scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {});
 			}
 			assertEquals(SchedulerReferenceModel.Admission.OVERLOAD,
 					model.submit(new SchedulerReferenceModel.Spec(
 							2L, WorkloadProfile.BATCH, Long.MAX_VALUE, 1, false), 0L));
-			var overload = assertThrows(RocksDBException.class, () -> scheduler.readExecutor().execute(() -> {}));
+			var overload = assertThrows(RocksDBException.class, () -> scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {}));
 			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, overload.getErrorUniqueId());
 
 			long now = System.currentTimeMillis();
@@ -199,7 +199,7 @@ class SchedulerStateModelPropertyTest {
 		var release = new CountDownLatch(1);
 		var ran = new CountDownLatch(1);
 		var view = scheduler.scheduler(WorkloadProfile.BATCH,
-				OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			model.submit(new SchedulerReferenceModel.Spec(1L,
 					WorkloadProfile.BATCH, Long.MAX_VALUE, 1, false), 0L);
@@ -252,7 +252,7 @@ class SchedulerStateModelPropertyTest {
 		var task = new ScriptedCooperativeTask(actions, fail);
 		model.submit(new SchedulerReferenceModel.Spec(
 				1L, WorkloadProfile.BATCH, Long.MAX_VALUE, 1, fail), 0L);
-		var handle = scheduler.readExecutor().executeCooperatively(task, 1L);
+		var handle = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).executeCooperatively(task, 1L);
 		boolean cancelled = false;
 		try {
 			for (int actionIndex = 0; actionIndex < actions.size(); actionIndex++) {

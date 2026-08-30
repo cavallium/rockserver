@@ -246,7 +246,7 @@ database: {
 			var api = testDB.getAPI();
 
 			String subId = "resolved-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null, true);
+			long startSeq = api.cdcCreate(subId, null, null, true, java.util.OptionalLong.empty());
 
 			// Use a dedicated column with merge operator enabled via fallback config
 			long mergeColId = api.createColumn("resolved-col-" + name,
@@ -276,14 +276,14 @@ database: {
 			Assertions.assertEquals(2, events.size());
 			CDCEvent ev1 = events.get(0);
 			CDCEvent ev2 = events.get(1);
-			
+
 			// With emitLatestValues=true, all events are resolved to the current value (Initial,-Patched)
 			// and emitted as PUT operations (replacing MERGE).
 			Buf expected = Buf.wrap("Initial,-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
-			
+
 			Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
 			assertSegmentEquals(expected, ev1.value());
-			
+
 			Assertions.assertEquals(CDCEvent.Op.PUT, ev2.op());
 			assertSegmentEquals(expected, ev2.value());
 		}
@@ -378,7 +378,7 @@ database: {
 			Assertions.assertTrue(api.get(0, colId, key2, RequestType.exists()));
 
 			var rolledBackKey = getNotFoundKeyI(100);
-			long rollbackTransaction = api.openTransaction(5_000);
+			long rollbackTransaction = api.openTransaction( java.time.Duration.ofMillis(5_000));
 			Assertions.assertTrue(api.putMulti(rollbackTransaction,
 					colId,
 					List.of(rolledBackKey),
@@ -390,7 +390,7 @@ database: {
 			Assertions.assertFalse(api.get(0, colId, rolledBackKey, RequestType.exists()));
 
 			var committedKey = getNotFoundKeyI(101);
-			long commitTransaction = api.openTransaction(5_000);
+			long commitTransaction = api.openTransaction( java.time.Duration.ofMillis(5_000));
 			Assertions.assertTrue(api.putMulti(commitTransaction,
 					colId,
 					List.of(committedKey),
@@ -595,21 +595,21 @@ database: {
 			var lastKey = getKVSequenceLast().keys();
 			var prevLastKV = getKVSequence().get(getKVSequence().size() - 2);
 			if (getSchemaVarKeys().isEmpty()) {
-				FirstAndLast<KV> firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+				FirstAndLast<KV> firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast());
 				Assertions.assertNull(firstAndLast.first(), "First should be empty because the db is empty");
 				Assertions.assertNull(firstAndLast.last(), "Last should be empty because the db is empty");
 
 				fillSomeKeys();
 
-				firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+				firstAndLast = db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast());
 				Assertions.assertEquals(getKVSequenceFirst(), firstAndLast.first(), "First key mismatch");
 				Assertions.assertEquals(prevLastKV, firstAndLast.last(), "Last key mismatch");
 
-				firstAndLast = db.reduceRange(0, colId, firstKey, firstKey, false, RequestType.firstAndLast(), 1000);
+				firstAndLast = db.reduceRange(0, colId, firstKey, firstKey, false, RequestType.firstAndLast());
 				Assertions.assertNull(firstAndLast.first(), "First should be empty because the range is empty");
 				Assertions.assertNull(firstAndLast.last(), "Last should be empty because the range is empty");
 			} else {
-				db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast(), 1000);
+				db.reduceRange(0, colId, firstKey, lastKey, false, RequestType.firstAndLast());
 			}
 		}
 	}
@@ -627,14 +627,14 @@ database: {
 			var rangeEndKeyIncl = getKVSequence().get(initIndex + count - 1);
 			System.out.println("[DEBUG_LOG] " + this.getClass().getName() + " VarKeys: " + getSchemaVarKeys());
 			if (getSchemaVarKeys().isEmpty()) {
-				var results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange(), 1000).toList();
+				var results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), false, RequestType.allInRange()).toList();
 				Assertions.assertEquals(0, results.size(), "Results count must be 0");
 
 				fillSomeKeys();
 
 				boolean reverse = false;
 				while (true) {
-					results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), reverse, RequestType.allInRange(), 1000).toList();
+					results = db.getRange(0, colId, rangeInitKey.keys(), rangeEndKeyExcl.keys(), reverse, RequestType.allInRange()).toList();
 
 					var expectedResults = getKVSequence().stream().skip(initIndex).limit(count).collect(Collectors.toCollection(ArrayList::new));
 					if (reverse) {
@@ -660,7 +660,7 @@ database: {
 				// For hashed keys, strictly verify full content via full scan
 				fillSomeKeys();
 				if (connection.method() != ConnectionMethod.THRIFT) {
-					var allResults = db.getRange(0, colId, null, null, false, RequestType.allInRange(), 10000).toList();
+					var allResults = db.getRange(0, colId, null, null, false, RequestType.allInRange()).toList();
 					// Range scans on hashed keys are problematic or not fully implemented in some backends.
 					// We only verify if we got results, otherwise warn or skip.
 					if (!allResults.isEmpty()) {
@@ -951,19 +951,19 @@ database: {
 
 		try (var testDB = new TestDB(db, connection)) {
 			var api = testDB.getAPI();
-			
+
 			// 1. Create CDC subscription
 			// Use a unique ID to avoid conflicts if parallel tests run (though DBTest usually sequential per instance)
 			String subId = "sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
-			
+			long startSeq = api.cdcCreate(subId, null, null, null, java.util.OptionalLong.empty());
+
 			// 2. Put data
 			fillSomeKeys();
-			
+
 			// 3. Consume via stream
 			// We expect 3 events from fillSomeKeys
 			int expectedEvents = 3;
-			
+
    List<CDCEvent> events = api.cdcStream(subId,
                             new it.cavallium.rockserver.core.common.cdc.CdcStreamOptions(
                                     startSeq,
@@ -975,10 +975,10 @@ database: {
                     .take(expectedEvents)
                     .collectList()
                     .block(Duration.ofSeconds(10));
-			
+
 			Assertions.assertNotNull(events);
 			Assertions.assertEquals(expectedEvents, events.size());
-			
+
 			// Verify sequence strictly increasing
 			long lastSeq = startSeq - 1;
 			for (CDCEvent ev : events) {
@@ -987,7 +987,7 @@ database: {
 				Assertions.assertEquals(colId, ev.columnId());
 				Assertions.assertEquals(CDCEvent.Op.PUT, ev.op());
 			}
-			
+
 			// 4. Commit last
 			api.cdcCommit(subId, lastSeq);
 		}
@@ -1006,7 +1006,7 @@ database: {
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 
 			String subId = "merge-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
+			long startSeq = api.cdcCreate(subId, null, null, null, java.util.OptionalLong.empty());
 
 			var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
 			var val1 = Buf.wrap("Initial".getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -1066,12 +1066,12 @@ database: {
 		try (var testDB = new TestDB(db, connection)) {
 			var api = testDB.getAPI();
 			String subId = "robust-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
+			long startSeq = api.cdcCreate(subId, null, null, null, java.util.OptionalLong.empty());
 
 			int countBatch1 = 50;
 			int countBatch2 = 50;
 			var kvSequence = getKVSequence();
-			
+
 			// 1. Put batch 1
 			for (int i = 0; i < countBatch1; i++) {
 				var kv = kvSequence.get(i);
@@ -1147,7 +1147,7 @@ database: {
 		try (var testDB = new TestDB(db, connection)) {
 			var api = testDB.getAPI();
 			String subId = "proc-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
+			long startSeq = api.cdcCreate(subId, null, null, null, java.util.OptionalLong.empty());
 
 			int count = 20;
 			var kvSequence = getKVSequence();
@@ -1176,7 +1176,7 @@ database: {
 			// Wait a tiny bit to allow the commit of the last batch to potentially complete (async)
 			Thread.sleep(200);
 			disposable.dispose();
-			
+
 			Assertions.assertTrue(finished, "Did not process all events in time");
 		}
 	}
@@ -1192,7 +1192,7 @@ database: {
 			var api = testDB.getAPI();
 
 			String subId = "ack-sub-" + name.replaceAll("[^a-zA-Z0-9]", "-");
-			long startSeq = api.cdcCreate(subId, null, null);
+			long startSeq = api.cdcCreate(subId, null, null, null, java.util.OptionalLong.empty());
 
 			int total = 20;
 			var kvSequence = getKVSequence();
@@ -1249,7 +1249,7 @@ database: {
 			var api = testDB.getAPI();
 			String subId = "complex-merge-" + name.replaceAll("[^a-zA-Z0-9]", "-");
 			// Use resolved=true to see merge results
-			long startSeq = api.cdcCreate(subId, null, null, true);
+			long startSeq = api.cdcCreate(subId, null, null, true, java.util.OptionalLong.empty());
 
 			// Create specific column to ensure merge operator is active and we control schema
 			long mColId = api.createColumn("complex-merge-col-" + name,
@@ -1286,7 +1286,7 @@ database: {
 			Assertions.assertEquals(3, events.size());
 			// With resolved=true, all events reflect the CURRENT state of the key.
 			String expectedValue = "Start,Middle,End";
-			
+
 			// Ev 1: PUT Start -> Resolved to Current
 			Assertions.assertEquals(CDCEvent.Op.PUT, events.get(0).op());
 			Assertions.assertEquals(expectedValue, new String(events.get(0).value().toByteArray()));

@@ -573,12 +573,11 @@ public final class GrpcOverloadBenchmark {
 		client.blockingWithDeadline().put(requests.foregroundWrites()[0][0]);
 		client.blockingWithDeadline().put(requests.maintenanceWrites()[0][0]);
 		long transactionId = client.blockingWithDeadline().openTransaction(OpenTransactionRequest.newBuilder()
-				.setTimeoutMs(DEADLINE_MILLIS)
+				.setTransactionLeaseTtlNanos(TimeUnit.MILLISECONDS.toNanos(DEADLINE_MILLIS))
 				.setContext(wireContext(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH))
 				.build()).getTransactionId();
 		var rollback = client.blockingWithDeadline().closeTransaction(CloseTransactionRequest.newBuilder()
 				.setTransactionId(transactionId)
-				.setTimeoutMs(DEADLINE_MILLIS)
 				.setCommit(false)
 				.setContext(wireContext(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH))
 				.build());
@@ -598,7 +597,8 @@ public final class GrpcOverloadBenchmark {
 			it.cavallium.rockserver.core.common.api.proto.WorkloadProfile profile) {
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfile(profile)
-				.setDeadlineEpochMillis(Long.MAX_VALUE - 1L)
+				.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE - 1L)
 				.build();
 	}
 
@@ -898,7 +898,7 @@ public final class GrpcOverloadBenchmark {
 		Pacer pacer = new Pacer(options.controlRate(), options.controlWorkers(), worker);
 		var context = wireContext(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH);
 		var open = OpenTransactionRequest.newBuilder()
-				.setTimeoutMs(DEADLINE_MILLIS)
+				.setTransactionLeaseTtlNanos(TimeUnit.MILLISECONDS.toNanos(DEADLINE_MILLIS))
 				.setContext(context)
 				.build();
 		control.ready.countDown();
@@ -912,7 +912,6 @@ public final class GrpcOverloadBenchmark {
 				long transactionId = client.blockingWithDeadline().openTransaction(open).getTransactionId();
 				var closed = client.blockingWithDeadline().closeTransaction(CloseTransactionRequest.newBuilder()
 						.setTransactionId(transactionId)
-						.setTimeoutMs(DEADLINE_MILLIS)
 						.setCommit(false)
 						.setContext(context)
 						.build());
@@ -2756,11 +2755,13 @@ public final class GrpcOverloadBenchmark {
 		private static Requests create(long columnId, Options options) {
 			var latencyContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY)
-					.setDeadlineEpochMillis(Long.MAX_VALUE - 1L)
+					.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE - 1L)
 					.build();
 			var analyticalContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.ANALYTICAL)
-					.setDeadlineEpochMillis(Long.MAX_VALUE - 1L)
+					.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE - 1L)
 					.build();
 			GetRequest[] points = new GetRequest[Math.min(options.pointRequestCount(), options.preloadKeys())];
 			for (int index = 0; index < points.length; index++) {
@@ -2792,7 +2793,6 @@ public final class GrpcOverloadBenchmark {
 						.setColumnId(columnId)
 						.addStartKeysInclusive(first)
 						.addEndKeysExclusive(keyByteString(end))
-						.setTimeoutMs(DEADLINE_MILLIS)
 						.setContext(latencyContext);
 				latencyRanges[index] = new RangeCase(baseRequest.build(), first, last);
 				analyticalRanges[index] = new RangeCase(
@@ -2831,7 +2831,8 @@ public final class GrpcOverloadBenchmark {
 									.setValue(ByteString.copyFrom(valueBytes(valueBytes, key))))
 							.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 									.setProfile(profile)
-									.setDeadlineEpochMillis(Long.MAX_VALUE))
+									.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE))
 							.build();
 				}
 			}

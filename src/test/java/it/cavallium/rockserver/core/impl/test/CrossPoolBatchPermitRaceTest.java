@@ -29,7 +29,7 @@ class CrossPoolBatchPermitRaceTest {
 		var readBatchRan = new AtomicBoolean();
 		var readBatchExecutor = scheduler.executor(WorkloadProfile.BATCH,
 				OperationFamily.RANGE_PAGE,
-				RequestContext.NO_DEADLINE);
+				Long.MAX_VALUE);
 		Runnable readBatch = () -> readBatchRan.set(true);
 		try {
 			scheduler.setStoragePressure(true);
@@ -45,7 +45,7 @@ class CrossPoolBatchPermitRaceTest {
 
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				writeBatchStarted.countDown();
 				awaitUninterruptibly(releaseWriteBatch);
 				writeBatchCompleted.countDown();
@@ -65,7 +65,7 @@ class CrossPoolBatchPermitRaceTest {
 
 			CompletableFuture.runAsync(() -> scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(foregroundCompleted::countDown)).get(1, SECONDS);
+					Long.MAX_VALUE).execute(foregroundCompleted::countDown)).get(1, SECONDS);
 			assertTrue(foregroundCompleted.await(1, SECONDS),
 					"new foreground submission must dispatch while the other pool still holds the permit");
 			assertFalse(readBatchRan.get(), "the cancelled losing BATCH candidate must never execute");
@@ -117,10 +117,10 @@ class CrossPoolBatchPermitRaceTest {
 			});
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(readWorkCompleted::countDown);
+					Long.MAX_VALUE).execute(readWorkCompleted::countDown);
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				readForegroundStarted.countDown();
 				readWorkCompleted.countDown();
 			});
@@ -131,7 +131,7 @@ class CrossPoolBatchPermitRaceTest {
 
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				writeBatchStarted.countDown();
 				awaitUninterruptibly(releaseWriteBatch);
 				writeBatchCompleted.countDown();
@@ -159,7 +159,7 @@ class CrossPoolBatchPermitRaceTest {
 			var permitProbeCompleted = new CountDownLatch(1);
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(permitProbeCompleted::countDown);
+					Long.MAX_VALUE).execute(permitProbeCompleted::countDown);
 			assertTrue(permitProbeCompleted.await(1, SECONDS),
 					"a subsequent pressured BATCH must acquire the fully conserved global permit");
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
@@ -185,7 +185,7 @@ class CrossPoolBatchPermitRaceTest {
 			var family = profile == WorkloadProfile.CDC
 					? OperationFamily.WAL_PAGE
 					: OperationFamily.RANGE_PAGE;
-			scheduler.executor(profile, family, RequestContext.NO_DEADLINE)
+			scheduler.executor(profile, family, Long.MAX_VALUE)
 					.execute(completed::countDown);
 			assertTrue(completed.await(5, SECONDS), "failed to prime DRR through " + profile);
 		}

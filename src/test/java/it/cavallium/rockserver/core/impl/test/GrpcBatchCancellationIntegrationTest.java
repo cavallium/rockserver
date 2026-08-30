@@ -67,7 +67,7 @@ class GrpcBatchCancellationIntegrationTest {
 			int writeWorkers = scheduler.poolSnapshot(RWScheduler.Pool.WRITE).workerCount();
 			var writesStarted = new CountDownLatch(writeWorkers);
 			for (int index = 0; index < writeWorkers; index++) {
-				scheduler.writeExecutor().execute(() -> {
+				scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.INGEST, it.cavallium.rockserver.core.common.OperationFamily.MUTATION, Long.MAX_VALUE).execute(() -> {
 					writesStarted.countDown();
 					awaitUninterruptibly(releaseWrites);
 				});

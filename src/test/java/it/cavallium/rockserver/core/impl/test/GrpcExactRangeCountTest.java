@@ -73,8 +73,7 @@ class GrpcExactRangeCountTest {
 							null,
 							null,
 							true,
-							RequestType.entriesCount(),
-							10_000).get(10, TimeUnit.SECONDS);
+							RequestType.entriesCount()).get(10, TimeUnit.SECONDS);
 					assertEquals(BUCKETED_ENTRY_COUNT, bucketedCount);
 					assertEquals(1, iteratorOpens.get(),
 							"remote bucket count must use one native iterator");
@@ -87,8 +86,7 @@ class GrpcExactRangeCountTest {
 							null,
 							null,
 							false,
-							RequestType.firstAndLast(),
-							10_000).get(10, TimeUnit.SECONDS);
+							RequestType.firstAndLast()).get(10, TimeUnit.SECONDS);
 					assertEquals(intKey(0), endpoints.first().keys());
 					assertEquals(intKey(VALUE_ENTRY_COUNT - 1), endpoints.last().keys());
 					assertEquals(1, iteratorOpens.get(),
@@ -103,8 +101,7 @@ class GrpcExactRangeCountTest {
 							null,
 							null,
 							false,
-							RequestType.allInRange(),
-							10_000))
+							RequestType.allInRange()))
 							.map(kv -> kv.value())
 							.collectList()
 							.block(Duration.ofSeconds(20));
@@ -121,8 +118,7 @@ class GrpcExactRangeCountTest {
 							null,
 							null,
 							false,
-							RequestType.allInRange(),
-							10_000))
+							RequestType.allInRange()))
 							.map(kv -> kv.value())
 							.collectList()
 							.block();
@@ -137,8 +133,7 @@ class GrpcExactRangeCountTest {
 							null,
 							null,
 							true,
-							RequestType.allInRange(),
-							10_000))
+							RequestType.allInRange()))
 							.map(kv -> kv.value())
 							.collectList()
 							.block();
@@ -156,8 +151,7 @@ class GrpcExactRangeCountTest {
 				null,
 				null,
 				reverse,
-				RequestType.entriesCount(),
-				10_000);
+				RequestType.entriesCount());
 	}
 
 	private static Keys intKey(int value) {

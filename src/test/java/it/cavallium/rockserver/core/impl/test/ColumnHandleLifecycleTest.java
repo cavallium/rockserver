@@ -100,7 +100,7 @@ class ColumnHandleLifecycleTest {
 	void deleteWaitsForExplicitIteratorLease() throws Exception {
 		String name = "iterator-use";
 		long columnId = db.createColumn(name, SCHEMA);
-		long iteratorId = db.openIterator(0L, columnId, null, null, false, 30_000L);
+		long iteratorId = db.openIterator(0L, columnId, null, null, false, java.time.Duration.ofMillis( 30_000L));
 		Future<?> deletion = executor.submit(() -> db.deleteColumn(columnId));
 
 		try {
@@ -129,8 +129,7 @@ class ColumnHandleLifecycleTest {
 				null,
 				null,
 				false,
-				RequestType.allInRange(),
-				30_000L))
+				RequestType.allInRange()))
 				.doOnNext(_ -> {
 					if (blockOnce.compareAndSet(false, true)) {
 						firstItem.countDown();

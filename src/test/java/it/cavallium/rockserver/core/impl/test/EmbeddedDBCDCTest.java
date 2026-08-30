@@ -45,7 +45,7 @@ public class EmbeddedDBCDCTest {
     @Test
     public void testCDCStandardBehavior() throws Exception {
         String subId = "sub1";
-        long startSeq = db.cdcCreate(subId, 0L, List.of(colId), false);
+        long startSeq = db.cdcCreate(subId, 0L, List.of(colId), false, java.util.OptionalLong.empty());
 
         Keys key = new Keys(Buf.wrap("key_0001".getBytes(StandardCharsets.UTF_8)));
         Buf val1 = Buf.wrap("val1".getBytes(StandardCharsets.UTF_8));
@@ -55,13 +55,13 @@ public class EmbeddedDBCDCTest {
         db.put(0, colId, key, val2, RequestType.none());
 
         List<CDCEvent> events = db.cdcPoll(subId, startSeq, 100).toList();
-        
+
         Assertions.assertEquals(2, events.size());
-        
+
         CDCEvent ev1 = events.get(0);
         Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
         Assertions.assertEquals("val1", new String(ev1.value().asArray(), StandardCharsets.UTF_8));
-        
+
         CDCEvent ev2 = events.get(1);
         Assertions.assertEquals(CDCEvent.Op.PUT, ev2.op());
         Assertions.assertEquals("val2", new String(ev2.value().asArray(), StandardCharsets.UTF_8));
@@ -70,7 +70,7 @@ public class EmbeddedDBCDCTest {
     @Test
     public void testCDCEmitLatestValuesBehavior() throws Exception {
         String subId = "sub2";
-        long startSeq = db.cdcCreate(subId, 0L, List.of(colId), true);
+        long startSeq = db.cdcCreate(subId, 0L, List.of(colId), true, java.util.OptionalLong.empty());
 
         Keys key = new Keys(Buf.wrap("keyLatst".getBytes(StandardCharsets.UTF_8)));
         Buf val1 = Buf.wrap("v1".getBytes(StandardCharsets.UTF_8));
@@ -80,14 +80,14 @@ public class EmbeddedDBCDCTest {
         db.put(0, colId, key, val2, RequestType.none());
 
         List<CDCEvent> events = db.cdcPoll(subId, startSeq, 100).toList();
-        
+
         Assertions.assertEquals(2, events.size());
-        
+
         // Both events should point to the latest value "v2"
         CDCEvent ev1 = events.get(0);
         Assertions.assertEquals(CDCEvent.Op.PUT, ev1.op());
         Assertions.assertEquals("v2", new String(ev1.value().asArray(), StandardCharsets.UTF_8));
-        
+
         CDCEvent ev2 = events.get(1);
         Assertions.assertEquals(CDCEvent.Op.PUT, ev2.op());
         Assertions.assertEquals("v2", new String(ev2.value().asArray(), StandardCharsets.UTF_8));
@@ -96,7 +96,7 @@ public class EmbeddedDBCDCTest {
     @Test
     public void testCDCEmitLatestValuesMixedKeys() throws Exception {
         String subId = "sub3";
-        long startSeq = db.cdcCreate(subId, 0L, List.of(colId), true);
+        long startSeq = db.cdcCreate(subId, 0L, List.of(colId), true, java.util.OptionalLong.empty());
 
         Keys k1 = new Keys(Buf.wrap("key_0001".getBytes(StandardCharsets.UTF_8)));
         Keys k2 = new Keys(Buf.wrap("key_0002".getBytes(StandardCharsets.UTF_8)));
@@ -120,10 +120,10 @@ public class EmbeddedDBCDCTest {
     @Test
     public void testCDCEmitLatestValuesBucketedSupported() throws Exception {
         long bucketColId = db.createColumn("bucketed", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(ColumnHashType.XXHASH32), true));
-        
+
         String subId = "sub4";
         // emitLatestValues = true
-        long startSeq = db.cdcCreate(subId, 0L, List.of(bucketColId), true);
+        long startSeq = db.cdcCreate(subId, 0L, List.of(bucketColId), true, java.util.OptionalLong.empty());
 
         // Bucketed column key: 1 fixed (Long.BYTES=8) + 1 variable (hashed XXHASH32)
         Keys key = new Keys(Buf.wrap("fixedkey".getBytes(StandardCharsets.UTF_8)), Buf.wrap("variable".getBytes(StandardCharsets.UTF_8)));
@@ -136,18 +136,18 @@ public class EmbeddedDBCDCTest {
         List<CDCEvent> events = db.cdcPoll(subId, startSeq, 100).toList();
 
         Assertions.assertEquals(2, events.size());
-        
+
         // Since we now support resolution for bucketed columns, both events should
         // resolve to the LATEST state of the bucket.
         // Also, we expect "Real Keys" (Fixed + Variable concatenated), not Raw/Hashed keys.
-        
+
         CDCEvent ev1 = events.get(0);
         CDCEvent ev2 = events.get(1);
-        
+
         // Value should be "b2" (the latest value), not the bucket blob
         Assertions.assertEquals("b2", new String(ev1.value().asArray(), StandardCharsets.UTF_8));
         Assertions.assertEquals("b2", new String(ev2.value().asArray(), StandardCharsets.UTF_8));
-        
+
         // Key should be "fixedkey" + "variable"
         String expectedKey = "fixedkey" + "variable";
         Assertions.assertEquals(expectedKey, new String(ev1.key().asArray(), StandardCharsets.UTF_8));

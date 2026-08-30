@@ -75,12 +75,12 @@ class WorkloadProfileLifecycleIntegrationTest {
 				"embedded-profile-lifecycle", config)) {
 			var batch = connection.getSyncApi(RequestContext.batch());
 			var ingest = connection.getSyncApi(RequestContext.ingest());
-			var latency = connection.getSyncApi(RequestContext.latency(Duration.ofSeconds(5)));
+			var latency = connection.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(5)));
 			var analytical = connection.getSyncApi(RequestContext.analytical());
 
 			long columnId = batch.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			batch.cdcCreate("lifecycle", null, null);
+			batch.cdcCreate("lifecycle", null, null, null, java.util.OptionalLong.empty());
 			ingest.put(0, columnId, key(1), value(1), RequestType.none());
 			assertEquals(value(1), latency.get(0, columnId, key(1), RequestType.current()));
 			assertEquals(1L, analytical.reduceRange(0,
@@ -88,12 +88,11 @@ class WorkloadProfileLifecycleIntegrationTest {
 					null,
 					null,
 					false,
-					RequestType.entriesCount(),
-					5_000));
+					RequestType.entriesCount()));
 
-			long transactionId = batch.openTransaction(5_000);
+			long transactionId = batch.openTransaction( java.time.Duration.ofMillis(5_000));
 			batch.closeTransaction(transactionId, false);
-			long iteratorId = batch.openIterator(0, columnId, new Keys(), null, false, 5_000);
+			long iteratorId = batch.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 5_000));
 			batch.closeIterator(iteratorId);
 
 			List<CDCEvent> events;
@@ -147,13 +146,13 @@ class WorkloadProfileLifecycleIntegrationTest {
 			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 					overload.getErrorUniqueId());
 
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("latency", order, reservedDone));
 			scheduler.executor(RequestContext.ingest(), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("ingest", order, reservedDone));
 			scheduler.executor(WorkloadProfile.CDC,
 					OperationFamily.WAL_PAGE,
-					RequestContext.NO_DEADLINE)
+					Long.MAX_VALUE)
 					.execute(() -> record("cdc", order, reservedDone));
 
 			releaseAnalytical.countDown();
@@ -188,7 +187,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 			scheduler.setStoragePressure(true);
 			scheduler.executor(WorkloadProfile.PHYSICAL_MAINTENANCE,
 					OperationFamily.FLUSH,
-					RequestContext.NO_DEADLINE)
+					Long.MAX_VALUE)
 					.execute(physicalDone::countDown);
 			batch.execute(() -> {
 				firstBatchStarted.countDown();
@@ -202,19 +201,19 @@ class WorkloadProfileLifecycleIntegrationTest {
 			});
 			batch.execute(recoveredBatchDone::countDown);
 
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(dataProgress::countDown);
 			scheduler.executor(RequestContext.ingest(), OperationFamily.MUTATION)
 					.execute(dataProgress::countDown);
 			scheduler.executor(WorkloadProfile.CDC,
 					OperationFamily.WAL_PAGE,
-					RequestContext.NO_DEADLINE)
+					Long.MAX_VALUE)
 					.execute(dataProgress::countDown);
 			scheduler.executor(RequestContext.analytical(), OperationFamily.FULL_SCAN_AGGREGATE)
 					.execute(dataProgress::countDown);
 			scheduler.executor(WorkloadProfile.CONTROL,
 					OperationFamily.CONTROL,
-					RequestContext.NO_DEADLINE)
+					Long.MAX_VALUE)
 					.execute(controlDone::countDown);
 
 			assertTrue(dataProgress.await(5, SECONDS),

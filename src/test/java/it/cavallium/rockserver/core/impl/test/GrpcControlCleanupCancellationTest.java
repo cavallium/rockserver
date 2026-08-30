@@ -143,18 +143,18 @@ class GrpcControlCleanupCancellationTest {
 		long columnId = sync.createColumn("protected-cleanup",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 		sync.put(0, columnId, key(1), Buf.wrap(new byte[] {1}), RequestType.none());
-		long transactionId = sync.openTransaction(TimeUnit.MINUTES.toMillis(1));
+		long transactionId = sync.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 		long iteratorId = async.openIteratorAsync(0,
 				columnId,
 				new Keys(),
 				null,
-				false,
-				TimeUnit.MINUTES.toMillis(1)).get(5, TimeUnit.SECONDS);
+				false, java.time.Duration.ofMillis(
+				TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 		long updateId = sync.get(0, columnId, key(1), RequestType.forUpdate()).updateId();
 		var scheduler = embeddedConnection.getScheduler();
 		var controlExecutor = scheduler.executor(WorkloadProfile.CONTROL,
 				OperationFamily.CONTROL,
-				RequestContext.NO_DEADLINE);
+				Long.MAX_VALUE);
 		var blockedControl = blockLane(2, controlExecutor::execute);
 		try {
 			var rollback = async.closeTransactionAsync(transactionId, false);
@@ -186,7 +186,7 @@ class GrpcControlCleanupCancellationTest {
 		var client = newClient();
 		var sync = client.getSyncApi(RequestContext.batch());
 		var async = client.getAsyncApi(RequestContext.batch());
-		long transactionId = sync.openTransaction(TimeUnit.MINUTES.toMillis(1));
+		long transactionId = sync.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 		var scheduler = embeddedConnection.getScheduler();
 		var ingestWriteExecutor = scheduler.executor(RequestContext.ingest(), OperationFamily.MUTATION);
 		var blockedWrite = blockLane(3, ingestWriteExecutor::execute);
@@ -213,8 +213,8 @@ class GrpcControlCleanupCancellationTest {
 		replaceServer(recordingBackend);
 		var client = newClient();
 		long transactionId = client.getSyncApi(RequestContext.batch())
-				.openTransaction(TimeUnit.MINUTES.toMillis(1));
-		var expiredCallerContext = RequestContext.batch(Instant.ofEpochMilli(1));
+				.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
+		var expiredCallerContext = RequestContext.batch(java.time.Duration.ofNanos(1));
 
 		assertTrue(client.getAsyncApi(expiredCallerContext)
 				.closeTransactionAsync(transactionId, false)
@@ -222,7 +222,7 @@ class GrpcControlCleanupCancellationTest {
 		var backendContext = recordingBackend.rollbackContext.get();
 		assertNotNull(backendContext);
 		assertEquals(WorkloadProfile.BATCH, backendContext.profile());
-		assertEquals(RequestContext.NO_DEADLINE, backendContext.deadlineEpochMillis());
+		assertEquals(Long.MAX_VALUE, backendContext.timeoutNanos());
 		assertEquals(0, embeddedConnection.getInternalDB().getOpenTransactionsCount());
 	}
 
@@ -236,7 +236,7 @@ class GrpcControlCleanupCancellationTest {
 		var client = newClient();
 		var sync = client.getSyncApi(RequestContext.batch());
 		var async = client.getAsyncApi(RequestContext.batch());
-		sync.cdcCreate("progress", 1L, null, false);
+		sync.cdcCreate("progress", 1L, null, false, java.util.OptionalLong.empty());
 		var successfulCommit = async.cdcCommitAsync("progress", 42L);
 		var failingCommit = async.cdcCommitAsync("missing", 99L);
 		try {
@@ -281,8 +281,8 @@ class GrpcControlCleanupCancellationTest {
 				columnId,
 				new Keys(),
 				null,
-				false,
-				TimeUnit.MINUTES.toMillis(1)).get(5, TimeUnit.SECONDS);
+				false, java.time.Duration.ofMillis(
+				TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 		var close = async.closeIteratorAsync(iteratorId);
 		Thread closeThread = null;
 		try {
@@ -341,8 +341,8 @@ class GrpcControlCleanupCancellationTest {
 				columnId,
 				new Keys(),
 				null,
-				false,
-				TimeUnit.MINUTES.toMillis(1)).get(5, TimeUnit.SECONDS);
+				false, java.time.Duration.ofMillis(
+				TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 		var close = async.closeIteratorAsync(iteratorId);
 		assertTrue(blockingBackend.awaitCloseStarted(5, TimeUnit.SECONDS),
 				"protected close did not begin running");
@@ -355,7 +355,8 @@ class GrpcControlCleanupCancellationTest {
 			assertTrue(failure.getMessage().contains("accepted protected gRPC operations"));
 			assertEquals(1, grpcServer.getAcceptedMustCompleteOperationCountForTesting());
 			var schedulerStillRunning = new CountDownLatch(1);
-			grpcServer.getSchedulerForTesting().control().schedule(schedulerStillRunning::countDown);
+			grpcServer.getSchedulerForTesting().scheduler(WorkloadProfile.CONTROL,
+					OperationFamily.CONTROL, Long.MAX_VALUE).schedule(schedulerStillRunning::countDown);
 			assertTrue(schedulerStillRunning.await(5, TimeUnit.SECONDS),
 					"owned scheduler was terminated before protected work drained");
 		} finally {
@@ -380,12 +381,12 @@ class GrpcControlCleanupCancellationTest {
 				columnId,
 				new Keys(),
 				null,
-				false,
-				TimeUnit.MINUTES.toMillis(1)).get(5, TimeUnit.SECONDS);
+				false, java.time.Duration.ofMillis(
+				TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 		var scheduler = embeddedConnection.getScheduler();
 		var controlExecutor = scheduler.executor(WorkloadProfile.CONTROL,
 				OperationFamily.CONTROL,
-				RequestContext.NO_DEADLINE);
+				Long.MAX_VALUE);
 		var blockedControl = blockLane(2, controlExecutor::execute);
 		var close = async.closeIteratorAsync(iteratorId);
 		awaitCondition(() -> scheduler.queuedTasks(WorkloadProfile.CONTROL) >= 1,
@@ -475,6 +476,11 @@ class GrpcControlCleanupCancellationTest {
 
 	private static final class BlockingCloseIteratorConnection implements RocksDBConnection {
 
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
+
 		private final RocksDBConnection delegate;
 		private final CountDownLatch closeStarted = new CountDownLatch(1);
 		private final CountDownLatch releaseClose = new CountDownLatch(1);
@@ -540,6 +546,11 @@ class GrpcControlCleanupCancellationTest {
 
 	private static final class RecordingRollbackConnection implements RocksDBConnection {
 
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
+
 		private final RocksDBConnection delegate;
 		private final AtomicReference<RequestContext> rollbackContext = new AtomicReference<>();
 
@@ -580,6 +591,8 @@ class GrpcControlCleanupCancellationTest {
 	}
 
 	private static final class BlockingCdcCommitConnection implements RocksDBConnection, InternalConnection {
+		@Override
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
 
 		private final EmbeddedConnection delegate;
 		private final CountDownLatch commitsStarted = new CountDownLatch(2);

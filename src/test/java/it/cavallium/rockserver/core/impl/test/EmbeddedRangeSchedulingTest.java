@@ -49,10 +49,10 @@ class EmbeddedRangeSchedulingTest {
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("cleanup-db"),
 				"cleanup-scheduling", configFile)) {
-			connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("progress", 1L, null, false);
+			connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("progress", 1L, null, false, java.util.OptionalLong.empty());
 			var writeStarted = new CountDownLatch(DATA_WORKERS);
 			var releaseWrite = new CountDownLatch(1);
-			occupyWorkers(connection.getScheduler().writeExecutor(), DATA_WORKERS, writeStarted, releaseWrite);
+			occupyWorkers(connection.getScheduler().executor(it.cavallium.rockserver.core.common.WorkloadProfile.INGEST, it.cavallium.rockserver.core.common.OperationFamily.MUTATION, Long.MAX_VALUE), DATA_WORKERS, writeStarted, releaseWrite);
 			try {
 				assertTrue(writeStarted.await(5, TimeUnit.SECONDS));
 				connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeFailedUpdateAsync(Long.MAX_VALUE)
@@ -101,7 +101,7 @@ class EmbeddedRangeSchedulingTest {
 			}
 			var occupiedWorkersEntered = new CountDownLatch(DATA_WORKERS - 1);
 			var releaseOccupiedWorkers = new CountDownLatch(1);
-			occupyWorkers(connection.getScheduler().readExecutor(),
+			occupyWorkers(connection.getScheduler().executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE),
 					DATA_WORKERS - 1,
 					occupiedWorkersEntered,
 					releaseOccupiedWorkers);
@@ -117,8 +117,7 @@ class EmbeddedRangeSchedulingTest {
 						null,
 						null,
 						false,
-						RequestType.allInRange(),
-						10_000))
+						RequestType.allInRange()))
 					.doOnNext(_ -> {
 						items.incrementAndGet();
 						if (firstItem.compareAndSet(true, false)) {
@@ -131,7 +130,11 @@ class EmbeddedRangeSchedulingTest {
 
 			assertTrue(firstItemBlocked.await(5, TimeUnit.SECONDS));
 			try {
-				connection.getInternalDB().getScheduler().interactiveRead().schedule(interactiveRan::countDown);
+				var scheduler = connection.getInternalDB().getScheduler();
+				scheduler.scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.LATENCY,
+						it.cavallium.rockserver.core.common.OperationFamily.POINT_LOOKUP,
+						scheduler.bindTimeoutNanos(java.util.concurrent.TimeUnit.MINUTES.toNanos(1)))
+						.schedule(interactiveRan::countDown);
 				assertTrue(interactiveRan.await(5, TimeUnit.SECONDS),
 						"the last available read worker stayed parked behind a blocked range consumer");
 				assertTrue(awaitPendingOps(connection, 0, 5, TimeUnit.SECONDS),
@@ -183,7 +186,7 @@ class EmbeddedRangeSchedulingTest {
 				api.put(0, columnId, intKey(i), intValue(i), RequestType.none());
 			}
 
-			long iteratorId = api.openIterator(0, columnId, new Keys(), null, false, 10_000);
+			long iteratorId = api.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 10_000));
 			try {
 				var scheduler = connection.getInternalDB().getScheduler();
 				long tasksBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
@@ -228,7 +231,7 @@ class EmbeddedRangeSchedulingTest {
 					.setExistsMultiSnapshotObserverForTesting(snapshotAcquisitions::incrementAndGet);
 
 			var existence = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
-					.existsMultiAsync(0, columnId, List.of(key), 10_000)
+					.existsMultiAsync(0, columnId, List.of(key))
 					.get(5, TimeUnit.SECONDS);
 
 			assertEquals(List.of(true), existence);
@@ -271,7 +274,7 @@ class EmbeddedRangeSchedulingTest {
 			var secondChunkSawCompetingComposite = new AtomicBoolean();
 			var pendingOpsBetweenChunks = new java.util.concurrent.atomic.AtomicLong(-1L);
 			var scheduler = connection.getInternalDB().getScheduler();
-			var readExecutor = scheduler.readExecutor();
+			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var occupiedWorkersEntered = new CountDownLatch(DATA_WORKERS - 1);
 			var releaseOccupiedWorkers = new CountDownLatch(1);
 			occupyWorkers(readExecutor,
@@ -305,7 +308,7 @@ class EmbeddedRangeSchedulingTest {
 				});
 
 				var existence = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
-						.existsMultiAsync(0, columnId, keys, 10_000)
+						.existsMultiAsync(0, columnId, keys)
 						.get(5, TimeUnit.SECONDS);
 
 				assertEquals(existingKeys + 1, existence.size());
@@ -358,11 +361,11 @@ class EmbeddedRangeSchedulingTest {
 				}
 			});
 
-			long transactionId = api.openTransaction(10_000);
+			long transactionId = api.openTransaction( java.time.Duration.ofMillis(10_000));
 			java.util.List<Boolean> existence;
 			try {
 				existence = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
-						.existsMultiAsync(transactionId, columnId, keys, 10_000)
+						.existsMultiAsync(transactionId, columnId, keys)
 						.get(10, TimeUnit.SECONDS);
 			} finally {
 				api.closeTransaction(transactionId, false);

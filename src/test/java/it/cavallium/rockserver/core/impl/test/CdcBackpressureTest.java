@@ -45,7 +45,7 @@ public class CdcBackpressureTest {
         var schema = ColumnSchema.of(IntList.of(4), new ObjectArrayList<>(), true, null, null, "it.cavallium.rockserver.examples.MessagePatchMergeOperator");
         long colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("messages", schema);
         try {
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId));
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), null, java.util.OptionalLong.empty());
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -101,7 +101,7 @@ public class CdcBackpressureTest {
             Mono.fromFuture(api.mergeBatchAsync(colId, source, MergeBatchMode.MERGE_WRITE_BATCH)).subscribe();
 
             AtomicInteger received = new AtomicInteger(0);
-            
+
             // Fast consumer (normal stream)
             List<Long> seqs = api.cdcStream(subId, new CdcStreamOptions(null, 10, Duration.ofMillis(50), null), null)
                     .doOnNext(e -> received.incrementAndGet())
@@ -129,7 +129,7 @@ public class CdcBackpressureTest {
 
             // CDC starts LATER
             AtomicInteger received = new AtomicInteger(0);
-            
+
             Long count = api.cdcStream(subId, new CdcStreamOptions(null, 100, Duration.ofMillis(10), null), null)
                     .take(itemCount)
                     .count()
@@ -149,14 +149,14 @@ public class CdcBackpressureTest {
 
             int itemCount = 5000;
             Flux<KVBatch> source = Flux.range(0, itemCount).map(this::createBatch);
-            
+
             Mono.fromFuture(api.mergeBatchAsync(colId, source, MergeBatchMode.MERGE_WRITE_BATCH)).subscribe();
 
             Long count = api.cdcStream(subId, new CdcStreamOptions(null, 1000, Duration.ofMillis(10), null), null)
                     .take(itemCount)
                     .count()
                     .block(Duration.ofSeconds(30));
-             
+
             Assertions.assertEquals(itemCount, count);
         });
     }

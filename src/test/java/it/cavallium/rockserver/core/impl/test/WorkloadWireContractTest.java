@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.impl.test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -71,15 +72,13 @@ class WorkloadWireContractTest {
 	}
 
 	@Test
-	void workloadV2CapabilitiesAndRangeRequestValuesAreExplicitAndStable() throws Exception {
+	void workloadV3CapabilitiesAndRangeRequestValuesAreExplicitAndStable() throws Exception {
 		var capabilities = it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse.newBuilder()
-				.setWorkloadContractVersion(2)
-				.setBoundedRange(true)
+				.setWorkloadContractVersion(3)
 				.build();
 		var decoded = it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse.parseFrom(
 				capabilities.toByteArray());
-		assertEquals(2, decoded.getWorkloadContractVersion());
-		org.junit.jupiter.api.Assertions.assertTrue(decoded.getBoundedRange());
+		assertEquals(3, decoded.getWorkloadContractVersion());
 
 		assertEquals(0, it.cavallium.rockserver.core.common.api.proto.RangeRequestType
 				.RANGE_REQUEST_TYPE_UNSPECIFIED.getNumber());
@@ -95,7 +94,8 @@ class WorkloadWireContractTest {
 	void protobufRetainsProfileAndAbsoluteDeadlineOnUnaryAndStreamInitialRequests() throws Exception {
 		var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.ANALYTICAL)
-				.setDeadlineEpochMillis(123_456L)
+				.setWorkloadContractVersion(3)
+				.setTimeoutNanos(123_456L)
 				.build();
 		var unary = PutRequest.newBuilder()
 				.setColumnId(1)
@@ -202,7 +202,8 @@ class WorkloadWireContractTest {
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.PHYSICAL_MAINTENANCE)) {
 			var wire = new it.cavallium.rockserver.core.common.api.RequestContext(
 					profile,
-					it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE);
+					3,
+					Long.MAX_VALUE);
 			var invocation = assertThrows(InvocationTargetException.class,
 					() -> mapper.invoke(null, wire));
 			var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(
@@ -211,14 +212,44 @@ class WorkloadWireContractTest {
 					failure.getErrorUniqueId());
 		}
 
-		var expired = new it.cavallium.rockserver.core.common.api.RequestContext(
+		var invalidTimeout = new it.cavallium.rockserver.core.common.api.RequestContext(
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.BATCH,
-				1L);
+				3,
+				0L);
 		var invocation = assertThrows(InvocationTargetException.class,
-				() -> mapper.invoke(null, expired));
+				() -> mapper.invoke(null, invalidTimeout));
 		var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(
 				RocksDBException.class, invocation.getCause());
-		assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+		assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 				failure.getErrorUniqueId());
+	}
+
+	@Test
+	void thriftServerRejectsMissingAndNonV3Contexts() throws Exception {
+		var mapper = ThriftServer.class.getDeclaredMethod("mapRequestContext",
+				it.cavallium.rockserver.core.common.api.RequestContext.class);
+		mapper.setAccessible(true);
+		for (int version : List.of(0, 2, 4)) {
+			var wire = new it.cavallium.rockserver.core.common.api.RequestContext()
+					.setProfile(it.cavallium.rockserver.core.common.api.WorkloadProfile.BATCH)
+					.setTimeoutNanos(Long.MAX_VALUE);
+			if (version != 0) {
+				wire.setWorkloadContractVersion(version);
+			}
+			var invocation = assertThrows(InvocationTargetException.class,
+					() -> mapper.invoke(null, wire));
+			var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(
+					RocksDBException.class, invocation.getCause());
+			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					failure.getErrorUniqueId());
+		}
+	}
+
+	@Test
+	void protobufV2DeadlineFieldIsReservedRatherThanReused() {
+		var descriptor = it.cavallium.rockserver.core.common.api.proto.RequestContext.getDescriptor();
+		assertNull(descriptor.findFieldByNumber(2));
+		assertEquals("workloadContractVersion", descriptor.findFieldByNumber(3).getName());
+		assertEquals("timeoutNanos", descriptor.findFieldByNumber(4).getName());
 	}
 }

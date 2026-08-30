@@ -234,7 +234,7 @@ class RWSchedulerMetricsTest {
 			var completed = new CompletableFuture<Void>();
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.METADATA,
-					RequestContext.NO_DEADLINE).execute(() -> completed.complete(null));
+					Long.MAX_VALUE).execute(() -> completed.complete(null));
 			completed.get(5, SECONDS);
 			assertEventually(() -> timerCount(registry,
 					"rockserver.workload.execution",
@@ -252,7 +252,7 @@ class RWSchedulerMetricsTest {
 			var failureRan = new CountDownLatch(1);
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.POINT_LOOKUP,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				failureRan.countDown();
 				throw new IllegalStateException("expected test failure");
 			});
@@ -272,7 +272,7 @@ class RWSchedulerMetricsTest {
 			var blockerStarted = new CountDownLatch(1);
 			var view = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			view.execute(() -> {
 				blockerStarted.countDown();
 				awaitUninterruptibly(release);
@@ -361,7 +361,7 @@ class RWSchedulerMetricsTest {
 				for (var family : OperationFamily.values()) {
 					if (!WorkloadAdmission.isAllowed(profile, family)) continue;
 					var completed = new CompletableFuture<Void>();
-					scheduler.executor(profile, family, RequestContext.NO_DEADLINE)
+					scheduler.executor(profile, family, Long.MAX_VALUE)
 							.execute(() -> completed.complete(null));
 					completed.get(5, SECONDS);
 					String resource = RWScheduler.resourcePool(profile, family)
@@ -417,7 +417,7 @@ class RWSchedulerMetricsTest {
 				for (var family : OperationFamily.values()) {
 					if (WorkloadAdmission.isAllowed(profile, family)) {
 						var completed = new CompletableFuture<Void>();
-						scheduler.executor(profile, family, RequestContext.NO_DEADLINE)
+						scheduler.executor(profile, family, Long.MAX_VALUE)
 								.execute(() -> completed.complete(null));
 						completed.get(5, SECONDS);
 					}
@@ -427,7 +427,7 @@ class RWSchedulerMetricsTest {
 			var failureRan = new CountDownLatch(1);
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.POINT_LOOKUP,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				failureRan.countDown();
 				throw new IllegalStateException("expected test failure");
 			});
@@ -435,7 +435,7 @@ class RWSchedulerMetricsTest {
 			var afterFailure = new CompletableFuture<Void>();
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.POINT_LOOKUP,
-					RequestContext.NO_DEADLINE).execute(() -> afterFailure.complete(null));
+					Long.MAX_VALUE).execute(() -> afterFailure.complete(null));
 			afterFailure.get(5, SECONDS);
 
 			exerciseCancellationAndOverload(scheduler, release);
@@ -465,7 +465,7 @@ class RWSchedulerMetricsTest {
 		try {
 			var view = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			view.execute(() -> {
 				blockerStarted.countDown();
 				awaitUninterruptibly(release);
@@ -526,7 +526,7 @@ class RWSchedulerMetricsTest {
 				var completed = new CompletableFuture<Void>();
 				scheduler.executor(WorkloadProfile.BATCH,
 						OperationFamily.RANGE_PAGE,
-						RequestContext.NO_DEADLINE).execute(() -> completed.complete(null));
+						Long.MAX_VALUE).execute(() -> completed.complete(null));
 				completed.get(5, SECONDS);
 			} finally {
 				if (scheduler != null) {
@@ -557,13 +557,13 @@ class RWSchedulerMetricsTest {
 			var completed = new CompletableFuture<Void>();
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.METADATA,
-					RequestContext.NO_DEADLINE).execute(() -> completed.complete(null));
+					Long.MAX_VALUE).execute(() -> completed.complete(null));
 			completed.get(5, SECONDS);
 
 			var failureRan = new CountDownLatch(1);
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.POINT_LOOKUP,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				failureRan.countDown();
 				throw new IllegalStateException("expected test failure");
 			});
@@ -573,7 +573,7 @@ class RWSchedulerMetricsTest {
 			var afterFailures = new CompletableFuture<Void>();
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.METADATA,
-					RequestContext.NO_DEADLINE).execute(() -> afterFailures.complete(null));
+					Long.MAX_VALUE).execute(() -> afterFailures.complete(null));
 			afterFailures.get(5, SECONDS);
 			assertEventually(() -> registry.recordingFailures().equals(failures));
 		} finally {
@@ -592,7 +592,7 @@ class RWSchedulerMetricsTest {
 		var blockerStarted = new CountDownLatch(1);
 		var view = scheduler.executor(WorkloadProfile.BATCH,
 				OperationFamily.RANGE_PAGE,
-				RequestContext.NO_DEADLINE);
+				Long.MAX_VALUE);
 		view.execute(() -> {
 			blockerStarted.countDown();
 			awaitUninterruptibly(release);

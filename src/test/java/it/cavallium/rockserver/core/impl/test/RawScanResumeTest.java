@@ -99,7 +99,7 @@ class RawScanResumeTest {
 			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
 			EmbeddedDB db = connection.getInternalDB();
 			long columnId = createPopulatedColumn(api);
-			var overloadOnce = new AdmissionOverloadExecutor(db.getScheduler().readExecutor(), 1);
+			var overloadOnce = new AdmissionOverloadExecutor(db.getScheduler().executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), 1);
 
 			var batches = db.scanRawAsyncInternal(columnId,
 					0,
@@ -127,7 +127,7 @@ class RawScanResumeTest {
 			RocksDBSyncAPI api = connection.getSyncApi(RequestContext.batch());
 			EmbeddedDB db = connection.getInternalDB();
 			long columnId = createPopulatedColumn(api, 1, KEYS_PER_SST);
-			var overloadOnce = new AdmissionOverloadExecutor(db.getScheduler().readExecutor(), 1);
+			var overloadOnce = new AdmissionOverloadExecutor(db.getScheduler().executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), 1);
 			var cleanupCalls = new AtomicInteger();
 			db.setRawScanCleanupObserverForTesting(() -> {
 				if (cleanupCalls.incrementAndGet() == 1) {
@@ -176,7 +176,7 @@ class RawScanResumeTest {
 			EmbeddedDB db = connection.getInternalDB();
 			long columnId = createPopulatedColumn(api);
 			var alwaysOverloaded = new AdmissionOverloadExecutor(
-					db.getScheduler().readExecutor(), Integer.MAX_VALUE);
+					db.getScheduler().executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), Integer.MAX_VALUE);
 
 			var scan = db.scanRawAsyncInternal(columnId,
 					0,
@@ -352,7 +352,7 @@ class RawScanResumeTest {
 			});
 			try {
 				assertThrows(IllegalStateException.class, () -> db.scanRawResumableAsyncInternal(
-						columnId, 0, 1, Set.of(), db.getScheduler().read())
+						columnId, 0, 1, Set.of(), db.getScheduler().scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE))
 						.doOnNext(observed::add)
 						.blockLast(Duration.ofSeconds(30)));
 				assertTrue(completionTokens(observed).isEmpty(),
@@ -371,7 +371,7 @@ class RawScanResumeTest {
 			long columnId = createPopulatedColumn(api);
 			EmbeddedDB db = connection.getInternalDB();
 			StepVerifier.create(db.scanRawResumableAsyncInternal(
-					columnId, 0, 1, Set.of(), db.getScheduler().read()), SST_COUNT)
+					columnId, 0, 1, Set.of(), db.getScheduler().scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE)), SST_COUNT)
 					.expectNextMatches(RawScanResumeTest::isBatchWithCompletion)
 					.expectNextMatches(RawScanResumeTest::isBatchWithCompletion)
 					.expectNextMatches(RawScanResumeTest::isBatchWithCompletion)
@@ -479,7 +479,8 @@ class RawScanResumeTest {
 			try {
 				var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 						.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-						.setDeadlineEpochMillis(Long.MAX_VALUE)
+						.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE)
 						.build();
 				var request = ScanRawRequest.newBuilder()
 						.setColumnId(columnId)
@@ -544,7 +545,8 @@ class RawScanResumeTest {
 
 				var validContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 						.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-						.setDeadlineEpochMillis(Long.MAX_VALUE)
+						.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE)
 						.build();
 				var invalidToken = missingContext.toBuilder()
 						.setContext(validContext)
@@ -564,16 +566,6 @@ class RawScanResumeTest {
 				assertEquals(Status.Code.INVALID_ARGUMENT, modeFailure.getStatus().getCode());
 				assertEquals("completed SST tokens require resumable raw scan mode",
 						modeFailure.getStatus().getDescription());
-
-				var legacyWithCoalescing = legacyWithToken.toBuilder()
-						.clearCompletedSstTokens()
-						.setCoalesceCompletedSstToken(true)
-						.build();
-				var coalescingFailure = assertThrows(StatusRuntimeException.class,
-						() -> stub.scanRaw(legacyWithCoalescing).hasNext());
-				assertEquals(Status.Code.INVALID_ARGUMENT, coalescingFailure.getStatus().getCode());
-				assertEquals("coalesced SST completion requires resumable raw scan mode",
-						coalescingFailure.getStatus().getDescription());
 			} finally {
 				channel.shutdownNow();
 				assertTrue(channel.awaitTermination(5, TimeUnit.SECONDS));
@@ -582,7 +574,7 @@ class RawScanResumeTest {
 	}
 
 	@Test
-	void grpcProxyAdvertisesOnlyTheBackendResumableCapability(@TempDir Path tempDir) throws Exception {
+	void grpcProxyPreservesMandatoryV3ResumableShape(@TempDir Path tempDir) throws Exception {
 		try (var embedded = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-capabilities", null)) {
 			RocksDBSyncAPI embeddedApi = embedded.getSyncApi(RequestContext.batch());
 			long columnId = createPopulatedColumn(embeddedApi);
@@ -594,23 +586,11 @@ class RawScanResumeTest {
 					proxy.start();
 					try (var downstream = GrpcConnection.forHostAndPort("raw-resume-downstream",
 							new Utils.HostAndPort("127.0.0.1", proxy.getPort()))) {
-						assertTrue(upstreamClient.getCapabilities().resumableRawScan());
-						assertTrue(downstream.getCapabilities().resumableRawScan());
+						assertEquals(3, upstreamClient.getCapabilities().workloadContractVersion());
+						assertEquals(3, downstream.getCapabilities().workloadContractVersion());
 						assertEquals((long) SST_COUNT * KEYS_PER_SST,
 								decodedRows(scan(downstream.getSyncApi(RequestContext.batch()), columnId, Set.of())));
 					}
-				}
-			}
-
-			var legacyBackend = new CapabilityMaskingConnection(embedded);
-			try (var proxy = new GrpcServer(legacyBackend, new InetSocketAddress("127.0.0.1", 0))) {
-				proxy.start();
-				try (var client = GrpcConnection.forHostAndPort("raw-resume-legacy-proxy",
-						new Utils.HostAndPort("127.0.0.1", proxy.getPort()))) {
-					assertFalse(client.getCapabilities().resumableRawScan());
-					var failure = assertThrows(RocksDBException.class,
-							() -> scan(client.getSyncApi(RequestContext.batch()), columnId, Set.of()));
-					assertEquals(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, failure.getErrorUniqueId());
 				}
 			}
 		}
@@ -682,7 +662,7 @@ class RawScanResumeTest {
 				var started = new CountDownLatch(1);
 				var release = new CountDownLatch(1);
 				activeReleases.add(release);
-				scheduler.readExecutor().execute(() -> {
+				scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 					started.countDown();
 					awaitUninterruptibly(release);
 				});
@@ -695,7 +675,7 @@ class RawScanResumeTest {
 
 		var queuedBlockerStarted = new CountDownLatch(1);
 		var queuedBlockerRelease = new CountDownLatch(1);
-		scheduler.readExecutor().execute(() -> {
+		scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 			queuedBlockerStarted.countDown();
 			awaitUninterruptibly(queuedBlockerRelease);
 		});
@@ -855,26 +835,4 @@ class RawScanResumeTest {
 		}
 	}
 
-	private record CapabilityMaskingConnection(RocksDBConnection delegate) implements RocksDBConnection {
-
-		@Override
-		public URI getUrl() {
-			return delegate.getUrl();
-		}
-
-		@Override
-		public RocksDBSyncAPI getSyncApi(RequestContext context) {
-			return delegate.getSyncApi(context);
-		}
-
-		@Override
-		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
-			return delegate.getAsyncApi(context);
-		}
-
-		@Override
-		public void close() {
-			// The test owns the embedded delegate separately.
-		}
-	}
 }

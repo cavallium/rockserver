@@ -59,7 +59,7 @@ class BucketedColumnEntriesCountTest {
         for (int i = 0; i < entriesCount; i++) {
             Buf varKey = Buf.wrap(("var-" + i).getBytes(StandardCharsets.UTF_8));
             Buf value = Buf.wrap(("val-" + i).getBytes(StandardCharsets.UTF_8));
-            
+
             db.put(0, columnId, new Keys(new Buf[]{fixedKey, varKey}), value, new RequestPut.RequestNothing<>());
         }
 
@@ -70,12 +70,12 @@ class BucketedColumnEntriesCountTest {
              Buf value = Buf.wrap(("val-" + i).getBytes(StandardCharsets.UTF_8));
              db.put(0, columnId, new Keys(new Buf[]{fixedKey2, varKey}), value, new RequestPut.RequestNothing<>());
         }
-        
+
         // Total expected entries: 5 + 3 = 8
 
         // 3. Call reduceRange with RequestEntriesCount
         try {
-            Long count = db.reduceRange(0, columnId, null, null, false, new RequestEntriesCount<>(), 1000);
+            Long count = db.reduceRange(0, columnId, null, null, false, new RequestEntriesCount<>());
             assertEquals(8L, count, "Should count total entries across buckets");
         } catch (RocksDBException e) {
             if (e.getErrorUniqueId() == RocksDBException.RocksDBErrorType.UNSUPPORTED_COLUMN_TYPE) {

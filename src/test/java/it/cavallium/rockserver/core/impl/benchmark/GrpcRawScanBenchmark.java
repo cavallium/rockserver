@@ -290,7 +290,8 @@ public final class GrpcRawScanBenchmark {
 					.setShardCount(1)
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-							.setDeadlineEpochMillis(Long.MAX_VALUE)
+							.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE)
 							.build());
 			// The untouched baseline may predate the extension. Invoke the new builder
 			// method only in the candidate process so the same benchmark can compare
@@ -622,8 +623,7 @@ public final class GrpcRawScanBenchmark {
 	private static final class ResumableProtocol {
 
 		private static void enable(ScanRawRequest.Builder request) {
-			request.setResumable(true)
-					.setCoalesceCompletedSstToken(true);
+			request.setResumable(true);
 		}
 
 		private static @Nullable String completionToken(

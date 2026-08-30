@@ -38,18 +38,18 @@ public class ReproduceCdcMergeBugTest {
         // Setup DB
         try (EmbeddedConnection db = new EmbeddedConnection(tempDir, "test-db", null)) {
             var api = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-            
+
             // Create column
             var schema = ColumnSchema.of(IntList.of(4), new ObjectArrayList<>(), true, null, null, "it.cavallium.rockserver.examples.MessagePatchMergeOperator");
             long colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("messages", schema);
 
             // Create CDC subscription
             String subId = "test-sub";
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId));
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), null, java.util.OptionalLong.empty());
 
             // Prepare stream of batches
             Sinks.Many<KVBatch> sink = Sinks.many().multicast().onBackpressureBuffer(2000);
-            
+
             // Start mergeBatchAsync
             api.mergeBatchAsync(colId, sink.asFlux(), MergeBatchMode.MERGE_WRITE_BATCH)
                     .exceptionally(e -> {
@@ -74,10 +74,10 @@ public class ReproduceCdcMergeBugTest {
                 int id = i;
                 Buf key = Buf.wrap(ByteBuffer.allocate(4).putInt(id).array());
                 Buf val = Buf.wrap("dummy".getBytes(StandardCharsets.UTF_8));
-                
+
                 List<Keys> keys = List.of(new Keys(new Buf[]{key}));
                 List<Buf> values = List.of(val);
-                
+
                 var res = sink.tryEmitNext(new KVBatch.KVBatchRef(keys, values));
                 if (res.isFailure()) {
                      throw new RuntimeException("Emit failed: " + res);
@@ -86,7 +86,7 @@ public class ReproduceCdcMergeBugTest {
 
             // Wait for CDC
             boolean received = latch.await(30, TimeUnit.SECONDS);
-            
+
             cdcDisposable.dispose();
             sink.tryEmitComplete();
 

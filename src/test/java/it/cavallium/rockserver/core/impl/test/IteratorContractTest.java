@@ -87,7 +87,7 @@ class IteratorContractTest {
 			api.put(0, columnId, key(10), value(10), RequestType.none());
 			api.put(0, columnId, key(20), value(20), RequestType.none());
 
-			long transactionId = api.openTransaction(30_000);
+			long transactionId = api.openTransaction( java.time.Duration.ofMillis(30_000));
 			assertTrue(transactionId < 0, name + ", transaction IDs must be negative");
 			try {
 				api.put(transactionId, columnId, key(15), value(15), RequestType.none());
@@ -119,7 +119,7 @@ class IteratorContractTest {
 			api.put(0, columnId, second, value(20), RequestType.none());
 			api.put(0, columnId, third, value(30), RequestType.none());
 
-			long forward = api.openIterator(0, columnId, new Keys(), null, false, ITERATOR_TIMEOUT_MS);
+			long forward = api.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( ITERATOR_TIMEOUT_MS));
 			try {
 				assertIterableEquals(values(10, 20, 30), api.subsequent(forward, 0, 10, RequestType.multi()));
 				api.seekTo(forward, second);
@@ -128,7 +128,7 @@ class IteratorContractTest {
 				api.closeIterator(forward);
 			}
 
-			long reverse = api.openIterator(0, columnId, new Keys(), null, true, ITERATOR_TIMEOUT_MS);
+			long reverse = api.openIterator(0, columnId, new Keys(), null, true, java.time.Duration.ofMillis( ITERATOR_TIMEOUT_MS));
 			try {
 				assertIterableEquals(values(30, 20, 10), api.subsequent(reverse, 0, 10, RequestType.multi()));
 				api.seekTo(reverse, second);
@@ -159,7 +159,7 @@ class IteratorContractTest {
 			api.put(0, columnId, key(i), value(i), RequestType.none());
 		}
 
-		long iteratorId = api.openIterator(0, columnId, new Keys(), null, false, ITERATOR_TIMEOUT_MS);
+		long iteratorId = api.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( ITERATOR_TIMEOUT_MS));
 		try {
 			var expected = java.util.stream.IntStream.range(1, 129)
 					.mapToObj(IteratorContractTest::value)
@@ -255,7 +255,7 @@ class IteratorContractTest {
 	}
 
 	private static void assertMaximumTimeoutDoesNotOverflow(RocksDBAPI api, long columnId) {
-		long iteratorId = api.openIterator(0, columnId, key(20), key(60), false, Long.MAX_VALUE);
+		long iteratorId = api.openIterator(0, columnId, key(20), key(60), false, java.time.Duration.ofMillis( Long.MAX_VALUE));
 		try {
 			assertIterableEquals(values(20), api.subsequent(iteratorId, 0, 1, RequestType.multi()));
 		} finally {
@@ -267,7 +267,7 @@ class IteratorContractTest {
 			long transactionId,
 			long columnId,
 			List<Buf> expected) {
-		long iteratorId = api.openIterator(transactionId, columnId, new Keys(), null, false, ITERATOR_TIMEOUT_MS);
+		long iteratorId = api.openIterator(transactionId, columnId, new Keys(), null, false, java.time.Duration.ofMillis( ITERATOR_TIMEOUT_MS));
 		try {
 			assertIterableEquals(expected, api.subsequent(iteratorId, 0, 10, RequestType.multi()));
 		} finally {
@@ -289,7 +289,7 @@ class IteratorContractTest {
 	}
 
 	private static long openBounded(RocksDBAPI api, long columnId, boolean reverse) {
-		return api.openIterator(0, columnId, key(20), key(60), reverse, ITERATOR_TIMEOUT_MS);
+		return api.openIterator(0, columnId, key(20), key(60), reverse, java.time.Duration.ofMillis( ITERATOR_TIMEOUT_MS));
 	}
 
 	private static void assertIteratorResourcesReleased(EmbeddedDB internal) {

@@ -56,7 +56,7 @@ class IteratorCloseConcurrencyTest {
 				api.put(0, columnId, key(entry), value(entry), RequestType.none());
 			}
 
-			long iteratorId = api.openIterator(0, columnId, key(10), null, false, 10_000);
+			long iteratorId = api.openIterator(0, columnId, key(10), null, false, java.time.Duration.ofMillis( 10_000));
 			Map<Long, REntry<RocksIterator>> iterators = getIterators(internal);
 			REntry<RocksIterator> iteratorEntry = iterators.get(iteratorId);
 			assertNotNull(iteratorEntry);
@@ -156,8 +156,8 @@ class IteratorCloseConcurrencyTest {
 					columnId,
 					new Keys(new Buf[] {Buf.wrap(new byte[Integer.BYTES])}),
 					null,
-					false,
-					10_000);
+					false, java.time.Duration.ofMillis(
+					10_000));
 
 			Map<Long, REntry<RocksIterator>> iterators = getIterators(internal);
 			REntry<RocksIterator> nativeEntry = iterators.remove(iteratorId);
@@ -208,8 +208,8 @@ class IteratorCloseConcurrencyTest {
 					columnId,
 					new Keys(new Buf[] {Buf.wrap(new byte[Integer.BYTES])}),
 					null,
-					false,
-					10_000);
+					false, java.time.Duration.ofMillis(
+					10_000));
 
 			Map<Long, REntry<RocksIterator>> iterators = getIterators(internal);
 			REntry<RocksIterator> nativeEntry = iterators.remove(iteratorId);

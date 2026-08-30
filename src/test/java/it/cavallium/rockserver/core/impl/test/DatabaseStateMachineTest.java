@@ -270,7 +270,7 @@ class DatabaseStateMachineTest {
 			TreeMap<Long, Long> expected,
 			SplittableRandom random,
 			String context) {
-		long transactionId = api.openTransaction(30_000);
+		long transactionId = api.openTransaction( java.time.Duration.ofMillis(30_000));
 		var transactionExpected = new TreeMap<>(expected);
 		var touchedKeys = new ArrayList<Long>();
 		boolean closed = false;
@@ -371,7 +371,7 @@ class DatabaseStateMachineTest {
 
 	private static List<ObservedValue> readRange(RocksDBAPI api, long columnId, boolean reverse) {
 		try (Stream<KV> range = api.getRange(
-				0, columnId, null, null, reverse, RequestType.allInRange(), 10_000)) {
+				0, columnId, null, null, reverse, RequestType.allInRange())) {
 			return range.map(kv -> new ObservedValue(readKey(kv.keys()), readValue(kv.value()))).toList();
 		}
 	}

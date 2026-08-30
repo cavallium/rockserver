@@ -24,7 +24,7 @@ class TransactionDeadlineOverflowTest {
 				"transaction-deadline-overflow", null)) {
 			EmbeddedDB internal = connection.getInternalDB();
 			var api = connection.getSyncApi(RequestContext.batch());
-			long transactionId = api.openTransaction(Long.MAX_VALUE);
+			long transactionId = api.openTransaction( java.time.Duration.ofMillis(Long.MAX_VALUE));
 
 			assertEquals(1, internal.getOpenTransactionsCount());
 			assertEquals(1L, internal.getPendingOpsCount(),
@@ -50,7 +50,7 @@ class TransactionDeadlineOverflowTest {
 			EmbeddedDB internal = connection.getInternalDB();
 			var api = connection.getSyncApi(RequestContext.batch());
 
-			var failure = assertThrows(RocksDBException.class, () -> api.openTransaction(-1L));
+			var failure = assertThrows(RocksDBException.class, () -> api.openTransaction( java.time.Duration.ofMillis(-1L)));
 			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, failure.getErrorUniqueId());
 			assertEquals(0, internal.getOpenTransactionsCount());
 			assertEquals(0L, internal.getPendingOpsCount(),

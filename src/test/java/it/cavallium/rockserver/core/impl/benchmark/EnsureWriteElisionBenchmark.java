@@ -72,7 +72,7 @@ public final class EnsureWriteElisionBenchmark {
 			var api = connection.getSyncApi(RequestContext.batch());
 			hotColumn = api.createColumn("hot", schema());
 			coldColumn = api.createColumn("cold", schema());
-			api.cdcCreate("ensure-benchmark-hot", null, List.of(hotColumn));
+			api.cdcCreate("ensure-benchmark-hot", null, List.of(hotColumn), null, java.util.OptionalLong.empty());
 
 			api.putMulti(0, hotColumn, keys, oldValues, RequestType.ensure());
 			long hotStart = System.nanoTime();
@@ -105,7 +105,7 @@ public final class EnsureWriteElisionBenchmark {
 			embedded.setWriteElisionMultiGetObserverForTesting(
 					(keysInCall, bytes) -> probeCalls.add(new ProbeCall(keysInCall, bytes)));
 			var api = connection.getSyncApi(RequestContext.batch());
-			api.cdcCreate("ensure-benchmark-cold", null, List.of(coldColumn));
+			api.cdcCreate("ensure-benchmark-cold", null, List.of(coldColumn), null, java.util.OptionalLong.empty());
 			if (embedded.getPendingOpsCount() != 0L) {
 				throw new IllegalStateException("benchmark started with pending work");
 			}

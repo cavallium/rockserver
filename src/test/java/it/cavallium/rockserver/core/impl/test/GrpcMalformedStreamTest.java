@@ -163,7 +163,8 @@ class GrpcMalformedStreamTest {
 	void ensureListRouteWritesEveryValue() {
 		var context = RequestContext.newBuilder()
 				.setProfile(WorkloadProfile.BATCH)
-				.setDeadlineEpochMillis(Long.MAX_VALUE)
+				.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE)
 				.build();
 		var firstKey = ByteString.copyFrom(new byte[Long.BYTES]);
 		var secondKey = ByteString.copyFrom(new byte[]{0, 0, 0, 0, 0, 0, 0, 1});

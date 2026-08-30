@@ -97,8 +97,7 @@ class EstimateNumKeysTest {
 				null,
 				null,
 				false,
-				RequestType.entriesCount(),
-				10_000), context);
+				RequestType.entriesCount()), context);
 	}
 
 	private static String safeName(String name) {

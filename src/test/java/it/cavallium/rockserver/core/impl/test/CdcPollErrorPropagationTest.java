@@ -76,7 +76,7 @@ class CdcPollErrorPropagationTest {
 					null,
 					null,
 					null));
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			db.put(0, columnId,
 					new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})}),
 					Buf.wrap("first".getBytes(StandardCharsets.UTF_8)),
@@ -104,7 +104,7 @@ class CdcPollErrorPropagationTest {
 					null,
 					null,
 					null));
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			db.put(0, columnId,
 					new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})}),
 					Buf.wrap("first".getBytes(StandardCharsets.UTF_8)),
@@ -132,7 +132,7 @@ class CdcPollErrorPropagationTest {
 					null,
 					null,
 					null));
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			int mutations = 4_097;
 			var keys = new ArrayList<Keys>(mutations);
 			var values = new ArrayList<Buf>(mutations);
@@ -164,8 +164,8 @@ class CdcPollErrorPropagationTest {
 					null,
 					null,
 					null));
-			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false);
-			long txId = db.openTransaction(10_000);
+			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
+			long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
 			for (int i = 0; i < 4; i++) {
 				db.put(txId, columnId,
 						new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, (byte) i})}),
@@ -210,7 +210,7 @@ class CdcPollErrorPropagationTest {
 					Buf.wrap("value".getBytes(StandardCharsets.UTF_8)),
 					RequestType.none());
 
-			db.cdcCreate("probe", 0L, List.of(columnId), false);
+			db.cdcCreate("probe", 0L, List.of(columnId), false, java.util.OptionalLong.empty());
 
 			assertTrue(db.earliestBatchClosed,
 					"The BatchResult owns a native WriteBatch that must be closed independently of its iterator");

@@ -474,8 +474,7 @@ public final class FastGetBenchmark {
 					null,
 					null,
 					false,
-					requestType,
-					options.scanTimeoutMillis())) {
+					requestType)) {
 				var iterator = range.iterator();
 				while (!stop.get() && iterator.hasNext()) {
 					var row = iterator.next();
@@ -512,8 +511,7 @@ public final class FastGetBenchmark {
 						null,
 						null,
 						false,
-						RequestType.firstAndLast(),
-						options.firstLastTimeoutMillis());
+						RequestType.firstAndLast());
 				if (result.first() == null || result.last() == null) {
 					metrics.recordError("firstAndLast unexpectedly returned an empty endpoint");
 				} else {

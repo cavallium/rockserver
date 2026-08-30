@@ -44,7 +44,7 @@ public final class AdversarialBatchLivenessBenchmark {
 		try {
 			var foreground = scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			for (int index = 0; index < foregroundReleases.length; index++) {
 				var release = new CountDownLatch(1);
 				foregroundReleases[index] = release;
@@ -62,7 +62,7 @@ public final class AdversarialBatchLivenessBenchmark {
 			scheduler.setStoragePressure(true);
 			var firstRead = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			firstRead.execute(() -> {
 				firstReadStarted.countDown();
 				awaitUninterruptibly(releaseFirstRead);
@@ -73,7 +73,7 @@ public final class AdversarialBatchLivenessBenchmark {
 
 			var writeBatch = scheduler.scheduler(WorkloadProfile.BATCH,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			var writeHandle = writeBatch.schedule(() -> {
 				writeBatchStartNanos.compareAndSet(Long.MIN_VALUE, System.nanoTime());
 				writeBatchStarted.countDown();
@@ -87,7 +87,7 @@ public final class AdversarialBatchLivenessBenchmark {
 
 			var readBatch = scheduler.scheduler(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			for (int index = 0; index < config.queuedReadTasks(); index++) {
 				queuedReadHandles.add(readBatch.schedule(progress::record));
 			}

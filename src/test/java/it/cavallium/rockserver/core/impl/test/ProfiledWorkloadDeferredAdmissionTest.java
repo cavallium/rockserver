@@ -41,20 +41,20 @@ class ProfiledWorkloadDeferredAdmissionTest {
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		var regularOvertakeRejected = new AtomicBoolean();
 		try {
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				activeStarted.countDown();
 				awaitUninterruptibly(activeRelease);
 			});
 			assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				order.add("queued-1");
 				try {
-					scheduler.readExecutor().execute(() -> order.add("overtake"));
+					scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> order.add("overtake"));
 				} catch (RocksDBException expected) {
 					regularOvertakeRejected.set(true);
 				}
 			});
-			scheduler.readExecutor().execute(() -> order.add("queued-2"));
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> order.add("queued-2"));
 
 			var first = new DeferredProbe(() -> order.add("deferred-1"));
 			var second = new DeferredProbe(() -> order.add("deferred-2"));
@@ -62,10 +62,10 @@ class ProfiledWorkloadDeferredAdmissionTest {
 					WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
 					System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(1)), first);
-			executeWhenCapacity(scheduler.read(), second);
+			executeWhenCapacity(scheduler.scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), second);
 			var overflow = new DeferredProbe(() -> order.add("overflow"));
 			RocksDBException rejection = assertThrows(RocksDBException.class,
-					() -> executeWhenCapacity(scheduler.read(), overflow));
+					() -> executeWhenCapacity(scheduler.scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), overflow));
 			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, rejection.getErrorUniqueId());
 			assertEquals(3L, scheduler.poolSnapshot(RWScheduler.Pool.READ).submissionAttempts(),
 					"bounded pre-admission waiters and overflow are not admitted scheduler attempts");
@@ -97,12 +97,12 @@ class ProfiledWorkloadDeferredAdmissionTest {
 		var queuedRelease = new CountDownLatch(1);
 		var queuedStarted = new CountDownLatch(1);
 		try {
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				activeStarted.countDown();
 				awaitUninterruptibly(activeRelease);
 			});
 			assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				queuedStarted.countDown();
 				awaitUninterruptibly(queuedRelease);
 			});
@@ -137,12 +137,12 @@ class ProfiledWorkloadDeferredAdmissionTest {
 		var activeRelease = new CountDownLatch(1);
 		var activeStarted = new CountDownLatch(1);
 		try {
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				activeStarted.countDown();
 				awaitUninterruptibly(activeRelease);
 			});
 			assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
-			scheduler.readExecutor().execute(() -> {});
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {});
 			var probe = new DeferredProbe(() -> {});
 			var handle = executeWhenCapacity(scheduler.scheduler(
 					WorkloadProfile.BATCH,
@@ -172,12 +172,12 @@ class ProfiledWorkloadDeferredAdmissionTest {
 		var probe = new BlockingRejectionProbe();
 		try {
 			scheduler.setStoragePressure(true);
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				activeStarted.countDown();
 				awaitUninterruptibly(activeRelease);
 			});
 			assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
-			scheduler.readExecutor().execute(() -> {});
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {});
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
 			var deadlineScheduler = scheduler.scheduler(
 					WorkloadProfile.BATCH,
@@ -233,7 +233,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 			var activeStarted = new CountDownLatch(1);
 			var probe = new LockCheckingDeferredProbe(scheduler);
 			try {
-				scheduler.readExecutor().execute(() -> {
+				scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 					activeStarted.countDown();
 					try {
 						activeRelease.await();
@@ -285,7 +285,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 		var probe = new BlockingRejectionProbe();
 		CompletableFuture<Void> shutdown = null;
 		try {
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				activeStarted.countDown();
 				awaitUninterruptibly(activeRelease);
 			});
@@ -328,7 +328,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 		var activeStarted = new CountDownLatch(1);
 		var probe = new BlockingRejectionProbe();
 		try {
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				activeStarted.countDown();
 				awaitUninterruptibly(activeRelease);
 			});
@@ -370,12 +370,12 @@ class ProfiledWorkloadDeferredAdmissionTest {
 		var activeRelease = new CountDownLatch(1);
 		var activeStarted = new CountDownLatch(1);
 		try {
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				activeStarted.countDown();
 				awaitUninterruptibly(activeRelease);
 			});
 			assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
-			scheduler.readExecutor().execute(() -> {});
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {});
 			var probe = new DeferredProbe(() -> {});
 			executeWhenCapacity(scheduler.scheduler(
 					WorkloadProfile.BATCH,

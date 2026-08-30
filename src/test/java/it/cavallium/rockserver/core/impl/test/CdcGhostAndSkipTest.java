@@ -46,7 +46,7 @@ class CdcGhostAndSkipTest {
     @BeforeEach
     void setUp() throws IOException, RocksDBException {
         db = new EmbeddedDB(tempDir, "test-db", null);
-        
+
         colA = db.createColumn("col-A", ColumnSchema.of(IntArrayList.of(4), new ObjectArrayList<>(), true, null, null, null));
         colB = db.createColumn("col-B", ColumnSchema.of(IntArrayList.of(4), new ObjectArrayList<>(), true, null, null, null));
     }
@@ -61,7 +61,7 @@ class CdcGhostAndSkipTest {
     private byte[] intToBytes(int x) {
         return java.nio.ByteBuffer.allocate(4).putInt(x).array();
     }
-    
+
     private int bytesToInt(byte[] b) {
         return java.nio.ByteBuffer.wrap(b).getInt();
     }
@@ -69,7 +69,7 @@ class CdcGhostAndSkipTest {
     private int writeFilteredWalPage() throws RocksDBException {
         int written = 0;
         for (int batch = 0; batch < FILTERED_WAL_BATCHES_PER_PHYSICAL_PAGE; batch++) {
-            long txId = db.openTransaction(10_000);
+            long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
             for (int i = 0; i < FILTERED_WAL_BATCH_SIZE; i++) {
                 int key = batch * FILTERED_WAL_BATCH_SIZE + i;
                 db.put(txId,
@@ -86,7 +86,7 @@ class CdcGhostAndSkipTest {
 
     private int writeFilteredWalPagesThenMatchingEvent() throws RocksDBException {
         int written = writeFilteredWalPage();
-        long matchingTx = db.openTransaction(10_000);
+        long matchingTx = db.openTransaction( java.time.Duration.ofMillis(10_000));
         db.put(matchingTx,
                 colA,
                 new Keys(new Buf[]{Buf.wrap(intToBytes(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE))}),
@@ -99,7 +99,7 @@ class CdcGhostAndSkipTest {
     @Test
     void eventOnlyAsyncPollTraversesFullyFilteredPhysicalPage() throws Exception {
         String subscriptionId = "sub-event-only-filtered-pages";
-        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false, java.util.OptionalLong.empty());
         int written = writeFilteredWalPagesThenMatchingEvent();
 
         assertEquals(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE + 1, written,
@@ -118,13 +118,13 @@ class CdcGhostAndSkipTest {
     @Test
     void eventOnlyAsyncPollRetainsOneWalIteratorAcrossFilteredPhysicalSlices() throws Exception {
         String subscriptionId = "sub-event-only-retained-wal-iterator";
-        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false, java.util.OptionalLong.empty());
         final int filteredPages = 3;
         int filteredMutations = 0;
         for (int page = 0; page < filteredPages; page++) {
             filteredMutations += writeFilteredWalPage();
         }
-        long matchingTx = db.openTransaction(10_000);
+        long matchingTx = db.openTransaction( java.time.Duration.ofMillis(10_000));
         db.put(matchingTx,
                 colA,
                 new Keys(new Buf[]{Buf.wrap(intToBytes(filteredMutations))}),
@@ -156,7 +156,7 @@ class CdcGhostAndSkipTest {
     @Test
     void batchPollContinuesAcrossFilteredSchedulerSlices() throws Exception {
         String subscriptionId = "sub-batch-filtered-page";
-        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false, java.util.OptionalLong.empty());
         // Scheduler slices are an internal fairness boundary. A logical batch poll
         // retains its WAL/parser cursor and must not expose an artificial empty batch
         // merely because one slice contained only filtered mutations.
@@ -176,13 +176,13 @@ class CdcGhostAndSkipTest {
     @Test
     void eventOnlyAsyncPollDoesNotChaseWritesPastItsCapturedTail() throws Exception {
         String subscriptionId = "sub-event-only-stable-tail";
-        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false, java.util.OptionalLong.empty());
         assertEquals(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE, writeFilteredWalPage());
 
         var appended = new AtomicBoolean();
         db.setCdcPollTailCapturedObserverForTesting(() -> {
             if (appended.compareAndSet(false, true)) {
-                long txId = db.openTransaction(10_000);
+                long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
                 db.put(txId,
                         colA,
                         new Keys(new Buf[]{Buf.wrap(intToBytes(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE))}),
@@ -217,12 +217,12 @@ class CdcGhostAndSkipTest {
     @Test
     void synchronousPollHonorsRequestsAboveTheFormerPhysicalPageSize() throws Exception {
         String subscriptionId = "sub-sync-large";
-        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false, java.util.OptionalLong.empty());
         final int events = 5_000;
         final int transactionSize = 512;
         int written = 0;
         for (int first = 0; first < events; first += transactionSize) {
-            long txId = db.openTransaction(10_000);
+            long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
             int end = Math.min(events, first + transactionSize);
             for (int i = first; i < end; i++) {
                 db.put(txId,
@@ -267,14 +267,14 @@ class CdcGhostAndSkipTest {
     @Test
     void eventOnlyAsyncPollKeepsOneAggregateByteBudgetAcrossPhysicalPages() throws Exception {
         String subscriptionId = "sub-async-byte-budget";
-        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false);
+        long startSeq = db.cdcCreate(subscriptionId, null, List.of(colA), false, java.util.OptionalLong.empty());
         final int events = 10_000;
         final int eventsPerTransaction = 1_000;
         final int valueBytes = 1_800;
         var value = Buf.wrap(new byte[valueBytes]);
         int written = 0;
         for (int first = 0; first < events; first += eventsPerTransaction) {
-            long txId = db.openTransaction(10_000);
+            long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
             int end = Math.min(events, first + eventsPerTransaction);
             for (int i = first; i < end; i++) {
                 db.put(txId,
@@ -310,22 +310,22 @@ class CdcGhostAndSkipTest {
         // Create subscriptions
         String subA = "sub-A";
         String subB = "sub-B";
-        db.cdcCreate(subA, null, List.of(colA), false);
-        db.cdcCreate(subB, null, List.of(colB), false);
+        db.cdcCreate(subA, null, List.of(colA), false, java.util.OptionalLong.empty());
+        db.cdcCreate(subB, null, List.of(colB), false, java.util.OptionalLong.empty());
 
         // Write a mixed batch: [Put A1, Put B1, Put A2]
         // We need to use raw RocksDB to ensure they are in the same WriteBatch
         // EmbeddedDB.putBatch usually separates by column or puts all in one if supported.
         // Let's use putBatch with multiple entries.
-        
+
         List<Keys> keys = new ArrayList<>();
         List<Buf> values = new ArrayList<>();
-        // But EmbeddedDB.putBatch takes a single columnId. 
-        // We need to use a Transaction or access raw DB to mix columns in one atomic batch, 
-        // OR rely on the fact that EmbeddedDB doesn't easily expose mixed-column atomic writes in one call 
+        // But EmbeddedDB.putBatch takes a single columnId.
+        // We need to use a Transaction or access raw DB to mix columns in one atomic batch,
+        // OR rely on the fact that EmbeddedDB doesn't easily expose mixed-column atomic writes in one call
         // EXCEPT via Transactions.
-        
-        long txId = db.openTransaction(10000);
+
+        long txId = db.openTransaction( java.time.Duration.ofMillis(10000));
         db.put(txId, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A1".getBytes()), RequestType.none());
         db.put(txId, colB, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("B1".getBytes()), RequestType.none());
         db.put(txId, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("A2".getBytes()), RequestType.none());
@@ -346,10 +346,10 @@ class CdcGhostAndSkipTest {
     @Test
     void testBatchInterleavingResumption() throws Exception {
         String subA = "sub-A-interleaved";
-        db.cdcCreate(subA, null, List.of(colA), false);
+        db.cdcCreate(subA, null, List.of(colA), false, java.util.OptionalLong.empty());
 
         // Write mixed batch: [Put A1, Put B1, Put A2]
-        long txId = db.openTransaction(10000);
+        long txId = db.openTransaction( java.time.Duration.ofMillis(10000));
         db.put(txId, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A1".getBytes()), RequestType.none());
         db.put(txId, colB, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("B1".getBytes()), RequestType.none());
         db.put(txId, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("A2".getBytes()), RequestType.none());
@@ -359,7 +359,7 @@ class CdcGhostAndSkipTest {
         CdcBatch batch1 = db.cdcPollBatchAsyncInternal(subA, null, 1).block();
         assertEquals(1, batch1.events().size());
         assertEquals("A1", new String(batch1.events().get(0).value().toByteArray()));
-        
+
         long nextSeq = batch1.nextSeq();
 
         // Poll A remaining
@@ -372,10 +372,10 @@ class CdcGhostAndSkipTest {
     @Test
     void testLogDataStuckIssue() throws Exception {
         String subA = "sub-logdata";
-        db.cdcCreate(subA, null, List.of(colA), false);
+        db.cdcCreate(subA, null, List.of(colA), false, java.util.OptionalLong.empty());
 
         // 1. Write Data (Using Transaction for consistency)
-        long tx1 = db.openTransaction(10000);
+        long tx1 = db.openTransaction( java.time.Duration.ofMillis(10000));
         db.put(tx1, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("Data1".getBytes()), RequestType.none());
         db.closeTransaction(tx1, true);
 
@@ -385,19 +385,19 @@ class CdcGhostAndSkipTest {
         long seqAfterA1 = b1.nextSeq();
 
         // 2. Write Put B1 (Batch 2) - This batch is filtered out for subA
-        long tx2 = db.openTransaction(10000);
+        long tx2 = db.openTransaction( java.time.Duration.ofMillis(10000));
         db.put(tx2, colB, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("B1".getBytes()), RequestType.none());
         db.closeTransaction(tx2, true);
 
         // 3. Write Put A2 (Batch 3)
-        long tx3 = db.openTransaction(10000);
+        long tx3 = db.openTransaction( java.time.Duration.ofMillis(10000));
         db.put(tx3, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("A2".getBytes()), RequestType.none());
         db.closeTransaction(tx3, true);
 
         // 4. Poll from seqAfterA1.
         // It should skip Batch 2 (all filtered) and find Batch 3.
         CdcBatch b2 = db.cdcPollBatchAsyncInternal(subA, seqAfterA1, 10).block();
-        
+
         assertFalse(b2.events().isEmpty(), "Should not be stuck on filtered batch");
         assertEquals("A2", new String(b2.events().get(0).value().toByteArray()));
     }
@@ -405,10 +405,10 @@ class CdcGhostAndSkipTest {
     @Test
     void testIdempotency() throws Exception {
         String sub = "sub-idempotent";
-        db.cdcCreate(sub, null, List.of(colA), false);
+        db.cdcCreate(sub, null, List.of(colA), false, java.util.OptionalLong.empty());
 
         // Write 3 items
-        long tx = db.openTransaction(10000);
+        long tx = db.openTransaction( java.time.Duration.ofMillis(10000));
         for(int i=0; i<3; i++) {
             db.put(tx, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(i))}), Buf.wrap(("V"+i).getBytes()), RequestType.none());
         }

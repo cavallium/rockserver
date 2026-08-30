@@ -49,7 +49,7 @@ class GrpcIteratorSchedulingTest {
 				try (var client = GrpcConnection.forHostAndPort("grpc-iterator-scheduling",
 						new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 					var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-					long iteratorId = api.openIterator(0, columnId, null, null, false, 10_000);
+					long iteratorId = api.openIterator(0, columnId, null, null, false, java.time.Duration.ofMillis( 10_000));
 					try {
 						var scheduler = embedded.getInternalDB().getScheduler();
 						long tasksBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
@@ -111,7 +111,7 @@ class GrpcIteratorSchedulingTest {
 				try (var client = GrpcConnection.forHostAndPort(database,
 						new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 					var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-					long iteratorId = api.openIterator(0, columnId, null, null, false, 10_000);
+					long iteratorId = api.openIterator(0, columnId, null, null, false, java.time.Duration.ofMillis( 10_000));
 					var scheduler = embedded.getInternalDB().getScheduler();
 					var blockersEntered = new CountDownLatch(2);
 					var releaseBlockers = new CountDownLatch(1);

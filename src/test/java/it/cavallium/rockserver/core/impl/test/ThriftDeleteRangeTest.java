@@ -116,10 +116,10 @@ class ThriftDeleteRangeTest {
 		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key4, value(140), RequestType.none());
 
 		var normal = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
-				.getRange(0, colId, key2, key4, false, RequestType.allInRange(), 1_000)
+				.getRange(0, colId, key2, key4, false, RequestType.allInRange())
 				.toList();
 		var noCache = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
-				.getRange(0, colId, key2, key4, false, RequestType.allInRangeNoCache(), 1_000)
+				.getRange(0, colId, key2, key4, false, RequestType.allInRangeNoCache())
 				.toList();
 
 		assertEquals(List.of(new KV(key2, value(120)), new KV(key3, value(130))), noCache);

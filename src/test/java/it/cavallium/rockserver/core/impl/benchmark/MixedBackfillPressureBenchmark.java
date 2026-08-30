@@ -114,7 +114,7 @@ public final class MixedBackfillPressureBenchmark {
 			long skippedRows = consumeScan(batch.scanRawResumable(reopenedColumn, 0, 1, Set.copyOf(checkpoints)),
 					new HashSet<>(), null, null);
 			if (skippedRows != 0L) throw new IllegalStateException("reopen did not skip completed SSTs: " + skippedRows);
-			batch.cdcCreate(CDC, null, List.of(reopenedColumn), false);
+			batch.cdcCreate(CDC, null, List.of(reopenedColumn), false, java.util.OptionalLong.empty());
 			result = measure(reopened, reopenedColumn, options, provenance, keySpace,
 					firstRows, resumedRows, checkpoints.size());
 			awaitDrain(reopened);
@@ -317,9 +317,9 @@ public final class MixedBackfillPressureBenchmark {
 		try {
 			scheduler.setStoragePressure(true);
 			var read = scheduler.executor(WorkloadProfile.BATCH,
-					OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+					OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var write = scheduler.executor(WorkloadProfile.BATCH,
-					OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
+					OperationFamily.MUTATION, Long.MAX_VALUE);
 			for (int task = 0; task < readTasks; task++) read.execute(() -> holdPermit(started, release));
 			for (int task = 0; task < writeTasks; task++) write.execute(() -> holdPermit(started, release));
 			if (!started.await(30, TimeUnit.SECONDS)) {

@@ -57,7 +57,7 @@ class ExactCountContinuationTest {
 			});
 			try {
 				var count = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(firstQuantum.await(10, TimeUnit.SECONDS));
 				assertEquals(1, connection.getInternalDB().getRetainedRangeSnapshotCount());
 				var ingest = connection.getSyncApi(RequestContext.ingest());
@@ -90,7 +90,7 @@ class ExactCountContinuationTest {
 			});
 			try {
 				var count = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(firstQuantum.await(10, TimeUnit.SECONDS));
 				assertEquals(1, connection.getInternalDB().getRetainedRangeSnapshotCount());
 				assertTrue(count.cancel(false));
@@ -124,7 +124,7 @@ class ExactCountContinuationTest {
 			});
 			try {
 				var count = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), Long.MAX_VALUE);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
 				assertEquals(1, connection.getInternalDB().getRetainedRangeSnapshotCount());
 				assertTrue(awaitCondition(
@@ -156,9 +156,9 @@ class ExactCountContinuationTest {
 				}
 			});
 			try {
-				var deadline = RequestContext.analytical(Instant.now().plusMillis(500));
+				var deadline = RequestContext.analytical(java.time.Duration.ofMillis(500));
 				var count = connection.getAsyncApi(deadline).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), Long.MAX_VALUE);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
 				assertTrue(awaitCondition(
 						() -> connection.getInternalDB().getRetainedRangeSnapshotCount() == 0, 2_000));
@@ -178,11 +178,11 @@ class ExactCountContinuationTest {
 			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
 			var negative = assertThrows(RocksDBException.class,
 					() -> connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-							0, columnId, null, null, false, RequestType.entriesCount(), -1));
+							0, columnId, null, null, false, RequestType.entriesCount()));
 			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, negative.getErrorUniqueId());
 
 			var zero = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount(), 0);
+					0, columnId, null, null, false, RequestType.entriesCount());
 			assertReadDeadline(zero);
 			assertRetainedResourcesClosed(connection);
 		}
@@ -215,13 +215,13 @@ class ExactCountContinuationTest {
 				}
 			});
 			var firstCount = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+					0, columnId, null, null, false, RequestType.entriesCount());
 			assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
 
 			var waiters = new ArrayList<CompletableFuture<Long>>(waiterCount);
 			for (int i = 0; i < waiterCount; i++) {
 				waiters.add(connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000));
+						0, columnId, null, null, false, RequestType.entriesCount()));
 			}
 			assertTrue(awaitCondition(
 					() -> connection.getInternalDB().getRetainedRangeWaiterCount() == waiterCount, 5_000));
@@ -275,13 +275,13 @@ class ExactCountContinuationTest {
 			});
 			try {
 				var active = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
 				long acceptedBefore = connection.getScheduler()
 						.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 				var waiting = connection.getAsyncApi(
-						RequestContext.analytical(Instant.now().plusMillis(500))).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), Long.MAX_VALUE);
+						RequestContext.analytical(java.time.Duration.ofMillis(500))).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(awaitCondition(
 						() -> connection.getInternalDB().getRetainedRangeWaiterCount() == 1, 2_000));
 				assertReadDeadline(waiting);
@@ -310,14 +310,14 @@ class ExactCountContinuationTest {
 			var releaseAnalyticalWorker = new CountDownLatch(1);
 			connection.getScheduler().executor(WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				analyticalWorkerEntered.countDown();
 				await(releaseAnalyticalWorker);
 			});
 			assertTrue(analyticalWorkerEntered.await(5, TimeUnit.SECONDS));
 			try {
 				var count = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(awaitCondition(() -> connection.getInternalDB().getRetainedRangePermitCount() == 1
 						&& connection.getScheduler().poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1,
 						5_000));
@@ -347,14 +347,14 @@ class ExactCountContinuationTest {
 			var quantumSizes = new ArrayList<Long>();
 			connection.getInternalDB().setRangeCountQuantumItemsObserverForTesting(quantumSizes::add);
 			assertEquals(29L, connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount(), 30_000)
+					0, columnId, null, null, false, RequestType.entriesCount())
 					.get(10, TimeUnit.SECONDS));
 			assertTrue(quantumSizes.size() > 5,
 					"the configured duration must yield before the seven-item ceiling at least once");
 			assertTrue(quantumSizes.stream().allMatch(size -> size > 0L && size <= 7L));
 
 			var missingColumn = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-					0, Long.MAX_VALUE, null, null, false, RequestType.entriesCount(), 30_000);
+					0, Long.MAX_VALUE, null, null, false, RequestType.entriesCount());
 			assertThrows(ExecutionException.class, () -> missingColumn.get(10, TimeUnit.SECONDS));
 			assertRetainedResourcesClosed(connection);
 		}
@@ -378,7 +378,7 @@ class ExactCountContinuationTest {
 			});
 			try {
 				var count = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
 				assertTrue(awaitCondition(() -> connection.getScheduler()
 						.poolSnapshot(RWScheduler.Pool.READ).activeTasks() == 0, 5_000));
@@ -391,7 +391,7 @@ class ExactCountContinuationTest {
 						System.currentTimeMillis() + 5_000L).execute(latencyProgress::countDown);
 				connection.getScheduler().executor(WorkloadProfile.CDC,
 						OperationFamily.WAL_PAGE,
-						RequestContext.NO_DEADLINE).execute(cdcProgress::countDown);
+						Long.MAX_VALUE).execute(cdcProgress::countDown);
 				assertTrue(latencyProgress.await(5, TimeUnit.SECONDS));
 				assertTrue(cdcProgress.await(5, TimeUnit.SECONDS));
 
@@ -425,11 +425,11 @@ class ExactCountContinuationTest {
 				}
 			});
 			connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+					0, columnId, null, null, false, RequestType.entriesCount());
 			assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
 			for (int i = 0; i < 8; i++) {
 				connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+						0, columnId, null, null, false, RequestType.entriesCount());
 			}
 			assertTrue(awaitCondition(
 					() -> connection.getInternalDB().getRetainedRangeWaiterCount() == 8, 5_000));
@@ -470,10 +470,10 @@ class ExactCountContinuationTest {
 				}
 			});
 			connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+					0, columnId, null, null, false, RequestType.entriesCount());
 			assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
 			connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+					0, columnId, null, null, false, RequestType.entriesCount());
 			assertTrue(awaitCondition(
 					() -> connection.getInternalDB().getRetainedRangeWaiterCount() == 1, 5_000));
 

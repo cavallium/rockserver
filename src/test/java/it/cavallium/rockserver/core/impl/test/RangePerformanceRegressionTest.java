@@ -58,8 +58,7 @@ class RangePerformanceRegressionTest {
 					null,
 					null,
 					false,
-					RequestType.allInRange(),
-					10_000))
+					RequestType.allInRange()))
 					.collectList()
 					.block(Duration.ofSeconds(20));
 			assertNotNull(rows);
@@ -73,8 +72,7 @@ class RangePerformanceRegressionTest {
 					null,
 					null,
 					false,
-					RequestType.entriesCount(),
-					10_000).get(20, TimeUnit.SECONDS);
+					RequestType.entriesCount()).get(20, TimeUnit.SECONDS);
 			assertEquals(entries, count);
 			assertEquals(1, iteratorOpens.get(),
 					"exact count must aggregate physical chunks with one iterator");
@@ -85,8 +83,7 @@ class RangePerformanceRegressionTest {
 					null,
 					null,
 					false,
-					RequestType.firstAndLast(),
-					10_000).get(20, TimeUnit.SECONDS);
+					RequestType.firstAndLast()).get(20, TimeUnit.SECONDS);
 			assertEquals(key(0), endpoints.first().keys());
 			assertEquals(key(entries - 1), endpoints.last().keys());
 			assertEquals(1, iteratorOpens.get(),
@@ -127,8 +124,7 @@ class RangePerformanceRegressionTest {
 					null,
 					null,
 					false,
-					RequestType.entriesCount(),
-					60_000);
+					RequestType.entriesCount());
 			assertTrue(firstChunk.await(10, TimeUnit.SECONDS));
 			assertTrue(count.cancel(true), "the cancellable count future must stop its source");
 			releaseChunk.countDown();
@@ -167,8 +163,7 @@ class RangePerformanceRegressionTest {
 					null,
 					null,
 					false,
-					RequestType.allInRange(),
-					10_000)).collectList().block(Duration.ofSeconds(20));
+					RequestType.allInRange())).collectList().block(Duration.ofSeconds(20));
 
 			assertNotNull(rows);
 			assertEquals(3, rows.size());
@@ -196,8 +191,7 @@ class RangePerformanceRegressionTest {
 					null,
 					null,
 					false,
-					RequestType.allInRange(),
-					10_000));
+					RequestType.allInRange()));
 			StepVerifier.create(range, 1)
 					.assertNext(first -> assertEquals(key(0), first.keys()))
 					.thenAwait(Duration.ofMillis(250))
@@ -230,8 +224,7 @@ class RangePerformanceRegressionTest {
 					null,
 					null,
 					false,
-					RequestType.allInRange(),
-					10_000));
+					RequestType.allInRange()));
 			StepVerifier.create(range, 1)
 					.assertNext(first -> assertEquals(key(0), first.keys()))
 					.then(() -> api.put(0, columnId, key(5_001), value(-1), RequestType.none()))
@@ -266,13 +259,12 @@ class RangePerformanceRegressionTest {
 			var outcomesBefore = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ)
 					.outcomes();
 			var range = Flux.from(connection.getAsyncApi(
-					RequestContext.batch(Instant.now().plusMillis(500))).getRangeAsync(0,
+					RequestContext.batch(java.time.Duration.ofMillis(500))).getRangeAsync(0,
 					columnId,
 					null,
 					null,
 					false,
-					RequestType.allInRange(),
-					Long.MAX_VALUE));
+					RequestType.allInRange()));
 			StepVerifier.create(range, 1)
 					.assertNext(first -> assertEquals(key(0), first.keys()))
 					.then(() -> assertEquals(1, internal.getActiveRangeCursorCount(),

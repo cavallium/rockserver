@@ -141,7 +141,6 @@ class RangePageContractTest {
 					false,
 					null,
 					RequestType.allInRangeNoCache(),
-					TIMEOUT_MS,
 					TWO_ITEMS);
 			assertEquals(List.of(20L, 30L), values(noCache));
 			assertTrue(noCache.hasMore());
@@ -158,7 +157,6 @@ class RangePageContractTest {
 					false,
 					null,
 					RequestType.allInRange(),
-					TIMEOUT_MS,
 					TWO_ITEMS).join();
 			assertEquals(List.of(20L, 30L), values(page));
 			assertEquals(key(30), page.resumeAfter());
@@ -176,18 +174,17 @@ class RangePageContractTest {
 					false,
 					null,
 					RequestType.allInRange(),
-					TIMEOUT_MS,
 					new RangeBudget(LATENCY_MAX_ITEMS, LATENCY_MAX_BYTES));
 			assertEquals(LATENCY_MAX_ITEMS, atLimit.items().size());
 			assertTrue(atLimit.hasMore());
 
 			var tooManyItems = assertThrows(RocksDBException.class, () -> api.getRangePage(0,
-					columnId, key(0), key(100), false, null, RequestType.allInRange(), TIMEOUT_MS,
+					columnId, key(0), key(100), false, null, RequestType.allInRange(),
 					new RangeBudget(LATENCY_MAX_ITEMS + 1, LATENCY_MAX_BYTES)));
 			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, tooManyItems.getErrorUniqueId());
 
 			var tooManyBytes = assertThrows(RocksDBException.class, () -> api.getRangePage(0,
-					columnId, key(0), key(100), false, null, RequestType.allInRange(), TIMEOUT_MS,
+					columnId, key(0), key(100), false, null, RequestType.allInRange(),
 					new RangeBudget(LATENCY_MAX_ITEMS, LATENCY_MAX_BYTES + 1)));
 			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, tooManyBytes.getErrorUniqueId());
 		}
@@ -198,18 +195,18 @@ class RangePageContractTest {
 		for (var api : apis()) {
 			var error = assertThrows(RocksDBException.class, () -> api.getRangePage(
 					0, columnId, key(0), key(100), false, null,
-					RequestType.allInRange(), TIMEOUT_MS, new RangeBudget(10, 15)));
+					RequestType.allInRange(), new RangeBudget(10, 15)));
 			assertEquals(RocksDBErrorType.RANGE_ITEM_TOO_LARGE, error.getErrorUniqueId());
 
 			var tooManyItems = assertThrows(RocksDBException.class, () -> api.getRangePage(
 					0, columnId, key(0), key(100), false, null,
-					RequestType.allInRange(), TIMEOUT_MS,
+					RequestType.allInRange(),
 					new RangeBudget(RangeBudget.DEFAULT_MAX_ITEMS + 1, RangeBudget.DEFAULT_MAX_BYTES)));
 			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, tooManyItems.getErrorUniqueId());
 
 			var tooManyBytes = assertThrows(RocksDBException.class, () -> api.getRangePage(
 					0, columnId, key(0), key(100), false, null,
-					RequestType.allInRange(), TIMEOUT_MS,
+					RequestType.allInRange(),
 					new RangeBudget(RangeBudget.DEFAULT_MAX_ITEMS, RangeBudget.DEFAULT_MAX_BYTES + 1)));
 			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, tooManyBytes.getErrorUniqueId());
 		}
@@ -234,7 +231,6 @@ class RangePageContractTest {
 						false,
 						null,
 						RequestType.allInRange(),
-						TIMEOUT_MS,
 						TWO_ITEMS);
 				assertEquals(List.of(20L, 30L), values(page));
 				assertTrue(page.hasMore());
@@ -249,7 +245,7 @@ class RangePageContractTest {
 		var firstPages = new ArrayList<RangePage<KV>>();
 		try {
 			for (var api : transportApis) {
-				transactionIds.add(api.openTransaction(TIMEOUT_MS));
+				transactionIds.add(api.openTransaction(Duration.ofMillis(TIMEOUT_MS)));
 			}
 			for (int index = 0; index < transportApis.size(); index++) {
 				var first = transportApis.get(index).getRangePage(transactionIds.get(index),
@@ -259,7 +255,6 @@ class RangePageContractTest {
 						false,
 						null,
 						RequestType.allInRange(),
-						TIMEOUT_MS,
 						new RangeBudget(1, RangeBudget.DEFAULT_MAX_BYTES));
 				assertEquals(List.of(0L), values(first));
 				firstPages.add(first);
@@ -275,7 +270,6 @@ class RangePageContractTest {
 						false,
 						firstPages.get(index).resumeAfter(),
 						RequestType.allInRange(),
-						TIMEOUT_MS,
 						new RangeBudget(1, RangeBudget.DEFAULT_MAX_BYTES));
 				assertEquals(List.of(10L), values(second),
 						"a later autocommit write must not enter the transaction snapshot");
@@ -309,7 +303,6 @@ class RangePageContractTest {
 					public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
 						return Mono.just(CapabilitiesResponse.newBuilder()
 								.setWorkloadContractVersion(1)
-								.setBoundedRange(false)
 								.build());
 					}
 				})
@@ -373,7 +366,6 @@ class RangePageContractTest {
 					reverse,
 					resumeAfter,
 					RequestType.allInRange(),
-					TIMEOUT_MS,
 					TWO_ITEMS);
 			assertTrue(page.items().size() <= TWO_ITEMS.maxItems());
 			actual.addAll(values(page));
@@ -396,7 +388,6 @@ class RangePageContractTest {
 					reverse,
 					resumeAfter,
 					RequestType.allInRange(),
-					TIMEOUT_MS,
 					TWO_ITEMS);
 			actual.addAll(page.items().stream()
 					.map(row -> new String(row.keys().keys()[1].toByteArray(), StandardCharsets.UTF_8))

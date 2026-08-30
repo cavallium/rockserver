@@ -68,7 +68,7 @@ class GrpcIteratorLeaseTest {
 				List<Long> iteratorIds = new ArrayList<>(ITERATOR_COUNT);
 				try {
 					for (int i = 0; i < ITERATOR_COUNT; i++) {
-						iteratorIds.add(api.openIterator(0, columnId, new Keys(), null, false, 25));
+						iteratorIds.add(api.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 25)));
 					}
 
 					assertEquals(0, server.getActiveIteratorOperationLeaseCountForTesting(),
@@ -109,7 +109,7 @@ class GrpcIteratorLeaseTest {
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var asyncApi = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				var syncApi = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-				long iteratorId = syncApi.openIterator(0, 0, new Keys(), null, false, 30_000);
+				long iteratorId = syncApi.openIterator(0, 0, new Keys(), null, false, java.time.Duration.ofMillis( 30_000));
 				var running = asyncApi.subsequentAsync(iteratorId, 4_097, 1, RequestType.exists());
 
 				try {
@@ -153,7 +153,8 @@ class GrpcIteratorLeaseTest {
 					.setTakeCount(128L)
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-							.setDeadlineEpochMillis(Long.MAX_VALUE))
+							.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE))
 					.build();
 
 			var values = grpcService(server).subsequentMultiGet(request)
@@ -222,7 +223,8 @@ class GrpcIteratorLeaseTest {
 					.setTakeCount(4_097L)
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-							.setDeadlineEpochMillis(Long.MAX_VALUE))
+							.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE))
 					.build();
 
 			StepVerifier.create(grpcService(server).subsequentMultiGet(request)
@@ -256,7 +258,8 @@ class GrpcIteratorLeaseTest {
 					.setTakeCount(4_097L)
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-							.setDeadlineEpochMillis(Long.MAX_VALUE))
+							.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE))
 					.build();
 
 			StepVerifier.create(grpcService(server).subsequentMultiGet(request), 0)
@@ -330,7 +333,7 @@ class GrpcIteratorLeaseTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-rejected-open-cleanup",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var open = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIteratorAsync(0, 0, new Keys(), null, false, 30_000);
+				var open = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIteratorAsync(0, 0, new Keys(), null, false, java.time.Duration.ofMillis( 30_000));
 				CompletableFuture<Void> schedulerShutdown = null;
 				try {
 					assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
@@ -377,6 +380,8 @@ class GrpcIteratorLeaseTest {
 	}
 
 	private static final class BlockingSubsequentConnection implements RocksDBConnection, InternalConnection {
+		@Override
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
 
 		private static final long ITERATOR_ID = 17;
 
@@ -387,6 +392,11 @@ class GrpcIteratorLeaseTest {
 		private final CountDownLatch finished = new CountDownLatch(1);
 		private final AtomicInteger subsequentCalls = new AtomicInteger();
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+
 			@Override
 			@SuppressWarnings("unchecked")
 			public <T> CompletableFuture<T> subsequentAsync(long iterationId,
@@ -466,6 +476,8 @@ class GrpcIteratorLeaseTest {
 
 	private static final class RecordingAsyncSubsequentConnection
 			implements RocksDBConnection, InternalConnection {
+		@Override
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
 
 		private static final long ITERATOR_ID = 31L;
 		private static final String METRIC_DATABASE = "grpc-recording-subsequent";
@@ -487,6 +499,11 @@ class GrpcIteratorLeaseTest {
 		private final CountDownLatch multiReturned = new CountDownLatch(1);
 		private final AtomicBoolean secondPageBeforeForeground = new AtomicBoolean();
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+
 			@Override
 			@SuppressWarnings("unchecked")
 			public <T> CompletableFuture<T> subsequentAsync(long iterationId,
@@ -623,6 +640,8 @@ class GrpcIteratorLeaseTest {
 	}
 
 	private static final class BlockingOpenIteratorConnection implements RocksDBConnection, InternalConnection {
+		@Override
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
 
 		private static final long ITERATOR_ID = 23;
 
@@ -632,7 +651,12 @@ class GrpcIteratorLeaseTest {
 		private final CountDownLatch release = new CountDownLatch(1);
 		private final CountDownLatch closed = new CountDownLatch(1);
 		private final AtomicBoolean iteratorOpen = new AtomicBoolean();
-		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {};
+		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+};
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
 			@Override
 			@SuppressWarnings("unchecked")

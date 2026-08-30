@@ -35,17 +35,17 @@ class CdcWalPurgeTest {
     @BeforeEach
     void setUp() throws IOException, RocksDBException {
         db = new EmbeddedDB(tempDir, "test-db", null);
-        
+
         var schema = ColumnSchema.of(
-                IntArrayList.of(4), 
-                new ObjectArrayList<>(), 
-                true, 
+                IntArrayList.of(4),
+                new ObjectArrayList<>(),
+                true,
                 null, null, null
         );
         columnId = db.createColumn("data", schema);
-        
+
         // Subscribe from "now" (which is start)
-        db.cdcCreate(subId, null, List.of(columnId), false);
+        db.cdcCreate(subId, null, List.of(columnId), false, java.util.OptionalLong.empty());
     }
 
     @AfterEach
@@ -60,21 +60,21 @@ class CdcWalPurgeTest {
         Field dbOptionsField = EmbeddedDB.class.getDeclaredField("dbOptions");
         dbOptionsField.setAccessible(true);
         DBOptions dbOptions = (DBOptions) dbOptionsField.get(db);
-        
+
         // Set TTL to 1 second
         dbOptions.setWalTtlSeconds(1);
-        
+
         // Apply to running DB if possible (though TTL usually requires reopen or SetDBOptions?)
-        // EmbeddedDB doesn't expose SetDBOptions easily, but let's try to assume RocksDB picks it up 
+        // EmbeddedDB doesn't expose SetDBOptions easily, but let's try to assume RocksDB picks it up
         // or we rely on the fact that we might need to close/reopen.
-        // Actually, let's close and reopen with the same path, but we can't easily inject the config 
+        // Actually, let's close and reopen with the same path, but we can't easily inject the config
         // because it's hardcoded in RocksDBLoader.
-        
+
         // Alternative: Use "setOptions" API if exposed? No.
-        
-        // Let's try to update the OPTIONS file or just use the field if it was not yet opened? 
+
+        // Let's try to update the OPTIONS file or just use the field if it was not yet opened?
         // The DB is already opened in setUp.
-        
+
         // RocksDB supports dynamic change of WAL_ttl_seconds via SetDBOptions.
         // We need to access the native DB object.
         var rocksDb = db.getDb().get();
@@ -91,7 +91,7 @@ class CdcWalPurgeTest {
 
         // 2. Write Batch 1 (Seq 1-10)
         writeBatch(0, 10, "A");
-        
+
         // 3. Consume it to know the sequence
         CdcBatch b1 = db.cdcPollBatchAsyncInternal(subId, null, 10).block();
         assertEquals(10, b1.events().size());
@@ -101,7 +101,7 @@ class CdcWalPurgeTest {
         // We need to write enough to fill a WAL file and exceed TTL.
         // Default WAL size might be large, but we set TTL=1s.
         // We need to wait > 1s and write to trigger check.
-        
+
         System.out.println("Writing filler data...");
         long start = System.currentTimeMillis();
         for (int i = 0; i < 50; i++) {
@@ -110,24 +110,24 @@ class CdcWalPurgeTest {
             if (i % 10 == 0) db.getDb().get().flushWal(true);
         }
         Thread.sleep(2000); // Wait for TTL
-        
+
         // Trigger generic flush/compaction to help purging
         db.getDb().get().flush(new org.rocksdb.FlushOptions());
-        
+
         // Write one more to ensure new WAL is active and old one can be deleted
         writeBatch(9999, 1, "End");
 
         // 5. Try to poll from the OLD sequence (nextSeq) which should be purged.
         // The WAL for seq ~11 should be gone.
         System.out.println("Polling from old sequence: " + nextSeq);
-        
+
         try {
             CdcBatch b2 = db.cdcPollBatchAsyncInternal(subId, nextSeq, 10).block();
-            
+
             // If we are here, either:
             // A) The WAL was NOT purged (test failed to reproduce)
             // B) The DB returned events from a MUCH LATER sequence (Silent Gap)
-            
+
             if (b2.events().isEmpty()) {
                  System.out.println("[DEBUG_LOG] Result empty, nextSeq=" + b2.nextSeq());
                  if (extractWalSeq(b2.nextSeq()) > extractWalSeq(nextSeq) + 100) {
@@ -159,7 +159,7 @@ class CdcWalPurgeTest {
             throw e; // Rethrow unexpected
         }
     }
-    
+
 	private long extractWalSeq(long seq) {
 		return seq >>> 20;
 	}

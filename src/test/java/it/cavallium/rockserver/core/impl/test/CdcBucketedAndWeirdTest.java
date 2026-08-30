@@ -58,27 +58,27 @@ class CdcBucketedAndWeirdTest {
 
         String subId = "sub-bucket-resolved";
         // Create CDC subscription WITH resolvedValues = true
-        long startSeq = db.cdcCreate(subId, null, List.of(colId), true);
+        long startSeq = db.cdcCreate(subId, null, List.of(colId), true, java.util.OptionalLong.empty());
 
         // 1. Put (1, "A") -> Val "V1"
         // Fixed key: 1. Variable: "A".
-        db.put(0, colId, 
-               new Keys(new Buf[]{Buf.wrap(intToBytes(1)), Buf.wrap("A".getBytes())}), 
-               Buf.wrap("V1".getBytes()), 
+        db.put(0, colId,
+               new Keys(new Buf[]{Buf.wrap(intToBytes(1)), Buf.wrap("A".getBytes())}),
+               Buf.wrap("V1".getBytes()),
                RequestType.none());
 
         // 2. Put (1, "A") -> Val "V2"
         // Same fixed key 1. Same variable "A".
         // This updates the SAME bucket.
-        db.put(0, colId, 
-               new Keys(new Buf[]{Buf.wrap(intToBytes(1)), Buf.wrap("A".getBytes())}), 
-               Buf.wrap("V2".getBytes()), 
+        db.put(0, colId,
+               new Keys(new Buf[]{Buf.wrap(intToBytes(1)), Buf.wrap("A".getBytes())}),
+               Buf.wrap("V2".getBytes()),
                RequestType.none());
 
         // Poll CDC
         // We expect 2 events (one for each Put).
         // Since resolved=true, BOTH events should contain the LATEST bucket content (containing "V2").
-        
+
         List<CDCEvent> events = db.cdcPollBatchAsyncInternal(subId, null, 10).block().events();
         assertEquals(2, events.size());
 
@@ -87,7 +87,7 @@ class CdcBucketedAndWeirdTest {
 
         assertEquals(CDCEvent.Op.PUT, ev1.op());
         assertEquals(CDCEvent.Op.PUT, ev2.op());
-        
+
         // Keys should be the real keys (Fixed + Variable)
         // Fixed: 4 bytes. Variable: "A" (1 byte). Total > 4.
         assertTrue(ev1.key().size() > 4, "Key should contain variable part");
@@ -95,7 +95,7 @@ class CdcBucketedAndWeirdTest {
         // Verify key ends with "A"
         byte[] k1 = ev1.key().toByteArray();
         assertEquals((byte)'A', k1[k1.length-1]);
-        
+
         assertTrue(ev2.key().size() > 4);
 
         // Values should be the resolved element value ("V2"), not the bucket blob.
@@ -110,7 +110,7 @@ class CdcBucketedAndWeirdTest {
 				IntList.of(4),
 				ObjectList.of(ColumnHashType.ALLSAME8),
 				true));
-		long startSeq = db.cdcCreate("sub-bucket-atomic", null, List.of(colId), true);
+		long startSeq = db.cdcCreate("sub-bucket-atomic", null, List.of(colId), true, java.util.OptionalLong.empty());
 
 		for (String suffix : List.of("A", "B", "C")) {
 			db.put(0,
@@ -144,14 +144,14 @@ class CdcBucketedAndWeirdTest {
         ));
 
         String subId = "sub-bucket-raw";
-        db.cdcCreate(subId, null, List.of(colId), false);
+        db.cdcCreate(subId, null, List.of(colId), false, java.util.OptionalLong.empty());
 
         db.put(0, colId, new Keys(new Buf[]{Buf.wrap(intToBytes(1)), Buf.wrap("A".getBytes())}), Buf.wrap("V1".getBytes()), RequestType.none());
         db.put(0, colId, new Keys(new Buf[]{Buf.wrap(intToBytes(1)), Buf.wrap("B".getBytes())}), Buf.wrap("V2".getBytes()), RequestType.none());
 
         List<CDCEvent> events = db.cdcPollBatchAsyncInternal(subId, null, 10).block().events();
         assertEquals(2, events.size());
-        
+
         // Ev1: Bucket has only V1
         // Ev2: Bucket has V1 and V2
         // They should differ.
@@ -170,11 +170,11 @@ class CdcBucketedAndWeirdTest {
         ));
 
         String subId = "sub-set";
-        db.cdcCreate(subId, null, List.of(colId), true); // resolved=true
+        db.cdcCreate(subId, null, List.of(colId), true, java.util.OptionalLong.empty()); // resolved=true
 
         // Put (1, "A")
-        db.put(0, colId, 
-               new Keys(new Buf[]{Buf.wrap(intToBytes(1)), Buf.wrap("A".getBytes())}), 
+        db.put(0, colId,
+               new Keys(new Buf[]{Buf.wrap(intToBytes(1)), Buf.wrap("A".getBytes())}),
                Buf.wrap(new byte[0]), // Value must be empty/ignored
                RequestType.none());
 
@@ -182,11 +182,11 @@ class CdcBucketedAndWeirdTest {
         List<CDCEvent> events = db.cdcPollBatchAsyncInternal(subId, null, 10).block().events();
         assertEquals(1, events.size());
         assertEquals(CDCEvent.Op.PUT, events.get(0).op());
-        
+
         // Value should be empty (since hasValue=false), NOT the bucket blob.
         // The bucket blob contains the keys, but we extracted them into the event key.
         assertEquals(0, events.get(0).value().size(), "Value should be empty for hasValue=false column");
-        
+
         // Key should contain "A"
         assertTrue(events.get(0).key().size() > 4);
     }

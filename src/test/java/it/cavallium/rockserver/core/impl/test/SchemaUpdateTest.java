@@ -56,9 +56,9 @@ public class SchemaUpdateTest {
         try (EmbeddedConnection db = new EmbeddedConnection(tempDir, dbName, configV1)) {
             // Create column with V1 schema (explicit class name)
             colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.MyStringAppendOperator"));
-            
+
             // Create CDC subscription (Resolved=true)
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), true);
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), true, java.util.OptionalLong.empty());
 
             // Put "A", Merge "B" -> "A,B"
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("A".getBytes()), RequestType.none());
@@ -74,7 +74,7 @@ public class SchemaUpdateTest {
             // Call createColumn with V2 schema (New Class Name)
             // This exercises the fix: schema update on disk
             colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.test.MyStringAppendOperatorV2"));
-            
+
             // Merge "C" -> Should use V2 (semicolon) -> "A,B;C"
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("C".getBytes()), RequestType.none());
 
@@ -88,7 +88,7 @@ public class SchemaUpdateTest {
             // All events should resolve to LATEST state ("A,B;C" or "A;B;C")
             List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll(subId, null, 100).collect(Collectors.toList());
             assertEquals(3, events.size());
-            
+
             String latestState = valStr;
             assertEquals(latestState, new String(events.get(0).value().toByteArray()));
             assertEquals(latestState, new String(events.get(1).value().toByteArray()));

@@ -67,12 +67,12 @@ database: {
         assertNotNull(v);
 
         // Explicit transaction with commit
-        long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(5_000);
+        long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(5_000));
         db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId, colId, k, Buf.wrap("b".getBytes()), RequestType.none());
         assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(txId, true));
 
         // Explicit transaction with rollback
-        long txId2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(5_000);
+        long txId2 = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(5_000));
         db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId2, colId, k, Buf.wrap("c".getBytes()), RequestType.none());
         assertTrue(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(txId2, false));
 
@@ -82,7 +82,7 @@ database: {
         assertNotNull(merged);
 
         // Range scan with cancellation (iterator should be closed)
-        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, false, RequestType.allInRange(), Duration.ofSeconds(5).toMillis());
+        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, false, RequestType.allInRange());
         var sub = reactor.core.publisher.Flux.from(pub).take(1).subscribe();
         sub.dispose();
 
@@ -103,7 +103,7 @@ database: {
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, Buf.wrap(new byte[]{(byte) i}), RequestType.none());
         }
         // Start range and cancel after a few elements
-        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, false, RequestType.allInRange(), Duration.ofSeconds(10).toMillis());
+        var pub = db.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(0, colId, null, null, false, RequestType.allInRange());
         var disposable = reactor.core.publisher.Flux.from(pub).take(3).subscribe();
         disposable.dispose();
         var internal = db.getInternalDB();

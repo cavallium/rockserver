@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.google.protobuf.ByteString;
 import io.grpc.CallOptions;
@@ -17,6 +18,7 @@ import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.epoll.Epoll;
@@ -67,11 +69,34 @@ class GrpcFastGetTest {
 	private static final it.cavallium.rockserver.core.common.api.proto.RequestContext BATCH_CONTEXT =
 			it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-					.setDeadlineEpochMillis(Long.MAX_VALUE)
+					.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE)
 					.build();
 
 	@TempDir
 	Path tempDir;
+
+	@Test
+	void fastGetRejectsMissingAndNonV3RequestContexts() throws Exception {
+		try (var embedded = openEmbedded("strict-v3")) {
+			long columnId = populate(embedded);
+			try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+				server.start();
+				try (var client = ClientHandle.forTcp("127.0.0.1", server.getPort())) {
+					for (int version : new int[] {0, 2, 4}) {
+						var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+								.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+								.setTimeoutNanos(Long.MAX_VALUE);
+						if (version != 0) context.setWorkloadContractVersion(version);
+						var request = request(columnId, 0L, 0L).toBuilder().setContext(context).build();
+						var failure = assertThrows(StatusRuntimeException.class,
+								() -> client.stub().get(request));
+						assertEquals(Status.Code.INVALID_ARGUMENT, failure.getStatus().getCode());
+					}
+				}
+			}
+		}
+	}
 
 	@Test
 	void stockClientDecodesLegacyHeapPinnedAndAutomaticResponses() throws Exception {
@@ -149,7 +174,7 @@ class GrpcFastGetTest {
 		try (var embedded = openEmbedded("fallbacks")) {
 			long columnId = populate(embedded);
 			var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-			long transactionId = api.openTransaction(TimeUnit.MINUTES.toMillis(1));
+			long transactionId = api.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 			byte[] transactionValue = value(42, 513);
 			api.put(transactionId, columnId, keys(42), Buf.wrap(transactionValue), RequestType.none());
 			System.setProperty("rockserver.grpc.fast-get.strategy", "automatic");

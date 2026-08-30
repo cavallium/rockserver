@@ -64,7 +64,7 @@ class CooperativeIteratorContinuationTest {
 			long columnId = populateFixedColumn(sync, "entries", entries);
 			var scheduler = connection.getScheduler();
 
-			long multiIterator = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long multiIterator = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			try {
 				long acceptedBefore = readSnapshot(scheduler).acceptedTasks();
 				var values = async.subsequentAsync(
@@ -79,7 +79,7 @@ class CooperativeIteratorContinuationTest {
 				sync.closeIterator(multiIterator);
 			}
 
-			long existsIterator = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long existsIterator = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			try {
 				long acceptedBefore = readSnapshot(scheduler).acceptedTasks();
 				assertTrue(async.subsequentAsync(
@@ -90,7 +90,7 @@ class CooperativeIteratorContinuationTest {
 				sync.closeIterator(existsIterator);
 			}
 
-			long noneIterator = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long noneIterator = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			try {
 				long acceptedBefore = readSnapshot(scheduler).acceptedTasks();
 				async.subsequentAsync(noneIterator, 0L, Long.MAX_VALUE, RequestType.none()).get(10, SECONDS);
@@ -112,7 +112,7 @@ class CooperativeIteratorContinuationTest {
 			long fixedColumn = populateFixedColumn(sync, "fixed", entries);
 			long bucketedColumn = populateBucketedColumn(sync, "bucketed", entries);
 
-			long reverseIterator = sync.openIterator(0L, fixedColumn, new Keys(), null, true, 30_000L);
+			long reverseIterator = sync.openIterator(0L, fixedColumn, new Keys(), null, true, java.time.Duration.ofMillis( 30_000L));
 			try {
 				var values = async.subsequentAsync(
 						reverseIterator, ITERATOR_STEP, 3L, RequestType.<Buf>multi()).get(10, SECONDS);
@@ -121,7 +121,7 @@ class CooperativeIteratorContinuationTest {
 				sync.closeIterator(reverseIterator);
 			}
 
-			long bucketedIterator = sync.openIterator(0L, bucketedColumn, new Keys(), null, false, 30_000L);
+			long bucketedIterator = sync.openIterator(0L, bucketedColumn, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			try {
 				var values = async.subsequentAsync(
 						bucketedIterator, ITERATOR_STEP, 3L, RequestType.<Buf>multi()).get(10, SECONDS);
@@ -131,10 +131,10 @@ class CooperativeIteratorContinuationTest {
 				sync.closeIterator(bucketedIterator);
 			}
 
-			long transactionId = sync.openTransaction(30_000L);
+			long transactionId = sync.openTransaction( java.time.Duration.ofMillis(30_000L));
 			try {
 				long transactionIterator = sync.openIterator(
-						transactionId, fixedColumn, new Keys(), null, false, 30_000L);
+						transactionId, fixedColumn, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 				try {
 					var values = async.subsequentAsync(
 							transactionIterator, ITERATOR_STEP, 3L, RequestType.<Buf>multi()).get(10, SECONDS);
@@ -157,7 +157,7 @@ class CooperativeIteratorContinuationTest {
 			var sync = connection.getSyncApi(RequestContext.batch());
 			var async = connection.getAsyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", entries);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			var scheduler = connection.getScheduler();
 			var blockersEntered = new CountDownLatch(READ_WORKERS - 1);
 			var releaseBlockers = new CountDownLatch(1);
@@ -213,7 +213,7 @@ class CooperativeIteratorContinuationTest {
 			var sync = connection.getSyncApi(RequestContext.batch());
 			var async = connection.getAsyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", entries, valueBytes);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			var scheduler = connection.getScheduler();
 			var blockersEntered = new CountDownLatch(READ_WORKERS - 1);
 			var releaseBlockers = new CountDownLatch(1);
@@ -242,7 +242,7 @@ class CooperativeIteratorContinuationTest {
 		try (var connection = connection("iterator-quantum-control")) {
 			var sync = connection.getSyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", entries, valueBytes);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			try {
 				var competing = new FixedCooperativeContext(true, false);
 				var byteBounded = connection.getInternalDB().readIteratorQuantumInternal(
@@ -291,7 +291,7 @@ class CooperativeIteratorContinuationTest {
 			var sync = connection.getSyncApi(RequestContext.batch());
 			var async = connection.getAsyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", entries, valueBytes);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			var scheduler = connection.getScheduler();
 			var blockersEntered = new CountDownLatch(READ_WORKERS - 1);
 			var releaseBlockers = new CountDownLatch(1);
@@ -331,7 +331,7 @@ class CooperativeIteratorContinuationTest {
 			var sync = connection.getSyncApi(RequestContext.batch());
 			var async = connection.getAsyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", entries);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			var scheduler = connection.getScheduler();
 			var blockersEntered = new CountDownLatch(READ_WORKERS - 1);
 			var releaseBlockers = new CountDownLatch(1);
@@ -364,7 +364,7 @@ class CooperativeIteratorContinuationTest {
 			var sync = connection.getSyncApi(RequestContext.batch());
 			var async = connection.getAsyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", entries);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			var stepCompleted = new CountDownLatch(1);
 			var releaseStep = new CountDownLatch(1);
 			var scheduler = connection.getScheduler();
@@ -415,7 +415,7 @@ class CooperativeIteratorContinuationTest {
 			var sync = connection.getSyncApi(RequestContext.batch());
 			var async = connection.getAsyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", entries);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			var scheduler = connection.getScheduler();
 			var nativeFailure = RocksDBException.of(RocksDBErrorType.GET_1,
 					"forced iterator continuation failure");
@@ -457,14 +457,14 @@ class CooperativeIteratorContinuationTest {
 		try (var connection = connection("iterator-deadline")) {
 			var sync = connection.getSyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", ITERATOR_STEP + 8);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			var scheduler = connection.getScheduler();
 			var blockersEntered = new CountDownLatch(READ_WORKERS);
 			var releaseBlockers = new CountDownLatch(1);
 			try {
 				occupyLatencyWorkers(scheduler, READ_WORKERS, blockersEntered, releaseBlockers);
 				assertTrue(blockersEntered.await(5, SECONDS));
-				var deadlineApi = connection.getAsyncApi(RequestContext.batch(Instant.now().plusMillis(50L)));
+				var deadlineApi = connection.getAsyncApi(RequestContext.batch(java.time.Duration.ofMillis(50L)));
 				var continuation = deadlineApi.subsequentAsync(
 						iteratorId, 0L, Long.MAX_VALUE, RequestType.none());
 				assertEventually(() -> readSnapshot(scheduler).queuedByProfile().get(WorkloadProfile.BATCH) == 1);
@@ -493,7 +493,7 @@ class CooperativeIteratorContinuationTest {
 			var sync = connection.getSyncApi(RequestContext.batch());
 			var async = connection.getAsyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", entries);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			var scheduler = connection.getScheduler();
 			var blockersEntered = new CountDownLatch(READ_WORKERS - 1);
 			var releaseBlockers = new CountDownLatch(1);
@@ -534,7 +534,7 @@ class CooperativeIteratorContinuationTest {
 			connection = connection("iterator-shutdown");
 			var sync = connection.getSyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(sync, "entries", ITERATOR_STEP + 8);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			var scheduler = connection.getScheduler();
 			var blockersEntered = new CountDownLatch(READ_WORKERS);
 			occupyLatencyWorkers(scheduler, READ_WORKERS, blockersEntered, releaseBlockers);
@@ -576,10 +576,10 @@ class CooperativeIteratorContinuationTest {
 		try (var connection = connection("iterator-latency")) {
 			var batch = connection.getSyncApi(RequestContext.batch());
 			long columnId = populateFixedColumn(batch, "entries", ITERATOR_STEP + 1);
-			var latencyContext = RequestContext.latency(Duration.ofSeconds(10));
+			var latencyContext = RequestContext.latency(java.time.Duration.ofSeconds(10));
 			var sync = connection.getSyncApi(latencyContext);
 			var async = connection.getAsyncApi(latencyContext);
-			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, 30_000L);
+			long iteratorId = sync.openIterator(0L, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));
 			try {
 				long acceptedBefore = readSnapshot(connection.getScheduler()).acceptedTasks();
 				var values = async.subsequentAsync(

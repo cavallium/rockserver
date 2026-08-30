@@ -51,18 +51,18 @@ class ExistsMultiTest {
 
 			var query = List.of(key3, missing, key1, key3, missing);
 			var expected = List.of(true, false, true, true, false);
-			assertEquals(expected, api.existsMulti(0, fixedColumn, query, 5_000));
-			assertEquals(expected, api.existsMultiAsync(0, fixedColumn, query, 5_000).join());
-			assertEquals(List.of(), api.existsMulti(0, fixedColumn, List.of(), 5_000));
+			assertEquals(expected, api.existsMulti(0, fixedColumn, query));
+			assertEquals(expected, api.existsMultiAsync(0, fixedColumn, query).join());
+			assertEquals(List.of(), api.existsMulti(0, fixedColumn, List.of()));
 
-			long transactionId = api.openTransaction(10_000);
+			long transactionId = api.openTransaction( java.time.Duration.ofMillis(10_000));
 			try {
 				api.delete(transactionId, fixedColumn, key1, RequestType.none());
 				api.put(transactionId, fixedColumn, key2, value(2), RequestType.none());
 				assertEquals(List.of(false, true, true, false),
-						api.existsMulti(transactionId, fixedColumn, List.of(key1, key2, key3, missing), 5_000));
+						api.existsMulti(transactionId, fixedColumn, List.of(key1, key2, key3, missing)));
 				assertEquals(List.of(true, false, true, false),
-						api.existsMulti(0, fixedColumn, List.of(key1, key2, key3, missing), 5_000));
+						api.existsMulti(0, fixedColumn, List.of(key1, key2, key3, missing)));
 			} finally {
 				api.closeTransaction(transactionId, false);
 			}
@@ -77,11 +77,10 @@ class ExistsMultiTest {
 			assertEquals(List.of(true, true, false, true),
 					api.existsMulti(0,
 							bucketedColumn,
-							List.of(bucketKey1, bucketKey2, missingBucketKey, bucketKey1),
-							5_000));
+							List.of(bucketKey1, bucketKey2, missingBucketKey, bucketKey1)));
 
 			var invalidTimeout = assertThrows(RocksDBException.class,
-					() -> api.existsMulti(0, fixedColumn, List.of(key1), -1));
+					() -> api.existsMulti(0, fixedColumn, List.of(key1)));
 			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					invalidTimeout.getErrorUniqueId());
 		} finally {

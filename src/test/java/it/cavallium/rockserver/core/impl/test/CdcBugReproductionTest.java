@@ -41,18 +41,18 @@ class CdcBugReproductionTest {
     void setUp() throws IOException, RocksDBException {
         // Initialize a fresh DB
         db = new EmbeddedDB(tempDir, "test-db", null);
-        
+
         // Create a simple column
         var schema = ColumnSchema.of(
                 IntArrayList.of(4), // Int key
-                new ObjectArrayList<>(), 
+                new ObjectArrayList<>(),
                 true, // has value
                 null, null, null
         );
         columnId = db.createColumn("data", schema);
-        
+
         // Create CDC subscription starting from now
-        db.cdcCreate(subId, null, List.of(columnId), false);
+        db.cdcCreate(subId, null, List.of(columnId), false, java.util.OptionalLong.empty());
     }
 
     @AfterEach
@@ -67,11 +67,11 @@ class CdcBugReproductionTest {
      * 1. Writes a single WriteBatch containing 10 items.
      * 2. Polls CDC with limit=5. This consumes half the batch.
      * 3. Polls CDC again starting from the next sequence.
-     * 
-     * BEFORE FIX: The second poll sees that the requested sequence falls 
+     *
+     * BEFORE FIX: The second poll sees that the requested sequence falls
      * inside the batch start, incorrectly skips the whole batch, and returns nothing.
-     * 
-     * AFTER FIX: The second poll detects the overlap, skips the first 5 items, 
+     *
+     * AFTER FIX: The second poll detects the overlap, skips the first 5 items,
      * and returns the remaining 5.
      */
     @Test
@@ -91,7 +91,7 @@ class CdcBugReproductionTest {
 
         // 2. Poll the first 5 items
         CdcBatch firstPoll = db.cdcPollBatchAsyncInternal(subId, null, 5).block();
-        
+
         assertNotNull(firstPoll);
         assertEquals(5, firstPoll.events().size(), "Should receive exactly 5 events");
         assertEquals(0, bytesToInt(firstPoll.events().get(0).key().toByteArray()), "First key should be 0");
@@ -106,7 +106,7 @@ class CdcBugReproductionTest {
         assertNotNull(secondPoll);
         assertFalse(secondPoll.events().isEmpty(), "Second poll should NOT be empty (Bug reproduction)");
         assertEquals(5, secondPoll.events().size(), "Should receive the remaining 5 events");
-        
+
         assertEquals(5, bytesToInt(secondPoll.events().get(0).key().toByteArray()), "First key of second batch should be 5");
         assertEquals(9, bytesToInt(secondPoll.events().get(4).key().toByteArray()), "Last key should be 9");
     }
@@ -137,7 +137,7 @@ class CdcBugReproductionTest {
         // Consume all in small pages to force boundary checks
         long currentSeq = 0; // 0 means start from beginning
         int totalEvents = 0;
-        
+
         // Page 1 (items 0-3 from Batch 1)
         var p1 = db.cdcPollBatchAsyncInternal(subId, currentSeq > 0 ? currentSeq : null, 4).block();
         assertEquals(4, p1.events().size());
@@ -176,7 +176,7 @@ class CdcBugReproductionTest {
                 try {
                     // We don't care about results, just accessing the native handle
                     db.cdcPollBatchAsyncInternal(subId, null, 100).block();
-                    Thread.sleep(1); 
+                    Thread.sleep(1);
                 } catch (Exception e) {
                     // Ignore errors during shutdown (DB closed exception is expected)
                 }
@@ -197,7 +197,7 @@ class CdcBugReproductionTest {
         try {
             poller.get(2, TimeUnit.SECONDS);
         } catch (Exception ignored) {}
-        
+
         // If we reached here without a JVM crash, the test passed.
         assertTrue(true, "JVM did not crash during concurrent close");
     }
@@ -244,7 +244,7 @@ class CdcBugReproductionTest {
 
         // Subscribe ONLY to the main columnId
         String filterSubId = "filter-sub";
-        db.cdcCreate(filterSubId, null, List.of(columnId), false);
+        db.cdcCreate(filterSubId, null, List.of(columnId), false, java.util.OptionalLong.empty());
 
         // Create a mixed batch: [Target, Noise, Target, Noise, Target]
         // This is a single RocksDB WriteBatch
@@ -342,7 +342,7 @@ class CdcBugReproductionTest {
 
         // Subscribe ONLY to the main columnId
         String filterSub = "filter-sub-2";
-        db.cdcCreate(filterSub, null, List.of(columnId), false);
+        db.cdcCreate(filterSub, null, List.of(columnId), false, java.util.OptionalLong.empty());
 
         // 1. Write a batch for the main column (Batch A)
         db.put(0, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A".getBytes()), RequestType.none());
@@ -373,7 +373,7 @@ class CdcBugReproductionTest {
     @Test
     void testTransactionCDC() throws RocksDBException {
         // Start a transaction
-        long txId = db.openTransaction(10_000);
+        long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
 
         // Add 5 items
         for(int i=0; i<5; i++) {
@@ -406,11 +406,11 @@ class CdcBugReproductionTest {
         );
         long mixedColId = db.createColumn("mixed-ops-col", schema);
         String mixedSubId = "mixed-ops-sub";
-        db.cdcCreate(mixedSubId, null, List.of(mixedColId), false);
+        db.cdcCreate(mixedSubId, null, List.of(mixedColId), false, java.util.OptionalLong.empty());
 
         // Create a batch with mixed ops: PUT, MERGE, PUT
         // We will use a transaction to create a mixed batch.
-        long txId = db.openTransaction(10_000);
+        long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
 
         // Op 0: PUT Key 1
         db.put(txId, mixedColId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("V1".getBytes()), RequestType.none());
@@ -448,7 +448,7 @@ class CdcBugReproductionTest {
         );
         long mergeColId = db.createColumn("conc-merge-col", schema);
         String mergeSubId = "conc-merge-sub";
-        db.cdcCreate(mergeSubId, null, List.of(mergeColId), false);
+        db.cdcCreate(mergeSubId, null, List.of(mergeColId), false, java.util.OptionalLong.empty());
 
         int count = 2000;
         AtomicBoolean producing = new AtomicBoolean(true);
@@ -621,7 +621,7 @@ class CdcBugReproductionTest {
 
         // 4. Re-create subscription (should load existing state)
         // Passing null as 'fromSeq' tells it to look up the saved state
-        long startSeq = db.cdcCreate(subId, null, List.of(columnId), false);
+        long startSeq = db.cdcCreate(subId, null, List.of(columnId), false, java.util.OptionalLong.empty());
 
         // The start sequence should be lastCommitted + 1
         // We can't easily check the exact number without bit math, but we can verify behavior.
@@ -682,7 +682,7 @@ class CdcBugReproductionTest {
         long resolvedColId = db.createColumn(columnName, schema);
 
         // Create sub with resolvedValues = true for this specific column
-        db.cdcCreate(resolvedSubId, null, List.of(resolvedColId), true);
+        db.cdcCreate(resolvedSubId, null, List.of(resolvedColId), true, java.util.OptionalLong.empty());
 
         // 1. Put initial value "Hello"
         db.put(0, resolvedColId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("Hello".getBytes()), RequestType.none());
@@ -712,8 +712,8 @@ class CdcBugReproductionTest {
         String subFast = "fast";
         String subSlow = "slow";
 
-        db.cdcCreate(subFast, null, List.of(columnId), false);
-        db.cdcCreate(subSlow, null, List.of(columnId), false);
+        db.cdcCreate(subFast, null, List.of(columnId), false, java.util.OptionalLong.empty());
+        db.cdcCreate(subSlow, null, List.of(columnId), false, java.util.OptionalLong.empty());
 
         // Insert 10 items
         for(int i=0; i<10; i++) {
@@ -756,7 +756,7 @@ class CdcBugReproductionTest {
         String dynamicSub = "dynamic-sub";
 
         // 1. Subscribe only to col1
-        db.cdcCreate(dynamicSub, null, List.of(col1), false);
+        db.cdcCreate(dynamicSub, null, List.of(col1), false, java.util.OptionalLong.empty());
 
         db.put(0, col1, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("1".getBytes()), RequestType.none());
         db.put(0, col2, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("2".getBytes()), RequestType.none());
@@ -769,7 +769,7 @@ class CdcBugReproductionTest {
         long nextSeq = b1.nextSeq();
 
         // 2. Update subscription to only col2
-        db.cdcCreate(dynamicSub, null, List.of(col2), false);
+        db.cdcCreate(dynamicSub, null, List.of(col2), false, java.util.OptionalLong.empty());
 
         db.put(0, col1, new Keys(new Buf[]{Buf.wrap(intToBytes(3))}), Buf.wrap("3".getBytes()), RequestType.none());
         db.put(0, col2, new Keys(new Buf[]{Buf.wrap(intToBytes(4))}), Buf.wrap("4".getBytes()), RequestType.none());
@@ -793,10 +793,10 @@ class CdcBugReproductionTest {
         db.put(0, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("Old".getBytes()), RequestType.none());
 
         String subNow = "sub-now";
-        db.cdcCreate(subNow, null, List.of(columnId), false);
+        db.cdcCreate(subNow, null, List.of(columnId), false, java.util.OptionalLong.empty());
 
         String subAll = "sub-all";
-        db.cdcCreate(subAll, 0L, List.of(columnId), false);
+        db.cdcCreate(subAll, 0L, List.of(columnId), false, java.util.OptionalLong.empty());
 
         db.put(0, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("New".getBytes()), RequestType.none());
 
@@ -867,7 +867,7 @@ class CdcBugReproductionTest {
 
         // Subscribe to it
         String tempSub = "temp-sub";
-        db.cdcCreate(tempSub, null, List.of(tempColId), false);
+        db.cdcCreate(tempSub, null, List.of(tempColId), false, java.util.OptionalLong.empty());
 
         // Write event 1
         db.put(0, tempColId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A".getBytes()), RequestType.none());
@@ -889,7 +889,7 @@ class CdcBugReproductionTest {
 
         // Re-create scenario:
         long tempColId2 = db.createColumn("temp-col-2", ColumnSchema.of(IntArrayList.of(4), new ObjectArrayList<>(), true, null, null, null));
-        db.cdcCreate("temp-sub-2", null, List.of(tempColId2), false);
+        db.cdcCreate("temp-sub-2", null, List.of(tempColId2), false, java.util.OptionalLong.empty());
 
         db.put(0, tempColId2, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("B".getBytes()), RequestType.none());
 
@@ -985,7 +985,7 @@ class CdcBugReproductionTest {
         );
         long bucketColId = db.createColumn("bucket-col", bucketSchema);
         String bucketSub = "bucket-sub";
-        db.cdcCreate(bucketSub, null, List.of(bucketColId), false);
+        db.cdcCreate(bucketSub, null, List.of(bucketColId), false, java.util.OptionalLong.empty());
 
         Buf[] keyParts = new Buf[]{ Buf.wrap(intToBytes(100)), Buf.wrap("suffix".getBytes()) };
         db.put(0, bucketColId, new Keys(keyParts), Buf.wrap("Val".getBytes()), RequestType.none());
@@ -1061,7 +1061,7 @@ class CdcBugReproductionTest {
     @Test
     void testSubscriptionLifecycle() throws RocksDBException {
         String lifeSub = "life-sub";
-        db.cdcCreate(lifeSub, null, List.of(columnId), false);
+        db.cdcCreate(lifeSub, null, List.of(columnId), false, java.util.OptionalLong.empty());
 
         db.put(0, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A".getBytes()), RequestType.none());
 
@@ -1080,7 +1080,7 @@ class CdcBugReproductionTest {
 				missing.getErrorUniqueId());
 
         // Re-create
-        db.cdcCreate(lifeSub, null, List.of(columnId), false);
+        db.cdcCreate(lifeSub, null, List.of(columnId), false, java.util.OptionalLong.empty());
 
         // Should start fresh (from now) or from where we left?
         // cdcCreate without fromSeq uses "now" if no meta exists.
@@ -1097,7 +1097,7 @@ class CdcBugReproductionTest {
     @Test
     void testTransactionRollback() throws RocksDBException {
         // 1. Open transaction
-        long txId = db.openTransaction(10_000);
+        long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
 
         // 2. Write data within transaction
         db.put(txId, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("Rollback".getBytes()), RequestType.none());
@@ -1159,7 +1159,7 @@ class CdcBugReproductionTest {
 
     @Test
     void testTransactionSavepoints() throws RocksDBException {
-        long txId = db.openTransaction(10_000);
+        long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
 
         // 1. Write "A"
         db.put(txId, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A".getBytes()), RequestType.none());

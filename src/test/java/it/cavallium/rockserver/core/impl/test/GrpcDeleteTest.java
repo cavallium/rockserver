@@ -137,7 +137,8 @@ class GrpcDeleteTest {
 							.setValue(ByteString.copyFrom(new byte[] {1})))
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfileValue(99)
-							.setDeadlineEpochMillis(Long.MAX_VALUE))
+							.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE))
 					.build();
 			var error = assertThrows(StatusRuntimeException.class,
 					() -> RocksDBServiceGrpc.newBlockingStub(channel).put(request));
@@ -158,7 +159,8 @@ class GrpcDeleteTest {
 							.setColumnId(colId)
 							.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 									.setProfileValue(99)
-									.setDeadlineEpochMillis(Long.MAX_VALUE)))
+									.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Long.MAX_VALUE)))
 					.build();
 			var error = assertThrows(StatusRuntimeException.class,
 					() -> ReactorRocksDBServiceGrpc.newReactorStub(channel).putBatch(Flux.just(initial)).block());

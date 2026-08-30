@@ -44,13 +44,13 @@ public class CdcTest {
             var colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 
             // Create CDC subscription
-            var startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null);
+            var startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null, null, java.util.OptionalLong.empty());
             assertTrue(startSeq >= 0);
 
             // Put some data
             var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-            
+
             var key2 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 2})});
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
@@ -61,39 +61,39 @@ public class CdcTest {
             assertEquals(CDCEvent.Op.PUT, events.get(1).op());
             assertEquals("val1", new String(events.get(0).value().toByteArray(), StandardCharsets.UTF_8));
             assertEquals("val2", new String(events.get(1).value().toByteArray(), StandardCharsets.UTF_8));
-            
+
             // Commit
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("sub1", events.get(1).seq());
         }
     }
-    
+
     @Test
     void testResumeAfterRestart() throws Exception {
         var colName = "test-col-resume";
         long lastSeq;
         long colId;
-        
+
         try (var db = new EmbeddedConnection(dbDir, "cdc-resume", configFile)) {
             colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null);
-            
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null, null, java.util.OptionalLong.empty());
+
             var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-            
+
             List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub1", null, 100).collect(Collectors.toList());
             assertEquals(1, events.size());
             lastSeq = events.get(0).seq();
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("sub1", lastSeq);
         }
-        
+
         // Reopen
         try (var db = new EmbeddedConnection(dbDir, "cdc-resume", configFile)) {
             colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId(colName);
-            
+
             // New event
             var key2 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 2})});
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, Buf.wrap("val2".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-            
+
             // Poll - should get only the new event
             List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub1", null, 100).collect(Collectors.toList());
             assertEquals(1, events.size());
@@ -101,24 +101,24 @@ public class CdcTest {
             assertEquals("val2", new String(events.get(0).value().toByteArray(), StandardCharsets.UTF_8));
         }
     }
-    
+
     @Test
     void testBucketedColumn() throws Exception {
         try (var db = new EmbeddedConnection(dbDir, "cdc-bucket", configFile)) {
             // Bucketed column: 1 fixed key (int), 1 variable key (int)
             var colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("bucket-col", ColumnSchema.of(
-                    IntList.of(Integer.BYTES), 
+                    IntList.of(Integer.BYTES),
                     ObjectList.of(ColumnHashType.XXHASH32),
                     true
             ));
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub-bucket", null, null);
-            
+            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub-bucket", null, null, null, java.util.OptionalLong.empty());
+
             var key = new Keys(new Buf[]{
                 Buf.wrap(new byte[]{0, 0, 0, 1}), // fixed
                 Buf.wrap(new byte[]{0, 0, 0, 2})  // variable
             });
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, Buf.wrap("bucket-val".getBytes(StandardCharsets.UTF_8)), RequestType.none());
-            
+
             List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("sub-bucket", null, 100).collect(Collectors.toList());
             assertEquals(1, events.size());
             // The key in CDC event should be the fixed key (4 bytes)
@@ -132,11 +132,11 @@ public class CdcTest {
     void testStressAndBackpressure() throws Exception {
         int totalEvents = 50_000;
         int batchSize = 1000;
-        
+
         try (var db = new EmbeddedConnection(dbDir, "cdc-stress", configFile)) {
             var colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("stress-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-            var startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("stress-sub", null, null);
-            
+            var startSeq = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("stress-sub", null, null, null, java.util.OptionalLong.empty());
+
             // 1. Generate load
             for (int i = 0; i < totalEvents; i++) {
                 var key = new Keys(new Buf[]{Buf.wrap(new byte[]{
@@ -145,32 +145,32 @@ public class CdcTest {
                 db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key, Buf.wrap(("val-" + i).getBytes(StandardCharsets.UTF_8)), RequestType.none());
                 if (i % 10000 == 0) db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).flush(); // Force some WAL flushes/rotations
             }
-            
+
             // 2. Poll with backpressure
             long consumed = 0;
             long lastSeq = startSeq - 1;
-            
+
             while (consumed < totalEvents) {
                 // Poll small batch
                 List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll("stress-sub", null, batchSize).collect(Collectors.toList());
-                
+
                 if (events.isEmpty()) {
-                    // Should not happen if we expect events, but maybe wait a bit? 
+                    // Should not happen if we expect events, but maybe wait a bit?
                     // In embedded DB, put is synchronous so WAL should be ready.
                     break;
                 }
-                
+
                 // Verify order and sequence
                 for (CDCEvent ev : events) {
                     assertTrue(ev.seq() > lastSeq, "Sequence must be strictly increasing");
                     lastSeq = ev.seq();
                     consumed++;
                 }
-                
+
                 // Commit periodically
                 db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("stress-sub", lastSeq);
             }
-            
+
             assertEquals(totalEvents, consumed);
         }
     }

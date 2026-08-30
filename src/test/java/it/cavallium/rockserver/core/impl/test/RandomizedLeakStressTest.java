@@ -206,7 +206,7 @@ public class RandomizedLeakStressTest {
 	}
 
 	private void doTxCommit(Random random) {
-		long transactionId = syncApi.openTransaction(5_000);
+		long transactionId = syncApi.openTransaction( java.time.Duration.ofMillis(5_000));
 		boolean closed = false;
 		try {
 			syncApi.put(transactionId,
@@ -224,7 +224,7 @@ public class RandomizedLeakStressTest {
 	}
 
 	private void doTxRollback(Random random) {
-		long transactionId = syncApi.openTransaction(5_000);
+		long transactionId = syncApi.openTransaction( java.time.Duration.ofMillis(5_000));
 		boolean closed = false;
 		try {
 			syncApi.put(transactionId,
@@ -247,8 +247,7 @@ public class RandomizedLeakStressTest {
 				null,
 				null,
 				random.nextBoolean(),
-				RequestType.allInRange(),
-				Duration.ofSeconds(5).toMillis());
+				RequestType.allInRange());
 		var disposable = Flux.from(publisher)
 				.take(1 + random.nextInt(5))
 				.subscribe(ignored -> {
@@ -294,8 +293,7 @@ public class RandomizedLeakStressTest {
 				start,
 				end,
 				random.nextBoolean(),
-				RequestType.allInRange(),
-				Duration.ofSeconds(10).toMillis());
+				RequestType.allInRange());
 		var subscription = Flux.from(publisher)
 				.take(1 + random.nextInt(8))
 				.subscribe(ignored -> {
@@ -320,8 +318,8 @@ public class RandomizedLeakStressTest {
 					colId,
 					key(random.nextInt(KEY_SPACE)),
 					null,
-					random.nextBoolean(),
-					50);
+					random.nextBoolean(), java.time.Duration.ofMillis(
+					50));
 		} catch (RocksDBException deadline) {
 			if (deadline.getErrorUniqueId() == RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED) {
 				return;
@@ -357,9 +355,9 @@ public class RandomizedLeakStressTest {
 		boolean countEntries = random.nextBoolean();
 		try {
 			if (countEntries) {
-				syncApi.reduceRange(0, colId, start, end, reverse, RequestType.entriesCount(), timeout);
+				syncApi.reduceRange(0, colId, start, end, reverse, RequestType.entriesCount());
 			} else {
-				syncApi.reduceRange(0, colId, start, end, reverse, RequestType.firstAndLast(), timeout);
+				syncApi.reduceRange(0, colId, start, end, reverse, RequestType.firstAndLast());
 			}
 		} catch (RuntimeException failure) {
 			throw new AssertionError("reduceRange failed; start=" + startValue + ", end=" + endValue
@@ -388,9 +386,9 @@ public class RandomizedLeakStressTest {
 	}
 
 	private void openExpiringTxAndIteratorThenCleanup() {
-		long transactionId = syncApi.openTransaction(10);
+		long transactionId = syncApi.openTransaction( java.time.Duration.ofMillis(10));
 		try {
-			syncApi.openIterator(transactionId, colId, key(1), null, false, 10);
+			syncApi.openIterator(transactionId, colId, key(1), null, false, java.time.Duration.ofMillis( 10));
 		} catch (RocksDBException expired) {
 			switch (expired.getErrorUniqueId()) {
 				case TX_NOT_FOUND, TRANSACTION_NOT_FOUND, READ_DEADLINE_EXCEEDED -> {

@@ -131,7 +131,7 @@ class NoFixedKeyTwoVarKeyNoValueColumnTest {
 			db.put(0, colId, new Keys(new Buf[]{varKey1, varKey2}), Buf.create(0), new RequestType.RequestNothing<>());
 		}
 
-		List<KV> results = db.getRange(0, colId, null, null, false, new RequestType.RequestGetAllInRange<>(), 1000)
+		List<KV> results = db.getRange(0, colId, null, null, false, new RequestType.RequestGetAllInRange<>())
 				.collect(Collectors.toList());
 
 		assertEquals(5, results.size());
@@ -151,7 +151,7 @@ class NoFixedKeyTwoVarKeyNoValueColumnTest {
 			db.put(0, colId, new Keys(new Buf[]{varKey1, varKey2}), Buf.create(0), new RequestType.RequestNothing<>());
 		}
 
-		Long count = db.reduceRange(0, colId, null, null, false, new RequestType.RequestEntriesCount<>(), 1000);
+		Long count = db.reduceRange(0, colId, null, null, false, new RequestType.RequestEntriesCount<>());
 		assertEquals(3L, count);
 	}
 

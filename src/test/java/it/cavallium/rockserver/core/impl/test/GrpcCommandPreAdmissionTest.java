@@ -100,7 +100,8 @@ class GrpcCommandPreAdmissionTest {
 			var stub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 			var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY)
-					.setDeadlineEpochMillis(System.currentTimeMillis() + Duration.ofSeconds(10).toMillis())
+					.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Duration.ofSeconds(10).toNanos())
 					.build();
 
 			assertInvalid(stub.deleteRange(DeleteRangeRequest.newBuilder()
@@ -112,7 +113,6 @@ class GrpcCommandPreAdmissionTest {
 
 			assertInvalid(stub.getAllInRange(GetRangeRequest.newBuilder()
 					.setColumnId(1)
-					.setTimeoutMs(1_000)
 					.setContext(context)
 					.build()).then());
 			assertEquals(0, scheduler.queuedTasks(WorkloadProfile.LATENCY),
@@ -453,14 +453,14 @@ class GrpcCommandPreAdmissionTest {
 				for (int worker = 0; worker < 3; worker++) {
 					scheduler.executor(WorkloadProfile.BATCH,
 							OperationFamily.POINT_LOOKUP,
-							it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE).execute(() -> {
+							Long.MAX_VALUE).execute(() -> {
 						blockersStarted.countDown();
 						awaitUninterruptibly(releaseBlockers);
 					});
 				}
 				assertTrue(blockersStarted.await(5, TimeUnit.SECONDS));
 				var before = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ);
-				long deadline = System.currentTimeMillis() + 100L;
+				long deadline = Duration.ofMillis(100).toNanos();
 				var call = new RecordingServerCall(scheduler);
 				ServerCall.Listener<GetRequest> listener = (ServerCall.Listener<GetRequest>) startCall.invoke(
 						handler, call, new Metadata());
@@ -469,7 +469,8 @@ class GrpcCommandPreAdmissionTest {
 						.addKeys(ByteString.copyFrom(new byte[] {1}))
 						.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 								.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-								.setDeadlineEpochMillis(deadline))
+								.setWorkloadContractVersion(3)
+				.setTimeoutNanos(deadline))
 						.build());
 				listener.onHalfClose();
 				assertTrue(field(listener.getClass(), "task").get(listener) instanceof Disposable);
@@ -678,7 +679,8 @@ class GrpcCommandPreAdmissionTest {
 			it.cavallium.rockserver.core.common.api.proto.WorkloadProfile profile) {
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfile(profile)
-				.setDeadlineEpochMillis(System.currentTimeMillis() + Duration.ofSeconds(10).toMillis())
+				.setWorkloadContractVersion(3)
+				.setTimeoutNanos(Duration.ofSeconds(10).toNanos())
 				.build();
 	}
 

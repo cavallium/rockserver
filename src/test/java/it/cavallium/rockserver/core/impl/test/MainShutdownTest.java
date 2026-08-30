@@ -95,7 +95,7 @@ public class MainShutdownTest {
 						ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 				api.put(0, columnId, key(1), value(1), RequestType.none());
 				api.flush();
-				api.openTransaction(TimeUnit.MINUTES.toMillis(5));
+				api.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(5)));
 			}
 
 			child.destroy();

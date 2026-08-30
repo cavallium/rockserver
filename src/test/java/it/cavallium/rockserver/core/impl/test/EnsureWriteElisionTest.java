@@ -71,7 +71,7 @@ class EnsureWriteElisionTest {
 		var key = intKey(1);
 		var first = value("first");
 		var second = value("second");
-		api.cdcCreate("single-ensure", null, List.of(columnId));
+		api.cdcCreate("single-ensure", null, List.of(columnId), null, java.util.OptionalLong.empty());
 
 		assertNull(api.put(0, columnId, key, first, RequestType.ensure()));
 		assertNull(api.put(0, columnId, key, first, RequestType.ensure()));
@@ -164,7 +164,7 @@ class EnsureWriteElisionTest {
 		assertTrue(probeCalls.stream().allMatch(call -> call.keys() <= 4_096 && call.bytes() <= MAX_PROBE_BYTES));
 
 		long orderedColumn = api.createColumn("ordered", fixedSchema(true));
-		api.cdcCreate("ordered-ensure", null, List.of(orderedColumn));
+		api.cdcCreate("ordered-ensure", null, List.of(orderedColumn), null, java.util.OptionalLong.empty());
 		var duplicate = intKey(9);
 		var first = value("first");
 		var second = value("second");
@@ -285,8 +285,8 @@ class EnsureWriteElisionTest {
 
 		var key = intKey(2);
 		var value = value("transactional");
-		api.cdcCreate("transactional-ensure", null, List.of(columnId));
-		long rollbackTx = api.openTransaction(5_000);
+		api.cdcCreate("transactional-ensure", null, List.of(columnId), null, java.util.OptionalLong.empty());
+		long rollbackTx = api.openTransaction( java.time.Duration.ofMillis(5_000));
 		assertNull(api.put(rollbackTx, columnId, key, value, RequestType.ensure()));
 		assertFalse(api.get(0, columnId, key, RequestType.exists()));
 		assertTrue(api.get(rollbackTx, columnId, key, RequestType.exists()));
@@ -294,7 +294,7 @@ class EnsureWriteElisionTest {
 		assertFalse(api.get(0, columnId, key, RequestType.exists()));
 		assertEquals(0L, cdcEventCount("transactional-ensure"));
 
-		long commitTx = api.openTransaction(5_000);
+		long commitTx = api.openTransaction( java.time.Duration.ofMillis(5_000));
 		assertTrue(api.putMulti(commitTx,
 				columnId,
 				List.of(key),
@@ -305,7 +305,7 @@ class EnsureWriteElisionTest {
 		assertEquals(1L, cdcEventCount("transactional-ensure"));
 		assertEquals(2.0, decisionCount("ensure", "bypass_writer"));
 
-		long equalCommitTx = api.openTransaction(5_000);
+		long equalCommitTx = api.openTransaction( java.time.Duration.ofMillis(5_000));
 		assertNull(api.put(equalCommitTx, columnId, key, value, RequestType.ensure()));
 		assertTrue(api.closeTransaction(equalCommitTx, true));
 		assertEquals(2L, cdcEventCount("transactional-ensure"),
@@ -344,7 +344,7 @@ class EnsureWriteElisionTest {
 		long columnId = api.createColumn("previous-presence", fixedSchema(true));
 		var key = intKey(1);
 		var value = value("same");
-		api.cdcCreate("previous-presence", null, List.of(columnId));
+		api.cdcCreate("previous-presence", null, List.of(columnId), null, java.util.OptionalLong.empty());
 
 		assertFalse(api.put(0, columnId, key, value, RequestType.previousPresence()));
 		assertTrue(api.put(0, columnId, key, value, RequestType.previousPresence()));

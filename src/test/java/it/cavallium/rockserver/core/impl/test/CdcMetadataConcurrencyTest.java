@@ -65,7 +65,7 @@ class CdcMetadataConcurrencyTest {
 
 	@Test
 	void concurrentCommitsCannotRegressCheckpoint() throws Exception {
-		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false);
+		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false, java.util.OptionalLong.empty());
 		var firstCommit = blockNextMetadataLoad("commit");
 
 		Future<?> lowerCommit = executor.submit(() -> db.cdcCommit(SUBSCRIPTION_ID, 10L));
@@ -85,11 +85,11 @@ class CdcMetadataConcurrencyTest {
 
 	@Test
 	void periodicCreateCannotOverwriteConcurrentCommit() throws Exception {
-		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false);
+		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false, java.util.OptionalLong.empty());
 		db.cdcCommit(SUBSCRIPTION_ID, 10L);
 		var periodicCreate = blockNextMetadataLoad("create");
 
-		Future<Long> create = executor.submit(() -> db.cdcCreate(SUBSCRIPTION_ID, 0L, null, false));
+		Future<Long> create = executor.submit(() -> db.cdcCreate(SUBSCRIPTION_ID, 0L, null, false, java.util.OptionalLong.empty()));
 		assertLoaded(periodicCreate);
 
 		var commitAttempted = observeNextOperation("commit");
@@ -106,7 +106,7 @@ class CdcMetadataConcurrencyTest {
 
 	@Test
 	void deleteAfterInFlightCommitCannotBeResurrected() throws Exception {
-		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false);
+		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false, java.util.OptionalLong.empty());
 		var commitLoad = blockNextMetadataLoad("commit");
 
 		Future<?> commit = executor.submit(() -> db.cdcCommit(SUBSCRIPTION_ID, 42L));
@@ -128,7 +128,7 @@ class CdcMetadataConcurrencyTest {
 	void deleteAfterInFlightCreateCannotBeResurrected() throws Exception {
 		var createLoad = blockNextMetadataLoad("create");
 
-		Future<Long> create = executor.submit(() -> db.cdcCreate(SUBSCRIPTION_ID, 0L, null, false));
+		Future<Long> create = executor.submit(() -> db.cdcCreate(SUBSCRIPTION_ID, 0L, null, false, java.util.OptionalLong.empty()));
 		assertLoaded(createLoad);
 
 		var deleteAttempted = observeNextOperation("delete");
@@ -145,7 +145,7 @@ class CdcMetadataConcurrencyTest {
 
 	@Test
 	void getterLinearizesAfterInFlightCommit() throws Exception {
-		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false);
+		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false, java.util.OptionalLong.empty());
 		var commitLoad = blockNextMetadataLoad("commit");
 
 		Future<?> commit = executor.submit(() -> db.cdcCommit(SUBSCRIPTION_ID, 77L));
@@ -163,7 +163,7 @@ class CdcMetadataConcurrencyTest {
 
 	@Test
 	void conditionalCreateRejectsCommitThatWinsTheMetadataLock() throws Exception {
-		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false);
+		db.cdcCreate(SUBSCRIPTION_ID, 1L, null, false, java.util.OptionalLong.empty());
 		db.cdcCommit(SUBSCRIPTION_ID, 10L);
 		var commitLoad = blockNextMetadataLoad("commit");
 

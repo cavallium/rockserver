@@ -44,7 +44,7 @@ class RWSchedulerTest {
 		var release = new CountDownLatch(1);
 		var queuedCompleted = new CountDownLatch(1);
 		try {
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
@@ -199,15 +199,15 @@ class RWSchedulerTest {
 		var completed = new CountDownLatch(2);
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		try {
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
 					});
 			assertTrue(blockerStarted.await(5, SECONDS));
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(20)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(20)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("later", order, completed));
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(10)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(10)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("earlier", order, completed));
 			release.countDown();
 			assertTrue(completed.await(5, SECONDS));
@@ -230,7 +230,7 @@ class RWSchedulerTest {
 				awaitUninterruptibly(release);
 			});
 			assertTrue(blockerStarted.await(5, SECONDS));
-			var deadline = new RequestContext(WorkloadProfile.LATENCY, System.currentTimeMillis() + 100L);
+			var deadline = RequestContext.latency(java.time.Duration.ofMillis(100));
 			scheduler.executor(deadline, OperationFamily.POINT_LOOKUP).execute(expired);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
 			Thread.sleep(150L);
@@ -260,7 +260,7 @@ class RWSchedulerTest {
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		var completed = new CountDownLatch(10);
 		try {
-			var latency = scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)),
+			var latency = scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)),
 					OperationFamily.POINT_LOOKUP);
 			latency.execute(() -> {
 				blockerStarted.countDown();
@@ -309,11 +309,11 @@ class RWSchedulerTest {
 			assertTrue(analyticalStarted.await(5, SECONDS));
 
 			batch.execute(() -> record("borrowed-batch", order, new CountDownLatch(0)));
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("latency", order, reservedDone));
 			scheduler.executor(RequestContext.ingest(), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("ingest", order, reservedDone));
-			scheduler.executor(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, RequestContext.NO_DEADLINE)
+			scheduler.executor(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE)
 					.execute(() -> record("cdc", order, reservedDone));
 
 			releaseAnalytical.countDown();
@@ -451,7 +451,8 @@ class RWSchedulerTest {
 		var secondStarted = new CountDownLatch(1);
 		try {
 			scheduler.setStoragePressure(true);
-			scheduler.maintenanceExecutor().execute(physical);
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE,
+					OperationFamily.COMPACTION, Long.MAX_VALUE).execute(physical);
 			scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE).execute(() -> {
 				firstStarted.countDown();
 				awaitUninterruptibly(releaseFirst);
@@ -494,18 +495,18 @@ class RWSchedulerTest {
 			scheduler.setStoragePressure(true);
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				writeForegroundStarted.countDown();
 				awaitUninterruptibly(releaseWriteForeground);
 			});
 			assertTrue(writeForegroundStarted.await(5, SECONDS));
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE).execute(writeBatchStarted::countDown);
+					Long.MAX_VALUE).execute(writeBatchStarted::countDown);
 
 			var readBatch = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			readBatch.execute(readBatchStarts::countDown);
 			readBatch.execute(readBatchStarts::countDown);
 
@@ -538,14 +539,14 @@ class RWSchedulerTest {
 			scheduler.setStoragePressure(true);
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				firstWriteForegroundStarted.countDown();
 				awaitUninterruptibly(releaseWriteForeground);
 			});
 			assertTrue(firstWriteForegroundStarted.await(5, SECONDS));
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				firstReadStarted.countDown();
 				awaitUninterruptibly(releaseFirstRead);
 			});
@@ -553,10 +554,10 @@ class RWSchedulerTest {
 
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE).execute(writeBatchStarted::countDown);
+					Long.MAX_VALUE).execute(writeBatchStarted::countDown);
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE).execute(secondReadStarted::countDown);
+					Long.MAX_VALUE).execute(secondReadStarted::countDown);
 			releaseFirstRead.countDown();
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)
 					.outcomes().get(RWScheduler.TerminalOutcome.RUN) == 1L);
@@ -572,7 +573,7 @@ class RWSchedulerTest {
 
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE).execute(() -> {
+					Long.MAX_VALUE).execute(() -> {
 				secondWriteForegroundStarted.countDown();
 				awaitUninterruptibly(releaseWriteForeground);
 			});
@@ -598,10 +599,10 @@ class RWSchedulerTest {
 		var releaseBlocker = new CountDownLatch(1);
 		var nextStarted = new CountDownLatch(1);
 		var batchView = scheduler.scheduler(
-				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			scheduler.setStoragePressure(true);
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
@@ -726,7 +727,7 @@ class RWSchedulerTest {
 		var registry = new SimpleMeterRegistry();
 		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "failure-test", registry, "failure-db");
 		try {
-			scheduler.readExecutor().execute(() -> {
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				throw new IllegalStateException("expected test failure");
 			});
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks() == 1L);
@@ -788,7 +789,7 @@ class RWSchedulerTest {
 		Runnable duplicate = runs::incrementAndGet;
 		var view = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
 		try {
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
@@ -818,7 +819,7 @@ class RWSchedulerTest {
 		var release = new CountDownLatch(1);
 		var view = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
 		try {
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
@@ -860,7 +861,7 @@ class RWSchedulerTest {
 		var analytical = scheduler.executor(RequestContext.analytical(),
 				OperationFamily.FULL_SCAN_AGGREGATE);
 		try {
-			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
@@ -918,7 +919,7 @@ class RWSchedulerTest {
 		assertEquals(1L, snapshot.failedTasks());
 		assertTrue(snapshot.terminated());
 		assertThrows(RejectedExecutionException.class,
-				() -> scheduler.readExecutor().execute(() -> {}));
+				() -> scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {}));
 	}
 
 	@Test
@@ -927,7 +928,7 @@ class RWSchedulerTest {
 		var second = scheduler(1, "reentrant-second");
 		var result = new CompletableFuture<List<Boolean>>();
 		try {
-			first.readExecutor().execute(() -> result.complete(List.of(
+			first.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> result.complete(List.of(
 					first.isExecutingWorkloadTask(),
 					second.isExecutingWorkloadTask())));
 			assertEquals(List.of(true, false), result.get(5, SECONDS));
@@ -947,7 +948,7 @@ class RWSchedulerTest {
 		try {
 			var cdc = scheduler.executor(WorkloadProfile.CDC,
 					OperationFamily.WAL_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			for (int i = 0; i < 3; i++) {
 				cdc.execute(() -> {
 					started.countDown();
@@ -975,13 +976,13 @@ class RWSchedulerTest {
 		var controlDone = new CountDownLatch(1);
 		try {
 			for (int i = 0; i < 3; i++) {
-				scheduler.readExecutor().execute(() -> {
+				scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 					dataStarted.countDown();
 					awaitUninterruptibly(release);
 				});
 			}
 			assertTrue(dataStarted.await(5, SECONDS));
-			scheduler.controlExecutor().execute(controlDone::countDown);
+			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL, it.cavallium.rockserver.core.common.OperationFamily.CONTROL, Long.MAX_VALUE).execute(controlDone::countDown);
 			assertTrue(controlDone.await(2, SECONDS));
 		} finally {
 			release.countDown();
@@ -1009,7 +1010,7 @@ class RWSchedulerTest {
 			assertTrue(foregroundStarted.await(5, SECONDS));
 
 			var batch = scheduler.executor(
-					WorkloadProfile.BATCH, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.MUTATION, Long.MAX_VALUE);
 			for (int i = 0; i < 6; i++) {
 				batch.execute(() -> {
 					batchStarts.incrementAndGet();
@@ -1054,7 +1055,7 @@ class RWSchedulerTest {
 			});
 			assertTrue(foregroundStarted.await(5, SECONDS));
 			var batch = scheduler.executor(
-					WorkloadProfile.BATCH, OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
+					WorkloadProfile.BATCH, OperationFamily.MUTATION, Long.MAX_VALUE);
 			for (int i = 0; i < 3; i++) {
 				batch.execute(() -> {
 					pacedStarts.add(System.nanoTime());
@@ -1200,7 +1201,7 @@ class RWSchedulerTest {
 			long estimatedBytes,
 			List<WorkloadProfile> order,
 			CountDownLatch completed) {
-		var executor = scheduler.executor(profile, family, RequestContext.NO_DEADLINE);
+		var executor = scheduler.executor(profile, family, Long.MAX_VALUE);
 		for (int i = 0; i < count; i++) {
 			executor.execute(() -> {
 				order.add(profile);

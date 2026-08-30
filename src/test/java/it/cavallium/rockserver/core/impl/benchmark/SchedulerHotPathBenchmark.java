@@ -104,7 +104,7 @@ public final class SchedulerHotPathBenchmark {
 					profile = WorkloadProfile.BATCH;
 					var executor = scheduler.executor(WorkloadProfile.BATCH,
 							OperationFamily.RANGE_PAGE,
-							RequestContext.NO_DEADLINE);
+							Long.MAX_VALUE);
 					submitter = () -> executor.executeCooperatively(cooperativeTask, 1L);
 					completed = cooperativeTask.completed;
 					failure = cooperativeTask.failure;
@@ -113,7 +113,7 @@ public final class SchedulerHotPathBenchmark {
 					profile = WorkloadProfile.INGEST;
 					var executor = scheduler.executor(WorkloadProfile.INGEST,
 							OperationFamily.POINT_LOOKUP,
-							RequestContext.NO_DEADLINE);
+							Long.MAX_VALUE);
 					submitter = () -> executor.execute(normalTask);
 					completed = normalTask.completed;
 					failure = normalTask.failure;
@@ -131,7 +131,7 @@ public final class SchedulerHotPathBenchmark {
 					profile = WorkloadProfile.INGEST;
 					var indexedScheduler = scheduler.scheduler(WorkloadProfile.INGEST,
 							OperationFamily.POINT_LOOKUP,
-							RequestContext.NO_DEADLINE);
+							Long.MAX_VALUE);
 					submitter = () -> indexedScheduler.schedule(normalTask);
 					completed = normalTask.completed;
 					failure = normalTask.failure;
@@ -188,7 +188,7 @@ public final class SchedulerHotPathBenchmark {
 	                                                       int measuredOperations) {
 		var executor = scheduler.executor(WorkloadProfile.BATCH,
 				OperationFamily.RANGE_PAGE,
-				RequestContext.NO_DEADLINE);
+				Long.MAX_VALUE);
 		TransitionMeasurement measurement;
 		if (scenario.equals("cooperative-yield")) {
 			runYieldWindow(scheduler, executor, threadMetrics, warmupOperations, false);
@@ -346,7 +346,7 @@ public final class SchedulerHotPathBenchmark {
 	                                               int measuredOperations) {
 		var executor = scheduler.executor(WorkloadProfile.BATCH,
 				OperationFamily.RANGE_PAGE,
-				RequestContext.NO_DEADLINE);
+				Long.MAX_VALUE);
 		var task = new ParkUntilCancelledTask();
 		runCancellationBatch(scheduler, executor, task, 0, warmupOperations);
 		long workerThreadId = workerThreadId(scheduler, RWScheduler.Pool.READ, threadMetrics);
@@ -385,7 +385,7 @@ public final class SchedulerHotPathBenchmark {
 	                                           int measuredOperations) {
 		var executor = scheduler.executor(WorkloadProfile.INGEST,
 				OperationFamily.POINT_LOOKUP,
-				RequestContext.NO_DEADLINE);
+				Long.MAX_VALUE);
 		var blocker = new BlockingRunnable();
 		var queued = new ImmediateRunnable();
 		var rejected = new RejectedRunnable();

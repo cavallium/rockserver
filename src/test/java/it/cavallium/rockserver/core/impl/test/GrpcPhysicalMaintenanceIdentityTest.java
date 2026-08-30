@@ -71,13 +71,13 @@ class GrpcPhysicalMaintenanceIdentityTest {
 			var releaseBlocker = new CountDownLatch(1);
 			var queuedFlushesRan = new CountDownLatch(16);
 			try {
-				backend.scheduler.maintenance(OperationFamily.COMPACTION).schedule(() -> {
+				backend.scheduler.scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE).schedule(() -> {
 					blockerStarted.countDown();
 					awaitUninterruptibly(releaseBlocker);
 				});
 				assertTrue(blockerStarted.await(5, SECONDS));
 
-				var cancelledFlush = backend.scheduler.maintenance(OperationFamily.FLUSH).schedule(() -> {});
+				var cancelledFlush = backend.scheduler.scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.FLUSH, Long.MAX_VALUE).schedule(() -> {});
 				assertEventually(() -> backend.scheduler.poolSnapshot(RWScheduler.Pool.PHYSICAL)
 						.queuedTasks() == 1);
 				cancelledFlush.dispose();
@@ -87,13 +87,13 @@ class GrpcPhysicalMaintenanceIdentityTest {
 						"rockserver.workload.cancellations", "compaction"));
 
 				for (int index = 0; index < 16; index++) {
-					backend.scheduler.maintenance(OperationFamily.FLUSH).schedule(queuedFlushesRan::countDown);
+					backend.scheduler.scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.FLUSH, Long.MAX_VALUE).schedule(queuedFlushesRan::countDown);
 				}
 				assertEventually(() -> backend.scheduler.poolSnapshot(RWScheduler.Pool.PHYSICAL)
 						.queuedTasks() == 16);
 
 				var overload = assertThrows(RocksDBException.class,
-						() -> backend.scheduler.maintenanceExecutor(OperationFamily.COMPACTION)
+						() -> backend.scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE)
 								.execute(() -> {}));
 				assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 						overload.getErrorUniqueId());
@@ -114,11 +114,11 @@ class GrpcPhysicalMaintenanceIdentityTest {
 	void maintenanceFamilyApiRejectsNonPhysicalOperations() {
 		try (var backend = new MaintenanceBackend()) {
 			var schedulerFailure = assertThrows(RocksDBException.class,
-					() -> backend.scheduler.maintenance(OperationFamily.MUTATION));
+					() -> backend.scheduler.scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.MUTATION, Long.MAX_VALUE));
 			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					schedulerFailure.getErrorUniqueId());
 			var executorFailure = assertThrows(RocksDBException.class,
-					() -> backend.scheduler.maintenanceExecutor(OperationFamily.RANGE_PAGE));
+					() -> backend.scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.RANGE_PAGE, Long.MAX_VALUE));
 			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					executorFailure.getErrorUniqueId());
 		}
@@ -167,6 +167,8 @@ class GrpcPhysicalMaintenanceIdentityTest {
 	}
 
 	private static final class MaintenanceBackend implements RocksDBConnection, InternalConnection, AutoCloseable {
+		@Override
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
 
 		private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
 		private final RWScheduler scheduler = RWScheduler.forTesting(
@@ -197,7 +199,12 @@ class GrpcPhysicalMaintenanceIdentityTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
-			return new RocksDBAsyncAPI() {};
+			return new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+};
 		}
 
 		@Override

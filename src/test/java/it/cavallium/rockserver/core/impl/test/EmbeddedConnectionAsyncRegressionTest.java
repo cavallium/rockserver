@@ -64,7 +64,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			syncApi.put(0, columnId, key(1), value(1), RequestType.none());
 
-			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, 10_000);
+			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 10_000));
 			try {
 				for (int attempt = 0; attempt < 1_000; attempt++) {
 					asyncApi.seekToAsync(iteratorId, key(1)).join();
@@ -95,9 +95,9 @@ class EmbeddedConnectionAsyncRegressionTest {
 					Flux.just(new KVBatchRef(keys, values)),
 					PutBatchMode.WRITE_BATCH_NO_WAL);
 
-			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, 10_000);
+			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 10_000));
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.readExecutor();
+			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var initialWorkerEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseInitialWorker = new CountDownLatch(1);
 			var betweenChunksEntered = new CountDownLatch(DATA_WORKERS);
@@ -145,7 +145,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.readExecutor();
+			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			long completedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks();
 			var workerEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseWorker = new CountDownLatch(1);
@@ -156,7 +156,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				assertTrue(workerEntered.await(5, SECONDS));
 
 				var queued = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
-						0, columnId, List.of(key(1)), 10_000);
+						0, columnId, List.of(key(1)));
 				assertTrue(awaitQueueSize(scheduler, 1), "the read never entered the executor queue");
 				assertTrue(queued.cancel(true));
 				assertTrue(awaitQueueSize(scheduler, 0),
@@ -184,7 +184,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				keys.add(key(i));
 			}
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.readExecutor();
+			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var nativeChunks = new AtomicInteger();
 			var snapshotAcquisitions = new AtomicInteger();
 			var betweenChunksEntered = new CountDownLatch(DATA_WORKERS);
@@ -198,7 +198,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			});
 			try {
 				var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
-						0, columnId, keys, 10_000);
+						0, columnId, keys);
 				assertTrue(betweenChunksEntered.await(5, SECONDS));
 				assertTrue(awaitQueueSize(scheduler, 1),
 						"the second native chunk never entered the composite queue");
@@ -239,7 +239,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				keys.add(key(i));
 			}
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.readExecutor();
+			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var nativeChunks = new AtomicInteger();
 			var betweenChunksEntered = new CountDownLatch(DATA_WORKERS);
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
@@ -249,7 +249,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			});
 
 			var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
-					0, columnId, keys, 10_000);
+					0, columnId, keys);
 			assertTrue(betweenChunksEntered.await(5, SECONDS));
 			assertTrue(awaitQueueSize(scheduler, 1),
 					"the second native chunk never entered the composite queue");
@@ -304,7 +304,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			long columnId = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.readExecutor();
+			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var workerEntered = new CountDownLatch(DATA_WORKERS);
 			var nativeChunks = new AtomicInteger();
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(nativeChunks::incrementAndGet);
@@ -312,7 +312,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			assertTrue(workerEntered.await(5, SECONDS));
 
 			var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
-					0, columnId, List.of(key(1)), 10_000);
+					0, columnId, List.of(key(1)));
 			assertTrue(awaitQueueSize(scheduler, 1), "the initial read never entered the executor queue");
 			assertEquals(1, connection.getInternalDB().getPendingOpsCount(),
 					"initial queue residence must retain one admitted logical operation");
@@ -361,7 +361,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.readExecutor();
+			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var workerEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseWorker = new CountDownLatch(1);
 			var nativeChunks = new AtomicInteger();
@@ -371,7 +371,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				assertTrue(workerEntered.await(5, SECONDS));
 
 				var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
-						0, columnId, List.of(key(1)), 25);
+						0, columnId, List.of(key(1)));
 				assertTrue(awaitQueueSize(scheduler, 1));
 				Thread.sleep(75);
 				releaseWorker.countDown();
@@ -402,7 +402,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 			});
 			try {
 				var running = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
-						0, columnId, List.of(key(1)), 10_000);
+						0, columnId, List.of(key(1)));
 				assertTrue(nativeCallFinished.await(5, SECONDS));
 				assertFalse(running.cancel(true),
 						"a running native read must retain its terminal completion");
@@ -550,9 +550,19 @@ class EmbeddedConnectionAsyncRegressionTest {
 
 	private static final class FixedFutureConnection implements RocksDBConnection {
 
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		}
+
+
 		private final CompletableFuture<Buf> future;
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {};
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
+
+			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
+			}
+
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {

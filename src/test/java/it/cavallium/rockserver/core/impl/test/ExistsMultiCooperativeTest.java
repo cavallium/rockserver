@@ -57,7 +57,7 @@ class ExistsMultiCooperativeTest {
 			var scheduler = connection.getScheduler();
 			var releaseBlockers = new CountDownLatch(1);
 			var blockersStarted = new CountDownLatch(2);
-			occupyReadWorkers(scheduler.readExecutor(), 2, blockersStarted, releaseBlockers);
+			occupyReadWorkers(scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), 2, blockersStarted, releaseBlockers);
 			assertTrue(blockersStarted.await(5, TimeUnit.SECONDS));
 
 			var firstNativeCall = new CountDownLatch(1);
@@ -91,7 +91,7 @@ class ExistsMultiCooperativeTest {
 
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.BOUNDED_FAN_OUT,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			var quantumCounter = connection.getInternalDB().getMetricsRegistry()
 					.get("rockserver.workload.quantums")
 					.tags("database", databaseName,
@@ -103,7 +103,7 @@ class ExistsMultiCooperativeTest {
 			long acceptedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 			try {
 				var request = connection.getAsyncApi(RequestContext.batch())
-						.existsMultiAsync(0, columnId, keys, 30_000);
+						.existsMultiAsync(0, columnId, keys);
 				assertTrue(firstNativeCall.await(5, TimeUnit.SECONDS));
 				assertEquals(1, connection.getInternalDB().getActiveExistsMultiRequestCount());
 
@@ -163,7 +163,7 @@ class ExistsMultiCooperativeTest {
 			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			try {
 				var request = connection.getAsyncApi(RequestContext.batch())
-						.existsMultiAsync(0, columnId, keys, 30_000);
+						.existsMultiAsync(0, columnId, keys);
 				assertTrue(firstNativeCall.await(5, TimeUnit.SECONDS));
 				assertEquals(1, connection.getInternalDB().getActiveExistsMultiRequestCount());
 
@@ -213,7 +213,7 @@ class ExistsMultiCooperativeTest {
 			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			try {
 				var request = connection.getAsyncApi(RequestContext.batch())
-						.existsMultiAsync(0, columnId, keys, 30_000);
+						.existsMultiAsync(0, columnId, keys);
 				var failure = assertThrows(java.util.concurrent.ExecutionException.class,
 						() -> request.get(5, TimeUnit.SECONDS));
 				assertTrue(failure.getCause() instanceof RocksDBException);
@@ -259,7 +259,7 @@ class ExistsMultiCooperativeTest {
 			var scheduler = connection.getScheduler();
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.BOUNDED_FAN_OUT,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			var quantumCounter = connection.getInternalDB().getMetricsRegistry()
 					.get("rockserver.workload.quantums")
 					.tags("database", databaseName,
@@ -271,7 +271,7 @@ class ExistsMultiCooperativeTest {
 			long acceptedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 
 			var result = connection.getAsyncApi(RequestContext.batch())
-					.existsMultiAsync(0, columnId, keys, 30_000)
+					.existsMultiAsync(0, columnId, keys)
 					.get(10, TimeUnit.SECONDS);
 			assertEquals(keyCount, result.size());
 			assertTrue(result.stream().noneMatch(Boolean.TRUE::equals));
@@ -302,7 +302,7 @@ class ExistsMultiCooperativeTest {
 			long acceptedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 
 			var result = connection.getAsyncApi(RequestContext.latency(java.time.Duration.ofSeconds(30)))
-					.existsMultiAsync(0, columnId, keys, 30_000)
+					.existsMultiAsync(0, columnId, keys)
 					.get(10, TimeUnit.SECONDS);
 			assertEquals(keyCount, result.size());
 			assertEquals(1, nativeCalls.get());
@@ -333,7 +333,7 @@ class ExistsMultiCooperativeTest {
 			var scheduler = connection.getScheduler();
 			long acceptedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 
-			var result = connection.getAsyncApi(context).existsMultiAsync(0, columnId, keys, 30_000)
+			var result = connection.getAsyncApi(context).existsMultiAsync(0, columnId, keys)
 					.get(10, TimeUnit.SECONDS);
 			assertEquals(keys.size(), result.size());
 			assertEquals(1L,

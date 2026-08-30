@@ -10,6 +10,7 @@ import static it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINT
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -213,7 +214,7 @@ class WorkloadAdmissionTest {
 				0, 1, List.of(keys(2), keys(3)), List.of(buffer(4), buffer(6)), RequestType.none())
 				.estimatedBytes());
 		assertEquals(11L, new RocksDBAPICommandSingle.ExistsMulti(
-				0, 1, List.of(keys(5), keys(6)), 1_000).estimatedBytes());
+				0, 1, List.of(keys(5), keys(6))).estimatedBytes());
 		assertEquals(19L, new RocksDBAPICommandSingle.UploadMergeOperator(
 				"operator", "Type", new byte[19]).estimatedBytes());
 		assertEquals(17L, new RocksDBAPICommandSingle.CheckMergeOperator(
@@ -230,22 +231,22 @@ class WorkloadAdmissionTest {
 				0, 1, List.of(keys(2), keys(3)), List.of(buffer(4), buffer(6)), RequestType.none())
 				.estimatedBytes());
 		assertEquals(7L, new RocksDBAPICommandSingle.OpenIterator(
-				0, 1, keys(3), keys(4), false, 1_000).estimatedBytes());
+				0, 1, keys(3), keys(4), false, Duration.ofSeconds(1)).estimatedBytes());
 		assertEquals(3L, new RocksDBAPICommandSingle.SeekTo(1, keys(3)).estimatedBytes());
 		assertEquals(7L, new RocksDBAPICommandSingle.ReduceRange<>(
-				0, 1, keys(3), keys(4), false, RequestType.firstAndLast(), 1_000).estimatedBytes());
+				0, 1, keys(3), keys(4), false, RequestType.firstAndLast()).estimatedBytes());
 		assertEquals(71L, new RocksDBAPICommandSingle.GetRangePage<>(
 				0, 1, keys(3), keys(4), false, null,
-				RequestType.allInRange(), 1_000, new RangeBudget(8, 64)).estimatedBytes());
+				RequestType.allInRange(), new RangeBudget(8, 64)).estimatedBytes());
 		assertEquals(7L, new RocksDBAPICommandStream.GetRange<>(
-				0, 1, keys(3), keys(4), false, RequestType.allInRange(), 1_000).estimatedBytes());
+				0, 1, keys(3), keys(4), false, RequestType.allInRange()).estimatedBytes());
 		assertEquals((long) RawSstToken.MAX_CHARACTERS * Character.BYTES,
 				new RocksDBAPICommandStream.ScanRawResumable(
 						1, 0, 1, Set.of(new RawSstToken("000123.sst"))).estimatedBytes());
 
 		var saturated = new RocksDBAPICommandSingle.GetRangePage<>(
 				0, 1, keys(1), null, false, null,
-				RequestType.allInRange(), 1_000, new RangeBudget(1, Long.MAX_VALUE));
+				RequestType.allInRange(), new RangeBudget(1, Long.MAX_VALUE));
 		assertEquals(WorkloadCost.MAX_ESTIMATED_BYTES, saturated.estimatedBytes());
 	}
 
@@ -325,7 +326,7 @@ class WorkloadAdmissionTest {
 				(count, bytes) -> new RocksDBAPICommandSingle.MergeMulti<>(
 						0, 1, emptyKeysList(count), valuesList(count, bytes), RequestType.none()),
 				(count, bytes) -> new RocksDBAPICommandSingle.ExistsMulti(
-						0, 1, keysList(count, bytes), 1_000));
+						0, 1, keysList(count, bytes)));
 
 		for (var command : commands) {
 			assertLatencyAllowed(command.apply(WorkloadAdmission.MAX_LATENCY_ITEMS - 1, 0));
@@ -349,7 +350,7 @@ class WorkloadAdmissionTest {
 				(count, bytes) -> new RocksDBAPICommandSingle.MergeMulti<>(
 						0, 1, emptyKeysList(count), valuesList(count, bytes), RequestType.none()),
 				(count, bytes) -> new RocksDBAPICommandSingle.ExistsMulti(
-						0, 1, keysList(count, bytes), 1_000));
+						0, 1, keysList(count, bytes)));
 
 		for (var command : commands) {
 			assertConfiguredLatencyAllowed(command.apply(configuredItems - 1, 0), configuredItems, configuredBytes);
@@ -371,7 +372,7 @@ class WorkloadAdmissionTest {
 		}
 
 		var aboveConfiguredExists = new RocksDBAPICommandSingle.ExistsMulti(
-				0, 1, emptyKeysList(configuredItems + 1), 1_000);
+				0, 1, emptyKeysList(configuredItems + 1));
 		for (var profile : List.of(ANALYTICAL, INGEST, BATCH)) {
 			assertEquals(profile, WorkloadAdmission.resolve(
 					context(profile), aboveConfiguredExists, configuredItems, configuredBytes));
@@ -445,8 +446,7 @@ class WorkloadAdmissionTest {
 		var oversizedExists = new RocksDBAPICommandSingle.ExistsMulti(
 				0,
 				1,
-				emptyKeysList(WorkloadAdmission.MAX_LATENCY_ITEMS + 1),
-				1_000);
+				emptyKeysList(WorkloadAdmission.MAX_LATENCY_ITEMS + 1));
 		assertEquals(ANALYTICAL, WorkloadAdmission.resolve(RequestContext.analytical(), oversizedExists));
 		assertEquals(INGEST, WorkloadAdmission.resolve(RequestContext.ingest(), oversizedExists));
 		assertEquals(BATCH, WorkloadAdmission.resolve(RequestContext.batch(), oversizedExists));
@@ -455,7 +455,7 @@ class WorkloadAdmissionTest {
 	@Test
 	void exactAggregatesRemainForbiddenInLatencyAndIngest() {
 		var exactCount = new RocksDBAPICommandSingle.ReduceRange<>(
-				0, 1, EMPTY_KEYS, null, false, RequestType.entriesCount(), 1_000);
+				0, 1, EMPTY_KEYS, null, false, RequestType.entriesCount());
 		assertThrows(RocksDBException.class, () -> WorkloadAdmission.resolve(context(LATENCY), exactCount));
 		assertThrows(RocksDBException.class, () -> WorkloadAdmission.resolve(context(INGEST), exactCount));
 		assertEquals(ANALYTICAL, WorkloadAdmission.resolve(context(ANALYTICAL), exactCount));
@@ -467,24 +467,37 @@ class WorkloadAdmissionTest {
 		for (var profile : EnumSet.of(CONTROL, CDC, PHYSICAL_MAINTENANCE)) {
 			assertFalse(profile.isClientSelectable());
 			assertThrows(IllegalArgumentException.class,
-					() -> new RequestContext(profile, RequestContext.NO_DEADLINE));
+					() -> new RequestContext(profile, Long.MAX_VALUE));
 		}
 	}
 
 	@Test
-	void publicProfilesHaveExplicitFactoriesAndLatencyRequiresADeadline() {
+	void publicProfilesHaveExplicitRelativeTimeoutFactories() {
 		assertTrue(LATENCY.isClientSelectable());
 		assertTrue(ANALYTICAL.isClientSelectable());
 		assertTrue(INGEST.isClientSelectable());
 		assertTrue(BATCH.isClientSelectable());
-		assertEquals(LATENCY, RequestContext.latency(Instant.now().plusSeconds(5)).profile());
+		assertEquals(LATENCY, RequestContext.latency(java.time.Duration.ofSeconds(5)).profile());
 		assertEquals(ANALYTICAL, RequestContext.analytical().profile());
 		assertEquals(INGEST, RequestContext.ingest().profile());
 		assertEquals(BATCH, RequestContext.batch().profile());
+		assertEquals(Duration.ofSeconds(5).toNanos(),
+				RequestContext.latency(Duration.ofSeconds(5)).timeoutNanos());
+		assertEquals(Duration.ofSeconds(5).toNanos(),
+				RequestContext.analytical(Duration.ofSeconds(5)).timeoutNanos());
+		assertEquals(Duration.ofSeconds(5).toNanos(),
+				RequestContext.ingest(Duration.ofSeconds(5)).timeoutNanos());
+		assertEquals(Duration.ofSeconds(5).toNanos(),
+				RequestContext.batch(Duration.ofSeconds(5)).timeoutNanos());
+		assertSame(RequestContext.analytical(), RequestContext.analytical());
+		assertSame(RequestContext.ingest(), RequestContext.ingest());
+		assertSame(RequestContext.batch(), RequestContext.batch());
+		assertEquals(Long.MAX_VALUE - 1L,
+				RequestContext.batch(Duration.ofSeconds(Long.MAX_VALUE)).timeoutNanos());
 		assertThrows(IllegalArgumentException.class,
-				() -> new RequestContext(LATENCY, RequestContext.NO_DEADLINE));
+				() -> new RequestContext(LATENCY, Long.MAX_VALUE));
 		assertThrows(IllegalArgumentException.class,
-				() -> RequestContext.latency(Duration.ZERO));
+				() -> RequestContext.latency(java.time.Duration.ZERO));
 	}
 
 	private static List<CommandExpectation> commandExpectations() {
@@ -495,7 +508,7 @@ class WorkloadAdmissionTest {
 		var seek = profiles(LATENCY, ANALYTICAL, BATCH);
 		var batch = profiles(BATCH);
 		var commands = new ArrayList<CommandExpectation>();
-		commands.add(client("openTransaction", new RocksDBAPICommandSingle.OpenTransaction(1_000), all));
+		commands.add(client("openTransaction", new RocksDBAPICommandSingle.OpenTransaction(Duration.ofSeconds(1)), all));
 		commands.add(client("commitTransaction", new RocksDBAPICommandSingle.CloseTransaction(1, true), ingestOrBatch));
 		commands.add(protectedCommand("rollbackTransaction", new RocksDBAPICommandSingle.CloseTransaction(1, false), CONTROL));
 		commands.add(protectedCommand("closeFailedUpdate", new RocksDBAPICommandSingle.CloseFailedUpdate(1), CONTROL));
@@ -522,20 +535,20 @@ class WorkloadAdmissionTest {
 				1, Flux.empty(), MergeBatchMode.MERGE_WRITE_BATCH), ingestOrBatch));
 		commands.add(client("get", new RocksDBAPICommandSingle.Get<>(0, 1, EMPTY_KEYS, RequestType.current()), all));
 		commands.add(client("existsMulti", new RocksDBAPICommandSingle.ExistsMulti(
-				0, 1, List.of(EMPTY_KEYS), 1_000), all));
+				0, 1, List.of(EMPTY_KEYS)), all));
 		commands.add(client("openIterator", new RocksDBAPICommandSingle.OpenIterator(
-				0, 1, EMPTY_KEYS, null, false, 1_000), seek));
+				0, 1, EMPTY_KEYS, null, false, Duration.ofSeconds(1)), seek));
 		commands.add(protectedCommand("closeIterator", new RocksDBAPICommandSingle.CloseIterator(1), CONTROL));
 		commands.add(client("seekTo", new RocksDBAPICommandSingle.SeekTo(1, EMPTY_KEYS), seek));
 		commands.add(client("subsequent", subsequent(0, 1), all));
 		commands.add(client("reduceBoundary", new RocksDBAPICommandSingle.ReduceRange<>(
-				0, 1, EMPTY_KEYS, null, false, RequestType.firstAndLast(), 1_000), seek));
+				0, 1, EMPTY_KEYS, null, false, RequestType.firstAndLast()), seek));
 		commands.add(client("reduceExact", new RocksDBAPICommandSingle.ReduceRange<>(
-				0, 1, EMPTY_KEYS, null, false, RequestType.entriesCount(), 1_000), analyticalOrBatch));
+				0, 1, EMPTY_KEYS, null, false, RequestType.entriesCount()), analyticalOrBatch));
 		commands.add(client("getRangePage", new RocksDBAPICommandSingle.GetRangePage<>(
-				0, 1, EMPTY_KEYS, null, false, null, RequestType.allInRange(), 1_000, RangeBudget.DEFAULT), all));
+				0, 1, EMPTY_KEYS, null, false, null, RequestType.allInRange(), RangeBudget.DEFAULT), all));
 		commands.add(client("getRange", new RocksDBAPICommandStream.GetRange<>(
-				0, 1, EMPTY_KEYS, null, false, RequestType.allInRange(), 1_000), analyticalOrBatch));
+				0, 1, EMPTY_KEYS, null, false, RequestType.allInRange()), analyticalOrBatch));
 		commands.add(client("scanRaw", new RocksDBAPICommandStream.ScanRaw(1, 0, 1), batch));
 		commands.add(client("scanRawResumable",
 				new RocksDBAPICommandStream.ScanRawResumable(1, 0, 1, Set.of()), batch));
@@ -586,7 +599,7 @@ class WorkloadAdmissionTest {
 
 	private static RequestContext context(WorkloadProfile profile) {
 		return switch (profile) {
-			case LATENCY -> RequestContext.latency(Duration.ofMinutes(1));
+			case LATENCY -> RequestContext.latency(java.time.Duration.ofMinutes(1));
 			case ANALYTICAL -> RequestContext.analytical();
 			case INGEST -> RequestContext.ingest();
 			case BATCH -> RequestContext.batch();
@@ -596,7 +609,7 @@ class WorkloadAdmissionTest {
 
 	private static RocksDBAPICommandSingle.GetRangePage<?> rangePage(RangeBudget budget) {
 		return new RocksDBAPICommandSingle.GetRangePage<>(
-				0, 1, EMPTY_KEYS, null, false, null, RequestType.allInRange(), 1_000, budget);
+				0, 1, EMPTY_KEYS, null, false, null, RequestType.allInRange(), budget);
 	}
 
 	private static void assertLatencyAllowed(RocksDBAPICommand<?, ?, ?> command) {

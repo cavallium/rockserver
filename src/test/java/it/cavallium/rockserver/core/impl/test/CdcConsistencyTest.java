@@ -32,15 +32,15 @@ class CdcConsistencyTest {
     @BeforeEach
     void setUp() throws IOException, RocksDBException {
         db = new EmbeddedDB(tempDir, "test-db", null);
-        
+
         var schema = ColumnSchema.of(
-                IntArrayList.of(4), 
-                new ObjectArrayList<>(), 
-                true, 
+                IntArrayList.of(4),
+                new ObjectArrayList<>(),
+                true,
                 null, null, null
         );
         defaultColId = db.createColumn("data", schema);
-        db.cdcCreate(subId, null, List.of(defaultColId), false);
+        db.cdcCreate(subId, null, List.of(defaultColId), false, java.util.OptionalLong.empty());
     }
 
     @AfterEach
@@ -73,15 +73,15 @@ class CdcConsistencyTest {
     @Test
     void testTransactionVisibility() throws Exception {
         // 1. Transaction Commit
-        long txId1 = db.openTransaction(5000);
+        long txId1 = db.openTransaction( java.time.Duration.ofMillis(5000));
         db.put(txId1, defaultColId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("Committed".getBytes()), RequestType.none());
-        
+
         // Should not see it yet
         CdcBatch batch = db.cdcPollBatchAsyncInternal(subId, null, 100).block();
         assertTrue(batch.events().isEmpty(), "Uncommitted transaction should not be visible");
-        
+
         db.closeTransaction(txId1, true); // Commit
-        
+
         // Should see it now
         batch = db.cdcPollBatchAsyncInternal(subId, null, 100).block();
         assertEquals(1, batch.events().size());
@@ -89,15 +89,15 @@ class CdcConsistencyTest {
         long nextSeq = batch.nextSeq();
 
         // 2. Transaction Rollback
-        long txId2 = db.openTransaction(5000);
+        long txId2 = db.openTransaction( java.time.Duration.ofMillis(5000));
         db.put(txId2, defaultColId, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("RolledBack".getBytes()), RequestType.none());
-        
+
         // Should not see it
         batch = db.cdcPollBatchAsyncInternal(subId, nextSeq, 100).block();
         assertTrue(batch.events().isEmpty(), "Uncommitted transaction should not be visible");
-        
+
         db.closeFailedUpdate(txId2); // Rollback
-        
+
         // Should NEVER see it
         batch = db.cdcPollBatchAsyncInternal(subId, nextSeq, 100).block();
         assertTrue(batch.events().isEmpty(), "Rolled back transaction should never be visible");
@@ -120,20 +120,20 @@ class CdcConsistencyTest {
         int pageSize = 7;
         int received = 0;
         long nextSeq = 0;
-        
+
         // Expected total iterations: ceil(50/7) = 8
         // Loop a bit more to be safe
         for (int i = 0; i < 15; i++) {
             CdcBatch batch = db.cdcPollBatchAsyncInternal(subId, nextSeq == 0 ? null : nextSeq, pageSize).block();
             if (batch.events().isEmpty()) break;
-            
+
             for (CDCEvent ev : batch.events()) {
                 assertEquals(received, bytesToInt(ev.key().toByteArray()), "Events should be strictly ordered");
                 received++;
             }
             nextSeq = batch.nextSeq();
         }
-        
+
         assertEquals(batchSize, received, "Should receive all events from atomic batch via pagination");
     }
 
@@ -143,22 +143,22 @@ class CdcConsistencyTest {
         long col2 = db.createColumn("data2", ColumnSchema.of(IntArrayList.of(4), new ObjectArrayList<>(), true, null, null, null));
         String sub2 = "multi-sub";
         // Subscribe to BOTH
-        db.cdcCreate(sub2, null, List.of(defaultColId, col2), false);
-        
+        db.cdcCreate(sub2, null, List.of(defaultColId, col2), false, java.util.OptionalLong.empty());
+
         // Manually create a WriteBatch with mixed CFs using Transaction
-        long txId = db.openTransaction(5000);
+        long txId = db.openTransaction( java.time.Duration.ofMillis(5000));
         db.put(txId, defaultColId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A".getBytes()), RequestType.none());
         db.put(txId, col2, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("B".getBytes()), RequestType.none());
         db.put(txId, defaultColId, new Keys(new Buf[]{Buf.wrap(intToBytes(3))}), Buf.wrap("C".getBytes()), RequestType.none());
         db.closeTransaction(txId, true);
-        
+
         CdcBatch batch = db.cdcPollBatchAsyncInternal(sub2, null, 10).block();
         assertEquals(3, batch.events().size());
-        
+
         assertEquals(defaultColId, batch.events().get(0).columnId());
         assertEquals(col2, batch.events().get(1).columnId());
         assertEquals(defaultColId, batch.events().get(2).columnId());
-        
+
         assertEquals(1, bytesToInt(batch.events().get(0).key().toByteArray()));
         assertEquals(2, bytesToInt(batch.events().get(1).key().toByteArray()));
         assertEquals(3, bytesToInt(batch.events().get(2).key().toByteArray()));

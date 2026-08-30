@@ -144,8 +144,7 @@ class RangeNoCacheTest {
 				key(2),
 				key(8),
 				reverse,
-				requestType,
-				RANGE_TIMEOUT_MS)) {
+				requestType)) {
 			result = range.toList();
 		}
 
@@ -164,8 +163,7 @@ class RangeNoCacheTest {
 				key(0),
 				key(10),
 				false,
-				RequestType.allInRangeNoCache(),
-				RANGE_TIMEOUT_MS)), 1)
+				RequestType.allInRangeNoCache())), 1)
 				.expectNext(rows.getFirst())
 				.thenCancel()
 				.verify(Duration.ofSeconds(10));

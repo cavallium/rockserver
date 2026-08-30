@@ -318,7 +318,7 @@ public final class SevenProfileWorkloadBenchmark {
 			futures.add(workers.submit(() -> runWorker(control, pressure,
 					new WorkloadKey(WorkloadProfile.CONTROL, OperationFamily.CONTROL),
 					new Pacer(options.controlRate(), options.controlWorkers(), workerIndex), () -> {
-						long transactionId = batch.openTransaction(60_000L);
+						long transactionId = batch.openTransaction( java.time.Duration.ofMillis(60_000L));
 						if (!batch.closeTransaction(transactionId, false)) {
 							throw new IllegalStateException("CONTROL rollback did not close its transaction");
 						}
@@ -331,7 +331,7 @@ public final class SevenProfileWorkloadBenchmark {
 				runWorker(control, pressure,
 						new WorkloadKey(WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP),
 						new Pacer(options.latencyRate(), options.latencyWorkers(), workerIndex),
-						() -> connection.getSyncApi(RequestContext.latency(Duration.ofMillis(LATENCY_DEADLINE_MILLIS)))
+						() -> connection.getSyncApi(RequestContext.latency(java.time.Duration.ofMillis(LATENCY_DEADLINE_MILLIS)))
 								.get(0L, dataset.columnId(), key(random.nextInt(options.preloadKeys())), RequestType.current()));
 			}));
 		}
@@ -345,7 +345,7 @@ public final class SevenProfileWorkloadBenchmark {
 							int available = options.preloadKeys() - options.rangeWidth();
 							long start = available == 0 ? 0L : random.nextInt(available + 1);
 							try (Stream<?> range = analytical.getRange(0L, dataset.columnId(), key(start),
-									key(start + options.rangeWidth()), false, RequestType.allInRange(), 10_000L)) {
+									key(start + options.rangeWidth()), false, RequestType.allInRange())) {
 								range.count();
 							}
 						});
@@ -402,8 +402,8 @@ public final class SevenProfileWorkloadBenchmark {
 					new WorkloadKey(WorkloadProfile.LATENCY, OperationFamily.BOUNDED_FAN_OUT),
 					new Pacer(options.cancellationRate(), options.cancellationWorkers(), workerIndex), () -> {
 						CompletableFuture<List<Boolean>> request = connection
-								.getAsyncApi(RequestContext.latency(Duration.ofMillis(LATENCY_DEADLINE_MILLIS)))
-								.existsMultiAsync(0L, dataset.columnId(), cancellationKeys, LATENCY_DEADLINE_MILLIS);
+								.getAsyncApi(RequestContext.latency(java.time.Duration.ofMillis(LATENCY_DEADLINE_MILLIS)))
+								.existsMultiAsync(0L, dataset.columnId(), cancellationKeys);
 						if (request.cancel(false)) {
 							throw new CancellationException("intentional benchmark cancellation");
 						}
@@ -463,7 +463,7 @@ public final class SevenProfileWorkloadBenchmark {
 	}
 
 	static long createCdcSubscriptionForMixedRun(RocksDBSyncAPI batch, long columnId) {
-		return batch.cdcCreate(CDC_SUBSCRIPTION, null, List.of(columnId), false);
+		return batch.cdcCreate(CDC_SUBSCRIPTION, null, List.of(columnId), false, java.util.OptionalLong.empty());
 	}
 
 	private static double runIsolatedIngestBaseline(PreparedDataset dataset, Options options) throws Exception {

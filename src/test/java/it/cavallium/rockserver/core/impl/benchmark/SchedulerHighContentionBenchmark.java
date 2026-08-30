@@ -582,7 +582,7 @@ public final class SchedulerHighContentionBenchmark {
 					? System.currentTimeMillis() - 1L
 					: lane.profile() == WorkloadProfile.LATENCY
 							? futureLatencyDeadlineEpochMillis
-							: RequestContext.NO_DEADLINE;
+							: Long.MAX_VALUE;
 			try {
 				if (fail) {
 					var task = new FailingTask(this, index, lane, submittedNanos, tokens);

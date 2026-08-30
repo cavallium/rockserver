@@ -214,9 +214,7 @@ class GrpcRawScanErrorMappingTest {
 		@Override
 		public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
 			return Mono.just(CapabilitiesResponse.newBuilder()
-					.setWorkloadContractVersion(2)
-					.setBoundedRange(true)
-					.setResumableRawScan(true)
+					.setWorkloadContractVersion(3)
 					.build());
 		}
 

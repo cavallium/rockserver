@@ -56,7 +56,7 @@ class RetainedRangeCooperativeTest {
 			var scheduler = connection.getScheduler();
 			var releaseBlockers = new CountDownLatch(1);
 			var blockersStarted = new CountDownLatch(2);
-			occupyReadWorkers(scheduler.readExecutor(), 2, blockersStarted, releaseBlockers);
+			occupyReadWorkers(scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), 2, blockersStarted, releaseBlockers);
 			assertTrue(blockersStarted.await(5, TimeUnit.SECONDS));
 
 			var firstChunk = new CountDownLatch(1);
@@ -78,7 +78,7 @@ class RetainedRangeCooperativeTest {
 
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.FULL_SCAN_AGGREGATE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			var quantumCounter = connection.getInternalDB().getMetricsRegistry()
 					.get("rockserver.workload.quantums")
 					.tags("database", databaseName,
@@ -90,7 +90,7 @@ class RetainedRangeCooperativeTest {
 			long acceptedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 			try {
 				var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(firstChunk.await(5, TimeUnit.SECONDS));
 				assertEquals(1, connection.getInternalDB().getActiveRangeCursorCount());
 				assertEquals(1, connection.getInternalDB().getRetainedRangeSnapshotCount());
@@ -133,7 +133,7 @@ class RetainedRangeCooperativeTest {
 			var scheduler = connection.getScheduler();
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			var quantumCounter = connection.getInternalDB().getMetricsRegistry()
 					.get("rockserver.workload.quantums")
 					.tags("database", databaseName,
@@ -149,7 +149,7 @@ class RetainedRangeCooperativeTest {
 			connection.getInternalDB().setRangeReadChunkSizeObserverForTesting(chunkSizes::add);
 
 			var range = Flux.from(connection.getAsyncApi(RequestContext.batch()).getRangeAsync(
-					0, columnId, null, null, false, RequestType.allInRange(), 30_000));
+					0, columnId, null, null, false, RequestType.allInRange()));
 			StepVerifier.create(range, 1)
 					.assertNext(first -> assertEquals(key(0), first.keys()))
 					.thenAwait(Duration.ofMillis(200))
@@ -193,7 +193,7 @@ class RetainedRangeCooperativeTest {
 			awaitReadPoolDrained(scheduler);
 			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+					0, columnId, null, null, false, RequestType.entriesCount());
 			assertTrue(cleanupEntered.await(5, TimeUnit.SECONDS));
 			assertEquals(1, db.getActiveRangeCursorCount());
 			assertEquals(1, db.getRetainedRangeSnapshotCount());
@@ -258,7 +258,7 @@ class RetainedRangeCooperativeTest {
 			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			try {
 				var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				var failure = assertThrows(ExecutionException.class, () -> count.get(5, TimeUnit.SECONDS));
 				assertTrue(failure.getCause() instanceof IllegalStateException);
 				assertEquals("synthetic retained cleanup failure", failure.getCause().getMessage());
@@ -290,7 +290,7 @@ class RetainedRangeCooperativeTest {
 			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			try {
 				var range = Flux.from(connection.getAsyncApi(RequestContext.batch()).getRangeAsync(
-						0, columnId, null, null, false, RequestType.allInRange(), 30_000))
+						0, columnId, null, null, false, RequestType.allInRange()))
 						.collectList()
 						.toFuture();
 				var failure = assertThrows(ExecutionException.class, () -> range.get(5, TimeUnit.SECONDS));
@@ -324,7 +324,7 @@ class RetainedRangeCooperativeTest {
 			var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			try {
 				var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+						0, columnId, null, null, false, RequestType.entriesCount());
 				var failure = assertThrows(ExecutionException.class, () -> count.get(5, TimeUnit.SECONDS));
 				assertTrue(failure.getCause() instanceof IllegalStateException);
 				assertEquals("synthetic retained iterator-open failure", failure.getCause().getMessage());
@@ -363,7 +363,7 @@ class RetainedRangeCooperativeTest {
 			var scheduler = connection.getScheduler();
 			var outcomesBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
 			var count = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+					0, columnId, null, null, false, RequestType.entriesCount());
 			assertTrue(quantumEntered.await(5, TimeUnit.SECONDS));
 
 			var connectionToClose = connection;
@@ -428,8 +428,8 @@ class RetainedRangeCooperativeTest {
 			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
 			var scheduler = connection.getScheduler();
 			var outcomesBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes();
-			var count = connection.getAsyncApi(RequestContext.batch(Instant.now().plusMillis(250)))
-					.reduceRangeAsync(0, columnId, null, null, false, RequestType.entriesCount(), 30_000);
+			var count = connection.getAsyncApi(RequestContext.batch(java.time.Duration.ofMillis(250)))
+					.reduceRangeAsync(0, columnId, null, null, false, RequestType.entriesCount());
 			assertTrue(quantumEntered.await(5, TimeUnit.SECONDS));
 			Thread.sleep(300L);
 			db.cleanupExpiredRangesNow();
@@ -492,7 +492,7 @@ class RetainedRangeCooperativeTest {
 			var scheduler = connection.getScheduler();
 			var releaseBlockers = new CountDownLatch(1);
 			var blockersStarted = new CountDownLatch(2);
-			occupyReadWorkers(scheduler.readExecutor(), 2, blockersStarted, releaseBlockers);
+			occupyReadWorkers(scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), 2, blockersStarted, releaseBlockers);
 			assertTrue(blockersStarted.await(5, TimeUnit.SECONDS));
 
 			var cursorOpening = new CountDownLatch(1);
@@ -505,7 +505,7 @@ class RetainedRangeCooperativeTest {
 
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					RequestContext.NO_DEADLINE);
+					Long.MAX_VALUE);
 			var quantumCounter = connection.getInternalDB().getMetricsRegistry()
 					.get("rockserver.workload.quantums")
 					.tags("database", databaseName,
@@ -517,7 +517,7 @@ class RetainedRangeCooperativeTest {
 			long acceptedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 			try {
 				var range = Flux.from(connection.getAsyncApi(RequestContext.batch()).getRangeAsync(
-						0, columnId, null, null, false, RequestType.allInRange(), 30_000));
+						0, columnId, null, null, false, RequestType.allInRange()));
 				StepVerifier.create(range, 1)
 						.then(() -> {
 							assertTrue(await(cursorOpening, 5, TimeUnit.SECONDS));
@@ -561,7 +561,7 @@ class RetainedRangeCooperativeTest {
 
 			var failure = assertThrows(RocksDBException.class,
 					() -> connection.getAsyncApi(RequestContext.ingest()).reduceRangeAsync(
-							0, columnId, null, null, false, RequestType.entriesCount(), 30_000));
+							0, columnId, null, null, false, RequestType.entriesCount()));
 			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, failure.getErrorUniqueId());
 			assertEquals(acceptedBefore, scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks(),
 					"rejected INGEST aggregates must not reach scheduler admission");
@@ -582,7 +582,7 @@ class RetainedRangeCooperativeTest {
 			connection.getInternalDB().setRangeIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
 
 			assertEquals(33L, connection.getAsyncApi(context).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount(), 30_000)
+					0, columnId, null, null, false, RequestType.entriesCount())
 					.get(10, TimeUnit.SECONDS));
 			assertEquals(1L,
 					scheduler.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks() - acceptedBefore);

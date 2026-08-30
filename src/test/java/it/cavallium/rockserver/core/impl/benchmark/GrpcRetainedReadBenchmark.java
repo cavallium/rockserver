@@ -941,7 +941,7 @@ public final class GrpcRetainedReadBenchmark {
 
 	private static OperationResult executeCount(WorkerContext context, Options options) {
 		long count = context.retainedApi().reduceRange(0L, context.columnId(), null, null, false,
-				RequestType.entriesCount(), READ_TIMEOUT_MILLIS);
+				RequestType.entriesCount());
 		if (count != options.preloadKeys()) {
 			throw new IllegalStateException("Exact count mismatch: expected=" + options.preloadKeys()
 					+ " actual=" + count);
@@ -956,7 +956,7 @@ public final class GrpcRetainedReadBenchmark {
 		long count = 0L;
 		long checksum = 0L;
 		try (var stream = context.retainedApi().getRange(0L, context.columnId(), null, null, false,
-				RequestType.<KV>allInRange(), READ_TIMEOUT_MILLIS)) {
+				RequestType.<KV>allInRange())) {
 			var iterator = stream.iterator();
 			while (iterator.hasNext()) {
 				KV entry = iterator.next();
@@ -978,7 +978,7 @@ public final class GrpcRetainedReadBenchmark {
 
 	private static OperationResult executeExistsMulti(WorkerContext context, Options options) {
 		List<Boolean> result = context.retainedApi().existsMulti(0L, context.columnId(),
-				context.existsKeys(), READ_TIMEOUT_MILLIS);
+				context.existsKeys());
 		if (result.size() != context.existsExpected().size()) {
 			throw new IllegalStateException("existsMulti result size mismatch");
 		}
@@ -998,7 +998,7 @@ public final class GrpcRetainedReadBenchmark {
 
 	private static OperationResult executeIterator(WorkerContext context, Options options) {
 		long iteratorId = context.retainedApi().openIterator(0L, context.columnId(), new Keys(), null,
-				false, READ_TIMEOUT_MILLIS);
+				false, java.time.Duration.ofMillis( READ_TIMEOUT_MILLIS));
 		try {
 			List<Buf> values = context.retainedApi().subsequent(iteratorId, options.iteratorSkip(),
 					options.iteratorTake(), RequestType.multi());

@@ -92,7 +92,7 @@ class ScanRawCompactionSafetyTest {
 				assertTrue(allScansAdmitted.await(10, TimeUnit.SECONDS),
 						"the regression needs at least readParallelism scans waiting to capture pins");
 
-				Buf actual = connection.getAsyncApi(RequestContext.latency(Duration.ofSeconds(10)))
+				Buf actual = connection.getAsyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)))
 						.getAsync(0, columnId, key(1), RequestType.current())
 						.get(2, TimeUnit.SECONDS);
 				assertEquals(expected, actual,
@@ -230,7 +230,7 @@ class ScanRawCompactionSafetyTest {
 				assertEquals(queueCapacity, internal.getRawScanPinCaptureQueueCapacityForTesting(),
 						"capture waiting must inherit the bounded BATCH admission capacity");
 
-				Buf actual = connection.getAsyncApi(RequestContext.latency(Duration.ofSeconds(10)))
+				Buf actual = connection.getAsyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)))
 						.getAsync(0, columnId, key(1), RequestType.current())
 						.get(2, TimeUnit.SECONDS);
 				assertEquals(expected, actual, "a saturated capture lane must not consume read workers");
@@ -315,7 +315,7 @@ class ScanRawCompactionSafetyTest {
 						"no yielded batch may retain the entire scan until EOF");
 
 				var resumableEvents = internal.scanRawResumableAsyncInternal(
-						columnId, 0, 1, Set.of(), internal.getScheduler().read())
+						columnId, 0, 1, Set.of(), internal.getScheduler().scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE))
 						.collectList()
 						.block(Duration.ofSeconds(30));
 				var resumableBatches = resumableEvents.stream()
@@ -441,10 +441,17 @@ class ScanRawCompactionSafetyTest {
 						}
 
 						@Override
-						public void dispose() {
-							if (disposed.compareAndSet(false, true)) {
-								command.reject(new java.util.concurrent.CancellationException());
+						public boolean cancel() {
+							if (!disposed.compareAndSet(false, true)) {
+								return false;
 							}
+							command.reject(new java.util.concurrent.CancellationException());
+							return true;
+						}
+
+						@Override
+						public void dispose() {
+							cancel();
 						}
 
 						@Override
@@ -628,7 +635,7 @@ class ScanRawCompactionSafetyTest {
 								0,
 								1,
 								reactor.core.scheduler.Schedulers.immediate(),
-								scheduler.readExecutor())
+								scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE))
 								.collectList()
 								.block(Duration.ofSeconds(10)));
 				assertEquals("synthetic raw scan cleanup failure", failure.getMessage());
@@ -704,8 +711,17 @@ class ScanRawCompactionSafetyTest {
 						}
 
 						@Override
-						public void dispose() {
+						public boolean cancel() {
+							if (disposed) {
+								return false;
+							}
 							disposed = true;
+							return true;
+						}
+
+						@Override
+						public void dispose() {
+							cancel();
 						}
 
 						@Override

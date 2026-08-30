@@ -144,7 +144,7 @@ class CdcLastCommittedSequenceTransportTest {
 				var schema = ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true);
 				long selectedColumn = api.createColumn("selected", schema);
 				long ignoredColumn = api.createColumn("ignored", schema);
-				long startSeq = api.cdcCreate("filtered", null, List.of(selectedColumn), false);
+				long startSeq = api.cdcCreate("filtered", null, List.of(selectedColumn), false, java.util.OptionalLong.empty());
 
 				api.put(0,
 						ignoredColumn,
@@ -224,7 +224,7 @@ class CdcLastCommittedSequenceTransportTest {
 					maxResponseSize)) {
 				var schema = ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true);
 				long columnId = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("budgeted", schema);
-				long startSeq = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("budgeted", null, List.of(columnId), false);
+				long startSeq = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("budgeted", null, List.of(columnId), false, java.util.OptionalLong.empty());
 				for (int i = 0; i < 3; i++) {
 					embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0,
 							columnId,
@@ -273,7 +273,7 @@ class CdcLastCommittedSequenceTransportTest {
 			server.start();
 			var schema = ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true);
 			long columnId = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("oversized", schema);
-			long startSeq = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("oversized", null, List.of(columnId), false);
+			long startSeq = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("oversized", null, List.of(columnId), false, java.util.OptionalLong.empty());
 			embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0,
 					columnId,
 					new Keys(Buf.wrap(new byte[] {0, 0, 0, 1})),
@@ -315,7 +315,7 @@ class CdcLastCommittedSequenceTransportTest {
 		Path databasePath = tempDir.resolve("db-reopen");
 
 		try (var embedded = new EmbeddedConnection(databasePath, "cdc-watermark", configFile)) {
-			embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("replica-watermark", 1L, null);
+			embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("replica-watermark", 1L, null, null, java.util.OptionalLong.empty());
 			embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCommit("replica-watermark", 42L);
 		}
 
@@ -339,8 +339,9 @@ class CdcLastCommittedSequenceTransportTest {
 			List<Long> columnIds,
 			Boolean emitLatestValues) {
 		return switch (type) {
-			case SYNC -> api.cdcCreate(subscriptionId, fromSeq, columnIds, emitLatestValues);
-			case ASYNC -> api.cdcCreateAsync(subscriptionId, fromSeq, columnIds, emitLatestValues).join();
+			case SYNC -> api.cdcCreate(subscriptionId, fromSeq, columnIds, emitLatestValues, java.util.OptionalLong.empty());
+			case ASYNC -> api.cdcCreateAsync(subscriptionId, fromSeq, columnIds, emitLatestValues,
+					OptionalLong.empty()).join();
 		};
 	}
 

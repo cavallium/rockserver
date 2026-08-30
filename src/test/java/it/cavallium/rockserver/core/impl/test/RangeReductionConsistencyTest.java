@@ -55,7 +55,7 @@ class RangeReductionConsistencyTest {
 			api.flush();
 			assertCountMatchesRange(api, 0, columnId, null, null, 2, name + ", flushed baseline");
 
-			long transactionId = api.openTransaction(30_000);
+			long transactionId = api.openTransaction( java.time.Duration.ofMillis(30_000));
 			assertTrue(transactionId < 0, name + ", transaction IDs must use the reserved negative range");
 			try {
 				api.put(transactionId, columnId, key3, toBufSimple(33), RequestType.none());
@@ -113,7 +113,7 @@ class RangeReductionConsistencyTest {
 			assertCountMatchesRange(api, 0, columnId, null, null, 2,
 					name + ", two colliding bucket entries");
 
-			long transactionId = api.openTransaction(30_000);
+			long transactionId = api.openTransaction( java.time.Duration.ofMillis(30_000));
 			assertTrue(transactionId < 0, name + ", transaction IDs must use the reserved negative range");
 			try {
 				api.put(transactionId, columnId, key3, toBufSimple(33), RequestType.none());
@@ -152,8 +152,7 @@ class RangeReductionConsistencyTest {
 				startInclusive,
 				endExclusive,
 				false,
-				RequestType.allInRange(),
-				10_000)) {
+				RequestType.allInRange())) {
 			scanned = range.count();
 		}
 		assertEquals(expected, scanned, context + ", scanned entries");
@@ -162,14 +161,12 @@ class RangeReductionConsistencyTest {
 				startInclusive,
 				endExclusive,
 				false,
-				RequestType.entriesCount(),
-				10_000), context + ", forward reduction");
+				RequestType.entriesCount()), context + ", forward reduction");
 		assertEquals(expected, api.reduceRange(transactionId,
 				columnId,
 				startInclusive,
 				endExclusive,
 				true,
-				RequestType.entriesCount(),
-				10_000), context + ", reverse reduction");
+				RequestType.entriesCount()), context + ", reverse reduction");
 	}
 }

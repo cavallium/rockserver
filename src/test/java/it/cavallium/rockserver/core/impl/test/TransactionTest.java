@@ -75,8 +75,8 @@ database: {
 	@Test
 	@Order(1)
 	void testMultiplePutsInOneTransaction() {
-		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(10_000);
-		
+		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(10_000));
+
 		var key1 = makeKey(1, 1, 1);
 		var value1 = toBufSimple(100);
 		var key2 = makeKey(2, 2, 2);
@@ -105,8 +105,8 @@ database: {
 		var key = makeKey(3, 3, 3);
 		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, toBufString("A"), RequestType.none());
 
-		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(10_000);
-		
+		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(10_000));
+
 		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId, colIdNoBuckets, key, toBufString("B"), RequestType.none());
 		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(txId, colIdNoBuckets, key, toBufString("C"), RequestType.none());
 

@@ -39,9 +39,9 @@ class EmbeddedReduceRangeSchedulingTest {
 	@Test
 	void firstAndLastIsInteractiveWhileAFullCountRemainsComposite() {
 		var firstAndLast = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<FirstAndLast<KV>>(
-				0, 1, null, null, false, RequestType.firstAndLast(), 1_000);
+				0, 1, null, null, false, RequestType.firstAndLast());
 		var entriesCount = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<Long>(
-				0, 1, null, null, false, RequestType.entriesCount(), 1_000);
+				0, 1, null, null, false, RequestType.entriesCount());
 
 		assertEquals(it.cavallium.rockserver.core.common.OperationFamily.BOUNDARY_SEEK,
 				firstAndLast.operationFamily());
@@ -69,7 +69,7 @@ class EmbeddedReduceRangeSchedulingTest {
 			var observedAsyncIo = new AtomicReference<Boolean>();
 			connection.getInternalDB().setReduceRangeAsyncIoObserverForTesting(observedAsyncIo::set);
 			try {
-				api.reduceRange(0, columnId, null, null, false, RequestType.firstAndLast(), 1_000);
+				api.reduceRange(0, columnId, null, null, false, RequestType.firstAndLast());
 				assertEquals(Boolean.TRUE, observedAsyncIo.get(),
 						"endpoint seeks must submit SST child reads concurrently");
 			} finally {
@@ -99,15 +99,15 @@ class EmbeddedReduceRangeSchedulingTest {
 
 			Keys upperBound = intKey(45);
 			assertEquals(new FirstAndLast<>(first, middle),
-					api.reduceRange(0, columnId, null, upperBound, false, RequestType.firstAndLast(), 1_000));
+					api.reduceRange(0, columnId, null, upperBound, false, RequestType.firstAndLast()));
 			assertEquals(new FirstAndLast<>(middle, first),
-					api.reduceRange(0, columnId, null, upperBound, true, RequestType.firstAndLast(), 1_000));
+					api.reduceRange(0, columnId, null, upperBound, true, RequestType.firstAndLast()));
 
 			Keys lowerBound = intKey(15);
 			assertEquals(new FirstAndLast<>(middle, last),
-					api.reduceRange(0, columnId, lowerBound, null, false, RequestType.firstAndLast(), 1_000));
+					api.reduceRange(0, columnId, lowerBound, null, false, RequestType.firstAndLast()));
 			assertEquals(new FirstAndLast<>(last, middle),
-					api.reduceRange(0, columnId, lowerBound, null, true, RequestType.firstAndLast(), 1_000));
+					api.reduceRange(0, columnId, lowerBound, null, true, RequestType.firstAndLast()));
 		}
 	}
 
@@ -132,7 +132,7 @@ class EmbeddedReduceRangeSchedulingTest {
 
 			var blockerStarted = new CountDownLatch(DATA_WORKERS);
 			var releaseBlocker = new CountDownLatch(1);
-			occupyWorkers(connection.getInternalDB().getScheduler().readExecutor(),
+			occupyWorkers(connection.getInternalDB().getScheduler().executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE),
 					blockerStarted,
 					releaseBlocker);
 			assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
@@ -141,7 +141,7 @@ class EmbeddedReduceRangeSchedulingTest {
 			connection.getInternalDB().setRangeIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
 			try {
 				var result = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.firstAndLast(), 50);
+						0, columnId, null, null, false, RequestType.firstAndLast());
 				Thread.sleep(150);
 				releaseBlocker.countDown();
 
@@ -177,7 +177,7 @@ class EmbeddedReduceRangeSchedulingTest {
 			long columnId = api.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getInternalDB().getScheduler();
-			var readExecutor = scheduler.readExecutor();
+			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var blockerStarted = new CountDownLatch(DATA_WORKERS);
 			var releaseBlocker = new CountDownLatch(1);
 			occupyWorkers(readExecutor, blockerStarted, releaseBlocker);
@@ -185,7 +185,7 @@ class EmbeddedReduceRangeSchedulingTest {
 
 			try {
 				var result = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(
-						0, columnId, null, null, false, RequestType.firstAndLast(), 5_000);
+						0, columnId, null, null, false, RequestType.firstAndLast());
 				awaitQueueSize(scheduler, 1);
 
 				assertTrue(result.cancel(true));

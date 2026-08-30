@@ -100,7 +100,7 @@ public class CdcGrpcTest {
         var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 
         // Create CDC subscription
-        var startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null);
+        var startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null, null, java.util.OptionalLong.empty());
         assertTrue(startSeq >= 0);
 
         // Put some data
@@ -159,7 +159,7 @@ public class CdcGrpcTest {
                 "selected-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
         var ignoredColumn = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "ignored-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("filtered-sub", null, List.of(selectedColumn));
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("filtered-sub", null, List.of(selectedColumn), null, java.util.OptionalLong.empty());
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
 
         client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, ignoredColumn, key,
@@ -197,7 +197,7 @@ public class CdcGrpcTest {
     void cdcUnaryBatchLargerThanFourMiBSucceedsWithExactCursor() throws Exception {
         long columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "large-response-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("large-response-sub", null, List.of(columnId));
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("large-response-sub", null, List.of(columnId), null, java.util.OptionalLong.empty());
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 7})});
         byte[] value = new byte[5 * 1024 * 1024];
         Arrays.fill(value, (byte) 0x5a);
@@ -245,7 +245,7 @@ public class CdcGrpcTest {
     void negotiatedLimitIsExactAndOversizedGroupFailsWithoutRetryingOrAdvancing() throws Exception {
         long columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "limit-boundary-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("limit-boundary-sub", null, List.of(columnId));
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("limit-boundary-sub", null, List.of(columnId), null, java.util.OptionalLong.empty());
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 8})});
         byte[] value = new byte[5 * 1024 * 1024];
         Arrays.fill(value, (byte) 0x33);
@@ -329,7 +329,7 @@ public class CdcGrpcTest {
     void negotiatedResponseBudgetPaginatesWithoutSkippingEvents() throws Exception {
         long columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
                 "response-pages-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("response-pages-sub", null, List.of(columnId));
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("response-pages-sub", null, List.of(columnId), null, java.util.OptionalLong.empty());
         int valueSize = 2 * 1024 * 1024;
         for (int i = 0; i < 3; i++) {
             byte[] value = new byte[valueSize];
@@ -391,7 +391,7 @@ public class CdcGrpcTest {
 	void cdcGapIsPropagatedOverGrpcInsteadOfReturningAnEmptyBatch() throws Exception {
 		var columnId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(
 				"gap-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("gap-sub", null, List.of(columnId));
+		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("gap-sub", null, List.of(columnId), null, java.util.OptionalLong.empty());
 
 		long missingWalSeq = embeddedConnection.getInternalDB()
 				.getDb()
@@ -426,7 +426,7 @@ public class CdcGrpcTest {
         long colId;
 
         colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null);
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub1", null, null, null, java.util.OptionalLong.empty());
 
         var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
         client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, Buf.wrap("val1".getBytes(StandardCharsets.UTF_8)), RequestType.none());
@@ -463,7 +463,7 @@ public class CdcGrpcTest {
                 true
         ));
 
-        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub-bucket", null, null);
+        client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("sub-bucket", null, null, null, java.util.OptionalLong.empty());
 
         var key = new Keys(new Buf[]{
             Buf.wrap(new byte[]{0, 0, 0, 1}), // fixed
@@ -485,7 +485,7 @@ public class CdcGrpcTest {
         int batchSize = 1000;
 
         var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("stress-col", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-        var startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("stress-sub", null, null);
+        var startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("stress-sub", null, null, null, java.util.OptionalLong.empty());
 
         // 1. Generate load
         for (int i = 0; i < totalEvents; i++) {
@@ -543,7 +543,7 @@ public class CdcGrpcTest {
 
         // Create CDC subscription with resolved values enabled
         String subId = "resolved-sub-grpc";
-        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), true);
+        long startSeq = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), true, java.util.OptionalLong.empty());
 
         // Put initial value, then merge a delta (using sample String append operator semantics)
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{0,0,0,1})});
