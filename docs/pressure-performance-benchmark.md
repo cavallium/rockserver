@@ -203,7 +203,9 @@ java -cp "${workload_classpath}" \
   it.cavallium.rockserver.core.impl.benchmark.MixedBackfillPressureBenchmark \
   --root=/mnt/bench/mixed-pressure-<candidate-sha> \
   --preload-keys=50000 --flush-every=5000 --measure-ms=10000 \
-  --pressured-batch-maximum-active=3
+  --pressured-batch-maximum-active=3 \
+  --expected-git-head=<full-clean-HEAD> \
+  --expected-production-sha256=<target/classes-content-sha256>
 ```
 
 The cap defaults to `1` for compatibility and is bounded by both the combined read/write worker
@@ -215,6 +217,10 @@ must drain before process telemetry begins, so proof work cannot inflate the rea
 or latency measurements. Consequently, a cap-N result proves N permits were actually exercised under
 pressure rather than merely written to configuration. V2 results use
 `mixed-backfill-pressure-v2.schema.json`; the V1 schema remains immutable for earlier artifacts.
+The CLI refuses to create its root unless the whole checkout is clean, its full HEAD matches the
+declared revision, loaded production and harness classes come from that worktree's `target` tree,
+and the production directory digest matches the declared SHA-256. The marker and result both record
+HEAD plus production and harness class digests, preventing path names from standing in for provenance.
 Injected pressure proves scheduler
 transitions; production observation is still required to prove RocksDB's native pressure signals,
 storage latency, NUMA behavior, and the deployed Yotsuba backfill SLO.

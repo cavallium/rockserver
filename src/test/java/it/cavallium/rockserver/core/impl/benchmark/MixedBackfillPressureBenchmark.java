@@ -16,6 +16,7 @@ import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -64,11 +65,19 @@ public final class MixedBackfillPressureBenchmark {
 	}
 
 	public static Result run(Options options) throws Exception {
+		return run(options, Provenance.captureStrict(options));
+	}
+
+	static Result runForTesting(Options options) throws Exception {
+		return run(options, Provenance.testing());
+	}
+
+	private static Result run(Options options, Provenance provenance) throws Exception {
 		options.validate();
 		Path root = options.root().toAbsolutePath().normalize();
 		if (Files.exists(root)) throw new IllegalArgumentException("Benchmark root already exists: " + root);
 		Files.createDirectories(root);
-		Files.writeString(root.resolve(MARKER), RESULT_SCHEMA + '\n', StandardOpenOption.CREATE_NEW);
+		Files.writeString(root.resolve(MARKER), provenance.marker(), StandardOpenOption.CREATE_NEW);
 		Path config = root.resolve("rockserver.conf");
 		Files.writeString(config, configText(options), StandardOpenOption.CREATE_NEW);
 		Path database = root.resolve("db");
@@ -106,7 +115,7 @@ public final class MixedBackfillPressureBenchmark {
 					new HashSet<>(), null, null);
 			if (skippedRows != 0L) throw new IllegalStateException("reopen did not skip completed SSTs: " + skippedRows);
 			batch.cdcCreate(CDC, null, List.of(reopenedColumn), false);
-			result = measure(reopened, reopenedColumn, options, keySpace,
+			result = measure(reopened, reopenedColumn, options, provenance, keySpace,
 					firstRows, resumedRows, checkpoints.size());
 			awaitDrain(reopened);
 		}
@@ -118,6 +127,7 @@ public final class MixedBackfillPressureBenchmark {
 	private static Result measure(EmbeddedConnection connection,
 			long columnId,
 			Options options,
+			Provenance provenance,
 			Keys[] keySpace,
 			long firstRows,
 			long resumedRows,
@@ -269,7 +279,7 @@ public final class MixedBackfillPressureBenchmark {
 			awaitDrain(connection);
 			long completed = backfillBatches.sum() + ingestWrites.sum() + latencyReads.sum() + cdcEvents.sum();
 			long p99 = latencies.p99();
-			return new Result(options, firstRows, resumedRows, checkpoints, elapsed,
+			return new Result(options, provenance, firstRows, resumedRows, checkpoints, elapsed,
 					backfillRows.sum(), backfillBatches.sum(), ingestWrites.sum(), latencyReads.sum(), cdcEvents.sum(),
 					maintenance.sum(), pressureTransitions.sum(), pressureCapWitness.maximumActive(),
 					pressureCapWitness.capWitnesses(), maximumGap.get(), maximumCdcLag.get(), p99,
@@ -486,6 +496,40 @@ public final class MixedBackfillPressureBenchmark {
 		return new IllegalStateException(failure);
 	}
 
+	private static String gitOutput(Path directory, String... arguments) throws Exception {
+		var command = new ArrayList<String>(arguments.length + 3);
+		command.add("git");
+		command.add("-C");
+		command.add(directory.toString());
+		command.addAll(List.of(arguments));
+		var process = new ProcessBuilder(command).redirectErrorStream(true).start();
+		var output = new java.util.concurrent.FutureTask<byte[]>(() -> process.getInputStream().readAllBytes());
+		Thread.ofVirtual().name("mixed-pressure-provenance").start(output);
+		byte[] bytes;
+		try {
+			if (!process.waitFor(30, TimeUnit.SECONDS)) {
+				process.destroyForcibly();
+				output.cancel(true);
+				throw new IllegalStateException("Git provenance command timed out: " + String.join(" ", command));
+			}
+			bytes = output.get(30, TimeUnit.SECONDS);
+		} catch (InterruptedException interrupted) {
+			process.destroyForcibly();
+			output.cancel(true);
+			Thread.currentThread().interrupt();
+			throw interrupted;
+		} catch (java.util.concurrent.TimeoutException timeout) {
+			process.destroyForcibly();
+			output.cancel(true);
+			throw new IllegalStateException("Git provenance output drain timed out", timeout);
+		}
+		String text = new String(bytes, StandardCharsets.UTF_8);
+		if (process.exitValue() != 0) {
+			throw new IllegalArgumentException("Git provenance command failed: " + text.trim());
+		}
+		return text.trim();
+	}
+
 	private static void await(CountDownLatch latch) {
 		try { latch.await(); } catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new IllegalStateException(failure); }
 	}
@@ -514,6 +558,76 @@ public final class MixedBackfillPressureBenchmark {
 	@FunctionalInterface private interface ThrowingRunnable { void run() throws Exception; }
 	private record CancelledScan(long rows) {}
 	private record PressureCapWitness(int maximumActive, long capWitnesses) {}
+
+	record Provenance(String gitHead,
+			String productionClassesSha256,
+			String harnessClassesSha256,
+			boolean checkoutClean) {
+
+		Provenance {
+			if (gitHead == null || !gitHead.matches("[0-9a-f]{40}")
+					|| productionClassesSha256 == null
+					|| !productionClassesSha256.matches("[0-9a-f]{64}")
+					|| harnessClassesSha256 == null
+					|| !harnessClassesSha256.matches("[0-9a-f]{64}")) {
+				throw new IllegalArgumentException("Invalid mixed benchmark provenance");
+			}
+		}
+
+		private static Provenance captureStrict(Options options) throws Exception {
+			if (options.expectedGitHead().isBlank() || options.expectedProductionSha256().isBlank()) {
+				throw new IllegalArgumentException("Representative runs require --expected-git-head and "
+						+ "--expected-production-sha256");
+			}
+			Path invocation = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
+			Path worktree = Path.of(gitOutput(invocation, "rev-parse", "--show-toplevel"))
+					.toAbsolutePath().normalize();
+			String head = gitOutput(worktree, "rev-parse", "--verify", "HEAD");
+			if (!head.equals(options.expectedGitHead())) {
+				throw new IllegalArgumentException("Git HEAD mismatch: expected=" + options.expectedGitHead()
+						+ " actual=" + head);
+			}
+			AdversarialBatchLivenessPairedBenchmark.verifyProductionCheckout(worktree, head);
+			String dirty = gitOutput(worktree, "status", "--porcelain=v1", "--untracked-files=all");
+			if (!dirty.isEmpty()) {
+				throw new IllegalArgumentException("Benchmark checkout is dirty: " + worktree);
+			}
+			Path expectedProduction = worktree.resolve("target/classes").toRealPath();
+			Path expectedHarness = worktree.resolve("target/test-classes").toRealPath();
+			Path loadedProduction = codeSource(RWScheduler.class);
+			Path loadedHarness = codeSource(MixedBackfillPressureBenchmark.class);
+			if (!loadedProduction.equals(expectedProduction) || !loadedHarness.equals(expectedHarness)) {
+				throw new IllegalArgumentException("Loaded benchmark classes do not belong to the clean HEAD "
+						+ "worktree: production=" + loadedProduction + ", harness=" + loadedHarness);
+			}
+			String productionSha = contentSha(expectedProduction);
+			if (!productionSha.equals(options.expectedProductionSha256())) {
+				throw new IllegalArgumentException("Loaded production classes SHA-256 mismatch: expected="
+						+ options.expectedProductionSha256() + " actual=" + productionSha);
+			}
+			return new Provenance(head, productionSha, contentSha(expectedHarness), true);
+		}
+
+		static Provenance testing() {
+			return new Provenance("0".repeat(40), "1".repeat(64), "2".repeat(64), true);
+		}
+
+		private static Path codeSource(Class<?> type) throws Exception {
+			return Path.of(type.getProtectionDomain().getCodeSource().getLocation().toURI()).toRealPath();
+		}
+
+		private static String contentSha(Path path) throws java.io.IOException {
+			return GrpcRetainedReadBenchmark.classPathContentSha256ForTesting(path.toString());
+		}
+
+		private String marker() {
+			return "schema=" + RESULT_SCHEMA + '\n'
+					+ "git-head=" + gitHead + '\n'
+					+ "production-classes-sha256=" + productionClassesSha256 + '\n'
+					+ "harness-classes-sha256=" + harnessClassesSha256 + '\n'
+					+ "checkout-clean=" + checkoutClean + '\n';
+		}
+	}
 
 	private static final class LatencySamples {
 		private final long[] values;
@@ -545,7 +659,9 @@ public final class MixedBackfillPressureBenchmark {
 			Duration maximumLatencyP99,
 			int maximumLatencySamples,
 			double minimumBackfillRowsPerSecond,
-			double minimumIngestWritesPerSecond) {
+			double minimumIngestWritesPerSecond,
+			String expectedGitHead,
+			String expectedProductionSha256) {
 
 		void validate() {
 			if (root == null || preloadKeys < 1 || valueBytes < 1 || flushEvery < 1 || flushEvery > preloadKeys
@@ -561,7 +677,12 @@ public final class MixedBackfillPressureBenchmark {
 					|| maximumCdcLag < 1 || maximumLatencyP99 == null || maximumLatencyP99.isZero()
 					|| maximumLatencyP99.isNegative() || maximumLatencySamples < 1
 					|| !Double.isFinite(minimumBackfillRowsPerSecond) || minimumBackfillRowsPerSecond <= 0.0d
-					|| !Double.isFinite(minimumIngestWritesPerSecond) || minimumIngestWritesPerSecond <= 0.0d) {
+					|| !Double.isFinite(minimumIngestWritesPerSecond) || minimumIngestWritesPerSecond <= 0.0d
+					|| expectedGitHead == null || expectedProductionSha256 == null
+					|| expectedGitHead.isBlank() != expectedProductionSha256.isBlank()
+					|| !expectedGitHead.isBlank() && !expectedGitHead.matches("[0-9a-f]{40}")
+					|| !expectedProductionSha256.isBlank()
+					&& !expectedProductionSha256.matches("[0-9a-f]{64}")) {
 				throw new IllegalArgumentException("Invalid mixed backfill pressure options");
 			}
 		}
@@ -578,7 +699,7 @@ public final class MixedBackfillPressureBenchmark {
 					"pressured-batch-maximum-active",
 					"cdc-batch-size", "pressure-period-ms", "maximum-zero-gap-ms", "maximum-cdc-lag",
 					"maximum-latency-p99-ms", "maximum-latency-samples", "minimum-backfill-rows-per-second",
-					"minimum-ingest-writes-per-second");
+					"minimum-ingest-writes-per-second", "expected-git-head", "expected-production-sha256");
 			for (String key : values.keySet()) if (!allowed.contains(key)) throw new IllegalArgumentException("Unknown option --" + key);
 			String root = values.get("root"); if (root == null) throw new IllegalArgumentException("--root is required");
 			var options = new Options(Path.of(root), integer(values, "preload-keys", 50_000), integer(values, "value-bytes", 256),
@@ -591,7 +712,9 @@ public final class MixedBackfillPressureBenchmark {
 					longValue(values, "maximum-cdc-lag", 100_000), Duration.ofMillis(longValue(values, "maximum-latency-p99-ms", 5_000)),
 					integer(values, "maximum-latency-samples", 100_000),
 					doubleValue(values, "minimum-backfill-rows-per-second", 100.0d),
-					doubleValue(values, "minimum-ingest-writes-per-second", 100.0d));
+					doubleValue(values, "minimum-ingest-writes-per-second", 100.0d),
+					values.getOrDefault("expected-git-head", ""),
+					values.getOrDefault("expected-production-sha256", ""));
 			options.validate();
 			return options;
 		}
@@ -601,6 +724,7 @@ public final class MixedBackfillPressureBenchmark {
 	}
 
 	public record Result(Options options,
+			Provenance provenance,
 			long cancelledRows,
 			long resumedRows,
 			int durableCheckpoints,
@@ -628,7 +752,7 @@ public final class MixedBackfillPressureBenchmark {
 			long nativeLeaks,
 			Path output) {
 
-		Result withNativeLeaks(long leaks) { return new Result(options, cancelledRows, resumedRows, durableCheckpoints,
+		Result withNativeLeaks(long leaks) { return new Result(options, provenance, cancelledRows, resumedRows, durableCheckpoints,
 				elapsedNanos, backfillRows, backfillBatches, ingestWrites, latencyReads, cdcEvents,
 				maintenanceOperations, pressureTransitions, maximumPressuredBatchActive,
 				pressuredBatchCapWitnesses, maximumZeroProgressGapNanos, maximumCdcLag,
@@ -638,6 +762,7 @@ public final class MixedBackfillPressureBenchmark {
 		public void assertCorrect() {
 			double seconds = elapsedNanos / 1_000_000_000.0d;
 			if (cancelledRows + resumedRows != options.preloadKeys() || durableCheckpoints < 1
+					|| provenance == null || !provenance.checkoutClean()
 					|| elapsedNanos <= 0L || backfillRows <= 0L || backfillBatches <= 0L || ingestWrites <= 0L
 					|| backfillRows / seconds < options.minimumBackfillRowsPerSecond()
 					|| ingestWrites / seconds < options.minimumIngestWritesPerSecond()
@@ -663,6 +788,10 @@ public final class MixedBackfillPressureBenchmark {
 
 		String properties() {
 			return "schema=" + RESULT_SCHEMA + '\n' + "pressure-mode=injected\n"
+					+ "git-head=" + provenance.gitHead() + '\n'
+					+ "production-classes-sha256=" + provenance.productionClassesSha256() + '\n'
+					+ "harness-classes-sha256=" + provenance.harnessClassesSha256() + '\n'
+					+ "checkout-clean=" + provenance.checkoutClean() + '\n'
 					+ "pressured-batch-witness-mode=held-barrier-scheduler-snapshots\n"
 					+ "shutdown-clean=true\nfinal-drained=true\n"
 					+ "pressured-batch-maximum-active=" + options.pressuredBatchMaximumActive() + '\n'
@@ -691,6 +820,8 @@ public final class MixedBackfillPressureBenchmark {
 
 		public String toMarkdown() {
 			return "# Mixed backfill pressure benchmark\n\n- Backfill: `" + backfillRows + "` rows\n"
+					+ "- Git HEAD: `" + provenance.gitHead() + "`\n"
+					+ "- Production classes SHA-256: `" + provenance.productionClassesSha256() + "`\n"
 					+ "- Pressured BATCH cap / observed peak / witnesses: `"
 					+ options.pressuredBatchMaximumActive() + " / " + maximumPressuredBatchActive + " / "
 					+ pressuredBatchCapWitnesses + "`\n"

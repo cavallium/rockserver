@@ -28,7 +28,7 @@ class MixedBackfillPressureBenchmarkTest {
 		Path root = temporary.resolve("mixed");
 		var options = options(root, 2);
 
-		var result = MixedBackfillPressureBenchmark.run(options);
+		var result = MixedBackfillPressureBenchmark.runForTesting(options);
 
 		assertDoesNotThrow(result::assertCorrect);
 		assertEquals(512L, result.cancelledRows() + result.resumedRows());
@@ -42,7 +42,14 @@ class MixedBackfillPressureBenchmarkTest {
 		assertTrue(Files.isRegularFile(root.resolve("checkpoint.txt")));
 		assertTrue(Files.readString(root.resolve("rockserver.conf"))
 				.contains("database.parallelism.workload.pressured-batch-maximum-active = 2"));
-		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.run(options),
+		var marker = new Properties();
+		marker.load(new StringReader(Files.readString(root.resolve(".rockserver-mixed-pressure-benchmark"))));
+		assertEquals("rockserver-mixed-backfill-pressure-v2", marker.getProperty("schema"));
+		assertEquals("0".repeat(40), marker.getProperty("git-head"));
+		assertEquals("1".repeat(64), marker.getProperty("production-classes-sha256"));
+		assertEquals("2".repeat(64), marker.getProperty("harness-classes-sha256"));
+		assertEquals("true", marker.getProperty("checkout-clean"));
+		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.runForTesting(options),
 				"an existing root must never be reused or deleted");
 	}
 
@@ -72,7 +79,20 @@ class MixedBackfillPressureBenchmarkTest {
 		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.Options.parse(
 				new String[] {"--root=" + root, "--pressured-batch-maximum-active=2",
 						"--pressured-batch-maximum-active=3"}));
+		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.Options.parse(
+				new String[] {"--root=" + root, "--expected-git-head=" + "a".repeat(40)}));
+		assertThrows(IllegalArgumentException.class, () -> MixedBackfillPressureBenchmark.Options.parse(
+				new String[] {"--root=" + root, "--expected-git-head=short",
+						"--expected-production-sha256=" + "b".repeat(64)}));
 		assertTrue(Files.notExists(root));
+	}
+
+	@Test
+	void representativeEntryPointRejectsMissingProvenanceBeforeCreatingRoot() {
+		Path root = temporary.resolve("unbound");
+		assertThrows(IllegalArgumentException.class,
+				() -> MixedBackfillPressureBenchmark.run(options(root, 2)));
+		assertTrue(Files.notExists(root), "an unbound run must not leave a benchmark artifact root");
 	}
 
 	@Test
@@ -109,6 +129,10 @@ class MixedBackfillPressureBenchmarkTest {
 		assertEquals("3", properties.getProperty("pressured-batch-cap-witnesses"));
 		assertEquals("held-barrier-scheduler-snapshots",
 				properties.getProperty("pressured-batch-witness-mode"));
+		assertEquals("0".repeat(40), properties.getProperty("git-head"));
+		assertEquals("1".repeat(64), properties.getProperty("production-classes-sha256"));
+		assertEquals("2".repeat(64), properties.getProperty("harness-classes-sha256"));
+		assertEquals("true", properties.getProperty("checkout-clean"));
 
 		String schema = Files.readString(Path.of("benchmarks", "schemas",
 				"mixed-backfill-pressure-v2.schema.json"));
@@ -131,7 +155,7 @@ class MixedBackfillPressureBenchmarkTest {
 		return new MixedBackfillPressureBenchmark.Options(root,
 				512, 64, 128, Duration.ofSeconds(1), 1, 1, 4, 4, 2, pressuredCap, 128,
 				Duration.ofMillis(50), Duration.ofSeconds(3), 20_000,
-				Duration.ofSeconds(5), 10_000, 1.0d, 1.0d);
+				Duration.ofSeconds(5), 10_000, 1.0d, 1.0d, "", "");
 	}
 
 	private static MixedBackfillPressureBenchmark.Result result(
@@ -139,6 +163,7 @@ class MixedBackfillPressureBenchmarkTest {
 			int maximumPressuredActive,
 			long capWitnesses) {
 		return new MixedBackfillPressureBenchmark.Result(options,
+				MixedBackfillPressureBenchmark.Provenance.testing(),
 				128L, 384L, 4, Duration.ofSeconds(1).toNanos(),
 				1_000L, 4L, 1_000L, 1_000L, 1_000L, 2L, 2L,
 				maximumPressuredActive, capWitnesses, 1L, 1L, 1L,

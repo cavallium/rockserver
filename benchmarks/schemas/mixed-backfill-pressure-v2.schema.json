@@ -4,7 +4,8 @@
   "title": "Rockserver mixed backfill pressure result v2",
   "type": "object",
   "required": [
-    "schema", "pressure-mode", "pressured-batch-witness-mode", "shutdown-clean", "final-drained",
+    "schema", "pressure-mode", "git-head", "production-classes-sha256", "harness-classes-sha256",
+    "checkout-clean", "pressured-batch-witness-mode", "shutdown-clean", "final-drained",
     "pressured-batch-maximum-active", "maximum-pressured-batch-active",
     "pressured-batch-cap-witnesses", "cancelled-rows", "resumed-rows", "durable-checkpoints",
     "elapsed-nanos", "backfill-rows", "backfill-rows-per-second", "backfill-batches",
@@ -18,12 +19,16 @@
   "properties": {
     "schema": { "const": "rockserver-mixed-backfill-pressure-v2" },
     "pressure-mode": { "const": "injected" },
+    "git-head": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "production-classes-sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "harness-classes-sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "checkout-clean": { "const": true },
     "pressured-batch-witness-mode": { "const": "held-barrier-scheduler-snapshots" },
     "shutdown-clean": { "const": true },
     "final-drained": { "const": true }
   },
   "patternProperties": {
-    "^(?!schema$|pressure-mode$|pressured-batch-witness-mode$|shutdown-clean$|final-drained$).+$": {
+    "^(?!schema$|pressure-mode$|git-head$|production-classes-sha256$|harness-classes-sha256$|checkout-clean$|pressured-batch-witness-mode$|shutdown-clean$|final-drained$).+$": {
       "type": "number", "minimum": 0
     }
   },
