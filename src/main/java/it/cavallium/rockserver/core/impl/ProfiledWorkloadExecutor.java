@@ -2335,11 +2335,18 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	@Override
 	public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
-		long deadline = System.nanoTime() + unit.toNanos(timeout);
+		Objects.requireNonNull(unit, "unit");
+		if (terminated) return true;
+		long timeoutNanos = unit.toNanos(timeout);
+		if (timeoutNanos <= 0L) return false;
+		long startedNanos = System.nanoTime();
 		for (var worker : List.copyOf(workers)) {
-			long remaining = deadline - System.nanoTime();
+			if (!worker.isAlive()) continue;
+			long elapsedNanos = System.nanoTime() - startedNanos;
+			if (elapsedNanos < 0L) return terminated;
+			long remaining = timeoutNanos - elapsedNanos;
 			if (remaining <= 0L) {
-				return false;
+				return terminated;
 			}
 			worker.join(Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remaining)));
 		}

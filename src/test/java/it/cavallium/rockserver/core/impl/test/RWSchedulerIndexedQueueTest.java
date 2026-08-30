@@ -1153,6 +1153,23 @@ class RWSchedulerIndexedQueueTest {
 	}
 
 	@Test
+	void terminatedPoolAcceptsZeroAndHugeAwaitTimeoutsWithoutDeadlineOverflow() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-await-boundaries");
+		var ran = new CountDownLatch(1);
+		scheduler.executor(WorkloadProfile.BATCH,
+				OperationFamily.RANGE_PAGE,
+				RequestContext.NO_DEADLINE).execute(ran::countDown);
+		assertTrue(ran.await(5, SECONDS));
+		scheduler.disposeNow();
+
+		var poolField = RWScheduler.class.getDeclaredField("readPool");
+		poolField.setAccessible(true);
+		var pool = (java.util.concurrent.ExecutorService) poolField.get(scheduler);
+		assertTrue(pool.awaitTermination(0L, java.util.concurrent.TimeUnit.NANOSECONDS));
+		assertTrue(pool.awaitTermination(Long.MAX_VALUE, java.util.concurrent.TimeUnit.DAYS));
+	}
+
+	@Test
 	void forcedShutdownRejectsQueuedWorkOnceAndInterruptsRunningWork() throws Exception {
 		var scheduler = scheduler(1, 8, "indexed-forced-shutdown");
 		var started = new CountDownLatch(1);
