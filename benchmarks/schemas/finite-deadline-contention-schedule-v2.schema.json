@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-finite-deadline-contention-schedule-v2",
+  "title": "Parsed finite-deadline contention schedule v2",
+  "type": "object",
+  "required": ["schema", "configuration-sha256", "metric-set-sha256", "pairs", "fresh-processes", "adaptive-stopping", "runs"],
+  "properties": {
+    "schema": { "const": "rockserver-finite-deadline-contention-schedule-v2" },
+    "configuration-sha256": { "$ref": "#/$defs/sha256" },
+    "metric-set-sha256": { "$ref": "#/$defs/sha256" },
+    "pairs": { "type": "integer", "minimum": 10 },
+    "fresh-processes": { "type": "integer", "minimum": 20 },
+    "adaptive-stopping": { "const": false },
+    "runs": {
+      "type": "array", "minItems": 20,
+      "items": {
+        "type": "object", "required": ["ordinal", "round", "implementation", "artifact"],
+        "properties": {
+          "ordinal": { "type": "integer", "minimum": 1 },
+          "round": { "type": "integer", "minimum": 1 },
+          "implementation": { "enum": ["baseline", "candidate"] },
+          "artifact": { "type": "string", "pattern": "^raw-scheduler/round-[0-9]{3}-(baseline|candidate)\\.properties$" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": { "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+}

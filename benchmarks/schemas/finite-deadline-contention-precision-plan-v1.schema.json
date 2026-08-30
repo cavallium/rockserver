@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-finite-deadline-contention-precision-plan-v1",
+  "title": "Finite-deadline contention equality precision plan v1",
+  "type": "object",
+  "required": [
+    "schema", "generated_at", "source_decision", "source_configuration_sha256",
+    "source_results_sha256", "source_schedule_sha256", "source_metadata_sha256", "source_workers_sha256",
+    "planning_effect", "power_method", "global_pass_power_lower_bound",
+    "per_metric_target_power", "metrics_planned", "source_fixed_pairs",
+    "recommended_fixed_pairs", "recommended_fresh_processes", "adaptive_stopping",
+    "family_wise_alpha", "throughput_minimum_ratio", "cost_maximum_ratio", "multiplicity", "metrics"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-finite-deadline-contention-precision-plan-v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "source_decision": { "const": "inconclusive" },
+    "source_configuration_sha256": { "$ref": "#/$defs/sha256" },
+    "source_results_sha256": { "$ref": "#/$defs/sha256" },
+    "source_schedule_sha256": { "$ref": "#/$defs/sha256" },
+    "source_metadata_sha256": { "$ref": "#/$defs/sha256" },
+    "source_workers_sha256": { "$ref": "#/$defs/sha256" },
+    "planning_effect": { "const": "exact-equality" },
+    "power_method": { "const": "student-critical-normal-approximation-v1" },
+    "global_pass_power_lower_bound": { "const": 0.9 },
+    "per_metric_target_power": { "const": 0.9875 },
+    "metrics_planned": { "const": 8 },
+    "source_fixed_pairs": { "type": "integer", "minimum": 10 },
+    "recommended_fixed_pairs": { "type": "integer", "minimum": 10 },
+    "recommended_fresh_processes": { "type": "integer", "minimum": 20 },
+    "adaptive_stopping": { "const": false },
+    "family_wise_alpha": { "const": 0.05 },
+    "throughput_minimum_ratio": { "const": 0.99 },
+    "cost_maximum_ratio": { "const": 1.02 },
+    "multiplicity": { "const": "holm-bonferroni" },
+    "metrics": {
+      "type": "array", "minItems": 8, "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["name", "direction", "paired_log_sd", "margin_log", "target_power", "required_fixed_pairs"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "direction": { "enum": ["higher", "lower"] },
+          "paired_log_sd": { "type": "number", "minimum": 0 },
+          "margin_log": { "type": "number", "exclusiveMinimum": 0 },
+          "target_power": { "const": 0.9875 },
+          "required_fixed_pairs": { "type": "integer", "minimum": 10 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": { "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+}
