@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -15,10 +16,18 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.OperationFamily;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.impl.InternalConnection;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.server.GrpcServer;
+import io.grpc.Context;
+import io.grpc.Deadline;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.time.Instant;
 import java.util.Arrays;
@@ -26,11 +35,13 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.slf4j.Logger;
@@ -301,6 +312,62 @@ class GrpcServerDeadlineErrorTest {
 	}
 
 	@Test
+	void grpcTransportDeadlineKeepsItsExactMonotonicRemainder() throws Exception {
+		var clock = new MutableClock(System.currentTimeMillis(), 0L);
+		var scheduler = scheduler(clock, "grpc-monotonic-transport");
+		var backend = new SchedulerBackedConnection(scheduler);
+		var deadlineExecutor = Executors.newSingleThreadScheduledExecutor();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			Field grpcField = GrpcServer.class.getDeclaredField("grpc");
+			grpcField.setAccessible(true);
+			Object grpc = grpcField.get(server);
+			Method mapper = grpc.getClass().getDeclaredMethod("mapRequestContext",
+					it.cavallium.rockserver.core.common.api.proto.RequestContext.class);
+			mapper.setAccessible(true);
+			long transportBudgetNanos = TimeUnit.MILLISECONDS.toNanos(500L) + 123L;
+			var ticker = new Deadline.Ticker() {
+				@Override
+				public long nanoTime() {
+					return 0L;
+				}
+			};
+			var deadline = Deadline.after(transportBudgetNanos, TimeUnit.NANOSECONDS, ticker);
+			Object resolved = Context.current().withDeadline(deadline, deadlineExecutor).call(() -> {
+				try {
+					return mapper.invoke(grpc, wireBatchContext());
+				} catch (InvocationTargetException invocation) {
+					if (invocation.getCause() instanceof Exception cause) {
+						throw cause;
+					}
+					throw new AssertionError(invocation.getCause());
+				}
+			});
+
+			Method epochAccessor = resolved.getClass().getDeclaredMethod("deadlineEpochMillis");
+			epochAccessor.setAccessible(true);
+			Method monotonicAccessor = resolved.getClass().getDeclaredMethod("localMonotonicDeadlineNanos");
+			monotonicAccessor.setAccessible(true);
+			long deadlineEpochMillis = (long) epochAccessor.invoke(resolved);
+			long monotonicDeadlineNanos = (long) monotonicAccessor.invoke(resolved);
+			assertEquals(transportBudgetNanos, monotonicDeadlineNanos,
+					"the 123ns remainder must not be lost through an epoch-millisecond round trip");
+
+			clock.nanoTime.addAndGet(transportBudgetNanos);
+			var ran = new AtomicBoolean();
+			var failure = assertThrows(RocksDBException.class,
+					() -> scheduler.executor(WorkloadProfile.BATCH,
+							OperationFamily.METADATA,
+							deadlineEpochMillis,
+							monotonicDeadlineNanos).execute(() -> ran.set(true)));
+			assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, failure.getErrorUniqueId());
+			assertFalse(ran.get());
+		} finally {
+			deadlineExecutor.shutdownNow();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void clientReadTimeoutIsAlsoTheGrpcCallDeadline() throws Exception {
 		var backend = new CancellableNeverCompletingBackendConnection();
 		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
@@ -383,6 +450,84 @@ class GrpcServerDeadlineErrorTest {
 				.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
 				.setDeadlineEpochMillis(it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE)
 				.build();
+	}
+
+	private static RWScheduler scheduler(MutableClock clock, String name) {
+		try {
+			Method factory = RWScheduler.class.getDeclaredMethod("forTesting",
+					int.class,
+					int.class,
+					int.class,
+					int.class,
+					int.class,
+					String.class,
+					LongSupplier.class,
+					LongSupplier.class);
+			factory.setAccessible(true);
+			return (RWScheduler) factory.invoke(null,
+					1,
+					1,
+					1,
+					8,
+					8,
+					name,
+					(LongSupplier) clock::epochMillis,
+					(LongSupplier) clock::nanoTime);
+		} catch (ReflectiveOperationException reflectionFailure) {
+			throw new AssertionError(reflectionFailure);
+		}
+	}
+
+	private static final class MutableClock {
+
+		private final AtomicLong epochMillis;
+		private final AtomicLong nanoTime;
+
+		private MutableClock(long epochMillis, long nanoTime) {
+			this.epochMillis = new AtomicLong(epochMillis);
+			this.nanoTime = new AtomicLong(nanoTime);
+		}
+
+		private long epochMillis() {
+			return epochMillis.get();
+		}
+
+		private long nanoTime() {
+			return nanoTime.get();
+		}
+	}
+
+	private static final class SchedulerBackedConnection implements RocksDBConnection, InternalConnection {
+
+		private final RWScheduler scheduler;
+
+		private SchedulerBackedConnection(RWScheduler scheduler) {
+			this.scheduler = scheduler;
+		}
+
+		@Override
+		public RWScheduler getScheduler() {
+			return scheduler;
+		}
+
+		@Override
+		public URI getUrl() {
+			return URI.create("memory://grpc-monotonic-transport");
+		}
+
+		@Override
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return new RocksDBSyncAPI() {};
+		}
+
+		@Override
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return new RocksDBAsyncAPI() {};
+		}
+
+		@Override
+		public void close() {
+		}
 	}
 
 	private static final class DeadlineBackendConnection implements RocksDBConnection {

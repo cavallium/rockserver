@@ -15,15 +15,20 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
+import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.impl.InternalConnection;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.server.ThriftServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.nio.ByteBuffer;
@@ -39,6 +44,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -137,6 +143,32 @@ class ThriftAsyncDispatchRegressionTest {
 				assertEquals(it.cavallium.rockserver.core.common.RequestContext.NO_DEADLINE,
 						connection.lastApiContextDeadline.get());
 			}
+		}
+	}
+
+	@Test
+	void thriftBindsTheWireEpochOnceBeforeAHostClockJump() throws Exception {
+		var clock = new MutableClock(System.currentTimeMillis(), 0L);
+		var scheduler = scheduler(clock, "thrift-monotonic-boundary");
+		var connection = new BoundaryJumpConnection(scheduler, clock);
+		int port = freePort();
+		try (var server = new ThriftServer(connection, "127.0.0.1", port)) {
+			server.start();
+			try (var client = new ThriftConnection("thrift-monotonic-boundary", "127.0.0.1", port)) {
+				var context = new it.cavallium.rockserver.core.common.RequestContext(
+						WorkloadProfile.BATCH,
+						clock.epochMillis() + 10_000L);
+
+				var failure = assertThrows(RocksDBException.class,
+						() -> client.getSyncApi(context).getColumnId("deadline-probe"));
+
+				assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						failure.getErrorUniqueId());
+				assertFalse(connection.scheduledTaskRan.get(),
+						"a backward wall jump after Thrift decoding must not grant a fresh scheduler budget");
+			}
+		} finally {
+			scheduler.disposeNow();
 		}
 	}
 
@@ -377,6 +409,32 @@ class ThriftAsyncDispatchRegressionTest {
 		}
 	}
 
+	private static RWScheduler scheduler(MutableClock clock, String name) {
+		try {
+			Method factory = RWScheduler.class.getDeclaredMethod("forTesting",
+					int.class,
+					int.class,
+					int.class,
+					int.class,
+					int.class,
+					String.class,
+					LongSupplier.class,
+					LongSupplier.class);
+			factory.setAccessible(true);
+			return (RWScheduler) factory.invoke(null,
+					1,
+					1,
+					1,
+					8,
+					8,
+					name,
+					(LongSupplier) clock::epochMillis,
+					(LongSupplier) clock::nanoTime);
+		} catch (ReflectiveOperationException reflectionFailure) {
+			throw new AssertionError(reflectionFailure);
+		}
+	}
+
 	private static Keys key(int value) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Integer.BYTES).putInt(value).array()));
 	}
@@ -386,6 +444,70 @@ class ThriftAsyncDispatchRegressionTest {
 	}
 
 	private record InterruptedInvocation(Throwable failure, boolean interruptRestored) {
+	}
+
+	private static final class MutableClock {
+
+		private final AtomicLong epochMillis;
+		private final AtomicLong nanoTime;
+
+		private MutableClock(long epochMillis, long nanoTime) {
+			this.epochMillis = new AtomicLong(epochMillis);
+			this.nanoTime = new AtomicLong(nanoTime);
+		}
+
+		private long epochMillis() {
+			return epochMillis.get();
+		}
+
+		private long nanoTime() {
+			return nanoTime.get();
+		}
+	}
+
+	private static final class BoundaryJumpConnection implements RocksDBConnection, InternalConnection {
+
+		private final RWScheduler scheduler;
+		private final MutableClock clock;
+		private final AtomicBoolean scheduledTaskRan = new AtomicBoolean();
+
+		private BoundaryJumpConnection(RWScheduler scheduler, MutableClock clock) {
+			this.scheduler = scheduler;
+			this.clock = clock;
+		}
+
+		@Override
+		public RWScheduler getScheduler() {
+			return scheduler;
+		}
+
+		@Override
+		public URI getUrl() {
+			return URI.create("memory://thrift-monotonic-boundary");
+		}
+
+		@Override
+		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return new RocksDBSyncAPI() {
+				@Override
+				public long getColumnId(String name) {
+					clock.epochMillis.addAndGet(-30_000L);
+					clock.nanoTime.addAndGet(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(10_001L));
+					scheduler.executor(WorkloadProfile.BATCH, OperationFamily.METADATA, context)
+							.execute(() -> scheduledTaskRan.set(true));
+					return 1L;
+				}
+			};
+		}
+
+		@Override
+		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+			return new RocksDBAsyncAPI() {};
+		}
+
+		@Override
+		public void close() {
+		}
 	}
 
 	@FunctionalInterface
