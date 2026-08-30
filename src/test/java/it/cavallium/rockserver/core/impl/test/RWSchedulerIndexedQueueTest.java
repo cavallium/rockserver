@@ -350,6 +350,55 @@ class RWSchedulerIndexedQueueTest {
 	}
 
 	@Test
+	void latencyBurstAtIntegerMaximumCannotWrapAndStarveNewGuaranteedWork() throws Exception {
+		var scheduler = scheduler(1, 16, "indexed-latency-burst-overflow");
+		setReadPoolLatencyBurst(scheduler, Integer.MAX_VALUE);
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var completed = new CountDownLatch(2);
+		var order = Collections.synchronizedList(new ArrayList<WorkloadProfile>());
+		try {
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				order.add(WorkloadProfile.LATENCY);
+				completed.countDown();
+			});
+			scheduler.executor(WorkloadProfile.INGEST,
+					OperationFamily.POINT_LOOKUP,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				order.add(WorkloadProfile.INGEST);
+				completed.countDown();
+			});
+
+			releaseBlocker.countDown();
+			assertTrue(completed.await(5, SECONDS));
+			assertEquals(WorkloadProfile.INGEST, order.getFirst(),
+					"a saturated LATENCY burst must immediately yield to guaranteed work");
+		} finally {
+			releaseBlocker.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	private static void setReadPoolLatencyBurst(RWScheduler scheduler, int value) throws Exception {
+		var poolField = RWScheduler.class.getDeclaredField("readPool");
+		poolField.setAccessible(true);
+		Object pool = poolField.get(scheduler);
+		var burstField = pool.getClass().getDeclaredField("latencyBurst");
+		burstField.setAccessible(true);
+		burstField.setInt(pool, value);
+	}
+
+	@Test
 	void latencyDeadlineIndexesResizeAndSupportArbitraryRemoval() throws Exception {
 		int taskCount = 64;
 		var scheduler = scheduler(1, 128, "indexed-edf-resize-remove");

@@ -1130,7 +1130,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private void commitSelectionUnsafe(WorkloadTask task) {
 		int profileIndex = task.profileIndex();
 		if (profileIndex == WorkloadProfile.LATENCY.ordinal()) {
-			latencyBurst++;
+			latencyBurst = latencyBurst < 0 || latencyBurst >= maxLatencyBurst
+					? maxLatencyBurst
+					: latencyBurst + 1;
 			return;
 		}
 		if (!isGuaranteedProfile(profileIndex)) {
