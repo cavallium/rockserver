@@ -14,7 +14,7 @@ The harness keeps these producers active at the same time:
 | Profile | Benchmark operation | Primary family |
 |---|---|---|
 | `CONTROL` | Open then protected rollback | `CONTROL` |
-| `LATENCY` | Point lookup with a fresh five-second absolute deadline | `POINT_LOOKUP` |
+| `LATENCY` | Point lookup with a fresh five-second relative timeout policy | `POINT_LOOKUP` |
 | `ANALYTICAL` | Bounded fallback range scan | `RANGE_PAGE` |
 | `INGEST` | Live point mutation | `MUTATION` |
 | `CDC` | Poll and commit against concurrent writes | `WAL_PAGE` |

@@ -5,6 +5,19 @@ describes the service guarantee the caller needs. It does not describe the datab
 operation or its cost: Rockserver derives and records the `OperationFamily` independently,
 then rejects an invalid pair before admission.
 
+Workload contract v3 stores a relative `timeoutNanos`, not an epoch timestamp. A reusable
+API view is a timeout policy: unary calls bind it at invocation, cold streams bind it at
+subscription, and client queueing consumes the resulting immutable monotonic budget.
+Transports send only the remaining nanoseconds; each server hop binds that remainder once
+and takes the minimum with its transport deadline. Retained continuations reuse the same
+bound deadline. Missing or non-v3 wire contexts are rejected, and protobuf field 2 remains
+reserved so a v2 epoch deadline cannot be reinterpreted as a duration.
+
+The request context is the single execution deadline for range reduction, bounded pages,
+streaming ranges, and multi-existence reads. Those APIs no longer accept a second
+`timeoutMs`. Transaction and iterator lifetimes are separate positive `Duration` lease
+TTLs; they do not affect EDF ordering or extend an operation deadline.
+
 Only `LATENCY`, `ANALYTICAL`, `INGEST`, and `BATCH` are caller-selectable. `CONTROL`,
 `CDC`, and `PHYSICAL_MAINTENANCE` are assigned by Rockserver and are rejected when they
 arrive from a client.
@@ -58,7 +71,10 @@ contracts.
 
 Rollback, failed-update close, iterator close, CDC lifecycle/poll/acknowledgement, and
 physical flush/compaction remain server-owned. Their protected profile is derived from
-the concrete command and cannot be changed by the caller's view context.
+the concrete command and cannot be changed by the caller's view context. Their transport
+messages still carry the exact workload-contract version and reject v2 or missing values.
+CDC creation also requires an explicit atomic precondition: metadata must either be absent
+or have the supplied durable checkpoint. There is no unchecked create mode.
 
 ## Decision tree
 
