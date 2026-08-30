@@ -63,6 +63,12 @@ final class SchedulerDeadlineClock {
 		target.set(nowNanos, monotonicDeadlineNanos(deadlineEpochMillis, nowNanos));
 	}
 
+	/** Sample admission time without rebinding an immutable transport-side deadline. */
+	void sampleBoundDeadlineNanos(long monotonicDeadlineNanos, DeadlineSample target) {
+		Objects.requireNonNull(target, "target");
+		target.set(monotonicNanos(), monotonicDeadlineNanos);
+	}
+
 	private long monotonicDeadlineNanos(long deadlineEpochMillis, long nowNanos) {
 		long nowEpochMillis = epochMillis();
 		if (deadlineEpochMillis <= nowEpochMillis) {

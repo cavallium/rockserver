@@ -5,6 +5,7 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.core.common.OperationFamily;
@@ -27,6 +28,66 @@ import org.junit.jupiter.api.Timeout;
 
 @Timeout(20)
 class SchedulerWallClockDiscontinuityTest {
+
+	@Test
+	void finiteAdmissionPathsShareOneClockPairAndPreserveBoundSidecars() {
+		var clock = new MutableClock(1_000L, 0L);
+		var scheduler = scheduler(clock, "deadline-coherent-admission-sample");
+		try {
+			clock.resetReadCounts();
+			assertThrows(RocksDBException.class, () -> scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					clock.rawEpochMillis()).execute(new TerminalProbe()));
+			assertClockReads(clock, 1L, 1L);
+
+			clock.resetReadCounts();
+			assertThrows(RocksDBException.class, () -> scheduler.executor(WorkloadProfile.ANALYTICAL,
+					OperationFamily.FULL_SCAN_AGGREGATE,
+					clock.rawEpochMillis()).executeCooperatively(new CooperativeProbe(), 1L));
+			assertClockReads(clock, 1L, 1L);
+
+			clock.resetReadCounts();
+			var deferred = scheduler.scheduler(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					clock.rawEpochMillis());
+			assertThrows(RocksDBException.class,
+					() -> executeWhenCapacity(deferred, new TerminalProbe()));
+			assertClockReads(clock, 1L, 1L);
+
+			clock.resetReadCounts();
+			assertThrows(RocksDBException.class, () -> scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					2_000L,
+					0L).execute(new TerminalProbe()));
+			assertClockReads(clock, 0L, 1L);
+		} finally {
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void alignedQueuedAdmissionsTakeExactlyOneClockPairEach() throws Exception {
+		var clock = new MutableClock(1_000L, 0L);
+		var scheduler = scheduler(clock, "deadline-aligned-clock-calls");
+		var release = occupyReadWorker(scheduler);
+		try {
+			clock.resetReadCounts();
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					2_000L).execute(new TerminalProbe());
+			clock.advanceNanos(MILLISECONDS.toNanos(10L));
+			clock.jumpWallMillis(10L);
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					3_000L).execute(new TerminalProbe());
+
+			assertClockReads(clock, 2L, 2L);
+			assertFalse(readPoolBoolean(scheduler, "latencyExpiryIndexed"));
+		} finally {
+			release.countDown();
+			scheduler.disposeNow();
+		}
+	}
 
 	@Test
 	void backwardWallJumpCannotExtendAQueuedDeadline() throws Exception {
@@ -513,6 +574,11 @@ class SchedulerWallClockDiscontinuityTest {
 		return condition.getAsBoolean();
 	}
 
+	private static void assertClockReads(MutableClock clock, long expectedEpoch, long expectedNano) {
+		assertEquals(expectedEpoch, clock.epochMillisReads(), "unexpected wall-clock sample count");
+		assertEquals(expectedNano, clock.nanoTimeReads(), "unexpected monotonic-clock sample count");
+	}
+
 	private static void awaitUninterruptibly(CountDownLatch latch) {
 		boolean interrupted = false;
 		while (true) {
@@ -532,6 +598,8 @@ class SchedulerWallClockDiscontinuityTest {
 
 		private final AtomicLong epochMillis;
 		private final AtomicLong nanoTime;
+		private final AtomicLong epochMillisReads = new AtomicLong();
+		private final AtomicLong nanoTimeReads = new AtomicLong();
 
 		private MutableClock(long epochMillis, long nanoTime) {
 			this.epochMillis = new AtomicLong(epochMillis);
@@ -539,11 +607,30 @@ class SchedulerWallClockDiscontinuityTest {
 		}
 
 		private long epochMillis() {
+			epochMillisReads.incrementAndGet();
 			return epochMillis.get();
 		}
 
 		private long nanoTime() {
+			nanoTimeReads.incrementAndGet();
 			return nanoTime.get();
+		}
+
+		private long rawEpochMillis() {
+			return epochMillis.get();
+		}
+
+		private void resetReadCounts() {
+			epochMillisReads.set(0L);
+			nanoTimeReads.set(0L);
+		}
+
+		private long epochMillisReads() {
+			return epochMillisReads.get();
+		}
+
+		private long nanoTimeReads() {
+			return nanoTimeReads.get();
 		}
 
 		private void jumpWallMillis(long delta) {
