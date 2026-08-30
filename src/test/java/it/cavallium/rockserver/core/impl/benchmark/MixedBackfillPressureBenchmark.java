@@ -4,6 +4,7 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RawScanEvent;
 import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -45,10 +46,12 @@ import reactor.core.publisher.Flux;
  */
 public final class MixedBackfillPressureBenchmark {
 
-	static final String RESULT_SCHEMA = "rockserver-mixed-backfill-pressure-v1";
+	static final String RESULT_SCHEMA = "rockserver-mixed-backfill-pressure-v2";
 	private static final String COLUMN = "mixed-pressure";
 	private static final String CDC = "mixed-pressure-cdc";
 	private static final String MARKER = ".rockserver-mixed-pressure-benchmark";
+	private static final int MAX_PRESSURED_BATCH_ACTIVE = 64;
+	private static final RWScheduler.Pool[] POOLS = RWScheduler.Pool.values();
 
 	private MixedBackfillPressureBenchmark() {
 	}
@@ -119,6 +122,7 @@ public final class MixedBackfillPressureBenchmark {
 			long firstRows,
 			long resumedRows,
 			int checkpoints) throws Exception {
+		var pressureCapWitness = exercisePressuredBatchCap(connection, options);
 		BenchmarkProcessTelemetry.enableAllocationMeasurement();
 		var stop = new AtomicBoolean();
 		var ready = new CountDownLatch(options.writers() + options.latencyReaders() + 5);
@@ -208,12 +212,19 @@ public final class MixedBackfillPressureBenchmark {
 			futures.add(submit(executor, failures, () -> {
 				ready.countDown(); await(start);
 				boolean pressure = false;
+				long periodNanos = options.pressurePeriod().toNanos();
+				long nextTransition = System.nanoTime();
 				try {
 					while (!stop.get()) {
+						long remaining = nextTransition - System.nanoTime();
+						if (remaining > 0L) {
+							LockSupport.parkNanos(remaining);
+							continue;
+						}
 						pressure = !pressure;
 						connection.getScheduler().setStoragePressure(pressure);
 						pressureTransitions.increment();
-						LockSupport.parkNanos(options.pressurePeriod().toNanos());
+						nextTransition = System.nanoTime() + periodNanos;
 					}
 				} finally {
 					connection.getScheduler().setStoragePressure(false);
@@ -222,16 +233,21 @@ public final class MixedBackfillPressureBenchmark {
 			futures.add(submit(executor, failures, () -> {
 				ready.countDown(); await(start);
 				lastProgress.set(System.nanoTime());
+				long[][] poolTelemetry = new long[POOLS.length][RWScheduler.POOL_TELEMETRY_LENGTH];
 				while (!stop.get()) {
 					long now = System.nanoTime();
 					long progress = lastProgress.get();
 					maximumGap.accumulateAndGet(Math.max(0L, now - progress), Math::max);
 					maximumCdcLag.accumulateAndGet(Math.max(0L, ingestWrites.sum() - cdcEvents.sum()), Math::max);
-					for (var pool : RWScheduler.Pool.values()) {
-						var snapshot = connection.getScheduler().poolSnapshot(pool);
-						maximumQueued.accumulateAndGet(snapshot.queuedTasks(), Math::max);
-						maximumParked.accumulateAndGet(snapshot.parkedTasks(), Math::max);
-						maximumOutstanding.accumulateAndGet(snapshot.outstandingTasks(), Math::max);
+					for (var pool : POOLS) {
+						long[] telemetry = poolTelemetry[pool.ordinal()];
+						BenchmarkSchedulerTelemetry.copyPoolTelemetry(connection.getScheduler(), pool, telemetry);
+						maximumQueued.accumulateAndGet(
+								Math.toIntExact(telemetry[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS]), Math::max);
+						maximumParked.accumulateAndGet(
+								Math.toIntExact(telemetry[RWScheduler.POOL_TELEMETRY_PARKED_TASKS]), Math::max);
+						maximumOutstanding.accumulateAndGet(
+								Math.toIntExact(telemetry[RWScheduler.POOL_TELEMETRY_OUTSTANDING_TASKS]), Math::max);
 					}
 					peaks.sample();
 					LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
@@ -255,7 +271,8 @@ public final class MixedBackfillPressureBenchmark {
 			long p99 = latencies.p99();
 			return new Result(options, firstRows, resumedRows, checkpoints, elapsed,
 					backfillRows.sum(), backfillBatches.sum(), ingestWrites.sum(), latencyReads.sum(), cdcEvents.sum(),
-					maintenance.sum(), pressureTransitions.sum(), maximumGap.get(), maximumCdcLag.get(), p99,
+					maintenance.sum(), pressureTransitions.sum(), pressureCapWitness.maximumActive(),
+					pressureCapWitness.capWitnesses(), maximumGap.get(), maximumCdcLag.get(), p99,
 					completed == 0L ? 0.0d : process.cpuNanos() / (double) completed,
 					completed == 0L ? 0.0d : process.allocatedBytes() / (double) completed,
 					process.gcCollections(), process.gcMillis(), maximumQueued.get(), maximumParked.get(),
@@ -264,6 +281,73 @@ public final class MixedBackfillPressureBenchmark {
 			stop.set(true); start.countDown(); connection.getScheduler().setStoragePressure(false);
 			executor.shutdownNow(); executor.awaitTermination(30, TimeUnit.SECONDS);
 		}
+	}
+
+	/**
+	 * Prove that the configured cap is exercised on this database's scheduler without adding a
+	 * production counter or relying on sub-millisecond RocksDB quantum duration. All tasks enter
+	 * after pressure is enabled and wait on one barrier, so repeated pool snapshots describe the
+	 * same stable set of live pressured permits.
+	 */
+	private static PressureCapWitness exercisePressuredBatchCap(EmbeddedConnection connection,
+			Options options) throws Exception {
+		var scheduler = connection.getScheduler();
+		int cap = options.pressuredBatchMaximumActive();
+		int readTasks = Math.min(options.readWorkers(), cap / 2 + cap % 2);
+		int writeTasks = cap - readTasks;
+		if (writeTasks > options.writeWorkers()) {
+			readTasks = Math.addExact(readTasks, writeTasks - options.writeWorkers());
+			writeTasks = options.writeWorkers();
+		}
+		var started = new CountDownLatch(cap);
+		var release = new CountDownLatch(1);
+		long[][] telemetry = new long[POOLS.length][RWScheduler.POOL_TELEMETRY_LENGTH];
+		int maximumActive = 0;
+		long witnesses = 0L;
+		try {
+			scheduler.setStoragePressure(true);
+			var read = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+			var write = scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.MUTATION, RequestContext.NO_DEADLINE);
+			for (int task = 0; task < readTasks; task++) read.execute(() -> holdPermit(started, release));
+			for (int task = 0; task < writeTasks; task++) write.execute(() -> holdPermit(started, release));
+			if (!started.await(30, TimeUnit.SECONDS)) {
+				throw new IllegalStateException("pressured BATCH cap did not become concurrently active: cap="
+						+ cap + ", read=" + scheduler.poolSnapshot(RWScheduler.Pool.READ)
+						+ ", write=" + scheduler.poolSnapshot(RWScheduler.Pool.WRITE));
+			}
+			for (int sample = 0; sample < 3; sample++) {
+				int active = activeBatchTasks(scheduler, telemetry);
+				maximumActive = Math.max(maximumActive, active);
+				if (active == cap) witnesses++;
+			}
+			if (maximumActive != cap || witnesses != 3L) {
+				throw new IllegalStateException("pressured BATCH cap snapshot mismatch: configured=" + cap
+						+ ", maximum=" + maximumActive + ", witnesses=" + witnesses);
+			}
+			return new PressureCapWitness(maximumActive, witnesses);
+		} finally {
+			release.countDown();
+			scheduler.setStoragePressure(false);
+			awaitDrain(connection);
+		}
+	}
+
+	private static void holdPermit(CountDownLatch started, CountDownLatch release) {
+		started.countDown();
+		await(release);
+	}
+
+	private static int activeBatchTasks(RWScheduler scheduler, long[][] telemetry) {
+		int active = 0;
+		for (var pool : POOLS) {
+			if (pool != RWScheduler.Pool.READ && pool != RWScheduler.Pool.WRITE) continue;
+			long[] values = telemetry[pool.ordinal()];
+			BenchmarkSchedulerTelemetry.copyPoolTelemetry(scheduler, pool, values);
+			active = Math.addExact(active, BenchmarkSchedulerTelemetry.active(values, WorkloadProfile.BATCH));
+		}
+		return active;
 	}
 
 	private static Future<?> submit(ExecutorService executor, List<Throwable> failures, ThrowingRunnable action) {
@@ -429,6 +513,7 @@ public final class MixedBackfillPressureBenchmark {
 
 	@FunctionalInterface private interface ThrowingRunnable { void run() throws Exception; }
 	private record CancelledScan(long rows) {}
+	private record PressureCapWitness(int maximumActive, long capWitnesses) {}
 
 	private static final class LatencySamples {
 		private final long[] values;
@@ -468,6 +553,7 @@ public final class MixedBackfillPressureBenchmark {
 					|| writers < 1 || latencyReaders < 1 || readWorkers < 3 || writeWorkers < 3
 					|| rawScanConcurrency < 1 || rawScanConcurrency > 64
 					|| pressuredBatchMaximumActive < 1
+					|| pressuredBatchMaximumActive > MAX_PRESSURED_BATCH_ACTIVE
 					|| pressuredBatchMaximumActive > (long) readWorkers + writeWorkers
 					|| cdcBatchSize < 1
 					|| pressurePeriod == null || pressurePeriod.isZero() || pressurePeriod.isNegative()
@@ -526,6 +612,8 @@ public final class MixedBackfillPressureBenchmark {
 			long cdcEvents,
 			long maintenanceOperations,
 			long pressureTransitions,
+			int maximumPressuredBatchActive,
+			long pressuredBatchCapWitnesses,
 			long maximumZeroProgressGapNanos,
 			long maximumCdcLag,
 			long latencyP99Nanos,
@@ -542,7 +630,8 @@ public final class MixedBackfillPressureBenchmark {
 
 		Result withNativeLeaks(long leaks) { return new Result(options, cancelledRows, resumedRows, durableCheckpoints,
 				elapsedNanos, backfillRows, backfillBatches, ingestWrites, latencyReads, cdcEvents,
-				maintenanceOperations, pressureTransitions, maximumZeroProgressGapNanos, maximumCdcLag,
+				maintenanceOperations, pressureTransitions, maximumPressuredBatchActive,
+				pressuredBatchCapWitnesses, maximumZeroProgressGapNanos, maximumCdcLag,
 				latencyP99Nanos, cpuNanosPerUsefulOperation, allocatedBytesPerUsefulOperation,
 				gcCollections, gcMillis, maximumQueued, maximumParked, maximumOutstanding, peaks, leaks, output); }
 
@@ -553,6 +642,8 @@ public final class MixedBackfillPressureBenchmark {
 					|| backfillRows / seconds < options.minimumBackfillRowsPerSecond()
 					|| ingestWrites / seconds < options.minimumIngestWritesPerSecond()
 					|| latencyReads <= 0L || cdcEvents <= 0L || maintenanceOperations <= 0L || pressureTransitions < 2L
+					|| maximumPressuredBatchActive != options.pressuredBatchMaximumActive()
+					|| pressuredBatchCapWitnesses <= 0L
 					|| maximumZeroProgressGapNanos > options.maximumZeroProgressGap().toNanos()
 					|| maximumCdcLag > options.maximumCdcLag() || latencyP99Nanos <= 0L
 					|| latencyP99Nanos > options.maximumLatencyP99().toNanos()
@@ -572,7 +663,11 @@ public final class MixedBackfillPressureBenchmark {
 
 		String properties() {
 			return "schema=" + RESULT_SCHEMA + '\n' + "pressure-mode=injected\n"
+					+ "pressured-batch-witness-mode=held-barrier-scheduler-snapshots\n"
 					+ "shutdown-clean=true\nfinal-drained=true\n"
+					+ "pressured-batch-maximum-active=" + options.pressuredBatchMaximumActive() + '\n'
+					+ "maximum-pressured-batch-active=" + maximumPressuredBatchActive + '\n'
+					+ "pressured-batch-cap-witnesses=" + pressuredBatchCapWitnesses + '\n'
 					+ "cancelled-rows=" + cancelledRows + '\n'
 					+ "resumed-rows=" + resumedRows + '\n' + "durable-checkpoints=" + durableCheckpoints + '\n'
 					+ "elapsed-nanos=" + elapsedNanos + '\n' + "backfill-rows=" + backfillRows + '\n'
@@ -596,6 +691,9 @@ public final class MixedBackfillPressureBenchmark {
 
 		public String toMarkdown() {
 			return "# Mixed backfill pressure benchmark\n\n- Backfill: `" + backfillRows + "` rows\n"
+					+ "- Pressured BATCH cap / observed peak / witnesses: `"
+					+ options.pressuredBatchMaximumActive() + " / " + maximumPressuredBatchActive + " / "
+					+ pressuredBatchCapWitnesses + "`\n"
 					+ "- Ingest / CDC: `" + ingestWrites + "` / `" + cdcEvents + "`\n"
 					+ "- LATENCY p99: `" + String.format(Locale.ROOT, "%.3f", latencyP99Nanos / 1_000_000.0d) + " ms`\n"
 					+ "- Maximum zero-progress gap: `" + String.format(Locale.ROOT, "%.3f", maximumZeroProgressGapNanos / 1_000_000.0d) + " ms`\n"

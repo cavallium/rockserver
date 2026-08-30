@@ -202,9 +202,19 @@ and RocksDB/JNI result ownership needed by the production paths.
 java -cp "${workload_classpath}" \
   it.cavallium.rockserver.core.impl.benchmark.MixedBackfillPressureBenchmark \
   --root=/mnt/bench/mixed-pressure-<candidate-sha> \
-  --preload-keys=50000 --flush-every=5000 --measure-ms=10000
+  --preload-keys=50000 --flush-every=5000 --measure-ms=10000 \
+  --pressured-batch-maximum-active=3
 ```
 
-The result schemas are `mixed-backfill-pressure-v1.schema.json`. Injected pressure proves scheduler
+The cap defaults to `1` for compatibility and is bounded by both the combined read/write worker
+capacity and the benchmark's explicit 64-permit safety ceiling.
+Before the timed phase, the driver enables pressure and admits N BATCH tasks on the real database
+scheduler. Those tasks wait on one benchmark-only barrier while three allocation-free scheduler
+snapshots verify the stable concurrent peak is exactly N. The barrier is released and the scheduler
+must drain before process telemetry begins, so proof work cannot inflate the real RocksDB throughput
+or latency measurements. Consequently, a cap-N result proves N permits were actually exercised under
+pressure rather than merely written to configuration. V2 results use
+`mixed-backfill-pressure-v2.schema.json`; the V1 schema remains immutable for earlier artifacts.
+Injected pressure proves scheduler
 transitions; production observation is still required to prove RocksDB's native pressure signals,
 storage latency, NUMA behavior, and the deployed Yotsuba backfill SLO.

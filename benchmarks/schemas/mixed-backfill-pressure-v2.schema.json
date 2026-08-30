@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-mixed-backfill-pressure-v2",
+  "title": "Rockserver mixed backfill pressure result v2",
+  "type": "object",
+  "required": [
+    "schema", "pressure-mode", "pressured-batch-witness-mode", "shutdown-clean", "final-drained",
+    "pressured-batch-maximum-active", "maximum-pressured-batch-active",
+    "pressured-batch-cap-witnesses", "cancelled-rows", "resumed-rows", "durable-checkpoints",
+    "elapsed-nanos", "backfill-rows", "backfill-rows-per-second", "backfill-batches",
+    "ingest-writes", "ingest-writes-per-second", "latency-reads", "cdc-events",
+    "maintenance-operations", "pressure-transitions", "maximum-zero-progress-gap-nanos",
+    "maximum-cdc-lag", "latency-p99-nanos", "cpu-nanos-per-useful-operation",
+    "allocated-bytes-per-useful-operation", "gc-collections", "gc-millis", "maximum-queued",
+    "maximum-parked", "maximum-outstanding", "peak-live-heap-bytes", "peak-direct-memory-bytes",
+    "peak-rss-bytes", "peak-threads", "peak-native-handles", "native-leaks"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-mixed-backfill-pressure-v2" },
+    "pressure-mode": { "const": "injected" },
+    "pressured-batch-witness-mode": { "const": "held-barrier-scheduler-snapshots" },
+    "shutdown-clean": { "const": true },
+    "final-drained": { "const": true }
+  },
+  "patternProperties": {
+    "^(?!schema$|pressure-mode$|pressured-batch-witness-mode$|shutdown-clean$|final-drained$).+$": {
+      "type": "number", "minimum": 0
+    }
+  },
+  "additionalProperties": false
+}
