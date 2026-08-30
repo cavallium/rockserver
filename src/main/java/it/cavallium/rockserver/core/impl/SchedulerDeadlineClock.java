@@ -49,6 +49,21 @@ final class SchedulerDeadlineClock {
 	 */
 	long monotonicDeadlineNanos(long deadlineEpochMillis) {
 		long nowNanos = monotonicNanos();
+		return monotonicDeadlineNanos(deadlineEpochMillis, nowNanos);
+	}
+
+	/**
+	 * Sample admission time and bind one external epoch deadline to that exact sample. The caller
+	 * owns and reuses {@code target}; this method performs no per-binding allocation. The wall clock
+	 * remains sampled for every binding so discontinuities cannot be hidden.
+	 */
+	void bindDeadlineEpochMillis(long deadlineEpochMillis, DeadlineSample target) {
+		Objects.requireNonNull(target, "target");
+		long nowNanos = monotonicNanos();
+		target.set(nowNanos, monotonicDeadlineNanos(deadlineEpochMillis, nowNanos));
+	}
+
+	private long monotonicDeadlineNanos(long deadlineEpochMillis, long nowNanos) {
 		long nowEpochMillis = epochMillis();
 		if (deadlineEpochMillis <= nowEpochMillis) {
 			return nowNanos;
@@ -110,5 +125,25 @@ final class SchedulerDeadlineClock {
 	}
 
 	private record EpochAnchor(long epochMillis, long monotonicNanos) {
+	}
+
+	/** Owner-confined reusable result for one coherent deadline binding and admission sample. */
+	static final class DeadlineSample {
+
+		private long nowNanos;
+		private long deadlineNanos;
+
+		long nowNanos() {
+			return nowNanos;
+		}
+
+		long deadlineNanos() {
+			return deadlineNanos;
+		}
+
+		private void set(long nowNanos, long deadlineNanos) {
+			this.nowNanos = nowNanos;
+			this.deadlineNanos = deadlineNanos;
+		}
 	}
 }
