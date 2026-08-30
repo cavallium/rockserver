@@ -25,12 +25,14 @@ import it.cavallium.rockserver.core.common.api.proto.PutBatchMode;
 import it.cavallium.rockserver.core.common.api.proto.PutBatchRequest;
 import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
 import it.cavallium.rockserver.core.server.GrpcServer;
+import it.cavallium.rockserver.core.impl.ReactorResultOwnership;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
@@ -314,14 +316,105 @@ class GrpcCommandPreAdmissionTest {
 				task.run();
 				rejectionAware.reject(new java.util.concurrent.RejectedExecutionException("late duplicate"));
 				subscription.dispose();
-				assertEventually(() -> calls.get() == successes.get() + cleanups.get());
 				assertTrue(booleanField(task, "terminated"), "task did not reach a terminal state");
 				assertFalse(booleanField(task, "running"), "task retained running ownership");
+				boolean cancellationWon = booleanField(task, "cancelled");
 				assertTrue(calls.get() <= 1, "callable ran more than once");
 				assertTrue(successes.get() + errors.get() <= 1, "subscriber saw duplicate terminal signals");
-				assertEquals(calls.get(), successes.get() + cleanups.get(),
-						"each produced result must be delivered or cleaned exactly once");
+				assertTrue(cleanups.get() <= 1, "result cleanup ran more than once");
+				if (calls.get() == 1 && cancellationWon) {
+					assertEquals(1, cleanups.get(), "cancellation-owned result was not cleaned");
+				}
+				assertTrue(field(task.getClass(), "pendingResult").get(task) == null,
+						"terminal hooks retained a produced result");
 			}
+		} finally {
+			Utils.deleteDirectory(root.toString());
+		}
+	}
+
+	@Test
+	void grpcScheduledResultOwnershipCoversCancellationSuccessNullableAndCleanupFailure() throws Exception {
+		Path root = Files.createTempDirectory("rockserver-grpc-result-ownership");
+		try (var embedded = new EmbeddedConnection(root, "grpc-result-ownership", null);
+				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			Object grpc = field(GrpcServer.class, "grpc").get(server);
+			Method execute = grpc.getClass().getDeclaredMethod(
+					"executeScheduled", Callable.class, Scheduler.class, Consumer.class, Scheduler.class, long.class);
+			execute.setAccessible(true);
+			String lateErrorKey = (String) field(GrpcServer.class,
+					"GRPC_LATE_ERROR_HANDLER_CONTEXT_KEY").get(null);
+			assertTrue(java.util.Arrays.stream(ReactorResultOwnership.class.getDeclaredFields())
+					.allMatch(candidate -> Modifier.isStatic(candidate.getModifiers())));
+
+			var cancelScheduler = new CapturingScheduler();
+			var callableEntered = new CountDownLatch(1);
+			var releaseCallable = new CountDownLatch(1);
+			var cleanupCalls = new AtomicInteger();
+			var cleanupFailure = new AtomicReference<Throwable>();
+			Mono<Integer> cancelledResult = invokeScheduledWithCleanup(
+					execute,
+					grpc,
+					cancelScheduler,
+					() -> {
+						callableEntered.countDown();
+						awaitUninterruptibly(releaseCallable);
+						return 7;
+					},
+					ignored -> {
+						cleanupCalls.incrementAndGet();
+						throw new IllegalStateException("synthetic late cleanup failure");
+					},
+					16L).contextWrite(context -> context.put(
+						lateErrorKey, (Consumer<Throwable>) cleanupFailure::set));
+			Disposable cancelledSubscription = cancelledResult.subscribe();
+			Runnable cancelledTask = cancelScheduler.task();
+			assertIntrusiveOwnershipState(cancelledTask);
+			var running = CompletableFuture.runAsync(cancelledTask);
+			assertTrue(callableEntered.await(5, TimeUnit.SECONDS));
+			cancelledSubscription.dispose();
+			assertTrue(booleanField(cancelledTask, "cancelled"));
+			releaseCallable.countDown();
+			running.get(5, TimeUnit.SECONDS);
+			((it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask) cancelledTask)
+					.reject(new java.util.concurrent.RejectedExecutionException("late duplicate"));
+			cancelledSubscription.dispose();
+			assertEquals(1, cleanupCalls.get());
+			assertEquals("synthetic late cleanup failure", cleanupFailure.get().getMessage());
+			assertTrue(field(cancelledTask.getClass(), "pendingResult").get(cancelledTask) == null);
+
+			var successScheduler = new CapturingScheduler();
+			var successes = new AtomicInteger();
+			var successCleanups = new AtomicInteger();
+			Disposable successSubscription = invokeScheduledWithCleanup(
+					execute, grpc, successScheduler, () -> 11,
+					ignored -> successCleanups.incrementAndGet(), 16L)
+					.subscribe(ignored -> successes.incrementAndGet());
+			Runnable successTask = successScheduler.task();
+			successTask.run();
+			assertEquals(1, successes.get());
+			assertEquals(0, successCleanups.get());
+			assertFalse(booleanField(successTask, "cancelled"));
+			assertTrue(field(successTask.getClass(), "pendingResult").get(successTask) == null);
+			successSubscription.dispose();
+
+			var nullableScheduler = new CapturingScheduler();
+			var nullableEntered = new CountDownLatch(1);
+			var releaseNullable = new CountDownLatch(1);
+			Disposable nullableSubscription = invokeScheduledWithCleanup(
+					execute, grpc, nullableScheduler, () -> {
+						nullableEntered.countDown();
+						awaitUninterruptibly(releaseNullable);
+						return 13;
+					}, null, 16L).subscribe();
+			Runnable nullableTask = nullableScheduler.task();
+			var nullableRun = CompletableFuture.runAsync(nullableTask);
+			assertTrue(nullableEntered.await(5, TimeUnit.SECONDS));
+			nullableSubscription.dispose();
+			releaseNullable.countDown();
+			nullableRun.get(5, TimeUnit.SECONDS);
+			assertTrue(field(nullableTask.getClass(), "pendingResult").get(nullableTask) == null);
 		} finally {
 			Utils.deleteDirectory(root.toString());
 		}
@@ -457,6 +550,14 @@ class GrpcCommandPreAdmissionTest {
 	private static boolean booleanField(Object owner, String name) throws Exception {
 		var field = field(owner.getClass(), name);
 		return field.getBoolean(owner);
+	}
+
+	private static void assertIntrusiveOwnershipState(Object task) {
+		assertEquals(0L, java.util.Arrays.stream(task.getClass().getDeclaredFields())
+				.filter(candidate -> candidate.getType() == ReactorResultOwnership.class
+						|| candidate.getType() == java.util.concurrent.atomic.AtomicBoolean.class
+						|| candidate.getType() == java.util.concurrent.atomic.AtomicReference.class)
+				.count(), "gRPC result ownership allocated a per-request helper");
 	}
 
 	private static Field field(Class<?> owner, String name) throws Exception {

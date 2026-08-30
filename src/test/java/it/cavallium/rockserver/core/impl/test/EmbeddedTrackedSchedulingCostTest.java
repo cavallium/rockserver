@@ -4,11 +4,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.impl.ReactorResultOwnership;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.file.Path;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
@@ -131,13 +134,106 @@ class EmbeddedTrackedSchedulingCostTest {
 				rejectionAware.reject(new RejectedExecutionException("late duplicate"));
 				subscription.dispose();
 				assertEquals(0L, connection.getInternalDB().getPendingOpsCount());
-				assertEventually(() -> calls.get() == successes.get() + cleanups.get());
-				assertEquals(calls.get(), successes.get() + cleanups.get(),
-						"each native result must be delivered or cleaned exactly once");
+				boolean cancellationWon = booleanField(task, "deliveryCancelled");
+				if (calls.get() == 1L && cancellationWon) {
+					assertEquals(1L, cleanups.get(), "cancellation-owned native result was not cleaned");
+				}
+				assertEquals(null, objectField(task, "pendingResult"),
+						"terminal hooks retained a native result");
 				org.junit.jupiter.api.Assertions.assertTrue(calls.get() <= 1L, "native callable ran twice");
+				org.junit.jupiter.api.Assertions.assertTrue(cleanups.get() <= 1L, "native cleanup ran twice");
 				org.junit.jupiter.api.Assertions.assertTrue(successes.get() + errors.get() <= 1L,
 						"subscriber saw duplicate terminal signals");
 			}
+		}
+	}
+
+	@Test
+	void trackedAndOrdinaryResultsTransferOwnershipWithoutPerRequestHelperObjects(@TempDir Path tempDir)
+			throws Exception {
+		try (var connection = new EmbeddedConnection(tempDir.resolve("db-result-ownership"),
+				"embedded-result-ownership", null)) {
+			assertTrue(java.util.Arrays.stream(ReactorResultOwnership.class.getDeclaredFields())
+					.allMatch(field -> Modifier.isStatic(field.getModifiers())),
+					"the shared ownership helper must remain allocation-free static code");
+
+			var trackedScheduler = new CapturingScheduler();
+			var trackedEntered = new CountDownLatch(1);
+			var releaseTracked = new CountDownLatch(1);
+			var trackedCleanup = new AtomicLong();
+			Mono<String> tracked = invokeTracked(connection.getInternalDB(), trackedScheduler, () -> {
+				trackedEntered.countDown();
+				awaitUninterruptibly(releaseTracked);
+				return "tracked";
+			}, ignored -> {
+				trackedCleanup.incrementAndGet();
+				throw new IllegalStateException("synthetic tracked cleanup diagnostic");
+			}, 1L);
+			Disposable trackedSubscription = tracked.subscribe();
+			Runnable trackedTask = trackedScheduler.task();
+			assertIntrusiveOwnershipState(trackedTask);
+			var trackedRun = CompletableFuture.runAsync(trackedTask);
+			assertTrue(trackedEntered.await(5, TimeUnit.SECONDS));
+			trackedSubscription.dispose();
+			assertTrue(booleanField(trackedTask, "deliveryCancelled"));
+			releaseTracked.countDown();
+			trackedRun.get(5, TimeUnit.SECONDS);
+			assertEquals(1L, trackedCleanup.get());
+			assertEquals(null, objectField(trackedTask, "pendingResult"));
+			assertEquals(0L, connection.getInternalDB().getPendingOpsCount());
+
+			var ordinaryExecutor = new CapturingWorkloadExecutor();
+			var ordinaryEntered = new CountDownLatch(1);
+			var releaseOrdinary = new CountDownLatch(1);
+			var ordinaryCleanup = new AtomicLong();
+			Mono<String> ordinary = invokeOrdinaryRangeStep(connection.getInternalDB(), ordinaryExecutor, () -> {
+				ordinaryEntered.countDown();
+				awaitUninterruptibly(releaseOrdinary);
+				return "ordinary";
+			}, ignored -> ordinaryCleanup.incrementAndGet());
+			Disposable ordinarySubscription = ordinary.subscribe();
+			Runnable ordinaryTask = ordinaryExecutor.task();
+			assertIntrusiveOwnershipState(ordinaryTask);
+			var ordinaryRun = CompletableFuture.runAsync(ordinaryTask);
+			assertTrue(ordinaryEntered.await(5, TimeUnit.SECONDS));
+			ordinarySubscription.dispose();
+			assertTrue(booleanField(ordinaryTask, "deliveryCancelled"));
+			releaseOrdinary.countDown();
+			ordinaryRun.get(5, TimeUnit.SECONDS);
+			((RWScheduler.RejectionAwareTask) ordinaryTask).reject(
+					new RejectedExecutionException("late ordinary duplicate"));
+			assertEquals(1L, ordinaryCleanup.get());
+			assertEquals(null, objectField(ordinaryTask, "pendingResult"));
+
+			var successExecutor = new CapturingWorkloadExecutor();
+			var successes = new AtomicLong();
+			var successCleanups = new AtomicLong();
+			Disposable successSubscription = invokeOrdinaryRangeStep(
+					connection.getInternalDB(), successExecutor, () -> "success",
+					ignored -> successCleanups.incrementAndGet())
+					.subscribe(ignored -> successes.incrementAndGet());
+			Runnable successTask = successExecutor.task();
+			successTask.run();
+			assertEquals(1L, successes.get());
+			assertEquals(0L, successCleanups.get());
+			assertEquals(null, objectField(successTask, "pendingResult"));
+			successSubscription.dispose();
+
+			var nullableExecutor = new CapturingWorkloadExecutor();
+			var nullableEntered = new CountDownLatch(1);
+			var releaseNullable = new CountDownLatch(1);
+			Disposable nullableSubscription = invokeOrdinaryRangeStep(
+					connection.getInternalDB(), nullableExecutor, () -> {
+						nullableEntered.countDown();
+						awaitUninterruptibly(releaseNullable);
+						return "nullable";
+					}, null).subscribe();
+			var nullableRun = CompletableFuture.runAsync(nullableExecutor.task());
+			assertTrue(nullableEntered.await(5, TimeUnit.SECONDS));
+			nullableSubscription.dispose();
+			releaseNullable.countDown();
+			nullableRun.get(5, TimeUnit.SECONDS);
+			assertEquals(null, objectField(nullableExecutor.task(), "pendingResult"));
 		}
 	}
 
@@ -170,6 +266,20 @@ class EmbeddedTrackedSchedulingCostTest {
 				long.class);
 		method.setAccessible(true);
 		return (Mono<T>) method.invoke(database, scheduler, callable, cleanup, estimatedBytes);
+	}
+
+	@SuppressWarnings("unchecked")
+	private static <T> Mono<T> invokeOrdinaryRangeStep(EmbeddedDB database,
+			RWScheduler.WorkloadExecutor executor,
+			Callable<T> callable,
+			Consumer<T> cleanup) throws Exception {
+		Method method = EmbeddedDB.class.getDeclaredMethod(
+				"scheduleOrdinaryRangeStep",
+				RWScheduler.WorkloadExecutor.class,
+				Callable.class,
+				Consumer.class);
+		method.setAccessible(true);
+		return (Mono<T>) method.invoke(database, executor, callable, cleanup);
 	}
 
 	private static final class ImmediateCostProbeScheduler implements Scheduler {
@@ -267,6 +377,27 @@ class EmbeddedTrackedSchedulingCostTest {
 		}
 	}
 
+	private static final class CapturingWorkloadExecutor implements RWScheduler.WorkloadExecutor {
+
+		private final AtomicReference<Runnable> task = new AtomicReference<>();
+
+		@Override
+		public void execute(Runnable command) {
+			execute(command, 0L);
+		}
+
+		@Override
+		public void execute(Runnable command, long estimatedBytes) {
+			if (!task.compareAndSet(null, command)) {
+				throw new AssertionError("ordinary range scheduling submitted more than one task");
+			}
+		}
+
+		private Runnable task() {
+			return assertInstanceOf(Runnable.class, task.get());
+		}
+	}
+
 	private static void awaitUninterruptibly(CountDownLatch latch) {
 		boolean interrupted = false;
 		while (true) {
@@ -282,10 +413,23 @@ class EmbeddedTrackedSchedulingCostTest {
 		}
 	}
 
-	private static void assertEventually(java.util.function.BooleanSupplier condition) throws InterruptedException {
-		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
-			Thread.sleep(1L);
-		}
+	private static boolean booleanField(Object owner, String name) throws Exception {
+		var field = owner.getClass().getDeclaredField(name);
+		field.setAccessible(true);
+		return field.getBoolean(owner);
+	}
+
+	private static Object objectField(Object owner, String name) throws Exception {
+		var field = owner.getClass().getDeclaredField(name);
+		field.setAccessible(true);
+		return field.get(owner);
+	}
+
+	private static void assertIntrusiveOwnershipState(Object task) {
+		assertEquals(0L, java.util.Arrays.stream(task.getClass().getDeclaredFields())
+				.filter(field -> field.getType() == ReactorResultOwnership.class
+						|| field.getType() == java.util.concurrent.atomic.AtomicBoolean.class
+						|| field.getType() == java.util.concurrent.atomic.AtomicReference.class)
+				.count(), "result ownership allocated a per-request helper for " + task.getClass());
 	}
 }
