@@ -76,7 +76,7 @@ class SchedulerHighContentionBenchmarkTest {
 		for (var pool : RWScheduler.Pool.values()) {
 			var poolResult = result.pools().get(pool);
 			assertTrue(poolResult.peakActive() > 0, "pool never dispatched: " + pool);
-			assertTrue(poolResult.peakQueued() <= poolResult.outstandingBound(),
+			assertTrue(poolResult.peakQueued() <= poolResult.queueBound(),
 					"queued lifetime bound exceeded: " + pool);
 			assertTrue(poolResult.peakOutstanding() <= poolResult.outstandingBound(),
 					"outstanding bound exceeded: " + pool);
@@ -87,6 +87,20 @@ class SchedulerHighContentionBenchmarkTest {
 		assertTrue(progress.batchWritePressured() + progress.batchWriteUnpressured() > 0L);
 		assertTrue(progress.foregroundReadPressured() > 0L);
 		assertTrue(progress.foregroundWritePressured() > 0L);
+	}
+
+	@Test
+	void queueBoundsAccountForIndependentCooperativeProfileRequeues() {
+		var config = config(1_000, 8, 8, 8, 65_536, 65_536, 256, 1L);
+		int cdcCapacity = 1_024;
+		int analyticalCapacity = 512;
+		int staticReadCapacity = 65_536 * 2 + cdcCapacity + analyticalCapacity + 65_536;
+		int staticWriteCapacity = 65_536 * 2 + cdcCapacity + 65_536;
+
+		assertEquals(staticReadCapacity + 8 * 3,
+				SchedulerHighContentionBenchmark.queueBound(config, RWScheduler.Pool.READ, 8));
+		assertEquals(staticWriteCapacity + 8 * 2,
+				SchedulerHighContentionBenchmark.queueBound(config, RWScheduler.Pool.WRITE, 8));
 	}
 
 	@Test

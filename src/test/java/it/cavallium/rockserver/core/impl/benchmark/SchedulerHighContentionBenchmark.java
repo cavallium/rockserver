@@ -1212,17 +1212,18 @@ public final class SchedulerHighContentionBenchmark {
 		}
 	}
 
-	private static int queueBound(Config config, RWScheduler.Pool pool, int workers) {
+	static int queueBound(Config config, RWScheduler.Pool pool, int workers) {
 		int cdc = Math.max(64, Math.min(config.foregroundQueueCapacity(), 1_024));
 		int analytical = Math.max(1, Math.min(config.batchQueueCapacity(), 512));
 		return switch (pool) {
-			// A running cooperative task may YIELD after a producer fills the queue
-			// slot it vacated. The scheduler therefore permits at most one worker-set
-			// of transient requeues above the sum of static profile capacities.
+			// A running cooperative task may YIELD after producers fill the queue slot it
+			// vacated. Those retained outstanding allowances can accumulate independently
+			// for every cooperative profile: INGEST, ANALYTICAL, and BATCH on READ; INGEST
+			// and BATCH on WRITE. Non-cooperative profiles cannot retain such an excess.
 			case READ -> config.foregroundQueueCapacity() * 2 + cdc + analytical
-					+ config.batchQueueCapacity() + workers;
+					+ config.batchQueueCapacity() + workers * 3;
 			case WRITE -> config.foregroundQueueCapacity() * 2 + cdc
-					+ config.batchQueueCapacity() + workers;
+					+ config.batchQueueCapacity() + workers * 2;
 			case CONTROL -> 256;
 			case PHYSICAL -> 16;
 		};
