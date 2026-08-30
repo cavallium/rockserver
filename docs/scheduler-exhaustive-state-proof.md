@@ -24,8 +24,7 @@ cover `off -> on -> off -> on`, including completion of a permit from a stale pr
 Four competition membership changes cover entry, removal into the hold interval, logical expiry and
 generation advance, re-entry, and stale completion. Queue, dispatchability, and preemption states are
 binary and therefore need no transition counter. One active permit is sufficient to prove the cap-one
-incident, finish/cancel conservation, and fair handoff; higher-cap concurrency remains covered by the
-existing pressure-controller tests.
+incident, finish/cancel conservation, and fair handoff.
 
 Two logical time observations form a sound quotient for these tests: `EARLY=0` is before every
 positive pacing deadline and `LATE=Long.MAX_VALUE` is after every finite deadline. Actual controller
@@ -56,6 +55,35 @@ Every state proves:
 - deferred and direct wakeup agreement;
 - competition and preemption publication agreement.
 
+## Concurrent cap complement
+
+`ConcurrentPressureControllerModel` independently specifies the controller with an unordered
+multiset of semantic permits. This is a symmetry quotient over indistinguishable permit identities,
+not over lifecycle ordering: every distinct permit class can still finish or cancel next. The real
+controller is cloned separately and compared after every action and every early/late eligibility
+observation. A mutable-field inventory makes cloning fail closed if production state changes.
+
+The complete finite graphs use pressure caps one, two, and three. Their competing READ cap equals the
+pressure cap and their competing WRITE cap is one, deliberately covering the asymmetric saturation
+that previously left capacity idle. The recovered clean regular-test result at `eddf3f6` is:
+
+| Pressure cap | Reachable states | Checked transitions | Maximum DFS depth |
+| ---: | ---: | ---: | ---: |
+| 1 | 44,032 | 754,560 | 316 |
+| 2 | 258,016 | 4,878,752 | 476 |
+| 3 | 1,009,344 | 20,483,712 | 689 |
+| **Total** | **1,311,392** | **26,117,024** | — |
+
+Every graph exercises pressure and competition generation changes, queued and independently
+dispatchable pools, early/late pacing, successful and rejected starts, finish, cancel, deadline
+expiry, and deferred/direct wakeups. Caps two and three additionally require witnesses for:
+
+- filling the pressure cap with concurrent permits from one pool;
+- mixed READ and WRITE permits;
+- continuing eligible work when the peer is already at its competition cap;
+- using every non-final free slot while preserving the final peer slot;
+- reserving exactly the final slot when both pools can consume it.
+
 ## One-pool arbitration complement
 
 `OnePoolSchedulerArbitrationExhaustiveTest` uses real worker threads held behind explicit BATCH
@@ -73,7 +101,8 @@ establish worker/queue ordering, and bounded waits only fail a missing transitio
 
 ## Evidence boundary
 
-This is a complete proof only for the explicitly bounded graph and enumerated arbitration spaces. It
-does not prove unbounded state, cap-greater-than-one interleavings, all queue lengths/costs, native I/O
-progress, deployed Yotsuba behavior, or performance. Those require the existing race, fuzz, mixed
-workload, fresh-process performance, and production-observation gates.
+This is a complete proof only for the explicitly bounded graphs and enumerated arbitration spaces. It
+does not prove unbounded state, pressure caps above three, every unequal competition-cap combination,
+pre-pressure work above the configured pressure cap, all queue lengths/costs, native I/O progress,
+deployed behavior, or performance. Those require the existing race, fuzz, mixed-workload, and
+fresh-process performance gates.
