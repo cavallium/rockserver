@@ -19,7 +19,7 @@ class PressurePerformanceContractV2Test {
 	private static final int[] DEFAULT_SIGNAL_COUNTS = {1, 64, 256, 1_024, 4_096};
 
 	@Test
-	void defaultPressureMetricSetHasTwoHundredThirtySevenMultiplicityControlledRatios() {
+	void defaultPressureMetricSetClassifiesOnlyExactSignalAllocationAsDeterministic() {
 		var scheduler = PressurePerformanceContractV2.schedulerSpecifications();
 		var signal = PressurePerformanceContractV2.signalSpecifications(DEFAULT_SIGNAL_COUNTS);
 		long stochastic = java.util.stream.Stream.concat(scheduler.stream(), signal.stream())
@@ -28,8 +28,8 @@ class PressurePerformanceContractV2Test {
 				.count();
 		long deterministic = scheduler.size() + signal.size() - stochastic;
 
-		assertEquals(237L, stochastic);
-		assertEquals(60L, deterministic);
+		assertEquals(242L, stochastic);
+		assertEquals(55L, deterministic);
 		assertEquals(297, scheduler.size() + signal.size());
 	}
 
@@ -101,11 +101,12 @@ class PressurePerformanceContractV2Test {
 	@Test
 	void structuralAndDeterministicResourceFailuresCannotBecomeStatisticalInconclusive() {
 		Map<String, Double> baseline = schedulerMetrics(100.0d);
-		var handles = new LinkedHashMap<>(baseline);
-		handles.put("scheduler.peak_native_handles", 1.0d);
+		Map<String, Double> signalBaseline = signalMetrics(new int[] {1}, 100.0d);
+		var allocation = new LinkedHashMap<>(signalBaseline);
+		allocation.put("case.no_pressure.cf_1.allocated_bytes_per_evaluation", 1.0d);
 
-		var resource = PressurePerformanceContractV2.evaluateScheduler(
-				repeated(baseline), repeated(handles), List.of());
+		var resource = PressurePerformanceContractV2.evaluateSignal(
+				new int[] {1}, repeated(signalBaseline), repeated(allocation), List.of());
 		var structural = PressurePerformanceContractV2.evaluateScheduler(
 				repeated(baseline), repeated(baseline), List.of("terminal conservation failed"));
 

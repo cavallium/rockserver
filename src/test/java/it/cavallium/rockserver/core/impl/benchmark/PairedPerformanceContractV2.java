@@ -40,22 +40,36 @@ public final class PairedPerformanceContractV2 {
 		INCONCLUSIVE
 	}
 
-	public record MetricSpec(String name, Direction direction, boolean primaryImprovement) {
+	public record MetricSpec(String name,
+	                         Direction direction,
+	                         boolean primaryImprovement,
+	                         double ratioOffset) {
 
 		public MetricSpec {
 			if (name == null || name.isBlank()) throw new IllegalArgumentException("Metric name is required");
 			if (direction == null) throw new IllegalArgumentException("Metric direction is required");
+			if (!Double.isFinite(ratioOffset) || ratioOffset < 0.0d) {
+				throw new IllegalArgumentException("Metric ratio offset must be finite and non-negative");
+			}
 			if (direction == Direction.DETERMINISTIC_NO_INCREASE && primaryImprovement) {
 				throw new IllegalArgumentException("Deterministic ceilings cannot be improvement primaries");
+			}
+			if (direction == Direction.DETERMINISTIC_NO_INCREASE && ratioOffset != 0.0d) {
+				throw new IllegalArgumentException("Deterministic ceilings do not use ratio offsets");
 			}
 		}
 
 		public static MetricSpec throughput(String name, boolean primaryImprovement) {
-			return new MetricSpec(name, Direction.HIGHER_IS_BETTER, primaryImprovement);
+			return new MetricSpec(name, Direction.HIGHER_IS_BETTER, primaryImprovement, 0.0d);
 		}
 
 		public static MetricSpec cost(String name, boolean primaryImprovement) {
-			return new MetricSpec(name, Direction.LOWER_IS_BETTER, primaryImprovement);
+			return new MetricSpec(name, Direction.LOWER_IS_BETTER, primaryImprovement, 0.0d);
+		}
+
+		/** Non-negative discrete/sampled cost using a fixed predeclared pseudocount of one. */
+		public static MetricSpec countCost(String name) {
+			return new MetricSpec(name, Direction.LOWER_IS_BETTER, false, 1.0d);
 		}
 
 		public static MetricSpec allocation(String name, boolean primaryImprovement) {
@@ -63,7 +77,7 @@ public final class PairedPerformanceContractV2 {
 		}
 
 		public static MetricSpec noIncrease(String name) {
-			return new MetricSpec(name, Direction.DETERMINISTIC_NO_INCREASE, false);
+			return new MetricSpec(name, Direction.DETERMINISTIC_NO_INCREASE, false, 0.0d);
 		}
 	}
 
@@ -194,7 +208,7 @@ public final class PairedPerformanceContractV2 {
 	private static MetricEvaluation evaluateStochastic(MetricSpec specification,
 			double[] baseline,
 			double[] candidate) {
-		var statistics = LogStatistics.of(baseline, candidate);
+		var statistics = LogStatistics.of(baseline, candidate, specification.ratioOffset());
 		boolean higher = specification.direction() == Direction.HIGHER_IS_BETTER;
 		double marginRatio = higher ? 1.0d / THROUGHPUT_MINIMUM_RATIO : COST_MAXIMUM_RATIO;
 		double harmMean = higher ? -statistics.meanLog() : statistics.meanLog();
@@ -371,7 +385,7 @@ public final class PairedPerformanceContractV2 {
 				int degreesOfFreedom,
 				PairedBenchmarkStatistics.RatioConfidenceInterval interval95) {
 
-		private static LogStatistics of(double[] baseline, double[] candidate) {
+		private static LogStatistics of(double[] baseline, double[] candidate, double ratioOffset) {
 			if (baseline.length != candidate.length || baseline.length < 2) {
 				throw new IllegalArgumentException("paired samples require at least two equal-length vectors");
 			}
@@ -380,11 +394,15 @@ public final class PairedPerformanceContractV2 {
 			double minimum = Double.POSITIVE_INFINITY;
 			double maximum = Double.NEGATIVE_INFINITY;
 			for (int pair = 0; pair < baseline.length; pair++) {
-				if (!Double.isFinite(baseline[pair]) || baseline[pair] <= 0.0d
-						|| !Double.isFinite(candidate[pair]) || candidate[pair] <= 0.0d) {
-					throw new IllegalArgumentException("stochastic samples must be finite and positive at index " + pair);
+				if (!Double.isFinite(baseline[pair]) || baseline[pair] < 0.0d
+						|| !Double.isFinite(candidate[pair]) || candidate[pair] < 0.0d
+						|| baseline[pair] + ratioOffset <= 0.0d
+						|| candidate[pair] + ratioOffset <= 0.0d) {
+					throw new IllegalArgumentException(
+							"stochastic samples plus their predeclared offset must be finite and positive at index "
+									+ pair);
 				}
-				logs[pair] = Math.log(candidate[pair] / baseline[pair]);
+				logs[pair] = Math.log((candidate[pair] + ratioOffset) / (baseline[pair] + ratioOffset));
 				sum += logs[pair];
 				minimum = Math.min(minimum, logs[pair]);
 				maximum = Math.max(maximum, logs[pair]);

@@ -32,15 +32,15 @@ public final class PressurePerformanceContractV2 {
 				"scheduler.cpu_nanos_per_attempt", true));
 		specifications.add(PairedPerformanceContractV2.MetricSpec.allocation(
 				"scheduler.allocated_bytes_per_attempt", true));
-		specifications.add(PairedPerformanceContractV2.MetricSpec.noIncrease("scheduler.gc_collections"));
-		specifications.add(PairedPerformanceContractV2.MetricSpec.noIncrease("scheduler.gc_millis"));
+		specifications.add(PairedPerformanceContractV2.MetricSpec.countCost("scheduler.gc_collections"));
+		specifications.add(PairedPerformanceContractV2.MetricSpec.countCost("scheduler.gc_millis"));
 		specifications.add(PairedPerformanceContractV2.MetricSpec.cost("scheduler.peak_live_heap_bytes", false));
-		specifications.add(PairedPerformanceContractV2.MetricSpec.noIncrease(
+		specifications.add(PairedPerformanceContractV2.MetricSpec.countCost(
 				"scheduler.peak_direct_memory_bytes"));
 		specifications.add(PairedPerformanceContractV2.MetricSpec.cost(
 				"scheduler.peak_resident_set_bytes", false));
-		specifications.add(PairedPerformanceContractV2.MetricSpec.noIncrease("scheduler.peak_threads"));
-		specifications.add(PairedPerformanceContractV2.MetricSpec.noIncrease("scheduler.peak_native_handles"));
+		specifications.add(PairedPerformanceContractV2.MetricSpec.cost("scheduler.peak_threads", false));
+		specifications.add(PairedPerformanceContractV2.MetricSpec.countCost("scheduler.peak_native_handles"));
 		for (var profile : WorkloadProfile.values()) {
 			addLatencyAndStarvationMetrics(specifications,
 					"profile." + profile.name().toLowerCase(Locale.ROOT) + '.');
