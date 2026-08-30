@@ -282,9 +282,6 @@ impl From<tonic::Status> for CdcError {
     }
 }
 
-/// Backward-compatible name for the error returned by checked CDC creation.
-pub type CdcCreateError = CdcError;
-
 #[cfg(test)]
 mod cdc_error_tests {
     use super::CdcError;
