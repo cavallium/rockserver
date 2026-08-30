@@ -408,6 +408,7 @@ public final class SchedulerHighContentionBenchmark {
 			report.append("operations=").append(attempts).append('\n');
 			report.append("seed=").append(config.seed()).append('\n');
 			report.append("submitters=").append(config.submitters()).append('\n');
+			report.append("latency_finite_deadlines=true\n");
 			report.append("elapsed_nanos=").append(elapsedNanos).append('\n');
 			report.append("attempts_per_second=")
 					.append(String.format(Locale.ROOT, "%.3f", attemptsPerSecond())).append('\n');
@@ -535,6 +536,7 @@ public final class SchedulerHighContentionBenchmark {
 		private final byte[] familyOrdinals;
 		private final PoolObservation[] poolObservations = new PoolObservation[POOLS.length];
 		private final AtomicLong monitorSamples = new AtomicLong();
+		private final long futureLatencyDeadlineEpochMillis;
 		private BenchmarkProcessTelemetry.PeakSampler peaks;
 		private volatile long startedNanos;
 		private volatile long elapsedNanos;
@@ -542,6 +544,7 @@ public final class SchedulerHighContentionBenchmark {
 		private RunState(Config config, RWScheduler scheduler) {
 			this.config = config;
 			this.scheduler = scheduler;
+			this.futureLatencyDeadlineEpochMillis = futureLatencyDeadline(config.timeout());
 			this.queueLatencyNanos = new long[config.operations()];
 			this.executionNanos = new long[config.operations()];
 			this.endToEndNanos = new long[config.operations()];
@@ -571,7 +574,11 @@ public final class SchedulerHighContentionBenchmark {
 			long submittedNanos = System.nanoTime();
 			long estimatedBytes = 1L << (10 + Math.floorMod((int) (hash >>> 8), 16));
 			int tokens = config.workTokens() * (1 + Math.floorMod((int) (hash >>> 29), 4));
-			long deadline = expired ? System.currentTimeMillis() - 1L : RequestContext.NO_DEADLINE;
+			long deadline = expired
+					? System.currentTimeMillis() - 1L
+					: lane.profile() == WorkloadProfile.LATENCY
+							? futureLatencyDeadlineEpochMillis
+							: RequestContext.NO_DEADLINE;
 			try {
 				if (fail) {
 					var task = new FailingTask(this, index, lane, submittedNanos, tokens);
@@ -611,6 +618,22 @@ public final class SchedulerHighContentionBenchmark {
 					expectedDeadlines.increment();
 				}
 			}
+		}
+
+		private static long futureLatencyDeadline(Duration timeout) {
+			long timeoutMillis;
+			try {
+				timeoutMillis = timeout.toMillis();
+			} catch (ArithmeticException overflow) {
+				timeoutMillis = Long.MAX_VALUE;
+			}
+			long horizonMillis = timeoutMillis >= Long.MAX_VALUE - TimeUnit.MINUTES.toMillis(1L)
+					? Long.MAX_VALUE
+					: timeoutMillis + TimeUnit.MINUTES.toMillis(1L);
+			long now = System.currentTimeMillis();
+			return horizonMillis >= Long.MAX_VALUE - 1L - now
+					? Long.MAX_VALUE - 1L
+					: now + horizonMillis;
 		}
 
 		private void monitor() {
