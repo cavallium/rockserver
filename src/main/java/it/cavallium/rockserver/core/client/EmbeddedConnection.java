@@ -1198,7 +1198,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					endKeysExclusive,
 					reverse,
 					timeoutMs,
-					context.deadlineEpochMillis(),
+					context,
 					resolveCommand(context, command)).block();
 		}
 		return db.reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
@@ -1233,7 +1233,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					endKeysExclusive,
 					reverse,
 					timeoutMs,
-					context.deadlineEpochMillis(),
+					context,
 					resolveCommand(context, command))
 					.contextWrite(reactorContext -> reactorContext.put(
 							REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY, lateFailureHandler))
@@ -1479,7 +1479,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				reverse,
 				requestType,
 				timeoutMs,
-				context.deadlineEpochMillis(),
+				context,
 				resolveCommand(context, command))).toStream();
 	}
 
@@ -1502,7 +1502,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				reverse,
 				requestType,
 				timeoutMs,
-				context.deadlineEpochMillis(),
+				context,
 				resolveCommand(context, command));
 	}
 

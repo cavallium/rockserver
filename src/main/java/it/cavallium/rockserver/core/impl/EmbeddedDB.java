@@ -451,6 +451,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private Path tempSSTsPath;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
+		this(path, name, embeddedConfigPath, null);
+	}
+
+	@VisibleForTesting
+	EmbeddedDB(@Nullable Path path,
+			String name,
+			@Nullable Path embeddedConfigPath,
+			@Nullable RWScheduler schedulerOverride) throws IOException {
 		this.path = path;
 		this.name = name;
 		this.logger = LoggerFactory.getLogger("db." + name);
@@ -669,11 +677,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics,
 				caches, cacheCapacities,
 				this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig, walMetricsConfig);
-		this.scheduler = new RWScheduler(
-				workloadSettings,
-				"db[" + name + "]",
-				metrics.getRegistry(),
-				name);
+		this.scheduler = schedulerOverride != null
+				? schedulerOverride
+				: new RWScheduler(
+						workloadSettings,
+						"db[" + name + "]",
+						metrics.getRegistry(),
+						name);
 		registerStoragePressureSignalMetrics(metrics.getRegistry());
 		// Pin capture performs filesystem work while RocksDB file deletion is
 		// disabled. Keep that serialized critical section on one owned thread so
@@ -1859,10 +1869,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return;
 		}
 		try {
-			long nowMicros = TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
 			for (var range : activeRangeResources) {
 				try {
-					range.expireIfDeadlinePassed(nowMicros);
+					range.expireIfDeadlinePassed();
 				} catch (Throwable error) {
 					// ScheduledExecutorService suppresses every later execution when one
 					// invocation escapes. Keep cleaning the other cursors and future runs.
@@ -6179,7 +6188,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	/** Compute the one immutable deadline shared by permit waiting, admission and native reads. */
 	private ReadDeadline retainedReadDeadline(long timeoutMs,
-			long contextDeadlineEpochMillis,
+			RequestContext context,
 			String timeoutLabel) {
 		if (timeoutMs < 0L) {
 			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -6193,13 +6202,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				? Long.MAX_VALUE
 				: nowMillis + maxRetainedSnapshotAgeMs;
 		long deadlineMillis = Math.min(operationDeadlineMillis, ageDeadlineMillis);
-		if (contextDeadlineEpochMillis != RequestContext.NO_DEADLINE) {
-			deadlineMillis = Math.min(deadlineMillis, contextDeadlineEpochMillis);
+		if (context.deadlineEpochMillis() != RequestContext.NO_DEADLINE) {
+			deadlineMillis = Math.min(deadlineMillis, context.deadlineEpochMillis());
 		}
 		long deadlineMicros = deadlineMillis >= Long.MAX_VALUE / 1_000L
 				? Long.MAX_VALUE
 				: TimeUnit.MILLISECONDS.toMicros(deadlineMillis);
-		return new ReadDeadline(deadlineMillis, deadlineMicros);
+		long localBudgetNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(timeoutMs),
+				TimeUnit.MILLISECONDS.toNanos(maxRetainedSnapshotAgeMs));
+		long localDeadlineNanos = scheduler.bindDeadlineAfterNanos(localBudgetNanos);
+		long contextDeadlineNanos = scheduler.resolveMonotonicDeadline(context);
+		long monotonicDeadlineNanos = Math.min(localDeadlineNanos, contextDeadlineNanos);
+		return new ReadDeadline(deadlineMillis, deadlineMicros, monotonicDeadlineNanos);
 	}
 
 	private final class IteratorState extends RocksDBObjects {
@@ -6851,6 +6865,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
 		long deadlineMicros = readDeadlineMicros(timeoutMs);
+		long monotonicDeadlineNanos = scheduler.bindDeadlineAfterNanos(
+				TimeUnit.MILLISECONDS.toNanos(timeoutMs));
 		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
 		actionLogger.logAction("GetRangePage",
 				start,
@@ -6868,6 +6884,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				endKeysExclusive,
 				reverse,
 				deadlineMicros,
+				monotonicDeadlineNanos,
 				fillCache,
 				false,
 				totalTime,
@@ -6926,7 +6943,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				reverse,
 				requestType,
 				timeoutMs,
-				RequestContext.NO_DEADLINE,
+				RequestContext.batch(),
 				WorkloadProfile.BATCH);
 	}
 
@@ -6937,14 +6954,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean reverse,
 			RequestGetRange<? super KV, T> requestType,
 			long timeoutMs,
-			long contextDeadlineEpochMillis,
+			RequestContext context,
 			@NotNull WorkloadProfile workloadProfile) throws RocksDBException {
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
-		var deadline = retainedReadDeadline(timeoutMs, contextDeadlineEpochMillis, "Range timeout");
+		var deadline = retainedReadDeadline(timeoutMs, context, "Range timeout");
 		var workloadExecutor = scheduler.executor(workloadProfile,
 				OperationFamily.RANGE_PAGE,
-				deadline.epochMillis());
+				deadline.epochMillis(),
+				deadline.monotonicNanos());
 		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
 		actionLogger.logAction("GetRange (begin)",
 				start,
@@ -6963,7 +6981,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							startKeysInclusive,
 							endKeysExclusive,
 							reverse,
-							deadline.micros(),
+							deadline,
 							fillCache,
 							false,
 							totalTime,
@@ -6989,14 +7007,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					cursor -> closeRangeCursor(cursor, totalTime, getRangeTimer));
 		}
 
-		return retainedQueryLimiter.acquire(deadline.micros())
+		return retainedQueryLimiter.acquire(deadline.monotonicNanos())
 				.flatMapMany(permit -> Flux.<RangeReadChunk>create(sink -> {
 					var state = new RetainedRangeReadTask(transactionId,
 							columnId,
 							startKeysInclusive,
 							endKeysExclusive,
 							reverse,
-							deadline.micros(),
+							deadline,
 							fillCache,
 							totalTime,
 							workloadExecutor,
@@ -7041,7 +7059,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				endKeysExclusive,
 				reverse,
 				timeoutMs,
-				RequestContext.NO_DEADLINE,
+				RequestContext.batch(),
 				WorkloadProfile.BATCH);
 	}
 
@@ -7051,14 +7069,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long timeoutMs,
-			long contextDeadlineEpochMillis,
+			RequestContext context,
 			@NotNull WorkloadProfile workloadProfile) {
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
-		var deadline = retainedReadDeadline(timeoutMs, contextDeadlineEpochMillis, "Exact count timeout");
+		var deadline = retainedReadDeadline(timeoutMs, context, "Exact count timeout");
 		var workloadExecutor = scheduler.executor(workloadProfile,
 				OperationFamily.FULL_SCAN_AGGREGATE,
-				deadline.epochMillis());
+				deadline.epochMillis(),
+				deadline.monotonicNanos());
 		actionLogger.logAction("ReduceRange (begin)",
 				start,
 				columnId,
@@ -7076,7 +7095,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							startKeysInclusive,
 							endKeysExclusive,
 							reverse,
-							deadline.micros(),
+							deadline,
 							false,
 							true,
 							totalTime,
@@ -7108,14 +7127,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					.reduce(0L, (total, chunk) -> total + chunk.count());
 		}
 
-		return retainedQueryLimiter.acquire(deadline.micros())
+		return retainedQueryLimiter.acquire(deadline.monotonicNanos())
 				.flatMap(permit -> Mono.create(sink -> {
 					var state = new RetainedRangeCountTask(transactionId,
 							columnId,
 							startKeysInclusive,
 							endKeysExclusive,
 							reverse,
-							deadline.micros(),
+							deadline,
 							totalTime,
 							workloadExecutor,
 							permit,
@@ -7129,8 +7148,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	/** Keep the immutable logical-read deadline active while decoded items await demand. */
 	private Mono<Void> retainedRangeDeadlineSignal(ReadDeadline deadline) {
 		return Mono.defer(() -> {
-			long delayMillis = Math.max(0L, deadline.epochMillis() - System.currentTimeMillis());
-			return Mono.delay(Duration.ofMillis(delayMillis))
+			long delayNanos = scheduler.remainingMonotonicDeadlineNanos(deadline.monotonicNanos());
+			return Mono.delay(Duration.ofNanos(delayNanos))
 					.then(Mono.error(retainedRangeDeadlineExceeded()));
 		});
 	}
@@ -7148,19 +7167,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
-			long deadlineMicros,
+			ReadDeadline deadline,
 			boolean fillCache,
 			boolean retainSnapshot,
 			LongAdder totalTime,
 			RWScheduler.WorkloadExecutor workloadExecutor) {
-		return retainedQueryLimiter.acquire(deadlineMicros)
+		return retainedQueryLimiter.acquire(deadline.monotonicNanos())
 				.flatMap(permit -> scheduleOrdinaryRangeStep(workloadExecutor,
 						() -> permit.open(() -> openRangeCursor(transactionId,
 								columnId,
 								startKeysInclusive,
 								endKeysExclusive,
 								reverse,
-								deadlineMicros,
+								deadline.micros(),
+								deadline.monotonicNanos(),
 								fillCache,
 								retainSnapshot,
 								totalTime,
@@ -7332,6 +7352,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long deadlineMicros,
+			long monotonicDeadlineNanos,
 			boolean fillCache,
 			boolean retainSnapshot,
 			LongAdder totalTime) {
@@ -7341,6 +7362,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				endKeysExclusive,
 				reverse,
 				deadlineMicros,
+				monotonicDeadlineNanos,
 				fillCache,
 				retainSnapshot,
 				totalTime,
@@ -7356,6 +7378,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long deadlineMicros,
+			long monotonicDeadlineNanos,
 			boolean fillCache,
 			boolean retainSnapshot,
 			LongAdder totalTime,
@@ -7367,6 +7390,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				endKeysExclusive,
 				reverse,
 				deadlineMicros,
+				monotonicDeadlineNanos,
 				fillCache,
 				retainSnapshot,
 				totalTime,
@@ -7382,6 +7406,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			long deadlineMicros,
+			long monotonicDeadlineNanos,
 			boolean fillCache,
 			boolean retainSnapshot,
 			LongAdder totalTime,
@@ -7411,6 +7436,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					calculatedEndKey,
 					reverse,
 					deadlineMicros,
+					monotonicDeadlineNanos,
 					fillCache,
 					retainSnapshot,
 					calculatedResumeKey,
@@ -7467,7 +7493,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final @Nullable Keys startKeysInclusive;
 		private final @Nullable Keys endKeysExclusive;
 		private final boolean reverse;
-		private final long deadlineMicros;
+		private final ReadDeadline deadline;
 		private final boolean fillCache;
 		private final boolean retainSnapshot;
 		protected final LongAdder totalTime;
@@ -7490,7 +7516,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				@Nullable Keys startKeysInclusive,
 				@Nullable Keys endKeysExclusive,
 				boolean reverse,
-				long deadlineMicros,
+				ReadDeadline deadline,
 				boolean fillCache,
 				boolean retainSnapshot,
 				LongAdder totalTime,
@@ -7502,7 +7528,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.startKeysInclusive = startKeysInclusive;
 			this.endKeysExclusive = endKeysExclusive;
 			this.reverse = reverse;
-			this.deadlineMicros = deadlineMicros;
+			this.deadline = deadline;
 			this.fillCache = fillCache;
 			this.retainSnapshot = retainSnapshot;
 			this.totalTime = totalTime;
@@ -7550,7 +7576,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						startKeysInclusive,
 						endKeysExclusive,
 						reverse,
-						deadlineMicros,
+						deadline.micros(),
+						deadline.monotonicNanos(),
 						fillCache,
 						retainSnapshot,
 						totalTime,
@@ -7576,8 +7603,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return;
 			}
 			deliveryCancelled = true;
-			if (deadlineMicros != Long.MAX_VALUE
-					&& TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis()) >= deadlineMicros) {
+			if (scheduler.isMonotonicDeadlineExpired(deadline.monotonicNanos())) {
 				var failure = retainedRangeDeadlineExceeded();
 				cancelAndFinish(failure, false, RWScheduler.TerminalOutcome.DEADLINE);
 			} else {
@@ -7603,8 +7629,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		@Override
-		public final void expireIfDeadlinePassed(long nowMicros) {
-			if (deadlineMicros == Long.MAX_VALUE || nowMicros < deadlineMicros || terminated) {
+		public final void expireIfDeadlinePassed() {
+			if (!scheduler.isMonotonicDeadlineExpired(deadline.monotonicNanos()) || terminated) {
 				return;
 			}
 			var failure = retainedRangeDeadlineExceeded();
@@ -7788,7 +7814,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				@Nullable Keys startKeysInclusive,
 				@Nullable Keys endKeysExclusive,
 				boolean reverse,
-				long deadlineMicros,
+				ReadDeadline deadline,
 				boolean fillCache,
 				LongAdder totalTime,
 				RWScheduler.WorkloadExecutor workloadExecutor,
@@ -7799,7 +7825,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					startKeysInclusive,
 					endKeysExclusive,
 					reverse,
-					deadlineMicros,
+					deadline,
 					fillCache,
 					false,
 					totalTime,
@@ -7911,7 +7937,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				@Nullable Keys startKeysInclusive,
 				@Nullable Keys endKeysExclusive,
 				boolean reverse,
-				long deadlineMicros,
+				ReadDeadline deadline,
 				LongAdder totalTime,
 				RWScheduler.WorkloadExecutor workloadExecutor,
 				RetainedQueryPermit retainedPermit,
@@ -7921,7 +7947,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					startKeysInclusive,
 					endKeysExclusive,
 					reverse,
-					deadlineMicros,
+					deadline,
 					false,
 					true,
 					totalTime,
@@ -8035,21 +8061,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.deadlineScheduler = deadlineScheduler;
 		}
 
-		private Mono<RetainedQueryPermit> acquire(long deadlineMicros) {
+		private Mono<RetainedQueryPermit> acquire(long monotonicDeadlineNanos) {
 			return Mono.create(sink -> {
 				final RetainedQueryWaiter waiter;
 				final Runnable action;
 				final boolean queued;
 				synchronized (this) {
-					waiter = new RetainedQueryWaiter(nextTicket++, deadlineMicros, sink);
+					waiter = new RetainedQueryWaiter(nextTicket++, monotonicDeadlineNanos, sink);
 					sink.onCancel(waiter::cancel);
 					sink.onDispose(waiter::deliveryDisposed);
-					long nowMicros = currentEpochMicros();
 					if (closed) {
 						waiter.state = TERMINAL;
 						action = () -> sink.error(new RejectedExecutionException("Database is shutting down"));
 						queued = false;
-					} else if (nowMicros >= deadlineMicros) {
+					} else if (scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
 						waiter.state = TERMINAL;
 						action = () -> sink.error(retainedRangeDeadlineExceeded());
 						queued = false;
@@ -8114,13 +8139,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (!activePermits.remove(permit) || closed) {
 					return;
 				}
-				long nowMicros = currentEpochMicros();
 				while (activePermits.size() < capacity && !waiters.isEmpty()) {
 					var waiter = waiters.removeFirst();
 					if (waiter.state != WAITING) {
 						continue;
 					}
-					if (nowMicros >= waiter.deadlineMicros) {
+					if (scheduler.isMonotonicDeadlineExpired(waiter.monotonicDeadlineNanos)) {
 						waiter.state = TERMINAL;
 						actions.add(() -> waiter.sink.error(retainedRangeDeadlineExceeded()));
 					} else {
@@ -8171,7 +8195,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final class RetainedQueryWaiter {
 
 			private final long ticket;
-			private final long deadlineMicros;
+			private final long monotonicDeadlineNanos;
 			private final reactor.core.publisher.MonoSink<RetainedQueryPermit> sink;
 			private int state = WAITING;
 			private @Nullable RetainedQueryPermit permit;
@@ -8180,18 +8204,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			private boolean deliveryCancelled;
 
 			private RetainedQueryWaiter(long ticket,
-					long deadlineMicros,
+					long monotonicDeadlineNanos,
 					reactor.core.publisher.MonoSink<RetainedQueryPermit> sink) {
 				this.ticket = ticket;
-				this.deadlineMicros = deadlineMicros;
+				this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 				this.sink = sink;
 			}
 
 			private void scheduleExpiration() {
-				long delayMicros = Math.max(0L, deadlineMicros - currentEpochMicros());
+				long delayNanos = scheduler.remainingMonotonicDeadlineNanos(monotonicDeadlineNanos);
 				final ScheduledFuture<?> scheduled;
 				try {
-					scheduled = deadlineScheduler.schedule(this::expire, delayMicros, TimeUnit.MICROSECONDS);
+					scheduled = deadlineScheduler.schedule(this::expire, delayNanos, TimeUnit.NANOSECONDS);
 				} catch (RejectedExecutionException shutdown) {
 					expire();
 					return;
@@ -8314,10 +8338,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private static long currentEpochMicros() {
-		return TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
-	}
-
 	private static RocksDBException retainedRangeDeadlineExceeded() {
 		return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded");
 	}
@@ -8326,7 +8346,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		void close();
 
-		void expireIfDeadlinePassed(long nowMicros);
+		void expireIfDeadlinePassed();
 	}
 
 	private record RangeCountChunk(long count, boolean exhausted) {
@@ -8335,7 +8355,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private record RangeReadChunk(List<KV> items, boolean exhausted) {
 	}
 
-	private record ReadDeadline(long epochMillis, long micros) {
+	private record ReadDeadline(long epochMillis, long micros, long monotonicNanos) {
 	}
 
 	private final class RangeCursor implements ActiveRangeResource {
@@ -8345,6 +8365,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final ColumnInstance col;
 		private final boolean reverse;
 		private final long deadlineMicros;
+		private final long monotonicDeadlineNanos;
 		private final boolean fillCache;
 		private final boolean deterministicBucketOrder;
 		private final AbstractSlice<?> startKeySlice;
@@ -8367,6 +8388,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				@Nullable Buf endKey,
 				boolean reverse,
 				long deadlineMicros,
+				long monotonicDeadlineNanos,
 				boolean fillCache,
 				boolean retainSnapshot,
 				@Nullable Buf resumeKey,
@@ -8378,6 +8400,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.col = columnUse.column();
 			this.reverse = reverse;
 			this.deadlineMicros = deadlineMicros;
+			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 			this.fillCache = fillCache;
 			this.deterministicBucketOrder = deterministicBucketOrder;
 			this.retainedPermit = retainedPermit;
@@ -8584,8 +8607,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private @Nullable KV nextPageItem() {
 			while (!exhausted) {
-				if (deadlineMicros != Long.MAX_VALUE
-						&& TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis()) >= deadlineMicros) {
+				if (scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
 					throw rangeDeadlineExceeded();
 				}
 				if (bucketIterator != null) {
@@ -8698,8 +8720,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					long count = 0L;
 					long scannedBytes = 0L;
 					while (count < maximumItems) {
-						if (deadlineMicros != Long.MAX_VALUE
-								&& TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis()) >= deadlineMicros) {
+						if (scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
 							throw rangeDeadlineExceeded();
 						}
 						if (count != 0L && System.nanoTime() - sliceStart >= maximumDurationNanos) {
@@ -8756,9 +8777,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		@Override
-		public void expireIfDeadlinePassed(long nowMicros) {
+		public void expireIfDeadlinePassed() {
 			synchronized (this) {
-				if (closed || deadlineMicros == Long.MAX_VALUE || nowMicros < deadlineMicros) {
+				if (closed || !scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
 					return;
 				}
 				expired = true;
