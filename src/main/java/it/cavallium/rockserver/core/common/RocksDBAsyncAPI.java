@@ -63,8 +63,8 @@ import reactor.util.retry.Retry;
 public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 
 	/** See: {@link OpenTransaction}. */
-	default CompletableFuture<Long> openTransactionAsync(long timeoutMs) throws RocksDBException {
-		return requestAsync(new OpenTransaction(timeoutMs));
+	default CompletableFuture<Long> openTransactionAsync(Duration transactionLeaseTtl) throws RocksDBException {
+		return requestAsync(new OpenTransaction(transactionLeaseTtl));
 	}
 
 	/** See: {@link CloseTransaction}. */
@@ -216,9 +216,8 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	/** See: {@link ExistsMulti}. */
 	default CompletableFuture<List<Boolean>> existsMultiAsync(long transactionId,
 			long columnId,
-			@NotNull List<@NotNull Keys> keys,
-			long timeoutMs) throws RocksDBException {
-		return requestAsync(new ExistsMulti(transactionId, columnId, keys, timeoutMs));
+			@NotNull List<@NotNull Keys> keys) throws RocksDBException {
+		return requestAsync(new ExistsMulti(transactionId, columnId, keys));
 	}
 
 	/** See: {@link OpenIterator}. */
@@ -227,13 +226,13 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 			@NotNull Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
-			long timeoutMs) throws RocksDBException {
+			Duration iteratorLeaseTtl) throws RocksDBException {
 		return requestAsync(new OpenIterator(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
-				timeoutMs
+				iteratorLeaseTtl
 		));
 	}
 
@@ -260,16 +259,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 													  long columnId,
 													  @Nullable Keys startKeysInclusive,
 													  @Nullable Keys endKeysExclusive,
-													  boolean reverse,
-													  RequestType.RequestReduceRange<? super KV, T> requestType,
-													  long timeoutMs) throws RocksDBException {
+												  boolean reverse,
+												  RequestType.RequestReduceRange<? super KV, T> requestType) throws RocksDBException {
 		return requestAsync(new ReduceRange<>(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
-				requestType,
-				timeoutMs
+				requestType
 		));
 	}
 
@@ -281,7 +278,6 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 			boolean reverse,
 			@Nullable Keys resumeAfter,
 			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
-			long timeoutMs,
 			@NotNull RangeBudget budget) throws RocksDBException {
 		return requestAsync(new GetRangePage<>(transactionId,
 				columnId,
@@ -290,7 +286,6 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 				reverse,
 				resumeAfter,
 				requestType,
-				timeoutMs,
 				budget));
 	}
 
@@ -299,16 +294,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 										   long columnId,
 										   @Nullable Keys startKeysInclusive,
 										   @Nullable Keys endKeysExclusive,
-										   boolean reverse,
-										   RequestType.RequestGetRange<? super KV, T> requestType,
-										   long timeoutMs) throws RocksDBException {
+									   boolean reverse,
+									   RequestType.RequestGetRange<? super KV, T> requestType) throws RocksDBException {
 		return requestAsync(new GetRange<>(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
-				requestType,
-				timeoutMs
+				requestType
 		));
 	}
 

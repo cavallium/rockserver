@@ -208,13 +208,13 @@ public class ThriftServer extends Server {
 	private static ResolvedRequestContext mapRequestContext(
 			it.cavallium.rockserver.core.common.api.RequestContext wireContext,
 			@Nullable RWScheduler scheduler) {
-		if (scheduler == null) {
-			var context = mapRequestContext(wireContext);
-			return new ResolvedRequestContext(context, 0L);
-		}
 		var context = parseRequestContext(wireContext);
+		if (scheduler == null) {
+			return new ResolvedRequestContext(context, 0L,
+					context.hasTimeout() ? System.nanoTime() : 0L);
+		}
 		return new ResolvedRequestContext(context,
-				scheduler.bindTimeoutNanos(context.timeoutNanos()));
+				scheduler.bindTimeoutNanos(context.timeoutNanos()), 0L);
 	}
 
 	private static RequestContext parseRequestContext(
@@ -246,6 +246,14 @@ public class ThriftServer extends Server {
 					"Workload profile " + profile + " is owned by Rockserver");
 		}
 		try {
+			if (wireContext.timeoutNanos == RequestContext.NO_TIMEOUT) {
+				return switch (profile) {
+					case ANALYTICAL -> RequestContext.analytical();
+					case INGEST -> RequestContext.ingest();
+					case BATCH -> RequestContext.batch();
+					default -> throw new IllegalArgumentException("Profile " + profile + " requires a timeout");
+				};
+			}
 			return new RequestContext(profile, wireContext.timeoutNanos);
 		} catch (IllegalArgumentException invalid) {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(
@@ -254,7 +262,9 @@ public class ThriftServer extends Server {
 		}
 	}
 
-	private record ResolvedRequestContext(RequestContext value, long localMonotonicDeadlineNanos) {
+	private record ResolvedRequestContext(RequestContext value,
+			long localMonotonicDeadlineNanos,
+			long ingressStartedNanos) {
 	}
 
 	private static UpdateBegin mapResult(UpdateContext<Buf> context) {
@@ -344,13 +354,13 @@ public class ThriftServer extends Server {
 
 		private RocksDBSyncAPI api(it.cavallium.rockserver.core.common.api.RequestContext context) {
 			var resolved = mapRequestContext(context, scheduler);
-			if (scheduler == null) {
-				return dispatchingSyncApi(client, resolved.value());
-			}
 			return new RocksDBSyncAPI() {
 				@Override
 				public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
 					var downstreamContext = remainingContext(resolved);
+					if (scheduler == null) {
+						return dispatchingSyncApi(client, downstreamContext).requestSync(request);
+					}
 					return scheduler.withDeadlineBinding(downstreamContext,
 							resolved.localMonotonicDeadlineNanos(),
 							() -> dispatchingSyncApi(client, downstreamContext).requestSync(request));
@@ -359,12 +369,19 @@ public class ThriftServer extends Server {
 		}
 
 		private RequestContext remainingContext(ResolvedRequestContext context) {
-			long deadlineNanos = context.localMonotonicDeadlineNanos();
-			if (deadlineNanos == Long.MAX_VALUE) {
+			if (!context.value().hasTimeout()) {
 				return context.value();
 			}
-			long remainingNanos = Objects.requireNonNull(scheduler)
-					.remainingMonotonicDeadlineNanos(deadlineNanos);
+			long remainingNanos;
+			if (scheduler != null) {
+				remainingNanos = scheduler.remainingMonotonicDeadlineNanos(
+						context.localMonotonicDeadlineNanos());
+			} else {
+				long elapsedNanos = System.nanoTime() - context.ingressStartedNanos();
+				remainingNanos = elapsedNanos < 0L || elapsedNanos >= context.value().timeoutNanos()
+						? 0L
+						: context.value().timeoutNanos() - elapsedNanos;
+			}
 			if (remainingNanos == 0L) {
 				throw it.cavallium.rockserver.core.common.RocksDBException.of(
 						it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
@@ -555,10 +572,10 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public long openTransaction(long timeoutMs,
+		public long openTransaction(long transactionLeaseTtlNanos,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
-				return api(context).openTransaction(timeoutMs);
+				return api(context).openTransaction(java.time.Duration.ofNanos(transactionLeaseTtlNanos));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -895,13 +912,11 @@ public class ThriftServer extends Server {
 		public List<Boolean> existsMulti(long transactionId,
 				long columnId,
 				List<List<ByteBuffer>> keysMulti,
-				long timeoutMs,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return api(context).existsMulti(transactionId,
 						columnId,
-						keysToRecords(keysMulti),
-						timeoutMs);
+						keysToRecords(keysMulti));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -913,10 +928,12 @@ public class ThriftServer extends Server {
 				List<ByteBuffer> startKeysInclusive,
 				List<ByteBuffer> endKeysExclusive,
 				boolean reverse,
-				long timeoutMs,
+				long iteratorLeaseTtlNanos,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
-				return api(context).openIterator(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, timeoutMs);
+				return api(context).openIterator(transactionId, columnId, keysToRecord(startKeysInclusive),
+						keysToRecord(endKeysExclusive), reverse,
+						java.time.Duration.ofNanos(iteratorLeaseTtlNanos));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -1072,10 +1089,9 @@ public class ThriftServer extends Server {
 				List<ByteBuffer> startKeysInclusive,
 				List<ByteBuffer> endKeysExclusive,
 				boolean reverse,
-				long timeoutMs,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
-				return mapFirstAndLast(api(context).reduceRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.firstAndLast(), timeoutMs));
+				return mapFirstAndLast(api(context).reduceRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.firstAndLast()));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -1087,10 +1103,9 @@ public class ThriftServer extends Server {
 				List<ByteBuffer> startKeysInclusive,
 				List<ByteBuffer> endKeysExclusive,
 				boolean reverse,
-				long timeoutMs,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
-				return api(context).reduceRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.entriesCount(), timeoutMs);
+				return api(context).reduceRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.entriesCount());
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
@@ -1102,10 +1117,9 @@ public class ThriftServer extends Server {
 				List<ByteBuffer> startKeysInclusive,
 				List<ByteBuffer> endKeysExclusive,
 				boolean reverse,
-				long timeoutMs,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
-				return api(context).getRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.allInRange(), timeoutMs)
+				return api(context).getRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.allInRange())
 						.map(ThriftServer::mapKV)
 						.collect(Collectors.toList());
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
@@ -1119,10 +1133,9 @@ public class ThriftServer extends Server {
 				List<ByteBuffer> startKeysInclusive,
 				List<ByteBuffer> endKeysExclusive,
 				boolean reverse,
-				long timeoutMs,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
-				return api(context).getRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.allInRangeNoCache(), timeoutMs)
+				return api(context).getRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.allInRangeNoCache())
 						.map(ThriftServer::mapKV)
 						.collect(Collectors.toList());
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
@@ -1138,7 +1151,6 @@ public class ThriftServer extends Server {
 				boolean reverse,
 				List<ByteBuffer> resumeAfter,
 				it.cavallium.rockserver.core.common.api.RangeRequestType requestType,
-				long timeoutMs,
 				it.cavallium.rockserver.core.common.api.RangeBudget budget,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
@@ -1175,7 +1187,6 @@ public class ThriftServer extends Server {
 						reverse,
 						keysToRecord(resumeAfter),
 						mappedRequestType,
-						timeoutMs,
 						mappedBudget);
 				var response = new it.cavallium.rockserver.core.common.api.RangePage(
 						page.items().stream().map(ThriftServer::mapKV).toList(), page.hasMore());

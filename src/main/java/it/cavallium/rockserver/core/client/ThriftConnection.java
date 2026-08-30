@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.LeaseTtl;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RangeBudget;
@@ -44,6 +45,7 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
@@ -57,10 +59,12 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -68,6 +72,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -146,6 +151,8 @@ public final class ThriftConnection extends BaseConnection {
 
 /** Package-private raw implementation behind {@link ThriftConnection}. */
 final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAPI {
+	private static final it.cavallium.rockserver.core.common.api.RequestContext[] NO_TIMEOUT_WIRE_CONTEXTS =
+			createNoTimeoutWireContexts();
 
 	private final URI uri;
 	private final String host;
@@ -159,6 +166,17 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	private final Scheduler executorScheduler;
 	private final RockserverCapabilities capabilities;
 	private final AtomicBoolean closed = new AtomicBoolean();
+
+	private static it.cavallium.rockserver.core.common.api.RequestContext[] createNoTimeoutWireContexts() {
+		var contexts = new it.cavallium.rockserver.core.common.api.RequestContext[WorkloadProfile.values().length];
+		for (var profile : List.of(WorkloadProfile.ANALYTICAL, WorkloadProfile.INGEST, WorkloadProfile.BATCH)) {
+			contexts[profile.ordinal()] = new it.cavallium.rockserver.core.common.api.RequestContext(
+					it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(profile.wireValue()),
+					RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION,
+					RequestContext.NO_TIMEOUT);
+		}
+		return contexts;
+	}
 
 	ThriftConnectionDelegate(String name, String host, int port) throws TException {
 		this(name, host, port, ThriftTransportLimits.configuredClientLimits());
@@ -275,9 +293,10 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	public long openTransaction(long timeoutMs) {
+	public long openTransaction(Duration transactionLeaseTtl) {
 		try {
-			return client.openTransaction(timeoutMs, currentWireRequestContext());
+			return client.openTransaction(LeaseTtl.toNanos(transactionLeaseTtl, "transactionLeaseTtl"),
+					currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -599,10 +618,9 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public List<Boolean> existsMulti(long transactionId,
 			long columnId,
-			List<Keys> keys,
-			long timeoutMs) {
+			List<Keys> keys) {
 		try {
-			return client.existsMulti(transactionId, columnId, mapKeysList(keys), timeoutMs,
+			return client.existsMulti(transactionId, columnId, mapKeysList(keys),
 					currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
@@ -610,10 +628,12 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	public long openIterator(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, long timeoutMs) {
+	public long openIterator(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive,
+			boolean reverse, Duration iteratorLeaseTtl) {
 		try {
 			return client.openIterator(transactionId, columnId, mapKeys(startKeysInclusive),
-					mapKeys(endKeysExclusive), reverse, timeoutMs, currentWireRequestContext());
+					mapKeys(endKeysExclusive), reverse,
+					LeaseTtl.toNanos(iteratorLeaseTtl, "iteratorLeaseTtl"), currentWireRequestContext());
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -658,17 +678,17 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	public <T> T reduceRange(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestReduceRange<? super KV, T> requestType, long timeoutMs) {
+	public <T> T reduceRange(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestReduceRange<? super KV, T> requestType) {
 		try {
 			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestEntriesCount) {
 				return (T) Long.valueOf(client.reduceRangeEntriesCount(transactionId, columnId,
-						mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, timeoutMs, context));
+						mapKeys(startKeysInclusive), mapKeys(endKeysExclusive), reverse, context));
 			} else if (requestType instanceof RequestGetFirstAndLast) {
 				it.cavallium.rockserver.core.common.api.FirstAndLast fl = client.reduceRangeFirstAndLast(
 						transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive),
-						reverse, timeoutMs, context);
+						reverse, context);
 				return (T) new it.cavallium.rockserver.core.common.FirstAndLast<>(
 						fl.isSetFirst() ? mapKV(fl.getFirst()) : null,
 						fl.isSetLast() ? mapKV(fl.getLast()) : null
@@ -681,19 +701,19 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	public <T> Stream<T> getRange(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestGetRange<? super KV, T> requestType, long timeoutMs) {
+	public <T> Stream<T> getRange(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestGetRange<? super KV, T> requestType) {
 		try {
 			var context = currentWireRequestContext();
 			if (requestType == null) throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			if (requestType instanceof RequestGetAllInRange) {
 				List<it.cavallium.rockserver.core.common.api.KV> list = client.getAllInRange(
 						transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive),
-						reverse, timeoutMs, context);
+						reverse, context);
 				return list.stream().map(this::mapKV).map(k -> (T) k);
 			} else if (requestType instanceof RequestGetAllInRangeNoCache) {
 				List<it.cavallium.rockserver.core.common.api.KV> list = client.getAllInRangeNoCache(
 						transactionId, columnId, mapKeys(startKeysInclusive), mapKeys(endKeysExclusive),
-						reverse, timeoutMs, context);
+						reverse, context);
 				return list.stream().map(this::mapKV).map(k -> (T) k);
 			}
 			throw new UnsupportedOperationException("Get range type " + requestType + " not implemented");
@@ -710,7 +730,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			boolean reverse,
 			Keys resumeAfter,
 			RequestGetRange<? super KV, T> requestType,
-			long timeoutMs,
 			RangeBudget budget) {
 		try {
 			if (requestType == null) {
@@ -729,7 +748,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 					reverse,
 					mapKeys(resumeAfter),
 					wireType,
-					timeoutMs,
 					wireBudget,
 					currentWireRequestContext());
 			@SuppressWarnings("unchecked")
@@ -858,8 +876,8 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	// --- Async API ---
 
 	@Override
-	public CompletableFuture<Long> openTransactionAsync(long timeoutMs) {
-		return supplyAsyncContextual(() -> openTransaction(timeoutMs), executor);
+	public CompletableFuture<Long> openTransactionAsync(Duration transactionLeaseTtl) {
+		return supplyAsyncContextual(() -> openTransaction(transactionLeaseTtl), executor);
 	}
 
 	@Override
@@ -968,14 +986,15 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public CompletableFuture<List<Boolean>> existsMultiAsync(long transactionId,
 			long columnId,
-			List<Keys> keys,
-			long timeoutMs) {
-		return supplyAsyncContextual(() -> existsMulti(transactionId, columnId, keys, timeoutMs), executor);
+			List<Keys> keys) {
+		return supplyAsyncContextual(() -> existsMulti(transactionId, columnId, keys), executor);
 	}
 
 	@Override
-	public CompletableFuture<Long> openIteratorAsync(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, long timeoutMs) {
-		return supplyAsyncContextual(() -> openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs), executor);
+	public CompletableFuture<Long> openIteratorAsync(long transactionId, long columnId, Keys startKeysInclusive,
+			Keys endKeysExclusive, boolean reverse, Duration iteratorLeaseTtl) {
+		return supplyAsyncContextual(() -> openIterator(transactionId, columnId, startKeysInclusive,
+				endKeysExclusive, reverse, iteratorLeaseTtl), executor);
 	}
 
 	@Override
@@ -994,12 +1013,12 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestReduceRange<? super KV, T> requestType, long timeoutMs) {
-		return supplyAsyncContextual(() -> reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs), executor);
+	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestReduceRange<? super KV, T> requestType) {
+		return supplyAsyncContextual(() -> reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType), executor);
 	}
 
 	@Override
-	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestGetRange<? super KV, T> requestType, long timeoutMs) {
+	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, Keys startKeysInclusive, Keys endKeysExclusive, boolean reverse, RequestGetRange<? super KV, T> requestType) {
 		// The legacy Thrift method materializes its response before returning, but
 		// downstream delivery can still obey demand and cancellation. Flux.fromStream
 		// also closes the stream on cancellation; the previous sink::next loop eagerly
@@ -1010,8 +1029,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
-				requestType,
-				timeoutMs))).subscribeOn(executorScheduler);
+				requestType))).subscribeOn(executorScheduler);
 	}
 
 	@Override
@@ -1022,7 +1040,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			boolean reverse,
 			Keys resumeAfter,
 			RequestGetRange<? super KV, T> requestType,
-			long timeoutMs,
 			RangeBudget budget) {
 		return supplyAsyncContextual(() -> getRangePage(transactionId,
 				columnId,
@@ -1031,7 +1048,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 				reverse,
 				resumeAfter,
 				requestType,
-				timeoutMs,
 				budget), executor);
 	}
 
@@ -1176,18 +1192,19 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			throw new TException("Thrift connection is closed");
 		}
 
-		ClientSlot slot;
-		try {
-			slot = availableClientSlots.take();
-		} catch (InterruptedException interrupted) {
-			Thread.currentThread().interrupt();
-			throw new TException("Interrupted while waiting for a Thrift client transport", interrupted);
-		}
+		int contextIndex = requestContextIndex(args);
+		boolean enforceCallerDeadline = contextIndex >= 0
+				&& ((it.cavallium.rockserver.core.common.api.RequestContext) args[contextIndex]).timeoutNanos
+				!= RequestContext.NO_TIMEOUT;
+		ClientSlot slot = acquireClientSlot(enforceCallerDeadline);
 		try {
 			if (closed.get()) {
 				throw new TException("Thrift connection is closed");
 			}
 			try {
+				if (contextIndex >= 0) {
+					args[contextIndex] = currentWireRequestContext(enforceCallerDeadline);
+				}
 				return method.invoke(slot.client(), args);
 			} catch (InvocationTargetException invocationFailure) {
 				Throwable failure = invocationFailure.getCause();
@@ -1203,6 +1220,40 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			// were already waiting acquire a slot, observe closed, and terminate.
 			availableClientSlots.offer(slot);
 		}
+	}
+
+	private ClientSlot acquireClientSlot(boolean enforceCallerDeadline) throws TException {
+		try {
+			if (!enforceCallerDeadline) {
+				return availableClientSlots.take();
+			}
+			long remainingNanos = currentBoundRequestContext().remainingNanos();
+			if (remainingNanos == 0L) {
+				throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						"Request deadline expired while waiting for a Thrift client transport");
+			}
+			var slot = availableClientSlots.poll(remainingNanos, TimeUnit.NANOSECONDS);
+			if (slot == null) {
+				throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						"Request deadline expired while waiting for a Thrift client transport");
+			}
+			return slot;
+		} catch (InterruptedException interrupted) {
+			Thread.currentThread().interrupt();
+			throw new TException("Interrupted while waiting for a Thrift client transport", interrupted);
+		}
+	}
+
+	private static int requestContextIndex(Object[] args) {
+		if (args == null) {
+			return -1;
+		}
+		for (int index = args.length - 1; index >= 0; index--) {
+			if (args[index] instanceof it.cavallium.rockserver.core.common.api.RequestContext) {
+				return index;
+			}
+		}
+		return -1;
 	}
 
 	private final class ClientSlot {
@@ -1287,7 +1338,12 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			validateRequestDeadline(boundContext);
 		}
 		var context = boundContext.value();
-		long remainingNanos = boundContext.remainingNanos();
+		long remainingNanos = enforceCallerDeadline
+				? boundContext.remainingNanos()
+				: RequestContext.NO_TIMEOUT;
+		if (remainingNanos == RequestContext.NO_TIMEOUT) {
+			return Objects.requireNonNull(NO_TIMEOUT_WIRE_CONTEXTS[context.profile().ordinal()]);
+		}
 		return new it.cavallium.rockserver.core.common.api.RequestContext(
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(
 						context.profile().wireValue()),

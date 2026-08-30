@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.net.URI;
+import java.time.Duration;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -173,8 +174,9 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	}
 
 	@Override
-	public long openTransaction(long timeoutMs) {
-		return db.openTransaction(timeoutMs, currentRequestContext().profile());
+	public long openTransaction(Duration transactionLeaseTtl) {
+		return db.openTransaction(LeaseTtl.toMillisCeil(transactionLeaseTtl, "transactionLeaseTtl"),
+				currentRequestContext().profile());
 	}
 
 	@Override
@@ -276,7 +278,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch mergeBatch -> this.mergeBatchAsync(
 					mergeBatch.columnId(), mergeBatch.batchPublisher(), mergeBatch.mode());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti existsMulti -> this.existsMultiAsync(
-					existsMulti.transactionId(), existsMulti.columnId(), existsMulti.keys(), existsMulti.timeoutMs());
+					existsMulti.transactionId(), existsMulti.columnId(), existsMulti.keys());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator closeIterator -> this.closeIteratorAsync(
 					closeIterator.iteratorId());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo seekTo -> this.seekToAsync(
@@ -289,8 +291,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					reduceRange.startKeysInclusive(),
 					reduceRange.endKeysExclusive(),
 					reduceRange.reverse(),
-					reduceRange.requestType(),
-					reduceRange.timeoutMs());
+					reduceRange.requestType());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<?> page -> this.getRangePageAsync(
 					page.transactionId(),
 					page.columnId(),
@@ -299,9 +300,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					page.reverse(),
 					page.resumeAfter(),
 					page.requestType(),
-					page.timeoutMs(),
 					page.budget());
-            case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType(), getRange.timeoutMs());
+			case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> getRange -> this.getRangeAsync(getRange.transactionId(), getRange.columnId(), getRange.startKeysInclusive(), getRange.endKeysExclusive(), getRange.reverse(), getRange.requestType());
             case RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw scanRaw -> this.scanRawAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount());
 			case RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable scanRaw ->
 					this.scanRawResumableAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount(),
@@ -323,7 +323,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					"Request deadline already expired");
 		}
 		var requestContext = context.value();
-		long monotonicDeadlineNanos = db.getScheduler().bindTimeoutNanos(remainingNanos);
+		long monotonicDeadlineNanos = db.getScheduler().resolveMonotonicDeadline(requestContext);
 		return db.getScheduler().withDeadlineBinding(requestContext,
 				monotonicDeadlineNanos,
 				() -> withRequestContext(context, operation));
@@ -522,13 +522,11 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	@Override
 	public List<Boolean> existsMulti(long transactionId,
 			long columnId,
-			@NotNull List<@NotNull Keys> keys,
-			long timeoutMs) throws RocksDBException {
+			@NotNull List<@NotNull Keys> keys) throws RocksDBException {
 		var context = currentRequestContext();
 		return db.existsMulti(transactionId,
 				columnId,
 				keys,
-				timeoutMs,
 				context.profile(),
 				db.getScheduler().resolveMonotonicDeadline(context));
 	}
@@ -536,13 +534,11 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	@Override
 	public CompletableFuture<List<Boolean>> existsMultiAsync(long transactionId,
 			long columnId,
-			@NotNull List<@NotNull Keys> keys,
-			long timeoutMs) throws RocksDBException {
+			@NotNull List<@NotNull Keys> keys) throws RocksDBException {
 		var context = currentRequestContext();
 		return db.existsMultiAsyncInternal(transactionId,
 				columnId,
 				keys,
-				timeoutMs,
 				context.profile(),
 				db.getScheduler().executor(context, OperationFamily.BOUNDED_FAN_OUT),
 				db.getScheduler().resolveMonotonicDeadline(context));
@@ -554,13 +550,13 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			@NotNull Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
-			long timeoutMs) throws RocksDBException {
+			Duration iteratorLeaseTtl) throws RocksDBException {
 		return db.openIterator(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
-				timeoutMs,
+				LeaseTtl.toMillisCeil(iteratorLeaseTtl, "iteratorLeaseTtl"),
 				currentRequestContext().profile());
 	}
 
@@ -1204,7 +1200,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 	@Override
 	@SuppressWarnings("unchecked")
-	public <T> T reduceRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestReduceRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+	public <T> T reduceRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestReduceRange<? super KV, T> requestType) throws RocksDBException {
 		var context = currentRequestContext();
 		db.validateTransactionProfile(transactionId, context.profile());
 		if (requestType instanceof RequestType.RequestEntriesCount<?>) {
@@ -1214,18 +1210,17 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					startKeysInclusive,
 					endKeysExclusive,
 					reverse,
-					requestType,
-					timeoutMs);
+					requestType);
 			return (T) db.countRangeAsyncInternal(transactionId,
 					columnId,
 					startKeysInclusive,
 					endKeysExclusive,
 					reverse,
-					timeoutMs,
 					context,
 					resolveCommand(context, command)).block();
 		}
-		return db.reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs);
+		return db.reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive,
+				reverse, requestType, db.getScheduler().resolveMonotonicDeadline(context));
 	}
 
 	@Override
@@ -1235,8 +1230,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
-			@NotNull RequestType.RequestReduceRange<? super KV, T> requestType,
-		long timeoutMs) throws RocksDBException {
+			@NotNull RequestType.RequestReduceRange<? super KV, T> requestType) throws RocksDBException {
 		var context = currentRequestContext();
 		db.validateTransactionProfile(transactionId, context.profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<>(
@@ -1245,25 +1239,22 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
-				requestType,
-				timeoutMs);
+				requestType);
 		if (requestType instanceof RequestType.RequestEntriesCount<?>) {
 			Consumer<Throwable> lateFailureHandler = error -> logLateRangeCountFailure(
-					transactionId, columnId, reverse, timeoutMs, error);
+					transactionId, columnId, reverse, 0L, error);
 			return (CompletableFuture<T>) (CompletableFuture<?>) db.countRangeAsyncInternal(
 					transactionId,
 					columnId,
 					startKeysInclusive,
 					endKeysExclusive,
 					reverse,
-					timeoutMs,
 					context,
 					resolveCommand(context, command))
 					.contextWrite(reactorContext -> reactorContext.put(
 							REACTOR_ON_ERROR_DROPPED_CONTEXT_KEY, lateFailureHandler))
 					.toFuture();
 		}
-		long queuedAtNanos = System.nanoTime();
 		return supplyAsyncPreservingRunningCompletion(() -> db.reduceRange(
 				transactionId,
 				columnId,
@@ -1271,7 +1262,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				endKeysExclusive,
 				reverse,
 				requestType,
-				remainingReadTimeoutMillis(timeoutMs, queuedAtNanos)), commandExecutor(command));
+				db.getScheduler().resolveMonotonicDeadline(context)), commandExecutor(command));
 	}
 
 	@Override
@@ -1282,9 +1273,9 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			boolean reverse,
 			@Nullable Keys resumeAfter,
 			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
-			long timeoutMs,
 			@NotNull RangeBudget budget) throws RocksDBException {
-		db.validateTransactionProfile(transactionId, currentRequestContext().profile());
+		var context = currentRequestContext();
+		db.validateTransactionProfile(transactionId, context.profile());
 		return db.getRangePage(transactionId,
 				columnId,
 				startKeysInclusive,
@@ -1292,8 +1283,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				reverse,
 				resumeAfter,
 				requestType,
-				timeoutMs,
-				budget);
+				budget,
+				db.getScheduler().resolveMonotonicDeadline(context));
 	}
 
 	@Override
@@ -1304,9 +1295,9 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			boolean reverse,
 			@Nullable Keys resumeAfter,
 			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
-			long timeoutMs,
 			@NotNull RangeBudget budget) throws RocksDBException {
-		db.validateTransactionProfile(transactionId, currentRequestContext().profile());
+		var context = currentRequestContext();
+		db.validateTransactionProfile(transactionId, context.profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<>(transactionId,
 				columnId,
 				startKeysInclusive,
@@ -1314,9 +1305,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				reverse,
 				resumeAfter,
 				requestType,
-				timeoutMs,
 				budget);
-		long queuedAtNanos = System.nanoTime();
 		return supplyAsyncPreservingRunningCompletion(() -> db.getRangePage(transactionId,
 				columnId,
 				startKeysInclusive,
@@ -1324,8 +1313,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				reverse,
 				resumeAfter,
 				requestType,
-				remainingReadTimeoutMillis(timeoutMs, queuedAtNanos),
-				budget), commandExecutor(command), budget.maxBytes());
+				budget,
+				db.getScheduler().resolveMonotonicDeadline(context)), commandExecutor(command), budget.maxBytes());
 	}
 
 	/**
@@ -1333,19 +1322,6 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	 * admission. Millisecond rounding preserves a positive final fraction without allowing
 	 * queueing time to grant the native read a fresh full timeout.
 	 */
-	private static long remainingReadTimeoutMillis(long timeoutMs, long queuedAtNanos) {
-		if (timeoutMs <= 0 || timeoutMs == Long.MAX_VALUE) {
-			return timeoutMs;
-		}
-		long elapsedNanos = Math.max(0L, System.nanoTime() - queuedAtNanos);
-		long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
-		if (elapsedMillis >= timeoutMs) {
-			throw RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
-					"Deadline exceeded");
-		}
-		return timeoutMs - elapsedMillis;
-	}
-
 	/**
 	 * Cancellation removes work that has not started, but a running native call keeps
 	 * its future observable so request-scoped transport logging can retain its real
@@ -1485,7 +1461,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	}
 
 	@Override
-	public <T> Stream<T> getRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+	public <T> Stream<T> getRange(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.@NotNull RequestGetRange<? super KV, T> requestType) throws RocksDBException {
 		var context = currentRequestContext();
 		db.validateTransactionProfile(transactionId, context.profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<>(
@@ -1494,21 +1470,19 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
-				requestType,
-				timeoutMs);
+				requestType);
 		return Flux.from(db.getRangeAsyncInternal(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
 				requestType,
-				timeoutMs,
 				context,
 				resolveCommand(context, command))).toStream();
 	}
 
 	@Override
-	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super KV, T> requestType, long timeoutMs) throws RocksDBException {
+	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.RequestGetRange<? super KV, T> requestType) throws RocksDBException {
 		var context = currentRequestContext();
 		db.validateTransactionProfile(transactionId, context.profile());
 		var command = new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<>(
@@ -1517,15 +1491,13 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
-				requestType,
-				timeoutMs);
+				requestType);
 		return db.getRangeAsyncInternal(transactionId,
 				columnId,
 				startKeysInclusive,
 				endKeysExclusive,
 				reverse,
 				requestType,
-				timeoutMs,
 				context,
 				resolveCommand(context, command));
 	}

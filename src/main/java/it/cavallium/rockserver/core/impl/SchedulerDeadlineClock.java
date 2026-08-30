@@ -36,12 +36,17 @@ final class SchedulerDeadlineClock {
 	}
 
 	long monotonicDeadlineAfterNanos(long remainingNanos) {
-		return deadlineAfterNanos(monotonicNanos(), Math.max(0L, remainingNanos));
+		long nowNanos = monotonicNanos();
+		if (nowNanos == Long.MAX_VALUE) {
+			return Long.MAX_VALUE - 1L;
+		}
+		return deadlineAfterNanos(nowNanos, Math.max(0L, remainingNanos));
 	}
 
 	private static long deadlineAfterNanos(long nowNanos, long remainingNanos) {
-		return remainingNanos >= Long.MAX_VALUE - nowNanos
-				? Long.MAX_VALUE
+		return nowNanos >= Long.MAX_VALUE - 1L
+				|| remainingNanos >= Long.MAX_VALUE - 1L - nowNanos
+				? Long.MAX_VALUE - 1L
 				: nowNanos + remainingNanos;
 	}
 

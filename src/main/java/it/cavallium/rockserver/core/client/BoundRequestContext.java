@@ -15,19 +15,17 @@ record BoundRequestContext(RequestContext value, long startedNanos) {
 	}
 
 	static BoundRequestContext bind(RequestContext context) {
+		Objects.requireNonNull(context, "context");
+		if (!context.hasTimeout()) {
+			return cachedNoTimeout(context);
+		}
 		return bindAt(context, System.nanoTime());
 	}
 
 	static BoundRequestContext bindAt(RequestContext context, long startedNanos) {
 		Objects.requireNonNull(context, "context");
 		if (!context.hasTimeout()) {
-			return switch (context.profile()) {
-				case ANALYTICAL -> ANALYTICAL_NO_TIMEOUT;
-				case INGEST -> INGEST_NO_TIMEOUT;
-				case BATCH -> BATCH_NO_TIMEOUT;
-				default -> throw new IllegalArgumentException(
-						"Only client-selectable non-latency profiles may omit a timeout");
-			};
+			return cachedNoTimeout(context);
 		}
 		return new BoundRequestContext(context, startedNanos);
 	}
@@ -37,7 +35,20 @@ record BoundRequestContext(RequestContext value, long startedNanos) {
 	}
 
 	long remainingNanos() {
+		if (!value.hasTimeout()) {
+			return RequestContext.NO_TIMEOUT;
+		}
 		return remainingNanosAt(System.nanoTime());
+	}
+
+	private static BoundRequestContext cachedNoTimeout(RequestContext context) {
+		return switch (context.profile()) {
+			case ANALYTICAL -> ANALYTICAL_NO_TIMEOUT;
+			case INGEST -> INGEST_NO_TIMEOUT;
+			case BATCH -> BATCH_NO_TIMEOUT;
+			default -> throw new IllegalArgumentException(
+					"Only client-selectable non-latency profiles may omit a timeout");
+		};
 	}
 
 	long remainingNanosAt(long nowNanos) {

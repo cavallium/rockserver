@@ -6,8 +6,10 @@ import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -216,18 +218,21 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * <p>
 		 * Returns the transaction id
 		 *
-		 * @param timeoutMs timeout in milliseconds
+		 * @param transactionLeaseTtl lifetime of the transaction lease
 		 */
-		record OpenTransaction(long timeoutMs) implements RocksDBAPICommandSingle<Long> {
+		record OpenTransaction(Duration transactionLeaseTtl) implements RocksDBAPICommandSingle<Long> {
+			public OpenTransaction {
+				validateLeaseTtl(transactionLeaseTtl, "transactionLeaseTtl");
+			}
 
 			@Override
 			public Long handleSync(RocksDBSyncAPI api) {
-				return api.openTransaction(timeoutMs);
+				return api.openTransaction(transactionLeaseTtl);
 			}
 
 			@Override
 			public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
-				return api.openTransactionAsync(timeoutMs);
+				return api.openTransactionAsync(transactionLeaseTtl);
 			}
 
 			@Override
@@ -877,21 +882,19 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param transactionId transaction id, or 0
 		 * @param columnId column id
 		 * @param keys logical keys to test, in result order
-		 * @param timeoutMs read timeout in milliseconds
 		 */
 		record ExistsMulti(long transactionId,
 					   long columnId,
-					   @NotNull List<@NotNull Keys> keys,
-					   long timeoutMs) implements RocksDBAPICommandSingle<List<Boolean>> {
+					   @NotNull List<@NotNull Keys> keys) implements RocksDBAPICommandSingle<List<Boolean>> {
 
 			@Override
 			public List<Boolean> handleSync(RocksDBSyncAPI api) {
-				return api.existsMulti(transactionId, columnId, keys, timeoutMs);
+				return api.existsMulti(transactionId, columnId, keys);
 			}
 
 			@Override
 			public CompletableFuture<List<Boolean>> handleAsync(RocksDBAsyncAPI api) {
-				return api.existsMultiAsync(transactionId, columnId, keys, timeoutMs);
+				return api.existsMultiAsync(transactionId, columnId, keys);
 			}
 
 			@Override
@@ -909,18 +912,21 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param startKeysInclusive start keys, inclusive. [] means "the beginning"
 		 * @param endKeysExclusive end keys, exclusive. Null means "the end"
 		 * @param reverse if true, seek in reverse direction
-		 * @param timeoutMs timeout in milliseconds
 		 */
 		record OpenIterator(long transactionId,
 							long columnId,
 							Keys startKeysInclusive,
 							@Nullable Keys endKeysExclusive,
 							boolean reverse,
-							long timeoutMs) implements RocksDBAPICommandSingle<Long> {
+							Duration iteratorLeaseTtl) implements RocksDBAPICommandSingle<Long> {
+			public OpenIterator {
+				validateLeaseTtl(iteratorLeaseTtl, "iteratorLeaseTtl");
+			}
 
 			@Override
 			public Long handleSync(RocksDBSyncAPI api) {
-				return api.openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs);
+				return api.openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive,
+						reverse, iteratorLeaseTtl);
 			}
 
 			@Override
@@ -930,7 +936,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 						startKeysInclusive,
 						endKeysExclusive,
 						reverse,
-						timeoutMs
+						iteratorLeaseTtl
 				);
 			}
 
@@ -939,6 +945,13 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return true;
 			}
 
+		}
+
+		private static void validateLeaseTtl(Duration leaseTtl, String name) {
+			Objects.requireNonNull(leaseTtl, name);
+			if (leaseTtl.isZero() || leaseTtl.isNegative()) {
+				throw new IllegalArgumentException(name + " must be positive");
+			}
 		}
 		/**
 		 * Close an iterator
@@ -1036,8 +1049,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 							  @Nullable Keys startKeysInclusive,
 							  @Nullable Keys endKeysExclusive,
 							  boolean reverse,
-							  RequestType.RequestReduceRange<? super KV, T> requestType,
-							  long timeoutMs) implements RocksDBAPICommandSingle<T> {
+							  RequestType.RequestReduceRange<? super KV, T> requestType) implements RocksDBAPICommandSingle<T> {
 
 			@Override
 			public T handleSync(RocksDBSyncAPI api) {
@@ -1046,8 +1058,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 						startKeysInclusive,
 						endKeysExclusive,
 						reverse,
-						requestType,
-						timeoutMs
+						requestType
 				);
 			}
 
@@ -1058,8 +1069,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 						startKeysInclusive,
 						endKeysExclusive,
 						reverse,
-						requestType,
-						timeoutMs
+						requestType
 				);
 			}
 
@@ -1078,7 +1088,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				boolean reverse,
 				@Nullable Keys resumeAfter,
 				@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
-				long timeoutMs,
 				@NotNull RangeBudget budget) implements RocksDBAPICommandSingle<RangePage<T>> {
 
 			@Override
@@ -1090,7 +1099,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 						reverse,
 						resumeAfter,
 						requestType,
-						timeoutMs,
 						budget);
 			}
 
@@ -1103,7 +1111,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 						reverse,
 						resumeAfter,
 						requestType,
-						timeoutMs,
 						budget);
 			}
 
@@ -1126,15 +1133,13 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param endKeysExclusive end keys, exclusive. Null means "the end"
 		 * @param reverse if true, seek in reverse direction
 		 * @param requestType the request type determines which type of data will be returned.
-		 * @param timeoutMs timeout in milliseconds
 		 */
 		record GetRange<T>(long transactionId,
 											 long columnId,
 											 @Nullable Keys startKeysInclusive,
 											 @Nullable Keys endKeysExclusive,
-											 boolean reverse,
-											 RequestType.RequestGetRange<? super KV, T> requestType,
-											 long timeoutMs) implements RocksDBAPICommandStream<T> {
+										 boolean reverse,
+										 RequestType.RequestGetRange<? super KV, T> requestType) implements RocksDBAPICommandStream<T> {
 
 			@Override
 			public Stream<T> handleSync(RocksDBSyncAPI api) {
@@ -1143,8 +1148,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 						startKeysInclusive,
 						endKeysExclusive,
 						reverse,
-						requestType,
-						timeoutMs
+						requestType
 				);
 			}
 
@@ -1155,8 +1159,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 						startKeysInclusive,
 						endKeysExclusive,
 						reverse,
-						requestType,
-						timeoutMs
+						requestType
 				);
 			}
 

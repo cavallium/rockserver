@@ -62,6 +62,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URI;
+import java.time.Duration;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -487,9 +488,9 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	@Override
-	public CompletableFuture<Long> openTransactionAsync(long timeoutMs) throws RocksDBException {
+	public CompletableFuture<Long> openTransactionAsync(Duration transactionLeaseTtl) throws RocksDBException {
 		var request = OpenTransactionRequest.newBuilder()
-				.setTimeoutMs(timeoutMs)
+				.setTransactionLeaseTtlNanos(LeaseTtl.toNanos(transactionLeaseTtl, "transactionLeaseTtl"))
 				.setContext(currentWireRequestContext())
 				.build();
 		return toResponse(futureStubWithRequestDeadline().openTransaction(request), OpenTransactionResponse::getTransactionId);
@@ -500,7 +501,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		var request = CloseTransactionRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setCommit(commit)
-				.setContext(currentWireRequestContext())
+				.setContext(currentWireRequestContext(commit))
 				.build();
 		var stub = commit ? futureStubWithRequestDeadline() : futureStub;
 		return toResponse(stub.closeTransaction(request), CloseTransactionResponse::getSuccessful);
@@ -994,13 +995,11 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@Override
 	public CompletableFuture<List<Boolean>> existsMultiAsync(long transactionId,
 			long columnId,
-			@NotNull List<@NotNull Keys> keys,
-			long timeoutMs) throws RocksDBException {
-		var deadlineStub = futureStubWithReadDeadline(timeoutMs);
+			@NotNull List<@NotNull Keys> keys) throws RocksDBException {
+		var deadlineStub = futureStubWithRequestDeadline();
 		var request = ExistsMultiRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
-				.setTimeoutMs(timeoutMs)
 				.setContext(currentWireRequestContext());
 		for (var logicalKeys : keys) {
 			var wireKeys = KeyTuple.newBuilder();
@@ -1020,12 +1019,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			@NotNull Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
-			long timeoutMs) throws RocksDBException {
+			Duration iteratorLeaseTtl) throws RocksDBException {
 		var requestBuilder = OpenIteratorRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
 				.setReverse(reverse)
-				.setTimeoutMs(timeoutMs)
+				.setIteratorLeaseTtlNanos(LeaseTtl.toNanos(iteratorLeaseTtl, "iteratorLeaseTtl"))
 				.setContext(currentWireRequestContext());
 		if (startKeysInclusive != null) {
 			for (var key : startKeysInclusive.keys()) {
@@ -1108,13 +1107,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> CompletableFuture<T> reduceRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.
-		RequestReduceRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
-		var deadlineStub = futureStubWithReadDeadline(timeoutMs);
+		RequestReduceRange<? super it.cavallium.rockserver.core.common.KV, T> requestType) throws RocksDBException {
+		var deadlineStub = futureStubWithRequestDeadline();
 		var requestBuilder = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
 				.setReverse(reverse)
-				.setTimeoutMs(timeoutMs)
 				.setContext(currentWireRequestContext());
 		if (startKeysInclusive != null) {
 			for (var key : startKeysInclusive.keys()) {
@@ -1164,37 +1162,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		return remainingNanos;
 	}
 
-	private RocksDBServiceFutureStub futureStubWithReadDeadline(long timeoutMs) {
-		validateReadTimeout(timeoutMs);
-		long requestTimeoutNanos = remainingRequestDeadlineNanos();
-		long operationTimeoutNanos = timeoutMs >= Long.MAX_VALUE / 1_000_000L
-				? Long.MAX_VALUE
-				: TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-		long effectiveTimeoutNanos = Math.min(operationTimeoutNanos, requestTimeoutNanos);
-		return effectiveTimeoutNanos == Long.MAX_VALUE
-				? futureStub
-				: futureStub.withDeadlineAfter(effectiveTimeoutNanos, TimeUnit.NANOSECONDS);
-	}
-
-	private ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStubWithReadDeadline(long timeoutMs) {
-		validateReadTimeout(timeoutMs);
-		long requestTimeoutNanos = remainingRequestDeadlineNanos();
-		long operationTimeoutNanos = timeoutMs >= Long.MAX_VALUE / 1_000_000L
-				? Long.MAX_VALUE
-				: TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-		long effectiveTimeoutNanos = Math.min(operationTimeoutNanos, requestTimeoutNanos);
-		return effectiveTimeoutNanos == Long.MAX_VALUE
-				? reactiveStub
-				: reactiveStub.withDeadlineAfter(effectiveTimeoutNanos, TimeUnit.NANOSECONDS);
-	}
-
-	private static void validateReadTimeout(long timeoutMs) {
-		if (timeoutMs < 0) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Read timeout must be non-negative");
-		}
-	}
-
 	@Override
 	public <T> CompletableFuture<it.cavallium.rockserver.core.common.RangePage<T>> getRangePageAsync(
 			long transactionId,
@@ -1204,7 +1171,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			boolean reverse,
 			@Nullable Keys resumeAfter,
 			@NotNull RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType,
-			long timeoutMs,
 			@NotNull it.cavallium.rockserver.core.common.RangeBudget budget) throws RocksDBException {
 		var requestBuilder = GetRangePageRequest.newBuilder()
 				.setTransactionId(transactionId)
@@ -1214,7 +1180,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 					case RequestType.RequestGetAllInRange<?> _ -> 1;
 					case RequestType.RequestGetAllInRangeNoCache<?> _ -> 2;
 				})
-				.setTimeoutMs(timeoutMs)
 				.setBudget(it.cavallium.rockserver.core.common.api.proto.RangeBudget.newBuilder()
 						.setMaxItems(budget.maxItems())
 						.setMaxBytes(budget.maxBytes()))
@@ -1236,7 +1201,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			}
 			requestBuilder.setResumeAfter(resumeAfterBuilder);
 		}
-		return toResponse(futureStubWithReadDeadline(timeoutMs).getRangePage(requestBuilder.build()), response -> {
+		return toResponse(futureStubWithRequestDeadline().getRangePage(requestBuilder.build()), response -> {
 			@SuppressWarnings("unchecked")
 			var items = (List<T>) (List<?>) response.getItemsList().stream()
 					.map(GrpcConnectionDelegate::mapKV)
@@ -1252,13 +1217,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@SuppressWarnings("unchecked")
 	@Override
 	public <T> Publisher<T> getRangeAsync(long transactionId, long columnId, @Nullable Keys startKeysInclusive, @Nullable Keys endKeysExclusive, boolean reverse, RequestType.
-		RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType, long timeoutMs) throws RocksDBException {
-		var deadlineStub = reactiveStubWithReadDeadline(timeoutMs);
+		RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType) throws RocksDBException {
+		var deadlineStub = reactiveStubWithRequestDeadline();
 		var requestBuilder = GetRangeRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
 				.setReverse(reverse)
-				.setTimeoutMs(timeoutMs)
 				.setContext(currentWireRequestContext());
 		if (startKeysInclusive != null) {
 			for (var key : startKeysInclusive.keys()) {
@@ -1441,9 +1405,16 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	private it.cavallium.rockserver.core.common.api.proto.RequestContext currentWireRequestContext() {
+		return currentWireRequestContext(true);
+	}
+
+	private it.cavallium.rockserver.core.common.api.proto.RequestContext currentWireRequestContext(
+			boolean enforceCallerDeadline) {
 		var boundContext = currentBoundRequestContext();
 		var context = boundContext.value();
-		long remainingNanos = boundContext.remainingNanos();
+		long remainingNanos = enforceCallerDeadline
+				? boundContext.remainingNanos()
+				: RequestContext.NO_TIMEOUT;
 		if (remainingNanos == 0L) {
 			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline already expired");

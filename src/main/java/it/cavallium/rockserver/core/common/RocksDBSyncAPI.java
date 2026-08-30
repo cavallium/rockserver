@@ -39,6 +39,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSt
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable;
 import it.cavallium.rockserver.core.common.cdc.CDCEvent;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
@@ -51,8 +52,8 @@ import org.jetbrains.annotations.Nullable;
 public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 
 	/** See: {@link OpenTransaction}. */
-	default long openTransaction(long timeoutMs) throws RocksDBException {
-		return requestSync(new OpenTransaction(timeoutMs));
+	default long openTransaction(Duration transactionLeaseTtl) throws RocksDBException {
+		return requestSync(new OpenTransaction(transactionLeaseTtl));
 	}
 
 	/** See: {@link CloseTransaction}. */
@@ -206,9 +207,8 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	/** See: {@link ExistsMulti}. */
 	default List<Boolean> existsMulti(long transactionId,
 			long columnId,
-			@NotNull List<@NotNull Keys> keys,
-			long timeoutMs) throws RocksDBException {
-		return requestSync(new ExistsMulti(transactionId, columnId, keys, timeoutMs));
+			@NotNull List<@NotNull Keys> keys) throws RocksDBException {
+		return requestSync(new ExistsMulti(transactionId, columnId, keys));
 	}
 
 	/** See: {@link OpenIterator}. */
@@ -217,8 +217,9 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 			Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
-			long timeoutMs) throws RocksDBException {
-		return requestSync(new OpenIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs));
+			Duration iteratorLeaseTtl) throws RocksDBException {
+		return requestSync(new OpenIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive,
+				reverse, iteratorLeaseTtl));
 	}
 
 	/** See: {@link CloseIterator}. */
@@ -245,9 +246,8 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 							  @Nullable Keys startKeysInclusive,
 							  @Nullable Keys endKeysExclusive,
 							  boolean reverse,
-							  @NotNull RequestType.RequestReduceRange<? super KV, T> requestType,
-							  long timeoutMs) throws RocksDBException {
-		return requestSync(new ReduceRange<>(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
+							  @NotNull RequestType.RequestReduceRange<? super KV, T> requestType) throws RocksDBException {
+		return requestSync(new ReduceRange<>(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType));
 	}
 
 	/** Return one bounded range page, excluding {@code resumeAfter} in either direction. */
@@ -258,7 +258,6 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 			boolean reverse,
 			@Nullable Keys resumeAfter,
 			@NotNull RequestType.RequestGetRange<? super KV, T> requestType,
-			long timeoutMs,
 			@NotNull RangeBudget budget) throws RocksDBException {
 		return requestSync(new GetRangePage<>(transactionId,
 				columnId,
@@ -267,7 +266,6 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 				reverse,
 				resumeAfter,
 				requestType,
-				timeoutMs,
 				budget));
 	}
 
@@ -277,9 +275,8 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 								   @Nullable Keys startKeysInclusive,
 								   @Nullable Keys endKeysExclusive,
 								   boolean reverse,
-								   @NotNull RequestType.RequestGetRange<? super KV, T> requestType,
-								   long timeoutMs) throws RocksDBException {
-		return requestSync(new GetRange<>(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, timeoutMs));
+								   @NotNull RequestType.RequestGetRange<? super KV, T> requestType) throws RocksDBException {
+		return requestSync(new GetRange<>(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType));
 	}
 
 	/** See: {@link ScanRaw}. */

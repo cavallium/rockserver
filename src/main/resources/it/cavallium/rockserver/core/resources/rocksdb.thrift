@@ -203,7 +203,7 @@ exception RocksDBThriftException {
 
 service RocksDB {
 
-   i64 openTransaction(1: required i64 timeoutMs, 2: required RequestContext context) throws (1: RocksDBThriftException e),
+   i64 openTransaction(1: required i64 transactionLeaseTtlNanos, 2: required RequestContext context) throws (1: RocksDBThriftException e),
 
    bool closeTransaction(1: required i64 transactionId, 2: required bool commit, 3: required RequestContext context) throws (1: RocksDBThriftException e),
 
@@ -255,9 +255,9 @@ service RocksDB {
 
    bool exists(1: required i64 transactionOrUpdateId, 3: required i64 columnId, 4: required list<binary> keys, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<bool> existsMulti(1: required i64 transactionId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required i64 timeoutMs, 5: required RequestContext context) throws (1: RocksDBThriftException e),
+   list<bool> existsMulti(1: required i64 transactionId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   i64 openIterator(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
+   i64 openIterator(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 iteratorLeaseTtlNanos, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
    void closeIterator(1: required i64 iteratorId) throws (1: RocksDBThriftException e),
 
@@ -283,13 +283,13 @@ service RocksDB {
 
    list<OptionalBinary> mergeMultiGetMerged(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   FirstAndLast reduceRangeFirstAndLast(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
+   FirstAndLast reduceRangeFirstAndLast(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   i64 reduceRangeEntriesCount(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
+   i64 reduceRangeEntriesCount(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<KV> getAllInRange(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
+   list<KV> getAllInRange(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   list<KV> getAllInRangeNoCache(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 timeoutMs, 7: required RequestContext context) throws (1: RocksDBThriftException e),
+   list<KV> getAllInRangeNoCache(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
    i64 uploadMergeOperator(1: required string operatorName, 2: required string className, 3: required binary jarPayload, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
@@ -321,6 +321,6 @@ service RocksDB {
 
    Capabilities getCapabilities(),
 
-   RangePage getRangePage(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: list<binary> resumeAfter, 7: required RangeRequestType requestType, 8: required i64 timeoutMs, 9: required RangeBudget budget, 10: required RequestContext context) throws (1: RocksDBThriftException e),
+   RangePage getRangePage(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: list<binary> resumeAfter, 7: required RangeRequestType requestType, 9: required RangeBudget budget, 10: required RequestContext context) throws (1: RocksDBThriftException e),
 
 }

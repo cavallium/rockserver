@@ -102,6 +102,7 @@ import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.Disposable;
@@ -1018,7 +1019,16 @@ public class GrpcServer extends Server {
 		private RocksDBAsyncAPI asyncApi(ResolvedRequestContext context) {
 			return new RocksDBAsyncAPI() {
 				@Override
+				@SuppressWarnings("unchecked")
 				public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
+					if (request instanceof RocksDBAPICommand.RocksDBAPICommandStream) {
+						return (RA) Flux.defer(() -> Flux.from((Publisher<?>) dispatchAsync(context, request)));
+					}
+					return dispatchAsync(context, request);
+				}
+
+				private <R, RS, RA> RA dispatchAsync(ResolvedRequestContext context,
+						RocksDBAPICommand<R, RS, RA> request) {
 					var downstreamContext = remainingContext(context);
 					return scheduler.withDeadlineBinding(downstreamContext,
 							context.localMonotonicDeadlineNanos(),
@@ -1027,10 +1037,12 @@ public class GrpcServer extends Server {
 
 				@Override
 				public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-					var downstreamContext = remainingContext(context);
-					return scheduler.withDeadlineBinding(downstreamContext,
-							context.localMonotonicDeadlineNanos(),
-							() -> asyncApi(downstreamContext).cdcPollBatchAsync(id, fromSeq, maxEvents));
+					return Mono.defer(() -> {
+						var downstreamContext = remainingContext(context);
+						return scheduler.withDeadlineBinding(downstreamContext,
+								context.localMonotonicDeadlineNanos(),
+								() -> asyncApi(downstreamContext).cdcPollBatchAsync(id, fromSeq, maxEvents));
+					});
 				}
 			};
 		}
@@ -1141,7 +1153,8 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<OpenTransactionResponse> openTransaction(OpenTransactionRequest request) {
 			return executeSync(request.getContext(), OperationFamily.METADATA, contextualApi -> {
-				var txId = contextualApi.openTransaction(request.getTimeoutMs());
+				var txId = contextualApi.openTransaction(
+						java.time.Duration.ofNanos(request.getTransactionLeaseTtlNanos()));
 				return OpenTransactionResponse.newBuilder().setTransactionId(txId).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("openTransaction", request));
 		}
@@ -1264,7 +1277,6 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<ExistsMultiResponse> existsMulti(ExistsMultiRequest request) {
-			var transportDeadline = Context.current().getDeadline();
 			return Mono.defer(() -> {
 					var keys = request.getKeysMultiList().stream()
 							.map(keyTuple -> mapKeys(keyTuple.getKeysList()))
@@ -1272,8 +1284,7 @@ public class GrpcServer extends Server {
 					return fromCancellableFuture(asyncApi(request.getContext()).existsMultiAsync(
 							request.getTransactionId(),
 							request.getColumnId(),
-							keys,
-							effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline)));
+							keys));
 				})
 					.map(present -> ExistsMultiResponse.newBuilder().addAllPresent(present).build())
 					.transform(this.onErrorMapMonoWithRequestInfo("existsMulti", request));
@@ -2147,7 +2158,7 @@ public class GrpcServer extends Server {
 						mapKeys(request.getStartKeysInclusiveList()),
 						mapKeys(request.getEndKeysExclusiveList()),
 						request.getReverse(),
-						request.getTimeoutMs()
+						java.time.Duration.ofNanos(request.getIteratorLeaseTtlNanos())
 				);
 				return OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build();
 			}, response -> {
@@ -2244,15 +2255,13 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<FirstAndLast> reduceRangeFirstAndLast(GetRangeRequest request) {
-			var transportDeadline = Context.current().getDeadline();
 			return Mono.defer(() -> fromCancellableFuture(asyncApi(request.getContext()).reduceRangeAsync(
 						request.getTransactionId(),
 						request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveList()),
 						mapKeys(request.getEndKeysExclusiveList()),
 						request.getReverse(),
-						RequestType.firstAndLast(),
-						effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline))))
+						RequestType.firstAndLast())))
 					.map(range -> {
 						if (range.first() == null || range.last() == null) {
 							return FirstAndLast.getDefaultInstance();
@@ -2267,26 +2276,15 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<EntriesCount> reduceRangeEntriesCount(GetRangeRequest request) {
-			var transportDeadline = Context.current().getDeadline();
 			return Mono.defer(() -> fromCancellableFuture(asyncApi(request.getContext()).reduceRangeAsync(
 						request.getTransactionId(),
 						request.getColumnId(),
 						mapKeys(request.getStartKeysInclusiveList()),
 						mapKeys(request.getEndKeysExclusiveList()),
 						request.getReverse(),
-						RequestType.entriesCount(),
-						effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline))))
+						RequestType.entriesCount())))
 					.map(count -> EntriesCount.newBuilder().setCount(count).build())
 					.transform(this.onErrorMapMonoWithRequestInfo("reduceRangeEntriesCount", request));
-		}
-
-		private long effectiveReadTimeoutMillis(long requestedTimeoutMs, @Nullable Deadline transportDeadline) {
-			if (requestedTimeoutMs < 0 || transportDeadline == null) {
-				return requestedTimeoutMs;
-			}
-			long transportRemainingMs = Math.max(0L,
-					transportDeadline.timeRemaining(TimeUnit.MILLISECONDS));
-			return Math.min(requestedTimeoutMs, transportRemainingMs);
 		}
 
 		@Override
@@ -2302,7 +2300,6 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<it.cavallium.rockserver.core.common.api.proto.RangePage> getRangePage(
 				GetRangePageRequest request) {
-			var transportDeadline = Context.current().getDeadline();
 			return Mono.defer(() -> {
 				if (!request.hasBudget()) {
 					return Mono.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -2333,7 +2330,6 @@ public class GrpcServer extends Server {
 						request.getReverse(),
 						resumeAfter,
 						requestType,
-						effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline),
 						budget));
 			}).map(page -> {
 				var response = it.cavallium.rockserver.core.common.api.proto.RangePage.newBuilder()
@@ -2356,15 +2352,13 @@ public class GrpcServer extends Server {
 				RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV,
 						it.cavallium.rockserver.core.common.KV> requestType,
 				String requestName) {
-			var transportDeadline = Context.current().getDeadline();
 			return Flux.defer(() -> Flux
 					.from(asyncApi(request.getContext()).getRangeAsync(request.getTransactionId(),
 							request.getColumnId(),
 							mapKeys(request.getStartKeysInclusiveList()),
 							mapKeys(request.getEndKeysExclusiveList()),
 							request.getReverse(),
-							requestType,
-							effectiveReadTimeoutMillis(request.getTimeoutMs(), transportDeadline))))
+							requestType)))
 					.map(GrpcServerImpl::unmapKVHeap)
 					.transform(this.onErrorMapFluxWithRequestInfo(requestName, request));
 		}

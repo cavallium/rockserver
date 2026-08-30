@@ -355,7 +355,8 @@ public class DbViewerUI extends JFrame {
 				var colId = analyticalApi.getColumnId(selectedTable.name());
 				var column = new Column(selectedTable.name(), colId, selectedTable.schema());
 
-				try (Stream<KV> dataStream = analyticalApi.getRange(0, column.colId, null, null, false, RequestType.allInRange(), 5_000)) {
+				try (Stream<KV> dataStream = analyticalApi.getRange(
+						0, column.colId, null, null, false, RequestType.allInRange())) {
 					var rows = dataStream.toList();
 					int numCols = column.schema().keysCount() + (column.schema.hasValue() ? 1 : 0);
 					Object[][] rowData = new Object[rows.size()][numCols];
