@@ -140,7 +140,8 @@ class EmbeddedReduceRangeSchedulingTest {
 			var iteratorOpens = new AtomicInteger();
 			connection.getInternalDB().setRangeIteratorOpenObserverForTesting(iteratorOpens::incrementAndGet);
 			try {
-				var result = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(
+				var result = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch(
+						java.time.Duration.ofMillis(50L))).reduceRangeAsync(
 						0, columnId, null, null, false, RequestType.firstAndLast());
 				Thread.sleep(150);
 				releaseBlocker.countDown();

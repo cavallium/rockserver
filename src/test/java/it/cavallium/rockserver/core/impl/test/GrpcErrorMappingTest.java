@@ -117,8 +117,8 @@ class GrpcErrorMappingTest {
 	}
 
 	@Test
-	void noCacheRangeFailsClearlyAgainstAnIncompatiblePeer() {
-		var error = assertThrows(RocksDBException.class, () -> {
+	void noCacheRangeDoesNotDowngradeAnUnimplementedV3Rpc() {
+		var error = assertThrows(StatusRuntimeException.class, () -> {
 			try (var range = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRange(0,
 					0,
 					null,
@@ -129,9 +129,7 @@ class GrpcErrorMappingTest {
 			}
 		});
 
-		assertEquals(RocksDBErrorType.NOT_IMPLEMENTED, error.getErrorUniqueId());
-		assertEquals("The connected Rockserver does not support RequestType.allInRangeNoCache(); "
-				+ "upgrade the peer to version 1.2.8 or newer", error.getMessage());
+		assertEquals(Status.Code.UNIMPLEMENTED, error.getStatus().getCode());
 	}
 
 	private static final class ErrorService extends ReactorRocksDBServiceGrpc.RocksDBServiceImplBase {

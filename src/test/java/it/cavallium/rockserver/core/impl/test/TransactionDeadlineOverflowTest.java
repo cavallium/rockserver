@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.RequestContext;
-import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import java.lang.reflect.Method;
 import java.nio.file.Path;
@@ -50,8 +49,8 @@ class TransactionDeadlineOverflowTest {
 			EmbeddedDB internal = connection.getInternalDB();
 			var api = connection.getSyncApi(RequestContext.batch());
 
-			var failure = assertThrows(RocksDBException.class, () -> api.openTransaction( java.time.Duration.ofMillis(-1L)));
-			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, failure.getErrorUniqueId());
+			assertThrows(IllegalArgumentException.class,
+					() -> api.openTransaction(java.time.Duration.ofMillis(-1L)));
 			assertEquals(0, internal.getOpenTransactionsCount());
 			assertEquals(0L, internal.getPendingOpsCount(),
 					"invalid timeout admission must not allocate or retain a native resource");

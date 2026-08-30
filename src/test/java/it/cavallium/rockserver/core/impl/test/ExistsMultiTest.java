@@ -8,8 +8,8 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
-import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.impl.test.DBTest.ConnectionConfig;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -79,10 +79,8 @@ class ExistsMultiTest {
 							bucketedColumn,
 							List.of(bucketKey1, bucketKey2, missingBucketKey, bucketKey1)));
 
-			var invalidTimeout = assertThrows(RocksDBException.class,
-					() -> api.existsMulti(0, fixedColumn, List.of(key1)));
-			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
-					invalidTimeout.getErrorUniqueId());
+			assertThrows(IllegalArgumentException.class,
+					() -> RequestContext.batch(java.time.Duration.ofNanos(-1L)));
 		} finally {
 			Files.deleteIfExists(configFile);
 		}

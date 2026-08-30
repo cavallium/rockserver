@@ -370,7 +370,8 @@ class EmbeddedConnectionAsyncRegressionTest {
 				occupyWorkers(readExecutor, workerEntered, releaseWorker);
 				assertTrue(workerEntered.await(5, SECONDS));
 
-				var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
+				var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch(
+						java.time.Duration.ofMillis(25L))).existsMultiAsync(
 						0, columnId, List.of(key(1)));
 				assertTrue(awaitQueueSize(scheduler, 1));
 				Thread.sleep(75);

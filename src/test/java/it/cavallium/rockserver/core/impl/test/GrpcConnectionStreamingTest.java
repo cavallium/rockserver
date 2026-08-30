@@ -159,9 +159,11 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void rangeVariantsUseTransportDeadlineAndTypedErrorMapping() throws InterruptedException {
-		expectReadDeadline(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
+		var context = it.cavallium.rockserver.core.common.RequestContext.batch(
+				Duration.ofMillis(RANGE_TIMEOUT_MS));
+		expectReadDeadline(client.getAsyncApi(context).getRangeAsync(
 				0, 29, null, null, false, RequestType.allInRange()));
-		expectReadDeadline(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
+		expectReadDeadline(client.getAsyncApi(context).getRangeAsync(
 				0, 31, null, null, false, RequestType.allInRangeNoCache()));
 
 		assertEquals(1, service.rangeCalls.get());

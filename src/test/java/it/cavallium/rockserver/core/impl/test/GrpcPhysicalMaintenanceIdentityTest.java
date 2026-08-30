@@ -44,8 +44,10 @@ class GrpcPhysicalMaintenanceIdentityTest {
 					.build();
 			try {
 				var stub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
-				stub.flush(FlushRequest.getDefaultInstance()).block(Duration.ofSeconds(5));
-				stub.compact(CompactRequest.getDefaultInstance()).block(Duration.ofSeconds(5));
+				stub.flush(FlushRequest.newBuilder().setWorkloadContractVersion(3).build())
+						.block(Duration.ofSeconds(5));
+				stub.compact(CompactRequest.newBuilder().setWorkloadContractVersion(3).build())
+						.block(Duration.ofSeconds(5));
 
 				assertEquals(1, backend.flushCalls.get());
 				assertEquals(1, backend.compactCalls.get());

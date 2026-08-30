@@ -467,7 +467,7 @@ class RawScanResumeTest {
 	}
 
 	@Test
-	void grpcRetainsLegacyCompletionShapeForClientsThatDoNotOptIn(@TempDir Path tempDir) throws Exception {
+	void grpcAlwaysCoalescesCompletionTokenIntoTheSerializedV3Event(@TempDir Path tempDir) throws Exception {
 		try (var embedded = new EmbeddedConnection(tempDir.resolve("db"), "raw-resume-grpc-legacy", null);
 				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 			RocksDBSyncAPI embeddedApi = embedded.getSyncApi(RequestContext.batch());
@@ -493,7 +493,7 @@ class RawScanResumeTest {
 				int completions = 0;
 				while (responses.hasNext()) {
 					var response = responses.next();
-					assertFalse(response.hasCompletedSstTokenAfterBatch());
+					assertTrue(response.hasCompletedSstTokenAfterBatch());
 					switch (response.getEventCase()) {
 						case SERIALIZED -> batches++;
 						case COMPLETEDSSTTOKEN -> completions++;
@@ -501,7 +501,7 @@ class RawScanResumeTest {
 					}
 				}
 				assertEquals(SST_COUNT, batches);
-				assertEquals(SST_COUNT, completions);
+				assertEquals(0, completions);
 			} finally {
 				channel.shutdownNow();
 				assertTrue(channel.awaitTermination(5, TimeUnit.SECONDS));

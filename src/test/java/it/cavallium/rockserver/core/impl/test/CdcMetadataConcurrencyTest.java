@@ -89,7 +89,8 @@ class CdcMetadataConcurrencyTest {
 		db.cdcCommit(SUBSCRIPTION_ID, 10L);
 		var periodicCreate = blockNextMetadataLoad("create");
 
-		Future<Long> create = executor.submit(() -> db.cdcCreate(SUBSCRIPTION_ID, 0L, null, false, java.util.OptionalLong.empty()));
+		Future<Long> create = executor.submit(() -> db.cdcCreate(
+				SUBSCRIPTION_ID, 0L, null, false, java.util.OptionalLong.of(10L)));
 		assertLoaded(periodicCreate);
 
 		var commitAttempted = observeNextOperation("commit");

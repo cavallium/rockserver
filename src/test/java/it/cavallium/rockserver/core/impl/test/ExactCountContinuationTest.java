@@ -173,17 +173,12 @@ class ExactCountContinuationTest {
 	}
 
 	@Test
-	void negativeExactCountTimeoutIsRejectedAndZeroIsAlreadyExpired() throws Exception {
+	void nonPositiveExactCountTimeoutPoliciesAreRejectedBeforeDispatch() throws Exception {
 		try (var connection = populatedConnection("snapshot-invalid-timeout")) {
-			long columnId = connection.getSyncApi(RequestContext.analytical()).getColumnId("entries");
-			var negative = assertThrows(RocksDBException.class,
-					() -> connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-							0, columnId, null, null, false, RequestType.entriesCount()));
-			assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST, negative.getErrorUniqueId());
-
-			var zero = connection.getAsyncApi(RequestContext.analytical()).reduceRangeAsync(
-					0, columnId, null, null, false, RequestType.entriesCount());
-			assertReadDeadline(zero);
+			assertThrows(IllegalArgumentException.class,
+					() -> RequestContext.analytical(java.time.Duration.ofNanos(-1L)));
+			assertThrows(IllegalArgumentException.class,
+					() -> RequestContext.analytical(java.time.Duration.ZERO));
 			assertRetainedResourcesClosed(connection);
 		}
 	}

@@ -621,7 +621,8 @@ class CdcBugReproductionTest {
 
         // 4. Re-create subscription (should load existing state)
         // Passing null as 'fromSeq' tells it to look up the saved state
-        long startSeq = db.cdcCreate(subId, null, List.of(columnId), false, java.util.OptionalLong.empty());
+		long startSeq = db.cdcCreate(subId, null, List.of(columnId), false,
+				java.util.OptionalLong.of(lastSeq));
 
         // The start sequence should be lastCommitted + 1
         // We can't easily check the exact number without bit math, but we can verify behavior.
@@ -756,7 +757,8 @@ class CdcBugReproductionTest {
         String dynamicSub = "dynamic-sub";
 
         // 1. Subscribe only to col1
-        db.cdcCreate(dynamicSub, null, List.of(col1), false, java.util.OptionalLong.empty());
+		long dynamicStart = db.cdcCreate(dynamicSub, null, List.of(col1), false,
+				java.util.OptionalLong.empty());
 
         db.put(0, col1, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("1".getBytes()), RequestType.none());
         db.put(0, col2, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("2".getBytes()), RequestType.none());
@@ -769,7 +771,8 @@ class CdcBugReproductionTest {
         long nextSeq = b1.nextSeq();
 
         // 2. Update subscription to only col2
-        db.cdcCreate(dynamicSub, null, List.of(col2), false, java.util.OptionalLong.empty());
+		db.cdcCreate(dynamicSub, null, List.of(col2), false,
+				java.util.OptionalLong.of(dynamicStart - 1L));
 
         db.put(0, col1, new Keys(new Buf[]{Buf.wrap(intToBytes(3))}), Buf.wrap("3".getBytes()), RequestType.none());
         db.put(0, col2, new Keys(new Buf[]{Buf.wrap(intToBytes(4))}), Buf.wrap("4".getBytes()), RequestType.none());
