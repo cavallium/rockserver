@@ -66,9 +66,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private static final Comparator<WorkloadTask> EDF_ORDER = Comparator
 			.comparingLong(WorkloadTask::deadlineEpochMillis)
 			.thenComparingLong(WorkloadTask::deadlineSequence);
-	private static final Comparator<WorkloadTask> EXPIRY_ORDER = Comparator
-			.comparingLong(WorkloadTask::monotonicDeadlineNanos)
-			.thenComparingLong(WorkloadTask::deadlineSequence);
 	private static final CounterHandle INERT_COUNTER = _ -> {};
 	private static final TimerHandle INERT_TIMER = _ -> {};
 	private static final TaskMetrics INERT_TASK_METRICS = TaskMetrics.inert();
@@ -89,6 +86,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			.thenComparingLong(deferred -> deferred.sequence));
 	private final CancellationIndex cancellationIndex = new CancellationIndex();
 	private int indexedDeadlineCount;
+	private boolean latencyBindingPresent;
+	private boolean latencyExpiryIndexed;
+	private long latencyBindingEpochMillis;
+	private long latencyBindingMonotonicNanos;
 	private final int[] queued = new int[PROFILES.length];
 	private final int[] active = new int[PROFILES.length];
 	private final int[] parked = new int[PROFILES.length];
@@ -514,8 +515,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						taskMetrics);
 				boolean becomesDeadlineHead = task.hasDeadline()
 						&& (indexedDeadlineCount == 0
-						|| EXPIRY_ORDER.compare(task, earliestDeadlineUnsafe()) < 0);
-				enqueueUnsafe(task);
+						|| expiryBefore(monotonicDeadlineNanos, task.deadlineSequence(),
+						earliestDeadlineNanosUnsafe(), earliestDeadlineUnsafe().deadlineSequence()));
+				enqueueUnsafe(task, monotonicDeadlineNanos);
 				incrementOutstandingUnsafe(profile);
 				admitCompetitionUnsafe(task);
 				acceptedTasks++;
@@ -779,7 +781,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		long earliestDeadlineNanos = indexedDeadlineCount == 0
 				? Long.MAX_VALUE
-				: earliestDeadlineUnsafe().monotonicDeadlineNanos();
+				: earliestDeadlineNanosUnsafe();
 		if (!deferredDeadlines.isEmpty()) {
 			earliestDeadlineNanos = Math.min(earliestDeadlineNanos,
 					Objects.requireNonNull(deferredDeadlines.peek()).monotonicDeadlineNanos);
@@ -791,7 +793,36 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (indexedDeadlineCount == 0) {
 			throw new IllegalStateException("No indexed workload deadline");
 		}
-		return deadlineQueue.first();
+		if (latencyExpiryIndexed) return deadlineQueue.first();
+		var latencyTask = latencyQueue.isEmpty() ? null : latencyQueue.first();
+		if (latencyTask != null && !latencyTask.hasDeadline()) latencyTask = null;
+		var otherTask = deadlineQueue.isEmpty() ? null : deadlineQueue.first();
+		if (latencyTask == null) return Objects.requireNonNull(otherTask, "Missing deadline task");
+		if (otherTask == null) return latencyTask;
+		return expiryBefore(alignedLatencyDeadlineNanosUnsafe(latencyTask), latencyTask.deadlineSequence(),
+				deadlineQueue.firstDeadlineKey(), otherTask.deadlineSequence()) ? latencyTask : otherTask;
+	}
+
+	private long earliestDeadlineNanosUnsafe() {
+		var task = earliestDeadlineUnsafe();
+		return deadlineNanosUnsafe(task);
+	}
+
+	private long deadlineNanosUnsafe(WorkloadTask task) {
+		if (task instanceof LatencyWorkloadTask) {
+			return latencyExpiryIndexed
+					? deadlineQueue.deadlineKey(task)
+					: alignedLatencyDeadlineNanosUnsafe(task);
+		}
+		return task.monotonicDeadlineNanos();
+	}
+
+	private static boolean expiryBefore(long leftDeadline,
+			long leftSequence,
+			long rightDeadline,
+			long rightSequence) {
+		int deadline = Long.compare(leftDeadline, rightDeadline);
+		return deadline < 0 || deadline == 0 && leftSequence < rightSequence;
 	}
 
 	private void incrementIndexedDeadlineCountUnsafe() {
@@ -821,7 +852,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					&& cancelSelectedUnsafe(task, dispatchCancellation, terminalActions)) {
 				continue;
 			}
-			if (task.hasDeadline() && nowNanos >= task.monotonicDeadlineNanos()) {
+			if (task.hasDeadline() && nowNanos >= deadlineNanosUnsafe(task)) {
 				unlinkUnsafe(task);
 				discardSelectionUnsafe(task);
 				terminateUnsafe(task,
@@ -1676,7 +1707,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		boolean expired = false;
 		while (indexedDeadlineCount != 0) {
 			var task = earliestDeadlineUnsafe();
-			if (nowNanos < task.monotonicDeadlineNanos()) {
+			if (nowNanos < deadlineNanosUnsafe(task)) {
 				if (expired) {
 					refreshPreemptionUnsafe();
 				}
@@ -1770,7 +1801,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					deferred,
 					deferred,
 					deferred.metrics);
-			enqueueUnsafe(task);
+			enqueueUnsafe(task, deferred.monotonicDeadlineNanos);
 			incrementOutstandingUnsafe(profile);
 			admitCompetitionUnsafe(task);
 			acceptedTasks++;
@@ -1779,9 +1810,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
-	private void enqueueUnsafe(WorkloadTask task) {
+	private void enqueueUnsafe(WorkloadTask task, long monotonicDeadlineNanos) {
 		int profileIndex = task.profileIndex();
 		if (task.hasProfile(WorkloadProfile.LATENCY)) {
+			prepareLatencyExpiryIndexUnsafe(task, monotonicDeadlineNanos);
 			if (!latencyQueue.add(task)) {
 				throw new IllegalStateException("Duplicate workload task sequence " + task.sequence());
 			}
@@ -1789,7 +1821,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			Objects.requireNonNull(queues[profileIndex], "Missing workload queue").addLast(task);
 		}
 		if (task.hasDeadline()) {
-			if (!deadlineQueue.add(task)) {
+			if ((!task.hasProfile(WorkloadProfile.LATENCY) || latencyExpiryIndexed)
+					&& !deadlineQueue.add(task, monotonicDeadlineNanos)) {
 				throw new IllegalStateException("Duplicate workload deadline sequence " + task.sequence());
 			}
 			incrementIndexedDeadlineCountUnsafe();
@@ -1804,6 +1837,65 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		task.markQueued();
 	}
 
+	private void prepareLatencyExpiryIndexUnsafe(WorkloadTask task, long monotonicDeadlineNanos) {
+		if (!task.hasDeadline()) return;
+		if (!latencyBindingPresent) {
+			latencyBindingPresent = true;
+			latencyBindingEpochMillis = task.deadlineEpochMillis();
+			latencyBindingMonotonicNanos = monotonicDeadlineNanos;
+			return;
+		}
+		if (latencyExpiryIndexed || affineRelationMatches(
+				latencyBindingEpochMillis,
+				latencyBindingMonotonicNanos,
+				task.deadlineEpochMillis(),
+				monotonicDeadlineNanos)) {
+			return;
+		}
+		latencyQueue.enableSecondaryIndices();
+		latencyExpiryIndexed = true;
+		latencyQueue.indexFiniteTasksIn(deadlineQueue, this::alignedLatencyDeadlineNanosUnsafe);
+	}
+
+	private long alignedLatencyDeadlineNanosUnsafe(WorkloadTask task) {
+		if (!latencyBindingPresent || !(task instanceof LatencyWorkloadTask)) {
+			throw new IllegalStateException("Missing aligned LATENCY deadline binding");
+		}
+		long epochDelta = task.deadlineEpochMillis() - latencyBindingEpochMillis;
+		if (subtractionOverflowed(task.deadlineEpochMillis(), latencyBindingEpochMillis, epochDelta)
+				|| epochDelta > Long.MAX_VALUE / 1_000_000L
+				|| epochDelta < Long.MIN_VALUE / 1_000_000L) {
+			throw new IllegalStateException("Aligned LATENCY deadline overflow");
+		}
+		long nanosDelta = epochDelta * 1_000_000L;
+		long result = latencyBindingMonotonicNanos + nanosDelta;
+		if (additionOverflowed(latencyBindingMonotonicNanos, nanosDelta, result)) {
+			throw new IllegalStateException("Aligned LATENCY monotonic deadline overflow");
+		}
+		return result;
+	}
+
+	private static boolean affineRelationMatches(long leftEpoch,
+			long leftMonotonic,
+			long rightEpoch,
+			long rightMonotonic) {
+		long epochDelta = rightEpoch - leftEpoch;
+		if (subtractionOverflowed(rightEpoch, leftEpoch, epochDelta)
+				|| epochDelta > Long.MAX_VALUE / 1_000_000L
+				|| epochDelta < Long.MIN_VALUE / 1_000_000L) return false;
+		long monotonicDelta = rightMonotonic - leftMonotonic;
+		return !subtractionOverflowed(rightMonotonic, leftMonotonic, monotonicDelta)
+				&& monotonicDelta == epochDelta * 1_000_000L;
+	}
+
+	private static boolean subtractionOverflowed(long left, long right, long result) {
+		return ((left ^ right) & (left ^ result)) < 0L;
+	}
+
+	private static boolean additionOverflowed(long left, long right, long result) {
+		return ((left ^ result) & (right ^ result)) < 0L;
+	}
+
 	private void enqueueCooperativeUnsafe(WorkloadTask task, boolean initialAdmission) {
 		int profileIndex = task.profileIndex();
 		var queue = cooperativeQueues[profileIndex];
@@ -1814,7 +1906,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (initialAdmission) {
 			admitCooperativeTaskUnsafe(task);
 			if (task.hasDeadline()) {
-				if (!deadlineQueue.add(task)) {
+				if (!deadlineQueue.add(task, task.monotonicDeadlineNanos())) {
 					throw new IllegalStateException("Duplicate cooperative workload deadline sequence "
 							+ task.sequence());
 				}
@@ -1838,19 +1930,21 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			return;
 		}
 		int profileIndex = task.profileIndex();
-		boolean removed = task.hasProfile(WorkloadProfile.LATENCY)
+		boolean latency = task.hasProfile(WorkloadProfile.LATENCY);
+		if (task.hasDeadline() && (!latency || latencyExpiryIndexed) && !deadlineQueue.remove(task)) {
+			throw new IllegalStateException("Finite-deadline workload task is not deadline-indexed: "
+					+ task.sequence());
+		}
+		boolean removed = latency
 				? latencyQueue.remove(task)
 				: Objects.requireNonNull(queues[profileIndex], "Missing workload queue").remove(task);
 		if (!removed) {
 			throw new IllegalStateException("Workload task is not queued: " + task.sequence());
 		}
 		if (task.hasDeadline()) {
-			if (!deadlineQueue.remove(task)) {
-				throw new IllegalStateException("Finite-deadline workload task is not deadline-indexed: "
-						+ task.sequence());
-			}
 			decrementIndexedDeadlineCountUnsafe();
 		}
+		if (latency && latencyQueue.isEmpty()) resetLatencyExpiryIndexUnsafe();
 		cancellationIndex.unlink(task);
 		cancellationIndex.unmap(task);
 		int remainingQueued = --queued[profileIndex];
@@ -1861,6 +1955,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (task.hasProfile(WorkloadProfile.BATCH) && !deferredAdmissions.isEmpty()) {
 			promoteDeferredUnsafe(WorkloadProfile.BATCH);
 		}
+	}
+
+	private void resetLatencyExpiryIndexUnsafe() {
+		if (latencyExpiryIndexed) latencyQueue.disableSecondaryIndices();
+		latencyBindingPresent = false;
+		latencyExpiryIndexed = false;
+		latencyBindingEpochMillis = 0L;
+		latencyBindingMonotonicNanos = 0L;
 	}
 
 	private void unlinkCooperativeQueuedUnsafe(WorkloadTask task) {
@@ -3252,9 +3354,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private static final class LatencyWorkloadTask extends WorkloadTask {
 
 		private final long deadlineEpochMillis;
-		private final long monotonicDeadlineNanos;
 		private int latencyHeapIndex = -1;
-		private int deadlineHeapIndex = -1;
 
 		private LatencyWorkloadTask(WorkloadProfile profile,
 		                                OperationFamily family,
@@ -3275,7 +3375,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					cancellationTask,
 					metrics);
 			this.deadlineEpochMillis = deadlineEpochMillis;
-			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 			if (deadlineEpochMillis != RequestContext.NO_DEADLINE) {
 				markHasDeadline();
 			}
@@ -3284,11 +3383,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		@Override
 		long deadlineEpochMillis() {
 			return deadlineEpochMillis;
-		}
-
-		@Override
-		long monotonicDeadlineNanos() {
-			return monotonicDeadlineNanos;
 		}
 
 		@Override
@@ -3301,21 +3395,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			latencyHeapIndex = index;
 		}
 
-		@Override
-		int deadlineHeapIndex() {
-			return deadlineHeapIndex;
-		}
-
-		@Override
-		void deadlineHeapIndex(int index) {
-			deadlineHeapIndex = index;
-		}
-
 	}
 
 	private static final class DeadlineWorkloadTask extends WorkloadTask {
 
-		private final long deadlineEpochMillis;
 		private final long monotonicDeadlineNanos;
 		private int deadlineHeapIndex = -1;
 
@@ -3337,14 +3420,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					command,
 					cancellationTask,
 					metrics);
-			this.deadlineEpochMillis = deadlineEpochMillis;
 			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 			markHasDeadline();
-		}
-
-		@Override
-		long deadlineEpochMillis() {
-			return deadlineEpochMillis;
 		}
 
 		@Override
@@ -3426,7 +3503,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private static final class OrderedCooperativeWorkloadTask extends CooperativeWorkloadTask {
 
-		private final long deadlineEpochMillis;
 		private final long monotonicDeadlineNanos;
 		private int deadlineHeapIndex = -1;
 
@@ -3448,16 +3524,10 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					cost,
 					command,
 					metrics);
-			this.deadlineEpochMillis = deadlineEpochMillis;
 			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 			if (deadlineEpochMillis != RequestContext.NO_DEADLINE) {
 				markHasDeadline();
 			}
-		}
-
-		@Override
-		long deadlineEpochMillis() {
-			return deadlineEpochMillis;
 		}
 
 		@Override
@@ -3497,16 +3567,19 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	 * Intrusive binary heap for dispatch or expiry indexes. The backing reference array is contiguous and grows
 	 * only at a new queue high-water mark; task insertion/removal allocates no per-entry tree node.
 	 */
-	private static final class TaskHeap {
+	private final class TaskHeap {
 
 		private static final int INITIAL_CAPACITY = 16;
 
 		private final boolean deadlineIndex;
 		private WorkloadTask[] elements = new WorkloadTask[INITIAL_CAPACITY];
+		private @Nullable long[] deadlineKeys;
+		private @Nullable int[] secondaryIndices;
 		private int size;
 
 		private TaskHeap(boolean deadlineIndex) {
 			this.deadlineIndex = deadlineIndex;
+			this.deadlineKeys = deadlineIndex ? new long[INITIAL_CAPACITY] : null;
 		}
 
 		private boolean isEmpty() {
@@ -3520,14 +3593,37 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			return Objects.requireNonNull(elements[0]);
 		}
 
+		private long firstDeadlineKey() {
+			if (!deadlineIndex || size == 0) {
+				throw new IllegalStateException("Deadline task heap is empty");
+			}
+			return Objects.requireNonNull(deadlineKeys)[0];
+		}
+
 		private boolean add(WorkloadTask task) {
+			if (deadlineIndex) {
+				throw new IllegalStateException("Deadline heap requires an immutable key");
+			}
+			return add(task, 0L);
+		}
+
+		private boolean add(WorkloadTask task, long deadlineKey) {
 			if (indexOf(task) >= 0) {
 				return false;
 			}
 			ensureCapacity(size + 1);
-			siftUp(size, task);
+			siftUp(size, task, deadlineKey);
 			size++;
 			return true;
+		}
+
+		private long deadlineKey(WorkloadTask task) {
+			if (!deadlineIndex) throw new IllegalStateException("EDF heap has no deadline keys");
+			int index = indexOf(task);
+			if (index < 0 || index >= size || elements[index] != task) {
+				throw new IllegalStateException("Task is not in the deadline heap");
+			}
+			return Objects.requireNonNull(deadlineKeys)[index];
 		}
 
 		private boolean remove(WorkloadTask task) {
@@ -3540,58 +3636,85 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			}
 			int lastIndex = --size;
 			var moved = elements[lastIndex];
+			long movedKey = deadlineIndex ? Objects.requireNonNull(deadlineKeys)[lastIndex] : 0L;
 			elements[lastIndex] = null;
+			if (deadlineIndex) Objects.requireNonNull(deadlineKeys)[lastIndex] = 0L;
 			setIndex(task, -1);
 			if (index == lastIndex) {
+				if (!deadlineIndex && secondaryIndices != null) secondaryIndices[index] = -1;
 				return true;
 			}
 			var movedTask = Objects.requireNonNull(moved);
 			int parentIndex = (index - 1) >>> 1;
-			if (index > 0 && compare(movedTask, elements[parentIndex]) < 0) {
-				siftUp(index, movedTask);
+			if (index > 0 && compare(movedTask, movedKey,
+					Objects.requireNonNull(elements[parentIndex]), key(parentIndex)) < 0) {
+				siftUp(index, movedTask, movedKey);
 			} else {
-				siftDown(index, movedTask);
+				siftDown(index, movedTask, movedKey);
 			}
 			return true;
 		}
 
-		private void siftUp(int index, WorkloadTask task) {
+		private void siftUp(int index, WorkloadTask task, long taskKey) {
+			int taskSecondaryIndex = secondaryIndexRaw(task);
 			while (index > 0) {
 				int parentIndex = (index - 1) >>> 1;
 				var parent = Objects.requireNonNull(elements[parentIndex]);
-				if (compare(task, parent) >= 0) {
+				long parentKey = key(parentIndex);
+				if (compare(task, taskKey, parent, parentKey) >= 0) {
 					break;
 				}
-				elements[index] = parent;
-				setIndex(parent, index);
+				move(parent, parentKey, index, secondaryIndexRaw(parent));
 				index = parentIndex;
 			}
-			elements[index] = task;
-			setIndex(task, index);
+			move(task, taskKey, index, taskSecondaryIndex);
 		}
 
-		private void siftDown(int index, WorkloadTask task) {
+		private void siftDown(int index, WorkloadTask task, long taskKey) {
+			int taskSecondaryIndex = secondaryIndexRaw(task);
 			int half = size >>> 1;
 			while (index < half) {
 				int childIndex = (index << 1) + 1;
 				var child = Objects.requireNonNull(elements[childIndex]);
+				long childKey = key(childIndex);
 				int rightIndex = childIndex + 1;
 				if (rightIndex < size) {
 					var right = Objects.requireNonNull(elements[rightIndex]);
-					if (compare(right, child) < 0) {
+					long rightKey = key(rightIndex);
+					if (compare(right, rightKey, child, childKey) < 0) {
 						childIndex = rightIndex;
 						child = right;
+						childKey = rightKey;
 					}
 				}
-				if (compare(task, child) <= 0) {
+				if (compare(task, taskKey, child, childKey) <= 0) {
 					break;
 				}
-				elements[index] = child;
-				setIndex(child, index);
+				move(child, childKey, index, secondaryIndexRaw(child));
 				index = childIndex;
 			}
+			move(task, taskKey, index, taskSecondaryIndex);
+		}
+
+		private void move(WorkloadTask task, long taskKey, int index, int secondaryIndex) {
+			if (!deadlineIndex && secondaryIndices != null) {
+				int oldIndex = task.latencyHeapIndex();
+				if (oldIndex >= 0 && oldIndex != index) secondaryIndices[oldIndex] = -1;
+				secondaryIndices[index] = secondaryIndex;
+			}
 			elements[index] = task;
+			if (deadlineIndex) Objects.requireNonNull(deadlineKeys)[index] = taskKey;
 			setIndex(task, index);
+		}
+
+		private int secondaryIndexRaw(WorkloadTask task) {
+			if (deadlineIndex || secondaryIndices == null) return -1;
+			int index = task.latencyHeapIndex();
+			return index < 0 ? -1 : secondaryIndices[index];
+		}
+
+		private long key(int index) {
+			return deadlineIndex ? Objects.requireNonNull(deadlineKeys)[index] : 0L;
 		}
 
 		private void ensureCapacity(int required) {
@@ -3599,11 +3722,20 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				return;
 			}
 			int grown = elements.length + (elements.length >>> 1);
-			elements = Arrays.copyOf(elements, Math.max(required, grown));
+			int newLength = Math.max(required, grown);
+			elements = Arrays.copyOf(elements, newLength);
+			if (deadlineIndex) deadlineKeys = Arrays.copyOf(Objects.requireNonNull(deadlineKeys), newLength);
+			if (secondaryIndices != null) {
+				int oldLength = secondaryIndices.length;
+				secondaryIndices = Arrays.copyOf(secondaryIndices, newLength);
+				Arrays.fill(secondaryIndices, oldLength, newLength, -1);
+			}
 		}
 
-		private int compare(WorkloadTask left, WorkloadTask right) {
-			return (deadlineIndex ? EXPIRY_ORDER : EDF_ORDER).compare(left, right);
+		private int compare(WorkloadTask left, long leftKey, WorkloadTask right, long rightKey) {
+			if (!deadlineIndex) return EDF_ORDER.compare(left, right);
+			int deadline = Long.compare(leftKey, rightKey);
+			return deadline != 0 ? deadline : Long.compare(left.deadlineSequence(), right.deadlineSequence());
 		}
 
 		private void collectSequenceOwners(IdentityHashMap<Object, Boolean> target) {
@@ -3613,14 +3745,67 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		private int indexOf(WorkloadTask task) {
-			return deadlineIndex ? task.deadlineHeapIndex() : task.latencyHeapIndex();
+			if (!deadlineIndex) return task.latencyHeapIndex();
+			return task instanceof LatencyWorkloadTask
+					? latencyQueue.secondaryIndex(task)
+					: task.deadlineHeapIndex();
 		}
 
 		private void setIndex(WorkloadTask task, int index) {
 			if (deadlineIndex) {
-				task.deadlineHeapIndex(index);
+				if (task instanceof LatencyWorkloadTask) {
+					latencyQueue.secondaryIndex(task, index);
+				} else {
+					task.deadlineHeapIndex(index);
+				}
 			} else {
 				task.latencyHeapIndex(index);
+			}
+		}
+
+		private void enableSecondaryIndices() {
+			if (deadlineIndex || secondaryIndices != null) {
+				throw new IllegalStateException("Latency secondary indexes already enabled");
+			}
+			secondaryIndices = new int[elements.length];
+			Arrays.fill(secondaryIndices, -1);
+		}
+
+		private void disableSecondaryIndices() {
+			if (deadlineIndex) throw new IllegalStateException("Deadline heap has no secondary indexes");
+			for (int index = 0; index < size; index++) {
+				if (Objects.requireNonNull(secondaryIndices)[index] >= 0) {
+					throw new IllegalStateException("Latency task remains expiry-indexed");
+				}
+			}
+			secondaryIndices = null;
+		}
+
+		private int secondaryIndex(WorkloadTask task) {
+			int latencyIndex = task.latencyHeapIndex();
+			if (secondaryIndices == null || latencyIndex < 0 || latencyIndex >= size
+					|| elements[latencyIndex] != task) return -1;
+			return secondaryIndices[latencyIndex];
+		}
+
+		private void secondaryIndex(WorkloadTask task, int deadlineIndex) {
+			int latencyIndex = task.latencyHeapIndex();
+			if (secondaryIndices == null || latencyIndex < 0 || latencyIndex >= size
+					|| elements[latencyIndex] != task) {
+				throw new IllegalStateException("Latency task has no primary EDF index");
+			}
+			secondaryIndices[latencyIndex] = deadlineIndex;
+		}
+
+		private void indexFiniteTasksIn(TaskHeap target, java.util.function.ToLongFunction<WorkloadTask> keys) {
+			if (deadlineIndex || !target.deadlineIndex || secondaryIndices == null) {
+				throw new IllegalStateException("Invalid adaptive expiry index build");
+			}
+			for (int index = 0; index < size; index++) {
+				var task = Objects.requireNonNull(elements[index]);
+				if (task.hasDeadline() && !target.add(task, keys.applyAsLong(task))) {
+					throw new IllegalStateException("Duplicate adaptive latency expiry task");
+				}
 			}
 		}
 	}
