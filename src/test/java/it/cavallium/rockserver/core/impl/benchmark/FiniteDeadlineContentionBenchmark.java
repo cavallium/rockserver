@@ -702,8 +702,15 @@ public final class FiniteDeadlineContentionBenchmark {
 			if (warmupOperations <= 0 || !alternateStoragePressure) {
 				throw new IllegalArgumentException("Positive warmup and alternating storage pressure are required");
 			}
-			measuredConfig().validate();
-			warmupConfig().validate();
+			new SchedulerHighContentionBenchmark.Config(operations, submitters, readWorkers, writeWorkers,
+					analyticalLimit, foregroundCapacity, batchCapacity, workTokens, cooperativeYields,
+					cooperativeParks, expiredDeadlinePercent, cancellationPercent, failurePercent,
+					cooperativePercent, alternateStoragePressure, seed, timeout).validate();
+			new SchedulerHighContentionBenchmark.Config(warmupOperations, Math.min(submitters, 32),
+					readWorkers, writeWorkers, analyticalLimit, Math.min(foregroundCapacity, 8_192),
+					Math.min(batchCapacity, 8_192), workTokens, cooperativeYields, cooperativeParks,
+					expiredDeadlinePercent, cancellationPercent, failurePercent, cooperativePercent,
+					alternateStoragePressure, seed ^ 0xD1B54A32D192ED03L, timeout).validate();
 		}
 
 		static Prepared fromArguments(Map<String, String> arguments) throws IOException {

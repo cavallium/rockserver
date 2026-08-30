@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-finite-deadline-contention-worker-v2",
+  "title": "Rockserver finite-deadline contention worker v2",
+  "type": "object",
+  "required": [
+    "artifact-schema", "round", "ordinal", "implementation", "build-sha",
+    "configuration-sha256", "metric-set-sha256", "host-sha256", "hardware-description",
+    "runtime-sha256", "harness-sha256", "classpath-sha256", "production-sha256",
+    "process-id", "started-epoch-millis", "finished-epoch-millis", "gate-correctness",
+    "gate-terminal-conservation", "gate-progress", "gate-drain", "gate-pressure", "gate-bounds",
+    "schema", "operations", "seed", "submitters", "latency_finite_deadlines", "elapsed_nanos",
+    "attempts_per_second", "useful_runs_per_second", "accepted", "runs",
+    "yield_transitions", "park_transitions", "pressure_transitions", "injected_failures"
+  ],
+  "properties": {
+    "artifact-schema": { "const": "rockserver-finite-deadline-contention-worker-v2" },
+    "round": { "type": "integer", "minimum": 1 },
+    "ordinal": { "type": "integer", "minimum": 1 },
+    "implementation": { "enum": ["baseline", "candidate"] },
+    "build-sha": { "$ref": "#/$defs/gitSha" },
+    "configuration-sha256": { "$ref": "#/$defs/sha256" },
+    "metric-set-sha256": { "$ref": "#/$defs/sha256" },
+    "host-sha256": { "$ref": "#/$defs/sha256" },
+    "hardware-description": { "type": "string", "minLength": 1 },
+    "runtime-sha256": { "$ref": "#/$defs/sha256" },
+    "harness-sha256": { "$ref": "#/$defs/sha256" },
+    "classpath-sha256": { "$ref": "#/$defs/sha256" },
+    "production-sha256": { "$ref": "#/$defs/sha256" },
+    "process-id": { "type": "integer", "minimum": 1 },
+    "started-epoch-millis": { "type": "integer", "minimum": 1 },
+    "finished-epoch-millis": { "type": "integer", "minimum": 1 },
+    "gate-correctness": { "const": true },
+    "gate-terminal-conservation": { "const": true },
+    "gate-progress": { "const": true },
+    "gate-drain": { "const": true },
+    "gate-pressure": { "const": true },
+    "gate-bounds": { "const": true },
+    "schema": { "const": "rockserver-scheduler-high-contention-v2" },
+    "operations": { "type": "integer", "minimum": 1 },
+    "seed": { "type": "integer" },
+    "submitters": { "type": "integer", "minimum": 2 },
+    "latency_finite_deadlines": { "const": true },
+    "elapsed_nanos": { "type": "integer", "minimum": 1 },
+    "attempts_per_second": { "type": "number", "exclusiveMinimum": 0 },
+    "useful_runs_per_second": { "type": "number", "exclusiveMinimum": 0 },
+    "accepted": { "type": "integer", "minimum": 0 },
+    "runs": { "type": "integer", "minimum": 1 },
+    "yield_transitions": { "type": "integer", "minimum": 1 },
+    "park_transitions": { "type": "integer", "minimum": 1 },
+    "pressure_transitions": { "type": "integer", "minimum": 1 },
+    "injected_failures": { "type": "integer", "minimum": 0 }
+  },
+  "patternProperties": {
+    "^(pressure|process|outcome|profile|family|pool)\\.[a-z0-9_.]+$": {
+      "type": ["integer", "number", "boolean"]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

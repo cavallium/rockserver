@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rockserver:benchmark:rockserver-finite-deadline-contention-comparison-v2",
+  "title": "Rockserver finite-deadline contention comparison v2",
+  "type": "object",
+  "required": [
+    "schema", "evaluated_at", "baseline_sha", "candidate_sha", "configuration_sha256",
+    "metric_set_sha256", "fixed_pairs", "fresh_processes", "adaptive_stopping",
+    "family_wise_alpha", "throughput_minimum_ratio", "cost_maximum_ratio", "multiplicity",
+    "runtime_sha256", "host_sha256", "harness_sha256", "baseline_production_sha256",
+    "candidate_production_sha256", "baseline_classpath_sha256", "candidate_classpath_sha256",
+    "decision", "failures", "inconclusive_metrics", "metrics"
+  ],
+  "properties": {
+    "schema": { "const": "rockserver-finite-deadline-contention-comparison-v2" },
+    "evaluated_at": { "type": "string", "format": "date-time" },
+    "baseline_sha": { "$ref": "#/$defs/gitSha" },
+    "candidate_sha": { "$ref": "#/$defs/gitSha" },
+    "configuration_sha256": { "$ref": "#/$defs/sha256" },
+    "metric_set_sha256": { "$ref": "#/$defs/sha256" },
+    "fixed_pairs": { "type": "integer", "minimum": 10 },
+    "fresh_processes": { "type": "integer", "minimum": 20 },
+    "adaptive_stopping": { "const": false },
+    "family_wise_alpha": { "const": 0.05 },
+    "throughput_minimum_ratio": { "const": 0.99 },
+    "cost_maximum_ratio": { "const": 1.02 },
+    "multiplicity": { "const": "holm-bonferroni" },
+    "runtime_sha256": { "$ref": "#/$defs/sha256" },
+    "host_sha256": { "$ref": "#/$defs/sha256" },
+    "harness_sha256": { "$ref": "#/$defs/sha256" },
+    "baseline_production_sha256": { "$ref": "#/$defs/sha256" },
+    "candidate_production_sha256": { "$ref": "#/$defs/sha256" },
+    "baseline_classpath_sha256": { "$ref": "#/$defs/sha256" },
+    "candidate_classpath_sha256": { "$ref": "#/$defs/sha256" },
+    "decision": { "enum": ["pass", "fail", "inconclusive"] },
+    "failures": { "type": "array", "items": { "type": "string" } },
+    "inconclusive_metrics": { "type": "array", "items": { "type": "string" } },
+    "metrics": {
+      "type": "object",
+      "required": [
+        "attempts-throughput", "useful-throughput", "latency-throughput",
+        "latency-queue-p99", "latency-end-to-end-p99", "latency-maximum-progress-gap",
+        "cpu-per-attempt", "allocation-per-attempt"
+      ],
+      "properties": {
+        "attempts-throughput": { "$ref": "#/$defs/metric" },
+        "useful-throughput": { "$ref": "#/$defs/metric" },
+        "latency-throughput": { "$ref": "#/$defs/metric" },
+        "latency-queue-p99": { "$ref": "#/$defs/metric" },
+        "latency-end-to-end-p99": { "$ref": "#/$defs/metric" },
+        "latency-maximum-progress-gap": { "$ref": "#/$defs/metric" },
+        "cpu-per-attempt": { "$ref": "#/$defs/metric" },
+        "allocation-per-attempt": { "$ref": "#/$defs/metric" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "vector": { "type": "array", "minItems": 10, "items": { "type": ["number", "null"] } },
+    "numberOrNull": { "type": ["number", "null"] },
+    "metric": {
+      "type": "object",
+      "required": [
+        "direction", "baseline", "candidate", "ratio_mean", "lower_95", "upper_95",
+        "regression_holm_p", "regression_demonstrated", "noninferiority_p", "noninferiority_proven"
+      ],
+      "properties": {
+        "direction": { "enum": ["higher", "lower"] },
+        "baseline": { "$ref": "#/$defs/vector" },
+        "candidate": { "$ref": "#/$defs/vector" },
+        "ratio_mean": { "$ref": "#/$defs/numberOrNull" },
+        "lower_95": { "$ref": "#/$defs/numberOrNull" },
+        "upper_95": { "$ref": "#/$defs/numberOrNull" },
+        "regression_holm_p": { "$ref": "#/$defs/numberOrNull" },
+        "regression_demonstrated": { "type": "boolean" },
+        "noninferiority_p": { "$ref": "#/$defs/numberOrNull" },
+        "noninferiority_proven": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}
