@@ -96,6 +96,60 @@ fixed counterbalanced pairs per suite (40 fresh JVMs). Results follow
 the v1 worker serialization format; they are raw measurements, and their v2 configuration hash
 binds them exclusively to the fresh v2 schedule.
 
+## Read-only precision planner
+
+An `INCONCLUSIVE` v2 result is not a failure and must not be re-evaluated with selected metrics or
+new margins. `PressurePerformancePrecisionPlanner` reads the immutable v2 metadata, schedule,
+worker artifacts, and comparison result; revalidates every worker identity, configuration,
+correctness flag, process ID, order, host, and runtime; and verifies that the workers still
+reproduce the recorded `INCONCLUSIVE` decision. It refuses v1, `PASS`, `FAIL`, incomplete,
+tampered, or already-planned roots.
+
+The planner uses all predeclared stochastic metrics. For each metric it computes the sample
+standard deviation `s` of the ten paired log ratios. It deliberately plans at true equality,
+not at the observed favorable or unfavorable mean. For a log non-inferiority margin `m`, fixed
+pair count `n`, and one-sided alpha `0.05`, version 1 reports the transparent normal-power
+approximation
+
+```text
+power(n) = Phi(m * sqrt(n) / s - t(0.95, n - 1)).
+```
+
+It reports the smallest fixed `n` reaching the target and the alternative worker-duration scale
+assuming variance falls inversely with measured work. This assumption is explicit evidence
+planning, not a guarantee; the fresh run remains authoritative.
+
+The desired probability that every metric proves non-inferiority is `0.90`. A union-bound design
+spends beta `0.03` on 54 scheduler-quality metrics and beta `0.07` on all remaining stochastic
+metrics. Queue p99, end-to-end p99, and maximum progress-gap metrics are predeclared critical, so
+their per-metric target is stricter. Deadline accounting, terminal conservation, progress, drain,
+shutdown, and leaks remain hard correctness gates rather than variance-planned metrics. The
+planner never recommends relaxing the `0.99`/`1.02` margins.
+
+The executable next-run alternative keeps ten fixed pairs and no adaptive stopping. It scales
+`scheduler-operations`; and, independently, signal measured column observations plus minimum and
+maximum evaluations by the ceiling of the worst required duration factor in each suite. It writes:
+
+- `precision-plan.json`, schema
+  `benchmarks/schemas/pressure-performance-precision-plan-v1.schema.json`;
+- `precision-plan.md`, with the limiting metrics first;
+- `next-run-v2.properties`, the complete predeclared fixed configuration.
+
+Run it against the baseline and candidate production class roots:
+
+```bash
+java -cp "${workload_classpath}" \
+  it.cavallium.rockserver.core.impl.benchmark.PressurePerformancePrecisionPlanner \
+  --root=/mnt/bench/pressure-paired-v2 \
+  --baseline-classes=/path/to/baseline/target/classes \
+  --candidate-classes=/path/to/candidate/target/classes
+```
+
+The planner hashes exactly
+`it/cavallium/rockserver/core/impl/StoragePressureSignal.class` in both roots. Equality is recorded
+only as component-byte provenance for the unchanged signal evaluator. It never changes the source
+decision, removes signal metrics, reduces required evidence, or supplies a statistical PASS.
+
 Metrics-on/off is not folded into this controller: the high-contention harness currently constructs
 an unmetered scheduler, and changing the measured workload to register Micrometer only on one side
 would no longer be an ablation of identical code paths. Use the existing fresh-process
