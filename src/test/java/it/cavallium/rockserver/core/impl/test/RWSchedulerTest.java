@@ -522,6 +522,51 @@ class RWSchedulerTest {
 	}
 
 	@Test
+	void losingPeerDispatchabilityWakesPoolWaitingForFairPressureTurn() throws Exception {
+		var scheduler = scheduler(1, "pressure-dispatchability-transition");
+		var firstReadStarted = new CountDownLatch(1);
+		var releaseFirstRead = new CountDownLatch(1);
+		var secondReadStarted = new CountDownLatch(1);
+		var writeForegroundStarted = new CountDownLatch(1);
+		var releaseWriteForeground = new CountDownLatch(1);
+		try {
+			scheduler.setStoragePressure(true);
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				firstReadStarted.countDown();
+				awaitUninterruptibly(releaseFirstRead);
+			});
+			assertTrue(firstReadStarted.await(5, SECONDS));
+
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.MUTATION,
+					RequestContext.NO_DEADLINE).execute(() -> {});
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).execute(secondReadStarted::countDown);
+			releaseFirstRead.countDown();
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)
+					.outcomes().get(RWScheduler.TerminalOutcome.RUN) == 1L);
+
+			scheduler.executor(WorkloadProfile.LATENCY,
+					OperationFamily.MUTATION,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				writeForegroundStarted.countDown();
+				awaitUninterruptibly(releaseWriteForeground);
+			});
+			assertTrue(writeForegroundStarted.await(5, SECONDS));
+			assertTrue(secondReadStarted.await(2_500L, TimeUnit.MILLISECONDS),
+					"READ's indefinite fair-turn wait must be signaled when WRITE becomes nondispatchable");
+		} finally {
+			releaseFirstRead.countDown();
+			releaseWriteForeground.countDown();
+			scheduler.setStoragePressure(false);
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void cancellationImmediatelyBeforeRunDoesNotConsumeAPressureInterval() throws Exception {
 		var scheduler = scheduler(1, "pressure-cancel-test");
 		var blockerStarted = new CountDownLatch(1);
