@@ -97,6 +97,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final Condition workAvailable = lock.newCondition();
 	private final List<Thread> workers = new ArrayList<>();
 	private final WorkloadPressureController pressureController;
+	private final SchedulerDeadlineClock deadlineClock;
 	private final String databaseName;
 	private final String resourceKind;
 	private final RWScheduler.Pool resourcePool;
@@ -142,6 +143,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	                         String resourceKind,
 	                         RWScheduler.Pool resourcePool,
 	                         WorkloadPressureController pressureController,
+	                         SchedulerDeadlineClock deadlineClock,
 	                         @Nullable MeterRegistry registry,
 	                         String databaseName) {
 		if (workerCount < 1) {
@@ -165,6 +167,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			this.quanta[profile.ordinal()] = quantum;
 		}
 		this.pressureController = Objects.requireNonNull(pressureController, "pressureController");
+		this.deadlineClock = Objects.requireNonNull(deadlineClock, "deadlineClock");
 		this.databaseName = Objects.requireNonNull(databaseName, "databaseName");
 		this.resourceKind = Objects.requireNonNull(resourceKind, "resourceKind");
 		this.resourcePool = Objects.requireNonNull(resourcePool, "resourcePool");
@@ -230,7 +233,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		try {
 			long nowMillis = deadlineEpochMillis == RequestContext.NO_DEADLINE
 					? 0L
-					: System.currentTimeMillis();
+					: deadlineClock.epochMillis();
 			if (deadlineEpochMillis != RequestContext.NO_DEADLINE && nowMillis >= deadlineEpochMillis) {
 				admissionFailure = deadlineFailure("Workload deadline expired before deferred admission");
 				admissionOutcome = RWScheduler.TerminalOutcome.DEADLINE;
@@ -309,7 +312,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		try {
 			boolean hasQueuedDeadlines = indexedDeadlineCount != 0;
 			long nowMillis = deadlineEpochMillis != RequestContext.NO_DEADLINE || hasQueuedDeadlines
-					? System.currentTimeMillis()
+					? deadlineClock.epochMillis()
 					: 0L;
 			if (hasQueuedDeadlines) {
 				terminalActions = expireDueUnsafe(nowMillis, terminalActions);
@@ -397,7 +400,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		try {
 			boolean hasQueuedDeadlines = indexedDeadlineCount != 0;
 			long nowMillis = deadlineEpochMillis != RequestContext.NO_DEADLINE || hasQueuedDeadlines
-					? System.currentTimeMillis()
+					? deadlineClock.epochMillis()
 					: 0L;
 			if (hasQueuedDeadlines) {
 				terminalActions = expireDueUnsafe(nowMillis, terminalActions);
@@ -620,7 +623,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				try {
 					long nowMillis = 0L;
 					if (indexedDeadlineCount != 0 || !deferredDeadlines.isEmpty()) {
-						nowMillis = System.currentTimeMillis();
+						nowMillis = deadlineClock.epochMillis();
 					}
 					if (indexedDeadlineCount != 0) {
 						expireDueUnsafe(nowMillis, terminalActions);
@@ -707,7 +710,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			earliestDeadlineMillis = Math.min(earliestDeadlineMillis,
 					Objects.requireNonNull(deferredDeadlines.peek()).deadlineEpochMillis);
 		}
-		long remainingMillis = earliestDeadlineMillis - System.currentTimeMillis();
+		long remainingMillis = earliestDeadlineMillis - deadlineClock.epochMillis();
 		return remainingMillis <= 0L ? 0L : TimeUnit.MILLISECONDS.toNanos(remainingMillis);
 	}
 
@@ -3094,7 +3097,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (cooperativeTask.requestedTermination != null) {
 				return true;
 			}
-			if (hasDeadline() && System.currentTimeMillis() >= deadlineEpochMillis()) {
+			if (hasDeadline() && cooperativeTask().owner.deadlineClock.epochMillis() >= deadlineEpochMillis()) {
 				CooperativeWorkloadTask.REQUESTED_TERMINATION.compareAndSet(
 						cooperativeTask, null, new RequestedTermination(
 						RWScheduler.TerminalOutcome.DEADLINE,

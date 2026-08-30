@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,24 +64,27 @@ public final class RWScheduler {
 	private final WorkloadExecutor[][] noDeadlineExecutors;
 
 	public RWScheduler(int readCap, int writeCap, String name) {
-		this(WorkloadSettings.defaults(readCap, writeCap), name, null, name, true);
+		this(WorkloadSettings.defaults(readCap, writeCap), name, null, name, true,
+				SchedulerDeadlineClock.system());
 	}
 
 	public RWScheduler(WorkloadSettings settings,
 			String name,
 			@Nullable MeterRegistry registry,
 			String databaseName) {
-		this(settings, name, registry, databaseName, true);
+		this(settings, name, registry, databaseName, true, SchedulerDeadlineClock.system());
 	}
 
 	private RWScheduler(WorkloadSettings settings,
 			String name,
 			@Nullable MeterRegistry registry,
 			String databaseName,
-			boolean productionCapacities) {
+			boolean productionCapacities,
+			SchedulerDeadlineClock deadlineClock) {
 		Objects.requireNonNull(settings, "settings");
 		Objects.requireNonNull(name, "name");
 		Objects.requireNonNull(databaseName, "databaseName");
+		Objects.requireNonNull(deadlineClock, "deadlineClock");
 		if (productionCapacities
 				&& (settings.readParallelism() < WorkloadSettings.MIN_PRODUCTION_DATA_THREADS
 				|| settings.writeParallelism() < WorkloadSettings.MIN_PRODUCTION_DATA_THREADS)) {
@@ -106,6 +110,7 @@ public final class RWScheduler {
 				"read",
 				Pool.READ,
 				pressureController,
+				deadlineClock,
 				registry,
 				databaseName);
 		this.writePool = new ProfiledWorkloadExecutor(settings.writeParallelism(),
@@ -118,6 +123,7 @@ public final class RWScheduler {
 				"write",
 				Pool.WRITE,
 				pressureController,
+				deadlineClock,
 				registry,
 				databaseName);
 		this.controlPool = new ProfiledWorkloadExecutor(settings.controlThreads(),
@@ -130,6 +136,7 @@ public final class RWScheduler {
 				"control",
 				Pool.CONTROL,
 				pressureController,
+				deadlineClock,
 				registry,
 				databaseName);
 		this.physicalPool = new ProfiledWorkloadExecutor(settings.physicalConcurrency(),
@@ -142,6 +149,7 @@ public final class RWScheduler {
 				"physical",
 				Pool.PHYSICAL,
 				pressureController,
+				deadlineClock,
 				registry,
 				databaseName);
 		this.pools = List.of(readPool, writePool, controlPool, physicalPool);
@@ -220,7 +228,8 @@ public final class RWScheduler {
 				name,
 				null,
 				name,
-				false);
+				false,
+				SchedulerDeadlineClock.system());
 	}
 
 	/** Explicit low-capacity construction with metrics for deterministic scheduler tests only. */
@@ -240,7 +249,29 @@ public final class RWScheduler {
 				name,
 				registry,
 				databaseName,
-				false);
+				false,
+				SchedulerDeadlineClock.system());
+	}
+
+	@VisibleForTesting
+	static RWScheduler forTesting(int readCap,
+			int writeCap,
+			int analyticalCap,
+			int foregroundQueueCapacity,
+			int batchQueueCapacity,
+			String name,
+			LongSupplier epochMillisSource,
+			LongSupplier nanoTimeSource) {
+		return new RWScheduler(WorkloadSettings.testingDefaults(readCap,
+				writeCap,
+				analyticalCap,
+				foregroundQueueCapacity,
+				batchQueueCapacity),
+				name,
+				null,
+				name,
+				false,
+				SchedulerDeadlineClock.testing(epochMillisSource, nanoTimeSource));
 	}
 
 	/** Resolve and validate the caller context, then return its resource-specific view. */
