@@ -63,12 +63,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			WorkloadProfile.CONTROL,
 			WorkloadProfile.PHYSICAL_MAINTENANCE
 	};
-	private static final Comparator<WorkloadTask> DEADLINE_ORDER = (left, right) -> {
-		int deadlineOrder = Long.compare(left.deadlineEpochMillis(), right.deadlineEpochMillis());
-		return deadlineOrder != 0
-				? deadlineOrder
-				: compareSequence(left.deadlineSequence(), right.deadlineSequence());
-	};
+	private static final Comparator<WorkloadTask> DEADLINE_ORDER = Comparator
+			.comparingLong(WorkloadTask::deadlineEpochMillis)
+			.thenComparingLong(WorkloadTask::deadlineSequence);
 	private static final CounterHandle INERT_COUNTER = _ -> {};
 	private static final TimerHandle INERT_TIMER = _ -> {};
 	private static final TaskMetrics INERT_TASK_METRICS = TaskMetrics.inert();
@@ -84,12 +81,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final TaskQueue[] cooperativeQueues = new TaskQueue[PROFILES.length];
 	private final TaskHeap deadlineQueue = new TaskHeap(true);
 	private final ArrayDeque<DeferredAdmission> deferredAdmissions = new ArrayDeque<>();
-	private final PriorityQueue<DeferredAdmission> deferredDeadlines = new PriorityQueue<>((left, right) -> {
-		int deadlineOrder = Long.compare(left.deadlineEpochMillis, right.deadlineEpochMillis);
-		return deadlineOrder != 0
-				? deadlineOrder
-				: compareSequence(left.sequence, right.sequence);
-	});
+	private final PriorityQueue<DeferredAdmission> deferredDeadlines = new PriorityQueue<>(Comparator
+			.comparingLong((DeferredAdmission deferred) -> deferred.deadlineEpochMillis)
+			.thenComparingLong(deferred -> deferred.sequence));
 	private final CancellationIndex cancellationIndex = new CancellationIndex();
 	private int indexedDeadlineCount;
 	private final int[] queued = new int[PROFILES.length];
@@ -499,16 +493,15 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	 * many later submissions.</p>
 	 */
 	private long nextSequenceUnsafe() {
-		if (sequence < 0L) {
-			throw new IllegalStateException("Workload ordering sequence wrapped without rebasing");
+		long next = sequence;
+		if (next != Long.MAX_VALUE) {
+			sequence = next + 1L;
+			return next;
 		}
-		if (sequence == Long.MAX_VALUE) {
-			rebaseSequencesUnsafe();
-		}
-		return sequence++;
+		return rebaseAndNextSequenceUnsafe();
 	}
 
-	private void rebaseSequencesUnsafe() {
+	private long rebaseAndNextSequenceUnsafe() {
 		var live = new IdentityHashMap<Object, Boolean>();
 		latencyQueue.collectSequenceOwners(live);
 		deadlineQueue.collectSequenceOwners(live);
@@ -542,7 +535,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 						+ owner.getClass().getName());
 			}
 		}
-		ordered.sort((left, right) -> compareSequence(left.current(), right.current()));
+		ordered.sort(Comparator.comparingLong(SequenceSlot::current));
 		long replacement = 0L;
 		for (int start = 0; start < ordered.size();) {
 			var first = ordered.get(start);
@@ -563,6 +556,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (sequence < 0L || sequence == Long.MAX_VALUE) {
 			throw new IllegalStateException("Live workload ordering inventory exceeds the ticket range");
 		}
+		return sequence++;
 	}
 
 	private static void validateSequenceAliases(List<SequenceSlot> ordered, int start, int end) {
@@ -595,10 +589,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			default -> throw new IllegalStateException("Unrecognized workload ordering owner: "
 					+ slot.owner().getClass().getName());
 		}
-	}
-
-	private static int compareSequence(long left, long right) {
-		return Long.compare(left, right);
 	}
 
 	private record SequenceSlot(Object owner, boolean deadline, long current) {
@@ -2150,9 +2140,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (cooperativeHead == null) {
 			return normalHead;
 		}
-		return compareSequence(normalHead.sequence(), cooperativeHead.sequence()) <= 0
-				? normalHead
-				: cooperativeHead;
+		return normalHead.sequence() <= cooperativeHead.sequence() ? normalHead : cooperativeHead;
 	}
 
 	private TaskMetrics metrics(WorkloadProfile profile, OperationFamily family) {
