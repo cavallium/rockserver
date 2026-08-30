@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
@@ -79,6 +80,189 @@ class RWSchedulerIndexedQueueTest {
 			releaseBlocker.countDown();
 			scheduler.disposeNow();
 			Schedulers.resetOnScheduleHook(hook);
+		}
+	}
+
+	@Test
+	void immediateReactorOverloadRejectsOriginalTaskExactlyOnce() throws Exception {
+		var scheduler = scheduler(1, 1, "indexed-reactor-overload");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var view = scheduler.scheduler(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+		var queued = new TerminalTask(() -> {});
+		var overloaded = new TerminalTask(() -> {});
+		try {
+			view.schedule(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			view.schedule(queued);
+
+			assertThrows(RejectedExecutionException.class, () -> view.schedule(overloaded));
+			var completion = assertThrows(ExecutionException.class, () -> overloaded.get(1, SECONDS));
+			assertInstanceOf(RocksDBException.class, completion.getCause());
+			assertEquals(1, overloaded.rejectionCount());
+			assertEquals(0, overloaded.disposeCount(),
+					"terminal delegation must mark the wrapper disposed before generic disposal fallback");
+			assertEquals(1L, scheduler.poolSnapshot(RWScheduler.Pool.READ)
+					.outcomes().get(RWScheduler.TerminalOutcome.OVERLOAD));
+		} finally {
+			releaseBlocker.countDown();
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void queuedReactorDeadlineRejectsOriginalTaskExactlyOnce() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-reactor-deadline");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		long deadline = System.currentTimeMillis() + 25L;
+		var view = scheduler.scheduler(WorkloadProfile.ANALYTICAL,
+				OperationFamily.FULL_SCAN_AGGREGATE, deadline);
+		var expired = new TerminalTask(() -> {});
+		try {
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			view.schedule(expired);
+			while (System.currentTimeMillis() < deadline) Thread.onSpinWait();
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).execute(() -> {});
+
+			assertDeadlineFailure(expired);
+			assertEquals(1, expired.rejectionCount());
+			assertEquals(0, expired.disposeCount());
+			assertEquals(1L, scheduler.poolSnapshot(RWScheduler.Pool.READ)
+					.outcomes().get(RWScheduler.TerminalOutcome.DEADLINE));
+		} finally {
+			releaseBlocker.countDown();
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void queuedReactorCancellationRejectsOriginalTaskExactlyOnce() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-reactor-cancellation-callback");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var view = scheduler.scheduler(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+		var cancelled = new TerminalTask(() -> {});
+		try {
+			view.schedule(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			Disposable handle = view.schedule(cancelled);
+			handle.dispose();
+
+			assertThrows(CancellationException.class, () -> cancelled.get(1, SECONDS));
+			assertEquals(1, cancelled.rejectionCount());
+			assertEquals(0, cancelled.disposeCount());
+			assertEquals(1L, scheduler.poolSnapshot(RWScheduler.Pool.READ)
+					.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+		} finally {
+			releaseBlocker.countDown();
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void queuedReactorShutdownRejectsOriginalTaskExactlyOnce() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-reactor-shutdown-callback");
+		var blockerStarted = new CountDownLatch(1);
+		var interrupted = new CountDownLatch(1);
+		var view = scheduler.scheduler(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+		var shutdown = new TerminalTask(() -> {});
+		try {
+			view.schedule(() -> {
+				blockerStarted.countDown();
+				try {
+					new CountDownLatch(1).await();
+				} catch (InterruptedException expected) {
+					interrupted.countDown();
+					Thread.currentThread().interrupt();
+				}
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			view.schedule(shutdown);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+
+			scheduler.disposeNow();
+
+			assertTrue(interrupted.await(5, SECONDS));
+			var completion = assertThrows(ExecutionException.class, () -> shutdown.get(1, SECONDS));
+			assertInstanceOf(RejectedExecutionException.class, completion.getCause());
+			assertEquals(1, shutdown.rejectionCount());
+			assertEquals(0, shutdown.disposeCount());
+			assertEquals(1L, scheduler.poolSnapshot(RWScheduler.Pool.READ)
+					.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
+		} finally {
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void queuedReactorCancellationRacingShutdownPublishesOneOriginalFailure() throws Exception {
+		for (int repetition = 0; repetition < 32; repetition++) {
+			var scheduler = scheduler(1, 8, "indexed-reactor-terminal-race-" + repetition);
+			var blockerStarted = new CountDownLatch(1);
+			var releaseRace = new CountDownLatch(1);
+			var view = scheduler.scheduler(
+					WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+			var terminal = new TerminalTask(() -> {});
+			try {
+				view.schedule(() -> {
+					blockerStarted.countDown();
+					try {
+						new CountDownLatch(1).await();
+					} catch (InterruptedException expected) {
+						Thread.currentThread().interrupt();
+					}
+				});
+				assertTrue(blockerStarted.await(5, SECONDS));
+				Disposable handle = view.schedule(terminal);
+				assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+
+				var cancel = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(releaseRace);
+					handle.dispose();
+				});
+				var shutdown = CompletableFuture.runAsync(() -> {
+					awaitUninterruptibly(releaseRace);
+					scheduler.disposeNow();
+				});
+				releaseRace.countDown();
+				cancel.get(5, SECONDS);
+				shutdown.get(5, SECONDS);
+
+				assertEquals(1, terminal.rejectionCount());
+				assertEquals(0, terminal.disposeCount());
+				assertTrue(terminal.isCompletedExceptionally());
+				var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
+				assertEquals(1L,
+						snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION)
+								+ snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
+				assertTrue(snapshot.drainedAndConserved());
+			} finally {
+				releaseRace.countDown();
+				view.dispose();
+				scheduler.disposeNow();
+			}
 		}
 	}
 
