@@ -3815,6 +3815,14 @@ final class WorkloadPressureController {
 		}
 	}
 
+	synchronized boolean isBatchDispatchable(RWScheduler.Pool pool) {
+		return (dispatchableBatchPoolMask & poolBit(resourcePool(pool))) != 0;
+	}
+
+	synchronized boolean hasFairPressureTurn(RWScheduler.Pool pool) {
+		return hasFairPressureTurnUnsafe(resourcePool(pool));
+	}
+
 	private boolean competitionActiveUnsafe(long nowNanos) {
 		if (competitionPoolMask != 0 || nowNanos < competitionUntilNanos) {
 			return true;

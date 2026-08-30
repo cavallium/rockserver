@@ -502,6 +502,16 @@ public final class RWScheduler {
 		executor.setBeforeBatchPermitAcquisitionObserverForTesting(observer);
 	}
 
+	@VisibleForTesting
+	public boolean isBatchDispatchableForTesting(Pool pool) {
+		return pressureController.isBatchDispatchable(pool);
+	}
+
+	@VisibleForTesting
+	public boolean hasFairPressureTurnForTesting(Pool pool) {
+		return pressureController.hasFairPressureTurn(pool);
+	}
+
 	private void signalAllPools() {
 		for (var pool : pools()) {
 			pool.signalAvailability();

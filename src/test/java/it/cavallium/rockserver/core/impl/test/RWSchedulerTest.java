@@ -523,14 +523,24 @@ class RWSchedulerTest {
 
 	@Test
 	void losingPeerDispatchabilityWakesPoolWaitingForFairPressureTurn() throws Exception {
-		var scheduler = scheduler(1, "pressure-dispatchability-transition");
+		var scheduler = RWScheduler.forTesting(1, 2, 1, 16, 16,
+				"pressure-dispatchability-transition");
 		var firstReadStarted = new CountDownLatch(1);
 		var releaseFirstRead = new CountDownLatch(1);
 		var secondReadStarted = new CountDownLatch(1);
-		var writeForegroundStarted = new CountDownLatch(1);
+		var firstWriteForegroundStarted = new CountDownLatch(1);
+		var secondWriteForegroundStarted = new CountDownLatch(1);
 		var releaseWriteForeground = new CountDownLatch(1);
+		var writeBatchStarted = new CountDownLatch(1);
 		try {
 			scheduler.setStoragePressure(true);
+			scheduler.executor(WorkloadProfile.INGEST,
+					OperationFamily.MUTATION,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				firstWriteForegroundStarted.countDown();
+				awaitUninterruptibly(releaseWriteForeground);
+			});
+			assertTrue(firstWriteForegroundStarted.await(5, SECONDS));
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
 					RequestContext.NO_DEADLINE).execute(() -> {
@@ -541,23 +551,36 @@ class RWSchedulerTest {
 
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.MUTATION,
-					RequestContext.NO_DEADLINE).execute(() -> {});
+					RequestContext.NO_DEADLINE).execute(writeBatchStarted::countDown);
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
 					RequestContext.NO_DEADLINE).execute(secondReadStarted::countDown);
 			releaseFirstRead.countDown();
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)
 					.outcomes().get(RWScheduler.TerminalOutcome.RUN) == 1L);
+			assertEquals(1, scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks());
+			assertEquals(1, scheduler.poolSnapshot(RWScheduler.Pool.WRITE).activeTasks());
+			assertEquals(1, scheduler.poolSnapshot(RWScheduler.Pool.WRITE)
+					.queuedByProfile().get(WorkloadProfile.BATCH));
+			assertTrue(scheduler.isBatchDispatchableForTesting(RWScheduler.Pool.WRITE));
+			assertFalse(scheduler.hasFairPressureTurnForTesting(RWScheduler.Pool.READ),
+					"READ must be waiting specifically for WRITE's published fair turn");
+			assertEquals(1L, secondReadStarted.getCount());
+			assertEquals(1L, writeBatchStarted.getCount());
 
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.MUTATION,
 					RequestContext.NO_DEADLINE).execute(() -> {
-				writeForegroundStarted.countDown();
+				secondWriteForegroundStarted.countDown();
 				awaitUninterruptibly(releaseWriteForeground);
 			});
-			assertTrue(writeForegroundStarted.await(5, SECONDS));
+			assertTrue(secondWriteForegroundStarted.await(5, SECONDS));
+			assertEquals(2, scheduler.poolSnapshot(RWScheduler.Pool.WRITE).activeTasks());
+			assertFalse(scheduler.isBatchDispatchableForTesting(RWScheduler.Pool.WRITE));
+			assertTrue(scheduler.hasFairPressureTurnForTesting(RWScheduler.Pool.READ));
 			assertTrue(secondReadStarted.await(2_500L, TimeUnit.MILLISECONDS),
 					"READ's indefinite fair-turn wait must be signaled when WRITE becomes nondispatchable");
+			assertEquals(1L, writeBatchStarted.getCount());
 		} finally {
 			releaseFirstRead.countDown();
 			releaseWriteForeground.countDown();
