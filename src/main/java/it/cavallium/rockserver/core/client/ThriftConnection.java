@@ -314,7 +314,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void closeFailedUpdate(long updateId) {
 		try {
-			client.closeFailedUpdate(updateId);
+			client.closeFailedUpdate(updateId, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -642,7 +642,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void closeIterator(long iteratorId) {
 		try {
-			client.closeIterator(iteratorId);
+			client.closeIterator(iteratorId, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -766,7 +766,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void flush() {
 		try {
-			client.flush();
+			client.flush(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -775,7 +775,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void compact() {
 		try {
-			client.compact();
+			client.compact(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -795,11 +795,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	public long cdcCreate(String id, Long fromSeq, List<Long> columnIds, Boolean emitLatestValues) {
-		return cdcCreate(id, fromSeq, columnIds, emitLatestValues, null);
-	}
-
-	@Override
 	public long cdcCreate(String id,
 			Long fromSeq,
 			List<Long> columnIds,
@@ -816,12 +811,11 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			if (emitLatestValues != null) {
 				request.setEmitLatestValues(emitLatestValues);
 			}
-			if (expectedLastCommitted != null) {
-				if (expectedLastCommitted.isPresent()) {
-					request.setExpectedLastCommittedSeq(expectedLastCommitted.getAsLong());
-				} else {
-					request.setExpectAbsent(true);
-				}
+			request.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			if (expectedLastCommitted.isPresent()) {
+				request.setExpectedLastCommittedSeq(expectedLastCommitted.getAsLong());
+			} else {
+				request.setExpectAbsent(true);
 			}
 			return client.cdcCreate(request);
 		} catch (TException e) {
@@ -832,7 +826,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void cdcDelete(String id) {
 		try {
-			client.cdcDelete(id);
+			client.cdcDelete(id, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -841,7 +835,8 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public long cdcGetEarliestAvailableSequence() {
 		try {
-			return client.cdcGetEarliestAvailableSequence();
+			return client.cdcGetEarliestAvailableSequence(
+					RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -850,7 +845,8 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public OptionalLong cdcGetLastCommittedSequence(String id) {
 		try {
-			OptionalLongValue response = client.cdcGetLastCommittedSequence(id);
+			OptionalLongValue response = client.cdcGetLastCommittedSequence(id,
+					RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 			return response.isSetValue()
 					? OptionalLong.of(response.getValue())
 					: OptionalLong.empty();
@@ -867,7 +863,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void cdcCommit(String id, long seq) {
 		try {
-			client.cdcCommit(id, seq);
+			client.cdcCommit(id, seq, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -1070,14 +1066,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	public CompletableFuture<Long> cdcCreateAsync(String id,
 			Long fromSeq,
 			List<Long> columnIds,
-			Boolean emitLatestValues) {
-		return cdcCreateAsync(id, fromSeq, columnIds, emitLatestValues, null);
-	}
-
-	@Override
-	public CompletableFuture<Long> cdcCreateAsync(String id,
-			Long fromSeq,
-			List<Long> columnIds,
 			Boolean emitLatestValues,
 			OptionalLong expectedLastCommitted) {
 		return supplyAsyncContextual(
@@ -1157,7 +1145,9 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			var request = new it.cavallium.rockserver.core.common.api.CdcPollRequest()
 					.setId(id)
 					.setMaxEvents(maxEvents)
-					.setMaxResponseBytes(maxCdcResponseSize);
+					.setMaxResponseBytes(maxCdcResponseSize)
+					.setWorkloadContractVersion(
+							RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 			if (fromSeq != null) {
 				request.setFromSeq(fromSeq);
 			}

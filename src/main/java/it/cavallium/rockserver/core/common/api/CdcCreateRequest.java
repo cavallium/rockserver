@@ -16,6 +16,7 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
   private static final org.apache.thrift.protocol.TField EMIT_LATEST_VALUES_FIELD_DESC = new org.apache.thrift.protocol.TField("emitLatestValues", org.apache.thrift.protocol.TType.BOOL, (short)4);
   private static final org.apache.thrift.protocol.TField EXPECT_ABSENT_FIELD_DESC = new org.apache.thrift.protocol.TField("expectAbsent", org.apache.thrift.protocol.TType.BOOL, (short)5);
   private static final org.apache.thrift.protocol.TField EXPECTED_LAST_COMMITTED_SEQ_FIELD_DESC = new org.apache.thrift.protocol.TField("expectedLastCommittedSeq", org.apache.thrift.protocol.TType.I64, (short)6);
+  private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)7);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new CdcCreateRequestStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new CdcCreateRequestTupleSchemeFactory();
@@ -26,6 +27,7 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
   public boolean emitLatestValues; // optional
   public boolean expectAbsent; // optional
   public long expectedLastCommittedSeq; // optional
+  public int workloadContractVersion; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -34,7 +36,8 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
     COLUMN_IDS((short)3, "columnIds"),
     EMIT_LATEST_VALUES((short)4, "emitLatestValues"),
     EXPECT_ABSENT((short)5, "expectAbsent"),
-    EXPECTED_LAST_COMMITTED_SEQ((short)6, "expectedLastCommittedSeq");
+    EXPECTED_LAST_COMMITTED_SEQ((short)6, "expectedLastCommittedSeq"),
+    WORKLOAD_CONTRACT_VERSION((short)7, "workloadContractVersion");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -62,6 +65,8 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
           return EXPECT_ABSENT;
         case 6: // EXPECTED_LAST_COMMITTED_SEQ
           return EXPECTED_LAST_COMMITTED_SEQ;
+        case 7: // WORKLOAD_CONTRACT_VERSION
+          return WORKLOAD_CONTRACT_VERSION;
         default:
           return null;
       }
@@ -109,6 +114,7 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
   private static final int __EMITLATESTVALUES_ISSET_ID = 1;
   private static final int __EXPECTABSENT_ISSET_ID = 2;
   private static final int __EXPECTEDLASTCOMMITTEDSEQ_ISSET_ID = 3;
+  private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 4;
   private byte __isset_bitfield = 0;
   private static final _Fields[] optionals = {_Fields.FROM_SEQ,_Fields.COLUMN_IDS,_Fields.EMIT_LATEST_VALUES,_Fields.EXPECT_ABSENT,_Fields.EXPECTED_LAST_COMMITTED_SEQ};
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
@@ -127,6 +133,8 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
     tmpMap.put(_Fields.EXPECTED_LAST_COMMITTED_SEQ, new org.apache.thrift.meta_data.FieldMetaData("expectedLastCommittedSeq", org.apache.thrift.TFieldRequirementType.OPTIONAL,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+    tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(CdcCreateRequest.class, metaDataMap);
   }
@@ -135,10 +143,13 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
   }
 
   public CdcCreateRequest(
-    java.lang.String id)
+    java.lang.String id,
+    int workloadContractVersion)
   {
     this();
     this.id = id;
+    this.workloadContractVersion = workloadContractVersion;
+    setWorkloadContractVersionIsSet(true);
   }
 
   /**
@@ -157,6 +168,7 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
     this.emitLatestValues = other.emitLatestValues;
     this.expectAbsent = other.expectAbsent;
     this.expectedLastCommittedSeq = other.expectedLastCommittedSeq;
+    this.workloadContractVersion = other.workloadContractVersion;
   }
 
   @Override
@@ -176,6 +188,8 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
     this.expectAbsent = false;
     setExpectedLastCommittedSeqIsSet(false);
     this.expectedLastCommittedSeq = 0;
+    setWorkloadContractVersionIsSet(false);
+    this.workloadContractVersion = 0;
   }
 
   @org.apache.thrift.annotation.Nullable
@@ -336,6 +350,29 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
     __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __EXPECTEDLASTCOMMITTEDSEQ_ISSET_ID, value);
   }
 
+  public int getWorkloadContractVersion() {
+    return this.workloadContractVersion;
+  }
+
+  public CdcCreateRequest setWorkloadContractVersion(int workloadContractVersion) {
+    this.workloadContractVersion = workloadContractVersion;
+    setWorkloadContractVersionIsSet(true);
+    return this;
+  }
+
+  public void unsetWorkloadContractVersion() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+  }
+
+  /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+  public boolean isSetWorkloadContractVersion() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+  }
+
+  public void setWorkloadContractVersionIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
+  }
+
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
@@ -387,6 +424,14 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
       }
       break;
 
+    case WORKLOAD_CONTRACT_VERSION:
+      if (value == null) {
+        unsetWorkloadContractVersion();
+      } else {
+        setWorkloadContractVersion((java.lang.Integer)value);
+      }
+      break;
+
     }
   }
 
@@ -412,6 +457,9 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
     case EXPECTED_LAST_COMMITTED_SEQ:
       return getExpectedLastCommittedSeq();
 
+    case WORKLOAD_CONTRACT_VERSION:
+      return getWorkloadContractVersion();
+
     }
     throw new java.lang.IllegalStateException();
   }
@@ -436,6 +484,8 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
       return isSetExpectAbsent();
     case EXPECTED_LAST_COMMITTED_SEQ:
       return isSetExpectedLastCommittedSeq();
+    case WORKLOAD_CONTRACT_VERSION:
+      return isSetWorkloadContractVersion();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -507,6 +557,15 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
         return false;
     }
 
+    boolean this_present_workloadContractVersion = true;
+    boolean that_present_workloadContractVersion = true;
+    if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+      if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+        return false;
+      if (this.workloadContractVersion != that.workloadContractVersion)
+        return false;
+    }
+
     return true;
   }
 
@@ -537,6 +596,8 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
     hashCode = hashCode * 8191 + ((isSetExpectedLastCommittedSeq()) ? 131071 : 524287);
     if (isSetExpectedLastCommittedSeq())
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(expectedLastCommittedSeq);
+
+    hashCode = hashCode * 8191 + workloadContractVersion;
 
     return hashCode;
   }
@@ -609,6 +670,16 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
         return lastComparison;
       }
     }
+    lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetWorkloadContractVersion()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
     return 0;
   }
 
@@ -674,6 +745,10 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
       sb.append(this.expectedLastCommittedSeq);
       first = false;
     }
+    if (!first) sb.append(", ");
+    sb.append("workloadContractVersion:");
+    sb.append(this.workloadContractVersion);
+    first = false;
     sb.append(")");
     return sb.toString();
   }
@@ -683,6 +758,7 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
     if (id == null) {
       throw new org.apache.thrift.protocol.TProtocolException("Required field 'id' was not present! Struct: " + toString());
     }
+    // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
     // check for sub-struct validity
   }
 
@@ -782,6 +858,14 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
+          case 7: // WORKLOAD_CONTRACT_VERSION
+            if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+              struct.workloadContractVersion = iprot.readI32();
+              struct.setWorkloadContractVersionIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
           default:
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
         }
@@ -790,6 +874,9 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
       iprot.readStructEnd();
 
       // check for required fields of primitive type, which can't be checked in the validate method
+      if (!struct.isSetWorkloadContractVersion()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+      }
       struct.validate();
     }
 
@@ -837,6 +924,9 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
         oprot.writeI64(struct.expectedLastCommittedSeq);
         oprot.writeFieldEnd();
       }
+      oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+      oprot.writeI32(struct.workloadContractVersion);
+      oprot.writeFieldEnd();
       oprot.writeFieldStop();
       oprot.writeStructEnd();
     }
@@ -856,6 +946,7 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
     public void write(org.apache.thrift.protocol.TProtocol prot, CdcCreateRequest struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       oprot.writeString(struct.id);
+      oprot.writeI32(struct.workloadContractVersion);
       java.util.BitSet optionals = new java.util.BitSet();
       if (struct.isSetFromSeq()) {
         optionals.set(0);
@@ -901,6 +992,8 @@ public class CdcCreateRequest implements org.apache.thrift.TBase<CdcCreateReques
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       struct.id = iprot.readString();
       struct.setIdIsSet(true);
+      struct.workloadContractVersion = iprot.readI32();
+      struct.setWorkloadContractVersionIsSet(true);
       java.util.BitSet incoming = iprot.readBitSet(5);
       if (incoming.get(0)) {
         struct.fromSeq = iprot.readI64();

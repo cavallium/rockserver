@@ -10932,26 +10932,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds)
-			throws RocksDBException {
-		return cdcCreate(id, fromSeq, columnIds, null, null);
-	}
-
-	@Override
-	public long cdcCreate(@NotNull String id,
-			@Nullable Long fromSeq,
-			@Nullable List<Long> columnIds,
-			@Nullable Boolean emitLatestValues) throws RocksDBException {
-		return cdcCreate(id, fromSeq, columnIds, emitLatestValues, null);
-	}
-
-	@Override
 	public long cdcCreate(@NotNull String id,
 			@Nullable Long fromSeq,
 			@Nullable List<Long> columnIds,
 			@Nullable Boolean emitLatestValues,
-			@Nullable OptionalLong expectedLastCommitted) throws RocksDBException {
+			@NotNull OptionalLong expectedLastCommitted) throws RocksDBException {
 		Objects.requireNonNull(id, "id");
+		Objects.requireNonNull(expectedLastCommitted, "expectedLastCommitted");
 		ops.beginOp();
 		try {
 			// Prefix-less WAL discovery can flush/probe repeatedly and belongs to the
@@ -11004,10 +10991,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private static void validateCdcCreatePrecondition(String id,
 			@Nullable CdcSubscriptionMeta existing,
-			@Nullable OptionalLong expectedLastCommitted) {
-		if (expectedLastCommitted == null) {
-			return;
-		}
+			OptionalLong expectedLastCommitted) {
 		if (expectedLastCommitted.isEmpty()) {
 			if (existing == null) {
 				return;

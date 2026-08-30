@@ -311,25 +311,15 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	}
 
     // CDC API
-    /** Create or update a CDC subscription. Returns the start sequence. */
-    default long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-        return cdcCreate(id, fromSeq, columnIds, null, null);
-    }
-
-    /** Create or update a CDC subscription. Returns the start sequence. */
-    default long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean emitLatestValues) throws RocksDBException {
-        return cdcCreate(id, fromSeq, columnIds, emitLatestValues, null);
-    }
-
     /**
      * Atomically create or update a CDC subscription if its durable checkpoint still matches.
-     * {@code null} disables the precondition, empty requires absence, and a present value requires an exact match.
+     * Empty requires absence; a present value requires an exact durable checkpoint.
      */
     default long cdcCreate(@NotNull String id,
                            @Nullable Long fromSeq,
                            @Nullable List<Long> columnIds,
                            @Nullable Boolean emitLatestValues,
-                           @Nullable OptionalLong expectedLastCommitted) throws RocksDBException {
+                           @NotNull OptionalLong expectedLastCommitted) throws RocksDBException {
         return requestSync(new RocksDBAPICommand.CdcCreate(
                 id, fromSeq, columnIds, emitLatestValues, expectedLastCommitted));
     }

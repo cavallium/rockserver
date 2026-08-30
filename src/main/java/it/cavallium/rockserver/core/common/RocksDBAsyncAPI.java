@@ -340,23 +340,15 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	}
 
     // CDC API
-    default CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-        return cdcCreateAsync(id, fromSeq, columnIds, null, null);
-    }
-
-    default CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
-        return cdcCreateAsync(id, fromSeq, columnIds, resolvedValues, null);
-    }
-
     /**
      * Atomically create or update a CDC subscription if its durable checkpoint still matches.
-     * {@code null} disables the precondition, empty requires absence, and a present value requires an exact match.
+     * Empty requires absence; a present value requires an exact durable checkpoint.
      */
     default CompletableFuture<Long> cdcCreateAsync(@NotNull String id,
                                                     @Nullable Long fromSeq,
                                                     @Nullable List<Long> columnIds,
                                                     @Nullable Boolean resolvedValues,
-                                                    @Nullable OptionalLong expectedLastCommitted) throws RocksDBException {
+                                                    @NotNull OptionalLong expectedLastCommitted) throws RocksDBException {
         return requestAsync(new RocksDBAPICommand.CdcCreate(
                 id, fromSeq, columnIds, resolvedValues, expectedLastCommitted));
     }

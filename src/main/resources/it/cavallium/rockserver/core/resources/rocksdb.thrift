@@ -104,17 +104,18 @@ struct CdcCreateRequest {
   2: optional i64 fromSeq,
   3: optional list<i64> columnIds,
   4: optional bool emitLatestValues,
-  // Both absent means unchecked. expectAbsent=true requires no metadata;
-  // expectedLastCommittedSeq requires an exact durable checkpoint.
+  // Exactly one precondition is required.
   5: optional bool expectAbsent,
-  6: optional i64 expectedLastCommittedSeq
+  6: optional i64 expectedLastCommittedSeq,
+  7: required i32 workloadContractVersion
 }
 
 struct CdcPollRequest {
   1: required string id,
   2: optional i64 fromSeq,
   3: required i64 maxEvents,
-  4: optional i32 maxResponseBytes
+  4: required i32 maxResponseBytes,
+  5: required i32 workloadContractVersion
 }
 
 struct UpdateBegin {
@@ -207,7 +208,7 @@ service RocksDB {
 
    bool closeTransaction(1: required i64 transactionId, 2: required bool commit, 3: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void closeFailedUpdate(1: required i64 updateId) throws (1: RocksDBThriftException e),
+   void closeFailedUpdate(1: required i64 updateId, 2: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
    i64 createColumn(1: required string name, 2: required ColumnSchema schema, 3: required RequestContext context) throws (1: RocksDBThriftException e),
 
@@ -259,7 +260,7 @@ service RocksDB {
 
    i64 openIterator(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: required i64 iteratorLeaseTtlNanos, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void closeIterator(1: required i64 iteratorId) throws (1: RocksDBThriftException e),
+   void closeIterator(1: required i64 iteratorId, 2: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
    void seekTo(1: required i64 iterationId, 2: required list<binary> keys, 3: required RequestContext context) throws (1: RocksDBThriftException e),
 
@@ -301,23 +302,23 @@ service RocksDB {
 
    list<bool> putMultiGetPreviousPresence(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 
-   void flush() throws (1: RocksDBThriftException e),
+   void flush(1: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
-   void compact() throws (1: RocksDBThriftException e),
+   void compact(1: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
    list<Column> getAllColumnDefinitions(1: required RequestContext context) throws (1: RocksDBThriftException e),
 
    i64 cdcCreate(1: required CdcCreateRequest request) throws (1: RocksDBThriftException e),
 
-   void cdcDelete(1: required string id) throws (1: RocksDBThriftException e),
+   void cdcDelete(1: required string id, 2: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
-   i64 cdcGetEarliestAvailableSequence() throws (1: RocksDBThriftException e),
+   i64 cdcGetEarliestAvailableSequence(1: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
-   OptionalLongValue cdcGetLastCommittedSequence(1: required string id) throws (1: RocksDBThriftException e),
+   OptionalLongValue cdcGetLastCommittedSequence(1: required string id, 2: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
    CdcPollBatchResult cdcPollBatch(1: required CdcPollRequest request) throws (1: RocksDBThriftException e),
 
-   void cdcCommit(1: required string id, 2: required i64 seq) throws (1: RocksDBThriftException e),
+   void cdcCommit(1: required string id, 2: required i64 seq, 3: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
    Capabilities getCapabilities(),
 

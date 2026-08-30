@@ -78,7 +78,8 @@ public class CdcMergeExample {
 
             // 3) Create or resume a CDC subscription BEFORE seeding data so we also see initial PUTs
             String subId = "messages-sub";
-			long startSeq = db.getSyncApi(INGEST_CONTEXT).cdcCreate(subId, null, List.of(columnId), true); // start from last committed + 1, resolved values
+			long startSeq = db.getSyncApi(INGEST_CONTEXT).cdcCreate(
+					subId, null, List.of(columnId), true, java.util.OptionalLong.empty());
             LOG.info("CDC subscription '{}' created. startSeq={}", subId, startSeq);
 
             // 4) Seed some initial records (real value serialization)

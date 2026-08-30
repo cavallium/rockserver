@@ -1323,7 +1323,11 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			@Nullable Long fromSeq,
 			@Nullable List<Long> columnIds,
 			@Nullable Boolean emitLatestValues,
-			@Nullable OptionalLong expectedLastCommitted) implements RocksDBAPICommandSingle<Long> {
+			@NotNull OptionalLong expectedLastCommitted) implements RocksDBAPICommandSingle<Long> {
+
+		public CdcCreate {
+			Objects.requireNonNull(expectedLastCommitted, "expectedLastCommitted");
+		}
 
         @Override
         public Long handleSync(RocksDBSyncAPI api) {

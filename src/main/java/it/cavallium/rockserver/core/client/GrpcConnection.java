@@ -511,6 +511,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	public CompletableFuture<Void> closeFailedUpdateAsync(long updateId) throws RocksDBException {
 		var request = CloseFailedUpdateRequest.newBuilder()
 				.setUpdateId(updateId)
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
 		return toResponse(this.futureStub.closeFailedUpdate(request), _ -> null);
 	}
@@ -1044,6 +1045,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	public CompletableFuture<Void> closeIteratorAsync(long iteratorId) throws RocksDBException {
 		var request = CloseIteratorRequest.newBuilder()
 				.setIteratorId(iteratorId)
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
 		return toResponse(this.futureStub.closeIterator(request), _ -> null);
 	}
@@ -1245,50 +1247,49 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
     // ============ CDC Async API ============
 
-    @Override
-    public CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-		return cdcCreateAsync(id, fromSeq, columnIds, null, null);
-    }
-
-    @Override
-    public CompletableFuture<Long> cdcCreateAsync(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
-		return cdcCreateAsync(id, fromSeq, columnIds, resolvedValues, null);
-	}
-
 	@Override
 	public CompletableFuture<Long> cdcCreateAsync(@NotNull String id,
 			@Nullable Long fromSeq,
 			@Nullable List<Long> columnIds,
 			@Nullable Boolean resolvedValues,
-			@Nullable OptionalLong expectedLastCommitted) throws RocksDBException {
-        var builder = CdcCreateRequest.newBuilder().setId(id);
+			@NotNull OptionalLong expectedLastCommitted) throws RocksDBException {
+		var builder = CdcCreateRequest.newBuilder()
+				.setId(id)
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
         if (columnIds != null) builder.addAllColumnIds(columnIds);
         if (resolvedValues != null) builder.setResolvedValues(resolvedValues);
-		if (expectedLastCommitted != null) {
-			if (expectedLastCommitted.isPresent()) {
-				builder.setExpectedLastCommittedSeq(expectedLastCommitted.getAsLong());
-			} else {
-				builder.setExpectAbsent(Empty.getDefaultInstance());
-			}
+		if (expectedLastCommitted.isPresent()) {
+			builder.setExpectedLastCommittedSeq(expectedLastCommitted.getAsLong());
+		} else {
+			builder.setExpectAbsent(Empty.getDefaultInstance());
 		}
         return toResponse(futureStub.cdcCreate(builder.build()), CdcCreateResponse::getStartSeq);
     }
 
     @Override
     public CompletableFuture<Void> cdcDeleteAsync(@NotNull String id) throws RocksDBException {
-        return toResponse(futureStub.cdcDelete(CdcDeleteRequest.newBuilder().setId(id).build()), _ -> null);
+		return toResponse(futureStub.cdcDelete(CdcDeleteRequest.newBuilder()
+				.setId(id)
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
+				.build()), _ -> null);
     }
 
 	@Override
 	public CompletableFuture<Long> cdcGetEarliestAvailableSequenceAsync() throws RocksDBException {
-		return toResponse(futureStub.cdcGetEarliestAvailableSequence(Empty.getDefaultInstance()),
+		return toResponse(futureStub.cdcGetEarliestAvailableSequence(
+				CdcGetEarliestAvailableSequenceRequest.newBuilder()
+						.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
+						.build()),
 				CdcGetEarliestAvailableSequenceResponse::getSequence);
 	}
 
     @Override
     public CompletableFuture<OptionalLong> cdcGetLastCommittedSequenceAsync(@NotNull String id) throws RocksDBException {
-        var request = CdcGetLastCommittedSequenceRequest.newBuilder().setId(id).build();
+		var request = CdcGetLastCommittedSequenceRequest.newBuilder()
+				.setId(id)
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
+				.build();
         return toResponse(futureStub.cdcGetLastCommittedSequence(request), response ->
                 response.hasLastCommittedSeq()
                         ? OptionalLong.of(response.getLastCommittedSeq())
@@ -1297,15 +1298,19 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
     @Override
     public CompletableFuture<Void> cdcCommitAsync(@NotNull String id, long seq) throws RocksDBException {
-        return toResponse(futureStub.cdcCommit(CdcCommitRequest.newBuilder().setId(id).setSeq(seq).build()), _ -> null);
+		return toResponse(futureStub.cdcCommit(CdcCommitRequest.newBuilder()
+				.setId(id).setSeq(seq)
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
+				.build()), _ -> null);
     }
 
     @Override
     public Publisher<CDCEvent> cdcPollAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
-        var builder = CdcPollRequest.newBuilder()
-                .setId(id)
-                .setMaxEvents(maxEvents)
-                .setMaxResponseBytes(maxInboundMessageSize);
+		var builder = CdcPollRequest.newBuilder()
+				.setId(id)
+				.setMaxEvents(maxEvents)
+				.setMaxResponseBytes(maxInboundMessageSize)
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
         return toResponse(reactiveStub.cdcPoll(builder.build()))
                 .map(GrpcConnectionDelegate::mapCDCEvent);
@@ -1321,10 +1326,11 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
     @Override
     public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
-        var builder = CdcPollRequest.newBuilder()
+		var builder = CdcPollRequest.newBuilder()
 				.setId(id)
 				.setMaxEvents(maxEvents)
-				.setMaxResponseBytes(maxInboundMessageSize);
+				.setMaxResponseBytes(maxInboundMessageSize)
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
 		return toResponse(reactiveStub.cdcPollBatch(builder.build()))
 				.map(response -> new CdcBatch(
@@ -1345,6 +1351,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@Override
 	public CompletableFuture<Void> flushAsync() {
 		var request = FlushRequest.newBuilder()
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
 		return toResponse(this.futureStub.flush(request), _ -> null);
 	}
@@ -1352,6 +1359,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@Override
 	public CompletableFuture<Void> compactAsync() {
 		var request = CompactRequest.newBuilder()
+				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
 		return toResponse(this.futureStub.compact(request), _ -> null);
 	}

@@ -14,6 +14,7 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
   private static final org.apache.thrift.protocol.TField FROM_SEQ_FIELD_DESC = new org.apache.thrift.protocol.TField("fromSeq", org.apache.thrift.protocol.TType.I64, (short)2);
   private static final org.apache.thrift.protocol.TField MAX_EVENTS_FIELD_DESC = new org.apache.thrift.protocol.TField("maxEvents", org.apache.thrift.protocol.TType.I64, (short)3);
   private static final org.apache.thrift.protocol.TField MAX_RESPONSE_BYTES_FIELD_DESC = new org.apache.thrift.protocol.TField("maxResponseBytes", org.apache.thrift.protocol.TType.I32, (short)4);
+  private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)5);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new CdcPollRequestStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new CdcPollRequestTupleSchemeFactory();
@@ -21,14 +22,16 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
   public @org.apache.thrift.annotation.Nullable java.lang.String id; // required
   public long fromSeq; // optional
   public long maxEvents; // required
-  public int maxResponseBytes; // optional
+  public int maxResponseBytes; // required
+  public int workloadContractVersion; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
     ID((short)1, "id"),
     FROM_SEQ((short)2, "fromSeq"),
     MAX_EVENTS((short)3, "maxEvents"),
-    MAX_RESPONSE_BYTES((short)4, "maxResponseBytes");
+    MAX_RESPONSE_BYTES((short)4, "maxResponseBytes"),
+    WORKLOAD_CONTRACT_VERSION((short)5, "workloadContractVersion");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -52,6 +55,8 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
           return MAX_EVENTS;
         case 4: // MAX_RESPONSE_BYTES
           return MAX_RESPONSE_BYTES;
+        case 5: // WORKLOAD_CONTRACT_VERSION
+          return WORKLOAD_CONTRACT_VERSION;
         default:
           return null;
       }
@@ -98,8 +103,9 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
   private static final int __FROMSEQ_ISSET_ID = 0;
   private static final int __MAXEVENTS_ISSET_ID = 1;
   private static final int __MAXRESPONSEBYTES_ISSET_ID = 2;
+  private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 3;
   private byte __isset_bitfield = 0;
-  private static final _Fields[] optionals = {_Fields.FROM_SEQ,_Fields.MAX_RESPONSE_BYTES};
+  private static final _Fields[] optionals = {_Fields.FROM_SEQ};
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
@@ -109,7 +115,9 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     tmpMap.put(_Fields.MAX_EVENTS, new org.apache.thrift.meta_data.FieldMetaData("maxEvents", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
-    tmpMap.put(_Fields.MAX_RESPONSE_BYTES, new org.apache.thrift.meta_data.FieldMetaData("maxResponseBytes", org.apache.thrift.TFieldRequirementType.OPTIONAL,
+    tmpMap.put(_Fields.MAX_RESPONSE_BYTES, new org.apache.thrift.meta_data.FieldMetaData("maxResponseBytes", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
+    tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(CdcPollRequest.class, metaDataMap);
@@ -120,12 +128,18 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
 
   public CdcPollRequest(
     java.lang.String id,
-    long maxEvents)
+    long maxEvents,
+    int maxResponseBytes,
+    int workloadContractVersion)
   {
     this();
     this.id = id;
     this.maxEvents = maxEvents;
     setMaxEventsIsSet(true);
+    this.maxResponseBytes = maxResponseBytes;
+    setMaxResponseBytesIsSet(true);
+    this.workloadContractVersion = workloadContractVersion;
+    setWorkloadContractVersionIsSet(true);
   }
 
   /**
@@ -139,6 +153,7 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
     this.fromSeq = other.fromSeq;
     this.maxEvents = other.maxEvents;
     this.maxResponseBytes = other.maxResponseBytes;
+    this.workloadContractVersion = other.workloadContractVersion;
   }
 
   @Override
@@ -155,6 +170,8 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
     this.maxEvents = 0;
     setMaxResponseBytesIsSet(false);
     this.maxResponseBytes = 0;
+    setWorkloadContractVersionIsSet(false);
+    this.workloadContractVersion = 0;
   }
 
   @org.apache.thrift.annotation.Nullable
@@ -251,6 +268,29 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
     __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __MAXRESPONSEBYTES_ISSET_ID, value);
   }
 
+  public int getWorkloadContractVersion() {
+    return this.workloadContractVersion;
+  }
+
+  public CdcPollRequest setWorkloadContractVersion(int workloadContractVersion) {
+    this.workloadContractVersion = workloadContractVersion;
+    setWorkloadContractVersionIsSet(true);
+    return this;
+  }
+
+  public void unsetWorkloadContractVersion() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+  }
+
+  /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+  public boolean isSetWorkloadContractVersion() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+  }
+
+  public void setWorkloadContractVersionIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
+  }
+
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
@@ -286,6 +326,14 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
       }
       break;
 
+    case WORKLOAD_CONTRACT_VERSION:
+      if (value == null) {
+        unsetWorkloadContractVersion();
+      } else {
+        setWorkloadContractVersion((java.lang.Integer)value);
+      }
+      break;
+
     }
   }
 
@@ -304,6 +352,9 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
 
     case MAX_RESPONSE_BYTES:
       return getMaxResponseBytes();
+
+    case WORKLOAD_CONTRACT_VERSION:
+      return getWorkloadContractVersion();
 
     }
     throw new java.lang.IllegalStateException();
@@ -325,6 +376,8 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
       return isSetMaxEvents();
     case MAX_RESPONSE_BYTES:
       return isSetMaxResponseBytes();
+    case WORKLOAD_CONTRACT_VERSION:
+      return isSetWorkloadContractVersion();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -369,12 +422,21 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
         return false;
     }
 
-    boolean this_present_maxResponseBytes = true && this.isSetMaxResponseBytes();
-    boolean that_present_maxResponseBytes = true && that.isSetMaxResponseBytes();
+    boolean this_present_maxResponseBytes = true;
+    boolean that_present_maxResponseBytes = true;
     if (this_present_maxResponseBytes || that_present_maxResponseBytes) {
       if (!(this_present_maxResponseBytes && that_present_maxResponseBytes))
         return false;
       if (this.maxResponseBytes != that.maxResponseBytes)
+        return false;
+    }
+
+    boolean this_present_workloadContractVersion = true;
+    boolean that_present_workloadContractVersion = true;
+    if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+      if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+        return false;
+      if (this.workloadContractVersion != that.workloadContractVersion)
         return false;
     }
 
@@ -395,9 +457,9 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
 
     hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(maxEvents);
 
-    hashCode = hashCode * 8191 + ((isSetMaxResponseBytes()) ? 131071 : 524287);
-    if (isSetMaxResponseBytes())
-      hashCode = hashCode * 8191 + maxResponseBytes;
+    hashCode = hashCode * 8191 + maxResponseBytes;
+
+    hashCode = hashCode * 8191 + workloadContractVersion;
 
     return hashCode;
   }
@@ -450,6 +512,16 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
         return lastComparison;
       }
     }
+    lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetWorkloadContractVersion()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
     return 0;
   }
 
@@ -491,12 +563,14 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
     sb.append("maxEvents:");
     sb.append(this.maxEvents);
     first = false;
-    if (isSetMaxResponseBytes()) {
-      if (!first) sb.append(", ");
-      sb.append("maxResponseBytes:");
-      sb.append(this.maxResponseBytes);
-      first = false;
-    }
+    if (!first) sb.append(", ");
+    sb.append("maxResponseBytes:");
+    sb.append(this.maxResponseBytes);
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("workloadContractVersion:");
+    sb.append(this.workloadContractVersion);
+    first = false;
     sb.append(")");
     return sb.toString();
   }
@@ -507,6 +581,8 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
       throw new org.apache.thrift.protocol.TProtocolException("Required field 'id' was not present! Struct: " + toString());
     }
     // alas, we cannot check 'maxEvents' because it's a primitive and you chose the non-beans generator.
+    // alas, we cannot check 'maxResponseBytes' because it's a primitive and you chose the non-beans generator.
+    // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
     // check for sub-struct validity
   }
 
@@ -580,6 +656,14 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
+          case 5: // WORKLOAD_CONTRACT_VERSION
+            if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+              struct.workloadContractVersion = iprot.readI32();
+              struct.setWorkloadContractVersionIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
           default:
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
         }
@@ -590,6 +674,12 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
       // check for required fields of primitive type, which can't be checked in the validate method
       if (!struct.isSetMaxEvents()) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'maxEvents' was not found in serialized data! Struct: " + toString());
+      }
+      if (!struct.isSetMaxResponseBytes()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'maxResponseBytes' was not found in serialized data! Struct: " + toString());
+      }
+      if (!struct.isSetWorkloadContractVersion()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
       }
       struct.validate();
     }
@@ -612,11 +702,12 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
       oprot.writeFieldBegin(MAX_EVENTS_FIELD_DESC);
       oprot.writeI64(struct.maxEvents);
       oprot.writeFieldEnd();
-      if (struct.isSetMaxResponseBytes()) {
-        oprot.writeFieldBegin(MAX_RESPONSE_BYTES_FIELD_DESC);
-        oprot.writeI32(struct.maxResponseBytes);
-        oprot.writeFieldEnd();
-      }
+      oprot.writeFieldBegin(MAX_RESPONSE_BYTES_FIELD_DESC);
+      oprot.writeI32(struct.maxResponseBytes);
+      oprot.writeFieldEnd();
+      oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+      oprot.writeI32(struct.workloadContractVersion);
+      oprot.writeFieldEnd();
       oprot.writeFieldStop();
       oprot.writeStructEnd();
     }
@@ -637,19 +728,15 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       oprot.writeString(struct.id);
       oprot.writeI64(struct.maxEvents);
+      oprot.writeI32(struct.maxResponseBytes);
+      oprot.writeI32(struct.workloadContractVersion);
       java.util.BitSet optionals = new java.util.BitSet();
       if (struct.isSetFromSeq()) {
         optionals.set(0);
       }
-      if (struct.isSetMaxResponseBytes()) {
-        optionals.set(1);
-      }
-      oprot.writeBitSet(optionals, 2);
+      oprot.writeBitSet(optionals, 1);
       if (struct.isSetFromSeq()) {
         oprot.writeI64(struct.fromSeq);
-      }
-      if (struct.isSetMaxResponseBytes()) {
-        oprot.writeI32(struct.maxResponseBytes);
       }
     }
 
@@ -660,14 +747,14 @@ public class CdcPollRequest implements org.apache.thrift.TBase<CdcPollRequest, C
       struct.setIdIsSet(true);
       struct.maxEvents = iprot.readI64();
       struct.setMaxEventsIsSet(true);
-      java.util.BitSet incoming = iprot.readBitSet(2);
+      struct.maxResponseBytes = iprot.readI32();
+      struct.setMaxResponseBytesIsSet(true);
+      struct.workloadContractVersion = iprot.readI32();
+      struct.setWorkloadContractVersionIsSet(true);
+      java.util.BitSet incoming = iprot.readBitSet(1);
       if (incoming.get(0)) {
         struct.fromSeq = iprot.readI64();
         struct.setFromSeqIsSet(true);
-      }
-      if (incoming.get(1)) {
-        struct.maxResponseBytes = iprot.readI32();
-        struct.setMaxResponseBytesIsSet(true);
       }
     }
   }

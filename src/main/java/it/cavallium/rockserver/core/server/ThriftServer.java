@@ -63,8 +63,6 @@ import reactor.core.publisher.Flux;
 public class ThriftServer extends Server {
 
 	private static final Logger LOG = LoggerFactory.getLogger(ThriftServer.class.getName());
-	private static final int LEGACY_MAX_CDC_RESPONSE_SIZE = ThriftTransportLimits.safeCdcResponseSize(
-			TConfiguration.DEFAULT_MAX_FRAME_SIZE);
 
 	private final Thread thriftThread;
 	private final TThreadedSelectorServer server;
@@ -591,8 +589,9 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void closeFailedUpdate(long updateId) throws RocksDBThriftException {
+		public void closeFailedUpdate(long updateId, int workloadContractVersion) throws RocksDBThriftException {
 			try {
+				requireV3(workloadContractVersion);
 				protectedApi().closeFailedUpdate(updateId);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -940,8 +939,9 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void closeIterator(long iteratorId) throws RocksDBThriftException {
+		public void closeIterator(long iteratorId, int workloadContractVersion) throws RocksDBThriftException {
 			try {
+				requireV3(workloadContractVersion);
 				protectedApi().closeIterator(iteratorId);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1259,8 +1259,9 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void flush() throws RocksDBThriftException {
+		public void flush(int workloadContractVersion) throws RocksDBThriftException {
 			try {
+				requireV3(workloadContractVersion);
 				protectedApi().flush();
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1268,8 +1269,9 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void compact() throws RocksDBThriftException {
+		public void compact(int workloadContractVersion) throws RocksDBThriftException {
 			try {
+				requireV3(workloadContractVersion);
 				protectedApi().compact();
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1293,6 +1295,7 @@ public class ThriftServer extends Server {
 		public long cdcCreate(it.cavallium.rockserver.core.common.api.CdcCreateRequest request)
 				throws RocksDBThriftException {
 			try {
+				requireV3(request.getWorkloadContractVersion());
 				if (request.isSetExpectAbsent() && request.isSetExpectedLastCommittedSeq()) {
 					throw it.cavallium.rockserver.core.common.RocksDBException.of(
 							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
@@ -1303,11 +1306,16 @@ public class ThriftServer extends Server {
 							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
 							"CDC create expectAbsent must be true when set");
 				}
-				OptionalLong expectedLastCommitted = request.isSetExpectAbsent()
-						? OptionalLong.empty()
-						: request.isSetExpectedLastCommittedSeq()
-								? OptionalLong.of(request.getExpectedLastCommittedSeq())
-								: null;
+				final OptionalLong expectedLastCommitted;
+				if (request.isSetExpectAbsent()) {
+					expectedLastCommitted = OptionalLong.empty();
+				} else if (request.isSetExpectedLastCommittedSeq()) {
+					expectedLastCommitted = OptionalLong.of(request.getExpectedLastCommittedSeq());
+				} else {
+					throw it.cavallium.rockserver.core.common.RocksDBException.of(
+							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
+							"CDC creation precondition is required");
+				}
 				return protectedApi().cdcCreate(request.getId(),
 						request.isSetFromSeq() ? request.getFromSeq() : null,
 						request.isSetColumnIds() ? request.getColumnIds() : null,
@@ -1319,8 +1327,9 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void cdcDelete(String id) throws RocksDBThriftException {
+		public void cdcDelete(String id, int workloadContractVersion) throws RocksDBThriftException {
 			try {
+				requireV3(workloadContractVersion);
 				protectedApi().cdcDelete(id);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1328,8 +1337,9 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public long cdcGetEarliestAvailableSequence() throws RocksDBThriftException {
+		public long cdcGetEarliestAvailableSequence(int workloadContractVersion) throws RocksDBThriftException {
 			try {
+				requireV3(workloadContractVersion);
 				return protectedApi().cdcGetEarliestAvailableSequence();
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1337,8 +1347,10 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public OptionalLongValue cdcGetLastCommittedSequence(String id) throws RocksDBThriftException {
+		public OptionalLongValue cdcGetLastCommittedSequence(String id, int workloadContractVersion)
+				throws RocksDBThriftException {
 			try {
+				requireV3(workloadContractVersion);
 				var sequence = protectedApi().cdcGetLastCommittedSequence(id);
 				var response = new OptionalLongValue();
 				sequence.ifPresent(response::setValue);
@@ -1353,9 +1365,8 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.CdcPollRequest request)
 				throws RocksDBThriftException {
 			try {
-				int requestedMaxResponseSize = request.isSetMaxResponseBytes()
-						? request.getMaxResponseBytes()
-						: LEGACY_MAX_CDC_RESPONSE_SIZE;
+				requireV3(request.getWorkloadContractVersion());
+				int requestedMaxResponseSize = request.getMaxResponseBytes();
 				if (requestedMaxResponseSize <= 0) {
 					throw it.cavallium.rockserver.core.common.RocksDBException.of(
 							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
@@ -1377,12 +1388,22 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void cdcCommit(String id, long seq) throws RocksDBThriftException {
+		public void cdcCommit(String id, long seq, int workloadContractVersion) throws RocksDBThriftException {
 			try {
+				requireV3(workloadContractVersion);
 				protectedApi().cdcCommit(id, seq);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
+		}
+	}
+
+	private static void requireV3(int workloadContractVersion) {
+		if (workloadContractVersion != RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION) {
+			throw it.cavallium.rockserver.core.common.RocksDBException.of(
+					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					"Request requires workload contract version "
+							+ RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		}
 	}
 

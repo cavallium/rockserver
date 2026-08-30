@@ -15,7 +15,7 @@ public class RocksDB {
 
     public boolean closeTransaction(long transactionId, boolean commit, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void closeFailedUpdate(long updateId) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void closeFailedUpdate(long updateId, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public long createColumn(java.lang.String name, ColumnSchema schema, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
@@ -67,7 +67,7 @@ public class RocksDB {
 
     public long openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long iteratorLeaseTtlNanos, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void closeIterator(long iteratorId) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void closeIterator(long iteratorId, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
@@ -109,23 +109,23 @@ public class RocksDB {
 
     public java.util.List<java.lang.Boolean> putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void flush() throws RocksDBThriftException, org.apache.thrift.TException;
+    public void flush(int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void compact() throws RocksDBThriftException, org.apache.thrift.TException;
+    public void compact(int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public java.util.List<Column> getAllColumnDefinitions(RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public long cdcCreate(CdcCreateRequest request) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void cdcDelete(java.lang.String id) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void cdcDelete(java.lang.String id, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public long cdcGetEarliestAvailableSequence() throws RocksDBThriftException, org.apache.thrift.TException;
+    public long cdcGetEarliestAvailableSequence(int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public OptionalLongValue cdcGetLastCommittedSequence(java.lang.String id) throws RocksDBThriftException, org.apache.thrift.TException;
+    public OptionalLongValue cdcGetLastCommittedSequence(java.lang.String id, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public CdcPollBatchResult cdcPollBatch(CdcPollRequest request) throws RocksDBThriftException, org.apache.thrift.TException;
 
-    public void cdcCommit(java.lang.String id, long seq) throws RocksDBThriftException, org.apache.thrift.TException;
+    public void cdcCommit(java.lang.String id, long seq, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public Capabilities getCapabilities() throws org.apache.thrift.TException;
 
@@ -139,7 +139,7 @@ public class RocksDB {
 
     public void closeTransaction(long transactionId, boolean commit, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Boolean> resultHandler) throws org.apache.thrift.TException;
 
-    public void closeFailedUpdate(long updateId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void closeFailedUpdate(long updateId, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
     public void createColumn(java.lang.String name, ColumnSchema schema, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
@@ -191,7 +191,7 @@ public class RocksDB {
 
     public void openIterator(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, long iteratorLeaseTtlNanos, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
-    public void closeIterator(long iteratorId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void closeIterator(long iteratorId, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
     public void seekTo(long iterationId, java.util.List<java.nio.ByteBuffer> keys, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
@@ -233,23 +233,23 @@ public class RocksDB {
 
     public void putMultiGetPreviousPresence(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<java.lang.Boolean>> resultHandler) throws org.apache.thrift.TException;
 
-    public void flush(org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void flush(int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void compact(org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void compact(int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
     public void getAllColumnDefinitions(RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<Column>> resultHandler) throws org.apache.thrift.TException;
 
     public void cdcCreate(CdcCreateRequest request, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
-    public void cdcDelete(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void cdcDelete(java.lang.String id, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
-    public void cdcGetEarliestAvailableSequence(org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
+    public void cdcGetEarliestAvailableSequence(int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
-    public void cdcGetLastCommittedSequence(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException;
+    public void cdcGetLastCommittedSequence(java.lang.String id, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException;
 
     public void cdcPollBatch(CdcPollRequest request, org.apache.thrift.async.AsyncMethodCallback<CdcPollBatchResult> resultHandler) throws org.apache.thrift.TException;
 
-    public void cdcCommit(java.lang.String id, long seq, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
+    public void cdcCommit(java.lang.String id, long seq, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException;
 
     public void getCapabilities(org.apache.thrift.async.AsyncMethodCallback<Capabilities> resultHandler) throws org.apache.thrift.TException;
 
@@ -337,16 +337,17 @@ public class RocksDB {
     }
 
     @Override
-    public void closeFailedUpdate(long updateId) throws RocksDBThriftException, org.apache.thrift.TException
+    public void closeFailedUpdate(long updateId, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_closeFailedUpdate(updateId);
+      send_closeFailedUpdate(updateId, workloadContractVersion);
       recv_closeFailedUpdate();
     }
 
-    public void send_closeFailedUpdate(long updateId) throws org.apache.thrift.TException
+    public void send_closeFailedUpdate(long updateId, int workloadContractVersion) throws org.apache.thrift.TException
     {
       closeFailedUpdate_args args = new closeFailedUpdate_args();
       args.setUpdateId(updateId);
+      args.setWorkloadContractVersion(workloadContractVersion);
       sendBase("closeFailedUpdate", args);
     }
 
@@ -1090,16 +1091,17 @@ public class RocksDB {
     }
 
     @Override
-    public void closeIterator(long iteratorId) throws RocksDBThriftException, org.apache.thrift.TException
+    public void closeIterator(long iteratorId, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_closeIterator(iteratorId);
+      send_closeIterator(iteratorId, workloadContractVersion);
       recv_closeIterator();
     }
 
-    public void send_closeIterator(long iteratorId) throws org.apache.thrift.TException
+    public void send_closeIterator(long iteratorId, int workloadContractVersion) throws org.apache.thrift.TException
     {
       closeIterator_args args = new closeIterator_args();
       args.setIteratorId(iteratorId);
+      args.setWorkloadContractVersion(workloadContractVersion);
       sendBase("closeIterator", args);
     }
 
@@ -1708,15 +1710,16 @@ public class RocksDB {
     }
 
     @Override
-    public void flush() throws RocksDBThriftException, org.apache.thrift.TException
+    public void flush(int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_flush();
+      send_flush(workloadContractVersion);
       recv_flush();
     }
 
-    public void send_flush() throws org.apache.thrift.TException
+    public void send_flush(int workloadContractVersion) throws org.apache.thrift.TException
     {
       flush_args args = new flush_args();
+      args.setWorkloadContractVersion(workloadContractVersion);
       sendBase("flush", args);
     }
 
@@ -1731,15 +1734,16 @@ public class RocksDB {
     }
 
     @Override
-    public void compact() throws RocksDBThriftException, org.apache.thrift.TException
+    public void compact(int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_compact();
+      send_compact(workloadContractVersion);
       recv_compact();
     }
 
-    public void send_compact() throws org.apache.thrift.TException
+    public void send_compact(int workloadContractVersion) throws org.apache.thrift.TException
     {
       compact_args args = new compact_args();
+      args.setWorkloadContractVersion(workloadContractVersion);
       sendBase("compact", args);
     }
 
@@ -1808,16 +1812,17 @@ public class RocksDB {
     }
 
     @Override
-    public void cdcDelete(java.lang.String id) throws RocksDBThriftException, org.apache.thrift.TException
+    public void cdcDelete(java.lang.String id, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_cdcDelete(id);
+      send_cdcDelete(id, workloadContractVersion);
       recv_cdcDelete();
     }
 
-    public void send_cdcDelete(java.lang.String id) throws org.apache.thrift.TException
+    public void send_cdcDelete(java.lang.String id, int workloadContractVersion) throws org.apache.thrift.TException
     {
       cdcDelete_args args = new cdcDelete_args();
       args.setId(id);
+      args.setWorkloadContractVersion(workloadContractVersion);
       sendBase("cdcDelete", args);
     }
 
@@ -1832,15 +1837,16 @@ public class RocksDB {
     }
 
     @Override
-    public long cdcGetEarliestAvailableSequence() throws RocksDBThriftException, org.apache.thrift.TException
+    public long cdcGetEarliestAvailableSequence(int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_cdcGetEarliestAvailableSequence();
+      send_cdcGetEarliestAvailableSequence(workloadContractVersion);
       return recv_cdcGetEarliestAvailableSequence();
     }
 
-    public void send_cdcGetEarliestAvailableSequence() throws org.apache.thrift.TException
+    public void send_cdcGetEarliestAvailableSequence(int workloadContractVersion) throws org.apache.thrift.TException
     {
       cdcGetEarliestAvailableSequence_args args = new cdcGetEarliestAvailableSequence_args();
+      args.setWorkloadContractVersion(workloadContractVersion);
       sendBase("cdcGetEarliestAvailableSequence", args);
     }
 
@@ -1858,16 +1864,17 @@ public class RocksDB {
     }
 
     @Override
-    public OptionalLongValue cdcGetLastCommittedSequence(java.lang.String id) throws RocksDBThriftException, org.apache.thrift.TException
+    public OptionalLongValue cdcGetLastCommittedSequence(java.lang.String id, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_cdcGetLastCommittedSequence(id);
+      send_cdcGetLastCommittedSequence(id, workloadContractVersion);
       return recv_cdcGetLastCommittedSequence();
     }
 
-    public void send_cdcGetLastCommittedSequence(java.lang.String id) throws org.apache.thrift.TException
+    public void send_cdcGetLastCommittedSequence(java.lang.String id, int workloadContractVersion) throws org.apache.thrift.TException
     {
       cdcGetLastCommittedSequence_args args = new cdcGetLastCommittedSequence_args();
       args.setId(id);
+      args.setWorkloadContractVersion(workloadContractVersion);
       sendBase("cdcGetLastCommittedSequence", args);
     }
 
@@ -1912,17 +1919,18 @@ public class RocksDB {
     }
 
     @Override
-    public void cdcCommit(java.lang.String id, long seq) throws RocksDBThriftException, org.apache.thrift.TException
+    public void cdcCommit(java.lang.String id, long seq, int workloadContractVersion) throws RocksDBThriftException, org.apache.thrift.TException
     {
-      send_cdcCommit(id, seq);
+      send_cdcCommit(id, seq, workloadContractVersion);
       recv_cdcCommit();
     }
 
-    public void send_cdcCommit(java.lang.String id, long seq) throws org.apache.thrift.TException
+    public void send_cdcCommit(java.lang.String id, long seq, int workloadContractVersion) throws org.apache.thrift.TException
     {
       cdcCommit_args args = new cdcCommit_args();
       args.setId(id);
       args.setSeq(seq);
+      args.setWorkloadContractVersion(workloadContractVersion);
       sendBase("cdcCommit", args);
     }
 
@@ -2093,18 +2101,20 @@ public class RocksDB {
     }
 
     @Override
-    public void closeFailedUpdate(long updateId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void closeFailedUpdate(long updateId, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      closeFailedUpdate_call method_call = new closeFailedUpdate_call(updateId, resultHandler, this, ___protocolFactory, ___transport);
+      closeFailedUpdate_call method_call = new closeFailedUpdate_call(updateId, workloadContractVersion, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class closeFailedUpdate_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
       private long updateId;
-      public closeFailedUpdate_call(long updateId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private int workloadContractVersion;
+      public closeFailedUpdate_call(long updateId, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.updateId = updateId;
+        this.workloadContractVersion = workloadContractVersion;
       }
 
       @Override
@@ -2112,6 +2122,7 @@ public class RocksDB {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("closeFailedUpdate", org.apache.thrift.protocol.TMessageType.CALL, 0));
         closeFailedUpdate_args args = new closeFailedUpdate_args();
         args.setUpdateId(updateId);
+        args.setWorkloadContractVersion(workloadContractVersion);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -3246,18 +3257,20 @@ public class RocksDB {
     }
 
     @Override
-    public void closeIterator(long iteratorId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void closeIterator(long iteratorId, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      closeIterator_call method_call = new closeIterator_call(iteratorId, resultHandler, this, ___protocolFactory, ___transport);
+      closeIterator_call method_call = new closeIterator_call(iteratorId, workloadContractVersion, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class closeIterator_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
       private long iteratorId;
-      public closeIterator_call(long iteratorId, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private int workloadContractVersion;
+      public closeIterator_call(long iteratorId, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.iteratorId = iteratorId;
+        this.workloadContractVersion = workloadContractVersion;
       }
 
       @Override
@@ -3265,6 +3278,7 @@ public class RocksDB {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("closeIterator", org.apache.thrift.protocol.TMessageType.CALL, 0));
         closeIterator_args args = new closeIterator_args();
         args.setIteratorId(iteratorId);
+        args.setWorkloadContractVersion(workloadContractVersion);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -4214,22 +4228,25 @@ public class RocksDB {
     }
 
     @Override
-    public void flush(org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void flush(int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      flush_call method_call = new flush_call(resultHandler, this, ___protocolFactory, ___transport);
+      flush_call method_call = new flush_call(workloadContractVersion, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class flush_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
-      public flush_call(org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private int workloadContractVersion;
+      public flush_call(int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
+        this.workloadContractVersion = workloadContractVersion;
       }
 
       @Override
       public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("flush", org.apache.thrift.protocol.TMessageType.CALL, 0));
         flush_args args = new flush_args();
+        args.setWorkloadContractVersion(workloadContractVersion);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -4247,22 +4264,25 @@ public class RocksDB {
     }
 
     @Override
-    public void compact(org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void compact(int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      compact_call method_call = new compact_call(resultHandler, this, ___protocolFactory, ___transport);
+      compact_call method_call = new compact_call(workloadContractVersion, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class compact_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
-      public compact_call(org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private int workloadContractVersion;
+      public compact_call(int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
+        this.workloadContractVersion = workloadContractVersion;
       }
 
       @Override
       public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("compact", org.apache.thrift.protocol.TMessageType.CALL, 0));
         compact_args args = new compact_args();
+        args.setWorkloadContractVersion(workloadContractVersion);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -4350,18 +4370,20 @@ public class RocksDB {
     }
 
     @Override
-    public void cdcDelete(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void cdcDelete(java.lang.String id, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      cdcDelete_call method_call = new cdcDelete_call(id, resultHandler, this, ___protocolFactory, ___transport);
+      cdcDelete_call method_call = new cdcDelete_call(id, workloadContractVersion, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class cdcDelete_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
       private java.lang.String id;
-      public cdcDelete_call(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private int workloadContractVersion;
+      public cdcDelete_call(java.lang.String id, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.id = id;
+        this.workloadContractVersion = workloadContractVersion;
       }
 
       @Override
@@ -4369,6 +4391,7 @@ public class RocksDB {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("cdcDelete", org.apache.thrift.protocol.TMessageType.CALL, 0));
         cdcDelete_args args = new cdcDelete_args();
         args.setId(id);
+        args.setWorkloadContractVersion(workloadContractVersion);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -4386,22 +4409,25 @@ public class RocksDB {
     }
 
     @Override
-    public void cdcGetEarliestAvailableSequence(org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
+    public void cdcGetEarliestAvailableSequence(int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      cdcGetEarliestAvailableSequence_call method_call = new cdcGetEarliestAvailableSequence_call(resultHandler, this, ___protocolFactory, ___transport);
+      cdcGetEarliestAvailableSequence_call method_call = new cdcGetEarliestAvailableSequence_call(workloadContractVersion, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class cdcGetEarliestAvailableSequence_call extends org.apache.thrift.async.TAsyncMethodCall<java.lang.Long> {
-      public cdcGetEarliestAvailableSequence_call(org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private int workloadContractVersion;
+      public cdcGetEarliestAvailableSequence_call(int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
+        this.workloadContractVersion = workloadContractVersion;
       }
 
       @Override
       public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("cdcGetEarliestAvailableSequence", org.apache.thrift.protocol.TMessageType.CALL, 0));
         cdcGetEarliestAvailableSequence_args args = new cdcGetEarliestAvailableSequence_args();
+        args.setWorkloadContractVersion(workloadContractVersion);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -4418,18 +4444,20 @@ public class RocksDB {
     }
 
     @Override
-    public void cdcGetLastCommittedSequence(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException {
+    public void cdcGetLastCommittedSequence(java.lang.String id, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      cdcGetLastCommittedSequence_call method_call = new cdcGetLastCommittedSequence_call(id, resultHandler, this, ___protocolFactory, ___transport);
+      cdcGetLastCommittedSequence_call method_call = new cdcGetLastCommittedSequence_call(id, workloadContractVersion, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
 
     public static class cdcGetLastCommittedSequence_call extends org.apache.thrift.async.TAsyncMethodCall<OptionalLongValue> {
       private java.lang.String id;
-      public cdcGetLastCommittedSequence_call(java.lang.String id, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private int workloadContractVersion;
+      public cdcGetLastCommittedSequence_call(java.lang.String id, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.id = id;
+        this.workloadContractVersion = workloadContractVersion;
       }
 
       @Override
@@ -4437,6 +4465,7 @@ public class RocksDB {
         prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("cdcGetLastCommittedSequence", org.apache.thrift.protocol.TMessageType.CALL, 0));
         cdcGetLastCommittedSequence_args args = new cdcGetLastCommittedSequence_args();
         args.setId(id);
+        args.setWorkloadContractVersion(workloadContractVersion);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -4488,9 +4517,9 @@ public class RocksDB {
     }
 
     @Override
-    public void cdcCommit(java.lang.String id, long seq, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
+    public void cdcCommit(java.lang.String id, long seq, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
       checkReady();
-      cdcCommit_call method_call = new cdcCommit_call(id, seq, resultHandler, this, ___protocolFactory, ___transport);
+      cdcCommit_call method_call = new cdcCommit_call(id, seq, workloadContractVersion, resultHandler, this, ___protocolFactory, ___transport);
       this.___currentMethod = method_call;
       ___manager.call(method_call);
     }
@@ -4498,10 +4527,12 @@ public class RocksDB {
     public static class cdcCommit_call extends org.apache.thrift.async.TAsyncMethodCall<Void> {
       private java.lang.String id;
       private long seq;
-      public cdcCommit_call(java.lang.String id, long seq, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+      private int workloadContractVersion;
+      public cdcCommit_call(java.lang.String id, long seq, int workloadContractVersion, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
         super(client, protocolFactory, transport, resultHandler, false);
         this.id = id;
         this.seq = seq;
+        this.workloadContractVersion = workloadContractVersion;
       }
 
       @Override
@@ -4510,6 +4541,7 @@ public class RocksDB {
         cdcCommit_args args = new cdcCommit_args();
         args.setId(id);
         args.setSeq(seq);
+        args.setWorkloadContractVersion(workloadContractVersion);
         args.write(prot);
         prot.writeMessageEnd();
       }
@@ -4798,7 +4830,7 @@ public class RocksDB {
       public closeFailedUpdate_result getResult(I iface, closeFailedUpdate_args args) throws org.apache.thrift.TException {
         closeFailedUpdate_result result = getEmptyResultInstance();
         try {
-          iface.closeFailedUpdate(args.updateId);
+          iface.closeFailedUpdate(args.updateId, args.workloadContractVersion);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -5769,7 +5801,7 @@ public class RocksDB {
       public closeIterator_result getResult(I iface, closeIterator_args args) throws org.apache.thrift.TException {
         closeIterator_result result = getEmptyResultInstance();
         try {
-          iface.closeIterator(args.iteratorId);
+          iface.closeIterator(args.iteratorId, args.workloadContractVersion);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -6549,7 +6581,7 @@ public class RocksDB {
       public flush_result getResult(I iface, flush_args args) throws org.apache.thrift.TException {
         flush_result result = getEmptyResultInstance();
         try {
-          iface.flush();
+          iface.flush(args.workloadContractVersion);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -6586,7 +6618,7 @@ public class RocksDB {
       public compact_result getResult(I iface, compact_args args) throws org.apache.thrift.TException {
         compact_result result = getEmptyResultInstance();
         try {
-          iface.compact();
+          iface.compact(args.workloadContractVersion);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -6698,7 +6730,7 @@ public class RocksDB {
       public cdcDelete_result getResult(I iface, cdcDelete_args args) throws org.apache.thrift.TException {
         cdcDelete_result result = getEmptyResultInstance();
         try {
-          iface.cdcDelete(args.id);
+          iface.cdcDelete(args.id, args.workloadContractVersion);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -6735,7 +6767,7 @@ public class RocksDB {
       public cdcGetEarliestAvailableSequence_result getResult(I iface, cdcGetEarliestAvailableSequence_args args) throws org.apache.thrift.TException {
         cdcGetEarliestAvailableSequence_result result = getEmptyResultInstance();
         try {
-          result.success = iface.cdcGetEarliestAvailableSequence();
+          result.success = iface.cdcGetEarliestAvailableSequence(args.workloadContractVersion);
           result.setSuccessIsSet(true);
         } catch (RocksDBThriftException e) {
           result.e = e;
@@ -6773,7 +6805,7 @@ public class RocksDB {
       public cdcGetLastCommittedSequence_result getResult(I iface, cdcGetLastCommittedSequence_args args) throws org.apache.thrift.TException {
         cdcGetLastCommittedSequence_result result = getEmptyResultInstance();
         try {
-          result.success = iface.cdcGetLastCommittedSequence(args.id);
+          result.success = iface.cdcGetLastCommittedSequence(args.id, args.workloadContractVersion);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -6847,7 +6879,7 @@ public class RocksDB {
       public cdcCommit_result getResult(I iface, cdcCommit_args args) throws org.apache.thrift.TException {
         cdcCommit_result result = getEmptyResultInstance();
         try {
-          iface.cdcCommit(args.id, args.seq);
+          iface.cdcCommit(args.id, args.seq, args.workloadContractVersion);
         } catch (RocksDBThriftException e) {
           result.e = e;
         }
@@ -7226,7 +7258,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, closeFailedUpdate_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.closeFailedUpdate(args.updateId,resultHandler);
+        iface.closeFailedUpdate(args.updateId, args.workloadContractVersion,resultHandler);
       }
     }
 
@@ -9202,7 +9234,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, closeIterator_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.closeIterator(args.iteratorId,resultHandler);
+        iface.closeIterator(args.iteratorId, args.workloadContractVersion,resultHandler);
       }
     }
 
@@ -10793,7 +10825,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, flush_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.flush(resultHandler);
+        iface.flush(args.workloadContractVersion,resultHandler);
       }
     }
 
@@ -10868,7 +10900,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, compact_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.compact(resultHandler);
+        iface.compact(args.workloadContractVersion,resultHandler);
       }
     }
 
@@ -11096,7 +11128,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, cdcDelete_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.cdcDelete(args.id,resultHandler);
+        iface.cdcDelete(args.id, args.workloadContractVersion,resultHandler);
       }
     }
 
@@ -11173,7 +11205,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, cdcGetEarliestAvailableSequence_args args, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
-        iface.cdcGetEarliestAvailableSequence(resultHandler);
+        iface.cdcGetEarliestAvailableSequence(args.workloadContractVersion,resultHandler);
       }
     }
 
@@ -11249,7 +11281,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, cdcGetLastCommittedSequence_args args, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException {
-        iface.cdcGetLastCommittedSequence(args.id,resultHandler);
+        iface.cdcGetLastCommittedSequence(args.id, args.workloadContractVersion,resultHandler);
       }
     }
 
@@ -11400,7 +11432,7 @@ public class RocksDB {
 
       @Override
       public void start(I iface, cdcCommit_args args, org.apache.thrift.async.AsyncMethodCallback<Void> resultHandler) throws org.apache.thrift.TException {
-        iface.cdcCommit(args.id, args.seq,resultHandler);
+        iface.cdcCommit(args.id, args.seq, args.workloadContractVersion,resultHandler);
       }
     }
 
@@ -13564,15 +13596,18 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("closeFailedUpdate_args");
 
     private static final org.apache.thrift.protocol.TField UPDATE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("updateId", org.apache.thrift.protocol.TType.I64, (short)1);
+    private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)2);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new closeFailedUpdate_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new closeFailedUpdate_argsTupleSchemeFactory();
 
     public long updateId; // required
+    public int workloadContractVersion; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-      UPDATE_ID((short)1, "updateId");
+      UPDATE_ID((short)1, "updateId"),
+      WORKLOAD_CONTRACT_VERSION((short)2, "workloadContractVersion");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -13590,6 +13625,8 @@ public class RocksDB {
         switch(fieldId) {
           case 1: // UPDATE_ID
             return UPDATE_ID;
+          case 2: // WORKLOAD_CONTRACT_VERSION
+            return WORKLOAD_CONTRACT_VERSION;
           default:
             return null;
         }
@@ -13634,12 +13671,15 @@ public class RocksDB {
 
     // isset id assignments
     private static final int __UPDATEID_ISSET_ID = 0;
+    private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 1;
     private byte __isset_bitfield = 0;
     public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
     static {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
       tmpMap.put(_Fields.UPDATE_ID, new org.apache.thrift.meta_data.FieldMetaData("updateId", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(closeFailedUpdate_args.class, metaDataMap);
     }
@@ -13648,11 +13688,14 @@ public class RocksDB {
     }
 
     public closeFailedUpdate_args(
-      long updateId)
+      long updateId,
+      int workloadContractVersion)
     {
       this();
       this.updateId = updateId;
       setUpdateIdIsSet(true);
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
     }
 
     /**
@@ -13661,6 +13704,7 @@ public class RocksDB {
     public closeFailedUpdate_args(closeFailedUpdate_args other) {
       __isset_bitfield = other.__isset_bitfield;
       this.updateId = other.updateId;
+      this.workloadContractVersion = other.workloadContractVersion;
     }
 
     @Override
@@ -13672,6 +13716,8 @@ public class RocksDB {
     public void clear() {
       setUpdateIdIsSet(false);
       this.updateId = 0;
+      setWorkloadContractVersionIsSet(false);
+      this.workloadContractVersion = 0;
     }
 
     public long getUpdateId() {
@@ -13697,6 +13743,29 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __UPDATEID_ISSET_ID, value);
     }
 
+    public int getWorkloadContractVersion() {
+      return this.workloadContractVersion;
+    }
+
+    public closeFailedUpdate_args setWorkloadContractVersion(int workloadContractVersion) {
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+      return this;
+    }
+
+    public void unsetWorkloadContractVersion() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+    public boolean isSetWorkloadContractVersion() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    public void setWorkloadContractVersionIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -13705,6 +13774,14 @@ public class RocksDB {
           unsetUpdateId();
         } else {
           setUpdateId((java.lang.Long)value);
+        }
+        break;
+
+      case WORKLOAD_CONTRACT_VERSION:
+        if (value == null) {
+          unsetWorkloadContractVersion();
+        } else {
+          setWorkloadContractVersion((java.lang.Integer)value);
         }
         break;
 
@@ -13717,6 +13794,9 @@ public class RocksDB {
       switch (field) {
       case UPDATE_ID:
         return getUpdateId();
+
+      case WORKLOAD_CONTRACT_VERSION:
+        return getWorkloadContractVersion();
 
       }
       throw new java.lang.IllegalStateException();
@@ -13732,6 +13812,8 @@ public class RocksDB {
       switch (field) {
       case UPDATE_ID:
         return isSetUpdateId();
+      case WORKLOAD_CONTRACT_VERSION:
+        return isSetWorkloadContractVersion();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -13758,6 +13840,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_workloadContractVersion = true;
+      boolean that_present_workloadContractVersion = true;
+      if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+        if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+          return false;
+        if (this.workloadContractVersion != that.workloadContractVersion)
+          return false;
+      }
+
       return true;
     }
 
@@ -13766,6 +13857,8 @@ public class RocksDB {
       int hashCode = 1;
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(updateId);
+
+      hashCode = hashCode * 8191 + workloadContractVersion;
 
       return hashCode;
     }
@@ -13784,6 +13877,16 @@ public class RocksDB {
       }
       if (isSetUpdateId()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.updateId, other.updateId);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetWorkloadContractVersion()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -13815,6 +13918,10 @@ public class RocksDB {
       sb.append("updateId:");
       sb.append(this.updateId);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("workloadContractVersion:");
+      sb.append(this.workloadContractVersion);
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -13822,6 +13929,7 @@ public class RocksDB {
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
       // alas, we cannot check 'updateId' because it's a primitive and you chose the non-beans generator.
+      // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
       // check for sub-struct validity
     }
 
@@ -13871,6 +13979,14 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 2: // WORKLOAD_CONTRACT_VERSION
+              if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+                struct.workloadContractVersion = iprot.readI32();
+                struct.setWorkloadContractVersionIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -13882,6 +13998,9 @@ public class RocksDB {
         if (!struct.isSetUpdateId()) {
           throw new org.apache.thrift.protocol.TProtocolException("Required field 'updateId' was not found in serialized data! Struct: " + toString());
         }
+        if (!struct.isSetWorkloadContractVersion()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+        }
         struct.validate();
       }
 
@@ -13892,6 +14011,9 @@ public class RocksDB {
         oprot.writeStructBegin(STRUCT_DESC);
         oprot.writeFieldBegin(UPDATE_ID_FIELD_DESC);
         oprot.writeI64(struct.updateId);
+        oprot.writeFieldEnd();
+        oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+        oprot.writeI32(struct.workloadContractVersion);
         oprot.writeFieldEnd();
         oprot.writeFieldStop();
         oprot.writeStructEnd();
@@ -13912,6 +14034,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, closeFailedUpdate_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeI64(struct.updateId);
+        oprot.writeI32(struct.workloadContractVersion);
       }
 
       @Override
@@ -13919,6 +14042,8 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.updateId = iprot.readI64();
         struct.setUpdateIdIsSet(true);
+        struct.workloadContractVersion = iprot.readI32();
+        struct.setWorkloadContractVersionIsSet(true);
       }
     }
 
@@ -44268,15 +44393,18 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("closeIterator_args");
 
     private static final org.apache.thrift.protocol.TField ITERATOR_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("iteratorId", org.apache.thrift.protocol.TType.I64, (short)1);
+    private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)2);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new closeIterator_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new closeIterator_argsTupleSchemeFactory();
 
     public long iteratorId; // required
+    public int workloadContractVersion; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-      ITERATOR_ID((short)1, "iteratorId");
+      ITERATOR_ID((short)1, "iteratorId"),
+      WORKLOAD_CONTRACT_VERSION((short)2, "workloadContractVersion");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -44294,6 +44422,8 @@ public class RocksDB {
         switch(fieldId) {
           case 1: // ITERATOR_ID
             return ITERATOR_ID;
+          case 2: // WORKLOAD_CONTRACT_VERSION
+            return WORKLOAD_CONTRACT_VERSION;
           default:
             return null;
         }
@@ -44338,12 +44468,15 @@ public class RocksDB {
 
     // isset id assignments
     private static final int __ITERATORID_ISSET_ID = 0;
+    private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 1;
     private byte __isset_bitfield = 0;
     public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
     static {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
       tmpMap.put(_Fields.ITERATOR_ID, new org.apache.thrift.meta_data.FieldMetaData("iteratorId", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(closeIterator_args.class, metaDataMap);
     }
@@ -44352,11 +44485,14 @@ public class RocksDB {
     }
 
     public closeIterator_args(
-      long iteratorId)
+      long iteratorId,
+      int workloadContractVersion)
     {
       this();
       this.iteratorId = iteratorId;
       setIteratorIdIsSet(true);
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
     }
 
     /**
@@ -44365,6 +44501,7 @@ public class RocksDB {
     public closeIterator_args(closeIterator_args other) {
       __isset_bitfield = other.__isset_bitfield;
       this.iteratorId = other.iteratorId;
+      this.workloadContractVersion = other.workloadContractVersion;
     }
 
     @Override
@@ -44376,6 +44513,8 @@ public class RocksDB {
     public void clear() {
       setIteratorIdIsSet(false);
       this.iteratorId = 0;
+      setWorkloadContractVersionIsSet(false);
+      this.workloadContractVersion = 0;
     }
 
     public long getIteratorId() {
@@ -44401,6 +44540,29 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __ITERATORID_ISSET_ID, value);
     }
 
+    public int getWorkloadContractVersion() {
+      return this.workloadContractVersion;
+    }
+
+    public closeIterator_args setWorkloadContractVersion(int workloadContractVersion) {
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+      return this;
+    }
+
+    public void unsetWorkloadContractVersion() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+    public boolean isSetWorkloadContractVersion() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    public void setWorkloadContractVersionIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -44409,6 +44571,14 @@ public class RocksDB {
           unsetIteratorId();
         } else {
           setIteratorId((java.lang.Long)value);
+        }
+        break;
+
+      case WORKLOAD_CONTRACT_VERSION:
+        if (value == null) {
+          unsetWorkloadContractVersion();
+        } else {
+          setWorkloadContractVersion((java.lang.Integer)value);
         }
         break;
 
@@ -44421,6 +44591,9 @@ public class RocksDB {
       switch (field) {
       case ITERATOR_ID:
         return getIteratorId();
+
+      case WORKLOAD_CONTRACT_VERSION:
+        return getWorkloadContractVersion();
 
       }
       throw new java.lang.IllegalStateException();
@@ -44436,6 +44609,8 @@ public class RocksDB {
       switch (field) {
       case ITERATOR_ID:
         return isSetIteratorId();
+      case WORKLOAD_CONTRACT_VERSION:
+        return isSetWorkloadContractVersion();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -44462,6 +44637,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_workloadContractVersion = true;
+      boolean that_present_workloadContractVersion = true;
+      if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+        if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+          return false;
+        if (this.workloadContractVersion != that.workloadContractVersion)
+          return false;
+      }
+
       return true;
     }
 
@@ -44470,6 +44654,8 @@ public class RocksDB {
       int hashCode = 1;
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(iteratorId);
+
+      hashCode = hashCode * 8191 + workloadContractVersion;
 
       return hashCode;
     }
@@ -44488,6 +44674,16 @@ public class RocksDB {
       }
       if (isSetIteratorId()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.iteratorId, other.iteratorId);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetWorkloadContractVersion()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -44519,6 +44715,10 @@ public class RocksDB {
       sb.append("iteratorId:");
       sb.append(this.iteratorId);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("workloadContractVersion:");
+      sb.append(this.workloadContractVersion);
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -44526,6 +44726,7 @@ public class RocksDB {
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
       // alas, we cannot check 'iteratorId' because it's a primitive and you chose the non-beans generator.
+      // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
       // check for sub-struct validity
     }
 
@@ -44575,6 +44776,14 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 2: // WORKLOAD_CONTRACT_VERSION
+              if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+                struct.workloadContractVersion = iprot.readI32();
+                struct.setWorkloadContractVersionIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -44586,6 +44795,9 @@ public class RocksDB {
         if (!struct.isSetIteratorId()) {
           throw new org.apache.thrift.protocol.TProtocolException("Required field 'iteratorId' was not found in serialized data! Struct: " + toString());
         }
+        if (!struct.isSetWorkloadContractVersion()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+        }
         struct.validate();
       }
 
@@ -44596,6 +44808,9 @@ public class RocksDB {
         oprot.writeStructBegin(STRUCT_DESC);
         oprot.writeFieldBegin(ITERATOR_ID_FIELD_DESC);
         oprot.writeI64(struct.iteratorId);
+        oprot.writeFieldEnd();
+        oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+        oprot.writeI32(struct.workloadContractVersion);
         oprot.writeFieldEnd();
         oprot.writeFieldStop();
         oprot.writeStructEnd();
@@ -44616,6 +44831,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, closeIterator_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeI64(struct.iteratorId);
+        oprot.writeI32(struct.workloadContractVersion);
       }
 
       @Override
@@ -44623,6 +44839,8 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.iteratorId = iprot.readI64();
         struct.setIteratorIdIsSet(true);
+        struct.workloadContractVersion = iprot.readI32();
+        struct.setWorkloadContractVersionIsSet(true);
       }
     }
 
@@ -70982,14 +71200,16 @@ public class RocksDB {
   public static class flush_args implements org.apache.thrift.TBase<flush_args, flush_args._Fields>, java.io.Serializable, Cloneable, Comparable<flush_args>   {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("flush_args");
 
+    private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)1);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new flush_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new flush_argsTupleSchemeFactory();
 
+    public int workloadContractVersion; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-;
+      WORKLOAD_CONTRACT_VERSION((short)1, "workloadContractVersion");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -71005,6 +71225,8 @@ public class RocksDB {
       @org.apache.thrift.annotation.Nullable
       public static _Fields findByThriftId(int fieldId) {
         switch(fieldId) {
+          case 1: // WORKLOAD_CONTRACT_VERSION
+            return WORKLOAD_CONTRACT_VERSION;
           default:
             return null;
         }
@@ -71046,9 +71268,15 @@ public class RocksDB {
         return _fieldName;
       }
     }
+
+    // isset id assignments
+    private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 0;
+    private byte __isset_bitfield = 0;
     public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
     static {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(flush_args.class, metaDataMap);
     }
@@ -71056,10 +71284,20 @@ public class RocksDB {
     public flush_args() {
     }
 
+    public flush_args(
+      int workloadContractVersion)
+    {
+      this();
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+    }
+
     /**
      * Performs a deep copy on <i>other</i>.
      */
     public flush_args(flush_args other) {
+      __isset_bitfield = other.__isset_bitfield;
+      this.workloadContractVersion = other.workloadContractVersion;
     }
 
     @Override
@@ -71069,11 +71307,44 @@ public class RocksDB {
 
     @Override
     public void clear() {
+      setWorkloadContractVersionIsSet(false);
+      this.workloadContractVersion = 0;
+    }
+
+    public int getWorkloadContractVersion() {
+      return this.workloadContractVersion;
+    }
+
+    public flush_args setWorkloadContractVersion(int workloadContractVersion) {
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+      return this;
+    }
+
+    public void unsetWorkloadContractVersion() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+    public boolean isSetWorkloadContractVersion() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    public void setWorkloadContractVersionIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
     }
 
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
+      case WORKLOAD_CONTRACT_VERSION:
+        if (value == null) {
+          unsetWorkloadContractVersion();
+        } else {
+          setWorkloadContractVersion((java.lang.Integer)value);
+        }
+        break;
+
       }
     }
 
@@ -71081,6 +71352,9 @@ public class RocksDB {
     @Override
     public java.lang.Object getFieldValue(_Fields field) {
       switch (field) {
+      case WORKLOAD_CONTRACT_VERSION:
+        return getWorkloadContractVersion();
+
       }
       throw new java.lang.IllegalStateException();
     }
@@ -71093,6 +71367,8 @@ public class RocksDB {
       }
 
       switch (field) {
+      case WORKLOAD_CONTRACT_VERSION:
+        return isSetWorkloadContractVersion();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -71110,12 +71386,23 @@ public class RocksDB {
       if (this == that)
         return true;
 
+      boolean this_present_workloadContractVersion = true;
+      boolean that_present_workloadContractVersion = true;
+      if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+        if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+          return false;
+        if (this.workloadContractVersion != that.workloadContractVersion)
+          return false;
+      }
+
       return true;
     }
 
     @Override
     public int hashCode() {
       int hashCode = 1;
+
+      hashCode = hashCode * 8191 + workloadContractVersion;
 
       return hashCode;
     }
@@ -71128,6 +71415,16 @@ public class RocksDB {
 
       int lastComparison = 0;
 
+      lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetWorkloadContractVersion()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -71152,12 +71449,16 @@ public class RocksDB {
       java.lang.StringBuilder sb = new java.lang.StringBuilder("flush_args(");
       boolean first = true;
 
+      sb.append("workloadContractVersion:");
+      sb.append(this.workloadContractVersion);
+      first = false;
       sb.append(")");
       return sb.toString();
     }
 
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
+      // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
       // check for sub-struct validity
     }
 
@@ -71171,6 +71472,8 @@ public class RocksDB {
 
     private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
       try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
         read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
       } catch (org.apache.thrift.TException te) {
         throw new java.io.IOException(te);
@@ -71197,6 +71500,14 @@ public class RocksDB {
             break;
           }
           switch (schemeField.id) {
+            case 1: // WORKLOAD_CONTRACT_VERSION
+              if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+                struct.workloadContractVersion = iprot.readI32();
+                struct.setWorkloadContractVersionIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -71205,6 +71516,9 @@ public class RocksDB {
         iprot.readStructEnd();
 
         // check for required fields of primitive type, which can't be checked in the validate method
+        if (!struct.isSetWorkloadContractVersion()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+        }
         struct.validate();
       }
 
@@ -71213,6 +71527,9 @@ public class RocksDB {
         struct.validate();
 
         oprot.writeStructBegin(STRUCT_DESC);
+        oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+        oprot.writeI32(struct.workloadContractVersion);
+        oprot.writeFieldEnd();
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -71231,11 +71548,14 @@ public class RocksDB {
       @Override
       public void write(org.apache.thrift.protocol.TProtocol prot, flush_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        oprot.writeI32(struct.workloadContractVersion);
       }
 
       @Override
       public void read(org.apache.thrift.protocol.TProtocol prot, flush_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.workloadContractVersion = iprot.readI32();
+        struct.setWorkloadContractVersionIsSet(true);
       }
     }
 
@@ -71628,14 +71948,16 @@ public class RocksDB {
   public static class compact_args implements org.apache.thrift.TBase<compact_args, compact_args._Fields>, java.io.Serializable, Cloneable, Comparable<compact_args>   {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("compact_args");
 
+    private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)1);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new compact_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new compact_argsTupleSchemeFactory();
 
+    public int workloadContractVersion; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-;
+      WORKLOAD_CONTRACT_VERSION((short)1, "workloadContractVersion");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -71651,6 +71973,8 @@ public class RocksDB {
       @org.apache.thrift.annotation.Nullable
       public static _Fields findByThriftId(int fieldId) {
         switch(fieldId) {
+          case 1: // WORKLOAD_CONTRACT_VERSION
+            return WORKLOAD_CONTRACT_VERSION;
           default:
             return null;
         }
@@ -71692,9 +72016,15 @@ public class RocksDB {
         return _fieldName;
       }
     }
+
+    // isset id assignments
+    private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 0;
+    private byte __isset_bitfield = 0;
     public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
     static {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(compact_args.class, metaDataMap);
     }
@@ -71702,10 +72032,20 @@ public class RocksDB {
     public compact_args() {
     }
 
+    public compact_args(
+      int workloadContractVersion)
+    {
+      this();
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+    }
+
     /**
      * Performs a deep copy on <i>other</i>.
      */
     public compact_args(compact_args other) {
+      __isset_bitfield = other.__isset_bitfield;
+      this.workloadContractVersion = other.workloadContractVersion;
     }
 
     @Override
@@ -71715,11 +72055,44 @@ public class RocksDB {
 
     @Override
     public void clear() {
+      setWorkloadContractVersionIsSet(false);
+      this.workloadContractVersion = 0;
+    }
+
+    public int getWorkloadContractVersion() {
+      return this.workloadContractVersion;
+    }
+
+    public compact_args setWorkloadContractVersion(int workloadContractVersion) {
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+      return this;
+    }
+
+    public void unsetWorkloadContractVersion() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+    public boolean isSetWorkloadContractVersion() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    public void setWorkloadContractVersionIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
     }
 
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
+      case WORKLOAD_CONTRACT_VERSION:
+        if (value == null) {
+          unsetWorkloadContractVersion();
+        } else {
+          setWorkloadContractVersion((java.lang.Integer)value);
+        }
+        break;
+
       }
     }
 
@@ -71727,6 +72100,9 @@ public class RocksDB {
     @Override
     public java.lang.Object getFieldValue(_Fields field) {
       switch (field) {
+      case WORKLOAD_CONTRACT_VERSION:
+        return getWorkloadContractVersion();
+
       }
       throw new java.lang.IllegalStateException();
     }
@@ -71739,6 +72115,8 @@ public class RocksDB {
       }
 
       switch (field) {
+      case WORKLOAD_CONTRACT_VERSION:
+        return isSetWorkloadContractVersion();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -71756,12 +72134,23 @@ public class RocksDB {
       if (this == that)
         return true;
 
+      boolean this_present_workloadContractVersion = true;
+      boolean that_present_workloadContractVersion = true;
+      if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+        if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+          return false;
+        if (this.workloadContractVersion != that.workloadContractVersion)
+          return false;
+      }
+
       return true;
     }
 
     @Override
     public int hashCode() {
       int hashCode = 1;
+
+      hashCode = hashCode * 8191 + workloadContractVersion;
 
       return hashCode;
     }
@@ -71774,6 +72163,16 @@ public class RocksDB {
 
       int lastComparison = 0;
 
+      lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetWorkloadContractVersion()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -71798,12 +72197,16 @@ public class RocksDB {
       java.lang.StringBuilder sb = new java.lang.StringBuilder("compact_args(");
       boolean first = true;
 
+      sb.append("workloadContractVersion:");
+      sb.append(this.workloadContractVersion);
+      first = false;
       sb.append(")");
       return sb.toString();
     }
 
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
+      // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
       // check for sub-struct validity
     }
 
@@ -71817,6 +72220,8 @@ public class RocksDB {
 
     private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
       try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
         read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
       } catch (org.apache.thrift.TException te) {
         throw new java.io.IOException(te);
@@ -71843,6 +72248,14 @@ public class RocksDB {
             break;
           }
           switch (schemeField.id) {
+            case 1: // WORKLOAD_CONTRACT_VERSION
+              if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+                struct.workloadContractVersion = iprot.readI32();
+                struct.setWorkloadContractVersionIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -71851,6 +72264,9 @@ public class RocksDB {
         iprot.readStructEnd();
 
         // check for required fields of primitive type, which can't be checked in the validate method
+        if (!struct.isSetWorkloadContractVersion()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+        }
         struct.validate();
       }
 
@@ -71859,6 +72275,9 @@ public class RocksDB {
         struct.validate();
 
         oprot.writeStructBegin(STRUCT_DESC);
+        oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+        oprot.writeI32(struct.workloadContractVersion);
+        oprot.writeFieldEnd();
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -71877,11 +72296,14 @@ public class RocksDB {
       @Override
       public void write(org.apache.thrift.protocol.TProtocol prot, compact_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        oprot.writeI32(struct.workloadContractVersion);
       }
 
       @Override
       public void read(org.apache.thrift.protocol.TProtocol prot, compact_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.workloadContractVersion = iprot.readI32();
+        struct.setWorkloadContractVersionIsSet(true);
       }
     }
 
@@ -74051,15 +74473,18 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcDelete_args");
 
     private static final org.apache.thrift.protocol.TField ID_FIELD_DESC = new org.apache.thrift.protocol.TField("id", org.apache.thrift.protocol.TType.STRING, (short)1);
+    private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)2);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcDelete_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcDelete_argsTupleSchemeFactory();
 
     public @org.apache.thrift.annotation.Nullable java.lang.String id; // required
+    public int workloadContractVersion; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-      ID((short)1, "id");
+      ID((short)1, "id"),
+      WORKLOAD_CONTRACT_VERSION((short)2, "workloadContractVersion");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -74077,6 +74502,8 @@ public class RocksDB {
         switch(fieldId) {
           case 1: // ID
             return ID;
+          case 2: // WORKLOAD_CONTRACT_VERSION
+            return WORKLOAD_CONTRACT_VERSION;
           default:
             return null;
         }
@@ -74120,11 +74547,15 @@ public class RocksDB {
     }
 
     // isset id assignments
+    private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 0;
+    private byte __isset_bitfield = 0;
     public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
     static {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
       tmpMap.put(_Fields.ID, new org.apache.thrift.meta_data.FieldMetaData("id", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+      tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcDelete_args.class, metaDataMap);
     }
@@ -74133,19 +74564,24 @@ public class RocksDB {
     }
 
     public cdcDelete_args(
-      java.lang.String id)
+      java.lang.String id,
+      int workloadContractVersion)
     {
       this();
       this.id = id;
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
     }
 
     /**
      * Performs a deep copy on <i>other</i>.
      */
     public cdcDelete_args(cdcDelete_args other) {
+      __isset_bitfield = other.__isset_bitfield;
       if (other.isSetId()) {
         this.id = other.id;
       }
+      this.workloadContractVersion = other.workloadContractVersion;
     }
 
     @Override
@@ -74156,6 +74592,8 @@ public class RocksDB {
     @Override
     public void clear() {
       this.id = null;
+      setWorkloadContractVersionIsSet(false);
+      this.workloadContractVersion = 0;
     }
 
     @org.apache.thrift.annotation.Nullable
@@ -74183,6 +74621,29 @@ public class RocksDB {
       }
     }
 
+    public int getWorkloadContractVersion() {
+      return this.workloadContractVersion;
+    }
+
+    public cdcDelete_args setWorkloadContractVersion(int workloadContractVersion) {
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+      return this;
+    }
+
+    public void unsetWorkloadContractVersion() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+    public boolean isSetWorkloadContractVersion() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    public void setWorkloadContractVersionIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -74191,6 +74652,14 @@ public class RocksDB {
           unsetId();
         } else {
           setId((java.lang.String)value);
+        }
+        break;
+
+      case WORKLOAD_CONTRACT_VERSION:
+        if (value == null) {
+          unsetWorkloadContractVersion();
+        } else {
+          setWorkloadContractVersion((java.lang.Integer)value);
         }
         break;
 
@@ -74203,6 +74672,9 @@ public class RocksDB {
       switch (field) {
       case ID:
         return getId();
+
+      case WORKLOAD_CONTRACT_VERSION:
+        return getWorkloadContractVersion();
 
       }
       throw new java.lang.IllegalStateException();
@@ -74218,6 +74690,8 @@ public class RocksDB {
       switch (field) {
       case ID:
         return isSetId();
+      case WORKLOAD_CONTRACT_VERSION:
+        return isSetWorkloadContractVersion();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -74244,6 +74718,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_workloadContractVersion = true;
+      boolean that_present_workloadContractVersion = true;
+      if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+        if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+          return false;
+        if (this.workloadContractVersion != that.workloadContractVersion)
+          return false;
+      }
+
       return true;
     }
 
@@ -74254,6 +74737,8 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetId()) ? 131071 : 524287);
       if (isSetId())
         hashCode = hashCode * 8191 + id.hashCode();
+
+      hashCode = hashCode * 8191 + workloadContractVersion;
 
       return hashCode;
     }
@@ -74272,6 +74757,16 @@ public class RocksDB {
       }
       if (isSetId()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.id, other.id);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetWorkloadContractVersion()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -74307,6 +74802,10 @@ public class RocksDB {
         sb.append(this.id);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("workloadContractVersion:");
+      sb.append(this.workloadContractVersion);
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -74316,6 +74815,7 @@ public class RocksDB {
       if (id == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'id' was not present! Struct: " + toString());
       }
+      // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
       // check for sub-struct validity
     }
 
@@ -74329,6 +74829,8 @@ public class RocksDB {
 
     private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
       try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
         read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
       } catch (org.apache.thrift.TException te) {
         throw new java.io.IOException(te);
@@ -74363,6 +74865,14 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 2: // WORKLOAD_CONTRACT_VERSION
+              if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+                struct.workloadContractVersion = iprot.readI32();
+                struct.setWorkloadContractVersionIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -74371,6 +74881,9 @@ public class RocksDB {
         iprot.readStructEnd();
 
         // check for required fields of primitive type, which can't be checked in the validate method
+        if (!struct.isSetWorkloadContractVersion()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+        }
         struct.validate();
       }
 
@@ -74384,6 +74897,9 @@ public class RocksDB {
           oprot.writeString(struct.id);
           oprot.writeFieldEnd();
         }
+        oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+        oprot.writeI32(struct.workloadContractVersion);
+        oprot.writeFieldEnd();
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -74403,6 +74919,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, cdcDelete_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeString(struct.id);
+        oprot.writeI32(struct.workloadContractVersion);
       }
 
       @Override
@@ -74410,6 +74927,8 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.id = iprot.readString();
         struct.setIdIsSet(true);
+        struct.workloadContractVersion = iprot.readI32();
+        struct.setWorkloadContractVersionIsSet(true);
       }
     }
 
@@ -74802,14 +75321,16 @@ public class RocksDB {
   public static class cdcGetEarliestAvailableSequence_args implements org.apache.thrift.TBase<cdcGetEarliestAvailableSequence_args, cdcGetEarliestAvailableSequence_args._Fields>, java.io.Serializable, Cloneable, Comparable<cdcGetEarliestAvailableSequence_args>   {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcGetEarliestAvailableSequence_args");
 
+    private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)1);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcGetEarliestAvailableSequence_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcGetEarliestAvailableSequence_argsTupleSchemeFactory();
 
+    public int workloadContractVersion; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-;
+      WORKLOAD_CONTRACT_VERSION((short)1, "workloadContractVersion");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -74825,6 +75346,8 @@ public class RocksDB {
       @org.apache.thrift.annotation.Nullable
       public static _Fields findByThriftId(int fieldId) {
         switch(fieldId) {
+          case 1: // WORKLOAD_CONTRACT_VERSION
+            return WORKLOAD_CONTRACT_VERSION;
           default:
             return null;
         }
@@ -74866,9 +75389,15 @@ public class RocksDB {
         return _fieldName;
       }
     }
+
+    // isset id assignments
+    private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 0;
+    private byte __isset_bitfield = 0;
     public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
     static {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcGetEarliestAvailableSequence_args.class, metaDataMap);
     }
@@ -74876,10 +75405,20 @@ public class RocksDB {
     public cdcGetEarliestAvailableSequence_args() {
     }
 
+    public cdcGetEarliestAvailableSequence_args(
+      int workloadContractVersion)
+    {
+      this();
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+    }
+
     /**
      * Performs a deep copy on <i>other</i>.
      */
     public cdcGetEarliestAvailableSequence_args(cdcGetEarliestAvailableSequence_args other) {
+      __isset_bitfield = other.__isset_bitfield;
+      this.workloadContractVersion = other.workloadContractVersion;
     }
 
     @Override
@@ -74889,11 +75428,44 @@ public class RocksDB {
 
     @Override
     public void clear() {
+      setWorkloadContractVersionIsSet(false);
+      this.workloadContractVersion = 0;
+    }
+
+    public int getWorkloadContractVersion() {
+      return this.workloadContractVersion;
+    }
+
+    public cdcGetEarliestAvailableSequence_args setWorkloadContractVersion(int workloadContractVersion) {
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+      return this;
+    }
+
+    public void unsetWorkloadContractVersion() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+    public boolean isSetWorkloadContractVersion() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    public void setWorkloadContractVersionIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
     }
 
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
+      case WORKLOAD_CONTRACT_VERSION:
+        if (value == null) {
+          unsetWorkloadContractVersion();
+        } else {
+          setWorkloadContractVersion((java.lang.Integer)value);
+        }
+        break;
+
       }
     }
 
@@ -74901,6 +75473,9 @@ public class RocksDB {
     @Override
     public java.lang.Object getFieldValue(_Fields field) {
       switch (field) {
+      case WORKLOAD_CONTRACT_VERSION:
+        return getWorkloadContractVersion();
+
       }
       throw new java.lang.IllegalStateException();
     }
@@ -74913,6 +75488,8 @@ public class RocksDB {
       }
 
       switch (field) {
+      case WORKLOAD_CONTRACT_VERSION:
+        return isSetWorkloadContractVersion();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -74930,12 +75507,23 @@ public class RocksDB {
       if (this == that)
         return true;
 
+      boolean this_present_workloadContractVersion = true;
+      boolean that_present_workloadContractVersion = true;
+      if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+        if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+          return false;
+        if (this.workloadContractVersion != that.workloadContractVersion)
+          return false;
+      }
+
       return true;
     }
 
     @Override
     public int hashCode() {
       int hashCode = 1;
+
+      hashCode = hashCode * 8191 + workloadContractVersion;
 
       return hashCode;
     }
@@ -74948,6 +75536,16 @@ public class RocksDB {
 
       int lastComparison = 0;
 
+      lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetWorkloadContractVersion()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
       return 0;
     }
 
@@ -74972,12 +75570,16 @@ public class RocksDB {
       java.lang.StringBuilder sb = new java.lang.StringBuilder("cdcGetEarliestAvailableSequence_args(");
       boolean first = true;
 
+      sb.append("workloadContractVersion:");
+      sb.append(this.workloadContractVersion);
+      first = false;
       sb.append(")");
       return sb.toString();
     }
 
     public void validate() throws org.apache.thrift.TException {
       // check for required fields
+      // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
       // check for sub-struct validity
     }
 
@@ -74991,6 +75593,8 @@ public class RocksDB {
 
     private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
       try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
         read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
       } catch (org.apache.thrift.TException te) {
         throw new java.io.IOException(te);
@@ -75017,6 +75621,14 @@ public class RocksDB {
             break;
           }
           switch (schemeField.id) {
+            case 1: // WORKLOAD_CONTRACT_VERSION
+              if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+                struct.workloadContractVersion = iprot.readI32();
+                struct.setWorkloadContractVersionIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -75025,6 +75637,9 @@ public class RocksDB {
         iprot.readStructEnd();
 
         // check for required fields of primitive type, which can't be checked in the validate method
+        if (!struct.isSetWorkloadContractVersion()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+        }
         struct.validate();
       }
 
@@ -75033,6 +75648,9 @@ public class RocksDB {
         struct.validate();
 
         oprot.writeStructBegin(STRUCT_DESC);
+        oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+        oprot.writeI32(struct.workloadContractVersion);
+        oprot.writeFieldEnd();
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -75051,11 +75669,14 @@ public class RocksDB {
       @Override
       public void write(org.apache.thrift.protocol.TProtocol prot, cdcGetEarliestAvailableSequence_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        oprot.writeI32(struct.workloadContractVersion);
       }
 
       @Override
       public void read(org.apache.thrift.protocol.TProtocol prot, cdcGetEarliestAvailableSequence_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.workloadContractVersion = iprot.readI32();
+        struct.setWorkloadContractVersionIsSet(true);
       }
     }
 
@@ -75551,15 +76172,18 @@ public class RocksDB {
     private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("cdcGetLastCommittedSequence_args");
 
     private static final org.apache.thrift.protocol.TField ID_FIELD_DESC = new org.apache.thrift.protocol.TField("id", org.apache.thrift.protocol.TType.STRING, (short)1);
+    private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)2);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcGetLastCommittedSequence_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcGetLastCommittedSequence_argsTupleSchemeFactory();
 
     public @org.apache.thrift.annotation.Nullable java.lang.String id; // required
+    public int workloadContractVersion; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-      ID((short)1, "id");
+      ID((short)1, "id"),
+      WORKLOAD_CONTRACT_VERSION((short)2, "workloadContractVersion");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -75577,6 +76201,8 @@ public class RocksDB {
         switch(fieldId) {
           case 1: // ID
             return ID;
+          case 2: // WORKLOAD_CONTRACT_VERSION
+            return WORKLOAD_CONTRACT_VERSION;
           default:
             return null;
         }
@@ -75620,11 +76246,15 @@ public class RocksDB {
     }
 
     // isset id assignments
+    private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 0;
+    private byte __isset_bitfield = 0;
     public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
     static {
       java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
       tmpMap.put(_Fields.ID, new org.apache.thrift.meta_data.FieldMetaData("id", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+      tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcGetLastCommittedSequence_args.class, metaDataMap);
     }
@@ -75633,19 +76263,24 @@ public class RocksDB {
     }
 
     public cdcGetLastCommittedSequence_args(
-      java.lang.String id)
+      java.lang.String id,
+      int workloadContractVersion)
     {
       this();
       this.id = id;
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
     }
 
     /**
      * Performs a deep copy on <i>other</i>.
      */
     public cdcGetLastCommittedSequence_args(cdcGetLastCommittedSequence_args other) {
+      __isset_bitfield = other.__isset_bitfield;
       if (other.isSetId()) {
         this.id = other.id;
       }
+      this.workloadContractVersion = other.workloadContractVersion;
     }
 
     @Override
@@ -75656,6 +76291,8 @@ public class RocksDB {
     @Override
     public void clear() {
       this.id = null;
+      setWorkloadContractVersionIsSet(false);
+      this.workloadContractVersion = 0;
     }
 
     @org.apache.thrift.annotation.Nullable
@@ -75683,6 +76320,29 @@ public class RocksDB {
       }
     }
 
+    public int getWorkloadContractVersion() {
+      return this.workloadContractVersion;
+    }
+
+    public cdcGetLastCommittedSequence_args setWorkloadContractVersion(int workloadContractVersion) {
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+      return this;
+    }
+
+    public void unsetWorkloadContractVersion() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+    public boolean isSetWorkloadContractVersion() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    public void setWorkloadContractVersionIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -75691,6 +76351,14 @@ public class RocksDB {
           unsetId();
         } else {
           setId((java.lang.String)value);
+        }
+        break;
+
+      case WORKLOAD_CONTRACT_VERSION:
+        if (value == null) {
+          unsetWorkloadContractVersion();
+        } else {
+          setWorkloadContractVersion((java.lang.Integer)value);
         }
         break;
 
@@ -75703,6 +76371,9 @@ public class RocksDB {
       switch (field) {
       case ID:
         return getId();
+
+      case WORKLOAD_CONTRACT_VERSION:
+        return getWorkloadContractVersion();
 
       }
       throw new java.lang.IllegalStateException();
@@ -75718,6 +76389,8 @@ public class RocksDB {
       switch (field) {
       case ID:
         return isSetId();
+      case WORKLOAD_CONTRACT_VERSION:
+        return isSetWorkloadContractVersion();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -75744,6 +76417,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_workloadContractVersion = true;
+      boolean that_present_workloadContractVersion = true;
+      if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+        if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+          return false;
+        if (this.workloadContractVersion != that.workloadContractVersion)
+          return false;
+      }
+
       return true;
     }
 
@@ -75754,6 +76436,8 @@ public class RocksDB {
       hashCode = hashCode * 8191 + ((isSetId()) ? 131071 : 524287);
       if (isSetId())
         hashCode = hashCode * 8191 + id.hashCode();
+
+      hashCode = hashCode * 8191 + workloadContractVersion;
 
       return hashCode;
     }
@@ -75772,6 +76456,16 @@ public class RocksDB {
       }
       if (isSetId()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.id, other.id);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetWorkloadContractVersion()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -75807,6 +76501,10 @@ public class RocksDB {
         sb.append(this.id);
       }
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("workloadContractVersion:");
+      sb.append(this.workloadContractVersion);
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -75816,6 +76514,7 @@ public class RocksDB {
       if (id == null) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'id' was not present! Struct: " + toString());
       }
+      // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
       // check for sub-struct validity
     }
 
@@ -75829,6 +76528,8 @@ public class RocksDB {
 
     private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
       try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
         read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
       } catch (org.apache.thrift.TException te) {
         throw new java.io.IOException(te);
@@ -75863,6 +76564,14 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 2: // WORKLOAD_CONTRACT_VERSION
+              if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+                struct.workloadContractVersion = iprot.readI32();
+                struct.setWorkloadContractVersionIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -75871,6 +76580,9 @@ public class RocksDB {
         iprot.readStructEnd();
 
         // check for required fields of primitive type, which can't be checked in the validate method
+        if (!struct.isSetWorkloadContractVersion()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+        }
         struct.validate();
       }
 
@@ -75884,6 +76596,9 @@ public class RocksDB {
           oprot.writeString(struct.id);
           oprot.writeFieldEnd();
         }
+        oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+        oprot.writeI32(struct.workloadContractVersion);
+        oprot.writeFieldEnd();
         oprot.writeFieldStop();
         oprot.writeStructEnd();
       }
@@ -75903,6 +76618,7 @@ public class RocksDB {
       public void write(org.apache.thrift.protocol.TProtocol prot, cdcGetLastCommittedSequence_args struct) throws org.apache.thrift.TException {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeString(struct.id);
+        oprot.writeI32(struct.workloadContractVersion);
       }
 
       @Override
@@ -75910,6 +76626,8 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         struct.id = iprot.readString();
         struct.setIdIsSet(true);
+        struct.workloadContractVersion = iprot.readI32();
+        struct.setWorkloadContractVersionIsSet(true);
       }
     }
 
@@ -77281,17 +77999,20 @@ public class RocksDB {
 
     private static final org.apache.thrift.protocol.TField ID_FIELD_DESC = new org.apache.thrift.protocol.TField("id", org.apache.thrift.protocol.TType.STRING, (short)1);
     private static final org.apache.thrift.protocol.TField SEQ_FIELD_DESC = new org.apache.thrift.protocol.TField("seq", org.apache.thrift.protocol.TType.I64, (short)2);
+    private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)3);
 
     private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new cdcCommit_argsStandardSchemeFactory();
     private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new cdcCommit_argsTupleSchemeFactory();
 
     public @org.apache.thrift.annotation.Nullable java.lang.String id; // required
     public long seq; // required
+    public int workloadContractVersion; // required
 
     /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
     public enum _Fields implements org.apache.thrift.TFieldIdEnum {
       ID((short)1, "id"),
-      SEQ((short)2, "seq");
+      SEQ((short)2, "seq"),
+      WORKLOAD_CONTRACT_VERSION((short)3, "workloadContractVersion");
 
       private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -77311,6 +78032,8 @@ public class RocksDB {
             return ID;
           case 2: // SEQ
             return SEQ;
+          case 3: // WORKLOAD_CONTRACT_VERSION
+            return WORKLOAD_CONTRACT_VERSION;
           default:
             return null;
         }
@@ -77355,6 +78078,7 @@ public class RocksDB {
 
     // isset id assignments
     private static final int __SEQ_ISSET_ID = 0;
+    private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 1;
     private byte __isset_bitfield = 0;
     public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
     static {
@@ -77363,6 +78087,8 @@ public class RocksDB {
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
       tmpMap.put(_Fields.SEQ, new org.apache.thrift.meta_data.FieldMetaData("seq", org.apache.thrift.TFieldRequirementType.REQUIRED,
           new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
       metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
       org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(cdcCommit_args.class, metaDataMap);
     }
@@ -77372,12 +78098,15 @@ public class RocksDB {
 
     public cdcCommit_args(
       java.lang.String id,
-      long seq)
+      long seq,
+      int workloadContractVersion)
     {
       this();
       this.id = id;
       this.seq = seq;
       setSeqIsSet(true);
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
     }
 
     /**
@@ -77389,6 +78118,7 @@ public class RocksDB {
         this.id = other.id;
       }
       this.seq = other.seq;
+      this.workloadContractVersion = other.workloadContractVersion;
     }
 
     @Override
@@ -77401,6 +78131,8 @@ public class RocksDB {
       this.id = null;
       setSeqIsSet(false);
       this.seq = 0;
+      setWorkloadContractVersionIsSet(false);
+      this.workloadContractVersion = 0;
     }
 
     @org.apache.thrift.annotation.Nullable
@@ -77451,6 +78183,29 @@ public class RocksDB {
       __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __SEQ_ISSET_ID, value);
     }
 
+    public int getWorkloadContractVersion() {
+      return this.workloadContractVersion;
+    }
+
+    public cdcCommit_args setWorkloadContractVersion(int workloadContractVersion) {
+      this.workloadContractVersion = workloadContractVersion;
+      setWorkloadContractVersionIsSet(true);
+      return this;
+    }
+
+    public void unsetWorkloadContractVersion() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
+    public boolean isSetWorkloadContractVersion() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+    }
+
+    public void setWorkloadContractVersionIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
+    }
+
     @Override
     public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
       switch (field) {
@@ -77470,6 +78225,14 @@ public class RocksDB {
         }
         break;
 
+      case WORKLOAD_CONTRACT_VERSION:
+        if (value == null) {
+          unsetWorkloadContractVersion();
+        } else {
+          setWorkloadContractVersion((java.lang.Integer)value);
+        }
+        break;
+
       }
     }
 
@@ -77482,6 +78245,9 @@ public class RocksDB {
 
       case SEQ:
         return getSeq();
+
+      case WORKLOAD_CONTRACT_VERSION:
+        return getWorkloadContractVersion();
 
       }
       throw new java.lang.IllegalStateException();
@@ -77499,6 +78265,8 @@ public class RocksDB {
         return isSetId();
       case SEQ:
         return isSetSeq();
+      case WORKLOAD_CONTRACT_VERSION:
+        return isSetWorkloadContractVersion();
       }
       throw new java.lang.IllegalStateException();
     }
@@ -77534,6 +78302,15 @@ public class RocksDB {
           return false;
       }
 
+      boolean this_present_workloadContractVersion = true;
+      boolean that_present_workloadContractVersion = true;
+      if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
+        if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+          return false;
+        if (this.workloadContractVersion != that.workloadContractVersion)
+          return false;
+      }
+
       return true;
     }
 
@@ -77546,6 +78323,8 @@ public class RocksDB {
         hashCode = hashCode * 8191 + id.hashCode();
 
       hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(seq);
+
+      hashCode = hashCode * 8191 + workloadContractVersion;
 
       return hashCode;
     }
@@ -77574,6 +78353,16 @@ public class RocksDB {
       }
       if (isSetSeq()) {
         lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.seq, other.seq);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetWorkloadContractVersion()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
         if (lastComparison != 0) {
           return lastComparison;
         }
@@ -77613,6 +78402,10 @@ public class RocksDB {
       sb.append("seq:");
       sb.append(this.seq);
       first = false;
+      if (!first) sb.append(", ");
+      sb.append("workloadContractVersion:");
+      sb.append(this.workloadContractVersion);
+      first = false;
       sb.append(")");
       return sb.toString();
     }
@@ -77623,6 +78416,7 @@ public class RocksDB {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'id' was not present! Struct: " + toString());
       }
       // alas, we cannot check 'seq' because it's a primitive and you chose the non-beans generator.
+      // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
       // check for sub-struct validity
     }
 
@@ -77680,6 +78474,14 @@ public class RocksDB {
                 org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
               }
               break;
+            case 3: // WORKLOAD_CONTRACT_VERSION
+              if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+                struct.workloadContractVersion = iprot.readI32();
+                struct.setWorkloadContractVersionIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
             default:
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
           }
@@ -77690,6 +78492,9 @@ public class RocksDB {
         // check for required fields of primitive type, which can't be checked in the validate method
         if (!struct.isSetSeq()) {
           throw new org.apache.thrift.protocol.TProtocolException("Required field 'seq' was not found in serialized data! Struct: " + toString());
+        }
+        if (!struct.isSetWorkloadContractVersion()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
         }
         struct.validate();
       }
@@ -77706,6 +78511,9 @@ public class RocksDB {
         }
         oprot.writeFieldBegin(SEQ_FIELD_DESC);
         oprot.writeI64(struct.seq);
+        oprot.writeFieldEnd();
+        oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
+        oprot.writeI32(struct.workloadContractVersion);
         oprot.writeFieldEnd();
         oprot.writeFieldStop();
         oprot.writeStructEnd();
@@ -77727,6 +78535,7 @@ public class RocksDB {
         org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
         oprot.writeString(struct.id);
         oprot.writeI64(struct.seq);
+        oprot.writeI32(struct.workloadContractVersion);
       }
 
       @Override
@@ -77736,6 +78545,8 @@ public class RocksDB {
         struct.setIdIsSet(true);
         struct.seq = iprot.readI64();
         struct.setSeqIsSet(true);
+        struct.workloadContractVersion = iprot.readI32();
+        struct.setWorkloadContractVersionIsSet(true);
       }
     }
 
