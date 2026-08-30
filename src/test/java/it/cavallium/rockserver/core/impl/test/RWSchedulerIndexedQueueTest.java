@@ -121,7 +121,7 @@ class RWSchedulerIndexedQueueTest {
 		var scheduler = scheduler(1, 8, "indexed-reactor-deadline");
 		var blockerStarted = new CountDownLatch(1);
 		var releaseBlocker = new CountDownLatch(1);
-		long deadline = System.currentTimeMillis() + 25L;
+		long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(25L));
 		var view = scheduler.scheduler(WorkloadProfile.ANALYTICAL,
 				OperationFamily.FULL_SCAN_AGGREGATE, deadline);
 		var expired = new TerminalTask(() -> {});
@@ -134,8 +134,7 @@ class RWSchedulerIndexedQueueTest {
 			});
 			assertTrue(blockerStarted.await(5, SECONDS));
 			view.schedule(expired);
-			// Cross the millisecond wall-to-monotonic binding quantization window.
-			while (System.currentTimeMillis() < deadline + 2L) Thread.onSpinWait();
+			Thread.sleep(30L);
 			scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
 					Long.MAX_VALUE).execute(() -> {});
@@ -288,9 +287,9 @@ class RWSchedulerIndexedQueueTest {
 		var blockerStarted = new CountDownLatch(1);
 		var releaseBlocker = new CountDownLatch(1);
 		var blockerReturned = new CountDownLatch(1);
-		long raceMillis = System.currentTimeMillis() + 100L;
+		long raceNanos = System.nanoTime() + MILLISECONDS.toNanos(100L);
 		long deadline = pair.has(TerminalTrigger.DEADLINE)
-				? raceMillis
+				? scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(100L))
 				: Long.MAX_VALUE;
 		var view = scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, deadline);
 		var terminal = new LockCheckingTask(scheduler);
@@ -313,9 +312,9 @@ class RWSchedulerIndexedQueueTest {
 
 			var raceStart = new CountDownLatch(1);
 			var first = CompletableFuture.runAsync(() -> runTerminalTrigger(
-					pair.first(), raceStart, raceMillis, handle, scheduler, releaseBlocker));
+					pair.first(), raceStart, raceNanos, handle, scheduler, releaseBlocker));
 			var second = CompletableFuture.runAsync(() -> runTerminalTrigger(
-					pair.second(), raceStart, raceMillis, handle, scheduler, releaseBlocker));
+					pair.second(), raceStart, raceNanos, handle, scheduler, releaseBlocker));
 			raceStart.countDown();
 			first.get(15, SECONDS);
 			second.get(15, SECONDS);
@@ -341,12 +340,12 @@ class RWSchedulerIndexedQueueTest {
 
 	private static void runTerminalTrigger(TerminalTrigger trigger,
 			CountDownLatch raceStart,
-			long raceMillis,
+			long raceNanos,
 			Disposable handle,
 			RWScheduler scheduler,
 			CountDownLatch releaseBlocker) {
 		awaitUninterruptibly(raceStart);
-		while (System.currentTimeMillis() < raceMillis) {
+		while (System.nanoTime() < raceNanos) {
 			Thread.onSpinWait();
 		}
 		switch (trigger) {
@@ -421,7 +420,7 @@ class RWSchedulerIndexedQueueTest {
 					});
 			assertTrue(blockerStarted.await(5, SECONDS));
 
-			long earlierDeadline = System.currentTimeMillis() + SECONDS.toMillis(20);
+			long earlierDeadline = scheduler.bindTimeoutNanos(SECONDS.toNanos(20));
 			long laterDeadline = earlierDeadline + SECONDS.toMillis(10);
 			scheduler.executor(WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP, laterDeadline)
 					.execute(() -> record("later", order, completed));
@@ -498,7 +497,7 @@ class RWSchedulerIndexedQueueTest {
 		var order = Collections.synchronizedList(new ArrayList<Integer>());
 		var tasks = new ArrayList<Runnable>(taskCount);
 		var expected = new ArrayList<Integer>(taskCount);
-		long deadlineBase = System.currentTimeMillis() + SECONDS.toMillis(30);
+		long deadlineBase = scheduler.bindTimeoutNanos(SECONDS.toNanos(30));
 		var removalView = scheduler.executor(
 				WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP, deadlineBase);
 		try {
@@ -517,7 +516,8 @@ class RWSchedulerIndexedQueueTest {
 					completed.countDown();
 				};
 				tasks.add(task);
-				long deadline = deadlineBase + ((value * 37) & (taskCount - 1));
+				long deadline = deadlineBase
+						+ MILLISECONDS.toNanos((value * 37) & (taskCount - 1));
 				scheduler.executor(WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP, deadline)
 						.execute(task);
 				if ((value & 3) != 0) {
@@ -593,7 +593,7 @@ class RWSchedulerIndexedQueueTest {
 					});
 			assertTrue(blockerStarted.await(5, SECONDS));
 
-			long deadline = System.currentTimeMillis() + 300L;
+			long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(300L));
 			scheduler.executor(
 						WorkloadProfile.ANALYTICAL, OperationFamily.FULL_SCAN_AGGREGATE, deadline)
 					.execute(expired);
@@ -629,16 +629,15 @@ class RWSchedulerIndexedQueueTest {
 					});
 			assertTrue(blockerStarted.await(5, SECONDS));
 
-			long nowMillis = System.currentTimeMillis();
 			scheduler.executor(
 						WorkloadProfile.ANALYTICAL,
 						OperationFamily.FULL_SCAN_AGGREGATE,
-						nowMillis + SECONDS.toMillis(4))
+						scheduler.bindTimeoutNanos(SECONDS.toNanos(4)))
 					.execute(later);
 			scheduler.executor(
 						WorkloadProfile.LATENCY,
 						OperationFamily.POINT_LOOKUP,
-						nowMillis + 250L)
+						scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(250L)))
 					.execute(earlier);
 
 			Thread.sleep(350L);
@@ -678,7 +677,7 @@ class RWSchedulerIndexedQueueTest {
 			scheduler.executor(
 						WorkloadProfile.ANALYTICAL,
 						OperationFamily.FULL_SCAN_AGGREGATE,
-						System.currentTimeMillis() + SECONDS.toMillis(4))
+						scheduler.bindTimeoutNanos(SECONDS.toNanos(4)))
 					.execute(late);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
 			Thread.sleep(50L);
@@ -686,7 +685,7 @@ class RWSchedulerIndexedQueueTest {
 			scheduler.executor(
 						WorkloadProfile.ANALYTICAL,
 						OperationFamily.FULL_SCAN_AGGREGATE,
-						System.currentTimeMillis() + 500L)
+						scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(500L)))
 					.execute(early);
 
 			var completion = assertThrows(ExecutionException.class, () -> early.get(2, SECONDS));
@@ -773,7 +772,7 @@ class RWSchedulerIndexedQueueTest {
 			scheduler.executor(
 						WorkloadProfile.LATENCY,
 						OperationFamily.POINT_LOOKUP,
-						System.currentTimeMillis() + SECONDS.toMillis(30))
+						scheduler.bindTimeoutNanos(SECONDS.toNanos(30)))
 					.execute(() -> record("latency", order, reservedDone));
 			scheduler.executor(
 						WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, Long.MAX_VALUE)
@@ -955,11 +954,11 @@ class RWSchedulerIndexedQueueTest {
 			var late = scheduler.executor(
 					WorkloadProfile.PHYSICAL_MAINTENANCE,
 					OperationFamily.COMPACTION,
-					System.currentTimeMillis() + SECONDS.toMillis(30));
+					scheduler.bindTimeoutNanos(SECONDS.toNanos(30)));
 			var early = scheduler.executor(
 					WorkloadProfile.PHYSICAL_MAINTENANCE,
 					OperationFamily.COMPACTION,
-					System.currentTimeMillis() + 500L);
+					scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(500L)));
 			late.execute(repeated);
 			early.execute(repeated);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.PHYSICAL).queuedTasks() == 2);

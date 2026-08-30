@@ -500,6 +500,24 @@ class WorkloadAdmissionTest {
 				() -> RequestContext.latency(java.time.Duration.ZERO));
 	}
 
+	@Test
+	void noTimeoutBindingsReuseZeroClockState() throws Exception {
+		var boundType = Class.forName("it.cavallium.rockserver.core.client.BoundRequestContext");
+		var bind = boundType.getDeclaredMethod("bind", RequestContext.class);
+		var startedNanos = boundType.getDeclaredMethod("startedNanos");
+		var remainingNanos = boundType.getDeclaredMethod("remainingNanos");
+		bind.setAccessible(true);
+		startedNanos.setAccessible(true);
+		remainingNanos.setAccessible(true);
+		for (var context : List.of(RequestContext.analytical(), RequestContext.ingest(), RequestContext.batch())) {
+			var first = bind.invoke(null, context);
+			var second = bind.invoke(null, context);
+			assertSame(first, second);
+			assertEquals(0L, startedNanos.invoke(first));
+			assertEquals(Long.MAX_VALUE, remainingNanos.invoke(first));
+		}
+	}
+
 	private static List<CommandExpectation> commandExpectations() {
 		var all = profiles(LATENCY, ANALYTICAL, INGEST, BATCH);
 		var mutation = profiles(LATENCY, INGEST, BATCH);

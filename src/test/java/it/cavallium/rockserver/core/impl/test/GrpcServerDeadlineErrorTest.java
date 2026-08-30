@@ -215,7 +215,7 @@ class GrpcServerDeadlineErrorTest {
 						+ "request={}, errorType={}, grpcStatus={}, message={}", warning.message());
 				assertEquals("reduceRangeFirstAndLast", warning.arguments().get(0));
 				assertTrue(warning.arguments().get(1).toString().endsWith(".GetRangeRequest"));
-				assertTrue(warning.arguments().get(2).toString().contains("timeoutMs=1000"));
+				assertTrue(warning.arguments().get(2).toString().contains("context"));
 				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, warning.arguments().get(3));
 				assertEquals(io.grpc.Status.Code.DEADLINE_EXCEEDED, warning.arguments().get(4));
 				assertEquals("Deadline exceeded", warning.arguments().get(5));
@@ -360,13 +360,14 @@ class GrpcServerDeadlineErrorTest {
 	}
 
 	@Test
-	void clientReadTimeoutIsAlsoTheGrpcCallDeadline() throws Exception {
+	void requestContextTimeoutIsTheGrpcCallDeadline() throws Exception {
 		var backend = new CancellableNeverCompletingBackendConnection();
 		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-call-deadline",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).reduceRangeAsync(0,
+				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch(
+						java.time.Duration.ofSeconds(1))).reduceRangeAsync(0,
 						0,
 						null,
 						null,
@@ -393,7 +394,8 @@ class GrpcServerDeadlineErrorTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-exists-multi-deadline",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
+				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch(
+						java.time.Duration.ofSeconds(1))).existsMultiAsync(
 						0, 0, List.of(new it.cavallium.rockserver.core.common.Keys()));
 				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 

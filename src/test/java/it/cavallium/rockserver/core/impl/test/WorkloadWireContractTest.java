@@ -111,7 +111,7 @@ class WorkloadWireContractTest {
 	}
 
 	@Test
-	void thriftGenericMethodsRequireRequestContextAndProtectedMethodsDoNot() throws Exception {
+	void thriftGenericMethodsRequireContextAndProtectedMethodsRequireV3() throws Exception {
 		assertNotNull(RocksDB.Iface.class.getMethod("getCapabilities"));
 		assertNotNull(RocksDB.Iface.class.getMethod("put",
 				long.class, long.class, List.class, ByteBuffer.class,
@@ -119,14 +119,13 @@ class WorkloadWireContractTest {
 		assertNotNull(RocksDB.Iface.class.getMethod("deleteRange",
 				long.class, List.class, List.class,
 				it.cavallium.rockserver.core.common.api.RequestContext.class));
-		assertNotNull(RocksDB.Iface.class.getMethod("closeIterator", long.class));
+		assertNotNull(RocksDB.Iface.class.getMethod("closeIterator", long.class, int.class));
 		assertNotNull(RocksDB.Iface.class.getMethod("getRangePage",
 				long.class, long.class, List.class, List.class, boolean.class, List.class,
 				it.cavallium.rockserver.core.common.api.RangeRequestType.class,
-				long.class,
 				it.cavallium.rockserver.core.common.api.RangeBudget.class,
 				it.cavallium.rockserver.core.common.api.RequestContext.class));
-		assertNotNull(RocksDB.Iface.class.getMethod("flush"));
+		assertNotNull(RocksDB.Iface.class.getMethod("flush", int.class));
 	}
 
 	@Test

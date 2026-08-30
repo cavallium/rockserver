@@ -17,10 +17,13 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.RockserverCapabilities;
+import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
@@ -42,6 +45,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -52,9 +57,53 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.api.parallel.Resources;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 @Timeout(30)
 class ThriftAsyncDispatchRegressionTest {
+	private static void awaitUninterruptibly(CountDownLatch latch) {
+		boolean interrupted = false;
+		while (true) {
+			try {
+				latch.await();
+				break;
+			} catch (InterruptedException ignored) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) Thread.currentThread().interrupt();
+	}
+	@Test
+	void thriftSlotContentionConsumesTheAlreadyBoundBudget() throws Exception {
+		String previousPoolSize = System.getProperty("rockserver.thrift.client.connections");
+		System.setProperty("rockserver.thrift.client.connections", "1");
+		var backend = new SlotBlockingConnection();
+		int port = freePort();
+		try (var server = new ThriftServer(backend, "127.0.0.1", port)) {
+			server.start();
+			try (var client = new ThriftConnection("thrift-slot-deadline", "127.0.0.1", port)) {
+				var first = CompletableFuture.supplyAsync(() -> client.getSyncApi(RequestContext.batch())
+						.getColumnId("block"));
+				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
+				long started = System.nanoTime();
+				var failure = assertThrows(RocksDBException.class,
+						() -> client.getSyncApi(RequestContext.batch(Duration.ofMillis(100)))
+								.getColumnId("must-not-send"));
+				long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+				assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						failure.getErrorUniqueId());
+				assertTrue(elapsedMillis >= 75L && elapsedMillis < 2_000L,
+						"slot wait ignored the request budget: " + elapsedMillis + " ms");
+				assertEquals(0, backend.secondCalls.get());
+				backend.release.countDown();
+				assertEquals(1L, first.get(5, TimeUnit.SECONDS));
+			}
+		} finally {
+			backend.release.countDown();
+			if (previousPoolSize == null) System.clearProperty("rockserver.thrift.client.connections");
+			else System.setProperty("rockserver.thrift.client.connections", previousPoolSize);
+		}
+	}
 
 	@TempDir
 	Path tempDir;
@@ -157,9 +206,8 @@ class ThriftAsyncDispatchRegressionTest {
 		try (var server = new ThriftServer(connection, "127.0.0.1", port)) {
 			server.start();
 			try (var client = new ThriftConnection("thrift-monotonic-boundary", "127.0.0.1", port)) {
-				var context = new it.cavallium.rockserver.core.common.RequestContext(
-						WorkloadProfile.BATCH,
-						clock.epochMillis() + 10_000L);
+				var context = it.cavallium.rockserver.core.common.RequestContext.batch(
+						Duration.ofSeconds(10));
 
 				var failure = assertThrows(RocksDBException.class,
 						() -> client.getSyncApi(context).getColumnId("deadline-probe"));
@@ -515,6 +563,48 @@ class ThriftAsyncDispatchRegressionTest {
 		@Override
 		public void close() {
 		}
+	}
+
+	private static final class SlotBlockingConnection implements RocksDBConnection {
+		private final CountDownLatch entered = new CountDownLatch(1);
+		private final CountDownLatch release = new CountDownLatch(1);
+		private final AtomicInteger secondCalls = new AtomicInteger();
+
+		@Override
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
+		}
+
+		@Override
+		public URI getUrl() { return URI.create("test://thrift-slot"); }
+
+		@Override
+		public RocksDBSyncAPI getSyncApi(RequestContext context) {
+			return new RocksDBSyncAPI() {
+				@Override
+				public long getColumnId(String name) {
+					if (name.equals("block")) {
+						entered.countDown();
+						awaitUninterruptibly(release);
+						return 1L;
+					}
+					secondCalls.incrementAndGet();
+					return 2L;
+				}
+			};
+		}
+
+		@Override
+		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
+			return new RocksDBAsyncAPI() {
+				@Override
+				public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
+					return Mono.error(new UnsupportedOperationException());
+				}
+			};
+		}
+
+		@Override public void close() {}
 	}
 
 	@FunctionalInterface

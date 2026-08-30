@@ -93,6 +93,22 @@ class GrpcFastGetTest {
 								() -> client.stub().get(request));
 						assertEquals(Status.Code.INVALID_ARGUMENT, failure.getStatus().getCode());
 					}
+					var protectedFailure = assertThrows(StatusRuntimeException.class,
+							() -> client.stub().closeIterator(
+									it.cavallium.rockserver.core.common.api.proto.CloseIteratorRequest
+											.newBuilder().setIteratorId(1L).build()));
+					assertEquals(Status.Code.INVALID_ARGUMENT, protectedFailure.getStatus().getCode());
+
+					var missingPrecondition = assertThrows(StatusRuntimeException.class,
+							() -> client.stub().cdcCreate(
+									it.cavallium.rockserver.core.common.api.proto.CdcCreateRequest.newBuilder()
+											.setId("must-not-create")
+											.setWorkloadContractVersion(3)
+											.build()));
+					assertEquals(Status.Code.INVALID_ARGUMENT, missingPrecondition.getStatus().getCode());
+					assertEquals(java.util.OptionalLong.empty(), embedded.getSyncApi(
+							it.cavallium.rockserver.core.common.RequestContext.batch())
+							.cdcGetLastCommittedSequence("must-not-create"));
 				}
 			}
 		}

@@ -57,8 +57,7 @@ class RetainedRangeMonotonicDeadlineTest {
 				db.put(0L, columnId, key(index), value(index), RequestType.none());
 			}
 
-			long deadlineEpochMillis = clock.epochMillis() + 30_000L;
-			var context = new RequestContext(WorkloadProfile.BATCH, deadlineEpochMillis);
+			var context = RequestContext.batch(java.time.Duration.ofSeconds(30));
 			var observedChunks = new AtomicInteger();
 			db.setRangeReadChunkSizeObserverForTesting(_ -> {
 				if (observedChunks.getAndIncrement() == 0) {
@@ -78,8 +77,10 @@ class RetainedRangeMonotonicDeadlineTest {
 			assertTrue(awaitCondition(() -> db.getActiveRangeCursorCount() == 1
 					&& db.getRetainedRangePermitCount() == 1, 5_000L));
 
-			assertEquals(MILLISECONDS.toMicros(deadlineEpochMillis), nativeReadDeadlineMicros(db),
-					"RocksDB ReadOptions must retain its absolute epoch deadline");
+			long nativeRemainingMicros = nativeReadDeadlineMicros(db)
+					- MILLISECONDS.toMicros(System.currentTimeMillis());
+			assertTrue(nativeRemainingMicros > SECONDS.toMicros(29));
+			assertTrue(nativeRemainingMicros <= SECONDS.toMicros(30));
 
 			var second = Flux.from(db.getRangeAsyncInternal(0L,
 					columnId,
