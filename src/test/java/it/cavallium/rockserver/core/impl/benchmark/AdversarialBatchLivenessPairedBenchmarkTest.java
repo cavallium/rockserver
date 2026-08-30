@@ -72,6 +72,29 @@ class AdversarialBatchLivenessPairedBenchmarkTest {
 						classPath, temporary.resolve("absent"), baseline));
 	}
 
+	@Test
+	void productionIdentityAllowsHarnessOnlyDescendantsButRejectsSourceDrift() throws Exception {
+		Path worktree = temporary.resolve("production-identity");
+		Path classes = worktree.resolve("target/classes");
+		createCheckoutFixture(worktree, "production", classes);
+		String productionSha = checkoutSha(worktree);
+		Path harness = worktree.resolve("src/test/java/Harness.java");
+		Files.createDirectories(harness.getParent());
+		Files.writeString(harness, "final class Harness {}\n");
+		new ProcessBuilder("git", "add", "src/test/java/Harness.java")
+				.directory(worktree.toFile()).start().waitFor();
+		new ProcessBuilder("git", "commit", "-q", "-m", "harness")
+				.directory(worktree.toFile()).start().waitFor();
+
+		AdversarialBatchLivenessPairedBenchmark.verifyProductionCheckout(worktree, productionSha);
+
+		Path drift = worktree.resolve("src/main/java/ProductionDrift.java");
+		Files.createDirectories(drift.getParent());
+		Files.writeString(drift, "final class ProductionDrift {}\n");
+		assertThrows(IllegalArgumentException.class, () ->
+				AdversarialBatchLivenessPairedBenchmark.verifyProductionCheckout(worktree, productionSha));
+	}
+
 	private Path prepare(String name, boolean enforce) throws Exception {
 		Path root = temporary.resolve(name);
 		prepareAt(root, enforce);

@@ -63,8 +63,8 @@ public final class AdversarialBatchLivenessPairedBenchmark {
 		if (Files.exists(prepared.root())) {
 			throw new IllegalArgumentException("Benchmark root already exists: " + prepared.root());
 		}
-		verifyCheckout(prepared.baselineWorktree(), prepared.baselineSha());
-		verifyCheckout(prepared.candidateWorktree(), prepared.candidateSha());
+		verifyProductionCheckout(prepared.baselineWorktree(), prepared.baselineSha());
+		verifyProductionCheckout(prepared.candidateWorktree(), prepared.candidateSha());
 		Files.createDirectories(prepared.root());
 		Files.writeString(prepared.root().resolve(METADATA_FILE), prepared.metadataText(),
 				StandardOpenOption.CREATE_NEW);
@@ -121,7 +121,7 @@ public final class AdversarialBatchLivenessPairedBenchmark {
 		String expectedBuild = implementation == Implementation.BASELINE
 				? prepared.baselineSha() : prepared.candidateSha();
 		if (!expectedBuild.equals(buildSha)) throw new IllegalArgumentException("Worker build SHA mismatch");
-		if (prepared.enforce()) verifyCheckout(Path.of("."), buildSha);
+		if (prepared.enforce()) verifyProductionCheckout(Path.of("."), buildSha);
 
 		URI productionLocation = RWScheduler.class.getProtectionDomain().getCodeSource().getLocation().toURI();
 		String productionSha = contentSha(Path.of(productionLocation));
@@ -454,15 +454,29 @@ public final class AdversarialBatchLivenessPairedBenchmark {
 		return String.join(File.pathSeparator, entries);
 	}
 
-	private static void verifyCheckout(Path worktree, String expectedSha) throws IOException {
+	static void verifyProductionCheckout(Path worktree, String expectedSha) throws IOException {
 		try {
-			var process = new ProcessBuilder("git", "rev-parse", "HEAD")
-					.directory(worktree.toAbsolutePath().normalize().toFile())
+			Path directory = worktree.toAbsolutePath().normalize();
+			var revision = new ProcessBuilder("git", "rev-parse", expectedSha + "^{commit}")
+					.directory(directory.toFile())
 					.redirectErrorStream(true)
 					.start();
-			String actual = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-			if (process.waitFor() != 0 || !actual.equals(expectedSha)) {
-				throw new IllegalArgumentException("Checkout does not match expected SHA: " + worktree);
+			String resolved = new String(revision.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+			if (revision.waitFor() != 0 || !resolved.equals(expectedSha)) {
+				throw new IllegalArgumentException("Expected production SHA is absent: " + expectedSha);
+			}
+			var difference = new ProcessBuilder("git", "diff", "--quiet", expectedSha, "--",
+					"pom.xml", "src/main", "src/library")
+					.directory(directory.toFile()).start();
+			if (difference.waitFor() != 0) {
+				throw new IllegalArgumentException("Production sources differ from expected SHA: " + worktree);
+			}
+			var dirty = new ProcessBuilder("git", "status", "--porcelain", "--untracked-files=all", "--",
+					"pom.xml", "src/main", "src/library")
+					.directory(directory.toFile()).redirectErrorStream(true).start();
+			String dirtyProduction = new String(dirty.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+			if (dirty.waitFor() != 0 || !dirtyProduction.isEmpty()) {
+				throw new IllegalArgumentException("Production source tree is dirty: " + worktree);
 			}
 		} catch (InterruptedException interrupted) {
 			Thread.currentThread().interrupt();
