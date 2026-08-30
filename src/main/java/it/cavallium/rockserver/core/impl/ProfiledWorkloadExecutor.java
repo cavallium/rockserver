@@ -8,6 +8,7 @@ import io.micrometer.core.instrument.Timer;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.WorkloadCost;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
@@ -42,9 +43,7 @@ import reactor.core.Disposable;
  */
 final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
-	static final long COST_BYTES = 2L * 1024L * 1024L;
-	static final int MAX_TASK_COST = 16;
-	private static final int MAX_DEFICIT = MAX_TASK_COST;
+	private static final int MAX_DEFICIT = WorkloadCost.MAX_UNITS;
 	private static final Logger LOG = LoggerFactory.getLogger(ProfiledWorkloadExecutor.class);
 	private static final ThreadLocal<ProfiledWorkloadExecutor> EXECUTING_POOL = new ThreadLocal<>();
 	private static final WorkloadProfile[] PROFILES = WorkloadProfile.values();
@@ -475,8 +474,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (estimatedBytes == 0L) {
 			return 1;
 		}
-		long cost = 1L + (estimatedBytes - 1L) / COST_BYTES;
-		return (int) Math.max(1L, Math.min(MAX_TASK_COST, cost));
+		long cost = 1L + (estimatedBytes - 1L) / WorkloadCost.QUANTUM_BYTES;
+		return (int) Math.max(1L, Math.min(WorkloadCost.MAX_UNITS, cost));
 	}
 
 	private void ensureWorkersStartedUnsafe() {
@@ -1100,7 +1099,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private @Nullable WorkloadTask selectGuaranteedCandidateUnsafe(boolean reservationOnly,
 	                                                               boolean batchEligible) {
-		int maxAttempts = GUARANTEED.length * (MAX_TASK_COST + 1);
+		int maxAttempts = GUARANTEED.length * (WorkloadCost.MAX_UNITS + 1);
 		for (int attempts = 0; attempts < maxAttempts; attempts++) {
 			var profile = GUARANTEED[guaranteedCursor];
 			if (queuedUnsafe(profile) == 0) {
