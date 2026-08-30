@@ -163,6 +163,7 @@ class RWSchedulerMetricsTest {
 		var scheduler = scheduler(registry, "metric-task-routing-cardinality");
 		try {
 			var routes = new java.util.HashSet<String>();
+			var metersByRoute = new java.util.HashMap<String, List<Meter>>();
 			for (var meter : registry.getMeters()) {
 				String operationTag = meter.getId().getTag(OPERATION);
 				if (operationTag == null) continue;
@@ -172,7 +173,26 @@ class RWSchedulerMetricsTest {
 				String expectedResource = RWScheduler.resourcePool(profile, family)
 						.name().toLowerCase(java.util.Locale.ROOT);
 				assertEquals(expectedResource, meter.getId().getTag(RESOURCE), meter.getId().toString());
-				routes.add(profile + "/" + family + "/" + expectedResource);
+				String route = profile + "/" + family + "/" + expectedResource;
+				routes.add(route);
+				metersByRoute.computeIfAbsent(route, ignored -> new ArrayList<>()).add(meter);
+				var expectedTagKeys = new java.util.HashSet<>(Set.of(
+						"database", RESOURCE, PROFILE, OPERATION));
+				switch (meter.getId().getName()) {
+					case "rockserver.workload.outcomes" -> expectedTagKeys.add("outcome");
+					case "rockserver.workload.rejections" -> expectedTagKeys.add("reason");
+					case "rockserver.workload.admission" -> expectedTagKeys.add("result");
+					case "rockserver.workload.queue.wait", "rockserver.workload.execution",
+							"rockserver.workload.quantums", "rockserver.workload.failures",
+							"rockserver.workload.cancellations" -> {
+					}
+					default -> throw new AssertionError("unexpected task meter: " + meter.getId());
+				}
+				assertEquals(expectedTagKeys,
+						meter.getId().getTags().stream()
+								.map(io.micrometer.core.instrument.Tag::getKey)
+								.collect(Collectors.toSet()),
+						meter.getId().toString());
 			}
 			long allowedPairs = 0L;
 			for (var profile : WorkloadProfile.values()) {
@@ -181,6 +201,24 @@ class RWSchedulerMetricsTest {
 				}
 			}
 			assertEquals(allowedPairs, routes.size());
+			assertEquals(allowedPairs * 18L,
+					metersByRoute.values().stream().mapToLong(List::size).sum(),
+					"each allowed profile/family route has a fixed eighteen-meter schema");
+			for (var entry : metersByRoute.entrySet()) {
+				var counts = entry.getValue().stream().collect(Collectors.groupingBy(
+						meter -> meter.getId().getName(), Collectors.counting()));
+				assertEquals(Map.of(
+						"rockserver.workload.queue.wait", 1L,
+						"rockserver.workload.execution", 1L,
+						"rockserver.workload.quantums", 1L,
+						"rockserver.workload.failures", 1L,
+						"rockserver.workload.cancellations", 1L,
+						"rockserver.workload.outcomes", 6L,
+						"rockserver.workload.rejections", 3L,
+						"rockserver.workload.admission", 4L),
+						counts,
+						entry.getKey());
+			}
 		} finally {
 			scheduler.dispose();
 			registry.close();
@@ -310,6 +348,58 @@ class RWSchedulerMetricsTest {
 		} finally {
 			release.countDown();
 			scheduler.dispose();
+			registry.close();
+		}
+	}
+
+	@Test
+	void everyAllowedRouteConservesOneAcceptedRunAcrossTimersCountersAndPools() throws Exception {
+		var registry = new SimpleMeterRegistry();
+		var scheduler = scheduler(registry, "metric-route-conservation");
+		try {
+			for (var profile : WorkloadProfile.values()) {
+				for (var family : OperationFamily.values()) {
+					if (!WorkloadAdmission.isAllowed(profile, family)) continue;
+					var completed = new CompletableFuture<Void>();
+					scheduler.executor(profile, family, RequestContext.NO_DEADLINE)
+							.execute(() -> completed.complete(null));
+					completed.get(5, SECONDS);
+					String resource = RWScheduler.resourcePool(profile, family)
+							.name().toLowerCase(java.util.Locale.ROOT);
+					String profileTag = profile.name().toLowerCase(java.util.Locale.ROOT);
+					String operationTag = family.name().toLowerCase(java.util.Locale.ROOT);
+					String[] routeTags = {
+							"database", DATABASE,
+							RESOURCE, resource,
+							PROFILE, profileTag,
+							OPERATION, operationTag
+					};
+					assertEventually(() -> registry.get("rockserver.workload.execution")
+							.tags(routeTags).timer().count() == 1L);
+					assertEquals(1L, registry.get("rockserver.workload.queue.wait").tags(routeTags).timer().count());
+					assertEquals(1L, registry.get("rockserver.workload.execution").tags(routeTags).timer().count());
+					assertEquals(1.0, registry.get("rockserver.workload.quantums").tags(routeTags).counter().count());
+					assertEquals(0.0, registry.get("rockserver.workload.failures").tags(routeTags).counter().count());
+					assertEquals(0.0, registry.get("rockserver.workload.cancellations").tags(routeTags).counter().count());
+					for (var outcome : RWScheduler.TerminalOutcome.values()) {
+						double expected = outcome == RWScheduler.TerminalOutcome.RUN ? 1.0 : 0.0;
+						assertEquals(expected, registry.get("rockserver.workload.outcomes")
+								.tags(routeTags)
+								.tag("outcome", outcome.name().toLowerCase(java.util.Locale.ROOT))
+								.counter().count(), profile + "/" + family + "/" + outcome);
+					}
+					for (String result : List.of("accepted", "deadline", "overload", "shutdown")) {
+						assertEquals(result.equals("accepted") ? 1.0 : 0.0,
+								registry.get("rockserver.workload.admission")
+										.tags(routeTags).tag("result", result).counter().count(),
+								profile + "/" + family + "/" + result);
+					}
+				}
+			}
+			assertTrue(scheduler.instrumentationSnapshot().pools().values().stream()
+					.allMatch(RWScheduler.PoolSnapshot::drainedAndConserved));
+		} finally {
+			scheduler.disposeNow();
 			registry.close();
 		}
 	}

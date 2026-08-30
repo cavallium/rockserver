@@ -1,21 +1,42 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Descriptors;
+import io.grpc.protobuf.ProtoFileDescriptorSupplier;
 import it.cavallium.rockserver.core.common.api.RocksDB;
 import it.cavallium.rockserver.core.common.api.proto.PutBatchInitialRequest;
 import it.cavallium.rockserver.core.common.api.proto.PutRequest;
 import java.nio.ByteBuffer;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.server.ThriftServer;
 
 class WorkloadWireContractTest {
+
+	private static final Set<String> CONTEXT_FREE_METHODS = Set.of(
+			"getCapabilities",
+			"closeFailedUpdate",
+			"closeIterator",
+			"flush",
+			"compact",
+			"cdcCreate",
+			"cdcDelete",
+			"cdcGetEarliestAvailableSequence",
+			"cdcGetLastCommittedSequence",
+			"cdcPoll",
+			"cdcPollBatch",
+			"cdcCommit");
 
 	@Test
 	void allSevenProfileNumbersAreExplicitAndStableAcrossJavaProtobufAndThrift() {
@@ -106,6 +127,68 @@ class WorkloadWireContractTest {
 				it.cavallium.rockserver.core.common.api.RangeBudget.class,
 				it.cavallium.rockserver.core.common.api.RequestContext.class));
 		assertNotNull(RocksDB.Iface.class.getMethod("flush"));
+	}
+
+	@Test
+	void everyGrpcAndThriftRequestVariantHasExactlyOneDeclaredContextPolicy() {
+		var schemaSupplier = org.junit.jupiter.api.Assertions.assertInstanceOf(
+				ProtoFileDescriptorSupplier.class,
+				it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc
+						.getServiceDescriptor().getSchemaDescriptor());
+		var service = schemaSupplier.getFileDescriptor().findServiceByName("RocksDBService");
+		assertNotNull(service);
+		var grpcNames = new HashSet<String>();
+		for (var method : service.getMethods()) {
+			grpcNames.add(method.getName());
+			boolean hasContext = containsRequestContext(method.getInputType(), new HashSet<>());
+			if (CONTEXT_FREE_METHODS.contains(method.getName())) {
+				assertFalse(hasContext, method.getFullName() + " must remain server-owned/context-free");
+			} else {
+				assertTrue(hasContext, method.getFullName() + " has no request context in its unary/stream initial shape");
+			}
+		}
+		assertTrue(grpcNames.containsAll(CONTEXT_FREE_METHODS),
+				"the explicit protected/capability set contains a stale or missing gRPC variant");
+
+		assertThriftContextPolicy(RocksDB.Iface.class);
+		assertThriftContextPolicy(RocksDB.AsyncIface.class);
+	}
+
+	private static boolean containsRequestContext(Descriptors.Descriptor descriptor,
+			Set<Descriptors.Descriptor> visited) {
+		if (!visited.add(descriptor)) return false;
+		var direct = descriptor.findFieldByName("context");
+		if (direct != null) {
+			return direct.getJavaType() == Descriptors.FieldDescriptor.JavaType.MESSAGE
+					&& direct.getMessageType().getFullName().endsWith(".RequestContext");
+		}
+		for (var field : descriptor.getFields()) {
+			if (field.getJavaType() == Descriptors.FieldDescriptor.JavaType.MESSAGE
+					&& containsRequestContext(field.getMessageType(), visited)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static void assertThriftContextPolicy(Class<?> api) {
+		var names = new HashSet<String>();
+		for (Method method : api.getDeclaredMethods()) {
+			names.add(method.getName());
+			long contexts = java.util.Arrays.stream(method.getParameterTypes())
+					.filter(type -> type == it.cavallium.rockserver.core.common.api.RequestContext.class)
+					.count();
+			if (CONTEXT_FREE_METHODS.contains(method.getName())) {
+				assertEquals(0L, contexts, api.getSimpleName() + "." + method.getName());
+			} else {
+				assertEquals(1L, contexts, api.getSimpleName() + "." + method.getName());
+			}
+		}
+		assertTrue(names.contains("getCapabilities"));
+		assertTrue(names.contains("closeFailedUpdate"));
+		assertTrue(names.contains("closeIterator"));
+		assertTrue(names.contains("flush"));
+		assertTrue(names.contains("compact"));
 	}
 
 	@Test

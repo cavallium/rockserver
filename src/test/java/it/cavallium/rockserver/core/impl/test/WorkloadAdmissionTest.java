@@ -19,6 +19,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.PutBatchMode;
+import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
@@ -29,6 +30,7 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.WorkloadCost;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.time.Duration;
@@ -82,6 +84,48 @@ class WorkloadAdmissionTest {
 	private static final List<WorkloadProfile> CLIENT_PROFILES = List.of(LATENCY, ANALYTICAL, INGEST, BATCH);
 	private static final Keys EMPTY_KEYS = new Keys(Buf.create(0));
 	private static final ColumnSchema TEST_SCHEMA = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
+	private static final Map<String, OperationFamily> EXPECTED_COMMAND_FAMILIES = Map.ofEntries(
+			Map.entry("openTransaction", OperationFamily.METADATA),
+			Map.entry("commitTransaction", OperationFamily.MUTATION),
+			Map.entry("rollbackTransaction", OperationFamily.CONTROL),
+			Map.entry("closeFailedUpdate", OperationFamily.CONTROL),
+			Map.entry("createColumn", OperationFamily.MUTATION),
+			Map.entry("uploadMergeOperator", OperationFamily.MUTATION),
+			Map.entry("checkMergeOperator", OperationFamily.METADATA),
+			Map.entry("deleteColumn", OperationFamily.MUTATION),
+			Map.entry("deleteColumnIfExists", OperationFamily.MUTATION),
+			Map.entry("getColumnId", OperationFamily.METADATA),
+			Map.entry("estimateNumKeys", OperationFamily.METADATA),
+			Map.entry("put", OperationFamily.MUTATION),
+			Map.entry("delete", OperationFamily.MUTATION),
+			Map.entry("deleteMulti", OperationFamily.MUTATION),
+			Map.entry("deleteRange", OperationFamily.MUTATION),
+			Map.entry("putMulti", OperationFamily.MUTATION),
+			Map.entry("putBatch", OperationFamily.MUTATION),
+			Map.entry("merge", OperationFamily.MUTATION),
+			Map.entry("mergeMulti", OperationFamily.MUTATION),
+			Map.entry("mergeBatch", OperationFamily.MUTATION),
+			Map.entry("get", OperationFamily.POINT_LOOKUP),
+			Map.entry("existsMulti", OperationFamily.BOUNDED_FAN_OUT),
+			Map.entry("openIterator", OperationFamily.BOUNDARY_SEEK),
+			Map.entry("closeIterator", OperationFamily.CONTROL),
+			Map.entry("seekTo", OperationFamily.BOUNDARY_SEEK),
+			Map.entry("subsequent", OperationFamily.RANGE_PAGE),
+			Map.entry("reduceBoundary", OperationFamily.BOUNDARY_SEEK),
+			Map.entry("reduceExact", OperationFamily.FULL_SCAN_AGGREGATE),
+			Map.entry("getRangePage", OperationFamily.RANGE_PAGE),
+			Map.entry("getRange", OperationFamily.RANGE_PAGE),
+			Map.entry("scanRaw", OperationFamily.RANGE_PAGE),
+			Map.entry("scanRawResumable", OperationFamily.RANGE_PAGE),
+			Map.entry("cdcPoll", OperationFamily.WAL_PAGE),
+			Map.entry("flush", OperationFamily.FLUSH),
+			Map.entry("compact", OperationFamily.COMPACTION),
+			Map.entry("getAllColumnDefinitions", OperationFamily.METADATA),
+			Map.entry("cdcCreate", OperationFamily.MUTATION),
+			Map.entry("cdcDelete", OperationFamily.MUTATION),
+			Map.entry("cdcEarliest", OperationFamily.WAL_PAGE),
+			Map.entry("cdcLastCommitted", OperationFamily.WAL_PAGE),
+			Map.entry("cdcCommit", OperationFamily.MUTATION));
 
 	@Test
 	void everyProfileAndOperationPairHasTheDocumentedResult() {
@@ -105,23 +149,38 @@ class WorkloadAdmissionTest {
 	@Test
 	void everyConcreteCommandHasAnExplicitResultForEveryClientProfile() {
 		var commands = commandExpectations();
+		assertEquals(EXPECTED_COMMAND_FAMILIES.keySet(),
+				commands.stream().map(CommandExpectation::name).collect(java.util.stream.Collectors.toSet()),
+				"Every command variant must have an explicit family expectation");
 		assertEquals(permittedConcreteCommandTypes(),
 				commands.stream().map(expectation -> expectation.command().getClass()).collect(java.util.stream.Collectors.toSet()),
 				"Every sealed command subtype must have an admission expectation");
 
 		for (var expectation : commands) {
+			var expectedFamily = EXPECTED_COMMAND_FAMILIES.get(expectation.name());
+			assertEquals(expectedFamily, expectation.command().operationFamily(), expectation.name());
+			assertEquals(expectation.protectedProfile(), expectation.command().protectedProfile(), expectation.name());
 			assertTrue(expectation.command().estimatedBytes() >= 0L,
 					expectation.name() + " produced a negative scheduler cost estimate");
+			assertEquals(expectation.name().equals("getRangePage") ? 4 : 1,
+					RWScheduler.taskCost(expectation.command().estimatedBytes()),
+					expectation.name() + " scheduler cost");
 			for (var profile : CLIENT_PROFILES) {
 				var context = context(profile);
 				if (expectation.protectedProfile() != null) {
+					var resolved = assertDoesNotThrow(() -> WorkloadAdmission.resolve(context, expectation.command()));
 					assertEquals(expectation.protectedProfile(),
-							assertDoesNotThrow(() -> WorkloadAdmission.resolve(context, expectation.command())),
+							resolved,
 							expectation.name() + " from " + profile);
+					assertEquals(expectedPool(resolved, expectedFamily),
+							RWScheduler.resourcePool(resolved, expectedFamily), expectation.name());
 				} else if (expectation.allowedProfiles().contains(profile)) {
+					var resolved = assertDoesNotThrow(() -> WorkloadAdmission.resolve(context, expectation.command()));
 					assertEquals(profile,
-							assertDoesNotThrow(() -> WorkloadAdmission.resolve(context, expectation.command())),
+							resolved,
 							expectation.name() + " from " + profile);
+					assertEquals(expectedPool(resolved, expectedFamily),
+							RWScheduler.resourcePool(resolved, expectedFamily), expectation.name());
 				} else {
 					var error = assertThrows(RocksDBException.class,
 							() -> WorkloadAdmission.resolve(context, expectation.command()),
@@ -130,6 +189,18 @@ class WorkloadAdmissionTest {
 				}
 			}
 		}
+	}
+
+	private static RWScheduler.Pool expectedPool(WorkloadProfile profile, OperationFamily family) {
+		if (profile == CONTROL) return RWScheduler.Pool.CONTROL;
+		if (profile == PHYSICAL_MAINTENANCE) return RWScheduler.Pool.PHYSICAL;
+		return switch (family) {
+			case MUTATION, FLUSH -> RWScheduler.Pool.WRITE;
+			case CONTROL -> RWScheduler.Pool.CONTROL;
+			case COMPACTION -> RWScheduler.Pool.PHYSICAL;
+			case METADATA, POINT_LOOKUP, BOUNDARY_SEEK, BOUNDED_FAN_OUT,
+					RANGE_PAGE, FULL_SCAN_AGGREGATE, WAL_PAGE -> RWScheduler.Pool.READ;
+		};
 	}
 
 	@Test
@@ -145,9 +216,32 @@ class WorkloadAdmissionTest {
 				0, 1, List.of(keys(5), keys(6)), 1_000).estimatedBytes());
 		assertEquals(19L, new RocksDBAPICommandSingle.UploadMergeOperator(
 				"operator", "Type", new byte[19]).estimatedBytes());
+		assertEquals(17L, new RocksDBAPICommandSingle.CheckMergeOperator(
+				"operator", new byte[17]).estimatedBytes());
+		assertEquals(7L, new RocksDBAPICommandSingle.Delete<>(
+				0, 1, keys(7), RequestType.none()).estimatedBytes());
+		assertEquals(5L, new RocksDBAPICommandSingle.DeleteMulti<>(
+				0, 1, List.of(keys(2), keys(3)), RequestType.none()).estimatedBytes());
+		assertEquals(7L, new RocksDBAPICommandSingle.DeleteRange(
+				1, keys(3), keys(4)).estimatedBytes());
+		assertEquals(12L, new RocksDBAPICommandSingle.Merge<>(
+				0, 1, keys(5), buffer(7), RequestType.none()).estimatedBytes());
+		assertEquals(15L, new RocksDBAPICommandSingle.MergeMulti<>(
+				0, 1, List.of(keys(2), keys(3)), List.of(buffer(4), buffer(6)), RequestType.none())
+				.estimatedBytes());
+		assertEquals(7L, new RocksDBAPICommandSingle.OpenIterator(
+				0, 1, keys(3), keys(4), false, 1_000).estimatedBytes());
+		assertEquals(3L, new RocksDBAPICommandSingle.SeekTo(1, keys(3)).estimatedBytes());
+		assertEquals(7L, new RocksDBAPICommandSingle.ReduceRange<>(
+				0, 1, keys(3), keys(4), false, RequestType.firstAndLast(), 1_000).estimatedBytes());
 		assertEquals(71L, new RocksDBAPICommandSingle.GetRangePage<>(
 				0, 1, keys(3), keys(4), false, null,
 				RequestType.allInRange(), 1_000, new RangeBudget(8, 64)).estimatedBytes());
+		assertEquals(7L, new RocksDBAPICommandStream.GetRange<>(
+				0, 1, keys(3), keys(4), false, RequestType.allInRange(), 1_000).estimatedBytes());
+		assertEquals((long) RawSstToken.MAX_CHARACTERS * Character.BYTES,
+				new RocksDBAPICommandStream.ScanRawResumable(
+						1, 0, 1, Set.of(new RawSstToken("000123.sst"))).estimatedBytes());
 
 		var saturated = new RocksDBAPICommandSingle.GetRangePage<>(
 				0, 1, keys(1), null, false, null,
