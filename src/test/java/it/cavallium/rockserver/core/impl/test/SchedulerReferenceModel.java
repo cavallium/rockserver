@@ -315,11 +315,23 @@ final class SchedulerReferenceModel {
 			long activeJobs = jobs.values().stream()
 					.filter(job -> job.spec.profile() == profile && job.phase == Phase.ACTIVE)
 					.count();
+			long parkedJobs = jobs.values().stream()
+					.filter(job -> job.spec.profile() == profile && job.phase == Phase.PARKED)
+					.count();
 			if (queued != queues.get(profile).size() || activeJobs != active.get(profile)) {
 				throw new AssertionError("reference ownership mismatch for " + profile);
 			}
-			if (queued > settings.capacities().getOrDefault(profile, 0)) {
-				throw new AssertionError("reference queue bound exceeded for " + profile);
+			long outstanding = queued + activeJobs + parkedJobs;
+			if (outstanding != outstanding(profile)) {
+				throw new AssertionError("reference outstanding ownership mismatch for " + profile);
+			}
+			// Queue capacity is an admission bound, not a lifetime bound. Already admitted
+			// cooperative tasks may park while other submissions fill the queue, then resume
+			// above that admission capacity. The outstanding bound remains absolute.
+			long outstandingLimit = (long) settings.capacities().getOrDefault(profile, 0)
+					+ settings.workers();
+			if (outstanding > outstandingLimit) {
+				throw new AssertionError("reference outstanding bound exceeded for " + profile);
 			}
 		}
 		if (activeTotal() > settings.workers()) throw new AssertionError("reference worker bound exceeded");
