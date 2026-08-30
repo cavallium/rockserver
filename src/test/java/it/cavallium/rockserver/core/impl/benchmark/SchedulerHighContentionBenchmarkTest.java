@@ -17,6 +17,15 @@ import org.junit.jupiter.api.Timeout;
 class SchedulerHighContentionBenchmarkTest {
 
 	@Test
+	void latencyDeadlineBudgetRetainsTheOneMinuteRunMarginAndSaturates() {
+		assertEquals(Duration.ofSeconds(66L).toNanos(),
+				SchedulerHighContentionBenchmark.latencyDeadlineBudgetNanos(Duration.ofSeconds(6L)));
+		assertEquals(Long.MAX_VALUE - 1L,
+				SchedulerHighContentionBenchmark.latencyDeadlineBudgetNanos(
+						Duration.ofSeconds(Long.MAX_VALUE)));
+	}
+
+	@Test
 	void extremeMixedContentionExercisesEveryProfilePoolAndTerminalPath() throws Exception {
 		var result = SchedulerHighContentionBenchmark.run(config(
 				100_000,

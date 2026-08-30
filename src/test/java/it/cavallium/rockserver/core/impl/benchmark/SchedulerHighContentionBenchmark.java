@@ -503,6 +503,14 @@ public final class SchedulerHighContentionBenchmark {
 		}
 	}
 
+	static long latencyDeadlineBudgetNanos(Duration timeout) {
+		long timeoutNanos = RequestContext.latency(timeout).timeoutNanos();
+		long marginNanos = TimeUnit.MINUTES.toNanos(1L);
+		return timeoutNanos >= RequestContext.NO_TIMEOUT - 1L - marginNanos
+				? RequestContext.NO_TIMEOUT - 1L
+				: timeoutNanos + marginNanos;
+	}
+
 	private static final class RunState {
 
 		private final Config config;
@@ -548,7 +556,8 @@ public final class SchedulerHighContentionBenchmark {
 		private RunState(Config config, RWScheduler scheduler) {
 			this.config = config;
 			this.scheduler = scheduler;
-			this.futureLatencyDeadlineNanos = scheduler.bindTimeoutNanos(config.timeout().toNanos());
+			this.futureLatencyDeadlineNanos = scheduler.bindTimeoutNanos(
+					latencyDeadlineBudgetNanos(config.timeout()));
 			this.queueLatencyNanos = new long[config.operations()];
 			this.executionNanos = new long[config.operations()];
 			this.endToEndNanos = new long[config.operations()];
