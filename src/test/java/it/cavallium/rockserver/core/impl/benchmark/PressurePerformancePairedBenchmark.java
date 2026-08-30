@@ -49,6 +49,8 @@ public final class PressurePerformancePairedBenchmark {
 		METADATA_KEYS_V2 = Set.copyOf(keys);
 		keys.add("fixed-pairs");
 		keys.add("planning-duration-scale-cap");
+		keys.add("planning-source-configuration-sha256");
+		keys.add("planning-source-results-sha256");
 		METADATA_KEYS_V2_PLANNED = Set.copyOf(keys);
 	}
 
@@ -767,7 +769,9 @@ public final class PressurePerformancePairedBenchmark {
 			int signalMaximumEvaluations,
 			int signalLatencySampleStride,
 			int fixedPairs,
-			int planningDurationScaleCap) {
+			int planningDurationScaleCap,
+			String planningSourceConfigurationSha256,
+			String planningSourceResultsSha256) {
 
 		Prepared {
 			root = root.toAbsolutePath().normalize();
@@ -780,6 +784,15 @@ public final class PressurePerformancePairedBenchmark {
 			if (planningDurationScaleCap < 1
 					|| contractVersion != ContractVersion.V2_PLANNED && planningDurationScaleCap != 1) {
 				throw new IllegalArgumentException("planning duration scale cap is invalid for the evidence version");
+			}
+			if (contractVersion == ContractVersion.V2_PLANNED) {
+				if (!planningSourceConfigurationSha256.matches("[0-9a-f]{64}")
+						|| !planningSourceResultsSha256.matches("[0-9a-f]{64}")) {
+					throw new IllegalArgumentException("planned evidence requires both source SHA-256 values");
+				}
+			} else if (!planningSourceConfigurationSha256.equals("none")
+					|| !planningSourceResultsSha256.equals("none")) {
+				throw new IllegalArgumentException("unplanned evidence cannot carry planner source hashes");
 			}
 			signalColumnFamilyCounts = signalColumnFamilyCounts.clone();
 			for (int index = 0; index < signalColumnFamilyCounts.length; index++) {
@@ -854,7 +867,9 @@ public final class PressurePerformancePairedBenchmark {
 			return "contract-version=" + contractVersion.value + '\n'
 					+ (contractVersion == ContractVersion.V2_PLANNED
 					? "fixed-pairs=" + fixedPairs + '\n'
-					+ "planning-duration-scale-cap=" + planningDurationScaleCap + '\n' : "")
+					+ "planning-duration-scale-cap=" + planningDurationScaleCap + '\n'
+					+ "planning-source-configuration-sha256=" + planningSourceConfigurationSha256 + '\n'
+					+ "planning-source-results-sha256=" + planningSourceResultsSha256 + '\n' : "")
 					+ "family-wise-alpha=" + PairedPerformanceContractV2.FAMILY_WISE_ALPHA + '\n'
 					+ "throughput-minimum-ratio=" + PairedPerformanceContractV2.THROUGHPUT_MINIMUM_RATIO + '\n'
 					+ "cost-maximum-ratio=" + PairedPerformanceContractV2.COST_MAXIMUM_RATIO + '\n'
@@ -870,7 +885,9 @@ public final class PressurePerformancePairedBenchmark {
 					+ (contractVersion == ContractVersion.V1 ? "" : "contract-version=" + contractVersion.value + '\n')
 					+ (contractVersion == ContractVersion.V2_PLANNED
 					? "fixed-pairs=" + fixedPairs + '\n'
-					+ "planning-duration-scale-cap=" + planningDurationScaleCap + '\n' : "")
+					+ "planning-duration-scale-cap=" + planningDurationScaleCap + '\n'
+					+ "planning-source-configuration-sha256=" + planningSourceConfigurationSha256 + '\n'
+					+ "planning-source-results-sha256=" + planningSourceResultsSha256 + '\n' : "")
 					+ "baseline-sha=" + baselineSha + '\n'
 					+ "candidate-sha=" + candidateSha + '\n'
 					+ "host-state=" + hostState + '\n'
@@ -924,7 +941,9 @@ public final class PressurePerformancePairedBenchmark {
 					intValue(values, "signal-maximum-evaluations", 2_000_000),
 					intValue(values, "signal-latency-sample-stride", 1_024),
 					intValue(values, "fixed-pairs", PairedPerformanceContractV2.REQUIRED_PAIRS),
-					intValue(values, "planning-duration-scale-cap", 1));
+					intValue(values, "planning-duration-scale-cap", 1),
+					value(values, "planning-source-configuration-sha256", "none"),
+					value(values, "planning-source-results-sha256", "none"));
 		}
 
 		private static Map<String, String> strictMetadata(String text) {

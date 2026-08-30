@@ -140,9 +140,11 @@ public final class PressurePerformancePrecisionPlanner {
 				resultsSha, scheduleSha, metadataSha), StandardOpenOption.CREATE_NEW);
 		Files.writeString(root.resolve(MARKDOWN_FILE), markdown(metrics, stochasticMetrics,
 				criticalMetrics, criticalTargetPower, standardTargetPower,
-				requiredFixedPairs, schedulerRequestedScale, signalRequestedScale, next, component),
+				requiredFixedPairs, schedulerRequestedScale, signalRequestedScale, next, component,
+				prepared.configurationSha256(), resultsSha),
 				StandardOpenOption.CREATE_NEW);
-		Files.writeString(root.resolve(NEXT_RUN_FILE), next.properties(), StandardOpenOption.CREATE_NEW);
+		Files.writeString(root.resolve(NEXT_RUN_FILE), next.properties(
+				prepared.configurationSha256(), resultsSha), StandardOpenOption.CREATE_NEW);
 	}
 
 	private static Measurements readMeasurements(PressurePerformancePairedBenchmark.Prepared prepared)
@@ -466,7 +468,9 @@ public final class PressurePerformancePrecisionPlanner {
 			double schedulerScale,
 			double signalScale,
 			NextRun next,
-			ComponentEvidence component) {
+			ComponentEvidence component,
+			String sourceConfigurationSha,
+			String sourceResultsSha) {
 		var text = new StringBuilder("# Pressure-performance precision plan\n\n")
 				.append("- Source decision: `INCONCLUSIVE` (unchanged)\n")
 				.append("- Planning effect: exact equality\n")
@@ -502,7 +506,7 @@ public final class PressurePerformancePrecisionPlanner {
 					.append(metric.requiredPairsAtRecommendedDuration()).append(" |\n");
 		}
 		return text.append("\n## Fixed next run\n\n```properties\n")
-				.append(next.properties())
+				.append(next.properties(sourceConfigurationSha, sourceResultsSha))
 				.append("```\n").toString();
 	}
 
@@ -634,9 +638,11 @@ public final class PressurePerformancePrecisionPlanner {
 					+ ",\"signal_maximum_evaluations\":" + signalMaximumEvaluations + '}';
 		}
 
-		private String properties() {
+		private String properties(String sourceConfigurationSha, String sourceResultsSha) {
 			return "contract-version=v2.1\nfixed-pairs=" + fixedPairs + '\n'
 					+ "planning-duration-scale-cap=" + MAXIMUM_PER_WORKER_DURATION_SCALE + '\n'
+					+ "planning-source-configuration-sha256=" + sourceConfigurationSha + '\n'
+					+ "planning-source-results-sha256=" + sourceResultsSha + '\n'
 					+ "baseline-sha=" + source.baselineSha() + '\n'
 					+ "candidate-sha=" + source.candidateSha() + '\n'
 					+ "host-state=" + source.hostState() + '\n'

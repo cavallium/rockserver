@@ -32,6 +32,8 @@ class PressurePerformancePairedBenchmarkPlannedTest {
 				planned.contractVersion());
 		assertEquals(12, planned.fixedPairs());
 		assertEquals(64, planned.planningDurationScaleCap());
+		assertEquals("c".repeat(64), planned.planningSourceConfigurationSha256());
+		assertEquals("d".repeat(64), planned.planningSourceResultsSha256());
 		assertNotEquals(v2.configurationSha256(), planned.configurationSha256());
 		assertTrue(Files.readString(plannedRoot.resolve("schedule.tsv"))
 				.startsWith("schema\trockserver-pressure-performance-schedule-v2.1\n"));
@@ -39,6 +41,21 @@ class PressurePerformancePairedBenchmarkPlannedTest {
 				.filter(line -> line.matches("\\d+\\t\\d+\\t.*")).count());
 		assertTrue(Files.readString(plannedRoot.resolve("schedule.tsv"))
 				.contains("45\t12\tscheduler\tcandidate"));
+	}
+
+	@Test
+	void plannerSourceHashTamperingChangesConfigurationAndInvalidatesPreparedSchedule() throws Exception {
+		Path root = temporary.resolve("source-hash-tamper");
+		prepare(root, "v2.1", 12, 64);
+		var original = PressurePerformancePairedBenchmark.Prepared.read(root);
+		Files.writeString(root.resolve("metadata.properties"),
+				Files.readString(root.resolve("metadata.properties"))
+						.replace("planning-source-results-sha256=" + "d".repeat(64),
+								"planning-source-results-sha256=" + "e".repeat(64)));
+		var tampered = PressurePerformancePairedBenchmark.Prepared.read(root);
+		assertNotEquals(original.configurationSha256(), tampered.configurationSha256());
+		assertThrows(IllegalArgumentException.class,
+				() -> PressurePerformancePairedBenchmark.main(new String[] {"--mode=evaluate", "--root=" + root}));
 	}
 
 	@Test
@@ -98,6 +115,8 @@ class PressurePerformancePairedBenchmarkPlannedTest {
 		if (version.equals("v2.1")) {
 			options.add("--fixed-pairs=" + pairs);
 			options.add("--planning-duration-scale-cap=" + durationCap);
+			options.add("--planning-source-configuration-sha256=" + "c".repeat(64));
+			options.add("--planning-source-results-sha256=" + "d".repeat(64));
 		}
 		options.addAll(java.util.List.of(
 				"--baseline-sha=" + "a".repeat(40), "--candidate-sha=" + "b".repeat(40),

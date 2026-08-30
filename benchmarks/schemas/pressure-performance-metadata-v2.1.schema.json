@@ -4,5 +4,5 @@
   "title": "Rockserver pressure metadata properties v2.1",
   "type": "string",
   "contentMediaType": "text/plain",
-  "pattern": "^schema=rockserver-pressure-performance-metadata-v2\\.1\\ncontract-version=v2\\.1\\nfixed-pairs=(?:1[0-9]|[2-9][0-9]|[1-9][0-9]{2,5}|1000000)\\nplanning-duration-scale-cap=[1-9][0-9]*\\n"
+  "pattern": "^schema=rockserver-pressure-performance-metadata-v2\\.1\\ncontract-version=v2\\.1\\nfixed-pairs=(?:1[0-9]|[2-9][0-9]|[1-9][0-9]{2,5}|1000000)\\nplanning-duration-scale-cap=[1-9][0-9]*\\nplanning-source-configuration-sha256=[0-9a-f]{64}\\nplanning-source-results-sha256=[0-9a-f]{64}\\n"
 }

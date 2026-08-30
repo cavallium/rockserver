@@ -131,7 +131,9 @@ operation count on real evidence. Precision-plan v2 therefore caps each worker a
 `64x` measured-duration scale, additionally bounded by every integer field. It then recomputes each
 metric's required pair count using `s / sqrt(chosen-duration-scale)` and selects the maximum. This
 mixed design never pretends the capped duration alone reaches target power. The cap is recorded in
-v2.1 metadata and its configuration hash.
+v2.1 metadata and its configuration hash. The source v2 configuration and result SHA-256 values
+are also mandatory v2.1 metadata, so copying or changing a recommendation changes the fresh
+configuration hash and invalidates its prewritten schedule.
 
 The executable next run uses contract version `v2.1`, the bounded scheduler/signal duration scales,
 and enough fixed pairs to satisfy every predeclared metric under the planning approximation. It
