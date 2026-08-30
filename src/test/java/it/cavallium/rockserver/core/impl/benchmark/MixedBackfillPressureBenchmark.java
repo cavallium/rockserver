@@ -420,7 +420,7 @@ public final class MixedBackfillPressureBenchmark {
 			long budget = Math.addExact(measurement.toMillis(), TimeUnit.SECONDS.toMillis(30));
 			return Math.addExact(nowEpochMillis, budget);
 		} catch (ArithmeticException overflow) {
-			return Long.MAX_VALUE;
+			return Long.MAX_VALUE - 1L;
 		}
 	}
 
