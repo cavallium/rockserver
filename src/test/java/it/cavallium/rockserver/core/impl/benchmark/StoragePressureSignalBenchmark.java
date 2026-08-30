@@ -40,6 +40,13 @@ public final class StoragePressureSignalBenchmark {
 		Objects.requireNonNull(config, "config").validate();
 		ThreadMXBean threads = threadBean();
 		long threadId = Thread.currentThread().threadId();
+		// Exercise the exact timed loop once outside the reported matrix. A fresh JVM can
+		// deoptimize/OSR-compile this loop after its ordinary warmup loop has completed;
+		// those one-time runtime allocations belong to the harness, not the evaluator.
+		var calibration = PreparedCase.create(Scenario.NO_PRESSURE, 1);
+		int calibrationEvaluations = Math.max(config.minimumEvaluations(),
+				Math.min(config.maximumEvaluations(), 100_000));
+		measure(calibration, threads, threadId, calibrationEvaluations, config.latencySampleStride());
 		var results = new ArrayList<CaseResult>();
 		for (int columnFamilies : config.columnFamilyCounts()) {
 			for (Scenario scenario : Scenario.values()) {
@@ -56,6 +63,7 @@ public final class StoragePressureSignalBenchmark {
 						config.maximumEvaluations());
 				for (int iteration = 0; iteration < warmupEvaluations; iteration++) {
 					blackhole ^= prepared.evaluate(iteration);
+					blackhole ^= prepared.signal.pressured() ? 1L : 0L;
 				}
 				results.add(measure(prepared,
 						threads,
@@ -77,8 +85,8 @@ public final class StoragePressureSignalBenchmark {
 		long pressuredEvaluations = 0L;
 		long localBlackhole = 0L;
 		int sample = 0;
-		long allocatedBefore = threads.getThreadAllocatedBytes(threadId);
 		long cpuBefore = threads.getCurrentThreadCpuTime();
+		long allocatedBefore = threads.getThreadAllocatedBytes(threadId);
 		long startedNanos = System.nanoTime();
 		for (int iteration = 0; iteration < evaluations; iteration++) {
 			long value;
@@ -93,8 +101,8 @@ public final class StoragePressureSignalBenchmark {
 			pressuredEvaluations += prepared.signal.pressured() ? 1L : 0L;
 		}
 		long elapsedNanos = System.nanoTime() - startedNanos;
-		long cpuNanos = threads.getCurrentThreadCpuTime() - cpuBefore;
 		long allocatedBytes = threads.getThreadAllocatedBytes(threadId) - allocatedBefore;
+		long cpuNanos = threads.getCurrentThreadCpuTime() - cpuBefore;
 		blackhole ^= localBlackhole;
 		Arrays.sort(latencySamples);
 		return new CaseResult(prepared.scenario,
