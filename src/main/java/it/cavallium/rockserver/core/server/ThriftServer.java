@@ -582,7 +582,11 @@ public class ThriftServer extends Server {
 		@Override
 		public boolean closeTransaction(long transactionId, boolean commit, it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
-				return (commit ? api(context) : protectedApi()).closeTransaction(transactionId, commit);
+				if (commit) {
+					return api(context).closeTransaction(transactionId, true);
+				}
+				requireV3(context == null ? 0 : context.workloadContractVersion);
+				return protectedApi().closeTransaction(transactionId, false);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}

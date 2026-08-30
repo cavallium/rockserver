@@ -56,6 +56,10 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.api.parallel.Resources;
+import org.apache.thrift.TConfiguration;
+import org.apache.thrift.protocol.TBinaryProtocol;
+import org.apache.thrift.transport.TSocket;
+import org.apache.thrift.transport.layered.TFramedTransport;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -193,6 +197,33 @@ class ThriftAsyncDispatchRegressionTest {
 				assertTrue(client.getSyncApi(expired).closeTransaction(transactionId, false));
 				assertEquals(Long.MAX_VALUE,
 						connection.lastApiContextDeadline.get());
+			}
+		}
+	}
+
+	@Test
+	void v2ThriftRollbackIsRejectedBeforeProtectedBackendDispatch() throws Exception {
+		var connection = new TrackingConnection();
+		int port = freePort();
+		try (var server = new ThriftServer(connection, "127.0.0.1", port)) {
+			server.start();
+			var configuration = TConfiguration.custom().build();
+			try (var transport = new TFramedTransport(
+					new TSocket(configuration, "127.0.0.1", port))) {
+				transport.open();
+				var rawClient = new it.cavallium.rockserver.core.common.api.RocksDB.Client(
+						new TBinaryProtocol(transport));
+				var v2Context = new it.cavallium.rockserver.core.common.api.RequestContext(
+						it.cavallium.rockserver.core.common.api.WorkloadProfile.BATCH,
+						2,
+						Long.MAX_VALUE);
+				var failure = assertThrows(
+						it.cavallium.rockserver.core.common.api.RocksDBThriftException.class,
+						() -> rawClient.closeTransaction(72L, false, v2Context));
+				assertEquals(it.cavallium.rockserver.core.common.api.RocksDBErrorType.PUT_INVALID_REQUEST,
+						failure.getErrorType());
+				assertTrue(connection.asyncRequests.isEmpty(),
+						"v2 rollback reached the protected backend");
 			}
 		}
 	}

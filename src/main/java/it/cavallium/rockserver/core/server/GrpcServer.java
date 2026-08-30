@@ -895,12 +895,12 @@ public class GrpcServer extends Server {
 		private static final long DEFAULT_ITERATOR_QUANTUM_BYTES = 8L * 1_024L * 1_024L;
 		private static final long DEFAULT_ITERATOR_QUANTUM_NANOS = TimeUnit.MILLISECONDS.toNanos(8L);
 		private static final int WRITE_ELISION_MULTI_STEP_SIZE = 4_096;
-		private static final it.cavallium.rockserver.core.common.RequestContext[] NO_DEADLINE_CONTEXTS
+		private static final it.cavallium.rockserver.core.common.RequestContext[] NO_TIMEOUT_CONTEXTS
 				= createNoDeadlineContexts();
 
 		private final RocksDBConnection client;
-		private final RocksDBSyncAPI[] noDeadlineSyncApis = new RocksDBSyncAPI[NO_DEADLINE_CONTEXTS.length];
-		private final RocksDBAsyncAPI[] noDeadlineAsyncApis = new RocksDBAsyncAPI[NO_DEADLINE_CONTEXTS.length];
+		private final RocksDBSyncAPI[] noDeadlineSyncApis = new RocksDBSyncAPI[NO_TIMEOUT_CONTEXTS.length];
+		private final RocksDBAsyncAPI[] noDeadlineAsyncApis = new RocksDBAsyncAPI[NO_TIMEOUT_CONTEXTS.length];
 		private final ConcurrentMap<Long, Object> iteratorOperations = new ConcurrentHashMap<>();
 		private final RocksDBSyncAPI commandCaptureApi = new RocksDBSyncAPI() {
 			@Override
@@ -922,7 +922,7 @@ public class GrpcServer extends Server {
 		public GrpcServerImpl(RocksDBConnection client) {
 			this.client = Objects.requireNonNull(client, "client");
 			for (var profile : WorkloadProfile.values()) {
-				var context = NO_DEADLINE_CONTEXTS[profile.ordinal()];
+				var context = NO_TIMEOUT_CONTEXTS[profile.ordinal()];
 				if (context != null) {
 					noDeadlineSyncApis[profile.ordinal()] = client.getSyncApi(context);
 					noDeadlineAsyncApis[profile.ordinal()] = client.getAsyncApi(context);
@@ -982,7 +982,7 @@ public class GrpcServer extends Server {
 			try {
 				it.cavallium.rockserver.core.common.RequestContext context;
 				if (timeoutNanos == it.cavallium.rockserver.core.common.RequestContext.NO_TIMEOUT) {
-					var cached = NO_DEADLINE_CONTEXTS[profile.ordinal()];
+					var cached = NO_TIMEOUT_CONTEXTS[profile.ordinal()];
 					if (cached != null) {
 						context = cached;
 					} else {
@@ -1168,6 +1168,7 @@ public class GrpcServer extends Server {
 						return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
 					});
 				}
+				requireV3(request.getContext().getWorkloadContractVersion());
 				return executeMustComplete("rollback",
 						() -> {
 							var rolledBack = protectedApi().closeTransaction(request.getTransactionId(), false);

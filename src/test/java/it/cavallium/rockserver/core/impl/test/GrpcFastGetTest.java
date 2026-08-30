@@ -80,6 +80,9 @@ class GrpcFastGetTest {
 	void fastGetRejectsMissingAndNonV3RequestContexts() throws Exception {
 		try (var embedded = openEmbedded("strict-v3")) {
 			long columnId = populate(embedded);
+			var embeddedApi = embedded.getSyncApi(
+					it.cavallium.rockserver.core.common.RequestContext.batch());
+			long rollbackTransaction = embeddedApi.openTransaction(java.time.Duration.ofMinutes(1L));
 			try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 				server.start();
 				try (var client = ClientHandle.forTcp("127.0.0.1", server.getPort())) {
@@ -98,6 +101,18 @@ class GrpcFastGetTest {
 									it.cavallium.rockserver.core.common.api.proto.CloseIteratorRequest
 											.newBuilder().setIteratorId(1L).build()));
 					assertEquals(Status.Code.INVALID_ARGUMENT, protectedFailure.getStatus().getCode());
+					var v2Context = BATCH_CONTEXT.toBuilder().setWorkloadContractVersion(2).build();
+					var rollbackFailure = assertThrows(StatusRuntimeException.class,
+							() -> client.stub().closeTransaction(
+									it.cavallium.rockserver.core.common.api.proto.CloseTransactionRequest
+											.newBuilder()
+											.setTransactionId(rollbackTransaction)
+											.setCommit(false)
+											.setContext(v2Context)
+											.build()));
+					assertEquals(Status.Code.INVALID_ARGUMENT, rollbackFailure.getStatus().getCode());
+					assertEquals(1, embedded.getInternalDB().getOpenTransactionsCount(),
+							"v2 rollback reached the protected backend");
 
 					var missingPrecondition = assertThrows(StatusRuntimeException.class,
 							() -> client.stub().cdcCreate(
@@ -110,6 +125,8 @@ class GrpcFastGetTest {
 							it.cavallium.rockserver.core.common.RequestContext.batch())
 							.cdcGetLastCommittedSequence("must-not-create"));
 				}
+			} finally {
+				embeddedApi.closeTransaction(rollbackTransaction, false);
 			}
 		}
 	}
