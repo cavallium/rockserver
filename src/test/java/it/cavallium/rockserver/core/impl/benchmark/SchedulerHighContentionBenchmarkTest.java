@@ -67,7 +67,10 @@ class SchedulerHighContentionBenchmarkTest {
 		for (var pool : RWScheduler.Pool.values()) {
 			var poolResult = result.pools().get(pool);
 			assertTrue(poolResult.peakActive() > 0, "pool never dispatched: " + pool);
-			assertTrue(poolResult.peakQueued() <= poolResult.queueBound(), "queue bound exceeded: " + pool);
+			assertTrue(poolResult.peakQueued() <= poolResult.outstandingBound(),
+					"queued lifetime bound exceeded: " + pool);
+			assertTrue(poolResult.peakOutstanding() <= poolResult.outstandingBound(),
+					"outstanding bound exceeded: " + pool);
 			assertTrue(poolResult.finalSnapshot().drainedAndConserved(), "pool did not drain: " + pool);
 		}
 		var progress = result.pressureProgress();

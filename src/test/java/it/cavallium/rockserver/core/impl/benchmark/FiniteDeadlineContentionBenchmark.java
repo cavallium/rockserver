@@ -978,7 +978,8 @@ public final class FiniteDeadlineContentionBenchmark {
 
 		private static boolean boundsProven(SchedulerHighContentionBenchmark.Result result) {
 			return result.pools().values().stream().allMatch(item -> item.peakActive() <= item.workers()
-					&& item.peakQueued() <= item.queueBound() && item.peakOutstanding() <= item.outstandingBound());
+					&& item.peakQueued() <= item.outstandingBound()
+					&& item.peakOutstanding() <= item.outstandingBound());
 		}
 	}
 

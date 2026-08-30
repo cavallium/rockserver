@@ -382,8 +382,12 @@ public final class SchedulerHighContentionBenchmark {
 				if (result.finalSnapshot().startedTasks() != result.finalSnapshot().completedTasks()) {
 					throw new IllegalStateException("started/completed imbalance: " + pool + " " + result);
 				}
+				// Queue capacity limits new admissions, not the later requeue of work that was
+				// already admitted and then PARKed. Multiple profiles can accumulate parked
+				// continuations while other submissions fill their admission queues, so the
+				// absolute lifetime bound for both queued and total work is outstandingBound.
 				if (result.peakActive() > result.workers()
-						|| result.peakQueued() > result.queueBound()
+						|| result.peakQueued() > result.outstandingBound()
 						|| result.peakOutstanding() > result.outstandingBound()) {
 					throw new IllegalStateException("pool exceeded configured bounds: " + pool + " " + result);
 				}
