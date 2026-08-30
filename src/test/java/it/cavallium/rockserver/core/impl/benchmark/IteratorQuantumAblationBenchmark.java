@@ -56,7 +56,8 @@ public final class IteratorQuantumAblationBenchmark {
 	private static final int DEFAULT_WARMUP_SCANS = 24;
 	private static final int DEFAULT_SCANS_PER_SAMPLE = 32;
 	private static final int DEFAULT_COMPETITIVE_SAMPLES = 4;
-	private static final int FIXED_PAIRS = 10;
+	private static final int FIXED_PAIRS = 40;
+	private static final int IDLE_INTERLEAVE_BLOCKS = 16;
 	private static final int PAGE_ITEMS = 4_096;
 	private static final int COMPETITIVE_VALUE_BYTES = 8 * 1_024;
 	private static final long PAGE_BYTES = 8L * 1_024L * 1_024L;
@@ -125,13 +126,14 @@ public final class IteratorQuantumAblationBenchmark {
 					String head = gitHead();
 					String report = String.format(Locale.ROOT,
 							"iterator_quantum_idle head=%s entries=%d value_bytes=%d pairs=%d "
-									+ "scans_per_sample=%d throughput_ratio=%.6f throughput_ci95=[%.6f,%.6f] "
+									+ "scans_per_sample=%d interleave_blocks=%d "
+									+ "throughput_ratio=%.6f throughput_ci95=[%.6f,%.6f] "
 									+ "allocation_ratio=%.6f allocation_ci95=[%.6f,%.6f]%n"
 									+ "iterator_quantum_competitive page_items=%d value_bytes=%d quantum_bytes=%d "
 									+ "quantum_nanos=%d pairs=%d samples_per_arm=%d handoff_ratio=%.6f "
 									+ "handoff_ci95=[%.6f,%.6f] one_step_to_bounded_ratio=%.6f "
 									+ "one_step_ci95=[%.6f,%.6f] decision=%s%n",
-							head, entries, valueBytes, FIXED_PAIRS, scansPerSample,
+							head, entries, valueBytes, FIXED_PAIRS, scansPerSample, IDLE_INTERLEAVE_BLOCKS,
 							idle.throughput().mean(), idle.throughput().lower95(), idle.throughput().upper95(),
 							idle.allocation().mean(), idle.allocation().lower95(), idle.allocation().upper95(),
 							PAGE_ITEMS, COMPETITIVE_VALUE_BYTES, PAGE_BYTES, PAGE_NANOS,
@@ -177,13 +179,9 @@ public final class IteratorQuantumAblationBenchmark {
 		double[] legacyAllocation = new double[FIXED_PAIRS];
 		double[] boundedAllocation = new double[FIXED_PAIRS];
 		for (int pair = 0; pair < FIXED_PAIRS; pair++) {
-			boolean legacyFirst = (pair & 1) == 0;
-			IdleSample first = runner.run(legacyFirst ? IdleMechanism.LEGACY : IdleMechanism.BOUNDED,
-					scansPerSample);
-			IdleSample second = runner.run(legacyFirst ? IdleMechanism.BOUNDED : IdleMechanism.LEGACY,
-					scansPerSample);
-			IdleSample legacy = legacyFirst ? first : second;
-			IdleSample bounded = legacyFirst ? second : first;
+			var measured = runInterleavedIdlePair(runner, pair, scansPerSample);
+			IdleSample legacy = measured.legacy();
+			IdleSample bounded = measured.bounded();
 			legacyThroughput[pair] = legacy.entriesPerSecond();
 			boundedThroughput[pair] = bounded.entriesPerSecond();
 			legacyAllocation[pair] = legacy.allocatedBytesPerEntry();
@@ -192,6 +190,29 @@ public final class IteratorQuantumAblationBenchmark {
 		return new IdleEvidence(
 				PairedBenchmarkStatistics.pairedLogRatio(legacyThroughput, boundedThroughput),
 				PairedBenchmarkStatistics.pairedLogRatio(legacyAllocation, boundedAllocation));
+	}
+
+	private static IdlePair runInterleavedIdlePair(IdleRunner runner,
+			int pair,
+			int scansPerMechanism) {
+		int blocks = Math.min(IDLE_INTERLEAVE_BLOCKS, scansPerMechanism);
+		int baseScans = scansPerMechanism / blocks;
+		int remainder = scansPerMechanism % blocks;
+		var legacy = new IdleTotals();
+		var bounded = new IdleTotals();
+		for (int block = 0; block < blocks; block++) {
+			int scans = baseScans + (block < remainder ? 1 : 0);
+			boolean legacyFirst = ((pair + block) & 1) == 0;
+			IdleSample first = runner.run(
+					legacyFirst ? IdleMechanism.LEGACY : IdleMechanism.BOUNDED,
+					scans);
+			IdleSample second = runner.run(
+					legacyFirst ? IdleMechanism.BOUNDED : IdleMechanism.LEGACY,
+					scans);
+			(legacyFirst ? legacy : bounded).add(first);
+			(legacyFirst ? bounded : legacy).add(second);
+		}
+		return new IdlePair(legacy.sample(), bounded.sample());
 	}
 
 	private static CompetitiveEvidence measureCompetitive(EmbeddedConnection connection,
@@ -325,7 +346,18 @@ public final class IteratorQuantumAblationBenchmark {
 		ONE_STEP
 	}
 
-	private record IdleSample(double entriesPerSecond, double allocatedBytesPerEntry) {
+	private record IdleSample(long entries, long elapsedNanos, long allocatedBytes) {
+
+		private double entriesPerSecond() {
+			return entries * 1_000_000_000.0d / elapsedNanos;
+		}
+
+		private double allocatedBytesPerEntry() {
+			return allocatedBytes / (double) entries;
+		}
+	}
+
+	private record IdlePair(IdleSample legacy, IdleSample bounded) {
 	}
 
 	private record CompetitiveSample(double averagePeerHandoffNanos) {
@@ -337,6 +369,23 @@ public final class IteratorQuantumAblationBenchmark {
 
 	private record CompetitiveEvidence(PairedBenchmarkStatistics.RatioConfidenceInterval handoff,
 			PairedBenchmarkStatistics.RatioConfidenceInterval oneStepToBounded) {
+	}
+
+	private static final class IdleTotals {
+
+		private long entries;
+		private long elapsedNanos;
+		private long allocatedBytes;
+
+		private void add(IdleSample sample) {
+			entries = Math.addExact(entries, sample.entries());
+			elapsedNanos = Math.addExact(elapsedNanos, sample.elapsedNanos());
+			allocatedBytes = Math.addExact(allocatedBytes, sample.allocatedBytes());
+		}
+
+		private IdleSample sample() {
+			return new IdleSample(entries, elapsedNanos, allocatedBytes);
+		}
 	}
 
 	private static final class IdleRunner {
@@ -399,8 +448,7 @@ public final class IteratorQuantumAblationBenchmark {
 				throw new IllegalStateException("Iterator idle ablation lost values: expected="
 						+ expected + " actual=" + consumed);
 			}
-			return new IdleSample(consumed * 1_000_000_000.0d / elapsed,
-					allocated / (double) consumed);
+			return new IdleSample(consumed, elapsed, allocated);
 		}
 	}
 

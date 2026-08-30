@@ -15,8 +15,12 @@ The mixed RocksDB and fresh-process suites remain authoritative at those wider e
 
 The idle arm uses one real RocksDB iterator, identical 8,192-entry data, seek/reset path, values,
 checksum, and thread. It alternates the legacy fixed-page primitive and the bounded primitive for
-ten predetermined pairs. Thread allocation is measured but remains diagnostic; a resource-only
-change is not a reason to accept worse scheduling quality.
+forty predetermined pairs. This fixed count was planned from the variance of an earlier independent
+ten-pair `INCONCLUSIVE` run, without changing either acceptance margin. Each paired arm is divided
+into sixteen fixed alternating sub-blocks;
+their raw elapsed time and allocation totals are combined before calculating the pair ratio. This
+reduces host-drift variance without selecting or discarding samples. Thread allocation is measured
+but remains diagnostic; a resource-only change is not a reason to accept worse scheduling quality.
 
 The competitive arm uses a real three-worker `RWScheduler`. Two workers are deterministically held
 by `LATENCY` tasks, the scan starts as `BATCH` on the third, and a new `LATENCY` task is queued before
