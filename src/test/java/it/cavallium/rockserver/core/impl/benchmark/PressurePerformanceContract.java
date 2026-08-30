@@ -73,6 +73,10 @@ public final class PressurePerformanceContract {
 			List<Map<String, Double>> baseline,
 			List<Map<String, Double>> candidate,
 			List<String> structuralFailures) {
+		return evaluate(schedulerSpecifications(), baseline, candidate, structuralFailures, true);
+	}
+
+	static List<PairedPerformanceContract.MetricSpec> schedulerSpecifications() {
 		var specifications = new ArrayList<PairedPerformanceContract.MetricSpec>();
 		specifications.add(PairedPerformanceContract.MetricSpec.throughput(
 				"scheduler.attempts_per_second", false));
@@ -105,7 +109,7 @@ public final class PressurePerformanceContract {
 			specifications.add(PairedPerformanceContract.MetricSpec.cost(prefix + "peak_queued", false));
 			specifications.add(PairedPerformanceContract.MetricSpec.cost(prefix + "peak_outstanding", false));
 		}
-		return evaluate(specifications, baseline, candidate, structuralFailures, true);
+		return List.copyOf(specifications);
 	}
 
 	public static PairedPerformanceContract.Evaluation evaluateSignal(
@@ -113,6 +117,11 @@ public final class PressurePerformanceContract {
 			List<Map<String, Double>> baseline,
 			List<Map<String, Double>> candidate,
 			List<String> structuralFailures) {
+		return evaluate(signalSpecifications(columnFamilyCounts),
+				baseline, candidate, structuralFailures, false);
+	}
+
+	static List<PairedPerformanceContract.MetricSpec> signalSpecifications(int[] columnFamilyCounts) {
 		var specifications = new ArrayList<PairedPerformanceContract.MetricSpec>();
 		for (int columnFamilies : columnFamilyCounts) {
 			for (var scenario : StoragePressureSignalBenchmark.Scenario.values()) {
@@ -127,7 +136,7 @@ public final class PressurePerformanceContract {
 						prefix + "allocated_bytes_per_evaluation"));
 			}
 		}
-		return evaluate(specifications, baseline, candidate, structuralFailures, false);
+		return List.copyOf(specifications);
 	}
 
 	private static void addLatencyAndStarvationMetrics(

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.benchmark;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -67,6 +68,9 @@ class PressurePerformanceContractTest {
 				counts, repeated(values), repeated(values), List.of());
 
 		assertTrue(result.automaticAcceptancePassed(), result.failures().toString());
+		assertEquals(StoragePressureSignalBenchmark.Scenario.values().length * counts.length * 4,
+				PressurePerformanceContract.signalSpecifications(counts).size());
+		assertTrue(PressurePerformanceContract.schedulerSpecifications().size() > 70);
 	}
 
 	@Test
