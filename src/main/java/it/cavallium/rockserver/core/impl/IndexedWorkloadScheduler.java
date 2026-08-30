@@ -2,7 +2,9 @@ package it.cavallium.rockserver.core.impl;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
 import org.jetbrains.annotations.Nullable;
 import reactor.core.Disposable;
 import reactor.core.Disposables;
@@ -24,6 +26,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 	private final it.cavallium.rockserver.core.common.WorkloadProfile profile;
 	private final it.cavallium.rockserver.core.common.OperationFamily family;
 	private final long deadlineEpochMillis;
+	private final Set<IndexedWorker> workers = new HashSet<>();
 	private volatile boolean disposed;
 
 	IndexedWorkloadScheduler(ProfiledWorkloadExecutor executor,
@@ -103,21 +106,34 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 	}
 
 	@Override
-	public Worker createWorker() {
+	public synchronized Worker createWorker() {
 		if (disposed) {
 			throw Exceptions.failWithRejected();
 		}
-		return new IndexedWorker(this);
+		var worker = new IndexedWorker(this);
+		workers.add(worker);
+		return worker;
 	}
 
 	@Override
 	public void dispose() {
-		disposed = true;
+		IndexedWorker[] registered;
+		synchronized (this) {
+			if (disposed) return;
+			disposed = true;
+			registered = workers.toArray(IndexedWorker[]::new);
+			workers.clear();
+		}
+		for (var worker : registered) worker.dispose();
 	}
 
 	@Override
 	public boolean isDisposed() {
 		return disposed;
+	}
+
+	private synchronized void delete(IndexedWorker worker) {
+		workers.remove(worker);
 	}
 
 	private static final class IndexedWorker implements Worker {
@@ -131,6 +147,9 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 
 		@Override
 		public Disposable schedule(Runnable task) {
+			if (scheduler.isDisposed()) {
+				throw Exceptions.failWithRejected();
+			}
 			Runnable original = Objects.requireNonNull(task, "task");
 			var scheduledTask = new IndexedScheduledTask(scheduler,
 					Schedulers.onSchedule(original),
@@ -152,6 +171,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		@Override
 		public void dispose() {
 			tasks.dispose();
+			scheduler.delete(this);
 		}
 
 		@Override

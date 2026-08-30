@@ -1034,6 +1034,43 @@ class RWSchedulerIndexedQueueTest {
 	}
 
 	@Test
+	void parentSchedulerDisposalCancelsRegisteredWorkerTasksAndRejectsLaterScheduling() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-parent-worker-disposal");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		var view = scheduler.scheduler(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, RequestContext.NO_DEADLINE);
+		var worker = view.createWorker();
+		var queued = new TerminalTask(() -> {});
+		try {
+			view.schedule(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			worker.schedule(queued);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+
+			view.dispose();
+
+			assertTrue(worker.isDisposed());
+			assertThrows(RejectedExecutionException.class, view::createWorker);
+			assertThrows(RejectedExecutionException.class, () -> worker.schedule(() -> {}));
+			assertThrows(CancellationException.class, () -> queued.get(1, SECONDS));
+			assertFalse(queued.ran());
+			assertEquals(1, queued.rejectionCount());
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 0);
+			assertEquals(1L, scheduler.poolSnapshot(RWScheduler.Pool.READ)
+					.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
+		} finally {
+			releaseBlocker.countDown();
+			worker.dispose();
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void dispatchCancellationChecksNeverInvokeQueuedCommands() throws Exception {
 		var scheduler = scheduler(1, 8, "indexed-dispatch-inspection");
 		var blockerStarted = new CountDownLatch(1);
