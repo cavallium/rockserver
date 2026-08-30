@@ -277,6 +277,94 @@ class ProfiledWorkloadDeferredAdmissionTest {
 		}
 	}
 
+	@Test
+	void promotedShutdownSelectionIsVisibleBeforeItsCallbackAndBeatsDispose() throws Exception {
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 1, 1, "deferred-selected-shutdown");
+		var activeRelease = new CountDownLatch(1);
+		var activeStarted = new CountDownLatch(1);
+		var probe = new BlockingRejectionProbe();
+		CompletableFuture<Void> shutdown = null;
+		try {
+			scheduler.readExecutor().execute(() -> {
+				activeStarted.countDown();
+				awaitUninterruptibly(activeRelease);
+			});
+			assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
+			var handle = executeWhenCapacity(scheduler.scheduler(
+					WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(1)), probe);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+
+			shutdown = CompletableFuture.runAsync(scheduler::disposeNow);
+			assertTrue(probe.rejectionEntered.await(5, TimeUnit.SECONDS));
+			assertTrue(handle.isDisposed(),
+					"shutdown must mark the promoted wrapper terminal before publishing rejection");
+			handle.dispose();
+			assertEquals(1, probe.rejectionCount.get());
+
+			probe.releaseRejection.countDown();
+			activeRelease.countDown();
+			shutdown.get(15, TimeUnit.SECONDS);
+			assertInstanceOf(RejectedExecutionException.class, probe.failure.get(5, TimeUnit.SECONDS));
+			assertEquals(1L,
+					scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes()
+							.get(RWScheduler.TerminalOutcome.SHUTDOWN));
+			assertTrue(scheduler.poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
+		} finally {
+			probe.releaseRejection.countDown();
+			activeRelease.countDown();
+			scheduler.disposeNow();
+			if (shutdown != null) {
+				shutdown.get(15, TimeUnit.SECONDS);
+			}
+		}
+	}
+
+	@Test
+	void promotedDeadlineSelectionIsVisibleBeforeItsCallbackAndBeatsDispose() throws Exception {
+		var scheduler = RWScheduler.forTesting(1, 1, 1, 1, 1, "deferred-selected-deadline");
+		var activeRelease = new CountDownLatch(1);
+		var activeStarted = new CountDownLatch(1);
+		var probe = new BlockingRejectionProbe();
+		try {
+			scheduler.readExecutor().execute(() -> {
+				activeStarted.countDown();
+				awaitUninterruptibly(activeRelease);
+			});
+			assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
+			long deadline = System.currentTimeMillis() + 200L;
+			var handle = executeWhenCapacity(scheduler.scheduler(
+					WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					deadline), probe);
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+			while (System.currentTimeMillis() < deadline + 2L) {
+				Thread.onSpinWait();
+			}
+			activeRelease.countDown();
+
+			assertTrue(probe.rejectionEntered.await(5, TimeUnit.SECONDS));
+			assertTrue(handle.isDisposed(),
+					"deadline must mark the promoted wrapper terminal before publishing rejection");
+			handle.dispose();
+			assertEquals(1, probe.rejectionCount.get());
+
+			probe.releaseRejection.countDown();
+			var failure = assertInstanceOf(RocksDBException.class, probe.failure.get(5, TimeUnit.SECONDS));
+			assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					failure.getErrorUniqueId());
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
+			assertEquals(1L,
+					scheduler.poolSnapshot(RWScheduler.Pool.READ).outcomes()
+							.get(RWScheduler.TerminalOutcome.DEADLINE));
+		} finally {
+			probe.releaseRejection.countDown();
+			activeRelease.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
 	private static void assertShutdownRejectsWaitingAdmission(boolean forced) throws Exception {
 		var scheduler = RWScheduler.forTesting(1, 1, 1, 1, 1, "deferred-shutdown-" + forced);
 		var activeRelease = new CountDownLatch(1);

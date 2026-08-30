@@ -2014,6 +2014,9 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		task.outcome(outcome);
 		if (outcome != RWScheduler.TerminalOutcome.RUN) {
+			if (task.command() instanceof DeferredAdmission deferred) {
+				deferred.markTerminalSelectedUnsafe();
+			}
 			completeCompetitionUnsafe(task);
 			decrementOutstandingUnsafe(task.profileIndex());
 			task.markTerminal();
@@ -2754,6 +2757,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		private void markCancelled() {
 			state = CANCELLED;
+		}
+
+		private void markTerminalSelectedUnsafe() {
+			if (state == QUEUED) {
+				state = TERMINAL;
+			} else if (state != CANCELLED && state != TERMINAL) {
+				throw new IllegalStateException("Deferred terminal selected from state " + state);
+			}
 		}
 
 		private void markTerminal() {
