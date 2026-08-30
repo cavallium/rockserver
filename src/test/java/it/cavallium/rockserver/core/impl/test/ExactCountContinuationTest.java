@@ -388,7 +388,8 @@ class ExactCountContinuationTest {
 				var cdcProgress = new CountDownLatch(1);
 				connection.getScheduler().executor(WorkloadProfile.LATENCY,
 						OperationFamily.POINT_LOOKUP,
-						System.currentTimeMillis() + 5_000L).execute(latencyProgress::countDown);
+						connection.getScheduler().bindTimeoutNanos(TimeUnit.MILLISECONDS.toNanos(5_000L)))
+						.execute(latencyProgress::countDown);
 				connection.getScheduler().executor(WorkloadProfile.CDC,
 						OperationFamily.WAL_PAGE,
 						Long.MAX_VALUE).execute(cdcProgress::countDown);

@@ -421,7 +421,7 @@ class RWSchedulerIndexedQueueTest {
 			assertTrue(blockerStarted.await(5, SECONDS));
 
 			long earlierDeadline = scheduler.bindTimeoutNanos(SECONDS.toNanos(20));
-			long laterDeadline = earlierDeadline + SECONDS.toMillis(10);
+			long laterDeadline = earlierDeadline + SECONDS.toNanos(10);
 			scheduler.executor(WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP, laterDeadline)
 					.execute(() -> record("later", order, completed));
 			var earlier = scheduler.executor(

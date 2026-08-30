@@ -28,7 +28,7 @@ class SchedulerDeadlineBindingScopeTest {
 
 	@Test
 	void nestedBindingsRestoreOuterStateAndClearCrossRequestIdentity() throws Exception {
-		var clock = new MutableClock(1_000L, 0L);
+		var clock = new MutableClock(0L);
 		var scheduler = scheduler(clock, "deadline-binding-nested");
 		var outer = new RequestContext(WorkloadProfile.BATCH, 2_000L);
 		var inner = new RequestContext(WorkloadProfile.BATCH, 3_000L);
@@ -45,7 +45,7 @@ class SchedulerDeadlineBindingScopeTest {
 			});
 
 			assertSame(MARKER, result);
-			assertEquals(1_000_000_000L, scheduler.resolveMonotonicDeadline(outer),
+			assertEquals(2_000L, scheduler.resolveMonotonicDeadline(outer),
 					"the completed request leaked its explicit sidecar into a later lookup");
 			assertClearedRetainedSlot(scheduler);
 
@@ -53,7 +53,7 @@ class SchedulerDeadlineBindingScopeTest {
 				assertEquals(333L, scheduler.resolveMonotonicDeadline(inner));
 				return MARKER;
 			});
-			assertEquals(2_000_000_000L, scheduler.resolveMonotonicDeadline(inner));
+			assertEquals(3_000L, scheduler.resolveMonotonicDeadline(inner));
 			assertClearedRetainedSlot(scheduler);
 		} finally {
 			scheduler.disposeNow();
@@ -62,7 +62,7 @@ class SchedulerDeadlineBindingScopeTest {
 
 	@Test
 	void directResolutionDoesNotCreateABindingSlot() throws Exception {
-		var clock = new MutableClock(1_000L, 0L);
+		var clock = new MutableClock(0L);
 		var scheduler = scheduler(clock, "deadline-binding-direct");
 		var context = new RequestContext(WorkloadProfile.BATCH, 2_000L);
 		var observedSlot = new AtomicReference<Object>();
@@ -70,7 +70,7 @@ class SchedulerDeadlineBindingScopeTest {
 		try {
 			Thread thread = Thread.startVirtualThread(() -> {
 				try {
-					assertEquals(1_000_000_000L, scheduler.resolveMonotonicDeadline(context));
+					assertEquals(2_000L, scheduler.resolveMonotonicDeadline(context));
 					observedSlot.set(bindingThreadLocal(scheduler).get());
 				} catch (Throwable failure) {
 					threadFailure.set(failure);
@@ -86,7 +86,7 @@ class SchedulerDeadlineBindingScopeTest {
 
 	@Test
 	void warmedBindingScopeAllocatesNoPerDispatchObjects() throws Exception {
-		var clock = new MutableClock(1_000L, 0L);
+		var clock = new MutableClock(0L);
 		var scheduler = scheduler(clock, "deadline-binding-allocation");
 		var context = new RequestContext(WorkloadProfile.BATCH, 2_000L);
 		var threadMetrics = (ThreadMXBean) ManagementFactory.getThreadMXBean();
@@ -147,10 +147,10 @@ class SchedulerDeadlineBindingScopeTest {
 		try {
 			Method factory = RWScheduler.class.getDeclaredMethod("forTesting",
 					int.class, int.class, int.class, int.class, int.class, String.class,
-					LongSupplier.class, LongSupplier.class);
+					LongSupplier.class);
 			factory.setAccessible(true);
 			return (RWScheduler) factory.invoke(null, 1, 1, 1, 8, 8, name,
-					(LongSupplier) clock::epochMillis, (LongSupplier) clock::nanoTime);
+					(LongSupplier) clock::nanoTime);
 		} catch (ReflectiveOperationException reflectionFailure) {
 			throw new AssertionError(reflectionFailure);
 		}
@@ -158,16 +158,10 @@ class SchedulerDeadlineBindingScopeTest {
 
 	private static final class MutableClock {
 
-		private final AtomicLong epochMillis;
 		private final AtomicLong nanoTime;
 
-		private MutableClock(long epochMillis, long nanoTime) {
-			this.epochMillis = new AtomicLong(epochMillis);
+		private MutableClock(long nanoTime) {
 			this.nanoTime = new AtomicLong(nanoTime);
-		}
-
-		private long epochMillis() {
-			return epochMillis.get();
 		}
 
 		private long nanoTime() {

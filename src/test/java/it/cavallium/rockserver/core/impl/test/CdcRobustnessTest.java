@@ -410,7 +410,8 @@ class CdcRobustnessTest {
 			var latencyProgress = new CountDownLatch(1);
 			db.getScheduler().executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					System.currentTimeMillis() + 5_000L).execute(latencyProgress::countDown);
+					db.getScheduler().bindTimeoutNanos(TimeUnit.MILLISECONDS.toNanos(5_000L)))
+					.execute(latencyProgress::countDown);
 			assertTrue(latencyProgress.await(5, TimeUnit.SECONDS),
 					"a retained CDC cursor between quanta must not monopolize chat capacity");
 		} finally {

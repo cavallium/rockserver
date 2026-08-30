@@ -85,7 +85,7 @@ class SchedulerStateModelPropertyTest {
 
 			var random = new SplittableRandom(seed);
 			int taskCount = 24 + random.nextInt(25);
-			long actualDeadlineBase = System.currentTimeMillis() + SECONDS.toMillis(30);
+			long actualDeadlineBase = scheduler.bindTimeoutNanos(SECONDS.toNanos(30));
 			var specs = new ArrayList<SchedulerReferenceModel.Spec>(taskCount);
 			var cancel = new boolean[taskCount];
 			for (int index = 0; index < taskCount; index++) {
@@ -178,12 +178,13 @@ class SchedulerStateModelPropertyTest {
 			var overload = assertThrows(RocksDBException.class, () -> scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {}));
 			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, overload.getErrorUniqueId());
 
-			long now = System.currentTimeMillis();
 			assertEquals(SchedulerReferenceModel.Admission.DEADLINE,
 					model.submit(new SchedulerReferenceModel.Spec(
 							3L, WorkloadProfile.LATENCY, 5L, 1, false), 5L));
 			assertThrows(RocksDBException.class, () -> scheduler.executor(
-					WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP, now - 1L).execute(() -> {}));
+					WorkloadProfile.LATENCY,
+					OperationFamily.POINT_LOOKUP,
+					scheduler.bindTimeoutNanos(0L)).execute(() -> {}));
 		} finally {
 			release.countDown();
 			scheduler.disposeNow();

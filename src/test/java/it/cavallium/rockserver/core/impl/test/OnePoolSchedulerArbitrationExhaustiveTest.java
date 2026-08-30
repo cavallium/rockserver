@@ -77,7 +77,7 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 		var blocker = blockWithBatch(scheduler);
 		var observed = new ArrayList<Integer>();
 		var completed = new CountDownLatch(10);
-		long deadlineBase = System.currentTimeMillis() + SECONDS.toMillis(30);
+		long deadlineBase = scheduler.bindTimeoutNanos(SECONDS.toNanos(30));
 		try {
 			for (int index = 0; index < 9; index++) {
 				int id = index;
@@ -143,7 +143,7 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 		var observed = new ArrayList<Integer>();
 		var handles = new Disposable[3];
 		long[] deadlines = {10L, 10L, 20L};
-		long deadlineBase = System.currentTimeMillis() + SECONDS.toMillis(30);
+		long deadlineBase = scheduler.bindTimeoutNanos(SECONDS.toNanos(30));
 		int expectedRuns = 3 - Integer.bitCount(cancellationMask);
 		int cancelled = cancellationMask;
 		var completed = new CountDownLatch(expectedRuns);

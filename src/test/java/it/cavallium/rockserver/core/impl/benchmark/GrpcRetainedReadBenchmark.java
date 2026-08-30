@@ -49,6 +49,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -1103,8 +1104,7 @@ public final class GrpcRetainedReadBenchmark {
 
 		private static WorkerContext create(GrpcConnection client, long columnId, Options options) {
 			RocksDBSyncAPI retained = client.getSyncApi(RequestContext.batch());
-			RocksDBSyncAPI latency = client.getSyncApi(new RequestContext(WorkloadProfile.LATENCY,
-					System.currentTimeMillis() + TimeUnit.HOURS.toMillis(2L)));
+			RocksDBSyncAPI latency = client.getSyncApi(RequestContext.latency(Duration.ofHours(2L)));
 			List<Keys> keys = new ArrayList<>(options.existsItems());
 			List<Boolean> expected = new ArrayList<>(options.existsItems());
 			for (int index = 0; index < options.existsItems(); index++) {

@@ -378,7 +378,7 @@ class RWSchedulerCooperativeTest {
 			};
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					System.currentTimeMillis() + SECONDS.toMillis(5)).execute(foreground);
+					scheduler.bindTimeoutNanos(SECONDS.toNanos(5))).execute(foreground);
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.POINT_LOOKUP,
 					Long.MAX_VALUE).execute(foreground);
@@ -1011,7 +1011,7 @@ class RWSchedulerCooperativeTest {
 		try {
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					System.currentTimeMillis() + SECONDS.toMillis(30)).execute(() -> {
+					scheduler.bindTimeoutNanos(SECONDS.toNanos(30))).execute(() -> {
 				blockerStarted.countDown();
 				awaitUninterruptibly(releaseBlocker);
 			});
@@ -1100,7 +1100,7 @@ class RWSchedulerCooperativeTest {
 
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					System.currentTimeMillis() + SECONDS.toMillis(5)).execute(() -> {
+					scheduler.bindTimeoutNanos(SECONDS.toNanos(5))).execute(() -> {
 				blockerStarted.countDown();
 				awaitUninterruptibly(releaseBlocker);
 			});

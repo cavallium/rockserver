@@ -102,7 +102,7 @@ class CrossPoolBatchPermitRaceTest {
 
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					System.currentTimeMillis() + SECONDS.toMillis(30)).execute(() -> {
+					scheduler.bindTimeoutNanos(SECONDS.toNanos(30))).execute(() -> {
 				awaitUninterruptibly(releaseReadBlocker);
 				readWorkCompleted.countDown();
 			});

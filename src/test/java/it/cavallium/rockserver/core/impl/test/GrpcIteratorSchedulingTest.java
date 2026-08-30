@@ -140,7 +140,7 @@ class GrpcIteratorSchedulingTest {
 			CountDownLatch release) {
 		var executor = scheduler.executor(WorkloadProfile.LATENCY,
 				OperationFamily.POINT_LOOKUP,
-				System.currentTimeMillis() + SECONDS.toMillis(30));
+				scheduler.bindTimeoutNanos(SECONDS.toNanos(30)));
 		for (int i = 0; i < workers; i++) {
 			executor.execute(() -> {
 				entered.countDown();

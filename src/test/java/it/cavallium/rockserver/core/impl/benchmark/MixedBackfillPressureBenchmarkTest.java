@@ -141,14 +141,12 @@ class MixedBackfillPressureBenchmarkTest {
 	}
 
 	@Test
-	void latencyDeadlineCoversRunsBeyondFiveSecondsAndSaturatesOnOverflow() {
-		long now = 1_000L;
-		assertTrue(MixedBackfillPressureBenchmark.latencyDeadlineEpochMillis(
-				now, Duration.ofSeconds(6)) > now + Duration.ofSeconds(6).toMillis());
-		assertEquals(Long.MAX_VALUE - 1L, MixedBackfillPressureBenchmark.latencyDeadlineEpochMillis(
-				Long.MAX_VALUE - 1L, Duration.ofSeconds(6)));
-		assertEquals(Long.MAX_VALUE - 1L, MixedBackfillPressureBenchmark.latencyDeadlineEpochMillis(
-				0L, Duration.ofSeconds(Long.MAX_VALUE)));
+	void latencyTimeoutCoversRunsBeyondFiveSecondsAndSaturatesOnOverflow() {
+		assertTrue(MixedBackfillPressureBenchmark.latencyContext(Duration.ofSeconds(6)).timeoutNanos()
+				> Duration.ofSeconds(6).toNanos());
+		assertEquals(Long.MAX_VALUE - 1L,
+				MixedBackfillPressureBenchmark.latencyContext(Duration.ofSeconds(Long.MAX_VALUE))
+						.timeoutNanos());
 	}
 
 	private static MixedBackfillPressureBenchmark.Options options(Path root, int pressuredCap) {

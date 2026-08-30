@@ -294,7 +294,7 @@ class RWSchedulerMetricsTest {
 			assertThrows(RocksDBException.class, () -> scheduler.executor(
 					WorkloadProfile.LATENCY,
 					OperationFamily.BOUNDARY_SEEK,
-					System.currentTimeMillis()).execute(expired));
+					scheduler.bindTimeoutNanos(0L)).execute(expired));
 
 			release.countDown();
 			queued.get(5, SECONDS);
@@ -442,7 +442,7 @@ class RWSchedulerMetricsTest {
 			assertThrows(RocksDBException.class, () -> scheduler.executor(
 					WorkloadProfile.LATENCY,
 					OperationFamily.BOUNDARY_SEEK,
-					System.currentTimeMillis()).execute(new MetricTask()));
+					scheduler.bindTimeoutNanos(0L)).execute(new MetricTask()));
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).activeTasks() == 0);
 
 			assertEquals(0,

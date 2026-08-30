@@ -540,7 +540,7 @@ public final class SchedulerHighContentionBenchmark {
 		private final byte[] familyOrdinals;
 		private final PoolObservation[] poolObservations = new PoolObservation[POOLS.length];
 		private final AtomicLong monitorSamples = new AtomicLong();
-		private final long futureLatencyDeadlineEpochMillis;
+		private final long futureLatencyDeadlineNanos;
 		private BenchmarkProcessTelemetry.PeakSampler peaks;
 		private volatile long startedNanos;
 		private volatile long elapsedNanos;
@@ -548,7 +548,7 @@ public final class SchedulerHighContentionBenchmark {
 		private RunState(Config config, RWScheduler scheduler) {
 			this.config = config;
 			this.scheduler = scheduler;
-			this.futureLatencyDeadlineEpochMillis = futureLatencyDeadline(config.timeout());
+			this.futureLatencyDeadlineNanos = scheduler.bindTimeoutNanos(config.timeout().toNanos());
 			this.queueLatencyNanos = new long[config.operations()];
 			this.executionNanos = new long[config.operations()];
 			this.endToEndNanos = new long[config.operations()];
@@ -579,9 +579,9 @@ public final class SchedulerHighContentionBenchmark {
 			long estimatedBytes = 1L << (10 + Math.floorMod((int) (hash >>> 8), 16));
 			int tokens = config.workTokens() * (1 + Math.floorMod((int) (hash >>> 29), 4));
 			long deadline = expired
-					? System.currentTimeMillis() - 1L
+					? 0L
 					: lane.profile() == WorkloadProfile.LATENCY
-							? futureLatencyDeadlineEpochMillis
+							? futureLatencyDeadlineNanos
 							: Long.MAX_VALUE;
 			try {
 				if (fail) {
@@ -622,22 +622,6 @@ public final class SchedulerHighContentionBenchmark {
 					expectedDeadlines.increment();
 				}
 			}
-		}
-
-		private static long futureLatencyDeadline(Duration timeout) {
-			long timeoutMillis;
-			try {
-				timeoutMillis = timeout.toMillis();
-			} catch (ArithmeticException overflow) {
-				timeoutMillis = Long.MAX_VALUE;
-			}
-			long horizonMillis = timeoutMillis >= Long.MAX_VALUE - TimeUnit.MINUTES.toMillis(1L)
-					? Long.MAX_VALUE
-					: timeoutMillis + TimeUnit.MINUTES.toMillis(1L);
-			long now = System.currentTimeMillis();
-			return horizonMillis >= Long.MAX_VALUE - 1L - now
-					? Long.MAX_VALUE - 1L
-					: now + horizonMillis;
 		}
 
 		private void monitor() {

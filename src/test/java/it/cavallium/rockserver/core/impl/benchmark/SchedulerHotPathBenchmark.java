@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.lang.management.ManagementFactory;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -122,7 +123,7 @@ public final class SchedulerHotPathBenchmark {
 					profile = WorkloadProfile.LATENCY;
 					var executor = scheduler.executor(WorkloadProfile.LATENCY,
 							OperationFamily.POINT_LOOKUP,
-							System.currentTimeMillis() + 600_000L);
+							scheduler.bindTimeoutNanos(TimeUnit.MILLISECONDS.toNanos(600_000L)));
 					submitter = () -> executor.execute(normalTask);
 					completed = normalTask.completed;
 					failure = normalTask.failure;

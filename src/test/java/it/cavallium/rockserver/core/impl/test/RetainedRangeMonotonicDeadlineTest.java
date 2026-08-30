@@ -132,7 +132,7 @@ class RetainedRangeMonotonicDeadlineTest {
 				firstChunk.countDown();
 				awaitUninterruptibly(releaseFirstChunk);
 			});
-			var context = new RequestContext(WorkloadProfile.BATCH, clock.epochMillis() + 30_000L);
+			var context = RequestContext.batch(java.time.Duration.ofSeconds(30L));
 			var range = Flux.from(db.getRangeAsyncInternal(0L,
 					columnId,
 					null,

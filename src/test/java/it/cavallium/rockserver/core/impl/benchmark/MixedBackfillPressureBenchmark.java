@@ -186,8 +186,7 @@ public final class MixedBackfillPressureBenchmark {
 				int lane = reader;
 				futures.add(submit(executor, failures, () -> {
 					ready.countDown(); await(start);
-					var api = connection.getSyncApi(new RequestContext(WorkloadProfile.LATENCY,
-							latencyDeadlineEpochMillis(System.currentTimeMillis(), options.measureDuration())));
+					var api = connection.getSyncApi(latencyContext(options.measureDuration()));
 					long sequence = lane;
 					while (!stop.get()) {
 						long before = System.nanoTime();
@@ -546,12 +545,12 @@ public final class MixedBackfillPressureBenchmark {
 				options.pressuredBatchMaximumActive());
 	}
 
-	static long latencyDeadlineEpochMillis(long nowEpochMillis, Duration measurement) {
+	static RequestContext latencyContext(Duration measurement) {
 		try {
-			long budget = Math.addExact(measurement.toMillis(), TimeUnit.SECONDS.toMillis(30));
-			return Math.addExact(nowEpochMillis, budget);
+			return RequestContext.latency(measurement.plusSeconds(30L));
 		} catch (ArithmeticException overflow) {
-			return Long.MAX_VALUE - 1L;
+			return new RequestContext(it.cavallium.rockserver.core.common.WorkloadProfile.LATENCY,
+					RequestContext.NO_TIMEOUT - 1L);
 		}
 	}
 

@@ -289,7 +289,7 @@ class ScanRawCompactionSafetyTest {
 			internal.getScheduler().executor(
 					WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30)).execute(() -> {
+					internal.getScheduler().bindTimeoutNanos(TimeUnit.SECONDS.toNanos(30))).execute(() -> {
 				foregroundStarted.countDown();
 				awaitLatch(releaseForeground);
 			});
@@ -536,7 +536,7 @@ class ScanRawCompactionSafetyTest {
 			internal.getScheduler().executor(
 					WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30)).execute(() -> {
+					internal.getScheduler().bindTimeoutNanos(TimeUnit.SECONDS.toNanos(30))).execute(() -> {
 				foregroundStarted.countDown();
 				awaitLatch(releaseForeground);
 			});

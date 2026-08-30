@@ -62,7 +62,7 @@ class SchedulerSequenceRebaseTest {
 		var blocker = blockReadPool(scheduler);
 		var observed = new ArrayList<Integer>();
 		var completed = new CountDownLatch(3);
-		long deadline = System.currentTimeMillis() + SECONDS.toMillis(30);
+		long deadline = scheduler.bindTimeoutNanos(SECONDS.toNanos(30));
 		try {
 			forceNextSequence(scheduler, Long.MAX_VALUE - 1L);
 			var latency = scheduler.scheduler(WorkloadProfile.LATENCY,
@@ -119,7 +119,7 @@ class SchedulerSequenceRebaseTest {
 		var blocker = blockReadPool(scheduler);
 		var observed = new ArrayList<Integer>();
 		var completed = new CountDownLatch(3);
-		long deadline = System.currentTimeMillis() + SECONDS.toMillis(30);
+		long deadline = scheduler.bindTimeoutNanos(SECONDS.toNanos(30));
 		try {
 			var latency = scheduler.scheduler(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
@@ -151,7 +151,7 @@ class SchedulerSequenceRebaseTest {
 		var queuedCompleted = new CountDownLatch(2);
 		var rejected = new CountDownLatch(2);
 		var rejectedOrder = new ArrayList<Integer>();
-		long deadline = System.currentTimeMillis() + 250L;
+		long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(250L));
 		try {
 			var batch = scheduler.executor(WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
@@ -168,7 +168,7 @@ class SchedulerSequenceRebaseTest {
 			executeWhenCapacity(deadlineBatch, new DeferredProbe(0, rejectedOrder, rejected));
 			executeWhenCapacity(deadlineBatch, new DeferredProbe(1, rejectedOrder, rejected));
 
-			awaitWallDeadline(deadline);
+			Thread.sleep(300L);
 			blocker.release().countDown();
 			assertTrue(rejected.await(5, SECONDS));
 			assertEquals(List.of(0, 1), rejectedOrder,
@@ -190,7 +190,7 @@ class SchedulerSequenceRebaseTest {
 		var completed = new CountDownLatch(concurrentTasks + 1);
 		var ready = new CountDownLatch(concurrentTasks);
 		var start = new CountDownLatch(1);
-		long deadline = System.currentTimeMillis() + SECONDS.toMillis(30);
+		long deadline = scheduler.bindTimeoutNanos(SECONDS.toNanos(30));
 		try (var submitters = Executors.newVirtualThreadPerTaskExecutor()) {
 			var latency = scheduler.scheduler(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
@@ -231,7 +231,7 @@ class SchedulerSequenceRebaseTest {
 		var releaseForeground = new CountDownLatch(1);
 		var completed = new CountDownLatch(2);
 		var observed = new ArrayList<Integer>();
-		long deadline = System.currentTimeMillis() + SECONDS.toMillis(30);
+		long deadline = scheduler.bindTimeoutNanos(SECONDS.toNanos(30));
 		try {
 			forceNextSequence(scheduler, Long.MAX_VALUE - 3L);
 			var ingest = scheduler.executor(WorkloadProfile.INGEST,
@@ -272,7 +272,7 @@ class SchedulerSequenceRebaseTest {
 		var releaseForeground = new CountDownLatch(1);
 		var rejected = new CountDownLatch(2);
 		var rejectionOrder = new ArrayList<Integer>();
-		long deadline = System.currentTimeMillis() + 500L;
+		long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(500L));
 		try {
 			forceNextSequence(scheduler, Long.MAX_VALUE - 3L);
 			var ingest = scheduler.executor(WorkloadProfile.INGEST,
@@ -293,7 +293,7 @@ class SchedulerSequenceRebaseTest {
 			forceNextSequence(scheduler, Long.MAX_VALUE);
 			ingest.execute(new ExpiryProbe(1, rejectionOrder, rejected));
 
-			awaitWallDeadline(deadline);
+			Thread.sleep(550L);
 			releaseForeground.countDown();
 			assertTrue(rejected.await(5, SECONDS));
 			assertEquals(List.of(0, 1), rejectionOrder,
@@ -316,7 +316,7 @@ class SchedulerSequenceRebaseTest {
 			var observed = new ArrayList<Integer>();
 			int cancelledId = scenario % tasks;
 			var completed = new CountDownLatch(tasks - 1);
-			long deadline = System.currentTimeMillis() + SECONDS.toMillis(30);
+			long deadline = scheduler.bindTimeoutNanos(SECONDS.toNanos(30));
 			try {
 				forceNextSequence(scheduler, Long.MAX_VALUE - distance);
 				var latency = scheduler.scheduler(WorkloadProfile.LATENCY,
@@ -378,12 +378,6 @@ class SchedulerSequenceRebaseTest {
 			if (failure.getCause() instanceof Exception exception) throw exception;
 			if (failure.getCause() instanceof Error error) throw error;
 			throw failure;
-		}
-	}
-
-	private static void awaitWallDeadline(long deadlineEpochMillis) throws InterruptedException {
-		while (System.currentTimeMillis() <= deadlineEpochMillis) {
-			MILLISECONDS.sleep(Math.max(1L, Math.min(10L, deadlineEpochMillis - System.currentTimeMillis() + 1L)));
 		}
 	}
 

@@ -177,7 +177,7 @@ class CooperativeIteratorContinuationTest {
 				var foregroundRan = new CountDownLatch(1);
 				scheduler.executor(WorkloadProfile.LATENCY,
 						OperationFamily.POINT_LOOKUP,
-						System.currentTimeMillis() + SECONDS.toMillis(30)).execute(() -> {
+						scheduler.bindTimeoutNanos(SECONDS.toNanos(30))).execute(() -> {
 					firstCompletion.compareAndSet(0, 1);
 					foregroundRan.countDown();
 				});
@@ -654,7 +654,7 @@ class CooperativeIteratorContinuationTest {
 			CountDownLatch release) {
 		var executor = scheduler.executor(WorkloadProfile.LATENCY,
 				OperationFamily.POINT_LOOKUP,
-				System.currentTimeMillis() + SECONDS.toMillis(30));
+				scheduler.bindTimeoutNanos(SECONDS.toNanos(30)));
 		for (int i = 0; i < workers; i++) {
 			executor.execute(() -> {
 				entered.countDown();

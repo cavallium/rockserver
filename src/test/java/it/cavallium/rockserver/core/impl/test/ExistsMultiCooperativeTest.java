@@ -109,7 +109,7 @@ class ExistsMultiCooperativeTest {
 
 				scheduler.executor(WorkloadProfile.LATENCY,
 						OperationFamily.POINT_LOOKUP,
-						System.currentTimeMillis() + 5_000L).execute(foregroundRan::countDown);
+						scheduler.bindTimeoutNanos(TimeUnit.MILLISECONDS.toNanos(5_000L))).execute(foregroundRan::countDown);
 				releaseFirstNativeCall.countDown();
 				assertTrue(foregroundRan.await(5, TimeUnit.SECONDS));
 				var result = request.get(10, TimeUnit.SECONDS);

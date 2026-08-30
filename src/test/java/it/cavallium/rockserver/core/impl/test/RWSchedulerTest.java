@@ -1003,7 +1003,7 @@ class RWSchedulerTest {
 		try {
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					System.currentTimeMillis() + SECONDS.toMillis(30)).execute(() -> {
+					scheduler.bindTimeoutNanos(SECONDS.toNanos(30))).execute(() -> {
 				foregroundStarted.countDown();
 				awaitUninterruptibly(releaseForeground);
 			});
@@ -1049,7 +1049,7 @@ class RWSchedulerTest {
 		try {
 			scheduler.executor(WorkloadProfile.LATENCY,
 					OperationFamily.POINT_LOOKUP,
-					System.currentTimeMillis() + SECONDS.toMillis(30)).execute(() -> {
+					scheduler.bindTimeoutNanos(SECONDS.toNanos(30))).execute(() -> {
 				foregroundStarted.countDown();
 				awaitUninterruptibly(releaseForeground);
 			});

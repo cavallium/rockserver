@@ -61,7 +61,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 			executeWhenCapacity(scheduler.scheduler(
 					WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(1)), first);
+					scheduler.bindTimeoutNanos(TimeUnit.MINUTES.toNanos(1))), first);
 			executeWhenCapacity(scheduler.scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), second);
 			var overflow = new DeferredProbe(() -> order.add("overflow"));
 			RocksDBException rejection = assertThrows(RocksDBException.class,
@@ -110,7 +110,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 			var handle = executeWhenCapacity(scheduler.scheduler(
 					WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(1)), probe);
+					scheduler.bindTimeoutNanos(TimeUnit.MINUTES.toNanos(1))), probe);
 
 			activeRelease.countDown();
 			assertTrue(queuedStarted.await(5, TimeUnit.SECONDS));
@@ -147,7 +147,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 			var handle = executeWhenCapacity(scheduler.scheduler(
 					WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(1)), probe);
+					scheduler.bindTimeoutNanos(TimeUnit.MINUTES.toNanos(1))), probe);
 			assertEquals(2L, scheduler.poolSnapshot(RWScheduler.Pool.READ).submissionAttempts());
 
 			handle.dispose();
@@ -182,7 +182,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 			var deadlineScheduler = scheduler.scheduler(
 					WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					System.currentTimeMillis() + 200L);
+					scheduler.bindTimeoutNanos(TimeUnit.MILLISECONDS.toNanos(200L)));
 			var handle = executeWhenCapacity(deadlineScheduler, probe);
 			assertEquals(2L, scheduler.poolSnapshot(RWScheduler.Pool.READ).submissionAttempts(),
 					"waiting before capacity is pre-admission and must not disturb conservation");
@@ -245,7 +245,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 				var handle = executeWhenCapacity(scheduler.scheduler(
 						WorkloadProfile.BATCH,
 						OperationFamily.RANGE_PAGE,
-						System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(1)), probe);
+						scheduler.bindTimeoutNanos(TimeUnit.MINUTES.toNanos(1))), probe);
 				assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
 
 				var raceStart = new CountDownLatch(1);
@@ -293,7 +293,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 			var handle = executeWhenCapacity(scheduler.scheduler(
 					WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(1)), probe);
+					scheduler.bindTimeoutNanos(TimeUnit.MINUTES.toNanos(1))), probe);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
 
 			shutdown = CompletableFuture.runAsync(scheduler::disposeNow);
@@ -333,15 +333,13 @@ class ProfiledWorkloadDeferredAdmissionTest {
 				awaitUninterruptibly(activeRelease);
 			});
 			assertTrue(activeStarted.await(5, TimeUnit.SECONDS));
-			long deadline = System.currentTimeMillis() + 200L;
+			long deadline = scheduler.bindTimeoutNanos(TimeUnit.MILLISECONDS.toNanos(200L));
 			var handle = executeWhenCapacity(scheduler.scheduler(
 					WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
 					deadline), probe);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
-			while (System.currentTimeMillis() < deadline + 2L) {
-				Thread.onSpinWait();
-			}
+			Thread.sleep(205L);
 			activeRelease.countDown();
 
 			assertTrue(probe.rejectionEntered.await(5, TimeUnit.SECONDS));
@@ -380,7 +378,7 @@ class ProfiledWorkloadDeferredAdmissionTest {
 			executeWhenCapacity(scheduler.scheduler(
 					WorkloadProfile.BATCH,
 					OperationFamily.RANGE_PAGE,
-					System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(1)), probe);
+					scheduler.bindTimeoutNanos(TimeUnit.MINUTES.toNanos(1))), probe);
 
 			CompletableFuture<Void> shutdown = CompletableFuture.runAsync(
 					forced ? scheduler::disposeNow : scheduler::dispose);
