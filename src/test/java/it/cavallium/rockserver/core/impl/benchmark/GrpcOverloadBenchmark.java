@@ -588,9 +588,12 @@ public final class GrpcOverloadBenchmark {
 			client.blockingWithDeadline().cdcCreate(CdcCreateRequest.newBuilder()
 					.setId(cdcSubscription(worker))
 					.addColumnIds(columnId)
+					.setExpectAbsent(Empty.getDefaultInstance())
+					.setWorkloadContractVersion(3)
 					.build());
 		}
-		client.blockingWithDeadline().flush(FlushRequest.getDefaultInstance());
+		client.blockingWithDeadline().flush(
+				FlushRequest.newBuilder().setWorkloadContractVersion(3).build());
 	}
 
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext(
@@ -941,6 +944,7 @@ public final class GrpcOverloadBenchmark {
 				.setId(cdcSubscription(worker))
 				.setMaxEvents(256L)
 				.setMaxResponseBytes(4 * 1024 * 1024)
+				.setWorkloadContractVersion(3)
 				.build();
 		control.ready.countDown();
 		control.start.await();
@@ -956,6 +960,7 @@ public final class GrpcOverloadBenchmark {
 					client.blockingWithDeadline().cdcCommit(CdcCommitRequest.newBuilder()
 							.setId(cdcSubscription(worker))
 							.setSeq(committed)
+							.setWorkloadContractVersion(3)
 							.build());
 				}
 				outcome = Outcome.SUCCESS;
@@ -985,7 +990,8 @@ public final class GrpcOverloadBenchmark {
 			Outcome outcome;
 			String detail = null;
 			try {
-				client.blockingWithDeadline().flush(FlushRequest.getDefaultInstance());
+				client.blockingWithDeadline().flush(
+						FlushRequest.newBuilder().setWorkloadContractVersion(3).build());
 				outcome = Outcome.SUCCESS;
 			} catch (Throwable failure) {
 				outcome = classify(failure);
