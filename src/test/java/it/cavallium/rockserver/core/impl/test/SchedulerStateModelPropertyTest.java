@@ -27,6 +27,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -482,9 +483,11 @@ class SchedulerStateModelPropertyTest {
 
 		private final Object controller;
 		private final Class<?> type;
+		private final AtomicBoolean readDispatchable = new AtomicBoolean();
+		private final AtomicBoolean writeDispatchable = new AtomicBoolean();
 		private final Method setPressured;
 		private final Method setQueued;
-		private final Method setDispatchable;
+		private final Method dispatchabilityLost;
 		private final Method setCompetition;
 		private final Method start;
 		private final Method finish;
@@ -497,8 +500,15 @@ class SchedulerStateModelPropertyTest {
 			this.type = type;
 			setPressured = accessible(type.getDeclaredMethod("setPressured", boolean.class));
 			setQueued = accessible(type.getDeclaredMethod("setBatchQueued", RWScheduler.Pool.class, boolean.class));
-			setDispatchable = accessible(type.getDeclaredMethod(
-					"setBatchDispatchable", RWScheduler.Pool.class, boolean.class));
+			var setDispatchabilitySources = accessible(type.getDeclaredMethod(
+					"setBatchDispatchabilitySources",
+					java.util.function.BooleanSupplier.class,
+					java.util.function.BooleanSupplier.class));
+			setDispatchabilitySources.invoke(controller,
+					(java.util.function.BooleanSupplier) readDispatchable::get,
+					(java.util.function.BooleanSupplier) writeDispatchable::get);
+			dispatchabilityLost = accessible(type.getDeclaredMethod(
+					"batchDispatchabilityLost", RWScheduler.Pool.class));
 			setCompetition = accessible(type.getDeclaredMethod(
 					"setPoolCompetition", RWScheduler.Pool.class, boolean.class));
 			start = accessible(type.getDeclaredMethod(
@@ -537,7 +547,9 @@ class SchedulerStateModelPropertyTest {
 		}
 
 		void dispatchable(SchedulerReferenceModel.BatchGate.Pool pool, boolean value) {
-			invoke(setDispatchable, actual(pool), value);
+			(pool == SchedulerReferenceModel.BatchGate.Pool.READ
+					? readDispatchable : writeDispatchable).set(value);
+			if (!value) invoke(dispatchabilityLost, actual(pool));
 		}
 
 		void competitor(SchedulerReferenceModel.BatchGate.Pool pool, boolean value) {
@@ -578,7 +590,8 @@ class SchedulerStateModelPropertyTest {
 			return "pressured=" + field("pressured") + ", active=" + field("activeBatches")
 					+ ", read=" + field("activeReadBatches") + ", write=" + field("activeWriteBatches")
 					+ ", queuedMask=" + field("queuedBatchPoolMask")
-					+ ", dispatchableMask=" + field("dispatchableBatchPoolMask")
+					+ ", dispatchableRead=" + readDispatchable.get()
+					+ ", dispatchableWrite=" + writeDispatchable.get()
 					+ ", competitionMask=" + field("competitionPoolMask")
 					+ ", last=" + field("lastCompletedPressuredBatchPoolBit")
 					+ ", nextPressure=" + field("nextBatchNanos")
