@@ -344,6 +344,7 @@ class RWSchedulerIndexedQueueTest {
 			assertTrue(blockerReturned.await(5, SECONDS), "blocker did not return for " + suffix);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).drainedAndConserved());
 
+			assertEventually(() -> terminal.rejectionCount() != 0);
 			assertEquals(1, terminal.rejectionCount(), "duplicate terminal callback for " + suffix);
 			assertEquals(0, terminal.disposeCount(),
 					"the indexed wrapper, not the original command, owns disposal for " + suffix);
