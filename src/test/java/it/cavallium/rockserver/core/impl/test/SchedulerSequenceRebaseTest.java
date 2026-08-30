@@ -11,13 +11,18 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import reactor.core.Disposable;
@@ -26,6 +31,30 @@ import reactor.core.scheduler.Scheduler;
 /** Regression coverage for the scheduler's lifetime-long FIFO/EDF ordering ticket. */
 @Timeout(60)
 class SchedulerSequenceRebaseTest {
+
+	@Test
+	void everySequenceFieldIsPartOfTheExplicitRebaseInventory() throws Exception {
+		var executor = Class.forName("it.cavallium.rockserver.core.impl.ProfiledWorkloadExecutor");
+		var classes = new ArrayList<Class<?>>();
+		classes.add(executor);
+		classes.addAll(Arrays.asList(executor.getDeclaredClasses()));
+		var actual = new HashSet<String>();
+		for (var type : classes) {
+			for (var field : type.getDeclaredFields()) {
+				if (!Modifier.isStatic(field.getModifiers())
+						&& field.getType() == long.class
+						&& field.getName().toLowerCase(java.util.Locale.ROOT).contains("sequence")) {
+					actual.add(type.getSimpleName() + '#' + field.getName());
+				}
+			}
+		}
+		assertEquals(Set.of(
+				"ProfiledWorkloadExecutor#sequence",
+				"DeferredAdmission#sequence",
+				"WorkloadTask#deadlineSequence",
+				"CooperativeWorkloadTask#sequence"), actual,
+				"a new order-bearing sequence must be added deliberately to rebaseSequencesUnsafe");
+	}
 
 	@Test
 	void equalDeadlineEdfRemainsFifoAcrossTheTicketBoundary() throws Exception {
@@ -194,6 +223,126 @@ class SchedulerSequenceRebaseTest {
 		}
 	}
 
+	@Test
+	void finiteDeadlineCooperativeDispatchPreservesBothTicketsAfterYieldAndRebase() throws Exception {
+		var scheduler = scheduler("sequence-cooperative-two-ticket-dispatch");
+		var initialBlocker = blockReadPool(scheduler);
+		var foregroundStarted = new CountDownLatch(1);
+		var releaseForeground = new CountDownLatch(1);
+		var completed = new CountDownLatch(2);
+		var observed = new ArrayList<Integer>();
+		long deadline = System.currentTimeMillis() + SECONDS.toMillis(30);
+		try {
+			forceNextSequence(scheduler, Long.MAX_VALUE - 3L);
+			var ingest = scheduler.executor(WorkloadProfile.INGEST,
+					OperationFamily.RANGE_PAGE,
+					deadline);
+			var cooperative = new YieldOnceTask(0, observed, completed, null, null);
+			ingest.executeCooperatively(cooperative, 1L);
+			ingest.execute(() -> {
+				foregroundStarted.countDown();
+				awaitUninterruptibly(releaseForeground);
+			});
+
+			initialBlocker.release().countDown();
+			assertTrue(foregroundStarted.await(5, SECONDS),
+					"the cooperative task must yield before the foreground blocker starts");
+			assertEquals(1, cooperative.quantums().get());
+
+			forceNextSequence(scheduler, Long.MAX_VALUE);
+			ingest.execute(() -> record(1, observed, completed));
+			releaseForeground.countDown();
+
+			assertTrue(completed.await(5, SECONDS));
+			assertEquals(List.of(0, 1), observed,
+					"the yielded cooperative dispatch ticket must remain older than a post-rebase task");
+			assertEventuallyConserved(scheduler);
+		} finally {
+			initialBlocker.release().countDown();
+			releaseForeground.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void finiteDeadlineCooperativeExpiryPreservesAdmissionTicketAfterYieldAndRebase() throws Exception {
+		var scheduler = scheduler("sequence-cooperative-two-ticket-expiry");
+		var initialBlocker = blockReadPool(scheduler);
+		var foregroundStarted = new CountDownLatch(1);
+		var releaseForeground = new CountDownLatch(1);
+		var rejected = new CountDownLatch(2);
+		var rejectionOrder = new ArrayList<Integer>();
+		long deadline = System.currentTimeMillis() + 500L;
+		try {
+			forceNextSequence(scheduler, Long.MAX_VALUE - 3L);
+			var ingest = scheduler.executor(WorkloadProfile.INGEST,
+					OperationFamily.RANGE_PAGE,
+					deadline);
+			var cooperative = new YieldOnceTask(0, null, null, rejectionOrder, rejected);
+			ingest.executeCooperatively(cooperative, 1L);
+			scheduler.executor(WorkloadProfile.INGEST,
+					OperationFamily.RANGE_PAGE,
+					RequestContext.NO_DEADLINE).execute(() -> {
+				foregroundStarted.countDown();
+				awaitUninterruptibly(releaseForeground);
+			});
+
+			initialBlocker.release().countDown();
+			assertTrue(foregroundStarted.await(5, SECONDS));
+			assertEquals(1, cooperative.quantums().get());
+			forceNextSequence(scheduler, Long.MAX_VALUE);
+			ingest.execute(new ExpiryProbe(1, rejectionOrder, rejected));
+
+			awaitWallDeadline(deadline);
+			releaseForeground.countDown();
+			assertTrue(rejected.await(5, SECONDS));
+			assertEquals(List.of(0, 1), rejectionOrder,
+					"rebasing the yielded dispatch ticket must also preserve its older deadline ticket");
+			assertEventuallyConserved(scheduler);
+		} finally {
+			initialBlocker.release().countDown();
+			releaseForeground.countDown();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void deterministicBoundaryWindowsPreserveEdfOrderAndCancellation() throws Exception {
+		for (int scenario = 0; scenario < 24; scenario++) {
+			var scheduler = scheduler("sequence-window-" + scenario);
+			var blocker = blockReadPool(scheduler);
+			int tasks = 4 + scenario % 7;
+			int distance = 1 + scenario % 3;
+			var observed = new ArrayList<Integer>();
+			int cancelledId = scenario % tasks;
+			var completed = new CountDownLatch(tasks - 1);
+			long deadline = System.currentTimeMillis() + SECONDS.toMillis(30);
+			try {
+				forceNextSequence(scheduler, Long.MAX_VALUE - distance);
+				var latency = scheduler.scheduler(WorkloadProfile.LATENCY,
+						OperationFamily.POINT_LOOKUP,
+						deadline);
+				var handles = new Disposable[tasks];
+				for (int id = 0; id < tasks; id++) {
+					int taskId = id;
+					handles[id] = latency.schedule(() -> record(taskId, observed, completed));
+				}
+				handles[cancelledId].dispose();
+				blocker.release().countDown();
+				assertTrue(completed.await(5, SECONDS));
+				var expected = java.util.stream.IntStream.range(0, tasks)
+						.filter(id -> id != cancelledId)
+						.boxed()
+						.toList();
+				assertEquals(expected, observed, "boundary scenario " + scenario);
+				assertEventuallyConserved(scheduler);
+			} finally {
+				blocker.release().countDown();
+				scheduler.disposeNow();
+			}
+		}
+	}
+
 	private static RWScheduler scheduler(String name) {
 		return RWScheduler.forTesting(1, 1, 1, 64, 64, name);
 	}
@@ -310,6 +459,73 @@ class SchedulerSequenceRebaseTest {
 		@Override
 		public void reject(RuntimeException failure) {
 			throw Objects.requireNonNull(failure);
+		}
+	}
+
+	private record ExpiryProbe(int id,
+			List<Integer> rejectionOrder,
+			CountDownLatch rejected,
+			AtomicBoolean ran) implements Runnable, RWScheduler.RejectionAwareTask {
+
+		private ExpiryProbe(int id, List<Integer> rejectionOrder, CountDownLatch rejected) {
+			this(id, rejectionOrder, rejected, new AtomicBoolean());
+		}
+
+		@Override
+		public void run() {
+			ran.set(true);
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			assertFalse(ran.get());
+			rejectionOrder.add(id);
+			rejected.countDown();
+		}
+	}
+
+	private static final class YieldOnceTask implements RWScheduler.CooperativeCompletionTask {
+		private final int id;
+		private final List<Integer> observed;
+		private final CountDownLatch completed;
+		private final List<Integer> rejectionOrder;
+		private final CountDownLatch rejected;
+		private final AtomicInteger quantums = new AtomicInteger();
+
+		private YieldOnceTask(int id,
+				List<Integer> observed,
+				CountDownLatch completed,
+				List<Integer> rejectionOrder,
+				CountDownLatch rejected) {
+			this.id = id;
+			this.observed = observed;
+			this.completed = completed;
+			this.rejectionOrder = rejectionOrder;
+			this.rejected = rejected;
+		}
+
+		@Override
+		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
+			if (quantums.incrementAndGet() == 1) {
+				return RWScheduler.CooperativeResult.YIELD;
+			}
+			record(id, Objects.requireNonNull(observed), Objects.requireNonNull(completed));
+			return RWScheduler.CooperativeResult.COMPLETE;
+		}
+
+		@Override
+		public void completeCooperatively() {
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			Objects.requireNonNull(failure);
+			Objects.requireNonNull(rejectionOrder).add(id);
+			Objects.requireNonNull(rejected).countDown();
+		}
+
+		private AtomicInteger quantums() {
+			return quantums;
 		}
 	}
 }
