@@ -121,6 +121,8 @@ class WorkloadAdmissionTest {
 			Map.entry("cdcPoll", OperationFamily.WAL_PAGE),
 			Map.entry("flush", OperationFamily.FLUSH),
 			Map.entry("compact", OperationFamily.COMPACTION),
+            Map.entry("compactFiles", OperationFamily.COMPACTION),
+            Map.entry("getSstMetadata", OperationFamily.METADATA),
 			Map.entry("getAllColumnDefinitions", OperationFamily.METADATA),
 			Map.entry("cdcCreate", OperationFamily.MUTATION),
 			Map.entry("cdcDelete", OperationFamily.MUTATION),
@@ -573,6 +575,9 @@ class WorkloadAdmissionTest {
 		commands.add(protectedCommand("cdcPoll", new RocksDBAPICommandStream.CdcPoll("cdc", null, 1), CDC));
 		commands.add(protectedCommand("flush", new RocksDBAPICommand.Flush(), PHYSICAL_MAINTENANCE));
 		commands.add(protectedCommand("compact", new RocksDBAPICommand.Compact(), PHYSICAL_MAINTENANCE));
+        commands.add(protectedCommand("compactFiles", new RocksDBAPICommand.CompactFiles(
+                new it.cavallium.rockserver.core.common.SstMaintenance.Request(1,"session",List.of("1.sst"),6,0,1024,1024,1,true)), PHYSICAL_MAINTENANCE));
+        commands.add(client("getSstMetadata", new RocksDBAPICommand.GetSstMetadata(1,6), batch));
 		commands.add(client("getAllColumnDefinitions", new RocksDBAPICommand.GetAllColumnDefinitions(), all));
 		commands.add(protectedCommand("cdcCreate", new RocksDBAPICommand.CdcCreate(
 				"cdc", null, null, null, OptionalLong.empty()), CDC));

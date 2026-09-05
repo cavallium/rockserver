@@ -121,24 +121,27 @@ class ColumnHandleLifecycleTest {
 		long columnId = db.createColumn(name, SCHEMA);
 		db.put(0L, columnId, key(1L), Buf.wrap(new byte[] {1}), RequestType.none());
 		db.put(0L, columnId, key(2L), Buf.wrap(new byte[] {2}), RequestType.none());
-		var firstItem = new CountDownLatch(1);
+		var rangeUseAcquired = new CountDownLatch(1);
 		var releaseRange = new CountDownLatch(1);
 		var blockOnce = new AtomicBoolean();
+		// Downstream delivery may outlive a prefetched/closed native cursor. Block
+		// at ownership acquisition instead, while deletion must still drain the lease.
+		db.setColumnUseAcquiredObserverForTesting(observedColumnId -> {
+			if (observedColumnId == columnId && blockOnce.compareAndSet(false, true)) {
+				rangeUseAcquired.countDown();
+				awaitLatch(releaseRange);
+			}
+		});
 		var rangeCompletion = Flux.from(db.getRangeAsyncInternal(0L,
 				columnId,
 				null,
 				null,
 				false,
 				RequestType.allInRange()))
-				.doOnNext(_ -> {
-					if (blockOnce.compareAndSet(false, true)) {
-						firstItem.countDown();
-						awaitLatch(releaseRange);
-					}
-				})
+				.subscribeOn(reactor.core.scheduler.Schedulers.fromExecutor(executor))
 				.then()
 				.toFuture();
-		assertTrue(firstItem.await(5, TimeUnit.SECONDS), "range cursor did not emit its first item");
+		assertTrue(rangeUseAcquired.await(5, TimeUnit.SECONDS), "range cursor did not acquire its column use");
 		Future<?> deletion = executor.submit(() -> db.deleteColumn(columnId));
 
 		try {

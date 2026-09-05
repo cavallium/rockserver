@@ -772,6 +772,19 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		}
 	}
 
+    @Override public it.cavallium.rockserver.core.common.SstMaintenance.Metadata getSstMetadata(long columnId, int level) {
+        throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "SST maintenance requires gRPC or embedded transport");
+    }
+    @Override public it.cavallium.rockserver.core.common.SstMaintenance.Result compactFiles(it.cavallium.rockserver.core.common.SstMaintenance.Request request) {
+        throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "SST maintenance requires gRPC or embedded transport");
+    }
+    @Override public CompletableFuture<it.cavallium.rockserver.core.common.SstMaintenance.Metadata> getSstMetadataAsync(long columnId, int level) {
+        return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "SST maintenance requires gRPC or embedded transport"));
+    }
+    @Override public CompletableFuture<it.cavallium.rockserver.core.common.SstMaintenance.Result> compactFilesAsync(it.cavallium.rockserver.core.common.SstMaintenance.Request request) {
+        return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "SST maintenance requires gRPC or embedded transport"));
+    }
+
 	@Override
 	public void compact() {
 		try {

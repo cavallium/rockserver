@@ -66,7 +66,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 					RocksDBAPICommandSingle.PutBatch _, RocksDBAPICommandSingle.MergeBatch _,
 					RocksDBAPICommandSingle.CloseIterator _, RocksDBAPICommandSingle.Subsequent<?> _,
 					RocksDBAPICommandStream.ScanRaw _, RocksDBAPICommandStream.CdcPoll _,
-					Flush _, Compact _, GetAllColumnDefinitions _, CdcCreate _, CdcDelete _,
+					Flush _, Compact _, CompactFiles _, GetSstMetadata _, GetAllColumnDefinitions _, CdcCreate _, CdcDelete _,
 					CdcGetEarliestAvailableSequence _, CdcGetLastCommittedSequence _, CdcCommit _ -> 0L;
 		};
 	}
@@ -184,8 +184,8 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 					OperationFamily.RANGE_PAGE;
 			case RocksDBAPICommandStream.CdcPoll _ -> OperationFamily.WAL_PAGE;
 			case Flush _ -> OperationFamily.FLUSH;
-			case Compact _ -> OperationFamily.COMPACTION;
-			case GetAllColumnDefinitions _ -> OperationFamily.METADATA;
+			case Compact _, CompactFiles _ -> OperationFamily.COMPACTION;
+			case GetAllColumnDefinitions _, GetSstMetadata _ -> OperationFamily.METADATA;
 			case CdcCreate _ -> OperationFamily.MUTATION;
 			case CdcDelete _ -> OperationFamily.MUTATION;
 			case CdcGetEarliestAvailableSequence _ -> OperationFamily.WAL_PAGE;
@@ -205,7 +205,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			case CdcCreate _, CdcDelete _, CdcGetEarliestAvailableSequence _,
 					CdcGetLastCommittedSequence _, CdcCommit _, RocksDBAPICommandStream.CdcPoll _ ->
 					WorkloadProfile.CDC;
-			case Flush _, Compact _ -> WorkloadProfile.PHYSICAL_MAINTENANCE;
+			case Flush _, Compact _, CompactFiles _ -> WorkloadProfile.PHYSICAL_MAINTENANCE;
 			default -> null;
 		};
 	}
@@ -1293,6 +1293,20 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		}
 
 	}
+    record GetSstMetadata(long columnId, int level) implements RocksDBAPICommandSingle<SstMaintenance.Metadata> {
+        public GetSstMetadata { if (level < -1) throw SstMaintenance.invalid("level must be -1 or non-negative"); }
+        @Override public SstMaintenance.Metadata handleSync(RocksDBSyncAPI api) { return api.getSstMetadata(columnId, level); }
+        @Override public CompletableFuture<SstMaintenance.Metadata> handleAsync(RocksDBAsyncAPI api) { return api.getSstMetadataAsync(columnId, level); }
+        @Override public boolean isReadOnly() { return true; }
+    }
+
+    record CompactFiles(SstMaintenance.Request request) implements RocksDBAPICommandSingle<SstMaintenance.Result> {
+        public CompactFiles { Objects.requireNonNull(request, "request"); }
+        @Override public SstMaintenance.Result handleSync(RocksDBSyncAPI api) { return api.compactFiles(request); }
+        @Override public CompletableFuture<SstMaintenance.Result> handleAsync(RocksDBAsyncAPI api) { return api.compactFilesAsync(request); }
+        @Override public boolean isReadOnly() { return !request.execute(); }
+    }
+
 	/**
 	 * Returns all column definitions
 	 */

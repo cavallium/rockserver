@@ -195,7 +195,8 @@ public final class WorkloadAdmission {
 		switch (command) {
 			case RocksDBAPICommandSingle.CreateColumn _, RocksDBAPICommandSingle.UploadMergeOperator _,
 					RocksDBAPICommandSingle.DeleteColumn _, RocksDBAPICommandSingle.DeleteColumnIfExists _,
-					RocksDBAPICommandStream.ScanRaw _, RocksDBAPICommandStream.ScanRawResumable _ ->
+					RocksDBAPICommandStream.ScanRaw _, RocksDBAPICommandStream.ScanRawResumable _,
+                    RocksDBAPICommand.GetSstMetadata _ ->
 					requireProfile(profile, command, BATCH);
 			case RocksDBAPICommandSingle.DeleteRange _, RocksDBAPICommandSingle.PutBatch _,
 					RocksDBAPICommandSingle.MergeBatch _ -> requireProfile(profile, command, INGEST, BATCH);
@@ -271,7 +272,7 @@ public final class WorkloadAdmission {
 					RocksDBAPICommandSingle.OpenIterator _,
 					RocksDBAPICommandSingle.CloseIterator _, RocksDBAPICommandSingle.SeekTo _,
 					RocksDBAPICommandSingle.ReduceRange<?> _, RocksDBAPICommandStream.CdcPoll _,
-					RocksDBAPICommand.Flush _, RocksDBAPICommand.Compact _,
+					RocksDBAPICommand.Flush _, RocksDBAPICommand.Compact _, RocksDBAPICommand.CompactFiles _,
 					RocksDBAPICommand.GetAllColumnDefinitions _, RocksDBAPICommand.CdcCreate _,
 					RocksDBAPICommand.CdcDelete _, RocksDBAPICommand.CdcGetEarliestAvailableSequence _,
 					RocksDBAPICommand.CdcGetLastCommittedSequence _, RocksDBAPICommand.CdcCommit _ -> {

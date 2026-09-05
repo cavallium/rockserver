@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.impl;
 
+import it.cavallium.rockserver.core.common.SstMaintenance;
+
 import static it.cavallium.rockserver.core.common.Utils.dummyRocksDBEmptyValue;
 import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
@@ -406,6 +408,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer getRangeTimer;
 	private final Timer flushTimer;
 	private final Timer compactTimer;
+	private final String sstMaintenanceSession = java.util.UUID.randomUUID().toString();
 	private final Timer getAllColumnDefinitionsTimer;
 	private final AtomicBoolean nativeDeleteRangeFallbackLogged = new AtomicBoolean();
 	private final Counter cdcEventsEmitted;
@@ -10086,6 +10089,59 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			flushTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
 	}
+
+    @Override
+    public SstMaintenance.Metadata getSstMetadata(long columnId, int level) {
+        ops.beginOp();
+        try (var use = acquireColumnUse(columnId)) {
+            return selectiveMetadata(use.column(), columnId, level);
+        } catch (org.rocksdb.RocksDBException e) {
+            throw RocksDBException.of(RocksDBErrorType.GET_PROPERTY_ERROR, e);
+        } finally { ops.endOp(); }
+    }
+
+    private SstMaintenance.Metadata selectiveMetadata(ColumnInstance column, long columnId, int level)
+            throws org.rocksdb.RocksDBException {
+        var name = new String(column.cfh().getName(), StandardCharsets.UTF_8);
+        // Resolve the same immutable volume configuration used when this CF was opened.
+        // Do not take columnEditLock after acquiring a lease: deletion holds it while draining.
+        try {
+            var global = config.global();
+            FallbackColumnConfig columnConfig = global.fallbackColumnOptions();
+            for (var named : global.columnOptions()) {
+                if (named.name().equals(name)) { columnConfig = named; break; }
+            }
+            var paths = path == null ? List.<String>of()
+                    : RocksDBLoader.getVolumeConfigs(definitiveDbPath, columnConfig).stream()
+                            .map(p -> p.path().toAbsolutePath().normalize().toString()).toList();
+            return SelectiveCompaction.metadata(db.get(), column.cfh(), paths,
+                    sstMaintenanceSession, columnId, level);
+        } catch (GestaltException e) {
+            throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
+        }
+    }
+
+    @Override
+    public SstMaintenance.Result compactFiles(SstMaintenance.Request request) {
+        Objects.requireNonNull(request, "request");
+        long start = System.nanoTime();
+        ops.beginOp();
+        try (var use = acquireColumnUse(request.columnId())) {
+            var observer = columnMaintenanceObserver;
+            if (observer != null) observer.run();
+            return SelectiveCompaction.compact(db.get(), use.column().cfh(),
+                    selectiveMetadata(use.column(), request.columnId(), request.level()), request);
+        } catch (org.rocksdb.RocksDBException e) {
+            var status = e.getStatus();
+            var type = status != null && (status.getCode() == org.rocksdb.Status.Code.Aborted
+                    || status.getCode() == org.rocksdb.Status.Code.InvalidArgument)
+                    ? RocksDBErrorType.COMPACTION_CONFLICT : RocksDBErrorType.COMPACTION_FAILED;
+            throw RocksDBException.of(type, e);
+        } finally {
+            ops.endOp();
+            compactTimer.record(System.nanoTime()-start, TimeUnit.NANOSECONDS);
+        }
+    }
 
 	@Override
 	public void compact() {

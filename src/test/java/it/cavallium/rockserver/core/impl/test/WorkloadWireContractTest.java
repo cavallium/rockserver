@@ -31,6 +31,7 @@ class WorkloadWireContractTest {
 			"closeIterator",
 			"flush",
 			"compact",
+			"compactFiles",
 			"cdcCreate",
 			"cdcDelete",
 			"cdcGetEarliestAvailableSequence",

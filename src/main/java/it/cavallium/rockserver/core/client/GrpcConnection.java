@@ -1356,6 +1356,20 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		return toResponse(this.futureStub.flush(request), _ -> null);
 	}
 
+    @Override
+    public CompletableFuture<SstMaintenance.Metadata> getSstMetadataAsync(long columnId, int level) {
+        var request = GetSstMetadataRequest.newBuilder().setColumnId(columnId).setLevel(level)
+                .setContext(currentWireRequestContext()).build();
+        return toResponse(futureStubWithRequestDeadline().withMaxInboundMessageSize(SstMaintenance.MAX_METADATA_RESPONSE_BYTES)
+                .getSstMetadata(request), SstMaintenanceProto::decode);
+    }
+
+    @Override
+    public CompletableFuture<SstMaintenance.Result> compactFilesAsync(SstMaintenance.Request request) {
+        // Deliberately excluded from the automatic-retry allowlist, like compact().
+        return toResponse(futureStub.compactFiles(SstMaintenanceProto.encode(request)), SstMaintenanceProto::decode);
+    }
+
 	@Override
 	public CompletableFuture<Void> compactAsync() {
 		var request = CompactRequest.newBuilder()

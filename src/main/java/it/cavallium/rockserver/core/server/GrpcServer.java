@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.server;
 
+import it.cavallium.rockserver.core.common.SstMaintenanceProto;
+
 import static it.cavallium.rockserver.core.common.Utils.toByteArray;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
@@ -2442,6 +2444,23 @@ public class GrpcServer extends Server {
 					.transform(this.onErrorMapMonoWithRequestInfo("flush", request));
 		}
 
+        @Override
+        public Mono<GetSstMetadataResponse> getSstMetadata(GetSstMetadataRequest request) {
+            return executeSync(request.getContext(), OperationFamily.METADATA, api ->
+                    SstMaintenanceProto.encode(api.getSstMetadata(request.getColumnId(), request.getLevel())))
+                    .transform(this.onErrorMapMonoWithRequestInfo("getSstMetadata", request));
+        }
+
+        @Override
+        public Mono<CompactFilesResponse> compactFiles(CompactFilesRequest request) {
+            requireV3(request.getWorkloadContractVersion());
+            return Mono.defer(() -> {
+                var decoded = SstMaintenanceProto.decode(request);
+                return executeScheduled(() -> SstMaintenanceProto.encode(protectedApi().compactFiles(decoded)),
+                        scheduler.scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE));
+            }).transform(this.onErrorMapMonoWithRequestInfo("compactFiles", request));
+        }
+
 		@Override
 		public Mono<Empty> compact(CompactRequest request) {
 			requireV3(request.getWorkloadContractVersion());
@@ -4095,7 +4114,9 @@ public class GrpcServer extends Server {
 			var rocksError = findRocksDBException(ex);
 			if (rocksError != null) {
 				return switch (rocksError.getErrorUniqueId()) {
-						case PUT_INVALID_REQUEST -> Status.INVALID_ARGUMENT
+						case COMPACTION_CONFLICT -> Status.ABORTED
+                                .withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
+                        case PUT_INVALID_REQUEST -> Status.INVALID_ARGUMENT
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case CDC_SUBSCRIPTION_NOT_FOUND, TRANSACTION_NOT_FOUND -> Status.NOT_FOUND
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);

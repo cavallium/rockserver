@@ -324,6 +324,14 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new ScanRawResumable(columnId, shardIndex, shardCount, completedSsts));
 	}
 
+    /** See: {@link RocksDBSyncAPI#getSstMetadata(long, int)}. */
+    default CompletableFuture<SstMaintenance.Metadata> getSstMetadataAsync(long columnId, int level) {
+        return requestAsync(new RocksDBAPICommand.GetSstMetadata(columnId, level));
+    }
+    default CompletableFuture<SstMaintenance.Result> compactFilesAsync(SstMaintenance.Request request) {
+        return requestAsync(new RocksDBAPICommand.CompactFiles(request));
+    }
+
 	/** See: {@link Flush}. */
 	default CompletableFuture<Void> flushAsync() {
 		return requestAsync(new Flush());

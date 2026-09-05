@@ -334,6 +334,10 @@ service RocksDBService {
   rpc scanRaw(ScanRawRequest) returns (stream ScanRawResponse);
   rpc flush(FlushRequest) returns (google.protobuf.Empty);
   rpc compact(CompactRequest) returns (google.protobuf.Empty);
+  // Metadata only: no flush, pin, SST data scan or compaction.
+  rpc getSstMetadata(GetSstMetadataRequest) returns (GetSstMetadataResponse);
+  // Selective same-level compaction; execute defaults to false (validation only).
+  rpc compactFiles(CompactFilesRequest) returns (CompactFilesResponse);
   rpc getAllColumnDefinitions(GetAllColumnDefinitionsRequest) returns (GetAllColumnDefinitionsResponse);
   rpc uploadMergeOperator(UploadMergeOperatorRequest) returns (UploadMergeOperatorResponse);
   rpc checkMergeOperator(CheckMergeOperatorRequest) returns (CheckMergeOperatorResponse);
@@ -423,4 +427,53 @@ message CDCEvent {
   bytes value = 4;
   enum Op { PUT = 0; DELETE = 1; MERGE = 2; }
   Op op = 5;
+}
+
+message GetSstMetadataRequest {
+  int64 columnId = 1;
+  // -1 means all levels. Otherwise only this level is returned.
+  int32 level = 2;
+  RequestContext context = 3;
+}
+message SstFileMetadata {
+  string name = 1;
+  int32 level = 2;
+  int32 pathId = 3;
+  int64 sizeBytes = 4;
+  string smallestKeyHex = 5;
+  string largestKeyHex = 6;
+  bool beingCompacted = 7;
+}
+message GetSstMetadataResponse {
+  string session = 1;
+  int64 columnId = 2;
+  string columnName = 3;
+  int32 numLevels = 4;
+  int32 baseLevel = 5;
+  // Index is the permanent RocksDB path ID.
+  repeated string paths = 6;
+  repeated SstFileMetadata files = 7;
+}
+message CompactFilesRequest {
+  int32 workloadContractVersion = 1;
+  int64 columnId = 2;
+  string session = 3;
+  repeated string files = 4;
+  // Inputs and outputs must be in this L1+ level at validation time.
+  int32 level = 5;
+  int32 outputPathId = 6;
+  int64 outputFileSizeLimit = 7;
+  // Preflight bound only: RocksDB can expand inputs atomically during execution.
+  int64 maxInputBytes = 8;
+  int32 maxSubcompactions = 9;
+  bool execute = 10;
+}
+message CompactFilesResponse {
+  bool executed = 1;
+  // Actual native inputs on execution; validated selection for a dry run.
+  repeated string inputFiles = 2;
+  repeated string outputFiles = 3;
+  int64 validatedInputBytes = 4;
+  int64 outputBytes = 5;
+  int64 elapsedNanos = 6;
 }

@@ -295,6 +295,16 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new ScanRawResumable(columnId, shardIndex, shardCount, completedSsts));
 	}
 
+    /** Current SST metadata; level=-1 includes all levels. No SST data is scanned. */
+    default SstMaintenance.Metadata getSstMetadata(long columnId, int level) {
+        return requestSync(new RocksDBAPICommand.GetSstMetadata(columnId, level));
+    }
+
+    /** Selective same-level compaction. See {@link SstMaintenance.Request}. */
+    default SstMaintenance.Result compactFiles(SstMaintenance.Request request) {
+        return requestSync(new RocksDBAPICommand.CompactFiles(request));
+    }
+
 	/** See: {@link Flush}. */
 	default void flush() {
 		requestSync(new Flush());

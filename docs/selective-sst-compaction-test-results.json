@@ -1,0 +1,104 @@
+{
+  "base": "6e221da8ff53f8204e0a33170b6c1d91f40371da",
+  "branch": "codex/selective-compact-files",
+  "command": "mvn -q -P library -Dtest=SelectiveCompactionTest,SelectiveCompactionIntegrationTest,WorkloadAdmissionTest,ManualCompactionTest,GrpcPhysicalMaintenanceIdentityTest,GrpcRetryPolicyTest,GrpcErrorMappingTest,GrpcShutdownTest test",
+  "exit_code": 0,
+  "suites": [
+    {
+      "name": "it.cavallium.rockserver.core.impl.test.GrpcPhysicalMaintenanceIdentityTest",
+      "tests": "3",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.066"
+    },
+    {
+      "name": "it.cavallium.rockserver.core.impl.test.ManualCompactionTest",
+      "tests": "2",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.322"
+    },
+    {
+      "name": "it.cavallium.rockserver.core.impl.test.SelectiveCompactionIntegrationTest",
+      "tests": "7",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "1.282"
+    },
+    {
+      "name": "it.cavallium.rockserver.core.impl.test.SelectiveCompactionTest",
+      "tests": "3",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.002"
+    },
+    {
+      "name": "it.cavallium.rockserver.core.impl.test.GrpcErrorMappingTest",
+      "tests": "8",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.395"
+    },
+    {
+      "name": "it.cavallium.rockserver.core.impl.test.GrpcRetryPolicyTest",
+      "tests": "4",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.028"
+    },
+    {
+      "name": "it.cavallium.rockserver.core.impl.test.GrpcShutdownTest",
+      "tests": "8",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "1.245"
+    },
+    {
+      "name": "it.cavallium.rockserver.core.impl.test.WorkloadAdmissionTest",
+      "tests": "16",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.013"
+    }
+  ],
+  "totals": {
+    "tests": 51,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "python_planner_tests": {
+    "tests": 4,
+    "failures": 0,
+    "exit_code": 0
+  },
+  "source_sha256": {
+    "src/main/java/it/cavallium/rockserver/core/client/EmbeddedConnection.java": "10ef6b2000d80c412e18c42f37c39ec6a5c58990eae148b880ed25e67bf64fa9",
+    "src/main/java/it/cavallium/rockserver/core/client/GrpcConnection.java": "e212b3b1afa2166c1db743494887a214e02be800195a344d0d7d0228cbfe1827",
+    "src/main/java/it/cavallium/rockserver/core/client/ThriftConnection.java": "667dbfe3b4db7d02b855b110ef8d5c22dbb834226dc37a370c9f1e7d553b40b1",
+    "src/main/java/it/cavallium/rockserver/core/common/RocksDBAPICommand.java": "6e46cb87173b05b778977fd388a00d0449e60489aff3f42b6bb5fff135f50458",
+    "src/main/java/it/cavallium/rockserver/core/common/RocksDBAsyncAPI.java": "37420acea8973411b8fdae427f6d8eda6da2bd9c35173ac3b1959173d06f9cb4",
+    "src/main/java/it/cavallium/rockserver/core/common/RocksDBException.java": "2be754d1f2ce86a991437ce69884031a716dc3503505565eaf77d2baf803ace1",
+    "src/main/java/it/cavallium/rockserver/core/common/RocksDBSyncAPI.java": "ad4195f402bb4c0905c8448d29b9d34f1b39cbea10a24260ab2eb6a41e2a686c",
+    "src/main/java/it/cavallium/rockserver/core/impl/EmbeddedDB.java": "9f9d15993945ed0f2748621debc4c3c9bc1411824d0a2b10f8d3360fe4fa8de6",
+    "src/main/java/it/cavallium/rockserver/core/impl/WorkloadAdmission.java": "47837851b200e39473b395354c01635c6dfa9b78993e99d91c8de86f0ed74036",
+    "src/main/java/it/cavallium/rockserver/core/server/GrpcServer.java": "93cea0b2670a7113104e738a5c896757d13a98e32ddf8c1ddd4972e9f491ac80",
+    "src/main/proto/rocksdb.proto": "ea9d068c0b100905e5ac9cde788227a2d94065aba262b02e156371ed878b0815",
+    "src/test/java/it/cavallium/rockserver/core/impl/test/WorkloadAdmissionTest.java": "a386675d1d5594a72dc611464764c5b5d6d7857e892c57fed804b30badc0c20c",
+    "scripts/compact-adjacent-ssts.py": "0e06bded99938364bf5584c41b3a60375f4c26c75cac6aa317809116314d7125",
+    "scripts/test_compact_adjacent_ssts.py": "c77bd02c0b25ef1ab5be278bd63a53e0c4acf168d6be2828caffbeb306063017",
+    "src/main/java/it/cavallium/rockserver/core/common/SstMaintenance.java": "184e681b6f02e9b93055e03ddea59bffce480839fe63a88e37dd4713f17110ab",
+    "src/main/java/it/cavallium/rockserver/core/common/SstMaintenanceProto.java": "01b3fa275b9032ec00fd01deaccc995787d9c1b7500e1420f00ebf90459bd753",
+    "src/main/java/it/cavallium/rockserver/core/impl/SelectiveCompaction.java": "8a661f12ed87cddf8b37a203c7dc9a1a4f99dd27341928bc6685854ff59f40ad",
+    "src/test/java/it/cavallium/rockserver/core/impl/test/SelectiveCompactionIntegrationTest.java": "20991e590da5987f75c8292ddf91d8e0fa5026ed15575a0216bb422ba6b7e39c",
+    "src/test/java/it/cavallium/rockserver/core/impl/test/SelectiveCompactionTest.java": "b57bf88b1dda4c4addc7240d3d9b066d5ac0c107ac5ea4ddd2f065a8205c0079"
+  }
+}

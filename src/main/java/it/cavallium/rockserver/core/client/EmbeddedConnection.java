@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.client;
 
+import it.cavallium.rockserver.core.common.SstMaintenance;
+
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
@@ -1506,6 +1508,13 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	public void flush() {
 		db.flush();
 	}
+
+    @Override public SstMaintenance.Metadata getSstMetadata(long columnId, int level) {
+        return db.getSstMetadata(columnId, level);
+    }
+    @Override public SstMaintenance.Result compactFiles(SstMaintenance.Request request) {
+        return db.compactFiles(request);
+    }
 
 	@Override
 	public void compact() {
