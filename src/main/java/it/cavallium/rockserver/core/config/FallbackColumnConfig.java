@@ -28,6 +28,12 @@ public interface FallbackColumnConfig {
 	Boolean cacheIndexAndFilterBlocks() throws GestaltException;
 
 	@Nullable
+	Boolean pinIndexAndFilterBlocks() throws GestaltException;
+
+	@Nullable
+	Boolean disableAutoCompactions() throws GestaltException;
+
+	@Nullable
 	String blockCacheName() throws GestaltException;
 
 	@Nullable

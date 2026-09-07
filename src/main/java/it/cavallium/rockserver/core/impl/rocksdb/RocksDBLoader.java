@@ -275,7 +275,8 @@ public class RocksDBLoader {
             }
             columnFamilyOptions.setMemtableMaxRangeDeletions(resolveMemtableMaxRangeDeletions(columnOptions));
 
-            boolean disableAutoCompactions = globalDatabaseConfig.disableAutoCompactions();
+            boolean disableAutoCompactions = Optional.ofNullable(columnOptions.disableAutoCompactions())
+                    .orElse(globalDatabaseConfig.disableAutoCompactions());
             boolean disableWriteSlowdown = disableAutoCompactions || globalDatabaseConfig.disableWriteSlowdown();
             if (disableAutoCompactions) {
                 columnFamilyOptions.setDisableAutoCompactions(true);
@@ -454,6 +455,7 @@ public class RocksDBLoader {
                     blockBasedTableConfig.setFilterPolicy(configuredFilter);
                 }
             }
+            boolean pinIndexAndFilterBlocks = Optional.ofNullable(columnOptions.pinIndexAndFilterBlocks()).orElse(true);
             boolean cacheIndexAndFilterBlocks = !inMemory && Optional.ofNullable(columnOptions.cacheIndexAndFilterBlocks())
                     // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
                     .orElse(true);
@@ -471,9 +473,9 @@ public class RocksDBLoader {
                         // http://rocksdb.org/blog/2018/08/23/data-block-hash-index.html
                         .setDataBlockHashTableUtilRatio(0.75)
                         // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
-                        .setPinTopLevelIndexAndFilter(true)
+                        .setPinTopLevelIndexAndFilter(pinIndexAndFilterBlocks)
                         // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
-                        .setPinL0FilterAndIndexBlocksInCache(!inMemory)
+                        .setPinL0FilterAndIndexBlocksInCache(!inMemory && pinIndexAndFilterBlocks)
                         // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
                         // RocksDB applies this priority to index, filter, and compression-dictionary
                         // blocks. The LRU cache's configured high-priority pool provides the reserve.

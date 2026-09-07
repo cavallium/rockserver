@@ -295,6 +295,38 @@ class RocksDBLoaderComplexConfigTest {
     }
 
     @Test
+    void retiredColumnDoesNotPinMetadataOrScheduleCompaction(@TempDir Path tempDir) throws Exception {
+        var config = parse(tempDir, "retired-column", """
+                database.global {
+                  block-cache: "8MiB"
+                  block-caches: [{ name: "retired", size: "1MiB" }]
+                  disable-auto-compactions: false
+                  fallback-column-options: { volumes: [], levels: [] }
+                  column-options: [
+                    ${database.global.fallback-column-options} { name: "retired", block-cache-name: "retired", pin-index-and-filter-blocks: false, disable-auto-compactions: true },
+                    ${database.global.fallback-column-options} { name: "active" }
+                  ]
+                }
+                """);
+        var loaded = RocksDBLoader.load(tempDir.resolve("retired-db"), config, LoggerFactory.getLogger(getClass()));
+        try {
+            var retired = loaded.definitiveColumnFamilyOptionsMap().get("retired");
+            var active = loaded.definitiveColumnFamilyOptionsMap().get("active");
+            var table = assertInstanceOf(BlockBasedTableConfig.class, retired.tableFormatConfig());
+            var activeTable = assertInstanceOf(BlockBasedTableConfig.class, active.tableFormatConfig());
+            assertFalse(table.pinTopLevelIndexAndFilter());
+            assertFalse(table.pinL0FilterAndIndexBlocksInCache());
+            assertTrue(retired.disableAutoCompactions());
+            assertTrue(activeTable.pinTopLevelIndexAndFilter());
+            assertFalse(active.disableAutoCompactions());
+            assertEquals(1L << 20, loaded.cacheCapacities().get("retired"));
+        } finally {
+            loaded.db().close();
+            loaded.refs().close();
+        }
+    }
+
+    @Test
     void rejectsUnknownNamedCache(@TempDir Path tempDir) throws Exception {
         var config = parse(tempDir, "unknown-cache", """
                 database.global.column-options: [{
