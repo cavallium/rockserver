@@ -7,7 +7,7 @@ import java.util.Objects;
 /** Live physical metadata and same-level manual compaction contracts. */
 public final class SstMaintenance {
     private SstMaintenance() {}
-    public static final int MAX_INPUT_FILES = 256;
+    public static final int MAX_INPUT_FILES = 65_536;
     public static final int MAX_METADATA_RESPONSE_BYTES = 64 * 1024 * 1024;
 
     /** Keys are raw RocksDB user keys encoded as lowercase hex, in bytewise order. */
