@@ -8427,7 +8427,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			try {
 				createdStartKeySlice = startKey != null ? toSlice(startKey) : null;
 				createdEndKeySlice = endKey != null ? toSlice(endKey) : null;
-				createdReadOptions = createReadOptions(createdStartKeySlice,
+				createdReadOptions = newRangeReadOptions(deadlineMicros, fillCache, createdStartKeySlice,
 						createdEndKeySlice);
 				if (transactionId != 0L) {
 					var transactionSnapshot = getTransaction(transactionId, false).val().getSnapshot();
@@ -8551,11 +8551,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 			return Integer.compare(left.length, right.length);
-		}
-
-		private ReadOptions createReadOptions(@Nullable AbstractSlice<?> lowerBound,
-				@Nullable AbstractSlice<?> upperBound) {
-			return newRangeReadOptions(deadlineMicros, fillCache, lowerBound, upperBound);
 		}
 
 		private RocksIterator createIterator(ReadOptions options) {
@@ -10993,7 +10988,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private CdcWalDiscovery findEarliestAvailableWal() {
 		for (int attempt = 0; attempt < CDC_PREFIXLESS_PROBE_MAX_ATTEMPTS; attempt++) {
 			try {
-				var result = findEarliestAvailableWalAttempt();
+				var result = probeEarliestAvailableWal(publishCdcWal());
 				if (result.isPresent()) {
 					return result.get();
 				}
@@ -11009,15 +11004,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 		}
 		throw new RocksDBRetryException();
-	}
-
-	private long findEarliestAvailableWalSeq() {
-		return findEarliestAvailableWal().earliestWalSequence();
-	}
-
-	private Optional<CdcWalDiscovery> findEarliestAvailableWalAttempt() throws org.rocksdb.RocksDBException {
-		var publication = publishCdcWal();
-		return probeEarliestAvailableWal(publication);
 	}
 
 	private CdcWalPublication publishCdcWal() throws org.rocksdb.RocksDBException {
@@ -11133,7 +11119,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// dedicated CDC lane. Resolve it before taking the per-subscription metadata
 			// lock so a slow probe cannot park an interactive watermark read behind it.
 			final long prefixlessStartSeq = fromSeq != null && fromSeq == 0L
-					? composeCdcSeq(findEarliestAvailableWalSeq(), 0)
+					? composeCdcSeq(findEarliestAvailableWal().earliestWalSequence(), 0)
 					: 0L;
 			return withCdcMetadataLock("create", id, () -> {
 				var existing = loadCdcMeta(id);
