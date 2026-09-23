@@ -338,10 +338,6 @@ final class SchedulerReferenceModel {
 		if (outcomes() > attempts || accepted > attempts) throw new AssertionError("reference conservation overflow");
 	}
 
-	private void expireQueued(long now) {
-		expire(now);
-	}
-
 	private Job select(boolean batchEligible) {
 		boolean reservedLatency = reservationDeficit(WorkloadProfile.LATENCY);
 		boolean reservedGuaranteed = false;
