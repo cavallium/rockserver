@@ -454,7 +454,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				boolean becomesDeadlineHead = task.hasDeadline()
 						&& (earliestDeadline == null
 						|| expiryBefore(monotonicDeadlineNanos, task.deadlineSequence(),
-						deadlineNanosUnsafe(earliestDeadline), earliestDeadline.deadlineSequence()));
+						earliestDeadline.monotonicDeadlineNanos(), earliestDeadline.deadlineSequence()));
 				enqueueUnsafe(task, monotonicDeadlineNanos);
 				incrementOutstandingUnsafe(profile);
 				admitCompetitionUnsafe(task);
@@ -719,7 +719,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 		long earliestDeadlineNanos = indexedDeadlineCount == 0
 				? Long.MAX_VALUE
-				: earliestDeadlineNanosUnsafe();
+				: earliestDeadlineUnsafe().monotonicDeadlineNanos();
 		if (!deferredDeadlines.isEmpty()) {
 			earliestDeadlineNanos = Math.min(earliestDeadlineNanos,
 					Objects.requireNonNull(deferredDeadlines.peek()).monotonicDeadlineNanos);
@@ -738,15 +738,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (otherTask == null) return latencyTask;
 		return expiryBefore(latencyTask.monotonicDeadlineNanos(), latencyTask.deadlineSequence(),
 				deadlineQueue.firstDeadlineKey(), otherTask.deadlineSequence()) ? latencyTask : otherTask;
-	}
-
-	private long earliestDeadlineNanosUnsafe() {
-		var task = earliestDeadlineUnsafe();
-		return deadlineNanosUnsafe(task);
-	}
-
-	private long deadlineNanosUnsafe(WorkloadTask task) {
-		return task.monotonicDeadlineNanos();
 	}
 
 	private static boolean expiryBefore(long leftDeadline,
@@ -784,7 +775,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 					&& cancelSelectedUnsafe(task, dispatchCancellation, terminalActions)) {
 				continue;
 			}
-			if (task.hasDeadline() && nowNanos >= deadlineNanosUnsafe(task)) {
+			if (task.hasDeadline() && nowNanos >= task.monotonicDeadlineNanos()) {
 				unlinkUnsafe(task);
 				discardSelectionUnsafe(task);
 				terminateUnsafe(task,
@@ -1639,7 +1630,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		boolean expired = false;
 		while (indexedDeadlineCount != 0) {
 			var task = earliestDeadlineUnsafe();
-			if (nowNanos < deadlineNanosUnsafe(task)) {
+			if (nowNanos < task.monotonicDeadlineNanos()) {
 				if (expired) {
 					refreshPreemptionUnsafe();
 				}
