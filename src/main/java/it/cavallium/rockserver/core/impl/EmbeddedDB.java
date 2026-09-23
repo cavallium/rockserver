@@ -119,7 +119,6 @@ import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.CompactRangeOptions;
 import org.rocksdb.CompactRangeOptions.BottommostLevelCompaction;
 import org.rocksdb.DBOptions;
-import org.rocksdb.DirectSlice;
 import org.rocksdb.FlushOptions;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.ReadTier;
@@ -10655,10 +10654,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	/** Resolved workload limits shared by scheduler and bounded-operation implementations. */
 	public WorkloadSettings getWorkloadSettings() {
 		return workloadSettings;
-	}
-
-	private AbstractSlice<?> toDirectSlice(Buf calculatedKey) {
-		return new DirectSlice(calculatedKey.asHeapByteBuffer(), calculatedKey.size());
 	}
 
 	private AbstractSlice<?> toSlice(Buf calculatedKey) {

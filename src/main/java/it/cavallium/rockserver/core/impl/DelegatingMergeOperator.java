@@ -28,10 +28,6 @@ public class DelegatingMergeOperator extends FFMAbstractMergeOperator {
 		}
 	}
 
-	public FFMAbstractMergeOperator getDelegate() {
-		return delegate;
-	}
-
 	@Override
 	public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
 		return delegate.merge(key, existingValue, operands);

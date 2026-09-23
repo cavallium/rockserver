@@ -315,29 +315,6 @@ public class CdcMergeExample {
         return buf.array();
     }
 
-    private static MessagePatch decodePatch(byte[] data) {
-        ByteBuffer buf = ByteBuffer.wrap(data);
-        int ver = Byte.toUnsignedInt(buf.get());
-        if (ver != 1) throw new IllegalStateException("Unknown Patch ver " + ver);
-        int id = buf.getInt();
-        byte flags = buf.get();
-        String append = null;
-        Boolean pinned = null;
-        Long ts = null;
-        if ((flags & 0x1) != 0) { int len = buf.getInt(); byte[] b = new byte[len]; buf.get(b); append = new String(b, StandardCharsets.UTF_8); }
-        if ((flags & 0x2) != 0) { pinned = buf.get() != 0; }
-        if ((flags & 0x4) != 0) { ts = buf.getLong(); }
-        return new MessagePatch(id, append, pinned, ts);
-    }
-
-    private static Message applyPatch(Message base, MessagePatch p) {
-        String text = base.text();
-        if (p.appendText() != null) text = (text != null ? text : "") + p.appendText();
-        boolean pinned = p.pinnedSet() != null ? p.pinnedSet() : base.pinned();
-        long updatedAt = p.updatedAt() != null ? p.updatedAt() : System.currentTimeMillis();
-        return new Message(base.id(), text, pinned, updatedAt);
-    }
-
     private static void putMessage(EmbeddedConnection db, long columnId, Message m) {
 		db.getSyncApi(INGEST_CONTEXT).put(0, columnId,
                 new Keys(new Buf[]{Buf.wrap(intToBytes(m.id()))}),
