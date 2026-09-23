@@ -935,7 +935,7 @@ public final class GrpcRetainedReadBenchmark {
 		return switch (operation) {
 			case EXACT_COUNT -> executeCount(context, options);
 			case STREAM_RANGE -> executeRange(context, options);
-			case EXISTS_MULTI -> executeExistsMulti(context, options);
+			case EXISTS_MULTI -> executeExistsMulti(context);
 			case ITERATOR -> executeIterator(context, options);
 		};
 	}
@@ -977,7 +977,7 @@ public final class GrpcRetainedReadBenchmark {
 				checksum, firstItemNanos);
 	}
 
-	private static OperationResult executeExistsMulti(WorkerContext context, Options options) {
+	private static OperationResult executeExistsMulti(WorkerContext context) {
 		List<Boolean> result = context.retainedApi().existsMulti(0L, context.columnId(),
 				context.existsKeys());
 		if (result.size() != context.existsExpected().size()) {

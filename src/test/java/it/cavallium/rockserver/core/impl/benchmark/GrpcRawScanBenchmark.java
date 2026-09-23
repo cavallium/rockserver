@@ -1157,11 +1157,6 @@ public final class GrpcRawScanBenchmark {
 						"Missing raw-scan provenance for " + implementation.value));
 	}
 
-	private static String interval(GrpcOverloadBenchmark.RatioConfidenceInterval interval) {
-		return "mean=" + format(interval.mean()) + ", 95% CI=[" + format(interval.lower95())
-				+ ", " + format(interval.upper95()) + ']';
-	}
-
 	private static String intervalJson(GrpcOverloadBenchmark.RatioConfidenceInterval interval) {
 		return "{\"samples\": " + interval.samples() + ", \"mean\": "
 				+ (interval.available() ? format(interval.mean()) : "null")
