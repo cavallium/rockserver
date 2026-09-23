@@ -94,7 +94,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
-import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
@@ -6913,6 +6912,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				false,
 				totalTime,
 				resumeAfter,
+				true,
+				null,
 				true);
 		try {
 			var page = cursor.readPage(totalTime, budget);
@@ -7358,60 +7359,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				sink.error(failure);
 			}
 		}
-	}
-
-	private RangeCursor openRangeCursor(long transactionId,
-			long columnId,
-			@Nullable Keys startKeysInclusive,
-			@Nullable Keys endKeysExclusive,
-			boolean reverse,
-			long deadlineMicros,
-			long monotonicDeadlineNanos,
-			boolean fillCache,
-			boolean retainSnapshot,
-			LongAdder totalTime) {
-		return openRangeCursor(transactionId,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				reverse,
-				deadlineMicros,
-				monotonicDeadlineNanos,
-				fillCache,
-				retainSnapshot,
-				totalTime,
-				null,
-				false,
-				null,
-				true);
-	}
-
-	private RangeCursor openRangeCursor(long transactionId,
-			long columnId,
-			@Nullable Keys startKeysInclusive,
-			@Nullable Keys endKeysExclusive,
-			boolean reverse,
-			long deadlineMicros,
-			long monotonicDeadlineNanos,
-			boolean fillCache,
-			boolean retainSnapshot,
-			LongAdder totalTime,
-			@Nullable Keys resumeAfter,
-			boolean deterministicBucketOrder) {
-		return openRangeCursor(transactionId,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				reverse,
-				deadlineMicros,
-				monotonicDeadlineNanos,
-				fillCache,
-				retainSnapshot,
-				totalTime,
-				resumeAfter,
-				deterministicBucketOrder,
-				null,
-				true);
 	}
 
 	private RangeCursor openRangeCursor(long transactionId,
@@ -8378,9 +8325,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final ColumnInstance.ColumnUse columnUse;
 		private final ColumnInstance col;
 		private final boolean reverse;
-		private final long deadlineMicros;
 		private final long monotonicDeadlineNanos;
-		private final boolean fillCache;
 		private final boolean deterministicBucketOrder;
 		private final AbstractSlice<?> startKeySlice;
 		private final AbstractSlice<?> endKeySlice;
@@ -8413,9 +8358,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			this.columnUse = columnUse;
 			this.col = columnUse.column();
 			this.reverse = reverse;
-			this.deadlineMicros = deadlineMicros;
 			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
-			this.fillCache = fillCache;
 			this.deterministicBucketOrder = deterministicBucketOrder;
 			this.retainedPermit = retainedPermit;
 
@@ -12296,12 +12239,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 */
 	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target, Callable<T> callable) {
 		return scheduleTracked(target, callable, null, 0L);
-	}
-
-	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target,
-			Callable<T> callable,
-			@Nullable Consumer<? super T> lateSuccessCleanup) {
-		return scheduleTracked(target, callable, lateSuccessCleanup, 0L);
 	}
 
 	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target,
