@@ -1028,29 +1028,24 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				.map(Entry::getValue)
 				.findFirst()
 				.orElseThrow(() -> new IllegalStateException("RocksDB default column family was not opened"));
-		upsertStoragePressureColumn(storagePressureColumn("default", defaultColumn, null));
+		upsertStoragePressureColumn(storagePressureColumn("default", defaultColumn));
 		upsertStoragePressureColumn(storagePressureColumn(
 				new String(COLUMN_SCHEMAS_COLUMN, StandardCharsets.UTF_8),
-				columnSchemasColumnDescriptorHandle,
-				null));
+				columnSchemasColumnDescriptorHandle));
 		upsertStoragePressureColumn(storagePressureColumn(
 				new String(MERGE_OPERATORS_COLUMN, StandardCharsets.UTF_8),
-				mergeOperatorsColumnDescriptorHandle,
-				null));
+				mergeOperatorsColumnDescriptorHandle));
 		upsertStoragePressureColumn(storagePressureColumn(
 				new String(CDC_META_COLUMN, StandardCharsets.UTF_8),
-				cdcMetaColumnDescriptorHandle,
-				null));
+				cdcMetaColumnDescriptorHandle));
 	}
 
-	private StoragePressureColumn storagePressureColumn(String name,
-			ColumnFamilyHandle handle,
-			@Nullable ColumnInstance registeredColumn) {
+	private StoragePressureColumn storagePressureColumn(String name, ColumnFamilyHandle handle) {
 		ColumnFamilyOptions options = Objects.requireNonNull(columnsConifg.get(name),
 				() -> "Column config not found while registering storage-pressure signal: " + name);
 		return new StoragePressureColumn(handle.getID(),
 				handle,
-				registeredColumn,
+				null,
 				options.softPendingCompactionBytesLimit());
 	}
 
@@ -1095,7 +1090,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull ColumnSchema schema,
 			@Nullable FFMAbstractMergeOperator mergeOp) {
 		long id = cfh.getID();
-		var pressureColumn = storagePressureColumn(name, cfh, null);
+		var pressureColumn = storagePressureColumn(name, cfh);
 
 		if (this.columns.containsKey(id)) {
 			throw new IllegalStateException("Column ID already registered: " + id);
