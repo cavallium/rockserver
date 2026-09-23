@@ -21,16 +21,8 @@ public final class WB implements Closeable, DBWriter {
         this.disableWal = disableWal;
     }
 
-    public RocksDB rocksDB() {
-        return rocksDB;
-    }
-
     public @NotNull WriteBatch wb() {
         return wb;
-    }
-
-    public boolean disableWal() {
-        return disableWal;
     }
 
     @Override
