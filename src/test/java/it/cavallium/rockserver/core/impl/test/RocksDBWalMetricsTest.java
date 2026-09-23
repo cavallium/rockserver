@@ -52,6 +52,7 @@ class RocksDBWalMetricsTest {
 
 		try (var walMetrics = newWalMetrics(
 				registry,
+				"visibility-test",
 				walDirectory,
 				List.of(
 						new WalMetadata("/archive-looking/000001.log", kAliveLogFile, 100L),
@@ -86,6 +87,7 @@ class RocksDBWalMetricsTest {
 
 		try (var walMetrics = newWalMetrics(
 				registry,
+				"visibility-test",
 				walDirectory,
 				List.of(
 						new WalMetadata("/000003.log", kAliveLogFile, 1_024L),
@@ -108,7 +110,29 @@ class RocksDBWalMetricsTest {
 		}
 	}
 
+	@Test
+	void closeRemovesOnlyItsOwnMetersEvenAfterALateRefresh(@TempDir Path walDirectory) throws Exception {
+		var registry = new SimpleMeterRegistry();
+		try (AutoCloseable registryClose = registry::close;
+		     var other = newWalMetrics(registry, "other", walDirectory, List.of(), 0L,
+				     _ -> 0L, Clock.systemUTC())) {
+			registry.counter("unrelated");
+			var remaining = java.util.Set.copyOf(registry.getMeters());
+			try (var metrics = newWalMetrics(registry, "visibility-test", walDirectory, List.of(), 0L,
+					_ -> 0L, Clock.systemUTC())) {
+				metrics.refresh();
+				assertEquals(remaining.size() + 8, registry.getMeters().size());
+				metrics.close();
+				metrics.close();
+				metrics.refresh();
+				assertEquals(remaining, java.util.Set.copyOf(registry.getMeters()));
+				assertEquals(0, registry.get(LIVE_BYTES_METRIC).tag("database", "other").gauge().value());
+			}
+		}
+	}
+
 	private static WalMetricsHandle newWalMetrics(MeterRegistry registry,
+			String database,
 			Path walDirectory,
 			List<WalMetadata> files,
 			long minLogNumberToKeep,
@@ -133,7 +157,7 @@ class RocksDBWalMetricsTest {
 		metricsConstructor.setAccessible(true);
 		var parameterTypes = metricsConstructor.getParameterTypes();
 		var instance = metricsConstructor.newInstance(
-				"visibility-test",
+				database,
 				registry,
 				walDirectory,
 				functionalProxy(parameterTypes[3], _ -> List.copyOf(nativeMetadata)),

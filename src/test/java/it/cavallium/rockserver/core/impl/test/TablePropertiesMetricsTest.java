@@ -24,7 +24,7 @@ class TablePropertiesMetricsTest {
         try (AutoCloseable registryClose = registry::close) {
             var source = new AtomicReference<Sinks.One<Map<String, ColumnTableProperties>>>(Sinks.one());
             var calls = new AtomicInteger();
-            try (var metrics = create(registry, () -> { calls.incrementAndGet(); return source.get().asMono(); })) {
+            try (var metrics = create(registry, "test", () -> { calls.incrementAndGet(); return source.get().asMono(); })) {
                 refresh(metrics);
                 refresh(metrics);
                 assertEquals(1, calls.get(), "one collection at a time");
@@ -56,13 +56,14 @@ class TablePropertiesMetricsTest {
         try (AutoCloseable registryClose = registry::close) {
             var cancelled = new AtomicInteger();
             var source = Sinks.<Map<String, ColumnTableProperties>>one();
-            var metrics = create(registry, () -> source.asMono().doOnCancel(cancelled::incrementAndGet));
+            var metrics = create(registry, "test", () -> source.asMono().doOnCancel(cancelled::incrementAndGet));
             refresh(metrics);
+            metrics.close();
             metrics.close();
             assertEquals(1, cancelled.get());
             source.tryEmitValue(Map.of("late", mock(ColumnTableProperties.class)));
             refresh(metrics);
-            assertTrue(registry.find(VALUES).gauges().isEmpty());
+            assertTrue(registry.getMeters().isEmpty(), "close removes values and health gauges");
         }
     }
 
@@ -75,7 +76,7 @@ class TablePropertiesMetricsTest {
         var cancelled = new AtomicInteger();
         try (AutoCloseable registryClose = registry::close;
              var executor = java.util.concurrent.Executors.newFixedThreadPool(2);
-             var metrics = create(registry, () -> {
+             var metrics = create(registry, "test", () -> {
                  entered.countDown();
                  try {
                      if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("subscription not released");
@@ -89,15 +90,37 @@ class TablePropertiesMetricsTest {
             } finally { release.countDown(); }
             subscribing.get(5, java.util.concurrent.TimeUnit.SECONDS);
             assertEquals(1, cancelled.get(), "late subscription must be cancelled by its disposed slot");
-            assertTrue(registry.find(VALUES).gauges().isEmpty());
+            assertTrue(registry.getMeters().isEmpty(), "close removes values and health gauges");
         }
     }
 
-    private static AutoCloseable create(MeterRegistry registry, Supplier<Mono<Map<String, ColumnTableProperties>>> source) throws Exception {
+    @Test
+    void closeRemovesOnlyItsOwnMetersAndIsIdempotent() throws Exception {
+        var registry = new SimpleMeterRegistry();
+        try (AutoCloseable registryClose = registry::close;
+             var other = create(registry, "other", () -> Mono.just(Map.of("column", mock(ColumnTableProperties.class))))) {
+            var unrelated = registry.counter("unrelated");
+            refresh(other);
+            var remaining = java.util.List.copyOf(registry.getMeters());
+            try (var metrics = create(registry, "test", () -> Mono.just(Map.of("column", mock(ColumnTableProperties.class))))) {
+                refresh(metrics);
+                assertEquals(remaining.size() + 20, registry.getMeters().size());
+                registry.config().onMeterRemoved(meter -> assertFalse(Thread.holdsLock(metrics),
+                        "registry callbacks must run outside the collector monitor"));
+                metrics.close();
+                metrics.close();
+                assertEquals(java.util.Set.copyOf(remaining), java.util.Set.copyOf(registry.getMeters()));
+                assertSame(unrelated, registry.get("unrelated").counter());
+                assertEquals(1, registry.get(VALUES + ".collection.success").tag("database", "other").gauge().value());
+            }
+        }
+    }
+
+    private static AutoCloseable create(MeterRegistry registry, String database, Supplier<Mono<Map<String, ColumnTableProperties>>> source) throws Exception {
         var c = Class.forName("it.cavallium.rockserver.core.impl.TablePropertiesMetrics")
                 .getDeclaredConstructor(String.class, MeterRegistry.class, long.class, Supplier.class);
         c.setAccessible(true);
-        return (AutoCloseable) c.newInstance("test", registry, 60L, source);
+        return (AutoCloseable) c.newInstance(database, registry, 60L, source);
     }
     private static void refresh(AutoCloseable metrics) throws Exception {
         Method m = metrics.getClass().getDeclaredMethod("refreshIfDue");

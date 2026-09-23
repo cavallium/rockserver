@@ -17,7 +17,10 @@ import reactor.core.publisher.Mono;
 /** One non-overlapping background collection; scrapes only read the last completed observation. */
 final class TablePropertiesMetrics implements AutoCloseable {
     private final Supplier<Mono<Map<String, ColumnTableProperties>>> collector;
+    private final MeterRegistry registry;
     private final MultiGauge values;
+    private final Gauge collectionSuccess;
+    private final Gauge lastSuccessTime;
     private final long intervalNanos;
     private Disposable.Swap subscription;
     private boolean running;
@@ -32,10 +35,11 @@ final class TablePropertiesMetrics implements AutoCloseable {
         if (intervalSeconds < 60) throw new IllegalArgumentException("table-properties-interval-seconds must be at least 60");
         this.intervalNanos = Duration.ofSeconds(intervalSeconds).toNanos();
         this.collector = collector;
+        this.registry = registry;
         values = MultiGauge.builder("rocksdb.table.properties").tag("database", database).register(registry);
-        Gauge.builder("rocksdb.table.properties.collection.success", () -> success)
+        collectionSuccess = Gauge.builder("rocksdb.table.properties.collection.success", () -> success)
                 .tag("database", database).register(registry);
-        Gauge.builder("rocksdb.table.properties.last.success.time", () -> lastSuccessSeconds)
+        lastSuccessTime = Gauge.builder("rocksdb.table.properties.last.success.time", () -> lastSuccessSeconds)
                 .baseUnit("seconds").tag("database", database).register(registry);
     }
 
@@ -102,8 +106,13 @@ final class TablePropertiesMetrics implements AutoCloseable {
             if (closed) return;
             closed = true;
             pending = subscription;
-            values.register(List.of(), true);
         }
-        if (pending != null) pending.dispose();
+        try {
+            values.register(List.of(), true);
+            registry.remove(collectionSuccess);
+            registry.remove(lastSuccessTime);
+        } finally {
+            if (pending != null) pending.dispose();
+        }
     }
 }

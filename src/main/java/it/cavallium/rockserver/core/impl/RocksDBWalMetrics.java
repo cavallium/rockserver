@@ -33,6 +33,7 @@ final class RocksDBWalMetrics implements AutoCloseable {
 	private static final WalGroup EMPTY_GROUP = new WalGroup(0L, 0L, NO_TIMESTAMP);
 	private static final WalSnapshot EMPTY_SNAPSHOT = new WalSnapshot(EMPTY_GROUP, EMPTY_GROUP, 0L);
 
+	private final MeterRegistry registry;
 	private final Path walDirectory;
 	private final WalMetadataSource walMetadataSource;
 	private final MinLogNumberSource minLogNumberSource;
@@ -65,6 +66,7 @@ final class RocksDBWalMetrics implements AutoCloseable {
 			FileTimestampSource fileTimestampSource,
 			Clock clock,
 			long configuredLiveWalLimitBytes) {
+		this.registry = registry;
 		this.walDirectory = Objects.requireNonNull(walDirectory, "walDirectory");
 		this.walMetadataSource = Objects.requireNonNull(walMetadataSource, "walMetadataSource");
 		this.minLogNumberSource = Objects.requireNonNull(minLogNumberSource, "minLogNumberSource");
@@ -166,7 +168,7 @@ final class RocksDBWalMetrics implements AutoCloseable {
 	@Override
 	public void close() {
 		if (closed.compareAndSet(false, true)) {
-			meters.forEach(Meter::close);
+			meters.forEach(registry::remove);
 		}
 	}
 
