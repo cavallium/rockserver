@@ -381,7 +381,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final WorkloadSettings workloadSettings;
 	private final RocksDBObjects refs;
 	private final Map<String, Cache> caches;
-	private final Map<String, Long> cacheCapacities;
 	private final MetricsManager metrics;
 	private final String name;
 	private final List<Meter> meters = new ArrayList<>();
@@ -646,7 +645,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.dbOptions = loadedDb.dbOptions();
 		this.refs = loadedDb.refs();
 		this.caches = loadedDb.caches();
-		this.cacheCapacities = loadedDb.cacheCapacities();
 		this.definitiveDbPath = loadedDb.definitiveDbPath();
 		// Compute upper-bound memory config from database options
 		RocksDBStatistics.MemoryUpperBoundConfig memoryUpperBoundConfig;
@@ -685,7 +683,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var walMetricsConfig = new RocksDBStatistics.WalMetricsConfig(
 				db.get(), walDirectory, dbOptions.maxTotalWalSize());
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics,
-				caches, cacheCapacities,
+				caches, loadedDb.cacheCapacities(),
 				this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig, walMetricsConfig);
 		this.scheduler = schedulerOverride != null
 				? schedulerOverride
