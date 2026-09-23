@@ -17,7 +17,7 @@
     <gestalt.version>0.37.2</gestalt.version>
     <jazzer.version>0.30.0</jazzer.version>
     <junit.version>5.14.3</junit.version>
-    <rocksdb.version>11.8.0.1</rocksdb.version>
+    <rocksdb.version>11.8.1.1</rocksdb.version>
     <slf4j.version>2.0.17</slf4j.version>
     <imageName>rockserver-core</imageName>
     <mainClass>it.cavallium.rockserver.core.Main</mainClass>
