@@ -626,17 +626,14 @@ public final class IteratorQuantumAblationBenchmark {
 
 	private static final class IdleContext implements RWScheduler.CooperativeContext {
 
-		private volatile boolean preemptionRequested;
-		private volatile boolean terminationRequested;
-
 		@Override
 		public boolean preemptionRequested() {
-			return preemptionRequested;
+			return false;
 		}
 
 		@Override
 		public boolean terminationRequested() {
-			return terminationRequested;
+			return false;
 		}
 
 		@Override
