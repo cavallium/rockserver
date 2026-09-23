@@ -4237,8 +4237,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						}
 					}
 					case SSTWriter sst -> {
-						if (writeSstEntries(col, sst, pendingSstEntries,
-								mode == MergeBatchMode.MERGE_SST_INGEST_BEHIND)) {
+						if (writeSstEntries(col, sst, pendingSstEntries)) {
 							sst.writePending();
 							recordCdcPublishedTail();
 						}
@@ -4289,8 +4288,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private boolean writeSstEntries(ColumnInstance col,
 			SSTWriter sst,
-			@Nullable List<Map.Entry<Keys, Buf>> entries,
-			boolean ingestBehind) throws RocksDBException {
+			@Nullable List<Map.Entry<Keys, Buf>> entries) throws RocksDBException {
 		if (entries == null || entries.isEmpty()) {
 			return false;
 		}
