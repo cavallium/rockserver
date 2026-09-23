@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.impl.benchmark;
 
+import static it.cavallium.rockserver.core.impl.benchmark.BenchmarkJson.appendJsonString;
+
 import com.sun.management.OperatingSystemMXBean;
 import com.sun.management.ThreadMXBean;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -2470,27 +2472,6 @@ public final class GrpcOverloadBenchmark {
 		json.append("]}");
 	}
 
-	private static void appendJsonString(StringBuilder json, String value) {
-		json.append('"');
-		for (int index = 0; index < value.length(); index++) {
-			char character = value.charAt(index);
-			switch (character) {
-				case '"' -> json.append("\\\"");
-				case '\\' -> json.append("\\\\");
-				case '\n' -> json.append("\\n");
-				case '\r' -> json.append("\\r");
-				case '\t' -> json.append("\\t");
-				default -> {
-					if (character < 0x20) {
-						json.append("\\u%04x".formatted((int) character));
-					} else {
-						json.append(character);
-					}
-				}
-			}
-		}
-		json.append('"');
-	}
 
 	private static String toMarkdown(BenchmarkResult result) {
 		StringBuilder markdown = new StringBuilder(12_000);

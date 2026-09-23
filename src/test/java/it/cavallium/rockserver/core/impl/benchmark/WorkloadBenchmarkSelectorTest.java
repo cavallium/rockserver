@@ -24,6 +24,23 @@ import org.junit.jupiter.api.io.TempDir;
 class WorkloadBenchmarkSelectorTest {
 
 	@Test
+	void selectionJsonEscapesEveryControlCharacter() {
+		var text = new StringBuilder("quotes \" slash \\ unicode é ");
+		for (char character = 0; character < 0x20; character++) {
+			text.append(character);
+		}
+		var value = text.toString();
+		var selection = new WorkloadBenchmarkSelector.Selection(value, value, value, value,
+				42L, 4, 100.0d, 10L, List.of(), List.of());
+		var json = WorkloadBenchmarkSelection.toJson(selection);
+		var parsed = org.bson.Document.parse(json);
+		assertEquals(value, parsed.getString("dataset_fingerprint"));
+		assertEquals(value, parsed.getString("comparison_fingerprint"));
+		assertEquals(value, parsed.getString("build_id"));
+		assertEquals(value, parsed.getString("storage_label"));
+	}
+
+	@Test
 	void generatesInclusivePowersOfTwo() {
 		assertEquals(List.of(4, 8, 16, 32), WorkloadBenchmarkSelector.powersOfTwo(3, 33));
 		assertEquals(List.of(4, 8), WorkloadBenchmarkSelector.powersOfTwo(1, 8));

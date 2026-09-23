@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.impl.benchmark;
 
+import static it.cavallium.rockserver.core.impl.benchmark.BenchmarkJson.appendJsonString;
+
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.io.IOException;
 import java.io.Reader;
@@ -242,21 +244,6 @@ public final class WorkloadBenchmarkSelection {
 		return String.format(Locale.ROOT, "%.6f", value);
 	}
 
-	private static void appendJsonString(StringBuilder json, String value) {
-		json.append('"');
-		for (int index = 0; index < value.length(); index++) {
-			char character = value.charAt(index);
-			switch (character) {
-				case '"' -> json.append("\\\"");
-				case '\\' -> json.append("\\\\");
-				case '\n' -> json.append("\\n");
-				case '\r' -> json.append("\\r");
-				case '\t' -> json.append("\\t");
-				default -> json.append(character);
-			}
-		}
-		json.append('"');
-	}
 
 	private static void printUsage() {
 		System.out.println("Usage: WorkloadBenchmarkSelection [--output=selection.json] "

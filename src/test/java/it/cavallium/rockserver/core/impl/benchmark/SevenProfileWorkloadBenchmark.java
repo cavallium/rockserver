@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.impl.benchmark;
 
+import static it.cavallium.rockserver.core.impl.benchmark.BenchmarkJson.appendJsonString;
+
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Timer;
@@ -1554,21 +1556,6 @@ public final class SevenProfileWorkloadBenchmark {
 		return value.replace("\\", "\\\\").replace("\"", "\\\"");
 	}
 
-	private static void appendJsonString(StringBuilder json, String value) {
-		json.append('"');
-		for (int index = 0; index < value.length(); index++) {
-			char character = value.charAt(index);
-			switch (character) {
-				case '"' -> json.append("\\\"");
-				case '\\' -> json.append("\\\\");
-				case '\n' -> json.append("\\n");
-				case '\r' -> json.append("\\r");
-				case '\t' -> json.append("\\t");
-				default -> json.append(character);
-			}
-		}
-		json.append('"');
-	}
 
 	private static void printUsage() {
 		System.out.println("""
