@@ -122,6 +122,54 @@ mvn -DskipTests test-compile org.codehaus.mojo:exec-maven-plugin:3.5.0:java \
   -Dexec.mainClass=it.cavallium.rockserver.core.impl.benchmark.GrpcFastGetBenchmark
 ```
 
+## SST table properties
+
+Read a column's persisted table statistics using an analytical context:
+
+```java
+var api = connection.getSyncApi(RequestContext.analytical(Duration.ofSeconds(30)));
+var properties = api.getTableProperties(columnId);
+long dataBytes = properties.dataSize();
+long physicalEntries = properties.numEntries();
+// Also available: getTablePropertiesAsync(columnId).
+```
+
+Embedded, gRPC and Thrift return the same immutable `ColumnTableProperties` model;
+Rust exposes `get_table_properties`. Use `getAllColumnDefinitions()` to enumerate
+columns. Each column is observed independently. The result contains SST counts,
+data/index/filter and raw sizes, block/entry/deletion/merge counts, compression
+estimates, timestamp bounds, and distributions of formats, fixed key lengths,
+index flags, column-family IDs, compression and other table configuration names.
+Distribution values count files; empty strings mean unspecified names. Sizes are
+bytes and timestamps are Unix seconds (zero means unknown). Creation-time bounds
+refer to RocksDB's oldest-ancestor timestamps, not filesystem creation times.
+Compression estimates sum available samples only and can cover a subset of files.
+
+This call does not flush, compact, or scan data rows. It excludes memtables, WALs,
+blob files and custom collector byte strings. Entries can include tombstones and
+obsolete versions, and bucketed columns count physical entries rather than logical
+rows. Reading metadata can still perform I/O for every SST, so use ANALYTICAL for
+interactive requests and BATCH for periodic work. Cancellation cannot interrupt a
+native metadata read; its database and column leases remain held until it returns.
+
+Optional background Micrometer collection is disabled by default:
+
+```hocon
+database.metrics {
+  table-properties-enabled: true
+  table-properties-interval-seconds: 300
+}
+```
+
+`rocksdb.table.properties` exports numeric values tagged by `database`,
+`column_family` and `property_name` (for example `data.size` or `num.entries`).
+There are no per-file or arbitrary string-value labels. Collection runs sequentially
+in the BATCH lane, at most once per configured interval (minimum 60 seconds), and
+scrapes read cached values. Check `rocksdb.table.properties.collection.success`
+and `rocksdb.table.properties.last.success.time` for failure and freshness. Failed
+collections remove the old value series; successful collections remove dropped
+columns. JMX and Influx exporters use the existing metrics configuration.
+
 ## Package fat jar
 ```shell
 mvn -Pfatjar -Dagent -DskipTests clean package

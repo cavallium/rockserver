@@ -109,6 +109,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.VisibleForTesting;
 import org.reactivestreams.Publisher;
+import org.rocksdb.TableProperties;
 import org.rocksdb.AbstractImmutableNativeReference;
 import org.rocksdb.AbstractSlice;
 import org.rocksdb.Cache;
@@ -477,12 +478,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		DatabaseConfig config = ConfigParser.parse(embeddedConfigPath);
 		this.config = config;
 		WorkloadSettings workloadSettings;
+        final boolean tablePropertiesEnabled;
+        final long tablePropertiesIntervalSeconds;
 		try {
 			workloadSettings = WorkloadSettings.resolve(config);
 			this.fastGet = config.global().enableFastGet();
+            tablePropertiesEnabled = config.metrics().tablePropertiesEnabled();
+            tablePropertiesIntervalSeconds = config.metrics().tablePropertiesIntervalSeconds();
+            if (tablePropertiesIntervalSeconds < 60 || tablePropertiesIntervalSeconds > Long.MAX_VALUE / 1_000_000_000L) {
+                throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "table-properties-interval-seconds must be at least 60 and fit in nanoseconds");
+            }
 		} catch (GestaltException e) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-					"Can't resolve workload or fast-get configuration",
+					"Can't resolve workload, fast-get or metrics configuration",
 					e);
 		}
 		this.workloadSettings = workloadSettings;
@@ -811,6 +820,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		loadExistingColumns(loadedDb.mergeOperators());
+        if (tablePropertiesEnabled) {
+            rocksDBStatistics.setTablePropertiesMetrics(new TablePropertiesMetrics(name, metrics.getRegistry(),
+                    tablePropertiesIntervalSeconds, this::collectTablePropertiesMetrics));
+        }
 		// Do not publish this object to the polling thread until column options,
 		// system handles, and registered-column pressure entries are complete.
 		leakScheduler.scheduleWithFixedDelay(this::refreshStoragePressure, 1, 1, TimeUnit.SECONDS);
@@ -10089,6 +10102,116 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			flushTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
 	}
+
+    private static ColumnTableProperties aggregateTableProperties(Collection<TableProperties> tables) {
+        long tableCount = 0;
+        long dataSize = 0;
+        long indexSize = 0;
+        long indexPartitions = 0;
+        long topLevelIndexSize = 0;
+        long filterSize = 0;
+        long rawKeySize = 0;
+        long rawValueSize = 0;
+        long numDataBlocks = 0;
+        long numEntries = 0;
+        long numDeletions = 0;
+        long numMergeOperands = 0;
+        long numRangeDeletions = 0;
+        long slowCompressionEstimatedDataSize = 0;
+        long fastCompressionEstimatedDataSize = 0;
+        long oldestCreationTime = 0;
+        long newestCreationTime = 0;
+        long oldestKeyTime = 0;
+        Map<Long, Long> formatVersions = new HashMap<>();
+        Map<Long, Long> fixedKeyLengths = new HashMap<>();
+        Map<Long, Long> indexKeysAreUserKeys = new HashMap<>();
+        Map<Long, Long> indexValuesAreDeltaEncoded = new HashMap<>();
+        Map<Long, Long> columnFamilyIds = new HashMap<>();
+        Map<String, Long> filterPolicies = new HashMap<>();
+        Map<String, Long> comparators = new HashMap<>();
+        Map<String, Long> mergeOperators = new HashMap<>();
+        Map<String, Long> prefixExtractors = new HashMap<>();
+        Map<String, Long> propertyCollectors = new HashMap<>();
+        Map<String, Long> compressions = new HashMap<>();
+        for (var p : tables) {
+            tableCount = Math.addExact(tableCount, 1);
+            dataSize = Math.addExact(dataSize, checkedTableProperty(p.getDataSize()));
+            indexSize = Math.addExact(indexSize, checkedTableProperty(p.getIndexSize()));
+            indexPartitions = Math.addExact(indexPartitions, checkedTableProperty(p.getIndexPartitions()));
+            topLevelIndexSize = Math.addExact(topLevelIndexSize, checkedTableProperty(p.getTopLevelIndexSize()));
+            filterSize = Math.addExact(filterSize, checkedTableProperty(p.getFilterSize()));
+            rawKeySize = Math.addExact(rawKeySize, checkedTableProperty(p.getRawKeySize()));
+            rawValueSize = Math.addExact(rawValueSize, checkedTableProperty(p.getRawValueSize()));
+            numDataBlocks = Math.addExact(numDataBlocks, checkedTableProperty(p.getNumDataBlocks()));
+            numEntries = Math.addExact(numEntries, checkedTableProperty(p.getNumEntries()));
+            numDeletions = Math.addExact(numDeletions, checkedTableProperty(p.getNumDeletions()));
+            numMergeOperands = Math.addExact(numMergeOperands, checkedTableProperty(p.getNumMergeOperands()));
+            numRangeDeletions = Math.addExact(numRangeDeletions, checkedTableProperty(p.getNumRangeDeletions()));
+            slowCompressionEstimatedDataSize = Math.addExact(slowCompressionEstimatedDataSize, checkedTableProperty(p.getSlowCompressionEstimatedDataSize()));
+            fastCompressionEstimatedDataSize = Math.addExact(fastCompressionEstimatedDataSize, checkedTableProperty(p.getFastCompressionEstimatedDataSize()));
+            oldestCreationTime = minimumKnownTableTime(oldestCreationTime, checkedTableProperty(p.getCreationTime()));
+            newestCreationTime = Math.max(newestCreationTime, checkedTableProperty(p.getCreationTime()));
+            oldestKeyTime = minimumKnownTableTime(oldestKeyTime, checkedTableProperty(p.getOldestKeyTime()));
+            formatVersions.merge(checkedTableProperty(p.getFormatVersion()), 1L, Math::addExact);
+            fixedKeyLengths.merge(checkedTableProperty(p.getFixedKeyLen()), 1L, Math::addExact);
+            indexKeysAreUserKeys.merge(checkedTableProperty(p.getIndexKeyIsUserKey()), 1L, Math::addExact);
+            indexValuesAreDeltaEncoded.merge(checkedTableProperty(p.getIndexValueIsDeltaEncoded()), 1L, Math::addExact);
+            columnFamilyIds.merge(checkedTableProperty(p.getColumnFamilyId()), 1L, Math::addExact);
+            filterPolicies.merge(p.getFilterPolicyName() == null ? "" : p.getFilterPolicyName(), 1L, Math::addExact);
+            comparators.merge(p.getComparatorName() == null ? "" : p.getComparatorName(), 1L, Math::addExact);
+            mergeOperators.merge(p.getMergeOperatorName() == null ? "" : p.getMergeOperatorName(), 1L, Math::addExact);
+            prefixExtractors.merge(p.getPrefixExtractorName() == null ? "" : p.getPrefixExtractorName(), 1L, Math::addExact);
+            propertyCollectors.merge(p.getPropertyCollectorsNames() == null ? "" : p.getPropertyCollectorsNames(), 1L, Math::addExact);
+            compressions.merge(p.getCompressionName() == null ? "" : p.getCompressionName(), 1L, Math::addExact);
+        }
+        return new ColumnTableProperties(
+                tableCount, dataSize, indexSize, indexPartitions,
+                topLevelIndexSize, filterSize, rawKeySize, rawValueSize,
+                numDataBlocks, numEntries, numDeletions, numMergeOperands,
+                numRangeDeletions, slowCompressionEstimatedDataSize, fastCompressionEstimatedDataSize, oldestCreationTime,
+                newestCreationTime, oldestKeyTime, formatVersions, fixedKeyLengths,
+                indexKeysAreUserKeys, indexValuesAreDeltaEncoded, columnFamilyIds, filterPolicies,
+                comparators, mergeOperators, prefixExtractors, propertyCollectors,
+                compressions);
+    }
+
+    private static long checkedTableProperty(long value) {
+        if (value < 0) throw new ArithmeticException("Unsigned table property exceeds signed long range");
+        return value;
+    }
+
+    private static long minimumKnownTableTime(long a, long b) {
+        return a == 0 ? b : b == 0 ? a : Math.min(a, b);
+    }
+
+    private Mono<Map<String, ColumnTableProperties>> collectTablePropertiesMetrics() {
+        // Schedule each column separately, so batch admission/pressure is rechecked between columns.
+        return Flux.fromIterable(List.copyOf(columns.entrySet()))
+                .concatMap(entry -> scheduleTracked(scheduler.scheduler(WorkloadProfile.BATCH,
+                        OperationFamily.FULL_SCAN_AGGREGATE, Long.MAX_VALUE), () -> {
+                    var column = entry.getValue();
+                    if (!tryBeginColumnUse(column)) return null; // An empty Mono skips retired columns.
+                    try {
+                        var properties = aggregateTableProperties(
+                                db.get().getPropertiesOfAllTables(column.cfh()).values());
+                        return Map.entry(new String(column.cfh().getName(), StandardCharsets.UTF_8), properties);
+                    } finally { column.endUse(); }
+                }), 1)
+                .collectMap(Map.Entry::getKey, Map.Entry::getValue);
+    }
+
+    @Override
+    public ColumnTableProperties getTableProperties(long columnId) {
+        ops.beginOp();
+        try (var use = acquireColumnUse(columnId)) {
+            // RocksDB owns a version reference during this call; the column lease prevents drop/close.
+            return aggregateTableProperties(db.get().getPropertiesOfAllTables(use.column().cfh()).values());
+        } catch (org.rocksdb.RocksDBException | ArithmeticException e) {
+            throw RocksDBException.of(RocksDBErrorType.GET_PROPERTY_ERROR, e);
+        } finally {
+            ops.endOp();
+        }
+    }
 
     @Override
     public SstMaintenance.Metadata getSstMetadata(long columnId, int level) {

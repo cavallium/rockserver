@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.client;
 
+import it.cavallium.rockserver.core.common.ColumnTableProperties;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
@@ -381,6 +382,48 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			throw wrap(e);
 		}
 	}
+
+    @Override
+    public ColumnTableProperties getTableProperties(long columnId) {
+        try {
+            var p = client.getTableProperties(columnId, currentWireRequestContext());
+            return new ColumnTableProperties(
+                    p.getTableCount(),
+                    p.getDataSize(),
+                    p.getIndexSize(),
+                    p.getIndexPartitions(),
+                    p.getTopLevelIndexSize(),
+                    p.getFilterSize(),
+                    p.getRawKeySize(),
+                    p.getRawValueSize(),
+                    p.getNumDataBlocks(),
+                    p.getNumEntries(),
+                    p.getNumDeletions(),
+                    p.getNumMergeOperands(),
+                    p.getNumRangeDeletions(),
+                    p.getSlowCompressionEstimatedDataSize(),
+                    p.getFastCompressionEstimatedDataSize(),
+                    p.getOldestCreationTime(),
+                    p.getNewestCreationTime(),
+                    p.getOldestKeyTime(),
+                    p.getFormatVersions(),
+                    p.getFixedKeyLengths(),
+                    p.getIndexKeysAreUserKeys(),
+                    p.getIndexValuesAreDeltaEncoded(),
+                    p.getColumnFamilyIds(),
+                    p.getFilterPolicies(),
+                    p.getComparators(),
+                    p.getMergeOperators(),
+                    p.getPrefixExtractors(),
+                    p.getPropertyCollectors(),
+                    p.getCompressions());
+        } catch (TException e) { throw wrap(e); }
+    }
+
+    @Override
+    public CompletableFuture<ColumnTableProperties> getTablePropertiesAsync(long columnId) {
+        return supplyAsyncContextual(() -> getTableProperties(columnId), executor);
+    }
 
 	@Override
 	public long estimateNumKeys(long columnId) {

@@ -47,6 +47,7 @@ public class RocksDBStatistics {
 	private final AtomicBoolean closed = new AtomicBoolean();
 
 	private volatile boolean stopRequested = false;
+    private volatile TablePropertiesMetrics tablePropertiesMetrics;
 
 	/**
 	 * Upper-bound memory configuration derived from RocksDB options.
@@ -299,6 +300,9 @@ public class RocksDBStatistics {
 						walMetrics.refresh();
 					}
 
+                    var tableMetrics = tablePropertiesMetrics;
+                    if (tableMetrics != null) tableMetrics.refreshIfDue();
+
 					// Update per-CF property snapshots and re-register MultiGauge rows
 					for (var entry : perCfLongPropertyMap.entrySet()) {
 						RocksDBLongProperty prop = entry.getKey();
@@ -363,11 +367,26 @@ public class RocksDBStatistics {
 
 	private record CacheStats(long usage, long pinnedUsage, long capacity) {}
 
+    void setTablePropertiesMetrics(TablePropertiesMetrics collector) {
+        synchronized (this) {
+            if (!stopRequested) {
+                tablePropertiesMetrics = collector;
+                return;
+            }
+        }
+        collector.close();
+    }
+
 	public void close() {
 		stopRequested = true;
 		if (!closed.compareAndSet(false, true)) {
 			return;
 		}
+        final TablePropertiesMetrics tableMetrics;
+        synchronized (this) {
+            tableMetrics = tablePropertiesMetrics;
+        }
+        if (tableMetrics != null) tableMetrics.close();
 		executor.interrupt();
 		boolean interrupted = false;
 		while (executor.isAlive()) {

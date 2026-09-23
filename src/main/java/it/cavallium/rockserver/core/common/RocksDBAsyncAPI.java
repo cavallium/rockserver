@@ -124,10 +124,16 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new GetColumnId(name));
 	}
 
+    /** See {@link RocksDBSyncAPI#getTableProperties(long)}. */
+    default CompletableFuture<ColumnTableProperties> getTablePropertiesAsync(long columnId) {
+        return requestAsync(new RocksDBAPICommand.GetTableProperties(columnId));
+    }
+
 	/**
 	 * Asynchronously return RocksDB's unbounded estimate of physical keys in a column.
 	 * See {@link RocksDBSyncAPI#estimateNumKeys(long)} for its deliberately approximate semantics.
 	 */
+
 	default CompletableFuture<Long> estimateNumKeysAsync(long columnId) throws RocksDBException {
 		return requestAsync(new EstimateNumKeys(columnId));
 	}

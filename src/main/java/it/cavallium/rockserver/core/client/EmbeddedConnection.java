@@ -1509,6 +1509,10 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		db.flush();
 	}
 
+    @Override public ColumnTableProperties getTableProperties(long columnId) {
+        return db.getTableProperties(columnId);
+    }
+
     @Override public SstMaintenance.Metadata getSstMetadata(long columnId, int level) {
         return db.getSstMetadata(columnId, level);
     }

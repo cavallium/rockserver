@@ -377,6 +377,19 @@ impl RockserverClient {
         Ok(resp.into_inner().column_id)
     }
 
+    /// Aggregates current SST properties without flushing. Excludes memtables and blob files.
+    /// Requires an ANALYTICAL or BATCH context. Counts physical entries, not live logical rows.
+    pub async fn get_table_properties(&self, column_id: i64) -> Result<ColumnTablePropertiesResponse> {
+        let req = GetTablePropertiesRequest {
+            column_id,
+            context: Some(self.context.clone()),
+        };
+        let resp = self.call_contextual(req, |mut client, request| async move {
+            client.get_table_properties(request).await
+        }).await?;
+        Ok(resp.into_inner())
+    }
+
     /// Returns RocksDB's unbounded estimate of physical keys in a column.
     pub async fn estimate_num_keys(&self, column_id: i64) -> Result<i64> {
         let req = EstimateNumKeysRequest {

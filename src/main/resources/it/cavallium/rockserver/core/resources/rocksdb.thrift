@@ -202,6 +202,39 @@ exception RocksDBThriftException {
   2: required string message
 }
 
+
+struct ColumnTablePropertiesData {
+  1: required i64 tableCount,
+  2: required i64 dataSize,
+  3: required i64 indexSize,
+  4: required i64 indexPartitions,
+  5: required i64 topLevelIndexSize,
+  6: required i64 filterSize,
+  7: required i64 rawKeySize,
+  8: required i64 rawValueSize,
+  9: required i64 numDataBlocks,
+  10: required i64 numEntries,
+  11: required i64 numDeletions,
+  12: required i64 numMergeOperands,
+  13: required i64 numRangeDeletions,
+  14: required i64 slowCompressionEstimatedDataSize,
+  15: required i64 fastCompressionEstimatedDataSize,
+  16: required i64 oldestCreationTime,
+  17: required i64 newestCreationTime,
+  18: required i64 oldestKeyTime,
+  19: required map<i64, i64> formatVersions,
+  20: required map<i64, i64> fixedKeyLengths,
+  21: required map<i64, i64> indexKeysAreUserKeys,
+  22: required map<i64, i64> indexValuesAreDeltaEncoded,
+  23: required map<i64, i64> columnFamilyIds,
+  24: required map<string, i64> filterPolicies,
+  25: required map<string, i64> comparators,
+  26: required map<string, i64> mergeOperators,
+  27: required map<string, i64> prefixExtractors,
+  28: required map<string, i64> propertyCollectors,
+  29: required map<string, i64> compressions,
+}
+
 service RocksDB {
 
    i64 openTransaction(1: required i64 transactionLeaseTtlNanos, 2: required RequestContext context) throws (1: RocksDBThriftException e),
@@ -218,6 +251,7 @@ service RocksDB {
 
    i64 getColumnId(1: required string name, 2: required RequestContext context) throws (1: RocksDBThriftException e),
 
+   ColumnTablePropertiesData getTableProperties(1: required i64 columnId, 2: required RequestContext context) throws (1: RocksDBThriftException e),
    i64 estimateNumKeys(1: required i64 columnId, 2: required RequestContext context) throws (1: RocksDBThriftException e),
 
    void putFast(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required binary value, 5: required RequestContext context) throws (1: RocksDBThriftException e),

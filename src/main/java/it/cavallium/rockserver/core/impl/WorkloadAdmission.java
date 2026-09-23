@@ -193,6 +193,7 @@ public final class WorkloadAdmission {
 			int maximumLatencyRangeItems,
 			long maximumLatencyRangeBytes) {
 		switch (command) {
+            case RocksDBAPICommand.GetTableProperties _ -> requireProfile(profile, command, ANALYTICAL, BATCH);
 			case RocksDBAPICommandSingle.CreateColumn _, RocksDBAPICommandSingle.UploadMergeOperator _,
 					RocksDBAPICommandSingle.DeleteColumn _, RocksDBAPICommandSingle.DeleteColumnIfExists _,
 					RocksDBAPICommandStream.ScanRaw _, RocksDBAPICommandStream.ScanRawResumable _,

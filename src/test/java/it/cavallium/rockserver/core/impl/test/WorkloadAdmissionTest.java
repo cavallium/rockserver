@@ -97,6 +97,7 @@ class WorkloadAdmissionTest {
 			Map.entry("deleteColumnIfExists", OperationFamily.MUTATION),
 			Map.entry("getColumnId", OperationFamily.METADATA),
 			Map.entry("estimateNumKeys", OperationFamily.METADATA),
+            Map.entry("getTableProperties", OperationFamily.FULL_SCAN_AGGREGATE),
 			Map.entry("put", OperationFamily.MUTATION),
 			Map.entry("delete", OperationFamily.MUTATION),
 			Map.entry("deleteMulti", OperationFamily.MUTATION),
@@ -539,6 +540,7 @@ class WorkloadAdmissionTest {
 		commands.add(client("deleteColumnIfExists", new RocksDBAPICommandSingle.DeleteColumnIfExists("column"), batch));
 		commands.add(client("getColumnId", new RocksDBAPICommandSingle.GetColumnId("column"), all));
 		commands.add(client("estimateNumKeys", new RocksDBAPICommandSingle.EstimateNumKeys(1), all));
+        commands.add(client("getTableProperties", new RocksDBAPICommand.GetTableProperties(1), EnumSet.of(ANALYTICAL, BATCH)));
 		commands.add(client("put", new RocksDBAPICommandSingle.Put<>(0, 1, EMPTY_KEYS, buffer(0), RequestType.none()), mutation));
 		commands.add(client("delete", new RocksDBAPICommandSingle.Delete<>(0, 1, EMPTY_KEYS, RequestType.none()), mutation));
 		commands.add(client("deleteMulti", new RocksDBAPICommandSingle.DeleteMulti<>(0, 1, List.of(EMPTY_KEYS), RequestType.none()), mutation));

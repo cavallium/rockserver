@@ -10,6 +10,12 @@ public interface MetricsConfig {
 
 	InfluxMetricsConfig influx() throws GestaltException;
 
+    /** Expensive SST metadata reads, off by default. */
+    boolean tablePropertiesEnabled() throws GestaltException;
+
+    /** Minimum interval in seconds; collection is also limited by the statistics polling cadence. */
+    long tablePropertiesIntervalSeconds() throws GestaltException;
+
 	JmxMetricsConfig jmx() throws GestaltException;
 
 }

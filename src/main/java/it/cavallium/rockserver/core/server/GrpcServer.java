@@ -1223,6 +1223,46 @@ public class GrpcServer extends Server {
 			}).transform(this.onErrorMapMonoWithRequestInfo("getColumnId", request));
 		}
 
+        @Override
+        public Mono<ColumnTablePropertiesResponse> getTableProperties(GetTablePropertiesRequest request) {
+            return executeSync(request.getContext(), OperationFamily.FULL_SCAN_AGGREGATE,
+                    api -> {
+                        var p = api.getTableProperties(request.getColumnId());
+                        return ColumnTablePropertiesResponse.newBuilder()
+                                .setTableCount(p.tableCount())
+                                .setDataSize(p.dataSize())
+                                .setIndexSize(p.indexSize())
+                                .setIndexPartitions(p.indexPartitions())
+                                .setTopLevelIndexSize(p.topLevelIndexSize())
+                                .setFilterSize(p.filterSize())
+                                .setRawKeySize(p.rawKeySize())
+                                .setRawValueSize(p.rawValueSize())
+                                .setNumDataBlocks(p.numDataBlocks())
+                                .setNumEntries(p.numEntries())
+                                .setNumDeletions(p.numDeletions())
+                                .setNumMergeOperands(p.numMergeOperands())
+                                .setNumRangeDeletions(p.numRangeDeletions())
+                                .setSlowCompressionEstimatedDataSize(p.slowCompressionEstimatedDataSize())
+                                .setFastCompressionEstimatedDataSize(p.fastCompressionEstimatedDataSize())
+                                .setOldestCreationTime(p.oldestCreationTime())
+                                .setNewestCreationTime(p.newestCreationTime())
+                                .setOldestKeyTime(p.oldestKeyTime())
+                                .putAllFormatVersions(p.formatVersions())
+                                .putAllFixedKeyLengths(p.fixedKeyLengths())
+                                .putAllIndexKeysAreUserKeys(p.indexKeysAreUserKeys())
+                                .putAllIndexValuesAreDeltaEncoded(p.indexValuesAreDeltaEncoded())
+                                .putAllColumnFamilyIds(p.columnFamilyIds())
+                                .putAllFilterPolicies(p.filterPolicies())
+                                .putAllComparators(p.comparators())
+                                .putAllMergeOperators(p.mergeOperators())
+                                .putAllPrefixExtractors(p.prefixExtractors())
+                                .putAllPropertyCollectors(p.propertyCollectors())
+                                .putAllCompressions(p.compressions())
+                                .build();
+                    })
+                    .transform(this.onErrorMapMonoWithRequestInfo("getTableProperties", request));
+        }
+
 		@Override
 		public Mono<EntriesCount> estimateNumKeys(EstimateNumKeysRequest request) {
 			return executeSync(request.getContext(), OperationFamily.METADATA, contextualApi -> EntriesCount.newBuilder()

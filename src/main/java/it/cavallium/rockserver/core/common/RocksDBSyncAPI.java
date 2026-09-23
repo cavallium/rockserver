@@ -111,6 +111,16 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new GetColumnId(name));
 	}
 
+    /**
+     * Read aggregate properties of the current SSTs for one column, without flushing or scanning rows.
+     * Requires ANALYTICAL (interactive) or BATCH (periodic) context. May perform metadata I/O for
+     * every SST. No cross-column atomicity; native metadata I/O cannot be interrupted mid-call.
+     * See {@link ColumnTableProperties} for units, exclusions and aggregation semantics.
+     */
+    default ColumnTableProperties getTableProperties(long columnId) {
+        return requestSync(new RocksDBAPICommand.GetTableProperties(columnId));
+    }
+
 	/**
 	 * Return RocksDB's unbounded estimate of physical keys in a column.
 	 *
@@ -119,6 +129,7 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	 * is approximate, ignores transaction-local state, and cannot be bounded. For bucketed columns,
 	 * it estimates physical buckets rather than logical entries.</p>
 	 */
+
 	default long estimateNumKeys(long columnId) throws RocksDBException {
 		return requestSync(new EstimateNumKeys(columnId));
 	}

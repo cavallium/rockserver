@@ -97,6 +97,42 @@ class ColumnHandleLifecycleTest {
 
 	@Test
 	@Timeout(15)
+	void deleteWaitsForTablePropertiesAndRejectsNewReaders() throws Exception {
+		String name = "table-properties-use";
+		long columnId = db.createColumn(name, SCHEMA);
+		var useAcquired = new CountDownLatch(1);
+		var releaseUse = new CountDownLatch(1);
+		var blockOnce = new AtomicBoolean();
+		db.setColumnUseAcquiredObserverForTesting(observedColumnId -> {
+			if (observedColumnId == columnId && blockOnce.compareAndSet(false, true)) {
+				useAcquired.countDown();
+				awaitLatch(releaseUse);
+			}
+		});
+
+		var activeUse = executor.submit(() -> db.getTableProperties(columnId));
+		assertTrue(useAcquired.await(5, TimeUnit.SECONDS), "table-property operation did not acquire its column use");
+		Future<?> deletion = executor.submit(() -> db.deleteColumn(columnId));
+
+		try {
+			awaitRetirement(name);
+			assertFalse(deletion.isDone(), "delete completed while a column use was still active");
+			assertColumnNotFound(() -> db.getTableProperties(columnId));
+		} finally {
+			releaseUse.countDown();
+		}
+
+		activeUse.get(5, TimeUnit.SECONDS);
+		deletion.get(5, TimeUnit.SECONDS);
+		db.setColumnUseAcquiredObserverForTesting(null);
+
+		long recreatedId = db.createColumn(name, SCHEMA);
+		assertEquals(recreatedId, db.getColumnId(name));
+		db.getTableProperties(recreatedId);
+	}
+
+	@Test
+	@Timeout(15)
 	void deleteWaitsForExplicitIteratorLease() throws Exception {
 		String name = "iterator-use";
 		long columnId = db.createColumn(name, SCHEMA);

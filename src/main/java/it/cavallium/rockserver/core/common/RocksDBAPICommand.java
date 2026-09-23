@@ -66,7 +66,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 					RocksDBAPICommandSingle.PutBatch _, RocksDBAPICommandSingle.MergeBatch _,
 					RocksDBAPICommandSingle.CloseIterator _, RocksDBAPICommandSingle.Subsequent<?> _,
 					RocksDBAPICommandStream.ScanRaw _, RocksDBAPICommandStream.CdcPoll _,
-					Flush _, Compact _, CompactFiles _, GetSstMetadata _, GetAllColumnDefinitions _, CdcCreate _, CdcDelete _,
+					Flush _, Compact _, CompactFiles _, GetSstMetadata _, GetTableProperties _, GetAllColumnDefinitions _, CdcCreate _, CdcDelete _,
 					CdcGetEarliestAvailableSequence _, CdcGetLastCommittedSequence _, CdcCommit _ -> 0L;
 		};
 	}
@@ -185,6 +185,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			case RocksDBAPICommandStream.CdcPoll _ -> OperationFamily.WAL_PAGE;
 			case Flush _ -> OperationFamily.FLUSH;
 			case Compact _, CompactFiles _ -> OperationFamily.COMPACTION;
+			case GetTableProperties _ -> OperationFamily.FULL_SCAN_AGGREGATE;
 			case GetAllColumnDefinitions _, GetSstMetadata _ -> OperationFamily.METADATA;
 			case CdcCreate _ -> OperationFamily.MUTATION;
 			case CdcDelete _ -> OperationFamily.MUTATION;
@@ -1293,6 +1294,12 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		}
 
 	}
+    record GetTableProperties(long columnId) implements RocksDBAPICommandSingle<ColumnTableProperties> {
+        @Override public ColumnTableProperties handleSync(RocksDBSyncAPI api) { return api.getTableProperties(columnId); }
+        @Override public CompletableFuture<ColumnTableProperties> handleAsync(RocksDBAsyncAPI api) { return api.getTablePropertiesAsync(columnId); }
+        @Override public boolean isReadOnly() { return true; }
+    }
+
     record GetSstMetadata(long columnId, int level) implements RocksDBAPICommandSingle<SstMaintenance.Metadata> {
         public GetSstMetadata { if (level < -1) throw SstMaintenance.invalid("level must be -1 or non-negative"); }
         @Override public SstMaintenance.Metadata handleSync(RocksDBSyncAPI api) { return api.getSstMetadata(columnId, level); }

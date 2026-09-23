@@ -654,6 +654,44 @@ public class ThriftServer extends Server {
 			}
 		}
 
+        @Override
+        public it.cavallium.rockserver.core.common.api.ColumnTablePropertiesData getTableProperties(long columnId,
+                it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
+            try {
+                var p = api(context).getTableProperties(columnId);
+                return new it.cavallium.rockserver.core.common.api.ColumnTablePropertiesData()
+                        .setTableCount(p.tableCount())
+                        .setDataSize(p.dataSize())
+                        .setIndexSize(p.indexSize())
+                        .setIndexPartitions(p.indexPartitions())
+                        .setTopLevelIndexSize(p.topLevelIndexSize())
+                        .setFilterSize(p.filterSize())
+                        .setRawKeySize(p.rawKeySize())
+                        .setRawValueSize(p.rawValueSize())
+                        .setNumDataBlocks(p.numDataBlocks())
+                        .setNumEntries(p.numEntries())
+                        .setNumDeletions(p.numDeletions())
+                        .setNumMergeOperands(p.numMergeOperands())
+                        .setNumRangeDeletions(p.numRangeDeletions())
+                        .setSlowCompressionEstimatedDataSize(p.slowCompressionEstimatedDataSize())
+                        .setFastCompressionEstimatedDataSize(p.fastCompressionEstimatedDataSize())
+                        .setOldestCreationTime(p.oldestCreationTime())
+                        .setNewestCreationTime(p.newestCreationTime())
+                        .setOldestKeyTime(p.oldestKeyTime())
+                        .setFormatVersions(p.formatVersions())
+                        .setFixedKeyLengths(p.fixedKeyLengths())
+                        .setIndexKeysAreUserKeys(p.indexKeysAreUserKeys())
+                        .setIndexValuesAreDeltaEncoded(p.indexValuesAreDeltaEncoded())
+                        .setColumnFamilyIds(p.columnFamilyIds())
+                        .setFilterPolicies(p.filterPolicies())
+                        .setComparators(p.comparators())
+                        .setMergeOperators(p.mergeOperators())
+                        .setPrefixExtractors(p.prefixExtractors())
+                        .setPropertyCollectors(p.propertyCollectors())
+                        .setCompressions(p.compressions());
+            } catch (it.cavallium.rockserver.core.common.RocksDBException e) { throw mapException(e); }
+        }
+
 		@Override
 		public long estimateNumKeys(long columnId,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {

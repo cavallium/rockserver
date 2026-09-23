@@ -288,6 +288,7 @@ service RocksDBService {
   rpc deleteColumn(DeleteColumnRequest) returns (google.protobuf.Empty);
   rpc deleteColumnIfExists(DeleteColumnIfExistsRequest) returns (DeleteColumnIfExistsResponse);
   rpc getColumnId(GetColumnIdRequest) returns (GetColumnIdResponse);
+  rpc getTableProperties(GetTablePropertiesRequest) returns (ColumnTablePropertiesResponse);
   rpc estimateNumKeys(EstimateNumKeysRequest) returns (EntriesCount);
   rpc put(PutRequest) returns (google.protobuf.Empty);
   rpc putEnsure(PutRequest) returns (google.protobuf.Empty);
@@ -334,6 +335,10 @@ service RocksDBService {
   rpc scanRaw(ScanRawRequest) returns (stream ScanRawResponse);
   rpc flush(FlushRequest) returns (google.protobuf.Empty);
   rpc compact(CompactRequest) returns (google.protobuf.Empty);
+  // Metadata only: no flush, pin, SST data scan or compaction.
+  rpc getSstMetadata(GetSstMetadataRequest) returns (GetSstMetadataResponse);
+  // Selective same-level compaction; execute defaults to false (validation only).
+  rpc compactFiles(CompactFilesRequest) returns (CompactFilesResponse);
   rpc getAllColumnDefinitions(GetAllColumnDefinitionsRequest) returns (GetAllColumnDefinitionsResponse);
   rpc uploadMergeOperator(UploadMergeOperatorRequest) returns (UploadMergeOperatorResponse);
   rpc checkMergeOperator(CheckMergeOperatorRequest) returns (CheckMergeOperatorResponse);
@@ -423,4 +428,87 @@ message CDCEvent {
   bytes value = 4;
   enum Op { PUT = 0; DELETE = 1; MERGE = 2; }
   Op op = 5;
+}
+
+message GetSstMetadataRequest {
+  int64 columnId = 1;
+  // -1 means all levels. Otherwise only this level is returned.
+  int32 level = 2;
+  RequestContext context = 3;
+}
+message SstFileMetadata {
+  string name = 1;
+  int32 level = 2;
+  int32 pathId = 3;
+  int64 sizeBytes = 4;
+  string smallestKeyHex = 5;
+  string largestKeyHex = 6;
+  bool beingCompacted = 7;
+}
+message GetSstMetadataResponse {
+  string session = 1;
+  int64 columnId = 2;
+  string columnName = 3;
+  int32 numLevels = 4;
+  int32 baseLevel = 5;
+  // Index is the permanent RocksDB path ID.
+  repeated string paths = 6;
+  repeated SstFileMetadata files = 7;
+}
+message CompactFilesRequest {
+  int32 workloadContractVersion = 1;
+  int64 columnId = 2;
+  string session = 3;
+  repeated string files = 4;
+  // Inputs and outputs must be in this L1+ level at validation time.
+  int32 level = 5;
+  int32 outputPathId = 6;
+  int64 outputFileSizeLimit = 7;
+  // Preflight bound only: RocksDB can expand inputs atomically during execution.
+  int64 maxInputBytes = 8;
+  int32 maxSubcompactions = 9;
+  bool execute = 10;
+}
+message CompactFilesResponse {
+  bool executed = 1;
+  // Actual native inputs on execution; validated selection for a dry run.
+  repeated string inputFiles = 2;
+  repeated string outputFiles = 3;
+  int64 validatedInputBytes = 4;
+  int64 outputBytes = 5;
+  int64 elapsedNanos = 6;
+}
+
+
+message GetTablePropertiesRequest { int64 columnId = 1; RequestContext context = 2; }
+message ColumnTablePropertiesResponse {
+  int64 tableCount = 1;
+  int64 dataSize = 2;
+  int64 indexSize = 3;
+  int64 indexPartitions = 4;
+  int64 topLevelIndexSize = 5;
+  int64 filterSize = 6;
+  int64 rawKeySize = 7;
+  int64 rawValueSize = 8;
+  int64 numDataBlocks = 9;
+  int64 numEntries = 10;
+  int64 numDeletions = 11;
+  int64 numMergeOperands = 12;
+  int64 numRangeDeletions = 13;
+  int64 slowCompressionEstimatedDataSize = 14;
+  int64 fastCompressionEstimatedDataSize = 15;
+  int64 oldestCreationTime = 16;
+  int64 newestCreationTime = 17;
+  int64 oldestKeyTime = 18;
+  map<int64, int64> formatVersions = 19;
+  map<int64, int64> fixedKeyLengths = 20;
+  map<int64, int64> indexKeysAreUserKeys = 21;
+  map<int64, int64> indexValuesAreDeltaEncoded = 22;
+  map<int64, int64> columnFamilyIds = 23;
+  map<string, int64> filterPolicies = 24;
+  map<string, int64> comparators = 25;
+  map<string, int64> mergeOperators = 26;
+  map<string, int64> prefixExtractors = 27;
+  map<string, int64> propertyCollectors = 28;
+  map<string, int64> compressions = 29;
 }

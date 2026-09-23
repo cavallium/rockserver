@@ -1357,6 +1357,43 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
     @Override
+    public CompletableFuture<ColumnTableProperties> getTablePropertiesAsync(long columnId) {
+        var request = GetTablePropertiesRequest.newBuilder().setColumnId(columnId)
+                .setContext(currentWireRequestContext()).build();
+        return toResponse(futureStubWithRequestDeadline().getTableProperties(request),
+                p -> new ColumnTableProperties(
+                        p.getTableCount(),
+                        p.getDataSize(),
+                        p.getIndexSize(),
+                        p.getIndexPartitions(),
+                        p.getTopLevelIndexSize(),
+                        p.getFilterSize(),
+                        p.getRawKeySize(),
+                        p.getRawValueSize(),
+                        p.getNumDataBlocks(),
+                        p.getNumEntries(),
+                        p.getNumDeletions(),
+                        p.getNumMergeOperands(),
+                        p.getNumRangeDeletions(),
+                        p.getSlowCompressionEstimatedDataSize(),
+                        p.getFastCompressionEstimatedDataSize(),
+                        p.getOldestCreationTime(),
+                        p.getNewestCreationTime(),
+                        p.getOldestKeyTime(),
+                        p.getFormatVersionsMap(),
+                        p.getFixedKeyLengthsMap(),
+                        p.getIndexKeysAreUserKeysMap(),
+                        p.getIndexValuesAreDeltaEncodedMap(),
+                        p.getColumnFamilyIdsMap(),
+                        p.getFilterPoliciesMap(),
+                        p.getComparatorsMap(),
+                        p.getMergeOperatorsMap(),
+                        p.getPrefixExtractorsMap(),
+                        p.getPropertyCollectorsMap(),
+                        p.getCompressionsMap()));
+    }
+
+    @Override
     public CompletableFuture<SstMaintenance.Metadata> getSstMetadataAsync(long columnId, int level) {
         var request = GetSstMetadataRequest.newBuilder().setColumnId(columnId).setLevel(level)
                 .setContext(currentWireRequestContext()).build();
