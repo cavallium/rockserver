@@ -1,7 +1,5 @@
 package it.cavallium.rockserver.core.server;
 
-import it.cavallium.rockserver.core.common.SstMaintenanceProto;
-
 import static it.cavallium.rockserver.core.common.Utils.toByteArray;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
@@ -2486,8 +2484,24 @@ public class GrpcServer extends Server {
 
         @Override
         public Mono<GetSstMetadataResponse> getSstMetadata(GetSstMetadataRequest request) {
-            return executeSync(request.getContext(), OperationFamily.METADATA, api ->
-                    SstMaintenanceProto.encode(api.getSstMetadata(request.getColumnId(), request.getLevel())))
+            return executeSync(request.getContext(), OperationFamily.METADATA, api -> {
+                var metadata = api.getSstMetadata(request.getColumnId(), request.getLevel());
+                var builder = GetSstMetadataResponse.newBuilder().setSession(metadata.session())
+                        .setColumnId(metadata.columnId()).setColumnName(metadata.columnName())
+                        .setNumLevels(metadata.numLevels()).setBaseLevel(metadata.baseLevel())
+                        .addAllPaths(metadata.paths());
+                for (var file : metadata.files()) {
+                    builder.addFiles(SstFileMetadata.newBuilder().setName(file.name()).setLevel(file.level())
+                            .setPathId(file.pathId()).setSizeBytes(file.sizeBytes())
+                            .setSmallestKeyHex(file.smallestKeyHex()).setLargestKeyHex(file.largestKeyHex())
+                            .setBeingCompacted(file.beingCompacted()));
+                }
+                var response = builder.build();
+                if (response.getSerializedSize() > SstMaintenance.MAX_METADATA_RESPONSE_BYTES) {
+                    throw SstMaintenance.invalid("SST metadata exceeds 64 MiB; query one level at a time");
+                }
+                return response;
+            })
                     .transform(this.onErrorMapMonoWithRequestInfo("getSstMetadata", request));
         }
 
@@ -2495,8 +2509,17 @@ public class GrpcServer extends Server {
         public Mono<CompactFilesResponse> compactFiles(CompactFilesRequest request) {
             requireV3(request.getWorkloadContractVersion());
             return Mono.defer(() -> {
-                var decoded = SstMaintenanceProto.decode(request);
-                return executeScheduled(() -> SstMaintenanceProto.encode(protectedApi().compactFiles(decoded)),
+                var decoded = new SstMaintenance.Request(request.getColumnId(), request.getSession(),
+                        request.getFilesList(), request.getLevel(), request.getOutputPathId(),
+                        request.getOutputFileSizeLimit(), request.getMaxInputBytes(), request.getMaxSubcompactions(),
+                        request.getExecute());
+                return executeScheduled(() -> {
+                    var result = protectedApi().compactFiles(decoded);
+                    return CompactFilesResponse.newBuilder().setExecuted(result.executed())
+                            .addAllInputFiles(result.inputFiles()).addAllOutputFiles(result.outputFiles())
+                            .setValidatedInputBytes(result.validatedInputBytes()).setOutputBytes(result.outputBytes())
+                            .setElapsedNanos(result.elapsedNanos()).build();
+                },
                         scheduler.scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE));
             }).transform(this.onErrorMapMonoWithRequestInfo("compactFiles", request));
         }
