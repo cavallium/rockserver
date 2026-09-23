@@ -3416,7 +3416,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		private final boolean deadlineIndex;
 		private WorkloadTask[] elements = new WorkloadTask[INITIAL_CAPACITY];
 		private @Nullable long[] deadlineKeys;
-		private @Nullable int[] secondaryIndices;
 		private int size;
 
 		private TaskHeap(boolean deadlineIndex) {
@@ -3459,15 +3458,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			return true;
 		}
 
-		private long deadlineKey(WorkloadTask task) {
-			if (!deadlineIndex) throw new IllegalStateException("EDF heap has no deadline keys");
-			int index = indexOf(task);
-			if (index < 0 || index >= size || elements[index] != task) {
-				throw new IllegalStateException("Task is not in the deadline heap");
-			}
-			return Objects.requireNonNull(deadlineKeys)[index];
-		}
-
 		private boolean remove(WorkloadTask task) {
 			int index = indexOf(task);
 			if (index < 0) {
@@ -3483,7 +3473,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			if (deadlineIndex) Objects.requireNonNull(deadlineKeys)[lastIndex] = 0L;
 			setIndex(task, -1);
 			if (index == lastIndex) {
-				if (!deadlineIndex && secondaryIndices != null) secondaryIndices[index] = -1;
 				return true;
 			}
 			var movedTask = Objects.requireNonNull(moved);
@@ -3498,7 +3487,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		private void siftUp(int index, WorkloadTask task, long taskKey) {
-			int taskSecondaryIndex = secondaryIndexRaw(task);
 			while (index > 0) {
 				int parentIndex = (index - 1) >>> 1;
 				var parent = Objects.requireNonNull(elements[parentIndex]);
@@ -3506,14 +3494,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				if (compare(task, taskKey, parent, parentKey) >= 0) {
 					break;
 				}
-				move(parent, parentKey, index, secondaryIndexRaw(parent));
+				move(parent, parentKey, index);
 				index = parentIndex;
 			}
-			move(task, taskKey, index, taskSecondaryIndex);
+			move(task, taskKey, index);
 		}
 
 		private void siftDown(int index, WorkloadTask task, long taskKey) {
-			int taskSecondaryIndex = secondaryIndexRaw(task);
 			int half = size >>> 1;
 			while (index < half) {
 				int childIndex = (index << 1) + 1;
@@ -3532,27 +3519,16 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				if (compare(task, taskKey, child, childKey) <= 0) {
 					break;
 				}
-				move(child, childKey, index, secondaryIndexRaw(child));
+				move(child, childKey, index);
 				index = childIndex;
 			}
-			move(task, taskKey, index, taskSecondaryIndex);
+			move(task, taskKey, index);
 		}
 
-		private void move(WorkloadTask task, long taskKey, int index, int secondaryIndex) {
-			if (!deadlineIndex && secondaryIndices != null) {
-				int oldIndex = task.latencyHeapIndex();
-				if (oldIndex >= 0 && oldIndex != index) secondaryIndices[oldIndex] = -1;
-				secondaryIndices[index] = secondaryIndex;
-			}
+		private void move(WorkloadTask task, long taskKey, int index) {
 			elements[index] = task;
 			if (deadlineIndex) Objects.requireNonNull(deadlineKeys)[index] = taskKey;
 			setIndex(task, index);
-		}
-
-		private int secondaryIndexRaw(WorkloadTask task) {
-			if (deadlineIndex || secondaryIndices == null) return -1;
-			int index = task.latencyHeapIndex();
-			return index < 0 ? -1 : secondaryIndices[index];
 		}
 
 		private long key(int index) {
@@ -3567,11 +3543,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			int newLength = Math.max(required, grown);
 			elements = Arrays.copyOf(elements, newLength);
 			if (deadlineIndex) deadlineKeys = Arrays.copyOf(Objects.requireNonNull(deadlineKeys), newLength);
-			if (secondaryIndices != null) {
-				int oldLength = secondaryIndices.length;
-				secondaryIndices = Arrays.copyOf(secondaryIndices, newLength);
-				Arrays.fill(secondaryIndices, oldLength, newLength, -1);
-			}
 		}
 
 		private int compare(WorkloadTask left, long leftKey, WorkloadTask right, long rightKey) {
@@ -3587,67 +3558,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 
 		private int indexOf(WorkloadTask task) {
-			if (!deadlineIndex) return task.latencyHeapIndex();
-			return task instanceof LatencyWorkloadTask
-					? latencyQueue.secondaryIndex(task)
-					: task.deadlineHeapIndex();
+			return deadlineIndex ? task.deadlineHeapIndex() : task.latencyHeapIndex();
 		}
 
 		private void setIndex(WorkloadTask task, int index) {
 			if (deadlineIndex) {
-				if (task instanceof LatencyWorkloadTask) {
-					latencyQueue.secondaryIndex(task, index);
-				} else {
-					task.deadlineHeapIndex(index);
-				}
+				task.deadlineHeapIndex(index);
 			} else {
 				task.latencyHeapIndex(index);
-			}
-		}
-
-		private void enableSecondaryIndices() {
-			if (deadlineIndex || secondaryIndices != null) {
-				throw new IllegalStateException("Latency secondary indexes already enabled");
-			}
-			secondaryIndices = new int[elements.length];
-			Arrays.fill(secondaryIndices, -1);
-		}
-
-		private void disableSecondaryIndices() {
-			if (deadlineIndex) throw new IllegalStateException("Deadline heap has no secondary indexes");
-			for (int index = 0; index < size; index++) {
-				if (Objects.requireNonNull(secondaryIndices)[index] >= 0) {
-					throw new IllegalStateException("Latency task remains expiry-indexed");
-				}
-			}
-			secondaryIndices = null;
-		}
-
-		private int secondaryIndex(WorkloadTask task) {
-			int latencyIndex = task.latencyHeapIndex();
-			if (secondaryIndices == null || latencyIndex < 0 || latencyIndex >= size
-					|| elements[latencyIndex] != task) return -1;
-			return secondaryIndices[latencyIndex];
-		}
-
-		private void secondaryIndex(WorkloadTask task, int deadlineIndex) {
-			int latencyIndex = task.latencyHeapIndex();
-			if (secondaryIndices == null || latencyIndex < 0 || latencyIndex >= size
-					|| elements[latencyIndex] != task) {
-				throw new IllegalStateException("Latency task has no primary EDF index");
-			}
-			secondaryIndices[latencyIndex] = deadlineIndex;
-		}
-
-		private void indexFiniteTasksIn(TaskHeap target, java.util.function.ToLongFunction<WorkloadTask> keys) {
-			if (deadlineIndex || !target.deadlineIndex || secondaryIndices == null) {
-				throw new IllegalStateException("Invalid adaptive expiry index build");
-			}
-			for (int index = 0; index < size; index++) {
-				var task = Objects.requireNonNull(elements[index]);
-				if (task.hasDeadline() && !target.add(task, keys.applyAsLong(task))) {
-					throw new IllegalStateException("Duplicate adaptive latency expiry task");
-				}
 			}
 		}
 	}
