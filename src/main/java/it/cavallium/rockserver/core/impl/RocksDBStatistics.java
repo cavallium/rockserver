@@ -38,7 +38,6 @@ public class RocksDBStatistics {
 	private final MetricsManager metrics;
 	private final EnumMap<TickerType, Counter> tickerMap;
 	private final EnumMap<HistogramType, MultiGauge> histogramMap;
-	private final EnumMap<RocksDBLongProperty, Gauge> longPropertyMap;
 	private final EnumMap<RocksDBLongProperty, MultiGauge> perCfLongPropertyMap;
 	private final Thread executor;
 	private final MultiGauge cacheStats;
@@ -142,17 +141,15 @@ public class RocksDBStatistics {
 								.register(metrics.getRegistry())
 				)));
 		// Register non-PER_CF properties as single gauges (DB_WIDE, SINGLE_CF)
-		this.longPropertyMap = new EnumMap<>(Arrays
-				.stream(RocksDBLongProperty.values())
-				.filter(p -> p.getAggregationMode() != AggregationMode.PER_CF)
-				.collect(Collectors.toMap(Function.identity(),
-						longProperty -> Gauge
-								.builder("rocksdb.property.long",
-										() -> readLongPropertyForGauge(longPropertyGetter, longProperty))
-								.tag("database", name)
-								.tag("property_name", longProperty.getName())
-								.register(metrics.getRegistry())
-				)));
+		for (var longProperty : RocksDBLongProperty.values()) {
+			if (longProperty.getAggregationMode() != AggregationMode.PER_CF) {
+				Gauge.builder("rocksdb.property.long",
+							() -> readLongPropertyForGauge(longPropertyGetter, longProperty))
+						.tag("database", name)
+						.tag("property_name", longProperty.getName())
+						.register(metrics.getRegistry());
+			}
+		}
 		// Register PER_CF properties as MultiGauges with column_family tag
 		this.perCfLongPropertyMap = new EnumMap<>(Arrays
 				.stream(RocksDBLongProperty.values())
