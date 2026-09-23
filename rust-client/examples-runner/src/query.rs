@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 #[derive(Debug)]
 pub enum Query {
     And(Vec<Query>),
@@ -166,16 +164,6 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                             }
                         }
                         tokens.push(Token::KeyOpValue(s.to_lowercase(), value));
-                    } else if s.starts_with("text_contains(") {
-                        // Hacky support for `text_contains("...")`
-                        // Expected: `text_contains("foo")`
-                        // We already consumed `text_contains`, peek is `(`... no, wait.
-                        // My lexing above stops at `(`, so `s` is `text_contains`.
-                        // But `(` is separate token.
-                        // This tokenizing is too simple for function calls.
-                        // I will rely on `text:"foo"` syntax primarily, 
-                        // but if user writes `text_contains` it might appear as identifier.
-                        tokens.push(Token::StringLit(s)); // Treat as bare string? No.
                     } else {
                          tokens.push(Token::StringLit(s));
                     }
