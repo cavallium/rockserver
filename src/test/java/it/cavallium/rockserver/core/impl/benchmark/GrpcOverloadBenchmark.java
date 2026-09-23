@@ -3975,11 +3975,6 @@ public final class GrpcOverloadBenchmark {
 	private record BlockDeviceEvidence(int rotational, String model) {
 	}
 
-	/** Captures storage evidence without creating the target path. */
-	public static StorageEnvironment captureStorageForTesting(Path target) {
-		return StorageEnvironment.capture(target);
-	}
-
 	/** Pure label consistency check used by release-provenance tests. */
 	public static boolean storageMatchesLabelForTesting(StorageEnvironment storage, String label) {
 		return switch (label) {

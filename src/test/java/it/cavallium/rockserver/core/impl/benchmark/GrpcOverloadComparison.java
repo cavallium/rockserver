@@ -506,14 +506,6 @@ public final class GrpcOverloadComparison {
 		return METRIC_BY_NAME.keySet();
 	}
 
-	public static boolean higherIsBetterForTesting(String name) {
-		return Objects.requireNonNull(METRIC_BY_NAME.get(name), name).direction() == Direction.HIGHER;
-	}
-
-	public static boolean noIncreaseForTesting(String name) {
-		return Objects.requireNonNull(METRIC_BY_NAME.get(name), name).direction() == Direction.NO_INCREASE;
-	}
-
 	private static String toJson(Comparison comparison) {
 		var json = new StringBuilder(16_384);
 		json.append("{\n  \"schema\": ");
