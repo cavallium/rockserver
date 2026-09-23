@@ -55,7 +55,7 @@ final class NativeRocksDBGet implements AutoCloseable {
 			int keyLength) throws RocksDBException {
 		State state = acquireState();
 		try {
-			return state.getHeap(database, columnFamily, readOptions, key, keyOffset, keyLength);
+			return database.getPinnedCopy(columnFamily, readOptions, key, keyOffset, keyLength, state.pinnedGet);
 		} finally {
 			releaseState(state);
 		}
@@ -75,7 +75,7 @@ final class NativeRocksDBGet implements AutoCloseable {
 		State state = acquireState();
 		boolean leased = false;
 		try {
-			if (!state.getPinned(database, columnFamily, defaultReadOptions, key, keyOffset, keyLength)) {
+			if (!database.getPinned(columnFamily, defaultReadOptions, key, keyOffset, keyLength, state.pinnedGet)) {
 				return null;
 			}
 			var lease = new PinnedGetLease(this, state);
@@ -239,24 +239,6 @@ final class NativeRocksDBGet implements AutoCloseable {
 			}
 			retainedSlot = slot;
 			preferredSlot = initialPreferredSlot;
-		}
-
-		private byte @Nullable [] getHeap(RocksDB database,
-				ColumnFamilyHandle columnFamily,
-				ReadOptions readOptions,
-				byte[] key,
-				int keyOffset,
-				int keyLength) throws RocksDBException {
-			return database.getPinnedCopy(columnFamily, readOptions, key, keyOffset, keyLength, pinnedGet);
-		}
-
-		private boolean getPinned(RocksDB database,
-				ColumnFamilyHandle columnFamily,
-				ReadOptions readOptions,
-				byte[] key,
-				int keyOffset,
-				int keyLength) throws RocksDBException {
-			return database.getPinned(columnFamily, readOptions, key, keyOffset, keyLength, pinnedGet);
 		}
 
 		@Override
