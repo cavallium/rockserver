@@ -92,7 +92,8 @@ public class MergeOperatorRegistry implements Closeable {
                 db.put(cfh, hashKey, baos.toByteArray());
 
                 // Pre-load to verify instantiation and cache it
-                loadAndCache(name, version, className, jarData);
+                FFMAbstractMergeOperator op = loadAndInstantiate(className, jarData);
+                cache.computeIfAbsent(name, k -> new ConcurrentHashMap<>()).put(version, op);
 
                 LOG.info("Uploaded merge operator '{}' version {} (class: {})", name, version, className);
                 return version;
@@ -216,12 +217,6 @@ public class MergeOperatorRegistry implements Closeable {
         return baos.toByteArray();
     }
 
-    private FFMAbstractMergeOperator loadAndCache(String name, long version, String className, byte[] jarData) {
-        FFMAbstractMergeOperator op = loadAndInstantiate(className, jarData);
-        cache.computeIfAbsent(name, k -> new ConcurrentHashMap<>()).put(version, op);
-        return op;
-    }
-
     private FFMAbstractMergeOperator loadAndInstantiate(String className, byte[] jarData) {
         try {
             InMemoryClassLoader cl = new InMemoryClassLoader(jarData, this.getClass().getClassLoader());
@@ -242,10 +237,7 @@ public class MergeOperatorRegistry implements Closeable {
     
     private void validateJar(byte[] jarData) {
         try (JarInputStream jis = new JarInputStream(new ByteArrayInputStream(jarData))) {
-            if (jis.getNextJarEntry() == null) {
-                // Warning: JAR might be empty of entries but have a manifest.
-                // We could inspect Manifest but for now simple check is enough.
-            }
+            jis.getNextJarEntry();
         } catch (IOException e) {
             throw new IllegalArgumentException("Invalid JAR data", e);
         }
