@@ -11228,12 +11228,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return WriteBatchIterator.cursor(writeBatch.data());
 	}
 
-	private static boolean checkCdcIteratorStatus(TransactionLogIterator iterator) throws org.rocksdb.RocksDBException {
+	private static void checkCdcIteratorStatus(TransactionLogIterator iterator) throws org.rocksdb.RocksDBException {
 		try {
 			iterator.status();
-			return false;
 		} catch (org.rocksdb.RocksDBException error) {
-			return handleCdcIteratorStatus(error);
+			handleCdcIteratorStatus(error);
 		}
 	}
 
