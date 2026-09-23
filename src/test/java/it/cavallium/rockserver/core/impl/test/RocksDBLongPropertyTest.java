@@ -4,7 +4,6 @@ import static it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationM
 import static it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode.PER_CF;
 import static it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode.SINGLE_CF;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.core.impl.RocksDBLongProperty;
@@ -20,11 +19,6 @@ class RocksDBLongPropertyTest {
 		for (var property : RocksDBLongProperty.values()) {
 			assertTrue(property.getName().startsWith("rocksdb."), property::name);
 			assertEquals(property.getName(), property.toString(), property::name);
-			assertTrue(property.isNumeric(), property::name);
-			assertFalse(property.isMap(), property::name);
-			assertFalse(property.isString(), property::name);
-			assertEquals(property.getAggregationMode() == PER_CF,
-					property.isDividedByColumnFamily(), property::name);
 		}
 	}
 

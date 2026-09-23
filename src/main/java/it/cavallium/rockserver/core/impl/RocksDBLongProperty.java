@@ -1,6 +1,6 @@
 package it.cavallium.rockserver.core.impl;
 
-public enum RocksDBLongProperty implements RocksDBProperty {
+public enum RocksDBLongProperty {
 	NUM_FILES_AT_LEVEL_0("num-files-at-level0"),
 	NUM_FILES_AT_LEVEL_1("num-files-at-level1"),
 	NUM_FILES_AT_LEVEL_2("num-files-at-level2"),
@@ -93,35 +93,12 @@ public enum RocksDBLongProperty implements RocksDBProperty {
 		return "rocksdb." + name;
 	}
 
-	@Override
 	public String getName() {
 		return "rocksdb." + name;
-	}
-
-	@Override
-	public boolean isNumeric() {
-		return true;
-	}
-
-	@Override
-	public boolean isMap() {
-		return false;
-	}
-
-	@Override
-	public boolean isString() {
-		return false;
 	}
 
 	public AggregationMode getAggregationMode() {
 		return aggregationMode;
 	}
 
-	/**
-	 * @deprecated Use {@link #getAggregationMode()} instead.
-	 */
-	@Deprecated
-	public boolean isDividedByColumnFamily() {
-		return aggregationMode == AggregationMode.PER_CF;
-	}
 }
