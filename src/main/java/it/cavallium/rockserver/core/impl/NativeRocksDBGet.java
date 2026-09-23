@@ -105,7 +105,15 @@ final class NativeRocksDBGet implements AutoCloseable {
 		} catch (Throwable throwable) {
 			failure = addFailure(failure, throwable);
 		}
-		throwIfFailed("Failed to release native fast-get resources", failure);
+		if (failure instanceof Error error) {
+			throw error;
+		}
+		if (failure instanceof RuntimeException runtimeException) {
+			throw runtimeException;
+		}
+		if (failure != null) {
+			throw new IllegalStateException("Failed to release native fast-get resources", failure);
+		}
 	}
 
 	private State acquireState() {
@@ -172,18 +180,6 @@ final class NativeRocksDBGet implements AutoCloseable {
 		}
 		failure.addSuppressed(additional);
 		return failure;
-	}
-
-	private static void throwIfFailed(String message, @Nullable Throwable failure) {
-		if (failure instanceof Error error) {
-			throw error;
-		}
-		if (failure instanceof RuntimeException runtimeException) {
-			throw runtimeException;
-		}
-		if (failure != null) {
-			throw new IllegalStateException(message, failure);
-		}
 	}
 
 	static final class PinnedGetLease implements AutoCloseable {
