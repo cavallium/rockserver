@@ -417,16 +417,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				"method", fullMethodName.substring(separator + 1));
 	}
 
-	private static List<MethodDescriptor<?, ?>> automaticRetryMethodDescriptors() {
-		return AUTOMATIC_RETRY_METHOD_DESCRIPTORS;
-	}
-
-	private static Set<String> automaticRetryMethodFullNames() {
-		return AUTOMATIC_RETRY_METHOD_DESCRIPTORS.stream()
-				.map(MethodDescriptor::getFullMethodName)
-				.collect(Collectors.toUnmodifiableSet());
-	}
-
 	private static int intProperty(String name, int defaultValue, int minValue) {
 		var value = System.getProperty(name);
 		if (value == null || value.isBlank()) {

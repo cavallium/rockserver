@@ -198,11 +198,6 @@ public class ThriftServer extends Server {
 		return buf != null ? result.setValue(asByteBuffer(buf)) : result;
 	}
 
-	private static RequestContext mapRequestContext(
-			it.cavallium.rockserver.core.common.api.RequestContext wireContext) {
-		return parseRequestContext(wireContext);
-	}
-
 	private static ResolvedRequestContext mapRequestContext(
 			it.cavallium.rockserver.core.common.api.RequestContext wireContext,
 			@Nullable RWScheduler scheduler) {

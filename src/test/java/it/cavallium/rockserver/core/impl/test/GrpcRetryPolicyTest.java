@@ -166,19 +166,23 @@ class GrpcRetryPolicyTest {
 				RocksDBServiceGrpc.getCdcGetEarliestAvailableSequenceMethod().getFullMethodName(),
 				RocksDBServiceGrpc.getCdcGetLastCommittedSequenceMethod().getFullMethodName());
 
-		assertEquals(expected, invokeDelegate("automaticRetryMethodFullNames"));
+		var descriptorsField = Class.forName("it.cavallium.rockserver.core.client.GrpcConnectionDelegate")
+				.getDeclaredField("AUTOMATIC_RETRY_METHOD_DESCRIPTORS");
+		descriptorsField.setAccessible(true);
+		var configuredDescriptors = assertInstanceOf(java.util.List.class, descriptorsField.get(null));
+		var configuredNames = new java.util.HashSet<String>();
+		for (var configuredDescriptor : configuredDescriptors) {
+			var method = assertInstanceOf(io.grpc.MethodDescriptor.class, configuredDescriptor);
+			configuredNames.add(method.getFullMethodName());
+			assertEquals(io.grpc.MethodDescriptor.MethodType.UNARY, method.getType(),
+					"streaming calls are deliberately excluded even when read-only");
+		}
+		assertEquals(expected, configuredNames);
 		var generatedMethods = RocksDBServiceGrpc.getServiceDescriptor().getMethods().stream()
 				.map(method -> method.getFullMethodName())
 				.collect(java.util.stream.Collectors.toUnmodifiableSet());
 		assertTrue(generatedMethods.containsAll(expected),
 				"every configured name must resolve to the generated service descriptor");
-		var configuredDescriptors = assertInstanceOf(java.util.List.class,
-				invokeDelegate("automaticRetryMethodDescriptors"));
-		for (var configuredDescriptor : configuredDescriptors) {
-			var method = assertInstanceOf(io.grpc.MethodDescriptor.class, configuredDescriptor);
-			assertEquals(io.grpc.MethodDescriptor.MethodType.UNARY, method.getType(),
-					"streaming calls are deliberately excluded even when read-only");
-		}
 	}
 
 	private static RetryFixture start(FailFirstService service) throws Exception {
@@ -201,20 +205,6 @@ class GrpcRetryPolicyTest {
 		configure.setAccessible(true);
 		try {
 			configure.invoke(null, builder);
-		} catch (InvocationTargetException failure) {
-			if (failure.getCause() instanceof Exception cause) {
-				throw cause;
-			}
-			throw failure;
-		}
-	}
-
-	private static Object invokeDelegate(String methodName) throws Exception {
-		Class<?> delegate = Class.forName("it.cavallium.rockserver.core.client.GrpcConnectionDelegate");
-		Method method = delegate.getDeclaredMethod(methodName);
-		method.setAccessible(true);
-		try {
-			return method.invoke(null);
 		} catch (InvocationTargetException failure) {
 			if (failure.getCause() instanceof Exception cause) {
 				throw cause;

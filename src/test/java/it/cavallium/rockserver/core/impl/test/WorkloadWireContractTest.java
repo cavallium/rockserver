@@ -193,7 +193,7 @@ class WorkloadWireContractTest {
 
 	@Test
 	void thriftServerRejectsEveryProtectedProfileSpoofAtTheWireBoundary() throws Exception {
-		var mapper = ThriftServer.class.getDeclaredMethod("mapRequestContext",
+		var mapper = ThriftServer.class.getDeclaredMethod("parseRequestContext",
 				it.cavallium.rockserver.core.common.api.RequestContext.class);
 		mapper.setAccessible(true);
 		for (var profile : List.of(
@@ -226,7 +226,7 @@ class WorkloadWireContractTest {
 
 	@Test
 	void thriftServerRejectsMissingAndNonV3Contexts() throws Exception {
-		var mapper = ThriftServer.class.getDeclaredMethod("mapRequestContext",
+		var mapper = ThriftServer.class.getDeclaredMethod("parseRequestContext",
 				it.cavallium.rockserver.core.common.api.RequestContext.class);
 		mapper.setAccessible(true);
 		for (int version : List.of(0, 2, 4)) {
