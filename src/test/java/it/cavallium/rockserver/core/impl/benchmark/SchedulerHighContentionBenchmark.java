@@ -24,7 +24,6 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import reactor.core.Disposable;
@@ -554,7 +553,6 @@ public final class SchedulerHighContentionBenchmark {
 		private final byte[] profileOrdinals;
 		private final byte[] familyOrdinals;
 		private final PoolObservation[] poolObservations = new PoolObservation[POOLS.length];
-		private final AtomicLong monitorSamples = new AtomicLong();
 		private final SchedulerDeadlineApi deadlineApi;
 		private final SchedulerDeadlineApi.Deadline futureLatencyDeadline;
 		private final SchedulerDeadlineApi.Deadline expiredLatencyDeadline;
@@ -776,7 +774,6 @@ public final class SchedulerHighContentionBenchmark {
 					scheduler.copyPoolTelemetry(pool, telemetry[pool.ordinal()]);
 					poolObservations[pool.ordinal()].observe(telemetry[pool.ordinal()]);
 				}
-				monitorSamples.incrementAndGet();
 				peaks.sample();
 				sample++;
 				LockSupport.parkNanos(50_000L);
