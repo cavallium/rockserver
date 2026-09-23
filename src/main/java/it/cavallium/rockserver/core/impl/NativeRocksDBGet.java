@@ -53,14 +53,19 @@ final class NativeRocksDBGet implements AutoCloseable {
 			byte[] key,
 			int keyOffset,
 			int keyLength) throws RocksDBException {
-		return getHeapInternal(columnFamily, readOptions, key, keyOffset, keyLength);
+		State state = acquireState();
+		try {
+			return state.getHeap(database, columnFamily, readOptions, key, keyOffset, keyLength);
+		} finally {
+			releaseState(state);
+		}
 	}
 
 	byte @Nullable [] getHeap(ColumnFamilyHandle columnFamily,
 			byte[] key,
 			int keyOffset,
 			int keyLength) throws RocksDBException {
-		return getHeapInternal(columnFamily, defaultReadOptions, key, keyOffset, keyLength);
+		return getHeap(columnFamily, defaultReadOptions, key, keyOffset, keyLength);
 	}
 
 	@Nullable PinnedGetLease getPinned(ColumnFamilyHandle columnFamily,
@@ -80,19 +85,6 @@ final class NativeRocksDBGet implements AutoCloseable {
 			if (!leased) {
 				releaseState(state);
 			}
-		}
-	}
-
-	private byte @Nullable [] getHeapInternal(ColumnFamilyHandle columnFamily,
-			ReadOptions readOptions,
-			byte[] key,
-			int keyOffset,
-			int keyLength) throws RocksDBException {
-		State state = acquireState();
-		try {
-			return state.getHeap(database, columnFamily, readOptions, key, keyOffset, keyLength);
-		} finally {
-			releaseState(state);
 		}
 	}
 
