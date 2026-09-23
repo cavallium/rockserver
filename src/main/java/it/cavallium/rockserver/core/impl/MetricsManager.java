@@ -35,6 +35,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.DatabaseConfig;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -317,10 +318,25 @@ public class MetricsManager implements AutoCloseable {
 		}
 		// Push registries publish one final snapshot from close(). Keep their HTTP
 		// transport and Vert.x owner alive until that publish has completed.
-		try {
-			compositeRegistry.close();
-		} catch (Throwable t) {
-			LOG.warn("Failed to close metrics registry", t);
+		var registries = new ArrayList<MeterRegistry>(compositeRegistry.getRegistries());
+		registries.add(compositeRegistry);
+		for (var registry : registries) {
+			try {
+				registry.close();
+			} catch (Throwable t) {
+				LOG.warn("Failed to close metrics registry", t);
+			}
+			// close() stops publishing but retains meters and their supplier references.
+			for (var meter : registry.getMeters()) {
+				try {
+					registry.remove(meter);
+				} catch (Throwable t) {
+					LOG.warn("Failed to remove metrics meter {}", meter.getId(), t);
+				}
+			}
+			if (registry != compositeRegistry) {
+				compositeRegistry.remove(registry);
+			}
 		}
 		if (httpClient != null) {
 			try {

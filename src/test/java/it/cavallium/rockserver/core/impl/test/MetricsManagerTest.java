@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
@@ -54,6 +55,7 @@ class MetricsManagerTest {
 		}
 
 		assertTrue(registry.isClosed());
+		assertTrue(registry.getMeters().isEmpty());
 		assertDoesNotThrow(manager::close);
 	}
 
@@ -67,6 +69,7 @@ class MetricsManagerTest {
 		var manager = new MetricsManager(config);
 		var registry = (CompositeMeterRegistry) manager.getRegistry();
 
+		var children = java.util.List.copyOf(registry.getRegistries());
 		try {
 			assertEquals(1, registry.getRegistries().size());
 			assertEquals("JmxMeterRegistry", registry.getRegistries().iterator().next().getClass().getSimpleName());
@@ -76,7 +79,9 @@ class MetricsManagerTest {
 		}
 
 		assertTrue(registry.isClosed());
-		assertTrue(registry.getRegistries().stream().allMatch(child -> child.isClosed()));
+		assertTrue(registry.getRegistries().isEmpty());
+		assertTrue(registry.getMeters().isEmpty());
+		assertTrue(children.stream().allMatch(child -> child.isClosed() && child.getMeters().isEmpty()));
 	}
 
 	@Test
@@ -93,6 +98,11 @@ class MetricsManagerTest {
 		when(httpClient.rxClose()).thenReturn(Completable.complete());
 		when(vertx.rxClose()).thenReturn(Completable.complete());
 		registry.add(exporter);
+		exporter.counter("exporter.only").increment();
+		doAnswer(call -> {
+			assertFalse(exporter.getMeters().isEmpty(), "final publication must precede meter removal");
+			return call.callRealMethod();
+		}).when(exporter).close();
 		setField(manager, "httpClient", httpClient);
 		setField(manager, "vertx", vertx);
 
@@ -102,10 +112,69 @@ class MetricsManagerTest {
 		closeOrder.verify(exporter).close();
 		closeOrder.verify(httpClient).rxClose();
 		closeOrder.verify(vertx).rxClose();
+		assertTrue(registry.getMeters().isEmpty());
+		assertTrue(exporter.getMeters().isEmpty());
+		assertTrue(registry.getRegistries().isEmpty());
 
 		manager.close();
+		verify(exporter, times(1)).close();
 		verify(httpClient, times(1)).rxClose();
 		verify(vertx, times(1)).rxClose();
+	}
+
+	@Test
+	void failingExporterDoesNotPreventOtherRegistriesFromClosingOrClearing() throws Exception {
+		var config = ConfigParser.parse(writeConfig("""
+				database.metrics.jmx.enabled = false
+				database.metrics.influx.enabled = false
+				"""));
+		try (var manager = new MetricsManager(config)) {
+			var registry = (CompositeMeterRegistry) manager.getRegistry();
+			var failing = spy(new SimpleMeterRegistry());
+			var healthy = new SimpleMeterRegistry();
+			registry.add(failing);
+			registry.add(healthy);
+			failing.counter("exporter.only").increment();
+			doAnswer(call -> {
+				call.callRealMethod();
+				throw new IllegalStateException("exporter close failed");
+			}).when(failing).close();
+
+			assertDoesNotThrow(manager::close);
+
+			assertTrue(registry.isClosed());
+			assertTrue(failing.isClosed());
+			assertTrue(healthy.isClosed());
+			assertTrue(registry.getMeters().isEmpty());
+			assertTrue(failing.getMeters().isEmpty());
+			assertTrue(healthy.getMeters().isEmpty());
+			assertTrue(registry.getRegistries().isEmpty());
+		}
+	}
+
+	@Test
+	void databaseShutdownEmptiesRetainedRegistriesWithTableMetricsEnabled() throws Exception {
+		var config = writeConfig("""
+				database.metrics.jmx.enabled = false
+				database.metrics.influx.enabled = false
+				database.metrics.table-properties-enabled = true
+				""");
+		try (var database = new it.cavallium.rockserver.core.impl.EmbeddedDB(
+				tempDir.resolve("database"), "metrics-shutdown", config)) {
+			var registry = (CompositeMeterRegistry) database.getMetricsRegistry();
+			var child = new SimpleMeterRegistry();
+			registry.add(child);
+			assertNotNull(child.find("rocksdb.table.properties.collection.success").gauge());
+			assertFalse(child.getMeters().isEmpty());
+
+			database.closeTesting();
+
+			assertTrue(registry.isClosed());
+			assertTrue(child.isClosed());
+			assertTrue(registry.getMeters().isEmpty());
+			assertTrue(child.getMeters().isEmpty());
+			assertTrue(registry.getRegistries().isEmpty());
+		}
 	}
 
 	private static void setField(Object target, String name, Object value) throws Exception {
