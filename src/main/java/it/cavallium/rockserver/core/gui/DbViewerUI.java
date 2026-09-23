@@ -57,7 +57,6 @@ public class DbViewerUI extends JFrame {
 			return sb.toString();
 		}
 	}
-	record Column(String name, Long colId, ColumnSchema schema) {}
 	private record TableData(Object[][] rows, List<String> columns, String tableName) {}
 
 
@@ -353,25 +352,25 @@ public class DbViewerUI extends JFrame {
 			protected TableData doInBackground() throws Exception {
 				var analyticalApi = apiClient.getSyncApi(RequestContext.analytical(Duration.ofSeconds(5)));
 				var colId = analyticalApi.getColumnId(selectedTable.name());
-				var column = new Column(selectedTable.name(), colId, selectedTable.schema());
+				var schema = selectedTable.schema();
 
 				try (Stream<KV> dataStream = analyticalApi.getRange(
-						0, column.colId, null, null, false, RequestType.allInRange())) {
+						0, colId, null, null, false, RequestType.allInRange())) {
 					var rows = dataStream.toList();
-					int numCols = column.schema().keysCount() + (column.schema.hasValue() ? 1 : 0);
+					int numCols = schema.keysCount() + (schema.hasValue() ? 1 : 0);
 					Object[][] rowData = new Object[rows.size()][numCols];
 
 					for (int rowI = 0; rowI < rows.size(); rowI++) {
 						var row = rows.get(rowI);
 						Keys rowKeys = row.keys();
-						for (int colI = 0; colI < column.schema.keysCount(); colI++) {
+						for (int colI = 0; colI < schema.keysCount(); colI++) {
 							rowData[rowI][colI] = rowKeys.keys()[colI].toByteArray();
 						}
-						if (column.schema.hasValue()) {
-							rowData[rowI][column.schema.keysCount()] = row.value().toByteArray();
+						if (schema.hasValue()) {
+							rowData[rowI][schema.keysCount()] = row.value().toByteArray();
 						}
 					}
-					List<String> columnNames = schemaToColumns(column.schema());
+					List<String> columnNames = schemaToColumns(schema);
 					return new TableData(rowData, columnNames, selectedTable.name());
 				}
 			}
