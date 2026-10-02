@@ -6006,7 +6006,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (col.hasBuckets()) {
 				var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 				try {
-					Buf previousRawBucket = dbGetWithDefaultOptions(tx, col, calculatedKey);
+					Buf previousRawBucket = dbGetWithDefaultOptions(tx, col, calculatedKey, callback instanceof RequestType.RequestForUpdate<?>);
 					if (previousRawBucket != null) {
 						var bucket = new Bucket(col, previousRawBucket);
 						foundValue = bucket.getElement(bucketElementKeys);
@@ -6022,7 +6022,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						&& callback instanceof RequestType.RequestExists<?>);
 				if (shouldGetCurrent) {
 					try {
-						foundValue = dbGetWithDefaultOptions(tx, col, calculatedKey);
+						foundValue = dbGetWithDefaultOptions(tx, col, calculatedKey, callback instanceof RequestType.RequestForUpdate<?>);
 						existsValue = foundValue != null;
 					} catch (org.rocksdb.RocksDBException e) {
 						throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
@@ -10336,10 +10336,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private Buf dbGet(Tx tx, ColumnInstance col, ReadOptions readOptions, Buf calculatedKey)
 			throws org.rocksdb.RocksDBException {
+		return dbGet(tx, col, readOptions, calculatedKey, false);
+	}
+
+	private Buf dbGet(Tx tx, ColumnInstance col, ReadOptions readOptions, Buf calculatedKey, boolean forUpdate)
+			throws org.rocksdb.RocksDBException {
 		if (tx != null) {
 			byte[] previousRawBucketByteArray;
 			byte[] calculatedKeyArray = calculatedKey.toByteArray();
-			if (tx.isFromGetForUpdate()) {
+			if (forUpdate || tx.isFromGetForUpdate()) {
 				previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 			} else {
 				previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKeyArray);
@@ -10364,11 +10369,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@Nullable
 	private Buf dbGetWithDefaultOptions(@Nullable Tx tx, ColumnInstance col, Buf calculatedKey)
 			throws org.rocksdb.RocksDBException {
+		return dbGetWithDefaultOptions(tx, col, calculatedKey, false);
+	}
+
+	@Nullable
+	private Buf dbGetWithDefaultOptions(@Nullable Tx tx, ColumnInstance col, Buf calculatedKey, boolean forUpdate)
+			throws org.rocksdb.RocksDBException {
 		if (tx == null && fastGet) {
 			return dbGetFast(col.cfh(), calculatedKey);
 		}
 		try (var readOptions = newReadOptions(null)) {
-			return dbGet(tx, col, readOptions, calculatedKey);
+			return dbGet(tx, col, readOptions, calculatedKey, forUpdate);
 		}
 	}
 

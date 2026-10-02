@@ -12,6 +12,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 @TestMethodOrder(MethodOrderer.MethodName.class)
 class TransactionTest {
@@ -161,6 +163,61 @@ database: {
 
 		// Trying to commit again should FAIL with TX_NOT_FOUND
 		Assertions.assertThrowsExactly(RocksDBException.class, () -> db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(updateId, true));
+	}
+
+	@ParameterizedTest
+	@CsvSource({"false,false", "false,true", "true,false", "true,true"})
+	void explicitTransactionForUpdateTracksGuard(boolean bucketed, boolean present) {
+		var api = db.getSyncApi(RequestContext.batch());
+		long column = bucketed ? colId : colIdNoBuckets;
+		var guard = bucketed
+				? new Keys(toBufSimple(6), toBufSimple(6, 6), toBufSimple(6), toBufString("guard"), toBufString("tail"))
+				: makeKey(6, 6, 6);
+		var payload = bucketed
+				? new Keys(toBufSimple(7), toBufSimple(7, 7), toBufSimple(7), toBufString("payload"), toBufString("tail"))
+				: makeKey(7, 7, 7);
+		if (present) {
+			api.put(0, column, guard, toBufSimple(0), RequestType.none());
+		}
+		long reader = api.openTransaction(java.time.Duration.ofSeconds(10));
+		long writer = api.openTransaction(java.time.Duration.ofSeconds(10));
+		try {
+			var fence = api.get(reader, column, guard, RequestType.forUpdate());
+			assertBufEquals(present ? toBufSimple(0) : null, fence.previous());
+			Assertions.assertEquals(reader, fence.updateId());
+			api.put(writer, column, guard, toBufSimple(1), RequestType.none());
+			Assertions.assertTrue(api.closeTransaction(writer, true));
+			api.put(reader, column, payload, toBufSimple(2), RequestType.none());
+			Assertions.assertNull(api.get(0, column, payload, RequestType.current()));
+			Assertions.assertFalse(api.closeTransaction(reader, true));
+			Assertions.assertNull(api.get(0, column, payload, RequestType.current()));
+		} finally {
+			api.closeTransaction(reader, false);
+			api.closeTransaction(writer, false);
+		}
+	}
+
+	@Test
+	void explicitForUpdatePreservesOrdinaryReadAndManualCommit() {
+		var api = db.getSyncApi(RequestContext.batch());
+		var tracked = makeKey(8, 8, 8);
+		var ordinary = makeKey(9, 9, 9);
+		var payload = makeKey(10, 10, 10);
+		long reader = api.openTransaction(java.time.Duration.ofSeconds(10));
+		long writer = api.openTransaction(java.time.Duration.ofSeconds(10));
+		try {
+			Assertions.assertNull(api.get(reader, colIdNoBuckets, tracked, RequestType.forUpdate()).previous());
+			Assertions.assertNull(api.get(reader, colIdNoBuckets, ordinary, RequestType.current()));
+			api.put(writer, colIdNoBuckets, ordinary, toBufSimple(1), RequestType.none());
+			Assertions.assertTrue(api.closeTransaction(writer, true));
+			api.put(reader, colIdNoBuckets, payload, toBufSimple(2), RequestType.none());
+			Assertions.assertNull(api.get(0, colIdNoBuckets, payload, RequestType.current()));
+			Assertions.assertTrue(api.closeTransaction(reader, true));
+			assertBufEquals(toBufSimple(2), api.get(0, colIdNoBuckets, payload, RequestType.current()));
+		} finally {
+			api.closeTransaction(reader, false);
+			api.closeTransaction(writer, false);
+		}
 	}
 
 	private static void assertBufEquals(Buf expected, Buf actual) {
