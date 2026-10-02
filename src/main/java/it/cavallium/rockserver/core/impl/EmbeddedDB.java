@@ -2227,6 +2227,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable AbstractSlice<?> endKeySlice) {
 		var ro = newReadOptions("get-range-async-read-options");
 		try {
+			// Retained iterators may move between workers; native async prefetch owns a thread-local ring.
+			ro.setAsyncIo(false);
 			ro.setDeadline(deadlineMicros);
 			ro.setFillCache(fillCache);
 			if (startKeySlice != null) {
@@ -6123,6 +6125,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 				var ro = newReadOptions("open-iterator-read-options");
 				state.add(ro);
+				ro.setAsyncIo(false);
 				ro.setDeadline(iteratorReadDeadlineMicros(timeoutMs));
 				if (startKeySlice != null) {
 					ro.setIterateLowerBound(startKeySlice);

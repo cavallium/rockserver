@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -15,6 +16,7 @@ import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.rocksdb.REntry;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -27,6 +29,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
@@ -34,6 +37,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.AbstractSlice;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksIterator;
+import org.rocksdb.Slice;
 import reactor.core.publisher.Flux;
 import reactor.test.StepVerifier;
 
@@ -90,6 +97,56 @@ class RangeNoCacheTest {
 		}
 		if (embeddedConnection != null) {
 			embeddedConnection.closeTesting();
+		}
+	}
+
+	@Test
+	void retainedRangeOptionsDisableAsyncIoWithoutChangingPointReadPolicy() throws Exception {
+		var ordinaryFactory = EmbeddedDB.class.getDeclaredMethod("newReadOptions", String.class);
+		ordinaryFactory.setAccessible(true);
+		try (var options = (ReadOptions) ordinaryFactory.invoke(embeddedDB, "ordinary-read-policy-test")) {
+			assertTrue(options.asyncIo(), "ordinary read options must retain async MultiGet policy");
+		}
+		var rangeFactory = EmbeddedDB.class.getDeclaredMethod("newRangeReadOptions", long.class,
+				boolean.class, AbstractSlice.class, AbstractSlice.class);
+		rangeFactory.setAccessible(true);
+		try (var lower = new Slice(new byte[] {2}); var upper = new Slice(new byte[] {8})) {
+			for (boolean fillCache : new boolean[] {true, false}) {
+				try (var options = (ReadOptions) rangeFactory.invoke(embeddedDB, 123456L, fillCache, lower, upper)) {
+					assertFalse(options.asyncIo(), "retained range options must not own async prefetch state");
+					assertEquals(fillCache, options.fillCache());
+					assertEquals(123456L, options.deadline());
+					assertArrayEquals(lower.data(), options.iterateLowerBound().data());
+					assertArrayEquals(upper.data(), options.iterateUpperBound().data());
+				}
+			}
+		}
+	}
+
+	@Test
+	void explicitIteratorsRetainSynchronousOptionsAndBoundedRowsUntilClose() throws Exception {
+		var api = embeddedConnection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+		var iteratorsField = EmbeddedDB.class.getDeclaredField("its");
+		iteratorsField.setAccessible(true);
+		@SuppressWarnings("unchecked")
+		var iterators = (Map<Long, REntry<RocksIterator>>) iteratorsField.get(embeddedDB);
+		for (boolean reverse : new boolean[] {false, true}) {
+			long iteratorId = api.openIterator(0, columnId, key(2), key(8), reverse, Duration.ofMillis(RANGE_TIMEOUT_MS));
+			var readOptions = iterators.get(iteratorId).objs().asList().stream()
+					.filter(ReadOptions.class::isInstance).map(ReadOptions.class::cast).toList();
+			try {
+				assertEquals(1, readOptions.size());
+				assertFalse(readOptions.getFirst().asyncIo());
+				assertTrue(readOptions.getFirst().fillCache());
+				assertTrue(readOptions.getFirst().deadline() > 0);
+				var expected = new ArrayList<>(rows.subList(2, 8).stream().map(KV::value).toList());
+				if (reverse) Collections.reverse(expected);
+				assertEquals(expected, api.subsequent(iteratorId, 0, 10, RequestType.multi()));
+			} finally {
+				api.closeIterator(iteratorId);
+			}
+			assertFalse(iterators.containsKey(iteratorId));
+			assertFalse(readOptions.getFirst().isOwningHandle(), "closing the iterator must release retained ReadOptions");
 		}
 	}
 
