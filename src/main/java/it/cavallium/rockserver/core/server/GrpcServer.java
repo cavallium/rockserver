@@ -2177,7 +2177,12 @@ public class GrpcServer extends Server {
 					responseBuilder.setPrevious(Utils.toByteString(forUpdate.previous()));
 				}
 				return responseBuilder.build();
-			}).transform(this.onErrorMapMonoWithRequestInfo("getForUpdate", request));
+			}, response -> {
+				if (request.getTransactionOrUpdateId() == 0L) {
+					protectedApi().closeFailedUpdate(response.getUpdateId());
+				}
+			}, scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
+					.transform(this.onErrorMapMonoWithRequestInfo("getForUpdate", request));
 		}
 
 		@Override

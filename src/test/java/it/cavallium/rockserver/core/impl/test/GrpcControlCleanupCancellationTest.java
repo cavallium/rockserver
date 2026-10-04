@@ -7,6 +7,13 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.grpc.BindableService;
+import io.grpc.ForwardingServerCallListener;
+import io.grpc.Metadata;
+import io.grpc.ServerCall;
+import io.grpc.ServerCallHandler;
+import io.grpc.ServerInterceptor;
+import io.grpc.netty.NettyServerBuilder;
 import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.buffer.Buf;
@@ -42,12 +49,15 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class GrpcControlCleanupCancellationTest {
 
@@ -71,6 +81,7 @@ class GrpcControlCleanupCancellationTest {
 	private Path configFile;
 	private EmbeddedConnection embeddedConnection;
 	private GrpcServer grpcServer;
+	private io.grpc.Server observedServer;
 
 	@BeforeEach
 	void setUp() throws IOException {
@@ -107,6 +118,16 @@ class GrpcControlCleanupCancellationTest {
 			client.close();
 		}
 		clients.clear();
+		if (observedServer != null) {
+			observedServer.shutdownNow();
+			try {
+				assertTrue(observedServer.awaitTermination(5, TimeUnit.SECONDS));
+			} catch (InterruptedException error) {
+				Thread.currentThread().interrupt();
+				throw new IOException(error);
+			}
+			observedServer = null;
+		}
 		if (grpcServer != null) {
 			grpcServer.close();
 			grpcServer = null;
@@ -419,6 +440,207 @@ class GrpcControlCleanupCancellationTest {
 		grpcServer = null;
 		assertEquals(0, embeddedConnection.getInternalDB().getOpenIteratorsCount());
 		assertEquals(0L, embeddedConnection.getInternalDB().getPendingOpsCount());
+	}
+
+	@Test
+	void cancelledRunningNewForUpdateClosesItsLateAllocationExactlyOnce() throws Exception {
+		var backend = new BlockingForUpdateConnection(embeddedConnection);
+		var cancelled = new CountDownLatch(1);
+		var client = observedClient(backend, cancelled);
+		long column = newForUpdateColumn();
+		var scheduler = embeddedConnection.getScheduler();
+		var blockedControl = blockLane(2, scheduler.executor(WorkloadProfile.CONTROL,
+				OperationFamily.CONTROL, Long.MAX_VALUE)::execute);
+		try {
+			var request = client.getAsyncApi(RequestContext.ingest()).getAsync(0, column, key(1), RequestType.forUpdate());
+			assertTrue(backend.allocated.await(5, TimeUnit.SECONDS));
+			assertEquals(1, embeddedConnection.getInternalDB().getOpenTransactionsCount());
+			assertEquals(1L, embeddedConnection.getInternalDB().getPendingOpsCount());
+			assertTrue(request.cancel(true));
+			assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+			backend.release.countDown();
+			awaitCondition(() -> scheduler.queuedTasks(WorkloadProfile.CONTROL) == 1,
+					"late update cleanup was not submitted to CONTROL");
+			assertEquals(0, backend.cleanups.get());
+		} finally {
+			backend.release.countDown();
+			blockedControl.release();
+		}
+		awaitCondition(() -> embeddedConnection.getInternalDB().getOpenTransactionsCount() == 0
+				&& embeddedConnection.getInternalDB().getPendingOpsCount() == 0L,
+				"late new update allocation was not released before its TTL");
+		awaitCondition(() -> scheduler.poolSnapshot(RWScheduler.Pool.CONTROL).drainedAndConserved(),
+				"protected late cleanup did not finish");
+		assertEquals(1, backend.cleanups.get());
+		assertEquals(RequestContext.batch(), backend.cleanupContext.get());
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void cancelledRunningForUpdatePreservesExistingOwner(boolean explicitTransaction) throws Exception {
+		long column = newForUpdateColumn();
+		var owner = embeddedConnection.getSyncApi(RequestContext.ingest());
+		long id = explicitTransaction ? owner.openTransaction(Duration.ofMinutes(1))
+				: owner.get(0, column, key(1), RequestType.forUpdate()).updateId();
+		var backend = new BlockingForUpdateConnection(embeddedConnection);
+		var cancelled = new CountDownLatch(1);
+		var client = observedClient(backend, cancelled);
+		try {
+			var request = client.getAsyncApi(RequestContext.ingest()).getAsync(id, column, key(1), RequestType.forUpdate());
+			assertTrue(backend.allocated.await(5, TimeUnit.SECONDS));
+			assertTrue(request.cancel(true));
+			assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+		} finally {
+			backend.release.countDown();
+		}
+		awaitCondition(() -> embeddedConnection.getScheduler().poolSnapshot(RWScheduler.Pool.WRITE).drainedAndConserved(),
+				"cancelled existing-owner operation did not finish");
+		awaitCondition(() -> embeddedConnection.getScheduler().poolSnapshot(RWScheduler.Pool.CONTROL).drainedAndConserved(),
+				"late response handling did not finish");
+		assertEquals(0, backend.cleanups.get());
+		assertEquals(1, embeddedConnection.getInternalDB().getOpenTransactionsCount());
+		owner.put(id, column, key(1), Buf.wrap(new byte[] {2}), RequestType.none());
+		if (explicitTransaction) assertTrue(owner.closeTransaction(id, true));
+		assertEquals(Buf.wrap(new byte[] {2}), owner.get(0, column, key(1), RequestType.current()));
+		assertEquals(0, embeddedConnection.getInternalDB().getOpenTransactionsCount());
+		assertEquals(0L, embeddedConnection.getInternalDB().getPendingOpsCount());
+	}
+
+	@Test
+	void successfulForUpdateTransfersNewAllocationToCallerWithoutCleanup() throws Exception {
+		var backend = new BlockingForUpdateConnection(embeddedConnection);
+		backend.release.countDown();
+		var client = observedClient(backend, new CountDownLatch(1));
+		long column = newForUpdateColumn();
+		var response = client.getAsyncApi(RequestContext.ingest()).getAsync(0, column, key(1), RequestType.forUpdate())
+				.get(5, TimeUnit.SECONDS);
+		assertEquals(Buf.wrap(new byte[] {1}), response.previous());
+		assertEquals(1, embeddedConnection.getInternalDB().getOpenTransactionsCount());
+		assertEquals(0, backend.cleanups.get());
+		embeddedConnection.getSyncApi(RequestContext.ingest()).closeFailedUpdate(response.updateId());
+		assertEquals(0L, embeddedConnection.getInternalDB().getPendingOpsCount());
+	}
+
+	@Test
+	void cancelledQueuedForUpdateAllocatesNoUpdate() throws Exception {
+		var backend = new BlockingForUpdateConnection(embeddedConnection);
+		backend.release.countDown();
+		var cancelled = new CountDownLatch(1);
+		var client = observedClient(backend, cancelled);
+		long column = newForUpdateColumn();
+		var scheduler = embeddedConnection.getScheduler();
+		var blockedWrite = blockLane(3, scheduler.executor(RequestContext.ingest(), OperationFamily.MUTATION)::execute);
+		try {
+			var request = client.getAsyncApi(RequestContext.ingest()).getAsync(0, column, key(1), RequestType.forUpdate());
+			awaitCondition(() -> scheduler.queuedTasks(WorkloadProfile.INGEST) == 1, "for-update was not queued");
+			assertTrue(request.cancel(true));
+			assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+			assertEquals(0, scheduler.queuedTasks(WorkloadProfile.INGEST));
+		} finally {
+			blockedWrite.release();
+		}
+		awaitCondition(() -> scheduler.poolSnapshot(RWScheduler.Pool.WRITE).drainedAndConserved(),
+				"write lane did not drain after queued cancellation");
+		assertEquals(1, backend.allocated.getCount());
+		assertEquals(0, backend.cleanups.get());
+		assertEquals(0, embeddedConnection.getInternalDB().getOpenTransactionsCount());
+		assertEquals(0L, embeddedConnection.getInternalDB().getPendingOpsCount());
+	}
+
+	private long newForUpdateColumn() {
+		var api = embeddedConnection.getSyncApi(RequestContext.batch());
+		long column = api.createColumn("for-update", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+		api.put(0, column, key(1), Buf.wrap(new byte[] {1}), RequestType.none());
+		return column;
+	}
+
+	private GrpcConnection observedClient(RocksDBConnection backend, CountDownLatch cancelled) throws Exception {
+		grpcServer.close();
+		grpcServer = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0));
+		var grpcField = GrpcServer.class.getDeclaredField("grpc");
+		grpcField.setAccessible(true);
+		var service = (BindableService) grpcField.get(grpcServer);
+		observedServer = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
+				.addService(service)
+				.intercept(new ServerInterceptor() {
+					@Override
+					public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
+							Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+						var delegate = next.startCall(call, headers);
+						return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(delegate) {
+							@Override
+							public void onCancel() {
+								super.onCancel();
+								cancelled.countDown();
+							}
+						};
+					}
+				}).build().start();
+		var client = GrpcConnection.forHostAndPort("grpc-for-update-cancellation-client",
+				new Utils.HostAndPort("127.0.0.1", observedServer.getPort()));
+		clients.add(client);
+		return client;
+	}
+
+	private static final class BlockingForUpdateConnection implements RocksDBConnection, InternalConnection {
+		private final EmbeddedConnection delegate;
+		private final CountDownLatch allocated = new CountDownLatch(1);
+		private final CountDownLatch release = new CountDownLatch(1);
+		private final AtomicInteger cleanups = new AtomicInteger();
+		private final AtomicReference<RequestContext> cleanupContext = new AtomicReference<>();
+
+		private BlockingForUpdateConnection(EmbeddedConnection delegate) {
+			this.delegate = delegate;
+		}
+
+		@Override
+		public URI getUrl() {
+			return delegate.getUrl();
+		}
+
+		@Override
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+			return delegate.getCapabilities();
+		}
+
+		@Override
+		public RocksDBSyncAPI getSyncApi(RequestContext context) {
+			var api = delegate.getSyncApi(context);
+			return new RocksDBSyncAPI() {
+				@Override
+				public <I, S, A> S requestSync(RocksDBAPICommand<I, S, A> command) {
+					if (command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate) {
+						cleanups.incrementAndGet();
+						cleanupContext.set(context);
+					}
+					var result = api.requestSync(command);
+					if (command instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Get<?> get
+							&& get.requestType().getRequestTypeId() == RequestType.RequestTypeId.FOR_UPDATE) {
+						allocated.countDown();
+						awaitUninterruptibly(release);
+					}
+					return result;
+				}
+			};
+		}
+
+		@Override
+		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
+			return delegate.getAsyncApi(context);
+		}
+
+		@Override
+		public RWScheduler getScheduler() {
+			return delegate.getScheduler();
+		}
+
+		@Override
+		public EmbeddedDB getEmbeddedDB() {
+			return delegate.getEmbeddedDB();
+		}
+
+		@Override
+		public void close() {}
 	}
 
 	private GrpcConnection newClient() {
