@@ -3169,6 +3169,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				tx = null;
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
+			if (updateId != 0L) {
+				synchronized (tx) {
+					requireLiveOwnedUpdate(updateId, tx);
+					return put(tx, col, updateId, keys, value, requestType);
+				}
+			}
 			return put(tx, col, updateId, keys, value, requestType);
 		} catch (RocksDBRetryException ex) {
 			throw ex;
@@ -3205,6 +3211,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				tx = null;
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
+			if (updateId != 0L) {
+				synchronized (tx) {
+					requireLiveOwnedUpdate(updateId, tx);
+					return delete(tx, col, updateId, keys, requestType);
+				}
+			}
 			return delete(tx, col, updateId, keys, requestType);
 		} catch (RocksDBRetryException ex) {
 			throw ex;
@@ -3241,6 +3253,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				tx = null;
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
+			if (updateId != 0L) {
+				synchronized (tx) {
+					requireLiveOwnedUpdate(updateId, tx);
+					return merge(tx, col, updateId, keys, value, requestType);
+				}
+			}
 			return merge(tx, col, updateId, keys, value, requestType);
 		} catch (RocksDBRetryException ex) {
 			throw ex;
@@ -3288,7 +3306,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
 
 			if (updateId != 0) {
-				return deleteMultiWithUpdateId(tx, updateId, col, keysList, requestType);
+				synchronized (tx) {
+					requireLiveOwnedUpdate(updateId, tx);
+					return deleteMultiWithUpdateId(tx, updateId, col, keysList, requestType);
+				}
 			}
 
 			List<T> responses =
@@ -3366,7 +3387,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					committedOwnedTx = true;
 				} catch (RocksDBRetryException e) {
-					if (savePointSet) {
+					if (savePointSet && tx.val().isOwningHandle()) {
 						try {
 							tx.val().rollbackToSavePoint();
 						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
@@ -3375,7 +3396,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					throw e;
 				} catch (Throwable t) {
-					if (savePointSet) {
+					if (savePointSet && tx.val().isOwningHandle()) {
 						try {
 							tx.val().rollbackToSavePoint();
 						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
@@ -3560,7 +3581,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
 
 			if (updateId != 0) {
-				return putMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
+				synchronized (tx) {
+					requireLiveOwnedUpdate(updateId, tx);
+					return putMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
+				}
 			}
 			if (tx == null && WriteElisionRequest.from(requestType) != null) {
 				return putMultiWithWriteElision(start, columnId, col, keysList, valueList, requestType);
@@ -3701,7 +3725,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					committedOwnedTx = true;
 				} catch (RocksDBRetryException e) {
-					if (savePointSet) {
+					if (savePointSet && tx.val().isOwningHandle()) {
 						try {
 							tx.val().rollbackToSavePoint();
 						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
@@ -3710,7 +3734,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					throw e;
 				} catch (Throwable t) {
-					if (savePointSet) {
+					if (savePointSet && tx.val().isOwningHandle()) {
 						try {
 							tx.val().rollbackToSavePoint();
 						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
@@ -3765,7 +3789,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
 
 			if (updateId != 0) {
-				return mergeMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
+				synchronized (tx) {
+					requireLiveOwnedUpdate(updateId, tx);
+					return mergeMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
+				}
 			}
 
 			List<T> responses =
@@ -3845,7 +3872,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					committedOwnedTx = true;
 				} catch (RocksDBRetryException e) {
-					if (savePointSet) {
+					if (savePointSet && tx.val().isOwningHandle()) {
 						try {
 							tx.val().rollbackToSavePoint();
 						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
@@ -3854,7 +3881,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					throw e;
 				} catch (Throwable t) {
-					if (savePointSet) {
+					if (savePointSet && tx.val().isOwningHandle()) {
 						try {
 							tx.val().rollbackToSavePoint();
 						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
@@ -5130,7 +5157,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 
 			try {
-				var result = get(tx, updateId, col, keys, requestType);
+				T result;
+				if (tx != null && tx.isFromGetForUpdate()) {
+					synchronized (tx) {
+						requireLiveOwnedUpdate(transactionOrUpdateId != 0L ? transactionOrUpdateId : updateId, tx);
+						result = get(tx, updateId, col, keys, requestType);
+					}
+				} else {
+					result = get(tx, updateId, col, keys, requestType);
+				}
 				actionLogger.logAction("Get (result)",
 						start,
 						columnId,
@@ -10402,6 +10437,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} catch (Throwable error) {
 			use.close();
 			throw error;
+		}
+	}
+
+	private void requireLiveOwnedUpdate(long updateId, Tx tx) {
+		if (txs.get(updateId) != tx || !tx.val().isOwningHandle()) {
+			throw RocksDBException.of(RocksDBErrorType.TRANSACTION_NOT_FOUND, "No transaction with id " + updateId);
 		}
 	}
 
