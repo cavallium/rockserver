@@ -280,8 +280,7 @@ class RocksDBLoaderComplexConfigTest {
             assertFalse(v2.levelCompactionDynamicLevelBytes());
             assertEquals(List.of(
                     new DbPath(dbPath.resolve("nvme-v2").toAbsolutePath().normalize(), 1L << 30),
-                    // RocksDB normalizes the final capacity path target to zero (unbounded).
-                    new DbPath(dbPath.resolve("hdd-v2").toAbsolutePath().normalize(), 0L)),
+                    new DbPath(dbPath.resolve("hdd-v2").toAbsolutePath().normalize(), 16L << 30)),
                     v2.cfPaths());
             assertEquals(1, EmbeddedDB.bottommostCompactionTargetPathId(v2));
             var rejected = assertThrows(RocksDBException.class,
