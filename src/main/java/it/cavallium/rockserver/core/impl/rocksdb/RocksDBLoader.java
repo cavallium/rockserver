@@ -1051,8 +1051,11 @@ public class RocksDBLoader {
 
             for (Map.Entry<String, FallbackColumnConfig> entry : columnConfigMap.entrySet()) {
                 String name = entry.getKey();
-                var columnFamilyOptions = getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
-                        logger, refs, path == null, optionsWithCache.caches());
+                var columnFamilyOptions = !(entry.getValue() instanceof NamedColumnConfig)
+                        && (name.equals("_column_schemas_") || name.equals("_merge_operators_") || name.equals("_cdc_meta_"))
+                        ? new ColumnOptionsWithMerge(getCompatibilityColumnOptions(refs), null)
+                        : getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
+                                logger, refs, path == null, optionsWithCache.caches());
 
                 // Create base directories
                 List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, entry.getValue());
