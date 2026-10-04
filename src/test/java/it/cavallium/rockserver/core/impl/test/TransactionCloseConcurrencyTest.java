@@ -40,7 +40,6 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
-import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.rocksdb.Transaction;
 
@@ -73,8 +72,8 @@ class TransactionCloseConcurrencyTest {
 							db, transactionId, secondThread, ready, start));
 					assertTrue(ready.await(1, TimeUnit.SECONDS));
 					start.countDown();
-					awaitWaitingForExclusiveOwnership(firstThread);
-					awaitWaitingForExclusiveOwnership(secondThread);
+					awaitBlockedOnTransaction(firstThread);
+					awaitBlockedOnTransaction(secondThread);
 				}
 
 				assertOneSuccessfulCommit(first.get(1, TimeUnit.SECONDS), second.get(1, TimeUnit.SECONDS));
@@ -87,13 +86,13 @@ class TransactionCloseConcurrencyTest {
 
 	@ParameterizedTest
 	@MethodSource("operationAndCleaner")
-	void ownedUpdateUseExcludesRollbackAndExpiryCleaner(Operation operation, boolean cleaner) throws Exception {
+	void transactionUseExcludesRollbackAndExpiryCleaner(Operation operation, boolean cleaner, boolean owned) throws Exception {
 		try (var connection = ownedUpdateConnection()) {
 			var db = connection.getInternalDB();
 			long column = createColumn(connection);
-			long id = db.get(0, column, key(1), RequestType.forUpdate(), WorkloadProfile.INGEST).updateId();
+			long id = openTransaction(connection, column, owned);
 			var probe = replaceNativeTransaction(db, id, cleaner ? 0L : Long.MAX_VALUE);
-			probe.blockMethod = operation.nativeMethod;
+			probe.blockMethod = operation.nativeMethod(owned);
 			var closerThread = new AtomicReference<Thread>();
 			try (var executor = Executors.newFixedThreadPool(2)) {
 				var operationFuture = executor.submit(() -> operation.run(db, id, column));
@@ -125,17 +124,17 @@ class TransactionCloseConcurrencyTest {
 			assertEquals(0, db.getPendingOpsCount());
 			db.closeFailedUpdate(id);
 			assertEquals(1, probe.closes.get());
-			assertEquals(operation.expectedValue(), db.get(0, column, key(1), RequestType.current()));
+			assertEquals(owned ? operation.expectedValue() : bytes("a"), db.get(0, column, key(1), RequestType.current()));
 		}
 	}
 
 	@ParameterizedTest
-	@EnumSource(Operation.class)
-	void removedOwnedUpdateIsRejectedBeforeNativeUse(Operation operation) throws Exception {
+	@MethodSource("operationAndOwnership")
+	void removedTransactionIsRejectedBeforeNativeUse(Operation operation, boolean owned) throws Exception {
 		try (var connection = ownedUpdateConnection()) {
 			var db = connection.getInternalDB();
 			long column = createColumn(connection);
-			long id = db.get(0, column, key(1), RequestType.forUpdate(), WorkloadProfile.INGEST).updateId();
+			long id = openTransaction(connection, column, owned);
 			var probe = replaceNativeTransaction(db, id, Long.MAX_VALUE);
 			var monitor = transactionMap(db).get(id);
 			var callerThread = new AtomicReference<Thread>();
@@ -243,6 +242,89 @@ class TransactionCloseConcurrencyTest {
 		}
 	}
 
+	@ParameterizedTest
+	@MethodSource("explicitMutationAndCommit")
+	void explicitMutationsStayInvisibleUntilCommitAndAreDiscardedByRollback(Operation operation, boolean commit) throws Exception {
+		try (var connection = ownedUpdateConnection()) {
+			var db = connection.getInternalDB();
+			long column = createColumn(connection);
+			long id = openTransaction(connection, column, false);
+			var probe = replaceNativeTransaction(db, id, Long.MAX_VALUE);
+			operation.run(db, id, column);
+			assertEquals(bytes("a"), db.get(0, column, key(1), RequestType.current()));
+			assertEquals(operation.expectedValue(), db.get(id, column, key(1), RequestType.current(), WorkloadProfile.INGEST));
+			assertEquals(1, db.getOpenTransactionsCount());
+			assertEquals(1, db.getPendingOpsCount());
+			assertEquals(0, probe.closes.get());
+			assertTrue(db.closeTransaction(id, commit));
+			assertEquals(commit ? operation.expectedValue() : bytes("a"), db.get(0, column, key(1), RequestType.current()));
+			assertEquals(1, probe.closes.get());
+			assertEquals(0, probe.closedNativeCalls.get());
+			assertEquals(0, db.getOpenTransactionsCount());
+			assertEquals(0, db.getPendingOpsCount());
+		}
+	}
+
+	@Test
+	void sameExplicitTransactionOperationsSerialize() throws Exception {
+		try (var connection = ownedUpdateConnection()) {
+			var db = connection.getInternalDB();
+			long column = createColumn(connection);
+			long id = openTransaction(connection, column, false);
+			var probe = replaceNativeTransaction(db, id, Long.MAX_VALUE);
+			probe.blockMethod = "put";
+			var secondThread = new AtomicReference<Thread>();
+			try (var executor = Executors.newFixedThreadPool(2)) {
+				var mutation = executor.submit(() -> Operation.PUT.run(db, id, column));
+				try {
+					assertTrue(probe.entered.await(2, TimeUnit.SECONDS));
+					var read = executor.submit(() -> {
+						secondThread.set(Thread.currentThread());
+						return Operation.CURRENT.run(db, id, column);
+					});
+					awaitBlockedOnTransaction(secondThread);
+					assertFalse(read.isDone());
+					probe.release.countDown();
+					mutation.get(2, TimeUnit.SECONDS);
+					assertEquals(bytes("b"), read.get(2, TimeUnit.SECONDS));
+				} finally {
+					probe.release.countDown();
+				}
+			}
+			assertEquals(0, probe.closedNativeCalls.get());
+			assertEquals(0, probe.closes.get());
+			assertTrue(db.closeTransaction(id, false));
+			assertEquals(bytes("a"), db.get(0, column, key(1), RequestType.current()));
+			assertEquals(0, db.getOpenTransactionsCount());
+			assertEquals(0, db.getPendingOpsCount());
+		}
+	}
+
+	@Test
+	void conflictingExplicitCommitKeepsItsHandleUntilRollbackAndFreshTransactionReadsNewValue() throws Exception {
+		try (var connection = ownedUpdateConnection()) {
+			var db = connection.getInternalDB();
+			long column = createColumn(connection);
+			long id = openTransaction(connection, column, false);
+			var probe = replaceNativeTransaction(db, id, Long.MAX_VALUE);
+			db.get(id, column, key(1), RequestType.forUpdate(), WorkloadProfile.INGEST);
+			db.put(0, column, key(1), bytes("new"), RequestType.none());
+			db.put(id, column, key(2), bytes("pending"), RequestType.none());
+			assertFalse(db.closeTransaction(id, true));
+			assertEquals(0, probe.closes.get());
+			assertEquals(1, db.getOpenTransactionsCount());
+			assertEquals(1, db.getPendingOpsCount());
+			assertTrue(db.closeTransaction(id, false));
+			long freshId = openTransaction(connection, column, false);
+			assertEquals(bytes("new"), db.get(freshId, column, key(1), RequestType.current(), WorkloadProfile.INGEST));
+			assertEquals(null, db.get(freshId, column, key(2), RequestType.current(), WorkloadProfile.INGEST));
+			assertTrue(db.closeTransaction(freshId, false));
+			assertEquals(0, probe.closedNativeCalls.get());
+			assertEquals(0, db.getOpenTransactionsCount());
+			assertEquals(0, db.getPendingOpsCount());
+		}
+	}
+
 	private EmbeddedConnection ownedUpdateConnection() throws Exception {
 		var config = tempDir.resolve("owned-update.conf");
 		Files.writeString(config, """
@@ -272,7 +354,22 @@ class TransactionCloseConcurrencyTest {
 
 	private static Stream<Arguments> operationAndCleaner() {
 		return Stream.of(Operation.values()).flatMap(operation -> Stream.of(false, true)
-				.map(cleaner -> Arguments.of(operation, cleaner)));
+				.flatMap(cleaner -> Stream.of(false, true).map(owned -> Arguments.of(operation, cleaner, owned))));
+	}
+
+	private static Stream<Arguments> operationAndOwnership() {
+		return Stream.of(Operation.values()).flatMap(operation -> Stream.of(false, true)
+				.map(owned -> Arguments.of(operation, owned)));
+	}
+
+	private static Stream<Arguments> explicitMutationAndCommit() {
+		return Stream.of(Operation.values()).filter(operation -> operation.nativeMethod.matches("put|delete|merge"))
+				.flatMap(operation -> Stream.of(false, true).map(commit -> Arguments.of(operation, commit)));
+	}
+
+	private static long openTransaction(EmbeddedConnection connection, long column, boolean owned) {
+		return owned ? connection.getInternalDB().get(0, column, key(1), RequestType.forUpdate(), WorkloadProfile.INGEST).updateId()
+				: connection.getSyncApi(RequestContext.ingest()).openTransaction(java.time.Duration.ofMinutes(1));
 	}
 
 	private static Stream<Arguments> mutationAndFailure() {
@@ -280,7 +377,7 @@ class TransactionCloseConcurrencyTest {
 				.flatMap(operation -> Stream.of(false, true).map(failure -> Arguments.of(operation, failure)));
 	}
 
-	private static void awaitBlockedOnTransaction(AtomicReference<Thread> reference) {
+	static void awaitBlockedOnTransaction(AtomicReference<Thread> reference) {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
 		while ((reference.get() == null || reference.get().getState() != Thread.State.BLOCKED)
 				&& System.nanoTime() < deadline) Thread.onSpinWait();
@@ -301,11 +398,11 @@ class TransactionCloseConcurrencyTest {
 		return (Map<Long, Tx>) field.get(db);
 	}
 
-	private static NativeProbe replaceNativeTransaction(EmbeddedDB db, long id, long expiry) throws Exception {
+	static NativeProbe replaceNativeTransaction(EmbeddedDB db, long id, long expiry) throws Exception {
 		var transactions = transactionMap(db);
 		var old = transactions.get(id);
 		var probe = new NativeProbe(old.val());
-		transactions.put(id, new Tx(probe.wrapped, true, expiry, old.objs(), old.workloadProfile()));
+		transactions.put(id, new Tx(probe.wrapped, old.isFromGetForUpdate(), expiry, old.objs(), old.workloadProfile()));
 		return probe;
 	}
 
@@ -319,14 +416,14 @@ class TransactionCloseConcurrencyTest {
 		}
 	}
 
-	private static final class NativeProbe {
+	static final class NativeProbe {
 		private final Transaction original;
 		private final Transaction wrapped;
-		private final CountDownLatch entered = new CountDownLatch(1);
-		private final CountDownLatch release = new CountDownLatch(1);
-		private final AtomicInteger closes = new AtomicInteger();
-		private final AtomicInteger closedNativeCalls = new AtomicInteger();
-		private volatile String blockMethod;
+		final CountDownLatch entered = new CountDownLatch(1);
+		final CountDownLatch release = new CountDownLatch(1);
+		final AtomicInteger closes = new AtomicInteger();
+		final AtomicInteger closedNativeCalls = new AtomicInteger();
+		volatile String blockMethod;
 		private volatile org.rocksdb.RocksDBException commitFailure;
 
 		private NativeProbe(Transaction original) {
@@ -361,6 +458,10 @@ class TransactionCloseConcurrencyTest {
 			this.multi = multi;
 		}
 
+		private String nativeMethod(boolean owned) {
+			return this == CURRENT && !owned ? "get" : nativeMethod;
+		}
+
 		private Object run(EmbeddedDB db, long id, long column) {
 			return switch (this) {
 				case PUT -> db.put(id, column, key(1), bytes("b"), RequestType.none());
@@ -393,27 +494,10 @@ class TransactionCloseConcurrencyTest {
 		ready.countDown();
 		start.await();
 		try {
-			return new CloseResult(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransaction(transactionId, true), null);
+			return new CloseResult(db.getInternalDB().closeTransaction(transactionId, true), null);
 		} catch (Throwable error) {
 			return new CloseResult(false, error);
 		}
-	}
-
-	private static void awaitWaitingForExclusiveOwnership(AtomicReference<Thread> threadReference) {
-		Thread thread = threadReference.get();
-		assertNotNull(thread);
-		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-		while (!isWaiting(thread.getState()) && System.nanoTime() < deadline) {
-			Thread.onSpinWait();
-		}
-		assertTrue(isWaiting(thread.getState()),
-				() -> "transaction closer did not wait for exclusive ownership: " + thread.getState());
-	}
-
-	private static boolean isWaiting(Thread.State state) {
-		return state == Thread.State.BLOCKED
-				|| state == Thread.State.WAITING
-				|| state == Thread.State.TIMED_WAITING;
 	}
 
 	private static void assertOneSuccessfulCommit(CloseResult first, CloseResult second) {

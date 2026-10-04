@@ -3169,9 +3169,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				tx = null;
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-			if (updateId != 0L) {
+			if (tx != null) {
 				synchronized (tx) {
-					requireLiveOwnedUpdate(updateId, tx);
+					requireLiveTransaction(transactionOrUpdateId, tx);
 					return put(tx, col, updateId, keys, value, requestType);
 				}
 			}
@@ -3211,9 +3211,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				tx = null;
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-			if (updateId != 0L) {
+			if (tx != null) {
 				synchronized (tx) {
-					requireLiveOwnedUpdate(updateId, tx);
+					requireLiveTransaction(transactionOrUpdateId, tx);
 					return delete(tx, col, updateId, keys, requestType);
 				}
 			}
@@ -3253,9 +3253,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				tx = null;
 			}
 			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-			if (updateId != 0L) {
+			if (tx != null) {
 				synchronized (tx) {
-					requireLiveOwnedUpdate(updateId, tx);
+					requireLiveTransaction(transactionOrUpdateId, tx);
 					return merge(tx, col, updateId, keys, value, requestType);
 				}
 			}
@@ -3307,31 +3307,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			if (updateId != 0) {
 				synchronized (tx) {
-					requireLiveOwnedUpdate(updateId, tx);
+					requireLiveTransaction(updateId, tx);
 					return deleteMultiWithUpdateId(tx, updateId, col, keysList, requestType);
 				}
 			}
 
-			List<T> responses =
-					requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
-			for (int i = 0; i < keysList.size(); i++) {
-				var keys = keysList.get(i);
-				actionLogger.logAction("deleteMulti (next)",
-						start,
-						columnId,
-						keys,
-						null,
-						transactionOrUpdateId,
-						null,
-						null,
-						requestType
-				);
-				T result = delete(tx, col, 0L, keys, requestType);
-				if (responses != null) {
-					responses.add(result);
+			if (tx != null) {
+				synchronized (tx) {
+					requireLiveTransaction(transactionOrUpdateId, tx);
+					return deleteMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, requestType);
 				}
 			}
-			return responses != null ? responses : List.of();
+			return deleteMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, requestType);
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -3344,6 +3331,35 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var end = System.nanoTime();
 			putMultiTimer.record(end - start, TimeUnit.NANOSECONDS); // Re-use putMultiTimer
 		}
+	}
+
+	private <T> List<T> deleteMultiWithoutUpdateId(long start,
+			long columnId,
+			long transactionOrUpdateId,
+			@Nullable Tx tx,
+			ColumnInstance col,
+			List<Keys> keysList,
+			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
+		List<T> responses =
+				requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+		for (int i = 0; i < keysList.size(); i++) {
+			var keys = keysList.get(i);
+			actionLogger.logAction("deleteMulti (next)",
+					start,
+					columnId,
+					keys,
+					null,
+					transactionOrUpdateId,
+					null,
+					null,
+					requestType
+			);
+			T result = delete(tx, col, 0L, keys, requestType);
+			if (responses != null) {
+				responses.add(result);
+			}
+		}
+		return responses != null ? responses : List.of();
 	}
 
 	private <T> List<T> deleteMultiWithUpdateId(Tx tx,
@@ -3582,7 +3598,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			if (updateId != 0) {
 				synchronized (tx) {
-					requireLiveOwnedUpdate(updateId, tx);
+					requireLiveTransaction(updateId, tx);
 					return putMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
 				}
 			}
@@ -3590,30 +3606,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return putMultiWithWriteElision(start, columnId, col, keysList, valueList, requestType);
 			}
 
-			List<T> responses =
-					requestType instanceof RequestType.RequestNothing<?>
-							|| requestType instanceof RequestType.RequestEnsure<?>
-							? null
-							: new ArrayList<>(keysList.size());
-			for (int i = 0; i < keysList.size(); i++) {
-				var keys = keysList.get(i);
-				var value = valueList.get(i);
-				actionLogger.logAction("putMulti (next)",
-						start,
-						columnId,
-						keys,
-						value,
-						transactionOrUpdateId,
-						null,
-						null,
-						requestType
-				);
-				T result = put(tx, col, 0L, keys, value, requestType);
-				if (responses != null) {
-					responses.add(result);
+			if (tx != null) {
+				synchronized (tx) {
+					requireLiveTransaction(transactionOrUpdateId, tx);
+					return putMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, valueList, requestType);
 				}
 			}
-			return responses != null ? responses : List.of();
+			return putMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, valueList, requestType);
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -3669,6 +3668,40 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				result = put(null, col, 0L, keys, value, requestType, false);
 				dirtyPhysicalKeys.add(physicalKey);
 			}
+			if (responses != null) {
+				responses.add(result);
+			}
+		}
+		return responses != null ? responses : List.of();
+	}
+
+	private <T> List<T> putMultiWithoutUpdateId(long start,
+			long columnId,
+			long transactionOrUpdateId,
+			@Nullable Tx tx,
+			ColumnInstance col,
+			List<Keys> keysList,
+			List<@NotNull Buf> valueList,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		List<T> responses =
+				requestType instanceof RequestType.RequestNothing<?>
+						|| requestType instanceof RequestType.RequestEnsure<?>
+						? null
+						: new ArrayList<>(keysList.size());
+		for (int i = 0; i < keysList.size(); i++) {
+			var keys = keysList.get(i);
+			var value = valueList.get(i);
+			actionLogger.logAction("putMulti (next)",
+					start,
+					columnId,
+					keys,
+					value,
+					transactionOrUpdateId,
+					null,
+					null,
+					requestType
+			);
+			T result = put(tx, col, 0L, keys, value, requestType);
 			if (responses != null) {
 				responses.add(result);
 			}
@@ -3790,32 +3823,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			if (updateId != 0) {
 				synchronized (tx) {
-					requireLiveOwnedUpdate(updateId, tx);
+					requireLiveTransaction(updateId, tx);
 					return mergeMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
 				}
 			}
 
-			List<T> responses =
-					requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
-			for (int i = 0; i < keysList.size(); i++) {
-				var keys = keysList.get(i);
-				var value = valueList.get(i);
-				actionLogger.logAction("mergeMulti (next)",
-						start,
-						columnId,
-						keys,
-						value,
-						transactionOrUpdateId,
-						null,
-						null,
-						requestType
-				);
-				T result = merge(tx, col, 0L, keys, value, requestType);
-				if (responses != null) {
-					responses.add(result);
+			if (tx != null) {
+				synchronized (tx) {
+					requireLiveTransaction(transactionOrUpdateId, tx);
+					return mergeMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, valueList, requestType);
 				}
 			}
-			return responses != null ? responses : List.of();
+			return mergeMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, valueList, requestType);
 		} catch (RocksDBException ex) {
 			throw ex;
 		} catch (Exception ex) {
@@ -3828,6 +3847,37 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var end = System.nanoTime();
 			putMultiTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
+	}
+
+	private <T> List<T> mergeMultiWithoutUpdateId(long start,
+			long columnId,
+			long transactionOrUpdateId,
+			@Nullable Tx tx,
+			ColumnInstance col,
+			List<Keys> keysList,
+			List<@NotNull Buf> valueList,
+			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
+		List<T> responses =
+				requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+		for (int i = 0; i < keysList.size(); i++) {
+			var keys = keysList.get(i);
+			var value = valueList.get(i);
+			actionLogger.logAction("mergeMulti (next)",
+					start,
+					columnId,
+					keys,
+					value,
+					transactionOrUpdateId,
+					null,
+					null,
+					requestType
+			);
+			T result = merge(tx, col, 0L, keys, value, requestType);
+			if (responses != null) {
+				responses.add(result);
+			}
+		}
+		return responses != null ? responses : List.of();
 	}
 
 	private <T> List<T> mergeMultiWithUpdateId(Tx tx,
@@ -5158,9 +5208,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			try {
 				T result;
-				if (tx != null && tx.isFromGetForUpdate()) {
+				if (tx != null) {
 					synchronized (tx) {
-						requireLiveOwnedUpdate(transactionOrUpdateId != 0L ? transactionOrUpdateId : updateId, tx);
+						requireLiveTransaction(transactionOrUpdateId != 0L ? transactionOrUpdateId : updateId, tx);
 						result = get(tx, updateId, col, keys, requestType);
 					}
 				} else {
@@ -10440,7 +10490,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private void requireLiveOwnedUpdate(long updateId, Tx tx) {
+	private void requireLiveTransaction(long updateId, Tx tx) {
 		if (txs.get(updateId) != tx || !tx.val().isOwningHandle()) {
 			throw RocksDBException.of(RocksDBErrorType.TRANSACTION_NOT_FOUND, "No transaction with id " + updateId);
 		}

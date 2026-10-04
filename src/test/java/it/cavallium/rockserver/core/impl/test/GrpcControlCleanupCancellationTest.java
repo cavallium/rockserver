@@ -443,6 +443,46 @@ class GrpcControlCleanupCancellationTest {
 	}
 
 	@Test
+	void cancelledRunningExplicitPointReadKeepsNativeOwnerUntilProtectedRollbackCanEnter() throws Exception {
+		long column = newForUpdateColumn();
+		var owner = embeddedConnection.getSyncApi(RequestContext.ingest());
+		long id = owner.openTransaction(Duration.ofMinutes(1));
+		var probe = TransactionCloseConcurrencyTest.replaceNativeTransaction(
+				embeddedConnection.getInternalDB(), id, Long.MAX_VALUE);
+		probe.blockMethod = "get";
+		var cancelled = new CountDownLatch(1);
+		var backend = new RecordingRollbackConnection(embeddedConnection);
+		var client = observedClient(backend, cancelled);
+		try {
+			var read = client.getAsyncApi(RequestContext.ingest()).getAsync(id, column, key(1), RequestType.current());
+			assertTrue(probe.entered.await(5, TimeUnit.SECONDS));
+			assertTrue(read.cancel(true));
+			assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+			assertTrue(read.isCancelled());
+			assertEquals(1, probe.release.getCount());
+			var rollback = client.getAsyncApi(RequestContext.ingest()).closeTransactionAsync(id, false);
+			awaitCondition(() -> grpcServer.getAcceptedMustCompleteOperationCountForTesting() == 1
+					&& embeddedConnection.getScheduler().poolSnapshot(RWScheduler.Pool.CONTROL).activeTasks() > 0,
+					"protected rollback did not start while the cancelled native call remained held");
+			TransactionCloseConcurrencyTest.awaitBlockedOnTransaction(backend.rollbackThread);
+			assertFalse(rollback.isDone());
+			assertEquals(0, probe.closes.get());
+			assertEquals(1, embeddedConnection.getInternalDB().getOpenTransactionsCount());
+			assertTrue(embeddedConnection.getInternalDB().getPendingOpsCount() >= 2);
+			probe.release.countDown();
+			assertTrue(rollback.get(5, TimeUnit.SECONDS));
+		} finally {
+			probe.release.countDown();
+		}
+		awaitCondition(() -> embeddedConnection.getInternalDB().getPendingOpsCount() == 0
+				&& grpcServer.getAcceptedMustCompleteOperationCountForTesting() == 0,
+				"cancelled native call and protected rollback did not both settle");
+		assertEquals(0, embeddedConnection.getInternalDB().getOpenTransactionsCount());
+		assertEquals(1, probe.closes.get());
+		assertEquals(0, probe.closedNativeCalls.get());
+	}
+
+	@Test
 	void cancelledRunningNewForUpdateClosesItsLateAllocationExactlyOnce() throws Exception {
 		var backend = new BlockingForUpdateConnection(embeddedConnection);
 		var cancelled = new CountDownLatch(1);
@@ -766,7 +806,7 @@ class GrpcControlCleanupCancellationTest {
 		}
 	}
 
-	private static final class RecordingRollbackConnection implements RocksDBConnection {
+	private static final class RecordingRollbackConnection implements RocksDBConnection, InternalConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
 			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
@@ -775,6 +815,7 @@ class GrpcControlCleanupCancellationTest {
 
 		private final RocksDBConnection delegate;
 		private final AtomicReference<RequestContext> rollbackContext = new AtomicReference<>();
+		private final AtomicReference<Thread> rollbackThread = new AtomicReference<>();
 
 		private RecordingRollbackConnection(RocksDBConnection delegate) {
 			this.delegate = delegate;
@@ -795,6 +836,7 @@ class GrpcControlCleanupCancellationTest {
 					if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction closeTransaction
 							&& !closeTransaction.commit()) {
 						rollbackContext.set(context);
+						rollbackThread.set(Thread.currentThread());
 					}
 					return delegateApi.requestSync(request);
 				}
@@ -804,6 +846,16 @@ class GrpcControlCleanupCancellationTest {
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
 			return delegate.getAsyncApi(context);
+		}
+
+		@Override
+		public RWScheduler getScheduler() {
+			return ((InternalConnection) delegate).getScheduler();
+		}
+
+		@Override
+		public EmbeddedDB getEmbeddedDB() {
+			return ((InternalConnection) delegate).getEmbeddedDB();
 		}
 
 		@Override
