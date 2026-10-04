@@ -742,7 +742,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				.filter(e -> Arrays.equals(e.getKey().getName(), COLUMN_SCHEMAS_COLUMN))
 				.findAny();
 		if (existingColumnSchemasColumnDescriptorOptional.isEmpty()) {
-			var columnSchemasColumnOptions = RocksDBLoader.getCompatibilityColumnOptions(refs);
+			var columnSchemasColumnOptions = RocksDBLoader.getCompatibilityColumnOptions(refs, path, definitiveDbPath, config);
 			var columnSchemasColumnDescriptor = new ColumnFamilyDescriptor(COLUMN_SCHEMAS_COLUMN,
 					columnSchemasColumnOptions);
 			try {
@@ -763,7 +763,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				.filter(e -> Arrays.equals(e.getKey().getName(), MERGE_OPERATORS_COLUMN))
 				.findAny();
 		if (existingMergeOperatorsColumnDescriptorOptional.isEmpty()) {
-			var mergeOperatorsColumnOptions = RocksDBLoader.getCompatibilityColumnOptions(refs);
+			var mergeOperatorsColumnOptions = RocksDBLoader.getCompatibilityColumnOptions(refs, path, definitiveDbPath, config);
 			var mergeOperatorsColumnDescriptor = new ColumnFamilyDescriptor(MERGE_OPERATORS_COLUMN,
 					mergeOperatorsColumnOptions);
 			try {
@@ -786,7 +786,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				.filter(e -> Arrays.equals(e.getKey().getName(), CDC_META_COLUMN))
 				.findAny();
 		if (existingCdcMetaColumnDescriptorOptional.isEmpty()) {
-			var cdcMetaColumnOptions = RocksDBLoader.getCompatibilityColumnOptions(refs);
+			var cdcMetaColumnOptions = RocksDBLoader.getCompatibilityColumnOptions(refs, path, definitiveDbPath, config);
 			var cdcMetaDescriptor = new ColumnFamilyDescriptor(CDC_META_COLUMN, cdcMetaColumnOptions);
 			try {
 				cdcMetaColumnDescriptorHandle = db.get().createColumnFamily(cdcMetaDescriptor);

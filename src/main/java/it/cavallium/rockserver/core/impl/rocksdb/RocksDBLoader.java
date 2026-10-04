@@ -207,6 +207,26 @@ public class RocksDBLoader {
         return columnFamilyOptions;
     }
 
+    public static ColumnFamilyOptions getCompatibilityColumnOptions(@NotNull RocksDBObjects refs,
+            @Nullable Path path, @NotNull Path definitiveDbPath, @NotNull DatabaseConfig config) throws IOException {
+        if (path == null) {
+            return getCompatibilityColumnOptions(refs);
+        }
+        List<DbPathRecord> volumeConfigs;
+        try {
+            volumeConfigs = getVolumeConfigs(definitiveDbPath, config.global().fallbackColumnOptions());
+        } catch (GestaltException e) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Failed to resolve internal column-family volumes", e);
+        }
+        for (DbPathRecord volumeConfig : volumeConfigs) {
+            Files.createDirectories(volumeConfig.path());
+        }
+        var columnFamilyOptions = getCompatibilityColumnOptions(refs);
+        columnFamilyOptions.setCfPaths(mapList(volumeConfigs, p -> new DbPath(p.path(), p.targetSize())));
+        return columnFamilyOptions;
+    }
+
     public static ColumnOptionsWithMerge getColumnOptions(String name,
         @Nullable Path path,
         @NotNull Path definitiveDbPath,
@@ -1053,7 +1073,7 @@ public class RocksDBLoader {
                 String name = entry.getKey();
                 var columnFamilyOptions = !(entry.getValue() instanceof NamedColumnConfig)
                         && (name.equals("_column_schemas_") || name.equals("_merge_operators_") || name.equals("_cdc_meta_"))
-                        ? new ColumnOptionsWithMerge(getCompatibilityColumnOptions(refs), null)
+                        ? new ColumnOptionsWithMerge(getCompatibilityColumnOptions(refs, path, definitiveDbPath, databaseOptions), null)
                         : getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
                                 logger, refs, path == null, optionsWithCache.caches());
 

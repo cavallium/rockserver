@@ -11,6 +11,7 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.config.ConfigParser;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.ByteArrayOutputStream;
@@ -58,36 +59,85 @@ class RocksDBCompatibilityOptionsTest {
 
 	@Test
 	void reopensFlushedInternalFamiliesWithDefaultVolume(@TempDir Path tempDir) throws Exception {
-		assertFlushedInternalFamiliesReopen(tempDir, false, false);
+		assertFlushedInternalFamiliesReopen(tempDir, Fixture.DEFAULT);
 	}
 
 	@Test
 	void reopensFlushedInternalFamiliesWithSeparateFallbackVolume(@TempDir Path tempDir) throws Exception {
-		assertFlushedInternalFamiliesReopen(tempDir, true, false);
+		assertFlushedInternalFamiliesReopen(tempDir, Fixture.SEPARATE);
 	}
 
 	@Test
 	void preservesExplicitInternalFamilyVolumesOnReopen(@TempDir Path tempDir) throws Exception {
-		assertFlushedInternalFamiliesReopen(tempDir, true, true);
+		assertFlushedInternalFamiliesReopen(tempDir, Fixture.NAMED);
 	}
 
-	private static void assertFlushedInternalFamiliesReopen(Path tempDir, boolean separateFallback,
-			boolean namedInternalFamilies) throws Exception {
+	@Test
+	void reopensLegacyExternalInternalFamiliesAfterRemovingNamedConfigs(@TempDir Path tempDir) throws Exception {
+		assertFlushedInternalFamiliesReopen(tempDir, Fixture.LEGACY);
+	}
+
+	@Test
+	void usesFallbackVolumesWhenDefaultHasDifferentNamedVolumes(@TempDir Path tempDir) throws Exception {
+		assertFlushedInternalFamiliesReopen(tempDir, Fixture.NAMED_DEFAULT);
+	}
+
+	@Test
+	void reopensInternalFamiliesWithDatabaseRootFallback(@TempDir Path tempDir) throws Exception {
+		assertFlushedInternalFamiliesReopen(tempDir, Fixture.ROOT_FALLBACK);
+	}
+
+	@Test
+	void honorsExplicitRootInternalOverrideWithExternalFallback(@TempDir Path tempDir) throws Exception {
+		assertFlushedInternalFamiliesReopen(tempDir, Fixture.ROOT_OVERRIDE);
+	}
+
+	@Test
+	void inMemoryCompatibilityOptionsDoNotConfigurePathsOrCreateDirectories(@TempDir Path tempDir) throws Exception {
+		Path configPath = tempDir.resolve("memory.conf");
+		Files.writeString(configPath, "database.global.fallback-column-options.volumes: ["
+				+ "{ volume-path: \"unused-volume\", target-size: \"1GiB\" }]");
+		try (var refs = new RocksDBObjects()) {
+			var options = RocksDBLoader.getCompatibilityColumnOptions(refs, null, tempDir, ConfigParser.parse(configPath));
+			assertTrue(options.cfPaths().isEmpty());
+			assertFalse(Files.exists(tempDir.resolve("unused-volume")));
+		}
+	}
+
+	private enum Fixture { DEFAULT, SEPARATE, NAMED, LEGACY, NAMED_DEFAULT, ROOT_FALLBACK, ROOT_OVERRIDE }
+
+	private static void assertFlushedInternalFamiliesReopen(Path tempDir, Fixture fixture) throws Exception {
+		boolean namedInternalFamilies = fixture == Fixture.NAMED || fixture == Fixture.LEGACY || fixture == Fixture.ROOT_OVERRIDE;
 		Path dbPath = tempDir.resolve("db");
 		Path configPath = null;
-		if (separateFallback) {
+		String fallbackConfig = null;
+		List<DbPath> internalPaths = null;
+		Path expectedInternalDirectory = dbPath.resolve("volume");
+		if (fixture != Fixture.DEFAULT) {
 			configPath = tempDir.resolve("database.conf");
+			String fallbackPath = fixture == Fixture.ROOT_FALLBACK ? "." : "../user-volume";
+			fallbackConfig = "database.global: { fallback-column-options: { volumes: ["
+					+ "{ volume-path: \"" + fallbackPath + "\", target-size: \"1GiB\" },"
+					+ "{ volume-path: \"../user-overflow\", target-size: \"1GiB\" }] }, column-options: [";
 			String namedConfigs = "";
+			String internalPath = fixture == Fixture.NAMED ? "../internal-volume"
+					: fixture == Fixture.ROOT_OVERRIDE ? "." : fallbackPath;
+			String internalOverflow = fixture == Fixture.NAMED || fixture == Fixture.ROOT_OVERRIDE
+					? "../internal-overflow" : "../user-overflow";
+			internalPaths = List.of(new DbPath(dbPath.resolve(internalPath).toAbsolutePath(), 1L << 30),
+					new DbPath(dbPath.resolve(internalOverflow).toAbsolutePath(), 1L << 30));
+			expectedInternalDirectory = dbPath.resolve(internalPath).normalize();
 			if (namedInternalFamilies) {
 				for (String name : STARTUP_COLUMN_FAMILIES.subList(1, STARTUP_COLUMN_FAMILIES.size())) {
 					namedConfigs += "{ name: \"" + name + "\", volumes: ["
-							+ "{ volume-path: \"../internal-volume\", target-size: \"1GiB\" },"
-							+ "{ volume-path: \"../internal-overflow\", target-size: \"1GiB\" }], levels: [] },";
+							+ "{ volume-path: \"" + internalPath + "\", target-size: \"1GiB\" },"
+							+ "{ volume-path: \"" + internalOverflow + "\", target-size: \"1GiB\" }], levels: [] },";
 				}
 			}
-			Files.writeString(configPath, "database.global: { fallback-column-options: { volumes: ["
-					+ "{ volume-path: \"../user-volume\", target-size: \"1GiB\" }] }, column-options: ["
-					+ namedConfigs + "] }");
+			if (fixture == Fixture.NAMED_DEFAULT) {
+				namedConfigs += "{ name: \"default\", volumes: [{ volume-path: \"../default-volume\", target-size: \"1GiB\" }], levels: [] }";
+			}
+			Files.writeString(configPath, fallbackConfig + namedConfigs + "] }");
 		}
 		var key = new Keys(Buf.wrap(new byte[]{1}));
 		var value = Buf.wrap(new byte[]{2, 3});
@@ -97,7 +147,7 @@ class RocksDBCompatibilityOptionsTest {
 		byte[] operatorHash;
 		var db = new EmbeddedDB(dbPath, "internal-paths", configPath);
 		try {
-			if (namedInternalFamilies) assertInternalPaths(db, tempDir);
+			if (namedInternalFamilies) assertInternalPaths(db, internalPaths);
 			long columnId = db.createColumn("data", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
 			db.put(0, columnId, key, value, RequestType.none());
 			var jarBytes = new ByteArrayOutputStream();
@@ -117,17 +167,18 @@ class RocksDBCompatibilityOptionsTest {
 				db.getDb().get().compactRange(handle);
 				persistedMetadata.put(family, metadata(db, handle));
 				assertFalse(persistedMetadata.get(family).isEmpty(), family + " must contain real metadata");
-				Path expectedPath = namedInternalFamilies ? tempDir.resolve("internal-volume") : dbPath;
-				assertSstDirectory(db, family, expectedPath);
+				assertSstDirectory(db, family, expectedInternalDirectory);
 			}
-			assertSstDirectory(db, "data", separateFallback ? tempDir.resolve("user-volume") : dbPath.resolve("volume"));
+			assertSstDirectory(db, "data", fixture == Fixture.DEFAULT ? dbPath.resolve("volume")
+					: fixture == Fixture.ROOT_FALLBACK ? dbPath : tempDir.resolve("user-volume"));
 		} finally {
 			db.closeTesting();
 		}
 
+		if (fixture == Fixture.LEGACY) Files.writeString(configPath, fallbackConfig + "] }");
 		var reopened = new EmbeddedDB(dbPath, "internal-paths-reopen", configPath);
 		try {
-			if (namedInternalFamilies) assertInternalPaths(reopened, tempDir);
+			if (internalPaths != null) assertInternalPaths(reopened, internalPaths);
 			assertEquals(value, reopened.get(0, reopened.getColumnId("data"), key, RequestType.current()));
 			assertEquals(cdcCommitted, reopened.cdcGetLastCommittedSequence("reopen-subscription").orElseThrow());
 			assertEquals(operatorVersion, reopened.checkMergeOperator("reopen-operator", operatorHash));
@@ -167,14 +218,11 @@ class RocksDBCompatibilityOptionsTest {
 		return result;
 	}
 
-	private static void assertInternalPaths(EmbeddedDB db, Path tempDir) {
+	private static void assertInternalPaths(EmbeddedDB db, List<DbPath> expectedPaths) {
 		for (var descriptor : db.getDb().getStartupColumns().keySet()) {
 			String name = new String(descriptor.getName(), StandardCharsets.UTF_8);
 			if (STARTUP_COLUMN_FAMILIES.subList(1, STARTUP_COLUMN_FAMILIES.size()).contains(name)) {
-				assertEquals(List.of(
-						new DbPath(tempDir.resolve("db/../internal-volume").toAbsolutePath(), 1L << 30),
-						new DbPath(tempDir.resolve("db/../internal-overflow").toAbsolutePath(), 1L << 30)),
-						descriptor.getOptions().cfPaths(), name);
+				assertEquals(expectedPaths, descriptor.getOptions().cfPaths(), name);
 			}
 		}
 	}
