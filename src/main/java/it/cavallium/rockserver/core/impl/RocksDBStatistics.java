@@ -142,7 +142,9 @@ public class RocksDBStatistics {
 				)));
 		// Register non-PER_CF properties as single gauges (DB_WIDE, SINGLE_CF)
 		for (var longProperty : RocksDBLongProperty.values()) {
-			if (longProperty.getAggregationMode() != AggregationMode.PER_CF) {
+			// The native pinned property scans the cache under the DB mutex; cached cache gauges expose it safely.
+			if (longProperty.getAggregationMode() != AggregationMode.PER_CF
+					&& longProperty != RocksDBLongProperty.BLOCK_CACHE_PINNED_USAGE) {
 				Gauge.builder("rocksdb.property.long",
 							() -> readLongPropertyForGauge(longPropertyGetter, longProperty))
 						.tag("database", name)

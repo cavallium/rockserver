@@ -9,6 +9,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.impl.MetricsManager;
 import it.cavallium.rockserver.core.impl.RocksDBStatistics;
+import it.cavallium.rockserver.core.impl.RocksDBLongProperty;
 import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -97,6 +98,7 @@ class RocksDBStatisticsShutdownTest {
 		try (var nativeStatistics = new Statistics();
 				var mainCache = new HyperClockCache(2L << 20, 0, -1, false);
 				var senderCache = new HyperClockCache(1L << 20, 0, -1, false)) {
+			var pinnedPropertyReads = new AtomicInteger();
 			var metrics = new MetricsManager(config);
 			var registry = new SimpleMeterRegistry();
 			((CompositeMeterRegistry) metrics.getRegistry()).add(registry);
@@ -106,10 +108,30 @@ class RocksDBStatisticsShutdownTest {
 					metrics,
 					Map.of("default", mainCache, "sender", senderCache),
 					Map.of("default", 2L << 20, "sender", 1L << 20),
-					(_, _) -> BigInteger.ONE,
+					(property, _) -> {
+						if (property.equals(RocksDBLongProperty.BLOCK_CACHE_PINNED_USAGE.getName())) {
+							pinnedPropertyReads.incrementAndGet();
+						}
+						return BigInteger.ONE;
+					},
 					_ -> Map.of("default", 1L),
 					new RocksDBStatistics.MemoryUpperBoundConfig(1, 0, 0));
 			try {
+				for (int poll = 0; poll < 2; poll++) {
+					registry.find("rocksdb.property.long").gauges().forEach(gauge -> gauge.value());
+					assertTrue(registry.find("rocksdb.property.long")
+							.tag("property_name", RocksDBLongProperty.BLOCK_CACHE_PINNED_USAGE.getName())
+							.gauges().isEmpty());
+					for (String cacheName : new String[]{"default", "sender"}) {
+						assertTrue(Double.isFinite(registry.get("rocksdb.cache.named")
+								.tag("database", "named-cache-test").tag("cache", cacheName)
+								.tag("field", "pinned_usage").gauge().value()));
+					}
+					assertTrue(Double.isFinite(registry.get("rocksdb.cache")
+							.tag("database", "named-cache-test").tag("field", "pinned_usage")
+							.gauge().value()));
+				}
+				assertEquals(0, pinnedPropertyReads.get());
 				assertEquals(2L << 20, registry.get("rocksdb.cache.named")
 						.tag("database", "named-cache-test")
 						.tag("cache", "default")
