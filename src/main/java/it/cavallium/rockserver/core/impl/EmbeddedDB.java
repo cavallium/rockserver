@@ -382,6 +382,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final RocksDBObjects refs;
 	private final Map<String, Cache> caches;
 	private final MetricsManager metrics;
+	private final ExistsMultiPerfSampler existsMultiPerfSampler;
 	private final String name;
 	private final List<Meter> meters = new ArrayList<>();
 	private final Timer openTransactionTimer;
@@ -497,6 +498,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		int writeCap = workloadSettings.writeParallelism();
 
 		this.metrics = new MetricsManager(config);
+		this.existsMultiPerfSampler = ExistsMultiPerfSampler.configured(metrics.getRegistry(), name);
 		Timer loadTimer = createTimer(Tags.of("action", "load"));
 		this.openTransactionTimer = createActionTimer(OpenTransaction.class);
 		this.closeTransactionTimer = createActionTimer(CloseTransaction.class);
@@ -5292,7 +5294,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				Tx tx = transactionId != 0
 						? getTransaction(transactionId, false, workloadProfile)
 						: null;
-				try (var cursor = new ExistsMultiCursor(columnUse, tx, keys, deadlineMicros)) {
+				try (var cursor = new ExistsMultiCursor(columnUse, tx, keys, deadlineMicros, workloadProfile == WorkloadProfile.LATENCY)) {
 				while (!cursor.readChunk()) {
 					// The synchronous API intentionally keeps processing on its caller thread.
 				}
@@ -5696,7 +5698,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				Tx tx = transactionId != 0
 						? getTransaction(transactionId, false, workloadProfile)
 						: null;
-				cursor = new ExistsMultiCursor(columnUse, tx, keys, deadlineMicros);
+				cursor = new ExistsMultiCursor(columnUse, tx, keys, deadlineMicros, workloadProfile == WorkloadProfile.LATENCY);
 			} catch (Throwable error) {
 				columnUse.close();
 				throw error;
@@ -5816,11 +5818,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private @Nullable ExistsMultiChunk chunk;
 		private boolean exhausted;
 		private boolean closed;
+		private final boolean sampleLatency;
 
 		private ExistsMultiCursor(ColumnInstance.ColumnUse columnUse,
 				@Nullable Tx tx,
 				List<Keys> keys,
-				long deadlineMicros) {
+				long deadlineMicros, boolean sampleLatency) {
+			this.sampleLatency = sampleLatency;
 			this.columnUse = columnUse;
 			this.col = columnUse.column();
 			this.tx = tx;
@@ -5885,7 +5889,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (tx == null && !col.hasBuckets()) {
 					result.addAll(existsMultiStatusOnly(col,
 							Objects.requireNonNull(readOptions),
-							currentChunk.calculatedKeys()));
+							currentChunk.calculatedKeys(), sampleLatency));
 				} else {
 					result.addAll(existsMultiWithValues(tx,
 							col,
@@ -6002,7 +6006,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private List<Boolean> existsMultiStatusOnly(ColumnInstance col,
 			ReadOptions readOptions,
-			List<Buf> calculatedKeys) throws org.rocksdb.RocksDBException {
+			List<Buf> calculatedKeys, boolean sampleLatency) throws org.rocksdb.RocksDBException {
 		var arena = Arena.ofConfined();
 		var arenaObserver = existsMultiArenaObserver;
 		try {
@@ -6016,7 +6020,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				emptyValues[i] = arena.allocate(0);
 			}
 
-			var statuses = db.get().multiGetByteBuffers(readOptions, List.of(col.cfh()), nativeKeys, emptyValues);
+			var nativeDb = db.get();
+			var columnHandles = List.of(col.cfh());
+			var sample = sampleLatency ? existsMultiPerfSampler.begin(nativeDb) : null;
+			List<org.rocksdb.ByteBufferGetStatus> statuses;
+			try {
+				statuses = nativeDb.multiGetByteBuffers(readOptions, columnHandles, nativeKeys, emptyValues);
+			} finally {
+				if (sample != null) existsMultiPerfSampler.finish(sample);
+			}
 			var result = new ArrayList<Boolean>(statuses.size());
 			for (var status : statuses) {
 				result.add(switch (status.status.getCode()) {
