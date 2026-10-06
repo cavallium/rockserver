@@ -103,7 +103,11 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
             sstFileWriter.open(tempFile.toString());
             return sstWriter;
         } catch (org.rocksdb.RocksDBException | RuntimeException | Error ex) {
-            sstWriter.close();
+            try {
+                sstWriter.close();
+            } catch (Throwable cleanupFailure) {
+                ex.addSuppressed(cleanupFailure);
+            }
             throw ex;
         }
     }

@@ -128,12 +128,15 @@ class DictionaryCompressionConfigTest {
                 var columnOptions = RocksDBLoader.getColumnOptions("test", dir.resolve("db"), dir.resolve("db"),
                         ConfigParser.parseDefault().global(), LoggerFactory.getLogger(getClass()), refs,
                         false, java.util.Map.of());
-                assertThrows(org.rocksdb.RocksDBException.class,
+                refs.add(() -> { throw new IllegalStateException("cleanup-failed"); });
+                var openError = assertThrows(org.rocksdb.RocksDBException.class,
                         () -> it.cavallium.rockserver.core.impl.rocksdb.SSTWriter.open(notDirectory, db.getDb(),
                                 writer.col(), columnOptions.options(), false, false, refs));
                 assertTrue(refs.asList().stream().filter(org.rocksdb.RocksObject.class::isInstance)
                         .map(org.rocksdb.RocksObject.class::cast).noneMatch(org.rocksdb.RocksObject::isOwningHandle));
-                assertDoesNotThrow(refs::close);
+                assertEquals(1, openError.getSuppressed().length);
+                assertEquals("cleanup-failed", openError.getSuppressed()[0].getCause().getMessage());
+                assertThrows(RuntimeException.class, refs::close);
             }
         }
     }
