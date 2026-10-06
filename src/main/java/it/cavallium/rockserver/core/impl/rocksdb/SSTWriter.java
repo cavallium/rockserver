@@ -39,11 +39,24 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
         }
         refs.add(envOptions);
 
-        var options = new Options() {
-					{
-						RocksLeakDetector.register(this, "sst-writer-open-options", owningHandle_);
-					}
-        };
+        Options options;
+        if (!forceNoOptions && columnConifg != null) {
+            // Copy native CF options, including dictionary buffering and table/prefix/merge settings
+            // that RocksJava's individual getters do not expose completely.
+            try (var dbOptions = new DBOptions()) {
+                options = new Options(dbOptions, columnConifg) {
+                    {
+                        RocksLeakDetector.register(this, "sst-writer-open-options", owningHandle_);
+                    }
+                };
+            }
+        } else {
+            options = new Options() {
+                {
+                    RocksLeakDetector.register(this, "sst-writer-open-options", owningHandle_);
+                }
+            };
+        }
         refs.add(options);
         if (!forceNoOptions) {
             options
@@ -63,9 +76,7 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                         .setMaxOpenFiles(-1)
                         .setCompressionPerLevel(columnConifg.compressionPerLevel())
                         .setCompressionType(columnConifg.compressionType())
-                        .setCompressionOptions(cloneCompressionOptions(columnConifg.compressionOptions(), refs))
-                        .setBottommostCompressionType(columnConifg.bottommostCompressionType())
-                        .setBottommostCompressionOptions(cloneCompressionOptions(columnConifg.bottommostCompressionOptions(), refs));
+                        .setBottommostCompressionType(columnConifg.bottommostCompressionType());
                 if (columnConifg.memTableConfig() != null) {
                         options.setMemTableConfig(columnConifg.memTableConfig());
                 }
@@ -88,8 +99,13 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
 					}
         };
         var sstWriter = new SSTWriter(db.get(), col, tempFile, sstFileWriter, ingestBehind, refs);
-        sstFileWriter.open(tempFile.toString());
-        return sstWriter;
+        try {
+            sstFileWriter.open(tempFile.toString());
+            return sstWriter;
+        } catch (org.rocksdb.RocksDBException | RuntimeException | Error ex) {
+            sstWriter.close();
+            throw ex;
+        }
     }
 
     /**
@@ -103,22 +119,6 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                     "Raw SST ingestion is disabled for multi-path columns because RocksDB does not expose "
                             + "a destination path id; use ordinary writes or a path-aware migration workflow");
         }
-    }
-
-    private static CompressionOptions cloneCompressionOptions(CompressionOptions compressionOptions, RocksDBObjects refs) {
-        var co = new CompressionOptions() {
-					{
-						RocksLeakDetector.register(this, "clone-compression-options-compression-options", owningHandle_);
-					}
-        }
-                .setEnabled(compressionOptions.enabled())
-                .setMaxDictBytes(compressionOptions.maxDictBytes())
-                .setLevel(compressionOptions.level())
-                .setStrategy(compressionOptions.strategy())
-                .setZStdMaxTrainBytes(compressionOptions.zstdMaxTrainBytes())
-                .setWindowBits(compressionOptions.windowBits());
-        refs.add(co);
-        return co;
     }
 
     public void put(byte[] key, byte[] value) throws RocksDBException {

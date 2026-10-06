@@ -4455,7 +4455,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					} catch (GestaltException e) {
 						throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
 					}
-					refs = null;
 				}
 			}
 			if (Files.notExists(tempSSTsPath)) {

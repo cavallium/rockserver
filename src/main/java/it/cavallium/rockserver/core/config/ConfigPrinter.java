@@ -51,9 +51,10 @@ public class ConfigPrinter {
 		return """
 				{
 				        "compression": "%s",
-				        "max-dict-bytes": "%s"
+				        "max-dict-bytes": "%s",
+				        "max-dict-buffer-bytes": %s
 				      }\
-				""".formatted(stringifyCompression(o.compression()), o.maxDictBytes());
+				""".formatted(stringifyCompression(o.compression()), o.maxDictBytes(), quote(o.maxDictBufferBytes()));
 	}
 
 	public static List<VolumeConfig> getVolumeConfigs(FallbackColumnConfig g) throws GestaltException {

@@ -248,13 +248,6 @@ public class RocksDBLoader {
         boolean inMemory,
         Map<String, Cache> caches) {
         try {
-            var columnFamilyOptions = new ColumnFamilyOptions() {
-              {
-                RocksLeakDetector.register(this, "cf-options", owningHandle_);
-              }
-            };
-            refs.add(columnFamilyOptions);
-
             FallbackColumnConfig columnOptions = null;
             for (NamedColumnConfig namedColumnConfig : globalDatabaseConfig.columnOptions()) {
                 if (namedColumnConfig.name().equals(name)) {
@@ -265,6 +258,31 @@ public class RocksDBLoader {
             if (columnOptions == null) {
                 columnOptions = globalDatabaseConfig.fallbackColumnOptions();
             }
+
+            var compressionProperties = new Properties();
+            var levels = columnOptions.levels();
+            if (levels.length > 0) {
+                compressionProperties.setProperty("compression_opts", compressionOptions(levels[0]));
+                compressionProperties.setProperty("bottommost_compression_opts", compressionOptions(levels[levels.length - 1]));
+            } else {
+                compressionProperties.setProperty("compression_opts",
+                        compressionOptions(false, 0, 64 * SizeUnit.MB));
+                compressionProperties.setProperty("bottommost_compression_opts",
+                        compressionOptions(true, 32 * SizeUnit.KB, 64 * SizeUnit.MB));
+            }
+            ColumnFamilyOptions columnFamilyOptions;
+            try (var parsedOptions = ColumnFamilyOptions.getColumnFamilyOptionsFromProps(compressionProperties)) {
+                if (parsedOptions == null) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                            "RocksDB rejected compression dictionary options");
+                }
+                columnFamilyOptions = new ColumnFamilyOptions(parsedOptions) {
+                    {
+                        RocksLeakDetector.register(this, "cf-options", owningHandle_);
+                    }
+                };
+            }
+            refs.add(columnFamilyOptions);
 
             Cache cache = null;
             if (!inMemory && !caches.isEmpty()) {
@@ -393,14 +411,8 @@ public class RocksDBLoader {
                 }
                 columnFamilyOptions.setCompressionPerLevel(compressionPerLevel);
 
-                var firstLevelOptions = getRocksLevelOptions(columnOptions.levels()[0], refs);
-                columnFamilyOptions.setCompressionType(firstLevelOptions.compressionType);
-                columnFamilyOptions.setCompressionOptions(firstLevelOptions.compressionOptions);
-
-                var lastLevelOptions = getRocksLevelOptions(columnOptions
-                        .levels()[columnOptions.levels().length - 1], refs);
-                columnFamilyOptions.setBottommostCompressionType(lastLevelOptions.compressionType);
-                columnFamilyOptions.setBottommostCompressionOptions(lastLevelOptions.compressionOptions);
+                columnFamilyOptions.setCompressionType(levels[0].compression());
+                columnFamilyOptions.setBottommostCompressionType(levels[levels.length - 1].compression());
             } else {
                 columnFamilyOptions.setNumLevels(7);
                 List<CompressionType> compressionTypes = new ArrayList<>(7);
@@ -412,15 +424,6 @@ public class RocksDBLoader {
                     }
                 }
                 columnFamilyOptions.setBottommostCompressionType(CompressionType.LZ4HC_COMPRESSION);
-                var compressionOptions = new CompressionOptions() {
-                  {
-                    RocksLeakDetector.register(this, "compression-options", owningHandle_);
-                  }
-                }.setEnabled(true)
-                    .setMaxDictBytes(Math.toIntExact(32 * SizeUnit.KB));
-                refs.add(compressionOptions);
-                setZstdCompressionOptions(compressionOptions);
-                columnFamilyOptions.setBottommostCompressionOptions(compressionOptions);
                 columnFamilyOptions.setCompressionPerLevel(compressionTypes);
             }
 
@@ -583,10 +586,26 @@ public class RocksDBLoader {
                 .setUniformCvThreshold(-1);
     }
 
-    private static void setZstdCompressionOptions(CompressionOptions compressionOptions) {
-        // https://rocksdb.org/blog/2021/05/31/dictionary-compression.html#:~:text=(zstd%20only,it%20to%20100x
-        compressionOptions
-                .setZStdMaxTrainBytes(compressionOptions.maxDictBytes() * 100);
+    private static String compressionOptions(ColumnLevelConfig level) throws GestaltException {
+        long bufferBytes = Optional.ofNullable(level.maxDictBufferBytes()).map(DataSize::longValue)
+                .orElse(64 * SizeUnit.MB);
+        if (bufferBytes < 0) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "max-dict-buffer-bytes must be non-negative");
+        }
+        boolean enabled = level.compression() != CompressionType.NO_COMPRESSION;
+        return compressionOptions(enabled, enabled ? level.maxDictBytes().longValue() : 0, bufferBytes);
+    }
+
+    private static String compressionOptions(boolean enabled, long dictionaryBytes, long bufferBytes) {
+        int maxDictBytes = Math.toIntExact(dictionaryBytes);
+        // The native parser exposes max_dict_buffer_bytes, which RocksJava's setters do not.
+        // Preserve RocksJava defaults for the other fields and the existing 100x Zstd training size.
+        try (var defaults = new CompressionOptions()) {
+            return "{enabled=%s;window_bits=%d;level=%d;strategy=%d;max_dict_bytes=%d;zstd_max_train_bytes=%d;max_dict_buffer_bytes=%d}"
+                    .formatted(enabled, defaults.windowBits(), defaults.level(), defaults.strategy(), maxDictBytes,
+                            maxDictBytes * 100, bufferBytes);
+        }
     }
 
     public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger) {
@@ -1203,22 +1222,4 @@ public class RocksDBLoader {
 
     public record DbPathRecord(Path path, long targetSize) {}
 
-    private record RocksLevelOptions(CompressionType compressionType, CompressionOptions compressionOptions) {}
-    private static RocksLevelOptions getRocksLevelOptions(ColumnLevelConfig levelOptions, RocksDBObjects refs) throws GestaltException {
-        var compressionType = levelOptions.compression();
-        var compressionOptions = new CompressionOptions() {
-          {
-            RocksLeakDetector.register(this, "get-rocks-level-options-compression-options", owningHandle_);
-          }
-        };
-        refs.add(compressionOptions);
-        if (compressionType != CompressionType.NO_COMPRESSION) {
-            compressionOptions.setEnabled(true)
-                    .setMaxDictBytes(Math.toIntExact(levelOptions.maxDictBytes().longValue()));
-            setZstdCompressionOptions(compressionOptions);
-        } else {
-            compressionOptions.setEnabled(false);
-        }
-        return new RocksLevelOptions(compressionType, compressionOptions);
-    }
 }
