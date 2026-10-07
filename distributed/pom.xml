@@ -7,5 +7,5 @@
   <version>${revision}</version>
   <properties><revision>1.0.0-SNAPSHOT</revision></properties>
   <packaging>pom</packaging>
-  <modules><module>..</module><module>ratis</module></modules>
+  <modules><module>..</module><module>ratis-server</module><module>ratis</module></modules>
 </project>

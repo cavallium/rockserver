@@ -540,3 +540,55 @@ timeout/publication, cancellation and shutdown/rejection. Compile and inspect
 replacement-class packaging and runtime dependency uniqueness before activation.
 Strict read acceptance and excluded failure exercises remain unverified; this
 review does not establish the deployed/runtime fix.
+
+
+## Fresh-read replacement implemented and locally validated
+
+The previously inactive server draft is repaired, tested and included in the
+optional distributed reactor. Its checksum-pinned upstream input remains Ratis
+3.3.1. The consumer now depends on one
+`rockserver-ratis-server:3.3.1-rockserver.1` implementation; the provided original
+server is not transitive to its runtime. Standalone does not gain Ratis dependencies.
+Sealed batches require fresh call-ID acknowledgements and actual Ratis joint
+majorities; the existing native completed-apply barrier remains intact.
+
+Repaired deadlines cover decided/unpublished futures, generation invalidation,
+and a later capacity error. Success also checks expiry at publication. Appender
+capacity is 32 for bounded joint sets, and over-capacity failure is recoverable.
+Failure publication is isolated from shared timer threads using node-bounded
+virtual-thread tasks; 4,096 publication permits stay owned until synchronous
+observers return. Cancellation and rejected publishers have explicit ownership
+and fallback. This is an initial publication budget, not final whole-node
+payload/admission/performance acceptance.
+
+The combined ordinary gate passes 29 core/native, 16 read-round and 17 adapter
+cases, Maven exit zero, `/tmp/rockserver-fresh-read-reactor-gate.log`. It uses
+`test-compile surefire:test@default-test`, explicit selectors and a runtime
+`dependency:tree`; the latter contains only the replacement server. Round tests
+use a manual clock/executor, actual Ratis joint configuration and ReadRequests
+apply barrier, and controlled virtual-thread publication. The runtime check
+finds exactly one implementation of each replacement class and one patch marker.
+No fuzzing, security work, traffic-isolation tests, network probes, process
+fixtures, density runs or paused-registry validation ran.
+
+Clean packaging was limited to the new server module's own target. Its output
+has 162 unchanged upstream classes byte-for-byte, 23 replacement classes, no
+obsolete read-listener classes, no missing method references from unchanged
+classes, and no missing non-private LeaderStateImpl signatures. Upstream LICENSE
+and NOTICE are unchanged. The inventory is in
+`/tmp/rockserver-fresh-read-package-inventory.json`; raw verification helper is
+`/tmp/rockserver-read-jar-inventory.py`. Clean packaging and forced repackaging
+with a fixed output timestamp produce identical SHA-256:
+`a9a903228c44ef865509a3b134d296418d8681e1d8d27fc590832c6fc7bc2e3d`.
+Logs: `/tmp/rockserver-fresh-read-clean-package.log` and
+`/tmp/rockserver-fresh-read-repro-package.log`. Packaging reused the passing tests
+for unchanged sources; it did not rerun excluded work.
+
+This fixes the identified cached-read-barrier implementation path locally;
+strict multi-process read acceptance of the new artifact is not established.
+Older stock-server process gates cannot be reused for it. Full distribution
+remains incomplete: bootstrap/API integration, shared node channels/executors,
+durable session receipt GC/floors, term-bound serializable transactions and
+reservations, 2PC/scoped fences, child seeds/dynamic topology, complete long
+workflows and representative equal-durability performance still require work.
+The unexecuted density fixture remains preserved and excluded.

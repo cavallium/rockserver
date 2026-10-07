@@ -75,3 +75,40 @@ Upstream licenses are Apache-2.0. Local jar SHA-256 identities are recorded in
 Maven Central did not provide `.jar.sha256` or `.jar.sha512` for the server jar.
 This check establishes artifact identity/integrity, not detached-signature
 verification. Release signature verification remains a packaging gate.
+
+
+## Fresh read rounds in the optional runtime
+
+The optional adapter now uses `rockserver-ratis-server:3.3.1-rockserver.1`, a
+single server implementation artifact assembled from the checksum-pinned 3.3.1
+release with replacement `LeaderStateImpl` and `ReadIndexHeartbeats` classes.
+The stock server is a provided compile input, not a second consumer runtime
+implementation. Unchanged classes and upstream LICENSE/NOTICE are retained.
+Standalone's reactor and JPMS dependencies are unchanged. Replacement classes
+require the selected JDK 25; the historical process gate used stock 3.3.1 and
+does not establish acceptance of this replacement.
+
+Reads enter bounded sealed batches. Each batch samples current-term/configuration
+identity and all next heartbeat call IDs before any trigger, then requires fresh
+successful replies with sufficient follower commit and the exact appender
+identity. Actual Ratis old/new joint-majority predicates govern completion.
+A later arrival or warmed committed index never reuses an old barrier. The
+existing completed-apply wait remains between the round and native query.
+The 32-appender bound covers the union of two bounded 16-replica configurations;
+oversize context failure is recoverable after topology shrinks.
+
+The original deadline covers queued, active and decided-but-unpublished waiters,
+including invalidation and later capacity failure. Successful publication also
+checks that deadline before resolving its promise. Failures leave timer threads
+through individual virtual-thread publications, with a shared 4,096-publication
+budget held until synchronous observers return. Cancellation and rejected
+publication preserve/release ownership exactly once. This bounds publication
+work; it does not account for every request payload or replace the architecture's
+remaining node/pool/tenant admission and measured-density requirements.
+
+Ordinary deterministic round tests and runtime classpath checks pass. They cover
+freshness, old replies, synchronous triggers, real joint quorum, completed apply,
+startup/minimum indexes, decided deadlines, shutdown/rejection/cancellation,
+blocked observers and node publication-budget conservation. Multi-process fresh
+read acceptance, independent-host failure domains, and representative resource
+performance remain unverified. No excluded network/failure exercise was run.
