@@ -6,6 +6,7 @@ import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
 import it.cavallium.rockserver.core.common.distributed.CommandResult;
 import it.cavallium.rockserver.core.common.distributed.TransactionScope;
+import it.cavallium.rockserver.core.common.distributed.PhysicalRangePage;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Map;
@@ -587,6 +588,28 @@ public final class ReplicatedRangeStore {
             if (!scope.containsRange(columnId, lower, upper)) throw new IllegalArgumentException("Scan outside declared scope");
             pin.visitColumn(columnId, lower, upper, Objects.requireNonNull(visitor));
         }
+        /** Exclusive full-physical-key continuation, in either direction, at this retained cut. */
+        public PhysicalRangePage page(UUID columnId, byte[] lowerInclusive, byte[] upperExclusive,
+                                      boolean reverse, byte[] resumeAfter, int itemLimit, int byteLimit) throws RocksDBException {
+            if (itemLimit < 1 || itemLimit > PhysicalRangePage.MAX_ITEMS
+                    || byteLimit < PhysicalRangePage.HEADER_BYTES || byteLimit > PhysicalRangePage.MAX_BYTES) {
+                throw new IllegalArgumentException("Invalid page budget");
+            }
+            if ((long)(lowerInclusive == null ? 0 : lowerInclusive.length) + (upperExclusive == null ? 0 : upperExclusive.length) > TransactionScope.MAX_BOUND_BYTES
+                    || resumeAfter != null && resumeAfter.length > PhysicalRangePage.MAX_BYTES) {
+                throw new IllegalArgumentException("Page request exceeds bound budget");
+            }
+            byte[] lower = lowerInclusive == null ? interval.lowerInclusive() : lowerInclusive.clone();
+            byte[] upper = upperExclusive == null ? interval.upperExclusive() : upperExclusive.clone();
+            if (!scope.containsRange(columnId, lower, upper)) throw new IllegalArgumentException("Page outside declared scope");
+            byte[] resume = resumeAfter == null ? null : resumeAfter.clone();
+            if (resume != null && (resume.length > PhysicalRangePage.MAX_BYTES
+                    || lower != null && Arrays.compareUnsigned(resume, lower) < 0
+                    || upper != null && Arrays.compareUnsigned(resume, upper) >= 0)) {
+                throw new IllegalArgumentException("Continuation outside page bounds");
+            }
+            return pin.page(columnId, lower, upper, reverse, resume, itemLimit, byteLimit);
+        }
         @Override public void close() { pin.close(); }
     }
 
@@ -699,6 +722,45 @@ public final class ReplicatedRangeStore {
                 throw new IllegalArgumentException("Export outside owned interval");
             }
             visit(cf, lower, upper, null, visitor);
+        }
+        private PhysicalRangePage page(UUID columnId, byte[] lower, byte[] upper, boolean reverse,
+                                       byte[] resume, int itemLimit, int byteLimit) throws RocksDBException {
+            var cf = columns.get(columnId);
+            if (cf == null) throw new IllegalArgumentException("Unknown logical column");
+            acquireUse();
+            try (var lowerBound = lower == null ? null : new org.rocksdb.Slice(lower);
+                    var upperBound = upper == null ? null : new org.rocksdb.Slice(upper);
+                    var options = new ReadOptions().setSnapshot(snapshot).setFillCache(false)) {
+                if (lowerBound != null) options.setIterateLowerBound(lowerBound);
+                if (upperBound != null) options.setIterateUpperBound(upperBound);
+                try (var iterator = db.newIterator(cf, options)) {
+                    byte[] sizingBuffer = new byte[0];
+                    if (resume != null) {
+                        if (reverse) iterator.seekForPrev(resume); else iterator.seek(resume);
+                        if (iterator.isValid() && iterator.key(sizingBuffer) == resume.length && Arrays.equals(iterator.key(), resume)) {
+                            if (reverse) iterator.prev(); else iterator.next();
+                        }
+                    } else if (reverse) iterator.seekToLast();
+                    else if (lower == null) iterator.seekToFirst(); else iterator.seek(lower);
+                    var rows = new ArrayList<PhysicalRangePage.Row>();
+                    int bytes = PhysicalRangePage.HEADER_BYTES, lastKeyBytes = 0;
+                    while (iterator.isValid() && rows.size() < itemLimit) {
+                        int keyBytes = iterator.key(sizingBuffer), valueBytes = iterator.value(sizingBuffer);
+                        if (keyBytes < 0 || valueBytes < 0) throw new IllegalStateException("Invalid native row length");
+                        long required = (long)bytes - lastKeyBytes + 8L + 2L * keyBytes + valueBytes;
+                        if (required > byteLimit) {
+                            iterator.status();
+                            if (rows.isEmpty()) throw new PhysicalRangePage.LimitExceededException(required);
+                            break;
+                        }
+                        rows.add(new PhysicalRangePage.Row(iterator.key(), iterator.value()));
+                        bytes = (int)required; lastKeyBytes = keyBytes;
+                        if (reverse) iterator.prev(); else iterator.next();
+                    }
+                    iterator.status();
+                    return new PhysicalRangePage(rows, iterator.isValid());
+                }
+            } finally { releaseUse(); }
         }
         public void visitState(SnapshotVisitor visitor) throws RocksDBException, IOException {
             visit(state, markerKey, null, markerKey, visitor);

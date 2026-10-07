@@ -396,3 +396,28 @@ read barrier; distributed scoped snapshot coordination, writable transaction
 history/validation/reservations and the documented read-consistency fix remain
 unfinished. The native-stream warning is the io_uring ENOMEM fallback, with no
 failed test assertion.
+
+## Bounded physical pages
+
+Scoped native snapshots now provide forward/reverse physical pages with exclusive
+full-key continuation, native iteration bounds, item/byte limits and immutable
+rows/continuation. Their initial ceilings match existing `RangeBudget` defaults:
+4096 items and 8 MiB. Payload accounting includes row lengths and continuation
+framing, while transport identity metadata belongs to the eventual protocol.
+Native row lengths are checked before Java key/value allocation; an oversized
+first row produces an explicit minimum-byte error, never an empty continuing page.
+No latest-state snapshot is reopened between pages.
+
+The final ordinary native gate passes 23 cases (14 native range, five scope, four
+loader-backed pool); log `/tmp/rockserver-physical-pages-native-final.log`, exit zero.
+New cases verify forward/reverse continuation, exclusive upper bounds, absent
+continuation keys, retained historical values after later writes, immutable page
+results, exact byte limits, empty physical keys/values and exhaustion. The affected
+adapter compiled and ten pure client/catalogue cases passed in
+`/tmp/rockserver-physical-pages-full-gate.log`; its unchanged paths remain supported
+by that gate. Both use the default Surefire execution, with no fuzzing, process
+fixtures or network probes.
+
+This is physical native pagination. Full logical bucket-member continuation,
+opaque cursor identity/lease handling, cross-range page coordination, frontend
+API integration and distributed read-barrier acceptance remain incomplete.

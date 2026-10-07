@@ -294,6 +294,81 @@ class ReplicatedRangeStoreTest {
         }
     }
 
+    @Test void scopedPagesResumeExclusivelyInBothDirectionsAtTheirOriginalCut() throws Exception {
+        try (Pool pool = new Pool(path)) {
+            pool.store.applyNoop(new ApplyPosition(1, 0));
+            pool.store.apply(new ApplyPosition(1, 1), command(0,
+                    new Mutation(Mutation.Kind.PUT, B, bytes("a"), bytes("old-a")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("b"), bytes("old-b")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("c"), bytes("old-c")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("d"), bytes("outside"))));
+            var scope = new TransactionScope(List.of(TransactionScope.Span.range(B, bytes("a"), bytes("d"))));
+            try (var snapshot = pool.store.capture(scope)) {
+                var first = snapshot.page(B, bytes("a"), bytes("d"), false, null, 2, 1024);
+                assertEquals(List.of("a", "b"), physicalKeys(first));
+                assertTrue(first.hasMore());
+                byte[] resume = first.resumeAfter(); resume[0] = 'z';
+                assertArrayEquals(bytes("b"), first.resumeAfter());
+                first.rows().getLast().key()[0] = 'z';
+                first.rows().getLast().value()[0] = 'X';
+                assertArrayEquals(bytes("b"), first.resumeAfter());
+                assertArrayEquals(bytes("old-b"), first.rows().getLast().value());
+                assertThrows(UnsupportedOperationException.class, () -> first.rows().clear());
+                pool.store.apply(new ApplyPosition(1, 2), command(1,
+                        new Mutation(Mutation.Kind.DELETE, B, bytes("b"), null),
+                        new Mutation(Mutation.Kind.PUT, B, bytes("c"), bytes("new-c"))));
+                var last = snapshot.page(B, bytes("a"), bytes("d"), false, first.resumeAfter(), 2, 1024);
+                assertEquals(List.of("c"), physicalKeys(last));
+                assertArrayEquals(bytes("old-c"), last.rows().getFirst().value());
+                assertFalse(last.hasMore());
+                var reverse = snapshot.page(B, bytes("a"), bytes("d"), true, null, 2, 1024);
+                assertEquals(List.of("c", "b"), physicalKeys(reverse));
+                assertTrue(reverse.hasMore());
+                var reverseLast = snapshot.page(B, bytes("a"), bytes("d"), true, reverse.resumeAfter(), 2, 1024);
+                assertEquals(List.of("a"), physicalKeys(reverseLast));
+                assertFalse(reverseLast.hasMore());
+                assertEquals(List.of("c"), physicalKeys(snapshot.page(B, bytes("a"), bytes("d"), false, bytes("bb"), 2, 1024)));
+                assertThrows(IllegalArgumentException.class, () -> snapshot.page(B, bytes("a"), bytes("d"), false, bytes("d"), 2, 1024));
+                assertThrows(IllegalArgumentException.class, () -> snapshot.page(B, null, null, false, null, 2, 1024));
+            }
+            assertEquals(0, pool.store.activeSnapshotPins());
+        }
+    }
+
+    @Test void pageByteLimitsIncludeContinuationAndOversizedFirstRowIsExplicit() throws Exception {
+        try (Pool pool = new Pool(path)) {
+            pool.store.applyNoop(new ApplyPosition(1, 0));
+            pool.store.apply(new ApplyPosition(1, 1), command(0,
+                    new Mutation(Mutation.Kind.PUT, B, new byte[0], new byte[0]),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("a"), bytes("value")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("b"), bytes("value"))));
+            var scope = new TransactionScope(List.of(TransactionScope.Span.range(B, null, null)));
+            try (var snapshot = pool.store.capture(scope)) {
+                var emptyKey = snapshot.page(B, null, null, false, null, 10, 17);
+                assertEquals(1, emptyKey.rows().size());
+                assertEquals(17, emptyKey.payloadBytes());
+                assertArrayEquals(new byte[0], emptyKey.resumeAfter());
+                assertTrue(emptyKey.hasMore());
+                var one = snapshot.page(B, null, null, false, emptyKey.resumeAfter(), 10, 24);
+                assertEquals(List.of("a"), physicalKeys(one));
+                assertEquals(24, one.payloadBytes());
+                assertTrue(one.hasMore());
+                var tooSmall = assertThrows(PhysicalRangePage.LimitExceededException.class,
+                        () -> snapshot.page(B, null, null, false, emptyKey.resumeAfter(), 10, 23));
+                assertEquals(24, tooSmall.minimumBytes());
+                var last = snapshot.page(B, null, null, false, one.resumeAfter(), 10, 24);
+                assertEquals(List.of("b"), physicalKeys(last));
+                assertFalse(last.hasMore());
+                var exhausted = snapshot.page(B, null, null, false, last.resumeAfter(), 10, 24);
+                assertTrue(exhausted.rows().isEmpty()); assertNull(exhausted.resumeAfter()); assertFalse(exhausted.hasMore());
+            }
+        }
+    }
+
+    private static List<String> physicalKeys(PhysicalRangePage page) {
+        return page.rows().stream().map(row -> new String(row.key(), StandardCharsets.UTF_8)).toList();
+    }
+
     private static DistributedCommand command(long sequence, Mutation... mutations) {
         return new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, sequence), List.of(mutations));
     }
