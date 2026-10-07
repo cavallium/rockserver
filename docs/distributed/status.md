@@ -156,3 +156,20 @@ proof remain next gates.
 This initial image format stores canonical streamed logical rows. Canonical SST
 export/import and representative migration/backup throughput remain required;
 the row-based importer is not evidence of efficient large-range movement.
+
+## Pending Ratis integration gate
+
+The latest XFS-focused optional-module run passed the real empty LISTENER
+snapshot-transfer/tail/promotion case, two controlled lifecycle cases and seven
+reply-barrier tests. It failed the existing leader-loss retry case and one
+snapshot-restore assertion. The full gate is therefore **not passing** and the
+Ratis edits remain uncommitted pending diagnosis and regression validation.
+
+The restore assertion used `SnapshotManagementApi.create(long,long)` incorrectly:
+its first argument is `creationGap`, not a minimum required applied index.
+Peer apply progress must be verified before requesting `create(true,timeout)`.
+Failed process logs are retained on XFS; a test-only SLF4J provider was added to
+make actual Ratis failures observable. Fixture startup's `purgeGap=0` was also
+invalid in released Ratis (minimum is one), and is corrected without increasing
+timeouts. Diagnostics and passing whole-process results are required before the
+snapshot adapter is committed.
