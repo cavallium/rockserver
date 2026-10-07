@@ -4,16 +4,31 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
-/** Immutable v1 atomic mutation envelope; it does not itself provide replication. */
+/** Immutable atomic mutation envelope; equality/absence predicates are not snapshot transaction history. */
 public final class DistributedCommand {
+    private final int formatVersion;
     private final UUID groupId;
     private final long rangeEpoch;
     private final byte[] schemaDigest;
     private final OperationId operationId;
     private final List<Mutation> mutations;
+    private final List<KeyPredicate> predicates;
 
     public DistributedCommand(UUID groupId, long rangeEpoch, byte[] schemaDigest,
                               OperationId operationId, List<Mutation> mutations) {
+        this(groupId, rangeEpoch, schemaDigest, operationId, mutations, List.of());
+    }
+
+    public DistributedCommand(UUID groupId, long rangeEpoch, byte[] schemaDigest,
+                              OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates) {
+        this(DistributedCommandCodec.FORMAT_VERSION, groupId, rangeEpoch, schemaDigest, operationId, mutations, predicates);
+    }
+
+    // Decoding retains the original version, including legacy payload/receipt identity.
+    DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
+                       OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates) {
+        if (formatVersion != 1 && formatVersion != 2) throw new IllegalArgumentException("Unsupported command version");
+        this.formatVersion = formatVersion;
         this.groupId = Objects.requireNonNull(groupId, "groupId");
         if (rangeEpoch < 0) throw new IllegalArgumentException("Range epoch must be nonnegative");
         this.rangeEpoch = rangeEpoch;
@@ -21,25 +36,30 @@ public final class DistributedCommand {
         if (schemaDigest.length != 32) throw new IllegalArgumentException("Schema digest must be SHA-256");
         this.operationId = Objects.requireNonNull(operationId, "operationId");
         Objects.requireNonNull(mutations, "mutations");
-        if (mutations.isEmpty() || mutations.size() > DistributedCommandCodec.MAX_MUTATIONS) {
-            throw new IllegalArgumentException("Command requires 1..256 mutations");
+        Objects.requireNonNull(predicates, "predicates");
+        if (mutations.isEmpty() || (long) mutations.size() + predicates.size() > DistributedCommandCodec.MAX_ITEMS
+                || (formatVersion == 1 && !predicates.isEmpty())) {
+            throw new IllegalArgumentException("Command requires mutations and at most 256 total items; v1 has no predicates");
         }
         this.mutations = List.copyOf(mutations);
-        long size = DistributedCommandCodec.HEADER_BYTES;
+        this.predicates = List.copyOf(predicates);
+        long size = DistributedCommandCodec.HEADER_BYTES + (formatVersion == 2 ? 4 : 0);
         for (Mutation mutation : this.mutations) size += mutation.encodedSize();
+        for (KeyPredicate predicate : this.predicates) size += predicate.encodedSize();
         if (size > DistributedCommandCodec.MAX_ENCODED_BYTES) {
             throw new IllegalArgumentException("Command exceeds encoded byte limit");
         }
         this.schemaDigest = schemaDigest.clone();
     }
 
-    public int formatVersion() { return DistributedCommandCodec.FORMAT_VERSION; }
+    public int formatVersion() { return formatVersion; }
     public UUID groupId() { return groupId; }
     public long rangeEpoch() { return rangeEpoch; }
     /** Digest of the immutable schema and operator contract selected by admission. */
     public byte[] schemaDigest() { return schemaDigest.clone(); }
     public OperationId operationId() { return operationId; }
     public List<Mutation> mutations() { return mutations; }
+    public List<KeyPredicate> predicates() { return predicates; }
     /** SHA-256 of the entire canonical encoding, including identity and ordered operands. */
     public byte[] payloadDigest() { return DistributedCommandCodec.digest(this); }
 }

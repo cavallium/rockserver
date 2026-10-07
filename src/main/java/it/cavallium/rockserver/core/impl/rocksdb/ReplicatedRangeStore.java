@@ -191,6 +191,11 @@ public final class ReplicatedRangeStore {
                 }
             }
         }
+        for (var predicate : command.predicates()) {
+            if (!columns.containsKey(predicate.columnId()) || !contains(predicate.key())) {
+                throw new IllegalArgumentException("Predicate outside owned column/interval");
+            }
+        }
         if (command.mutations().stream().anyMatch(m -> m.returnMode() != Mutation.ReturnMode.NONE)
                 && command.mutations().stream().anyMatch(m -> m.kind() == Mutation.Kind.DELETE_RANGE)) {
             throw new IllegalArgumentException("Point results with range deletion require a range-aware overlay");
@@ -216,6 +221,9 @@ public final class ReplicatedRangeStore {
             throws RocksDBException {
         Objects.requireNonNull(position);
         validate(command);
+        if (result != null && !command.predicates().isEmpty()) {
+            throw new IllegalArgumentException("Precomputed results require a fully evaluated plan without live predicates");
+        }
         if (result != null && result.length > MAX_RESULT_BYTES) throw new IllegalArgumentException("Result exceeds receipt budget");
         byte[] stableResult = result == null ? null : result.clone();
         byte[] digest = command.payloadDigest();
@@ -262,6 +270,12 @@ public final class ReplicatedRangeStore {
     }
 
     private CommandResult evaluate(DistributedCommand command) throws RocksDBException {
+        for (var predicate : command.predicates()) {
+            byte[] current = db.get(columns.get(predicate.columnId()), predicate.key());
+            if (!Arrays.equals(current, predicate.expectedValue())) {
+                return new CommandResult(CommandResult.Status.CONFLICT, List.of());
+            }
+        }
         if (command.mutations().stream().allMatch(m -> m.returnMode() == Mutation.ReturnMode.NONE)) {
             return new CommandResult(CommandResult.Status.SUCCESS, List.of());
         }

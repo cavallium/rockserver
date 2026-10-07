@@ -52,8 +52,10 @@ public class RatisDurableProcessesTest {
                     awaitInitialVoters(client, group);
                     var seed = command(0, new Mutation(Mutation.Kind.PUT, A, bytes("key"), bytes("seed")));
                     assertTrue(client.io().send(message(seed)).isSuccess());
-                    var update = command(1, new Mutation(Mutation.Kind.MERGE, A, bytes("key"), bytes("first"), Mutation.ReturnMode.CURRENT),
-                            new Mutation(Mutation.Kind.PUT, B, bytes("key"), bytes("paired"), Mutation.ReturnMode.PREVIOUS));
+                    var update = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 1),
+                            List.of(new Mutation(Mutation.Kind.MERGE, A, bytes("key"), bytes("first"), Mutation.ReturnMode.CURRENT),
+                                    new Mutation(Mutation.Kind.PUT, B, bytes("key"), bytes("paired"), Mutation.ReturnMode.PREVIOUS)),
+                            List.of(new KeyPredicate(A, bytes("key"), bytes("seed")), new KeyPredicate(B, bytes("key"), null)));
                     // Discard the application result; a fresh transport must resolve the same operation.
                     assertTrue(client.io().send(message(update)).isSuccess());
                     int leader = Integer.parseInt(client.getLeaderId().toString().substring(1));

@@ -7,10 +7,11 @@ import java.util.ArrayList;
 import java.util.Objects;
 import java.util.UUID;
 
-/** Canonical big-endian v1 encoding, with explicit tags and bounded length prefixes. */
+/** Canonical big-endian v1/v2 encoding; decoded legacy commands retain their original bytes/hash. */
 public final class DistributedCommandCodec {
-    public static final int FORMAT_VERSION = 1;
-    public static final int MAX_MUTATIONS = 256;
+    public static final int FORMAT_VERSION = 2;
+    public static final int MAX_ITEMS = 256;
+    public static final int MAX_MUTATIONS = MAX_ITEMS;
     public static final int MAX_ENCODED_BYTES = 2 * 1024 * 1024;
     // version, group UUID, range epoch, schema digest, session UUID/epoch/sequence, count
     static final int HEADER_BYTES = 4 + 16 + 8 + 32 + 16 + 8 + 8 + 4;
@@ -19,15 +20,17 @@ public final class DistributedCommandCodec {
 
     public static byte[] encode(DistributedCommand command) {
         Objects.requireNonNull(command, "command");
-        int size = HEADER_BYTES;
+        int size = HEADER_BYTES + (command.formatVersion() == 2 ? 4 : 0);
         for (Mutation mutation : command.mutations()) size += mutation.encodedSize();
+        for (KeyPredicate predicate : command.predicates()) size += predicate.encodedSize();
         ByteBuffer output = ByteBuffer.allocate(size);
-        output.putInt(FORMAT_VERSION);
+        output.putInt(command.formatVersion());
         putUuid(output, command.groupId());
         output.putLong(command.rangeEpoch()).put(command.schemaDigest());
         putUuid(output, command.operationId().sessionId());
         output.putLong(command.operationId().epoch()).putLong(command.operationId().sequence());
         output.putInt(command.mutations().size());
+        if (command.formatVersion() == 2) output.putInt(command.predicates().size());
         for (Mutation mutation : command.mutations()) {
             output.put((byte) switch (mutation.kind()) {
                 case PUT -> 1; case DELETE -> 2; case MERGE -> 3; case DELETE_RANGE -> 4;
@@ -42,6 +45,14 @@ public final class DistributedCommandCodec {
             output.putInt(value == null ? -1 : value.length);
             if (value != null) output.put(value);
         }
+        for (KeyPredicate predicate : command.predicates()) {
+            output.put((byte) 1); // v2 key equality/absence
+            putUuid(output, predicate.columnId());
+            byte[] key = predicate.key();
+            byte[] expected = predicate.expectedValue();
+            output.putInt(key.length).put(key).putInt(expected == null ? -1 : expected.length);
+            if (expected != null) output.put(expected);
+        }
         return output.array();
     }
 
@@ -51,15 +62,19 @@ public final class DistributedCommandCodec {
             throw new IllegalArgumentException("Invalid command byte length");
         }
         ByteBuffer input = ByteBuffer.wrap(encoded);
-        if (input.getInt() != FORMAT_VERSION) throw new IllegalArgumentException("Unsupported command version");
+        int version = input.getInt();
+        if (version != 1 && version != 2) throw new IllegalArgumentException("Unsupported command version");
+        if (version == 2 && input.remaining() < HEADER_BYTES) throw new IllegalArgumentException("Truncated v2 header");
         UUID group = getUuid(input);
         long rangeEpoch = input.getLong();
         byte[] schema = new byte[32];
         input.get(schema);
         OperationId operation = new OperationId(getUuid(input), input.getLong(), input.getLong());
         int count = input.getInt();
-        if (count <= 0 || count > MAX_MUTATIONS || count > input.remaining() / 26) {
-            throw new IllegalArgumentException("Invalid mutation count");
+        int predicateCount = version == 2 ? input.getInt() : 0;
+        if (count <= 0 || predicateCount < 0 || (long) count + predicateCount > MAX_ITEMS
+                || 26L * count + 25L * predicateCount > input.remaining()) {
+            throw new IllegalArgumentException("Invalid command item counts");
         }
         var mutations = new ArrayList<Mutation>(count);
         for (int i = 0; i < count; i++) {
@@ -92,8 +107,28 @@ public final class DistributedCommandCodec {
             if (value != null) input.get(value);
             mutations.add(new Mutation(kind, column, key, value, mode));
         }
+        var predicates = new ArrayList<KeyPredicate>(predicateCount);
+        for (int i = 0; i < predicateCount; i++) {
+            require(input, 25);
+            if (input.get() != 1) throw new IllegalArgumentException("Unknown predicate kind");
+            UUID column = getUuid(input);
+            int keyLength = input.getInt();
+            if (keyLength < 0 || keyLength > input.remaining() - 4) {
+                throw new IllegalArgumentException("Invalid predicate key length");
+            }
+            int expectedLength = input.getInt(input.position() + keyLength);
+            if (expectedLength < -1 || expectedLength > input.remaining() - keyLength - 4) {
+                throw new IllegalArgumentException("Invalid predicate value length");
+            }
+            byte[] key = new byte[keyLength];
+            input.get(key);
+            input.getInt();
+            byte[] expected = expectedLength == -1 ? null : new byte[expectedLength];
+            if (expected != null) input.get(expected);
+            predicates.add(new KeyPredicate(column, key, expected));
+        }
         if (input.hasRemaining()) throw new IllegalArgumentException("Trailing command bytes");
-        return new DistributedCommand(group, rangeEpoch, schema, operation, mutations);
+        return new DistributedCommand(version, group, rangeEpoch, schema, operation, mutations, predicates);
     }
 
     static byte[] digest(DistributedCommand command) {

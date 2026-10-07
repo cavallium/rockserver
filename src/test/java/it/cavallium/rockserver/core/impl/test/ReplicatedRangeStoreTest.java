@@ -180,6 +180,54 @@ class ReplicatedRangeStoreTest {
         }
     }
 
+    @Test void conditionalMutationsAreAtomicAndConflictReceiptCannotBecomeASecondAttempt() throws Exception {
+        try (Pool pool = new Pool(path)) {
+            pool.store.applyNoop(new ApplyPosition(1, 0));
+            pool.store.apply(new ApplyPosition(1, 1), command(0,
+                    new Mutation(Mutation.Kind.PUT, A, bytes("k"), bytes("seed")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("k"), bytes("paired"))));
+            var conditional = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 1),
+                    List.of(new Mutation(Mutation.Kind.MERGE, A, bytes("k"), bytes("first"), Mutation.ReturnMode.CURRENT),
+                            new Mutation(Mutation.Kind.PUT, B, bytes("k"), bytes("next"), Mutation.ReturnMode.PREVIOUS)),
+                    List.of(new KeyPredicate(A, bytes("k"), bytes("seed")), new KeyPredicate(B, bytes("k"), bytes("paired"))));
+            assertThrows(IllegalArgumentException.class,
+                    () -> pool.store.apply(new ApplyPosition(1, 2), conditional, new byte[0]));
+            assertEquals(new ApplyPosition(1, 1), pool.store.applied());
+            var result = CommandResult.decode(pool.store.apply(new ApplyPosition(1, 2), conditional));
+            assertEquals(CommandResult.Status.SUCCESS, result.status());
+            assertArrayEquals(bytes("seed,first"), result.value(0));
+            assertArrayEquals(bytes("paired"), result.value(1));
+            var rejected = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 2),
+                    List.of(new Mutation(Mutation.Kind.PUT, B, bytes("k"), bytes("must-not-apply")),
+                            new Mutation(Mutation.Kind.MERGE, A, bytes("k"), bytes("must-not-merge"))),
+                    List.of(new KeyPredicate(A, bytes("k"), bytes("seed"))));
+            byte[] conflict = pool.store.apply(new ApplyPosition(1, 3), rejected);
+            assertEquals(CommandResult.Status.CONFLICT, CommandResult.decode(conflict).status());
+            assertArrayEquals(bytes("next"), pool.db.get(pool.handles.get(2), bytes("k")));
+            assertArrayEquals(bytes("seed,first"), pool.db.get(pool.handles.get(1), bytes("k")));
+            pool.store.apply(new ApplyPosition(1, 4), command(3, new Mutation(Mutation.Kind.PUT, A, bytes("k"), bytes("seed"))));
+            assertArrayEquals(conflict, pool.store.apply(new ApplyPosition(1, 5), rejected));
+            assertArrayEquals(bytes("next"), pool.db.get(pool.handles.get(2), bytes("k")));
+            assertArrayEquals(bytes("seed"), pool.db.get(pool.handles.get(1), bytes("k")));
+        }
+    }
+
+    @Test void predicatesDistinguishAnAbsentKeyFromAPresentEmptyValue() throws Exception {
+        try (Pool pool = new Pool(path)) {
+            pool.store.applyNoop(new ApplyPosition(1, 0));
+            pool.store.apply(new ApplyPosition(1, 1), command(0, new Mutation(Mutation.Kind.PUT, B, bytes("empty"), new byte[0])));
+            var mutation = List.of(new Mutation(Mutation.Kind.PUT, A, bytes("k"), bytes("value")));
+            var absent = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 1), mutation,
+                    List.of(new KeyPredicate(B, bytes("empty"), null)));
+            assertEquals(CommandResult.Status.CONFLICT, CommandResult.decode(pool.store.apply(new ApplyPosition(1, 2), absent)).status());
+            assertNull(pool.db.get(pool.handles.get(1), bytes("k")));
+            var empty = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 2), mutation,
+                    List.of(new KeyPredicate(B, bytes("empty"), new byte[0])));
+            assertEquals(CommandResult.Status.SUCCESS, CommandResult.decode(pool.store.apply(new ApplyPosition(1, 3), empty)).status());
+            assertArrayEquals(bytes("value"), pool.db.get(pool.handles.get(1), bytes("k")));
+        }
+    }
+
     private static DistributedCommand command(long sequence, Mutation... mutations) {
         return new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, sequence), List.of(mutations));
     }
