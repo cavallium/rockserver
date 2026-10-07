@@ -295,3 +295,78 @@ Surefire's native-stream warning is the same io_uring ENOMEM fallback recorded i
 its dumpstream, not a failed assertion. Strict read-safety/fault acceptance and
 all remaining architecture milestones remain open. No merge, push, publication,
 deployment or live acceptance occurred.
+
+## Partition read failure reproduced
+
+`RatisReadPartitionTest` reproduced the preceding candidate against stock Ratis
+3.3.1 on its first executed run. Three independent JVMs used the XFS test factory.
+A test-only gRPC interceptor isolated Raft server traffic to/from the old leader;
+client/admin RPC remained reachable. Every initial voter applied configuration
+before writes. The fixture configured election timing to 100 ms–3 s; this is not
+a production timeout change.
+
+Evidence from `/tmp/rockserver-read-partition-gate.log` (Maven exit one):
+
+- 3005 ms: old leader n2 had a warmed stable committed cut at index 2.
+- 3006 ms: Raft traffic to/from n2 was isolated.
+- 5584 ms: the other quorum acknowledged the replacement value through n0 at index 5.
+- 5588 ms: n2 still reported LEADER, native applied index 2.
+- 5597 ms: a fresh no-retry client targeted n2 directly and received SUCCESS with
+  the old value; n2 still reported LEADER afterward.
+
+The failed assertion compared the acknowledged new value (26 bytes) with the
+returned old value (16 bytes). The preserved fixture is
+`distributed/ratis/target/ratis-disk-tests/ratis-10169440901303389205`, including
+`partition-evidence.txt` and each child process log. This is an executed strict
+linearizability violation, not eventual-unavailability or a missing timing window.
+The earlier 76-core/23-Ratis passing gate does not establish this invariant.
+
+Remediation is in progress: replace cached/index-keyed read acknowledgements with
+bounded fresh quorum rounds, safely batch requests before each round starts,
+preserve current/joint membership and completed native apply, and retain one
+patched server artifact with the reviewed 3.3.1 input checksum. No remediation
+or patched-runtime acceptance is claimed yet. Stock behavior must fail this
+regression; the patched artifact must pass it and the existing durability,
+snapshot, catalogue and routing gates before it is retained as a fix.
+
+The user subsequently excluded fuzzing and security-oriented testing. The
+traffic-isolation test was retired from the automated source/test output trees;
+its source and already-produced evidence remain in the preserved failure fixture.
+It will not be rerun. Subsequent validation uses ordinary deterministic database
+unit and integration checks, with Maven `test-compile surefire:test@default-test`
+to bypass the root's separate `fuzz-regressions` execution. The previously executed
+failure remains evidence; no post-fix traffic-isolation acceptance is claimed.
+
+## Transaction scope foundation
+
+The active reactor/dependency wiring remains at the last validated 3.3.1 server;
+the unfinished `distributed/ratis-server` draft is preserved outside that reactor.
+Its workers were stopped following the user's testing restriction. It is not a
+compiled or accepted replacement, and the documented read-consistency defect
+remains unresolved. The opt-in density fixture is also an unexecuted draft.
+
+`TransactionScope` now supplies an immutable bounded physical declaration of
+point keys, half-open ranges and prefixes. Prefix upper bounds use unsigned
+carry with correct truncation/infinity handling. Point declarations do not grant
+scan access; range coverage can combine adjacent/overlapping declarations but
+rejects gaps and other columns. The full participant plan validates routing and
+its budget before any native snapshot allocation. Bounds are 256 spans and
+2 MiB of declared key/bound bytes.
+
+This is a model/planning foundation, not an executed transaction or coordinated
+snapshot. Native pin acquisition, term binding, mutation history/ABA validation,
+accepted commit records and cross-group decisions remain required.
+
+Ordinary unit validation uses only the default Surefire execution:
+
+```
+mvn test-compile surefire:test@default-test \
+  -Dtest=TransactionScopeTest,RangeDirectoryCodecTest \
+  -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+No fuzz-regressions execution, security-oriented tests, retired traffic-isolation
+tests or additional network probes are part of this gate.
+
+This gate passed five scope cases and eight directory cases (13 total, zero
+failures/errors/skips, Maven exit zero); log `/tmp/rockserver-transaction-scope-gate.log`.
