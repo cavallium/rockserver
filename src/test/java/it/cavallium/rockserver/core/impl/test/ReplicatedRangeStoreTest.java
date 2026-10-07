@@ -361,6 +361,57 @@ class ReplicatedRangeStoreTest {
                 assertFalse(last.hasMore());
                 var exhausted = snapshot.page(B, null, null, false, last.resumeAfter(), 10, 24);
                 assertTrue(exhausted.rows().isEmpty()); assertNull(exhausted.resumeAfter()); assertFalse(exhausted.hasMore());
+                try (var cursor = snapshot.openCursor(B, null, null, false)) {
+                    assertArrayEquals(new byte[0], cursor.nextPage(10, 17).resumeAfter());
+                    assertThrows(PhysicalRangePage.LimitExceededException.class, () -> cursor.nextPage(10, 23));
+                    assertEquals(List.of("a"), physicalKeys(cursor.nextPage(10, 24)), "Budget rejection must not advance continuation");
+                    assertEquals(List.of("b"), physicalKeys(cursor.nextPage(10, 24)));
+                }
+            }
+        }
+    }
+
+    @Test void pageCursorBindsBoundsDirectionAndCutAndStopsWithItsParent() throws Exception {
+        try (Pool pool = new Pool(path)) {
+            pool.store.applyNoop(new ApplyPosition(1, 0));
+            pool.store.apply(new ApplyPosition(1, 1), command(0,
+                    new Mutation(Mutation.Kind.PUT, B, bytes("a"), bytes("old-a")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("b"), bytes("old-b")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("c"), bytes("old-c"))));
+            var scope = new TransactionScope(List.of(TransactionScope.Span.range(B, bytes("a"), bytes("d"))));
+            var snapshot = pool.store.capture(scope);
+            try {
+                byte[] lower = bytes("a"), upper = bytes("d");
+                try (var forward = snapshot.openCursor(B, lower, upper, false);
+                        var reverse = snapshot.openCursor(B, lower, upper, true)) {
+                    lower[0] = 'z'; upper[0] = 'a';
+                    assertEquals(List.of("a"), physicalKeys(forward.nextPage(1, 1024)));
+                    assertEquals(List.of("c"), physicalKeys(reverse.nextPage(1, 1024)));
+                    pool.store.apply(new ApplyPosition(1, 2), command(1,
+                            new Mutation(Mutation.Kind.DELETE, B, bytes("b"), null),
+                            new Mutation(Mutation.Kind.PUT, B, bytes("c"), bytes("new-c"))));
+                    assertEquals(List.of("b"), physicalKeys(forward.nextPage(1, 1024)));
+                    assertEquals(List.of("b"), physicalKeys(reverse.nextPage(1, 1024)));
+                    var last = forward.nextPage(1, 1024);
+                    assertEquals(List.of("c"), physicalKeys(last));
+                    assertArrayEquals(bytes("old-c"), last.rows().getFirst().value());
+                    assertFalse(last.hasMore());
+                    assertTrue(forward.nextPage(1, 1024).rows().isEmpty());
+                    assertThrows(IllegalArgumentException.class, () -> forward.nextPage(0, 1024));
+                    assertEquals(1, pool.store.activeSnapshotPins(), "Both cursors borrow one native cut");
+                    snapshot.close();
+                    assertThrows(IllegalStateException.class, () -> forward.nextPage(1, 1024));
+                    assertThrows(IllegalStateException.class, () -> reverse.nextPage(1, 1024));
+                    assertThrows(IllegalStateException.class, () -> snapshot.openCursor(B, bytes("a"), bytes("d"), false));
+                }
+            } finally { snapshot.close(); }
+            assertEquals(0, pool.store.activeSnapshotPins());
+            try (var reopened = pool.store.capture(scope); var cursor = reopened.openCursor(B, bytes("a"), bytes("d"), false)) {
+                assertEquals(List.of("a", "c"), physicalKeys(cursor.nextPage(3, 1024)));
+                cursor.close();
+                assertThrows(IllegalStateException.class, () -> cursor.nextPage(1, 1024));
+                assertEquals(1, pool.store.activeSnapshotPins(), "Cursor close leaves its parent pin owned");
+                assertArrayEquals(bytes("new-c"), reopened.get(B, bytes("c")));
             }
         }
     }

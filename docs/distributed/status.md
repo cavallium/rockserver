@@ -421,3 +421,22 @@ fixtures or network probes.
 This is physical native pagination. Full logical bucket-member continuation,
 opaque cursor identity/lease handling, cross-range page coordination, frontend
 API integration and distributed read-barrier acceptance remain incomplete.
+
+## Bound local page cursor
+
+A scoped snapshot can now open a local `PageCursor` with immutable copied bounds,
+column and direction. The cursor advances its exclusive continuation internally;
+failed byte-budget requests leave continuation unchanged. Successive requests are
+serialized, and exhaustion avoids reopening an iterator. Cursor close stops its
+own admission while allowing an already-started page to finish. It borrows its
+parent's native pin: closing one cursor does not close sibling readers, while
+closing the parent invalidates all its cursors, including exhausted ones. No
+latest-cut fallback occurs.
+
+The ordinary combined gate passes 24 core/native cases and ten pure adapter cases
+(Maven exit zero), log `/tmp/rockserver-local-cursor-full-gate.log`. Added workflow
+coverage includes two directions on one cut, bounds-array mutation, later writes,
+close/reopen, budget-error retry and parent/cursor ownership. The command uses
+`test-compile surefire:test@default-test`; no fuzzing, process fixtures or network
+probes ran. This is a local borrowed cursor; remote cursor leases, logical bucket
+members, cross-range coordination and API integration remain required.

@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -591,10 +592,7 @@ public final class ReplicatedRangeStore {
         /** Exclusive full-physical-key continuation, in either direction, at this retained cut. */
         public PhysicalRangePage page(UUID columnId, byte[] lowerInclusive, byte[] upperExclusive,
                                       boolean reverse, byte[] resumeAfter, int itemLimit, int byteLimit) throws RocksDBException {
-            if (itemLimit < 1 || itemLimit > PhysicalRangePage.MAX_ITEMS
-                    || byteLimit < PhysicalRangePage.HEADER_BYTES || byteLimit > PhysicalRangePage.MAX_BYTES) {
-                throw new IllegalArgumentException("Invalid page budget");
-            }
+            validatePageBudget(itemLimit, byteLimit);
             if ((long)(lowerInclusive == null ? 0 : lowerInclusive.length) + (upperExclusive == null ? 0 : upperExclusive.length) > TransactionScope.MAX_BOUND_BYTES
                     || resumeAfter != null && resumeAfter.length > PhysicalRangePage.MAX_BYTES) {
                 throw new IllegalArgumentException("Page request exceeds bound budget");
@@ -610,7 +608,50 @@ public final class ReplicatedRangeStore {
             }
             return pin.page(columnId, lower, upper, reverse, resume, itemLimit, byteLimit);
         }
+        /** Bounds/direction remain fixed; this cursor borrows its parent snapshot and never reopens at latest. */
+        public PageCursor openCursor(UUID columnId, byte[] lowerInclusive, byte[] upperExclusive, boolean reverse) {
+            if ((long)(lowerInclusive == null ? 0 : lowerInclusive.length) + (upperExclusive == null ? 0 : upperExclusive.length) > TransactionScope.MAX_BOUND_BYTES) {
+                throw new IllegalArgumentException("Cursor bounds exceed budget");
+            }
+            byte[] lower = lowerInclusive == null ? interval.lowerInclusive() : lowerInclusive.clone();
+            byte[] upper = upperExclusive == null ? interval.upperExclusive() : upperExclusive.clone();
+            if (!scope.containsRange(columnId, lower, upper)) throw new IllegalArgumentException("Cursor outside declared scope");
+            pin.requireOpen();
+            return new PageCursor(columnId, lower, upper, reverse);
+        }
+
+        public final class PageCursor implements AutoCloseable {
+            private final UUID columnId;
+            private final byte[] lower, upper;
+            private final boolean reverse;
+            private final AtomicBoolean cursorClosed = new AtomicBoolean();
+            private byte[] resume;
+            private boolean exhausted;
+            private PageCursor(UUID columnId, byte[] lower, byte[] upper, boolean reverse) {
+                this.columnId = columnId; this.lower = lower; this.upper = upper; this.reverse = reverse;
+            }
+            /** Calls serialize continuation changes; closing allows an already-started page to finish. */
+            public synchronized PhysicalRangePage nextPage(int itemLimit, int byteLimit) throws RocksDBException {
+                if (cursorClosed.get()) throw new IllegalStateException("Page cursor closed");
+                validatePageBudget(itemLimit, byteLimit);
+                pin.requireOpen();
+                if (exhausted) return new PhysicalRangePage(List.of(), false);
+                var result = pin.page(columnId, lower, upper, reverse, resume, itemLimit, byteLimit);
+                resume = result.resumeAfter();
+                exhausted = !result.hasMore();
+                return result;
+            }
+            /** Stops this borrowed cursor; the parent snapshot continues to own its native pin. */
+            @Override public void close() { cursorClosed.set(true); }
+        }
         @Override public void close() { pin.close(); }
+    }
+
+    private static void validatePageBudget(int itemLimit, int byteLimit) {
+        if (itemLimit < 1 || itemLimit > PhysicalRangePage.MAX_ITEMS
+                || byteLimit < PhysicalRangePage.HEADER_BYTES || byteLimit > PhysicalRangePage.MAX_BYTES) {
+            throw new IllegalArgumentException("Invalid page budget");
+        }
     }
 
     private SnapshotPin captureUnderAdmission() throws RocksDBException {
@@ -789,6 +830,9 @@ public final class ReplicatedRangeStore {
             } finally {
                 releaseUse();
             }
+        }
+        private synchronized void requireOpen() {
+            if (closed) throw new IllegalStateException("Snapshot pin closed");
         }
         private synchronized void acquireUse() {
             if (closed) throw new IllegalStateException("Snapshot pin closed");
