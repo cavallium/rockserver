@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.DistributedCommand;
+import java.util.function.Consumer;
 import it.cavallium.rockserver.core.common.distributed.DistributedCommandCodec;
 import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
@@ -39,6 +41,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 /** Initial synchronous apply adapter; the pool owner drains Ratis before closing native handles. */
 public final class RatisRangeStateMachine extends BaseStateMachine {
     private final ReplicatedRangeStore store;
+    private final Consumer<DistributedCommand> commandValidator;
     private volatile Throwable storageFailure;
     private final HashMap<OperationId, Admission> admissions = new HashMap<>();
     private long admittedBytes;
@@ -72,6 +75,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     private record Deferred(long term, byte[] encoded, CompletableFuture<Message> future) {}
 
     public RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits) {
+        this(store, initialGroup, limits, command -> {});
+    }
+
+    /** Deterministic envelope validation, repeated on every replica before native apply. */
+    public RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
+            Consumer<DistributedCommand> commandValidator) {
+        this.commandValidator = java.util.Objects.requireNonNull(commandValidator);
         this.store = java.util.Objects.requireNonNull(store);
         this.initialGroup = java.util.Objects.requireNonNull(initialGroup);
         this.limits = java.util.Objects.requireNonNull(limits);
@@ -432,6 +442,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
             requireHealthy();
             byte[] encoded = request.getMessage().getContent().toByteArray();
             var command = DistributedCommandCodec.decode(encoded);
+            commandValidator.accept(command);
             store.validate(command);
             byte[] digest = command.payloadDigest();
             // Native receipt reads stay outside the short admission lock. If apply
@@ -491,6 +502,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                     return pending.future().whenComplete((message, problem) -> releaseAdmission(transaction));
                 }
                 var command = DistributedCommandCodec.decode(encoded);
+                commandValidator.accept(command);
                 byte[] bytes = store.apply(new ApplyPosition(entry.getTerm(), entry.getIndex()), command);
                 advance(entry.getTerm(), entry.getIndex());
                 result = Message.valueOf(ByteString.copyFrom(bytes));

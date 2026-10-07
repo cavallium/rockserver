@@ -225,3 +225,73 @@ client/API routing, durable session GC/fences, scoped snapshots/transactions and
 disjoint proposal reservations, child seed proof, dynamic topology and migration,
 SST/bulk/export/CDC/backup workflows, transport parity, deterministic/fault models,
 rolling feature negotiation, bounded resource/performance and power-loss gates.
+
+## Catalogue and routing checkpoint
+
+The next combined XFS gate passes 76 core/loader tests and 23 optional Ratis
+cases. The eight new core cases validate bounded canonical directory images,
+unsigned full-domain coverage, fixed-prefix colocation, immutable identities,
+forward/reverse intersections and malformed inputs. Optional additions cover
+catalogue validation (three), routed-client contracts (seven), and one real
+three-JVM catalogue/two-data-group workflow. Core cases repeat in the root fuzz
+execution; repetitions are not independent cases. The passing log is
+`/tmp/rockserver-catalogue-full-gate.log` (exit zero, 2026-10-07).
+
+The catalogue stores a domain directory in a dedicated native pool and Raft group.
+A pure validator runs at admission and replica apply: one conditional canonical
+replacement, matching cluster/database/domain, initial generation zero or exactly
+one generation advance, unchanged schema/columns/projection. Native ordered
+predicates arbitrate competing proposals; both success and conflict receipts
+retain their original outcome. The catalogue CAS limit is 1 MiB minus 256 bytes
+so both expected and replacement images fit one bounded command. This initial
+whole-image model is not final large-catalogue paging or schema migration.
+
+The routed client caches an immutable directory and supports points and atomic
+same-range mutations/predicates. Cross-group operations fail before submission.
+A prepared command preserves its operation ID, complete payload, group/epoch and
+original descriptor through directory refresh and explicit retry. No ambiguous
+mutation is automatically rerouted. Actual calls use bounded read-only leader
+probes and one user submission; stopped-peer gRPC status exceptions are normalized
+to IOException so discovery can inspect surviving voters. Calls are bounded to
+32 with no waiting queue; per-operation clients/probes still require performance
+work and are not the final efficient connection model.
+
+The three-JVM fixture uses an independent catalogue pool and two disjoint data
+ranges sharing one loader-backed user CF/native pool per JVM. It checks competing
+CAS proposals and original outcomes, direct malformed-write rejection, both data
+routes, actual catalogue read unavailability after two local catalogue groups
+are removed, cached data writes, a data leader kill, original-command retry and
+continued writes/reads on the surviving quorum. Initial configuration apply is
+proven on every voter before directory publication. This fixture does not yet
+implement catalogue-authorized production activation, dynamic topology, durable
+node/incarnation authorization, genuinely lost CAS network replies or host-level
+failure domains.
+
+A separate source review identified a **candidate partition stale-read defect**
+in pinned Ratis 3.3.1: ReadIndexHeartbeats reuses an acked commit index without a
+fresh heartbeat round, while old-leader expiry runs separately. Immediate read
+success after local follower-group removal is not itself stale-read evidence;
+those removals leave no replacement writable quorum. The decisive pending gate
+keeps the old leader's client endpoint reachable, isolates its Raft traffic,
+acknowledges a newer write through the other voters, then reads the old leader
+with a fresh client. The read must fail or see that write. Existing process/read
+successes and eventual leader expiry do not establish this partition invariant.
+No executed stale-read result or remediation is claimed at this checkpoint.
+
+Pinned source anchors for that candidate:
+[ReadIndexHeartbeats](https://raw.githubusercontent.com/apache/ratis/ratis-3.3.1/ratis-server/src/main/java/org/apache/ratis/server/impl/ReadIndexHeartbeats.java),
+[LeaderStateImpl](https://raw.githubusercontent.com/apache/ratis/ratis-3.3.1/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java),
+[RaftServerImpl](https://raw.githubusercontent.com/apache/ratis/ratis-3.3.1/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java).
+
+Passing combined command:
+
+```
+mvn -f distributed/pom.xml -pl :rockserver-distributed-ratis -am \
+  -Dtest=DistributedCommandCodecTest,DistributedMergeOperatorRegistryTest,ReplicatedRangeStoreTest,RangeOwnershipTest,NativeRangeImageTest,NativeRangeInstallTest,ReplicatedPoolModeTest,DistributedStoragePoolTest,RocksDBLoaderComplexConfigTest,RangeDirectoryCodecTest,RatisDurableProcessesTest,RatisSnapshotLifecycleTest,RatisSnapshotAckInterceptorTest,RatisCatalogueValidationTest,RatisCatalogueProcessesTest,RatisRoutedClientTest \
+  -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Surefire's native-stream warning is the same io_uring ENOMEM fallback recorded in
+its dumpstream, not a failed assertion. Strict read-safety/fault acceptance and
+all remaining architecture milestones remain open. No merge, push, publication,
+deployment or live acceptance occurred.
