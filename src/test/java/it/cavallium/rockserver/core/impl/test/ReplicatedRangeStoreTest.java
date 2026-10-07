@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.common.distributed.*;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
+import it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -196,7 +197,10 @@ class ReplicatedRangeStoreTest {
                     new ColumnFamilyDescriptor(bytes("a"), merged), new ColumnFamilyDescriptor(bytes("b"), plain),
                     new ColumnFamilyDescriptor(bytes("state"), plain), new ColumnFamilyDescriptor(bytes("receipts"), plain));
             db = RocksDB.open(options, path.toString(), descriptors, handles);
-            store = new ReplicatedRangeStore(db, GROUP, 1, new byte[32], Map.of(A, handles.get(1), B, handles.get(2)),
+            var guard = new RangeOwnership();
+            var owner = new RangeOwnership.Owner(GROUP, 1);
+            guard.register(owner, new RangeOwnership.Interval(GROUP, Set.of(A, B), null, null), RangeOwnership.State.ACTIVE);
+            store = new ReplicatedRangeStore(db, guard, owner, new byte[32], Map.of(A, handles.get(1), B, handles.get(2)),
                     handles.get(3), handles.get(4), Set.of(A));
         }
         @Override public void close() {

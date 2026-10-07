@@ -16,6 +16,7 @@ import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.io.IOException;
+import java.nio.file.Path;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
@@ -24,6 +25,8 @@ import org.rocksdb.Snapshot;
 import org.rocksdb.WriteBatch;
 import org.rocksdb.WriteOptions;
 import org.rocksdb.WriteBatchWithIndex;
+import org.rocksdb.OptimisticTransactionDB;
+import org.rocksdb.TransactionDB;
 
 /**
  * Native atomic apply seam for one range in a shared storage pool.
@@ -35,6 +38,8 @@ public final class ReplicatedRangeStore {
     private static final int STATE_VERSION = 1;
     private static final int MAX_RESULT_BYTES = 2 * 1024 * 1024;
     private final RocksDB db;
+    // getBaseDB() is borrowed and does not retain its original Java/native owner.
+    private final RocksDB databaseOwner;
     private final UUID groupId;
     private final long rangeEpoch;
     private final byte[] schemaDigest;
@@ -43,18 +48,33 @@ public final class ReplicatedRangeStore {
     private final ColumnFamilyHandle state;
     private final ColumnFamilyHandle receipts;
     private final byte[] markerKey;
+    private final byte[] installingKey;
+    private final byte[] configurationKey;
+    private final RangeOwnership ownership;
+    private final RangeOwnership.Owner owner;
+    private final RangeOwnership.Interval interval;
     private final ReentrantLock applyLane = new ReentrantLock();
     private volatile ApplyPosition applied;
     private final AtomicInteger snapshotPins = new AtomicInteger();
+    private volatile byte[] pendingInstallation;
 
-    public ReplicatedRangeStore(RocksDB db, UUID groupId, long rangeEpoch,
+    public ReplicatedRangeStore(RocksDB db, RangeOwnership ownership, RangeOwnership.Owner owner,
             byte[] schemaDigest, Map<UUID, ColumnFamilyHandle> columns,
             ColumnFamilyHandle state, ColumnFamilyHandle receipts,
             Set<UUID> deterministicMergeColumns) throws RocksDBException {
-        this.db = Objects.requireNonNull(db);
-        this.groupId = Objects.requireNonNull(groupId);
-        if (rangeEpoch < 0 || schemaDigest.length != 32) throw new IllegalArgumentException("Invalid range schema");
-        this.rangeEpoch = rangeEpoch;
+        this.databaseOwner = Objects.requireNonNull(db);
+        if (db instanceof TransactionDB) {
+            throw new IllegalArgumentException("Distributed pools require regular or optimistic-base RocksDB for atomic range deletion");
+        }
+        this.db = db instanceof OptimisticTransactionDB optimistic ? optimistic.getBaseDB() : db;
+        this.ownership = Objects.requireNonNull(ownership);
+        this.owner = Objects.requireNonNull(owner);
+        this.interval = ownership.get(owner).interval();
+        this.groupId = owner.groupId();
+        this.rangeEpoch = owner.epoch();
+        if (schemaDigest.length != 32 || !interval.columns().equals(columns.keySet())) {
+            throw new IllegalArgumentException("Invalid range schema or physical column coverage");
+        }
         this.schemaDigest = schemaDigest.clone();
         this.columns = Map.copyOf(columns);
         this.deterministicMergeColumns = Set.copyOf(deterministicMergeColumns);
@@ -67,16 +87,92 @@ public final class ReplicatedRangeStore {
                 cf -> cf.getID() == state.getID() || cf.getID() == receipts.getID())) {
             throw new IllegalArgumentException("User, state and receipt CFs must be distinct");
         }
+        if (columns.values().stream().map(ColumnFamilyHandle::getID).distinct().count() != columns.size()) {
+            throw new IllegalArgumentException("Logical columns must have distinct physical column families");
+        }
         markerKey = uuidBytes(groupId);
-        byte[] recovered = db.get(state, markerKey);
+        installingKey = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x7f).array();
+        configurationKey = ByteBuffer.allocate(17).put(markerKey).put((byte) 1).array();
+        byte[] recovered = this.db.get(state, markerKey);
         applied = recovered == null ? null : decodePosition(recovered);
+        pendingInstallation = this.db.get(state, installingKey);
+        if (pendingInstallation != null) {
+            if (pendingInstallation.length != 52 || ByteBuffer.wrap(pendingInstallation).getInt() != STATE_VERSION) {
+                throw new IllegalStateException("Invalid pending installation marker");
+            }
+            if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
+        }
     }
 
     /** Null means no log entry has yet completed. This is not a durable snapshot watermark. */
     public ApplyPosition applied() { return applied; }
     public int activeSnapshotPins() { return snapshotPins.get(); }
+    public boolean pendingInstallation() { return pendingInstallation != null; }
+    public RangeOwnership.Ownership ownership() { return ownership.get(owner); }
+    public byte[] schemaDigest() { return schemaDigest.clone(); }
+    public Set<UUID> deterministicMergeColumns() { return deterministicMergeColumns; }
+
+    public record Configuration(long term, long index, byte[] data) {
+        public Configuration {
+            if (term < 0 || index < -1 || (index == -1 && term != 0) || data.length == 0 || data.length > 65536) {
+                throw new IllegalArgumentException("Invalid cut configuration");
+            }
+            data = data.clone();
+        }
+        @Override public byte[] data() { return data.clone(); }
+        public static Configuration decode(byte[] value) { return decodeConfiguration(value); }
+    }
+
+    public Configuration configuration() throws RocksDBException {
+        byte[] value = db.get(state, configurationKey);
+        return value == null ? null : decodeConfiguration(value);
+    }
+
+    public void initializeConfiguration(byte[] initialConfiguration) throws RocksDBException {
+        applyLane.lock();
+        try {
+            if (configuration() != null) return;
+            if (applied != null || pendingInstallation != null) throw new IllegalStateException("Recovered range has no cut configuration");
+            var bootstrap = new Configuration(0, -1, initialConfiguration);
+            try (var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
+                db.put(state, options, configurationKey, encodeConfiguration(bootstrap));
+            }
+        } finally { applyLane.unlock(); }
+    }
+
+    public void fence() {
+        applyLane.lock();
+        try {
+            var current = ownership.get(owner);
+            if (current.state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
+            else if (current.state() != RangeOwnership.State.FENCED) throw new IllegalStateException("Range cannot be fenced");
+        } finally { applyLane.unlock(); }
+    }
+
+    /** Local activation only; the range adapter must supply the committed ownership authority. */
+    public void activate() {
+        applyLane.lock();
+        try {
+            if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
+            ownership.activate(owner);
+        } finally { applyLane.unlock(); }
+    }
+
+    private void requireActive() {
+        if (pendingInstallation != null || ownership.get(owner).state() != RangeOwnership.State.ACTIVE) {
+            throw new IllegalStateException("Range is fenced");
+        }
+    }
+
+    private boolean contains(byte[] key) {
+        byte[] lower = interval.lowerInclusive();
+        byte[] upper = interval.upperExclusive();
+        return (lower == null || Arrays.compareUnsigned(key, lower) >= 0)
+                && (upper == null || Arrays.compareUnsigned(key, upper) < 0);
+    }
 
     public void validate(DistributedCommand command) {
+        requireActive();
         if (!groupId.equals(command.groupId()) || rangeEpoch != command.rangeEpoch()
                 || !Arrays.equals(schemaDigest, command.schemaDigest())) {
             throw new IllegalArgumentException("Wrong group, epoch or schema");
@@ -85,6 +181,13 @@ public final class ReplicatedRangeStore {
             if (!columns.containsKey(mutation.columnId())) throw new IllegalArgumentException("Unknown logical column");
             if (mutation.kind() == Mutation.Kind.MERGE && !deterministicMergeColumns.contains(mutation.columnId())) {
                 throw new IllegalArgumentException("Column has no admitted deterministic merge operator");
+            }
+            if (!contains(mutation.key())) throw new IllegalArgumentException("Mutation outside owned interval");
+            if (mutation.kind() == Mutation.Kind.DELETE_RANGE) {
+                byte[] upper = interval.upperExclusive();
+                if (upper != null && Arrays.compareUnsigned(mutation.value(), upper) > 0) {
+                    throw new IllegalArgumentException("Range deletion outside owned interval");
+                }
             }
         }
         if (command.mutations().stream().anyMatch(m -> m.returnMode() != Mutation.ReturnMode.NONE)
@@ -118,6 +221,7 @@ public final class ReplicatedRangeStore {
         byte[] receiptKey = receiptKey(command.operationId());
         applyLane.lock();
         try {
+            requireActive();
             byte[] saved = db.get(receipts, receiptKey);
             byte[] original = saved == null ? null : decodeReceipt(saved, digest);
             if (applied != null && position.index() <= applied.index()) {
@@ -191,18 +295,163 @@ public final class ReplicatedRangeStore {
 
     /** Every committed configuration/no-op entry must be accounted for in log order. */
     public void applyNoop(ApplyPosition position) throws RocksDBException {
+        applyNoop(position, null);
+    }
+
+    public void applyNoop(ApplyPosition position, byte[] configuration) throws RocksDBException {
         applyLane.lock();
         try {
+            var current = ownership.get(owner).state();
+            if (pendingInstallation != null || (current != RangeOwnership.State.ACTIVE && current != RangeOwnership.State.FENCED)) {
+                throw new IllegalStateException("Range cannot complete Raft accounting");
+            }
             if (applied != null && position.index() <= applied.index()) return;
             requireNext(position);
             try (WriteBatch batch = new WriteBatch();
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
                 batch.put(state, markerKey, encodePosition(position));
+                if (configuration != null) {
+                    batch.put(state, configurationKey, encodeConfiguration(new Configuration(position.term(), position.index(), configuration)));
+                }
                 db.write(options, batch);
             }
             applied = position;
         } finally {
             applyLane.unlock();
+        }
+    }
+
+    /**
+     * Replaces only this fenced interval, retaining a durable INSTALLING marker
+     * until all imported data and metadata have been flushed through the WAL.
+     * The caller supplies consensus/ownership authority and keeps the pool open.
+     * Successful installation leaves ownership fenced for explicit activation.
+     */
+    public NativeRangeImage.Manifest installSnapshot(Path image, NativeRangeImage.Limits limits)
+            throws IOException, RocksDBException {
+        return installSnapshot(image, limits, batches -> {});
+    }
+
+    public NativeRangeImage.Manifest installSnapshot(Path image, NativeRangeImage.Limits limits,
+            InstallationObserver observer) throws IOException, RocksDBException {
+        var expected = NativeRangeImage.inspect(image, limits);
+        if (!expected.owner().equals(owner) || !expected.interval().equals(interval)
+                || !Arrays.equals(expected.schemaDigest(), schemaDigest)
+                || !expected.deterministicMergeColumns().equals(deterministicMergeColumns)) {
+            throw new IOException("Snapshot target identity/schema/coverage mismatch");
+        }
+        Objects.requireNonNull(observer);
+        applyLane.lock();
+        try {
+            if (snapshotPins.get() != 0) throw new IllegalStateException("Native snapshot readers have not drained");
+            if (ownership.get(owner).state() != RangeOwnership.State.FENCED) {
+                throw new IllegalStateException("Snapshot installation requires a fenced interval");
+            }
+            if (pendingInstallation != null) {
+                var pending = ByteBuffer.wrap(pendingInstallation);
+                pending.getInt();
+                long pendingTerm = pending.getLong();
+                long pendingIndex = pending.getLong();
+                byte[] hash = new byte[32];
+                pending.get(hash);
+                if (expected.position().index() < pendingIndex || expected.position().term() < pendingTerm
+                        || (expected.position().index() == pendingIndex && !Arrays.equals(hash, expected.sha256()))) {
+                    throw new IOException("Snapshot regresses or disagrees with pending installation");
+                }
+            }
+            try (var lease = ownership.claimInstall(owner)) {
+                pendingInstallation = ByteBuffer.allocate(52).putInt(STATE_VERSION)
+                        .putLong(expected.position().term()).putLong(expected.position().index()).put(expected.sha256()).array();
+                // Publish recovery authority before the first destructive interval change.
+                try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
+                    batch.put(state, installingKey, pendingInstallation);
+                    batch.delete(state, markerKey);
+                    db.write(options, batch);
+                }
+                applied = null;
+                try (var writer = new InstallWriter(observer)) {
+                    for (var cf : columns.values()) clearForInstall(cf, interval.lowerInclusive(), interval.upperExclusive(), null, writer);
+                    clearForInstall(state, markerKey, null, markerKey, writer);
+                    clearForInstall(receipts, markerKey, null, markerKey, writer);
+                    writer.flush();
+                    var actual = NativeRangeImage.visit(image, limits, (section, column, key, value) -> {
+                        try {
+                            switch (section) {
+                                case USER -> writer.put(columns.get(column), key, value);
+                                case RECEIPTS -> writer.put(receipts, key, value);
+                                case STATE -> {
+                                    if (Arrays.equals(key, installingKey)) throw new IOException("Image contains incomplete-install metadata");
+                                    if (!Arrays.equals(key, markerKey)) writer.put(state, key, value);
+                                }
+                            }
+                        } catch (RocksDBException storage) { throw new IOException("Native snapshot import failed", storage); }
+                    });
+                    if (!Arrays.equals(expected.sha256(), actual.sha256())) throw new IOException("Snapshot changed during installation");
+                    writer.flush();
+                    // Flush every prior CF mutation before publishing the final applied marker.
+                    db.flushWal(true);
+                    try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
+                        batch.put(state, markerKey, encodePosition(expected.position()));
+                        batch.delete(state, installingKey);
+                        db.write(options, batch);
+                    }
+                    applied = expected.position();
+                    pendingInstallation = null;
+                    return actual;
+                }
+            }
+        } finally { applyLane.unlock(); }
+    }
+
+    @FunctionalInterface
+    public interface InstallationObserver {
+        /** Fault/measurement hook; the interval remains exclusively leased and unservable. */
+        void afterBatch(int completedBatches) throws IOException;
+    }
+
+    private final class InstallWriter implements AutoCloseable {
+        private final InstallationObserver observer;
+        private final WriteBatch batch = new WriteBatch();
+        private final WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false);
+        private long bytes;
+        private int batches;
+        InstallWriter(InstallationObserver observer) { this.observer = observer; }
+        void put(ColumnFamilyHandle cf, byte[] key, byte[] value) throws IOException, RocksDBException {
+            reserve(key.length + (long) value.length);
+            batch.put(cf, key, value);
+            bytes += key.length + (long) value.length + 32;
+        }
+        void delete(ColumnFamilyHandle cf, byte[] key) throws IOException, RocksDBException {
+            reserve(key.length);
+            batch.delete(cf, key);
+            bytes += key.length + 32L;
+        }
+        private void reserve(long added) throws IOException, RocksDBException {
+            if (batch.count() >= 256 || (batch.count() != 0 && bytes + added + 32 > 2L * 1024 * 1024)) flush();
+        }
+        void flush() throws IOException, RocksDBException {
+            if (batch.count() == 0) return;
+            db.write(options, batch);
+            batch.clear();
+            bytes = 0;
+            observer.afterBatch(++batches);
+        }
+        @Override public void close() { batch.close(); options.close(); }
+    }
+
+    private void clearForInstall(ColumnFamilyHandle cf, byte[] lower, byte[] upper, byte[] prefix, InstallWriter writer)
+            throws IOException, RocksDBException {
+        try (var options = new ReadOptions().setFillCache(false); var iterator = db.newIterator(cf, options)) {
+            if (lower == null) iterator.seekToFirst(); else iterator.seek(lower);
+            while (iterator.isValid()) {
+                byte[] key = iterator.key();
+                if (upper != null && Arrays.compareUnsigned(key, upper) >= 0) break;
+                if (prefix != null && (key.length < prefix.length
+                        || !Arrays.equals(prefix, 0, prefix.length, key, 0, prefix.length))) break;
+                if (cf.getID() != state.getID() || !Arrays.equals(key, installingKey)) writer.delete(cf, key);
+                iterator.next();
+            }
+            iterator.status();
         }
     }
 
@@ -217,8 +466,10 @@ public final class ReplicatedRangeStore {
      * A native cut alone does not constitute a durable installable Raft snapshot.
      */
     public SnapshotPin capture() throws RocksDBException {
+        requireActive();
         applyLane.lock();
         try {
+            requireActive();
             Snapshot snapshot = db.getSnapshot();
             try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
                 byte[] marker = db.get(state, options, markerKey);
@@ -246,11 +497,25 @@ public final class ReplicatedRangeStore {
             this.position = position;
         }
         public ApplyPosition position() { return position; }
+        public UUID groupId() { return groupId; }
+        public long rangeEpoch() { return rangeEpoch; }
+        public byte[] schemaDigest() { return schemaDigest.clone(); }
+        public Set<UUID> columns() { return columns.keySet(); }
+        public Set<UUID> deterministicMergeColumns() { return deterministicMergeColumns; }
+        public RangeOwnership.Interval interval() { return interval; }
+        public Configuration configuration() throws RocksDBException {
+            acquireUse();
+            try (var options = new ReadOptions().setSnapshot(snapshot)) {
+                byte[] value = db.get(state, options, configurationKey);
+                return value == null ? null : decodeConfiguration(value);
+            } finally { releaseUse(); }
+        }
         public byte[] get(UUID columnId, byte[] key) throws RocksDBException {
             acquireUse();
             try {
                 var cf = columns.get(columnId);
                 if (cf == null) throw new IllegalArgumentException("Unknown logical column");
+                if (!contains(key)) throw new IllegalArgumentException("Read outside owned interval");
                 try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
                     return db.get(cf, options, key);
                 }
@@ -274,8 +539,13 @@ public final class ReplicatedRangeStore {
                 throws RocksDBException, IOException {
             var cf = columns.get(columnId);
             if (cf == null) throw new IllegalArgumentException("Unknown logical column");
-            visit(cf, lowerInclusive == null ? null : lowerInclusive.clone(),
-                    upperExclusive == null ? null : upperExclusive.clone(), null, visitor);
+            byte[] lower = lowerInclusive == null ? interval.lowerInclusive() : lowerInclusive.clone();
+            byte[] upper = upperExclusive == null ? interval.upperExclusive() : upperExclusive.clone();
+            if ((interval.lowerInclusive() != null && (lower == null || Arrays.compareUnsigned(lower, interval.lowerInclusive()) < 0))
+                    || (interval.upperExclusive() != null && (upper == null || Arrays.compareUnsigned(upper, interval.upperExclusive()) > 0))) {
+                throw new IllegalArgumentException("Export outside owned interval");
+            }
+            visit(cf, lower, upper, null, visitor);
         }
         public void visitState(SnapshotVisitor visitor) throws RocksDBException, IOException {
             visit(state, markerKey, null, markerKey, visitor);
@@ -350,6 +620,20 @@ public final class ReplicatedRangeStore {
     }
     private static byte[] encodePosition(ApplyPosition position) {
         return ByteBuffer.allocate(20).putInt(STATE_VERSION).putLong(position.term()).putLong(position.index()).array();
+    }
+    private static byte[] encodeConfiguration(Configuration configuration) {
+        return ByteBuffer.allocate(20 + configuration.data.length).putInt(STATE_VERSION)
+                .putLong(configuration.term()).putLong(configuration.index()).put(configuration.data).array();
+    }
+    private static Configuration decodeConfiguration(byte[] value) {
+        if (value.length <= 20 || value.length > 20 + 65536) throw new IllegalStateException("Invalid cut configuration bytes");
+        var input = ByteBuffer.wrap(value);
+        if (input.getInt() != STATE_VERSION) throw new IllegalStateException("Unsupported configuration version");
+        long term = input.getLong();
+        long index = input.getLong();
+        byte[] data = new byte[input.remaining()];
+        input.get(data);
+        return new Configuration(term, index, data);
     }
     private static ApplyPosition decodePosition(byte[] value) {
         if (value.length != 20) throw new IllegalStateException("Invalid applied marker");
