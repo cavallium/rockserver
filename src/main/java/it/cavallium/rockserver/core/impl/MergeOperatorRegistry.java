@@ -11,6 +11,9 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureClassLoader;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+import java.util.Objects;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +35,7 @@ public class MergeOperatorRegistry implements Closeable {
     private final ColumnFamilyHandle cfh;
     // Cache: OperatorName -> Version -> OperatorInstance
     private final Map<String, Map<Long, FFMAbstractMergeOperator>> cache = new ConcurrentHashMap<>();
+    private final Map<DistributedOperatorDescriptor, FFMAbstractMergeOperator> distributedCache = new ConcurrentHashMap<>();
 
     public MergeOperatorRegistry(RocksDB db, ColumnFamilyHandle cfh) {
         this.db = db;
@@ -144,6 +148,101 @@ public class MergeOperatorRegistry implements Closeable {
                     .computeIfAbsent(version, v -> loadFromDb(name, v));
     }
 
+    /** Explicit admission metadata, not bytecode verification or a sandbox guarantee. */
+    public record DeterministicContract(String identifier, int version, boolean admitted) {
+        public DeterministicContract {
+            if (identifier == null || identifier.isBlank() || version <= 0) {
+                throw new IllegalArgumentException("Deterministic contract requires an identifier and positive version");
+            }
+        }
+    }
+
+    /** Exact immutable artifact/schema identity; SHA-256 is canonical lowercase hexadecimal. */
+    public record DistributedOperatorDescriptor(String name, long version, String artifactSha256,
+                                               String className, int codecVersion,
+                                               DeterministicContract contract) {
+        public DistributedOperatorDescriptor {
+            if (name == null || name.isBlank() || className == null || className.isBlank()
+                    || version <= 0 || codecVersion <= 0) {
+                throw new IllegalArgumentException("Distributed operator requires exact name, version, class and codec version");
+            }
+            if (artifactSha256 == null || !artifactSha256.matches("[0-9a-f]{64}")) {
+                throw new IllegalArgumentException("Artifact digest must be canonical SHA-256 hexadecimal");
+            }
+        }
+    }
+
+    /**
+     * Loads only an explicitly admitted deterministic operator, with a replica-stable constructor identity.
+     * Admission must establish purity externally; this method cannot prove arbitrary Java code deterministic.
+     * The distributed instance never shares native ownership with the standalone cache.
+     */
+    public synchronized FFMAbstractMergeOperator getDistributed(DistributedOperatorDescriptor descriptor) {
+        Objects.requireNonNull(descriptor, "descriptor");
+        if (descriptor.contract() == null || !descriptor.contract().admitted()) {
+            throw new IllegalArgumentException("Merge operator has no admitted deterministic contract");
+        }
+        return distributedCache.computeIfAbsent(descriptor, this::loadDistributedFromDb);
+    }
+
+    private FFMAbstractMergeOperator loadDistributedFromDb(DistributedOperatorDescriptor descriptor) {
+        try {
+            byte[] stored = db.get(cfh, encodeKey(descriptor.name(), descriptor.version()));
+            if (stored == null) {
+                throw RocksDBException.of(RocksDBErrorType.COLUMN_NOT_FOUND,
+                        "Merge operator not found: " + descriptor.name() + " v" + descriptor.version());
+            }
+            try (var input = new DataInputStream(new ByteArrayInputStream(stored))) {
+                String className = input.readUTF();
+                int jarLength = input.readInt();
+                if (jarLength <= 0 || jarLength != input.available()) {
+                    throw new IllegalArgumentException("Malformed stored operator artifact");
+                }
+                byte[] jar = input.readNBytes(jarLength);
+                if (!descriptor.className().equals(className)
+                        || !descriptor.artifactSha256().equals(HexFormat.of().formatHex(sha256(jar)))) {
+                    throw new IllegalArgumentException("Distributed operator artifact/class mismatch");
+                }
+                var loader = new InMemoryClassLoader(jar, getClass().getClassLoader());
+                // Require the declared class from this exact artifact, even if a parent has the same name.
+                Class<?> type = loader.findClass(className);
+                if (!FFMAbstractMergeOperator.class.isAssignableFrom(type)) {
+                    throw new IllegalArgumentException("Operator class must extend FFMAbstractMergeOperator");
+                }
+                return (FFMAbstractMergeOperator) type.getConstructor(String.class)
+                        .newInstance(distributedConstructorIdentity(descriptor));
+            }
+        } catch (RocksDBException | IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+                    "Failed to load distributed merge operator " + descriptor.name(), e);
+        }
+    }
+
+    private static byte[] sha256(byte[] bytes) {
+        try {
+            return MessageDigest.getInstance("SHA-256").digest(bytes);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static String distributedConstructorIdentity(DistributedOperatorDescriptor descriptor) throws IOException {
+        var bytes = new ByteArrayOutputStream();
+        try (var output = new DataOutputStream(bytes)) {
+            output.writeInt(1); // identity encoding version
+            output.writeUTF(descriptor.name());
+            output.writeLong(descriptor.version());
+            output.writeUTF(descriptor.artifactSha256());
+            output.writeUTF(descriptor.className());
+            output.writeInt(descriptor.codecVersion());
+            output.writeUTF(descriptor.contract().identifier());
+            output.writeInt(descriptor.contract().version());
+        }
+        return "DistributedOp-v1-" + HexFormat.of().formatHex(sha256(bytes.toByteArray()));
+    }
+
     /**
      * Returns the number of distinct operator names currently cached.
      */
@@ -244,7 +343,7 @@ public class MergeOperatorRegistry implements Closeable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         for (Map<Long, FFMAbstractMergeOperator> versions : cache.values()) {
             for (FFMAbstractMergeOperator op : versions.values()) {
                 try {
@@ -263,6 +362,14 @@ public class MergeOperatorRegistry implements Closeable {
             }
         }
         cache.clear();
+        for (FFMAbstractMergeOperator op : distributedCache.values()) {
+            try {
+                if (op.isOwningHandle()) op.close();
+            } catch (Throwable e) {
+                LOG.debug("Ignoring error while closing distributed merge operator", e);
+            }
+        }
+        distributedCache.clear();
     }
 
     public record MergeOperatorInfo(String name, long version, String className) {}
