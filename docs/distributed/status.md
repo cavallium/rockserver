@@ -59,7 +59,7 @@ tests again in its fuzz execution; those are repeated checks, not additional
 independent tests. Native io_uring initialization emits an ENOMEM warning and
 falls back; this is not storage power-loss evidence.
 
-The process test verifies disk-backed quorum writes, cross-column native atomic
+The initial process test verified file-backed quorum writes, cross-column native atomic
 apply, noncommutative merge order, saved previous/merged results, dropped
 application-result handling, leader kill, original-identity retry, node restart
 and a new write with a second original voter stopped. All processes share a
@@ -112,3 +112,47 @@ pool per node. Density fixtures must cap per-division and gRPC executors, use
 fresh directories for group-add FORMAT, collect RSS/thread/FD samples after
 warmup, and report local results without extrapolating to production NUMA or
 quorum-durable throughput. This density measurement has not been run.
+
+## Portable native recovery checkpoint
+
+Native image/import implementation is committed at `878bedc`, with persistent
+test storage at `63b5299`. A streamed versioned image includes the exact native
+cut's data, receipts, configuration and completed marker; ordering, ownership,
+row/image limits and embedded/whole-file SHA-256 hashes are verified. It is
+published by an atomic no-overwrite hard link after file/directory sync.
+
+Installation acquires an inactive interval lease and persists `INSTALLING`
+before cleanup. User and group metadata are restored with bounded WAL-enabled
+batches, followed by a WAL sync and one final marker/recovery-state batch.
+Interrupted, corrupt or changing images leave the range fenced. Reopen and retry
+are tested, including untouched neighboring range data/receipts and original
+result retention. Status reads reject transitions rather than expose partial
+receipt state. Physical ownership bounds now reject cross-range access.
+
+Regular RocksDB and optimistic borrowed-base modes pass range-tombstone,
+cross-CF batch, snapshot and reopen tests. The optimistic wrapper itself rejects
+range-tombstone batches; the distributed store retains its original owner while
+using the borrowed base. Pessimistic TransactionDB is rejected before distribution
+because the pinned Java API lacks the required raw optimized range-write route.
+Existing standalone modes are unchanged.
+
+Storage verification corrected an earlier assumption: host `/tmp` is **tmpfs**,
+so earlier default JUnit temp fixtures prove file-backed process/reopen behavior,
+not physical disk durability. Native durability fixtures now use the worktree's
+`target/native-disk-tests` on XFS `/dev/nvme1n1p1`. All 41 core tests pass there;
+the four installer cases also pass after status-transition fencing was tightened.
+Filesystem sync tests remain distinct from hardware power-loss simulation.
+
+The initial Ratis snapshot integration passed native-pool-loss restoration and
+retained-tail replay in three JVMs. Its latest lifecycle/remote-publication changes
+are still uncommitted and unverified: rerun process/lifecycle gates on XFS before
+claiming their disk-backed acceptance. Released Ratis publishes received snapshot
+directories without fsync and acknowledges before native reload. Staging recovery
+and a gRPC final-reply durability barrier through the supported service customizer
+are under implementation. Failed pause/shutdown must settle deferred callbacks
+before Ratis joins its updater. Real remote installation and local child seed
+proof remain next gates.
+
+This initial image format stores canonical streamed logical rows. Canonical SST
+export/import and representative migration/backup throughput remain required;
+the row-based importer is not evidence of efficient large-range movement.
