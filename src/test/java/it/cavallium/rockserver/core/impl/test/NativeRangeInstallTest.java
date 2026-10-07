@@ -21,7 +21,7 @@ class NativeRangeInstallTest {
     private static final RangeOwnership.Interval INTERVAL = new RangeOwnership.Interval(DOMAIN, Set.of(A, B),
             new byte[] {0x10}, new byte[] {(byte) 0x80});
     private static final NativeRangeImage.Limits LIMITS = new NativeRangeImage.Limits(4 * 1024 * 1024, 16 * 1024 * 1024, 2);
-    @TempDir Path root;
+    @TempDir(factory = DiskTestDirectory.class) Path root;
 
     @Test void interruptedImportStaysFencedAcrossReopenAndRecoversWithoutTouchingNeighbor() throws Exception {
         Path image = root.resolve("image");
@@ -46,6 +46,8 @@ class NativeRangeInstallTest {
             assertThrows(IOException.class, () -> target.store.installSnapshot(image, LIMITS, batches -> {
                 assertEquals(RangeOwnership.State.INSTALLING, target.store.ownership().state());
                 assertThrows(IllegalStateException.class, target.store::activate);
+                assertThrows(IllegalStateException.class,
+                        () -> target.store.operationResult(command.operationId(), command.payloadDigest()));
                 if (batches == 1) throw new IOException("Injected interruption after cleanup batch");
             }));
             assertTrue(target.store.pendingInstallation());

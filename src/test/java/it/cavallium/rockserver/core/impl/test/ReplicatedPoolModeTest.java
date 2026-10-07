@@ -16,7 +16,7 @@ class ReplicatedPoolModeTest {
     static { RocksDB.loadLibrary(); }
     enum Mode { REGULAR, OPTIMISTIC }
     static final UUID GROUP = new UUID(1, 1), A = new UUID(1, 2), B = new UUID(1, 3), SESSION = new UUID(1, 4);
-    @TempDir Path root;
+    @TempDir(factory = DiskTestDirectory.class) Path root;
 
     @ParameterizedTest @EnumSource(Mode.class)
     void atomicRangeBatchAndOriginalReceiptSurviveReopen(Mode mode) throws Exception {

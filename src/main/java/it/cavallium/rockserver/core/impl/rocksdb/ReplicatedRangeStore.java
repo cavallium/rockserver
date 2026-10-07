@@ -57,6 +57,7 @@ public final class ReplicatedRangeStore {
     private volatile ApplyPosition applied;
     private final AtomicInteger snapshotPins = new AtomicInteger();
     private volatile byte[] pendingInstallation;
+    private volatile long installationGeneration;
 
     public ReplicatedRangeStore(RocksDB db, RangeOwnership ownership, RangeOwnership.Owner owner,
             byte[] schemaDigest, Map<UUID, ColumnFamilyHandle> columns,
@@ -360,6 +361,7 @@ public final class ReplicatedRangeStore {
                 }
             }
             try (var lease = ownership.claimInstall(owner)) {
+                installationGeneration++;
                 pendingInstallation = ByteBuffer.allocate(52).putInt(STATE_VERSION)
                         .putLong(expected.position().term()).putLong(expected.position().index()).put(expected.sha256()).array();
                 // Publish recovery authority before the first destructive interval change.
@@ -396,6 +398,7 @@ public final class ReplicatedRangeStore {
                         db.write(options, batch);
                     }
                     applied = expected.position();
+                    installationGeneration++;
                     pendingInstallation = null;
                     return actual;
                 }
@@ -456,7 +459,12 @@ public final class ReplicatedRangeStore {
     }
 
     public byte[] operationResult(OperationId id, byte[] payloadDigest) throws RocksDBException {
+        long generation = installationGeneration;
+        if (pendingInstallation != null) throw new IllegalStateException("Range metadata is being installed");
         byte[] saved = db.get(receipts, receiptKey(id));
+        if (generation != installationGeneration || pendingInstallation != null) {
+            throw new IllegalStateException("Range metadata changed during status lookup");
+        }
         return saved == null ? null : decodeReceipt(saved, payloadDigest);
     }
 

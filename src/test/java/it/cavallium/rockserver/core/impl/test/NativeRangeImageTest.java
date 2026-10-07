@@ -30,7 +30,7 @@ class NativeRangeImageTest {
     private static final UUID B = new UUID(3, 2);
     private static final UUID SESSION = new UUID(4, 1);
     private static final Limits LIMITS = new Limits(4096, 1024 * 1024, 4);
-    @TempDir Path directory;
+    @TempDir(factory = DiskTestDirectory.class) Path directory;
 
     private record Row(Section section, UUID column, byte[] key, byte[] value) {}
     private byte[] key(int value) { return new byte[]{(byte) value}; }

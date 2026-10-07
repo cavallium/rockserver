@@ -24,7 +24,7 @@ class ReplicatedRangeStoreTest {
     private static final UUID A = UUID.fromString("a8800000-0000-0000-0000-000000000002");
     private static final UUID B = UUID.fromString("a8800000-0000-0000-0000-000000000003");
     private static final UUID SESSION = UUID.fromString("a8800000-0000-0000-0000-000000000004");
-    @TempDir Path path;
+    @TempDir(factory = DiskTestDirectory.class) Path path;
 
     @Test void duplicateReturnsOriginalResultWithoutRepeatingMergeAfterReopen() throws Exception {
         var command = command(0, new Mutation(Mutation.Kind.MERGE, A, bytes("k"), bytes("first")),
