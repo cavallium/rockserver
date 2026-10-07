@@ -157,9 +157,9 @@ This initial image format stores canonical streamed logical rows. Canonical SST
 export/import and representative migration/backup throughput remain required;
 the row-based importer is not evidence of efficient large-range movement.
 
-## Pending Ratis integration gate
+## Historical Ratis integration failures
 
-The latest XFS-focused optional-module run passed the real empty LISTENER
+An intermediate XFS-focused optional-module run passed the real empty LISTENER
 snapshot-transfer/tail/promotion case, two controlled lifecycle cases and seven
 reply-barrier tests. It failed the existing leader-loss retry case and one
 snapshot-restore assertion. The full gate is therefore **not passing** and the
@@ -173,3 +173,55 @@ make actual Ratis failures observable. Fixture startup's `purgeGap=0` was also
 invalid in released Ratis (minimum is one), and is corrected without increasing
 timeouts. Diagnostics and passing whole-process results are required before the
 snapshot adapter is committed.
+
+## Current verified checkpoint
+
+The previous failures are resolved. Ratis integration is committed at `24a6863`,
+conditional commands at `3c7a1e3`, and the actual loader-backed shared pool owner
+at `8c0842b`. The combined XFS gate passes 68 core/loader tests and 12 optional
+Ratis tests: three independent-JVM process cases, two controlled lifecycle cases
+and seven transport-barrier boundary cases. Root selected tests repeat in the
+fuzz execution; repeated executions are not extra independent cases.
+
+Initial-voter readiness proved decisive: Ratis ignores votes from an empty-log
+voter once the candidate has committed entries. Fixtures now prove initial
+configuration apply on every initial voter before user writes; individual writes
+still return on quorum, with no all-voter apply wait. The production node/catalogue
+must enforce this initial activation gate; the fixture is not that runtime authority.
+
+Received images are verified and synced in staging, retained through stock Ratis's
+directory replacement, and synced again through the released gRPC customization
+hook before final SUCCESS. Complete orphan images recover after restart. Native
+reload/serving remains separate from transport acknowledgement. Recovery-image
+pruning and reference accounting remain required before bounded-retention acceptance.
+
+New command v2 carries bounded equality/absence predicates. Native apply evaluates
+them in committed order and saves either success or a conflict receipt without
+partial user effects. Delayed retries retain their original outcome even when
+conditions later change. Decoded v1 commands re-encode identical bytes/hashes.
+This is autocommit condition checking; snapshot transactions/ABA/history and 2PC
+remain unimplemented. Feature-epoch activation for v2 is still runtime work.
+
+`DistributedStoragePool` retains the whole LoadedDb resource graph, creates shared
+CF bindings, and reopens its explicitly reserved internal CFs with compatibility
+options. Standalone loader calls retain their original reserved-name behavior.
+Range admission closes before native draining; a held pin prevents pool closure
+and keeps all native options/caches/WBM/handles live for retry. Actual process
+fixtures now open through this pool/ConfigParser/RocksDBLoader path rather than
+handmade DBOptions pools. HOCON fixture substitutions are resolved within one
+input source containing defaults; separate config sources do not resolve those
+substitutions against each other.
+
+Passing combined command:
+
+```
+mvn -f distributed/pom.xml -pl :rockserver-distributed-ratis -am \
+  -Dtest=DistributedCommandCodecTest,DistributedMergeOperatorRegistryTest,ReplicatedRangeStoreTest,RangeOwnershipTest,NativeRangeImageTest,NativeRangeInstallTest,ReplicatedPoolModeTest,DistributedStoragePoolTest,RocksDBLoaderComplexConfigTest,RatisDurableProcessesTest,RatisSnapshotLifecycleTest,RatisSnapshotAckInterceptorTest \
+  -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Whole distribution is still incomplete: catalogue/bootstrap authority and real
+client/API routing, durable session GC/fences, scoped snapshots/transactions and
+disjoint proposal reservations, child seed proof, dynamic topology and migration,
+SST/bulk/export/CDC/backup workflows, transport parity, deterministic/fault models,
+rolling feature negotiation, bounded resource/performance and power-loss gates.
