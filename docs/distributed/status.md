@@ -50,11 +50,11 @@ Passing command (2026-10-07):
 
 ```
 mvn -f distributed/pom.xml -pl :rockserver-distributed-ratis -am \
-  -Dtest=DistributedCommandCodecTest,ReplicatedRangeStoreTest,DistributedMergeOperatorRegistryTest,RatisDurableProcessesTest \
+  -Dtest=DistributedCommandCodecTest,ReplicatedRangeStoreTest,DistributedMergeOperatorRegistryTest,RangeOwnershipTest,RatisDurableProcessesTest \
   -Dsurefire.failIfNoSpecifiedTests=false test
 ```
 
-Seventeen core tests and one three-process test pass. The root POM runs selected
+Twenty-four core tests and one three-process test pass. The root POM runs selected
 tests again in its fuzz execution; those are repeated checks, not additional
 independent tests. Native io_uring initialization emits an ENOMEM warning and
 falls back; this is not storage power-loss evidence.
@@ -74,6 +74,22 @@ enabled despite `rocksdb.migrate`, and deterministic uploaded-operator identity
 across instances. Explicit operator qualification does not prove arbitrary Java
 pure or sandboxed. Distributed callbacks require further cross-JVM/property
 and compaction-schedule testing.
+
+Independent review found and corrected pre-append MERGE admission on plain
+columns. The native store now requires an immutable set of admitted deterministic
+merge columns; a trusted pool/schema owner must populate it from actual qualified
+operators. The process gate rejects plain-column MERGE and malformed/payload-
+mismatched commands, then verifies continued valid writes/reads. It does not
+prove arbitrary custom operand validation.
+
+Snapshot pin release now waits for its native readers/iterators to return even
+when close/cancellation arrives during export. A controlled reader barrier
+verifies that another apply can proceed while the original cut stays retained;
+the pool must remain open until `activeSnapshotPins()` returns to zero.
+`RangeOwnership` additionally enforces unsigned intervals, stale identity checks,
+one live local owner and exclusive inactive install/cleanup leases. Its six tests
+cover metadata-only local split/merge and overlap races. This guard is not durable
+ownership state and does not establish distributed split/merge behavior.
 
 The current adapter applies synchronously. It explicitly accounts for Ratis
 configuration/metadata entries before publishing completed progress. Log data

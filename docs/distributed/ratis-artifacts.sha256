@@ -1,0 +1,9 @@
+a635a8c69b5c59089b026992178ecea95ead7d709c5ff4f94834e06eaa0c911d  ratis-server/3.3.1/ratis-server-3.3.1.jar
+1ecf852c98ae9c8491c5495d20d259f8a5cb1020948566d869ca4377d6a80203  ratis-server-api/3.3.1/ratis-server-api-3.3.1.jar
+8485d2051b173d80ccfd39924a597c6b7e256c34008eb2a979aa6641a15e8027  ratis-common/3.3.1/ratis-common-3.3.1.jar
+bbec328a5035c9ad3847852e9333a34137bf1902976b137cbedd1076410dfdac  ratis-client/3.3.1/ratis-client-3.3.1.jar
+573a4f79a6fdcd84819805da55a1994eaca8c68ff71b911e6706bf51746697ad  ratis-grpc/3.3.1/ratis-grpc-3.3.1.jar
+2c98855a2b1e8087b45cae929d59587d75b7f24b6549bf74962c2ab651c85497  ratis-proto/3.3.1/ratis-proto-3.3.1.jar
+2f47550e19c251485f8414f62b408719ddffa17d5925a97e38ed407bfb9f3c4b  ratis-metrics-api/3.3.1/ratis-metrics-api-3.3.1.jar
+b472c192a19b16baf76d0819a3101975d996fda3089bcbb6e500975ee463a78f  ratis-metrics-default/3.3.1/ratis-metrics-default-3.3.1.jar
+3940f4ea532737831a5ed3d559977755465438555c34d7242855997833615138  ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar
