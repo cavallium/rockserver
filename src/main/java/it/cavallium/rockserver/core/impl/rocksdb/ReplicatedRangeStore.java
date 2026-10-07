@@ -17,6 +17,9 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.TimeUnit;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
@@ -54,6 +57,8 @@ public final class ReplicatedRangeStore {
     private final RangeOwnership.Owner owner;
     private final RangeOwnership.Interval interval;
     private final ReentrantLock applyLane = new ReentrantLock();
+    private final ReentrantReadWriteLock nativeLifecycle = new ReentrantReadWriteLock();
+    private volatile boolean closing;
     private volatile ApplyPosition applied;
     private final AtomicInteger snapshotPins = new AtomicInteger();
     private volatile byte[] pendingInstallation;
@@ -125,14 +130,26 @@ public final class ReplicatedRangeStore {
     }
 
     public Configuration configuration() throws RocksDBException {
+        enterNative();
+        try { return configurationUnderAdmission(); }
+        finally { leaveNative(); }
+    }
+
+    private Configuration configurationUnderAdmission() throws RocksDBException {
         byte[] value = db.get(state, configurationKey);
         return value == null ? null : decodeConfiguration(value);
     }
 
     public void initializeConfiguration(byte[] initialConfiguration) throws RocksDBException {
+        enterNative();
+        try { initializeConfigurationUnderAdmission(initialConfiguration); }
+        finally { leaveNative(); }
+    }
+
+    private void initializeConfigurationUnderAdmission(byte[] initialConfiguration) throws RocksDBException {
         applyLane.lock();
         try {
-            if (configuration() != null) return;
+            if (configurationUnderAdmission() != null) return;
             if (applied != null || pendingInstallation != null) throw new IllegalStateException("Recovered range has no cut configuration");
             var bootstrap = new Configuration(0, -1, initialConfiguration);
             try (var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
@@ -152,6 +169,12 @@ public final class ReplicatedRangeStore {
 
     /** Local activation only; the range adapter must supply the committed ownership authority. */
     public void activate() {
+        enterNative();
+        try { activateUnderAdmission(); }
+        finally { leaveNative(); }
+    }
+
+    private void activateUnderAdmission() {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
@@ -173,6 +196,7 @@ public final class ReplicatedRangeStore {
     }
 
     public void validate(DistributedCommand command) {
+        if (closing) throw new IllegalStateException("Range admission is closed");
         requireActive();
         if (!groupId.equals(command.groupId()) || rangeEpoch != command.rangeEpoch()
                 || !Arrays.equals(schemaDigest, command.schemaDigest())) {
@@ -218,6 +242,13 @@ public final class ReplicatedRangeStore {
     }
 
     private byte[] applyInternal(ApplyPosition position, DistributedCommand command, byte[] result)
+            throws RocksDBException {
+        enterNative();
+        try { return applyUnderAdmission(position, command, result); }
+        finally { leaveNative(); }
+    }
+
+    private byte[] applyUnderAdmission(ApplyPosition position, DistributedCommand command, byte[] result)
             throws RocksDBException {
         Objects.requireNonNull(position);
         validate(command);
@@ -314,6 +345,12 @@ public final class ReplicatedRangeStore {
     }
 
     public void applyNoop(ApplyPosition position, byte[] configuration) throws RocksDBException {
+        enterNative();
+        try { applyNoopUnderAdmission(position, configuration); }
+        finally { leaveNative(); }
+    }
+
+    private void applyNoopUnderAdmission(ApplyPosition position, byte[] configuration) throws RocksDBException {
         applyLane.lock();
         try {
             var current = ownership.get(owner).state();
@@ -348,6 +385,13 @@ public final class ReplicatedRangeStore {
     }
 
     public NativeRangeImage.Manifest installSnapshot(Path image, NativeRangeImage.Limits limits,
+            InstallationObserver observer) throws IOException, RocksDBException {
+        enterNative();
+        try { return installUnderAdmission(image, limits, observer); }
+        finally { leaveNative(); }
+    }
+
+    private NativeRangeImage.Manifest installUnderAdmission(Path image, NativeRangeImage.Limits limits,
             InstallationObserver observer) throws IOException, RocksDBException {
         var expected = NativeRangeImage.inspect(image, limits);
         if (!expected.owner().equals(owner) || !expected.interval().equals(interval)
@@ -473,6 +517,12 @@ public final class ReplicatedRangeStore {
     }
 
     public byte[] operationResult(OperationId id, byte[] payloadDigest) throws RocksDBException {
+        enterNative();
+        try { return operationResultUnderAdmission(id, payloadDigest); }
+        finally { leaveNative(); }
+    }
+
+    private byte[] operationResultUnderAdmission(OperationId id, byte[] payloadDigest) throws RocksDBException {
         long generation = installationGeneration;
         if (pendingInstallation != null) throw new IllegalStateException("Range metadata is being installed");
         byte[] saved = db.get(receipts, receiptKey(id));
@@ -488,6 +538,12 @@ public final class ReplicatedRangeStore {
      * A native cut alone does not constitute a durable installable Raft snapshot.
      */
     public SnapshotPin capture() throws RocksDBException {
+        enterNative();
+        try { return captureUnderAdmission(); }
+        finally { leaveNative(); }
+    }
+
+    private SnapshotPin captureUnderAdmission() throws RocksDBException {
         requireActive();
         applyLane.lock();
         try {
@@ -507,6 +563,34 @@ public final class ReplicatedRangeStore {
         } finally {
             applyLane.unlock();
         }
+    }
+
+    private void enterNative() {
+        if (closing) throw new IllegalStateException("Range admission is closed");
+        nativeLifecycle.readLock().lock();
+        if (closing) {
+            nativeLifecycle.readLock().unlock();
+            throw new IllegalStateException("Range admission is closed");
+        }
+    }
+
+    private void leaveNative() { nativeLifecycle.readLock().unlock(); }
+
+    /**
+     * Permanently closes borrowed native admission. Pool ownership stays intact
+     * until true is returned. Existing pins retain their exact cut and may finish;
+     * this method never closes their database or forcibly releases a native user.
+     */
+    public boolean close(Duration timeout) throws InterruptedException {
+        Objects.requireNonNull(timeout);
+        if (timeout.isNegative()) throw new IllegalArgumentException("Negative close timeout");
+        long nanos = timeout.toNanos();
+        closing = true;
+        if (!nativeLifecycle.writeLock().tryLock(nanos, TimeUnit.NANOSECONDS)) return false;
+        try {
+            fence();
+            return snapshotPins.get() == 0;
+        } finally { nativeLifecycle.writeLock().unlock(); }
     }
 
     public final class SnapshotPin implements AutoCloseable {

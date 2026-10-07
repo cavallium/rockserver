@@ -617,6 +617,19 @@ public class RocksDBLoader {
             Logger logger,
             @Nullable MeterRegistry meterRegistry,
             @Nullable String databaseName) {
+        return load(path, config, logger, meterRegistry, databaseName, Set.of());
+    }
+
+    /** Explicit internal families for a loader-backed owner; ordinary callers retain user options. */
+    public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger,
+            @Nullable MeterRegistry meterRegistry, @Nullable String databaseName,
+            Set<String> extraInternalColumns) {
+        extraInternalColumns = Set.copyOf(extraInternalColumns);
+        for (String name : extraInternalColumns) {
+            if (name.isEmpty() || name.indexOf('\0') >= 0 || !StandardCharsets.US_ASCII.newEncoder().canEncode(name)) {
+                throw new IllegalArgumentException("Internal column names must be nonempty ASCII");
+            }
+        }
         var refs = new RocksDBObjects();
         try {
             // Get databases directory path
@@ -632,7 +645,7 @@ public class RocksDBLoader {
             }
             var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
             return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger,
-                    meterRegistry, databaseName);
+                    meterRegistry, databaseName, extraInternalColumns);
         } catch (RuntimeException | Error failure) {
             try {
                 refs.close();
@@ -1035,7 +1048,7 @@ public class RocksDBLoader {
     private static LoadedDb loadDb(@Nullable Path path,
         @NotNull Path definitiveDbPath,
         DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger,
-        @Nullable MeterRegistry meterRegistry, @Nullable String databaseName) {
+        @Nullable MeterRegistry meterRegistry, @Nullable String databaseName, Set<String> extraInternalColumns) {
         var inMemory = path == null;
         var rocksdbOptions = optionsWithCache.options();
         Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap = new HashMap<>();
@@ -1088,10 +1101,14 @@ public class RocksDBLoader {
                 }
             }
 
+            for (String internal : extraInternalColumns) {
+                columnConfigMap.putIfAbsent(internal, databaseOptions.global().fallbackColumnOptions());
+            }
+
             for (Map.Entry<String, FallbackColumnConfig> entry : columnConfigMap.entrySet()) {
                 String name = entry.getKey();
-                var columnFamilyOptions = !(entry.getValue() instanceof NamedColumnConfig)
-                        && (name.equals("_column_schemas_") || name.equals("_merge_operators_") || name.equals("_cdc_meta_"))
+                var columnFamilyOptions = extraInternalColumns.contains(name) || (!(entry.getValue() instanceof NamedColumnConfig)
+                        && (name.equals("_column_schemas_") || name.equals("_merge_operators_") || name.equals("_cdc_meta_")))
                         ? new ColumnOptionsWithMerge(getCompatibilityColumnOptions(refs, path, definitiveDbPath, databaseOptions), null)
                         : getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
                                 logger, refs, path == null, optionsWithCache.caches());

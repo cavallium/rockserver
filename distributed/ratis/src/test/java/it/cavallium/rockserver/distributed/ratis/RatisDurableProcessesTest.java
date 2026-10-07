@@ -2,6 +2,9 @@ package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.*;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
+import it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool;
+import it.cavallium.rockserver.core.config.ConfigParser;
+import org.slf4j.LoggerFactory;
 import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage;
 import it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership;
 import java.net.ServerSocket;
@@ -332,19 +335,28 @@ public class RatisDurableProcessesTest {
         int node = Integer.parseInt(args[1]);
         boolean purge = args[args.length - 1].equals("purge");
         int[] ports = java.util.stream.IntStream.range(2, args.length - (purge ? 1 : 0)).map(i -> Integer.parseInt(args[i])).toArray();
-        var handles = new ArrayList<ColumnFamilyHandle>();
-        try (var options = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
-                var plain = new ColumnFamilyOptions();
-                var merged = new ColumnFamilyOptions().setMergeOperator(new StringAppendOperator(","))) {
-            var descriptors = List.of(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, plain),
-                    new ColumnFamilyDescriptor(bytes("a"), merged), new ColumnFamilyDescriptor(bytes("b"), plain),
-                    new ColumnFamilyDescriptor(bytes("state"), plain), new ColumnFamilyDescriptor(bytes("receipts"), plain));
-            try (var db = RocksDB.open(options, directory.resolve("pool").toString(), descriptors, handles)) {
-                var guard = new RangeOwnership();
+        Path configuration = directory.resolve("pool.conf");
+        String defaults;
+        try (var input = RatisDurableProcessesTest.class.getClassLoader()
+                .getResourceAsStream("it/cavallium/rockserver/core/resources/default.conf")) {
+            if (input == null) throw new java.io.IOException("Missing default pool configuration");
+            defaults = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        Files.writeString(configuration, defaults + "\n" + """
+                database.global.column-options: [
+                  ${database.global.fallback-column-options} {
+                    name: "a"
+                    merge-operator-class: "it.cavallium.rockserver.core.impl.MyStringAppendOperator"
+                  },
+                  ${database.global.fallback-column-options} { name: "b" }
+                ]
+                """);
+        var pool = DistributedStoragePool.open(directory.resolve("pool"), ConfigParser.parse(configuration),
+                LoggerFactory.getLogger(RatisDurableProcessesTest.class));
+        try {
                 var owner = new RangeOwnership.Owner(GROUP, 1);
-                guard.register(owner, new RangeOwnership.Interval(GROUP, Set.of(A, B), null, null), RangeOwnership.State.ACTIVE);
-                var store = new ReplicatedRangeStore(db, guard, owner, new byte[32],
-                        Map.of(A, handles.get(1), B, handles.get(2)), handles.get(3), handles.get(4), Set.of(A));
+                var store = pool.openRange(owner, new RangeOwnership.Interval(GROUP, Set.of(A, B), null, null),
+                        new byte[32], Map.of(A, "a", B, "b"), Set.of(A));
                 var properties = RatisDurability.properties(directory.resolve("raft"));
                 RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.GRPC);
                 GrpcConfigKeys.Server.setPort(properties, ports[node]);
@@ -370,9 +382,9 @@ public class RatisDurableProcessesTest {
                     machine.beginShutdown();
                     server.close();
                     machine.awaitNativeReaders(Duration.ofSeconds(10));
-                    for (var handle : handles) handle.close();
                 }
-            }
+        } finally {
+            if (!pool.close(Duration.ofSeconds(10))) throw new java.io.IOException("Native pool drain incomplete");
         }
     }
 }

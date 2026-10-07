@@ -53,6 +53,7 @@ module rockserver.core {
 	opens it.cavallium.rockserver.core.client to rockserver.core.test;
 	opens it.cavallium.rockserver.core.impl to rockserver.core.test;
 	exports it.cavallium.rockserver.core.impl.rocksdb to rockserver.core.test;
+	opens it.cavallium.rockserver.core.impl.rocksdb to rockserver.core.test;
 	exports it.cavallium.rockserver.core.impl to rockserver.core.test;
 	exports it.cavallium.rockserver.core.common.api.proto;
 	exports it.cavallium.rockserver.core.common.api to rockserver.core.test;
