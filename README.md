@@ -175,6 +175,21 @@ columns. JMX and Influx exporters use the existing metrics configuration.
 mvn -Pfatjar -Dagent -DskipTests clean package
 ```
 
+## Package desktop UI
+
+Select `desktop` instead of `fatjar`, `library`, or `native` (including in the IDE's Maven profiles).
+It includes the server/client code, standalone logging, and the desktop UI in a shaded executable JAR:
+
+```shell
+mvn -Pdesktop -DskipTests package
+java --enable-native-access=ALL-UNNAMED -jar target/rockserver-core-1.0.0-SNAPSHOT-desktop.jar
+```
+
+GUI sources and tests live under `src/desktop/java` and `src/desktop-test/java`.
+`mvn -Pdesktop test` includes the GUI tests; use `xvfb-run -a` on a headless Linux machine.
+The other profiles omit the GUI sources and runtime dependencies. Each build variant uses
+its own class/test output directories, so switching profiles cannot reuse the wrong module descriptor.
+
 ## Package native
 ```shell
 GRAALVM_HOME=/usr/lib/jvm/xx;JAVA_HOME=/usr/lib/jvm/xx mvn -Pnative -Dagent -DskipTests clean package

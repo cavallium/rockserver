@@ -3,6 +3,7 @@ module rockserver.core.test {
 	requires jazzer.junit;
 	requires org.lz4.java;
 	requires rockserver.core;
+	requires org.mongodb.bson;
 	requires com.google.common;
 	requires com.google.protobuf;
 	requires org.slf4j;

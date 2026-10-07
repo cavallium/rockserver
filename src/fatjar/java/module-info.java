@@ -40,9 +40,7 @@ module rockserver.core {
 	requires vertx.rx.java3;
 	requires io.reactivex.rxjava3;
 	requires micrometer.jvm.extras;
-	requires java.desktop;
 	requires java.sql;
-	requires org.mongodb.bson;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

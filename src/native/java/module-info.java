@@ -26,6 +26,7 @@ module rockserver.core {
 	requires io.netty.transport;
 	requires io.netty.codec.http;
 	requires io.netty.codec;
+	requires io.netty.codec.compression;
 	requires io.netty.codec.http2;
 	requires io.netty.transport.classes.epoll;
 	requires org.reactivestreams;
@@ -41,9 +42,7 @@ module rockserver.core {
 	requires vertx.rx.java3;
 	requires io.reactivex.rxjava3;
 	requires micrometer.jvm.extras;
-	requires java.desktop;
 	requires java.sql;
-	requires org.mongodb.bson;
 
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;

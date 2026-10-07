@@ -26,6 +26,10 @@
     <grpc.version>1.80.0</grpc.version>
     <netty.version>4.2.12.Final</netty.version>
     <rainbowgum.version>0.8.2</rainbowgum.version>
+    <rockserver.classesDirectory>${project.build.directory}/library/classes</rockserver.classesDirectory>
+    <rockserver.testClassesDirectory>${project.build.directory}/library/test-classes</rockserver.testClassesDirectory>
+    <rockserver.testModuleDirectory>src/test-module/java</rockserver.testModuleDirectory>
+    <rockserver.artifactName>${project.artifactId}-${project.version}</rockserver.artifactName>
   </properties>
 
   <repositories>
@@ -362,10 +366,14 @@
       <groupId>org.mongodb</groupId>
       <artifactId>bson</artifactId>
       <version>5.6.5</version>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 
   <build>
+    <finalName>${rockserver.artifactName}</finalName>
+    <outputDirectory>${rockserver.classesDirectory}</outputDirectory>
+    <testOutputDirectory>${rockserver.testClassesDirectory}</testOutputDirectory>
     <resources>
       <resource>
         <directory>src/main/filtered-resources</directory>
@@ -386,6 +394,21 @@
     <plugins>
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <id>add-test-module-source</id>
+            <phase>generate-test-sources</phase>
+            <goals><goal>add-test-source</goal></goals>
+            <configuration>
+              <sources><source>${rockserver.testModuleDirectory}</source></sources>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
         <version>3.5.0</version>
         <executions>
@@ -395,7 +418,7 @@
               <goal>java</goal>
             </goals>
             <configuration>
-              <mainClass>it.cavallium.rockserver.core.Main</mainClass>
+              <mainClass>${mainClass}</mainClass>
             </configuration>
           </execution>
         </executions>
@@ -473,7 +496,7 @@
           <archive>
             <manifest>
               <addClasspath>true</addClasspath>
-              <mainClass>it.cavallium.rockserver.core.Main</mainClass>
+              <mainClass>${mainClass}</mainClass>
             </manifest>
           </archive>
         </configuration>
@@ -671,6 +694,11 @@
 
     <profile>
       <id>fatjar</id>
+      <properties>
+        <!-- Keep the standalone JPMS descriptor out of the library/IDE output. -->
+        <rockserver.classesDirectory>${project.build.directory}/fatjar/classes</rockserver.classesDirectory>
+        <rockserver.testClassesDirectory>${project.build.directory}/fatjar/test-classes</rockserver.testClassesDirectory>
+      </properties>
       <dependencies>
         <dependency>
           <groupId>io.jstach.rainbowgum</groupId>
@@ -736,6 +764,106 @@
     </profile>
 
     <profile>
+      <id>desktop</id>
+      <properties>
+        <mainClass>it.cavallium.rockserver.core.gui.RockserverGui</mainClass>
+        <rockserver.artifactName>${project.artifactId}-${project.version}-desktop</rockserver.artifactName>
+        <rockserver.testModuleDirectory>src/desktop-test-module/java</rockserver.testModuleDirectory>
+        <!-- Keep the standalone JPMS descriptor out of the library/IDE output. -->
+        <rockserver.classesDirectory>${project.build.directory}/desktop/classes</rockserver.classesDirectory>
+        <rockserver.testClassesDirectory>${project.build.directory}/desktop/test-classes</rockserver.testClassesDirectory>
+      </properties>
+      <dependencies>
+        <!-- Already present transitively; declare the streaming JSON API used by the viewer. -->
+        <dependency>
+          <groupId>com.fasterxml.jackson.core</groupId>
+          <artifactId>jackson-core</artifactId>
+          <version>2.18.6</version>
+        </dependency>
+        <!-- Desktop theme only: no extras, bundled fonts, or third-party themes. -->
+        <dependency>
+          <groupId>com.formdev</groupId>
+          <artifactId>flatlaf</artifactId>
+          <version>3.7.2</version>
+        </dependency>
+        <dependency>
+          <groupId>org.mongodb</groupId>
+          <artifactId>bson</artifactId>
+          <version>5.6.5</version>
+          <scope>compile</scope>
+        </dependency>
+        <dependency>
+          <groupId>io.jstach.rainbowgum</groupId>
+          <artifactId>rainbowgum-core</artifactId>
+          <version>${rainbowgum.version}</version>
+          <scope>compile</scope>
+        </dependency>
+        <dependency>
+          <groupId>io.jstach.rainbowgum</groupId>
+          <artifactId>rainbowgum-pattern</artifactId>
+          <version>${rainbowgum.version}</version>
+          <scope>compile</scope>
+        </dependency>
+        <dependency>
+          <groupId>io.jstach.rainbowgum</groupId>
+          <artifactId>rainbowgum-slf4j</artifactId>
+          <version>${rainbowgum.version}</version>
+          <scope>compile</scope>
+        </dependency>
+      </dependencies>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.6.0</version>
+            <executions>
+              <execution>
+                <id>add-desktop-tests</id>
+                <phase>generate-test-sources</phase>
+                <goals><goal>add-test-source</goal></goals>
+                <configuration>
+                  <sources><source>src/desktop-test/java</source></sources>
+                </configuration>
+              </execution>
+              <execution>
+                <id>add-source</id>
+                <phase>generate-sources</phase>
+                <goals>
+                  <goal>add-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>src/standalone/java/</source>
+                    <source>src/desktop/java/</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-shade-plugin</artifactId>
+            <version>3.6.0</version>
+            <configuration>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+            <executions>
+              <execution>
+                <phase>package</phase>
+                <goals>
+                  <goal>shade</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
+    <profile>
       <id>library</id>
       <activation>
         <activeByDefault>true</activeByDefault>
@@ -766,6 +894,10 @@
     </profile>
     <profile>
       <id>native</id>
+      <properties>
+        <rockserver.classesDirectory>${project.build.directory}/native/classes</rockserver.classesDirectory>
+        <rockserver.testClassesDirectory>${project.build.directory}/native/test-classes</rockserver.testClassesDirectory>
+      </properties>
       <dependencies>
         <dependency>
           <groupId>io.jstach.rainbowgum</groupId>

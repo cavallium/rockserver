@@ -24,13 +24,31 @@ import org.bson.codecs.DecoderContext;
 import org.bson.json.JsonWriterSettings;
 
 /**
- * A panel that displays the details of a single cell's data in various formats.
- * Features a rich, navigable JTree for BSON data with a right-click copy menu.
- * NOTE: The BSON viewer requires the 'org.mongodb:mongodb-driver-core' dependency.
+ * Bounded text, binary, JSON and BSON previews with per-component inspector preferences.
+ * Preferences retain schema identities and tab names, never row data.
  */
 public class CellDetailViewerPanel extends JPanel {
+    /** A logical component, shared by every row in the same database column/schema. */
+    public record CellContext(String columnName, it.cavallium.rockserver.core.common.ColumnSchema schema, int component, String entryKey) {
+        public CellContext(String columnName, it.cavallium.rockserver.core.common.ColumnSchema schema, int component) {
+            this(columnName, schema, component, null);
+        }
+        CellContext fieldDefault() { return new CellContext(columnName, schema, component); }
+    }
+    private final Map<CellContext, String> inspectorTabs = new java.util.LinkedHashMap<>(32, 0.75f, true) {
+        @Override protected boolean removeEldestEntry(Map.Entry<CellContext, String> entry) { return size() > 512; }
+    };
+    private CellContext context;
+    private boolean restoringTab;
+    private final JTabbedPane tabbedPane = new JTabbedPane();
+    private final JTextArea jsonView = new JTextArea();
+    private byte[] renderedJsonBytes;
 
-	private final JTextArea stringView;
+	private byte[] currentBytes;
+    private final JButton exportRaw = new JButton("Save raw bytes…");
+    private static final int TEXT_LIMIT = 16 * 1024;
+    private static final int HEX_LIMIT = 4096;
+    private final JTextArea stringView;
 	private final JTextArea hexView;
 	private final JTextArea numericView;
 	private final JLabel typeLabel;
@@ -49,15 +67,11 @@ public class CellDetailViewerPanel extends JPanel {
 
 	public CellDetailViewerPanel() {
 		super(new BorderLayout(5, 5));
-		setBorder(BorderFactory.createTitledBorder(
-				BorderFactory.createEtchedBorder(),
-				"Cell Inspector",
-				TitledBorder.CENTER,
-				TitledBorder.TOP
-		));
+        setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
 
 		typeLabel = new JLabel("Type: (no cell selected)");
-		typeLabel.setBorder(BorderFactory.createEmptyBorder(5, 5, 5, 5));
+		typeLabel.setBorder(BorderFactory.createEmptyBorder(8, 0, 8, 0));
+        typeLabel.setForeground(ViewerTheme.MUTED);
 
 		stringView = createReadOnlyTextArea();
 		hexView = createReadOnlyTextArea();
@@ -100,19 +114,68 @@ public class CellDetailViewerPanel extends JPanel {
 		});
 		// --- End BSON view setup ---
 
-		JTabbedPane tabbedPane = new JTabbedPane();
+
+        tabbedPane.setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
+        tabbedPane.putClientProperty("JTabbedPane.tabInsets", new Insets(0, 8, 0, 8));
 		tabbedPane.addTab("Text", new JScrollPane(stringView));
 		tabbedPane.addTab("Hex", new JScrollPane(hexView));
 		tabbedPane.addTab("Numeric", new JScrollPane(numericView));
+        jsonView.setEditable(false);
+        jsonView.setBackground(Color.WHITE);
+        jsonView.setFont(monoFont);
+        jsonView.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
+        tabbedPane.addTab("JSON", new JScrollPane(jsonView));
 		tabbedPane.addTab("BSON", bsonPanel); // Add the panel with CardLayout
 
-		add(typeLabel, BorderLayout.NORTH);
+        tabbedPane.addChangeListener(e -> {
+            if (!restoringTab && context != null && currentBytes != null) {
+                String tab = tabbedPane.getTitleAt(tabbedPane.getSelectedIndex());
+                inspectorTabs.put(context.fieldDefault(), tab);
+                inspectorTabs.put(context, tab);
+            }
+            updateJsonPreview();
+        });
+        var header = new JPanel(new BorderLayout(8, 0));
+        header.add(typeLabel, BorderLayout.CENTER);
+        header.add(exportRaw, BorderLayout.EAST);
+        exportRaw.setEnabled(false);
+        exportRaw.addActionListener(e -> saveRaw());
+        add(header, BorderLayout.NORTH);
 		add(tabbedPane, BorderLayout.CENTER);
 	}
+
+    private void updateJsonPreview() {
+        if (restoringTab || !"JSON".equals(tabbedPane.getTitleAt(tabbedPane.getSelectedIndex()))) return;
+        if (currentBytes == renderedJsonBytes && renderedJsonBytes != null) return;
+        var preview = JsonPreview.format(currentBytes, true);
+        jsonView.setText(preview.text()); jsonView.setCaretPosition(0);
+        renderedJsonBytes = currentBytes;
+    }
+
+    private void saveRaw() {
+        if (currentBytes == null) return;
+        byte[] bytes = currentBytes;
+        var chooser = new JFileChooser();
+        chooser.setSelectedFile(new java.io.File("cell.bin"));
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        var path = chooser.getSelectedFile().toPath();
+        if (java.nio.file.Files.exists(path) && JOptionPane.showConfirmDialog(this, "Replace " + path.getFileName() + "?",
+                "Save raw bytes", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+        exportRaw.setEnabled(false);
+        new SwingWorker<Void, Void>() {
+            @Override protected Void doInBackground() throws Exception { java.nio.file.Files.write(path, bytes); return null; }
+            @Override protected void done() {
+                try { get(); }
+                catch (Exception e) { JOptionPane.showMessageDialog(CellDetailViewerPanel.this, e.getMessage(), "Save failed", JOptionPane.ERROR_MESSAGE); }
+                finally { exportRaw.setEnabled(currentBytes != null); }
+            }
+        }.execute();
+    }
 
 	private JTextArea createReadOnlyTextArea() {
 		JTextArea textArea = new JTextArea();
 		textArea.setEditable(false);
+        textArea.setBackground(Color.WHITE);
 		textArea.setWrapStyleWord(true);
 		textArea.setLineWrap(true);
 		textArea.setBorder(BorderFactory.createEmptyBorder(5, 5, 5, 5));
@@ -123,10 +186,25 @@ public class CellDetailViewerPanel extends JPanel {
 	 * Updates the viewer to display information about the provided data object.
 	 * @param data The raw data object from the table cell.
 	 */
-	public void displayCellData(Object data) {
+    public void displayCellData(Object data) { displayCellData(data, null); }
+
+    public void displayCellData(Object data, CellContext nextContext) {
+        context = null;
+        restoringTab = true;
+        try {
+            if (nextContext != null) {
+                String tab = inspectorTabs.getOrDefault(nextContext, inspectorTabs.getOrDefault(nextContext.fieldDefault(), "Text"));
+                tabbedPane.setSelectedIndex(tabbedPane.indexOfTab(tab));
+            }
+        } finally { restoringTab = false; }
+        context = nextContext;
+        currentBytes = data == null ? null : convertToByteArray(data);
+        exportRaw.setEnabled(currentBytes != null);
+        if (currentBytes != renderedJsonBytes) { renderedJsonBytes = null; jsonView.setText(""); }
 		if (data == null) {
-			typeLabel.setText("Type: NULL");
-			stringView.setText("(null)");
+			typeLabel.setText("No cell selected");
+            jsonView.setText(""); renderedJsonBytes = null;
+			stringView.setText("");
 			hexView.setText("");
 			numericView.setText("");
 			displayBsonTree(null); // Clear BSON view
@@ -134,10 +212,15 @@ public class CellDetailViewerPanel extends JPanel {
 		}
 
 		typeLabel.setText("Type: " + data.getClass().getSimpleName());
-		byte[] bytes = convertToByteArray(data);
+		byte[] bytes = currentBytes;
 		if (bytes != null) {
-			stringView.setText(new String(bytes, StandardCharsets.UTF_8));
-			hexView.setText(toHexDump(bytes));
+            String component = context == null ? "Binary" : context.component() < context.schema().keysCount() ? "Key " + context.component() : "Value";
+            typeLabel.setText(component + " · " + SstAnalysis.size(bytes.length));
+            typeLabel.setToolTipText(bytes.length + " bytes" + (context == null ? "" : " · " + context.columnName()));
+            stringView.setText(new String(bytes, 0, Math.min(bytes.length, TEXT_LIMIT), StandardCharsets.UTF_8)
+                    + (bytes.length > TEXT_LIMIT ? "\n[Text preview limited to 16 KiB; save raw bytes for full content]" : ""));
+            hexView.setText(toHexDump(java.util.Arrays.copyOf(bytes, Math.min(bytes.length, HEX_LIMIT)))
+                    + (bytes.length > HEX_LIMIT ? "\n[Hex preview limited to 4 KiB; save raw bytes for full content]" : ""));
 			numericView.setText(interpretAsNumbers(bytes));
 			displayBsonTree(bytes); // Update BSON tree
 		} else {
@@ -147,6 +230,7 @@ public class CellDetailViewerPanel extends JPanel {
 			displayBsonTree(null);
 		}
 
+        updateJsonPreview();
 		// Reset scroll position to the top for all views
 		SwingUtilities.invokeLater(() -> {
 			stringView.setCaretPosition(0);
@@ -168,6 +252,11 @@ public class CellDetailViewerPanel extends JPanel {
 			return;
 		}
 
+        if (bytes.length > 4096) {
+            bsonErrorLabel.setText("BSON preview limited to 4 KiB. Save raw bytes to inspect the full value.");
+            bsonCardLayout.show(bsonPanel, BSON_ERROR_VIEW);
+            return;
+        }
 		try {
 			var reader = new BsonBinaryReader(ByteBuffer.wrap(bytes));
 			var codec = new BsonDocumentCodec();
@@ -195,19 +284,28 @@ public class CellDetailViewerPanel extends JPanel {
 	/**
 	 * Recursively populates a JTree node from a BSON value.
 	 */
-	private void buildTree(BsonValue bsonValue, DefaultMutableTreeNode parentNode) {
+    private void buildTree(BsonValue bsonValue, DefaultMutableTreeNode parentNode) {
+        buildTree(bsonValue, parentNode, 0, new int[]{0});
+    }
+    private void buildTree(BsonValue bsonValue, DefaultMutableTreeNode parentNode, int depth, int[] nodes) {
+        if (depth >= 20 || nodes[0] >= 512) {
+            parentNode.add(new DefaultMutableTreeNode("Preview limit reached; save raw bytes for full content"));
+            return;
+        }
 		if (bsonValue.isDocument()) {
-			for (Map.Entry<String, BsonValue> entry : bsonValue.asDocument().entrySet()) {
+            for (Map.Entry<String, BsonValue> entry : bsonValue.asDocument().entrySet()) {
+                if (++nodes[0] > 512) break;
 				DefaultMutableTreeNode childNode = new DefaultMutableTreeNode(new BsonNodeInfo(entry.getKey(), entry.getValue()));
 				parentNode.add(childNode);
-				buildTree(entry.getValue(), childNode); // Recurse
+				buildTree(entry.getValue(), childNode, depth + 1, nodes); // Recurse
 			}
 		} else if (bsonValue.isArray()) {
 			int i = 0;
-			for (BsonValue item : bsonValue.asArray()) {
+            for (BsonValue item : bsonValue.asArray()) {
+                if (++nodes[0] > 512) break;
 				DefaultMutableTreeNode childNode = new DefaultMutableTreeNode(new BsonNodeInfo(String.valueOf(i), item));
 				parentNode.add(childNode);
-				buildTree(item, childNode); // Recurse
+				buildTree(item, childNode, depth + 1, nodes); // Recurse
 				i++;
 			}
 		}
@@ -391,7 +489,7 @@ public class CellDetailViewerPanel extends JPanel {
 
 		private String formatNode(BsonNodeInfo info) {
 			String keyHtml = String.format("<font color='#%06x'>\"%s\"</font>",
-					KEY_COLOR.getRGB() & 0xFFFFFF, info.key());
+					KEY_COLOR.getRGB() & 0xFFFFFF, escapeHtml(info.key()));
 
 			BsonValue bsonValue = info.value();
 			String valueHtml;
@@ -424,7 +522,7 @@ public class CellDetailViewerPanel extends JPanel {
 		}
 
 		private String escapeHtml(String text) {
-			return text.replace("&", "&").replace("<", "<").replace(">", ">");
+			return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
 		}
 	}
 }

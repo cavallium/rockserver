@@ -15,6 +15,7 @@ public class PerColumnCellRenderer extends DefaultTableCellRenderer {
 
 	public PerColumnCellRenderer(Map<Integer, CellInterpreter> columnInterpreters) {
 		this.columnInterpreters = columnInterpreters;
+		putClientProperty("html.disable", Boolean.TRUE);
 	}
 
 	@Override

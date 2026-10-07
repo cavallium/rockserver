@@ -17,7 +17,7 @@ import org.bson.codecs.DecoderContext;
  */
 public enum CellInterpreter {
 	// --- Standard Interpreters ---
-	HEX_SUMMARY("Hex Summary", 0), TEXT_UTF8("Text (UTF-8)", 0), BSON("BSON Document", 0),
+	HEX_SUMMARY("Hex Summary", 0), TEXT_UTF8("Text (UTF-8)", 0), JSON("JSON", 0), BSON("BSON Document", 0),
 
 	// --- 32-bit Numeric Interpreters ---
 	NUM_SIGNED_BE_32("Signed BE (int)", 4), NUM_UNSIGNED_BE_32("Unsigned BE (int)",
@@ -65,12 +65,20 @@ public enum CellInterpreter {
 						yield HexFormat.of().formatHex(data);
 					}
 				}
-				case TEXT_UTF8 -> new String(data, StandardCharsets.UTF_8);
+				case TEXT_UTF8 -> new String(data, 0, Math.min(data.length, 1024), StandardCharsets.UTF_8)
+                        + (data.length > 1024 ? "… (preview; " + data.length + " bytes)" : "");
+                case JSON -> {
+                    var result = JsonPreview.format(data, false);
+                    String text = result.valid() ? result.text() : "<" + result.text() + ">";
+                    yield text.length() <= 1024 ? text : text.substring(0, 1024) + "…";
+                }
 				case BSON -> {
+                    if (data.length > 4096) yield "<BSON exceeds 4 KiB preview; export raw cell>";
 					var reader = new BsonBinaryReader(ByteBuffer.wrap(data));
 					var codec = new BsonDocumentCodec();
 					BsonDocument document = codec.decode(reader, DecoderContext.builder().build());
-					yield document.toJson();
+					String json = document.toJson();
+                    yield json.length() <= 1024 ? json : json.substring(0, 1024) + "…";
 				}
 
 				case NUM_SIGNED_BE_32 -> String.valueOf(ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN).getInt());
@@ -85,7 +93,7 @@ public enum CellInterpreter {
 				case NUM_UNSIGNED_LE_64 ->
 						Long.toUnsignedString(ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getLong());
 
-				case NUM_UNSIGNED_BE_128 -> new BigInteger(1, data).toString();
+				case NUM_UNSIGNED_BE_128 -> new BigInteger(1, java.util.Arrays.copyOf(data, 16)).toString();
 				case NUM_UNSIGNED_LE_128 -> {
 					byte[] beBytes = new byte[16];
 					for (int i = 0; i < 16; i++) {

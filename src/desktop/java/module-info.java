@@ -1,7 +1,6 @@
 module rockserver.core {
 	requires rocksdbjni;
 	requires net.sourceforge.argparse4j;
-	requires java.logging;
 	requires org.jetbrains.annotations;
 	requires high.scale.lib;
 	requires org.github.gestalt.core;
@@ -16,6 +15,8 @@ module rockserver.core {
 	requires it.cavallium.datagen;
 	requires com.google.common;
 	requires io.grpc.netty;
+	requires io.jstach.rainbowgum;
+	requires io.jstach.rainbowgum.pattern;
 	requires io.netty.common;
 	requires proto.google.common.protos;
 	requires io.netty.handler;
@@ -39,8 +40,14 @@ module rockserver.core {
 	requires vertx.rx.java3;
 	requires io.reactivex.rxjava3;
 	requires micrometer.jvm.extras;
+	requires java.desktop;
+	requires com.formdev.flatlaf;
+	requires com.fasterxml.jackson.core;
 	requires java.sql;
+	requires org.mongodb.bson;
 
+	exports it.cavallium.rockserver.core.gui to rockserver.core.test;
+	opens it.cavallium.rockserver.core.gui to rockserver.core.test;
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
 	exports it.cavallium.rockserver.core.common.cdc;
