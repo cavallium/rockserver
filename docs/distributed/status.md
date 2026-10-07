@@ -34,3 +34,57 @@ Representative hardware, equal-durability performance, storage power-loss
 simulation, dynamic topology, transactions, export/CDC and backup restoration
 remain required gates. Local smoke tests cannot establish independent host
 failure domains or production acceptance.
+
+## Verified initial slice
+
+JDK 25, pinned JNI 11.8.1.4, Apache Ratis 3.3.1. The optional classpath adapter
+is built by `mvn -f distributed/pom.xml -pl :rockserver-distributed-ratis -am`;
+the standalone core's dependency graph and modular build remain separate.
+Ratis server/server-api have overlapping automatic-module packages, so they
+cannot be added directly to the current JPMS module graph. Its protobuf,
+gRPC and Netty are relocated in thirdparty-misc 1.1.0; the resolved core
+versions remain protobuf 3.25.8, gRPC 1.80.0, Netty 4.2.12.Final and custom JNI
+11.8.1.4, without a second RocksDB artifact.
+
+Passing command (2026-10-07):
+
+```
+mvn -f distributed/pom.xml -pl :rockserver-distributed-ratis -am \
+  -Dtest=DistributedCommandCodecTest,ReplicatedRangeStoreTest,DistributedMergeOperatorRegistryTest,RatisDurableProcessesTest \
+  -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Seventeen core tests and one three-process test pass. The root POM runs selected
+tests again in its fuzz execution; those are repeated checks, not additional
+independent tests. Native io_uring initialization emits an ENOMEM warning and
+falls back; this is not storage power-loss evidence.
+
+The process test verifies disk-backed quorum writes, cross-column native atomic
+apply, noncommutative merge order, saved previous/merged results, dropped
+application-result handling, leader kill, original-identity retry, node restart
+and a new write with a second original voter stopped. All processes share a
+host; independent host/disk failure domains and power-loss recovery remain
+unverified. The reply is discarded at the application boundary, not dropped by
+a network proxy. The test uses a qualified built-in append operator and a
+fixture pool; normal loader/config integration remains required.
+
+Native tests also verify same-batch result evaluation, response-budget rejection
+without partial writes, one native snapshot cut for data/receipts/marker, WAL
+enabled despite `rocksdb.migrate`, and deterministic uploaded-operator identity
+across instances. Explicit operator qualification does not prove arbitrary Java
+pure or sandboxed. Distributed callbacks require further cross-JVM/property
+and compaction-schedule testing.
+
+The current adapter applies synchronously. It explicitly accounts for Ratis
+configuration/metadata entries before publishing completed progress. Log data
+is disk-backed, unsafe/async flush and leader-lease reads are disabled, reads
+are LINEARIZABLE/COMMIT_INDEX. No durable snapshot is advertised and automatic
+snapshot triggering is disabled. Retaining logs is an initial correctness
+boundary, not the final bounded-retention implementation.
+
+Still missing: installable snapshots/seed initialization, range-aware result
+overlay, durable session receipt GC/fences, conditional predicates and scoped
+transactions, reservations/disjoint pipelining, production node/client/API
+integration, catalogue/topology, long workflows, transport parity and the final
+resource/performance/fault gates. A command combining range deletion with point
+return modes is currently rejected before append. The task remains active.

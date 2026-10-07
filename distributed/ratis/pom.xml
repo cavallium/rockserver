@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>it.cavallium.rockserver</groupId>
+  <artifactId>rockserver-distributed-ratis</artifactId>
+  <version>${revision}</version>
+  <properties>
+    <maven.compiler.release>25</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <ratis.version>3.3.1</ratis.version>
+    <revision>1.0.0-SNAPSHOT</revision>
+  </properties>
+  <repositories>
+    <repository><id>gitea</id><url>https://git.tgdb.org/api/packages/andreacavalli/maven</url></repository>
+    <repository><id>mchv-release</id><url>https://mvn.mchv.eu/repository/mchv</url></repository>
+  </repositories>
+  <dependencies>
+    <dependency><groupId>it.cavallium.rockserver</groupId><artifactId>rockserver-core</artifactId><version>${revision}</version></dependency>
+    <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-server</artifactId><version>${ratis.version}</version></dependency>
+    <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-client</artifactId><version>${ratis.version}</version></dependency>
+    <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-grpc</artifactId><version>${ratis.version}</version></dependency>
+    <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-metrics-default</artifactId><version>${ratis.version}</version></dependency>
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.14.3</version><scope>test</scope></dependency>
+  </dependencies>
+  <build><plugins>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.14.0</version></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.2.5</version>
+      <configuration><useModulePath>false</useModulePath><argLine>--enable-native-access=ALL-UNNAMED</argLine></configuration>
+    </plugin>
+  </plugins></build>
+</project>
