@@ -3,6 +3,9 @@ package it.cavallium.rockserver.core.impl.test;
 import it.cavallium.rockserver.core.common.distributed.*;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
 import it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership;
+import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport;
+import java.nio.file.Files;
+import java.time.Duration;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -413,6 +416,60 @@ class ReplicatedRangeStoreTest {
                 assertEquals(1, pool.store.activeSnapshotPins(), "Cursor close leaves its parent pin owned");
                 assertArrayEquals(bytes("new-c"), reopened.get(B, bytes("c")));
             }
+        }
+    }
+
+    @Test void nativeSstExportLoadsMaterializedSnapshotValuesWithColumnMergeOptions() throws Exception {
+        try (Pool source = new Pool(path.resolve("source")); Pool target = new Pool(path.resolve("target"))) {
+            source.store.applyNoop(new ApplyPosition(1,0));
+            source.store.apply(new ApplyPosition(1,1), command(0,
+                    new Mutation(Mutation.Kind.PUT,A,bytes("a"),bytes("old-a")),
+                    new Mutation(Mutation.Kind.MERGE,A,bytes("b"),bytes("one")),
+                    new Mutation(Mutation.Kind.MERGE,A,bytes("b"),bytes("two")),
+                    new Mutation(Mutation.Kind.PUT,A,bytes("d"),bytes("outside"))));
+            var scope = new TransactionScope(List.of(TransactionScope.Span.range(A,bytes("a"),bytes("d"))));
+            try (var snapshot = source.store.capture(scope)) {
+                source.store.apply(new ApplyPosition(1,2), command(1,
+                        new Mutation(Mutation.Kind.PUT,A,bytes("a"),bytes("new-a")),
+                        new Mutation(Mutation.Kind.MERGE,A,bytes("b"),bytes("later"))));
+                var limits = new NativeRangeSstExport.Limits(2,1024,1024*1024,Duration.ofSeconds(10));
+                var manifest = NativeRangeSstExport.write(path.resolve("column-a.sst"),snapshot,A,bytes("a"),bytes("d"),source.options,source.merged,limits);
+                assertEquals(2,manifest.rows());
+                assertEquals(new ApplyPosition(1,1),manifest.position());
+                assertEquals(Files.size(manifest.file()),manifest.fileBytes());
+                assertEquals(32,manifest.sha256().length);
+                try (var ingest = new IngestExternalFileOptions().setMoveFiles(false)) {
+                    target.db.ingestExternalFile(target.handles.get(1),List.of(manifest.file().toString()),ingest);
+                }
+                assertArrayEquals(bytes("old-a"),target.db.get(target.handles.get(1),bytes("a")));
+                assertArrayEquals(bytes("one,two"),target.db.get(target.handles.get(1),bytes("b")));
+                assertNull(target.db.get(target.handles.get(1),bytes("d")));
+                target.db.merge(target.handles.get(1),bytes("b"),bytes("three"));
+                assertArrayEquals(bytes("one,two,three"),target.db.get(target.handles.get(1),bytes("b")));
+                assertThrows(java.nio.file.FileAlreadyExistsException.class, () -> NativeRangeSstExport.write(manifest.file(),snapshot,A,bytes("a"),bytes("d"),source.options,source.merged,limits));
+            }
+            assertEquals(0,source.store.activeSnapshotPins());
+        }
+    }
+
+    @Test void nativeSstExportLeavesNoPublishedFileForEmptyOrOverBudgetJobs() throws Exception {
+        try (Pool source = new Pool(path.resolve("source"))) {
+            source.store.applyNoop(new ApplyPosition(1,0));
+            source.store.apply(new ApplyPosition(1,1),command(0,new Mutation(Mutation.Kind.PUT,B,bytes("a"),bytes("value"))));
+            var scope = new TransactionScope(List.of(TransactionScope.Span.range(B,null,null)));
+            try (var snapshot = source.store.capture(scope)) {
+                var limits = new NativeRangeSstExport.Limits(1,1024,1024*1024,Duration.ofSeconds(10));
+                var emptyPath = path.resolve("empty.sst");
+                var empty = NativeRangeSstExport.write(emptyPath,snapshot,B,bytes("z"),null,source.options,source.plain,limits);
+                assertEquals(0,empty.rows()); assertNull(empty.file()); assertFalse(Files.exists(emptyPath));
+                var limitedPath = path.resolve("limited.sst");
+                assertThrows(java.io.IOException.class, () -> NativeRangeSstExport.write(limitedPath,snapshot,B,null,null,source.options,source.plain,
+                        new NativeRangeSstExport.Limits(1,1,1024*1024,Duration.ofSeconds(10))));
+                assertFalse(Files.exists(limitedPath));
+                try (var files = Files.list(path)) { assertTrue(files.noneMatch(file -> file.getFileName().toString().startsWith(".range-sst-building-"))); }
+                assertEquals(1,source.store.activeSnapshotPins(),"Exporter retains but does not close the caller's snapshot");
+            }
+            assertEquals(0,source.store.activeSnapshotPins());
         }
     }
 

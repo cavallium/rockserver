@@ -572,6 +572,13 @@ public final class ReplicatedRangeStore {
         private final SnapshotPin pin;
         private ScopedSnapshot(TransactionScope scope, SnapshotPin pin) { this.scope = scope; this.pin = pin; }
         public TransactionScope scope() { return scope; }
+        public RangeOwnership.Interval interval() { return pin.interval(); }
+        NativeUse retainForExport() {
+            var released = new AtomicBoolean();
+            NativeUse use = () -> { if (released.compareAndSet(false, true)) pin.releaseUse(); };
+            pin.acquireUse();
+            return use;
+        }
         public ApplyPosition position() { return pin.position(); }
         public UUID groupId() { return pin.groupId(); }
         public long rangeEpoch() { return pin.rangeEpoch(); }
@@ -856,6 +863,11 @@ public final class ReplicatedRangeStore {
             try { db.releaseSnapshot(snapshot); }
             finally { snapshotPins.decrementAndGet(); }
         }
+    }
+
+    @FunctionalInterface
+    interface NativeUse extends AutoCloseable {
+        @Override void close();
     }
 
     @FunctionalInterface

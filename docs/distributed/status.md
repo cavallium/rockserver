@@ -440,3 +440,31 @@ close/reopen, budget-error retry and parent/cursor ownership. The command uses
 `test-compile surefire:test@default-test`; no fuzzing, process fixtures or network
 probes ran. This is a local borrowed cursor; remote cursor leases, logical bucket
 members, cross-range coordination and API integration remain required.
+
+## Native user-column SST export
+
+`NativeRangeSstExport` now streams materialized physical rows from one scoped
+snapshot into an SST using copies of the source DB/column options. An idempotent
+native-use loan retains the source pool while writer/options cleanup completes.
+The exporter borrows, rather than closes, the caller's snapshot. It enforces row,
+payload, file-size and duration limits, uses bounded native pages, and publishes
+only a finished, forced, hashed file through no-overwrite hard-link publication
+and directory forcing. Empty exports produce an explicit no-file manifest;
+failed pre-publication jobs remove their temporary file. As with image publication,
+a failure after the link is created must not be advertised as completed.
+
+The manifest carries group/epoch/column/schema identity, actual completed cut,
+effective bounds, row/payload/file sizes and file digest. This is a user-column
+artifact, not a complete replicated snapshot, backup or range install: receipts,
+configuration and topology metadata remain separate work. It is not the split
+child-seed protocol and does not put a full copy beneath a topology fence.
+
+Ordinary validation passes 28 core/native cases and ten pure adapter cases;
+`/tmp/rockserver-sst-export-full-gate.log`, Maven exit zero. The new round trip
+loads an old exported cut into a fresh native DB, verifies materialized merge
+values and continued merge behavior, checks range exclusion and preserves the
+existing output file. Empty and over-budget jobs leave no published SST or temp
+file. This uses `test-compile surefire:test@default-test`, with no fuzzing, process
+fixtures or network probes. The earlier registry prototype, its methods and
+release-tracking diff are preserved under `target/paused-registry-draft` outside
+the active source/build tree.
