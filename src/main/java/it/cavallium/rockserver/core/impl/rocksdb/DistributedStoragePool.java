@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 
@@ -151,6 +152,36 @@ public final class DistributedStoragePool implements AutoCloseable {
             }
         } finally {
             nativeMutation.release();
+        }
+    }
+
+    /** Export a caller-owned cut with this pool's exact column options; no schema lock spans file I/O. */
+    public NativeRangeSstExport.Manifest exportSst(Path destination, ReplicatedRangeStore.ScopedSnapshot snapshot,
+            UUID column, byte[] lowerInclusive, byte[] upperExclusive, NativeRangeSstExport.Limits limits)
+            throws IOException, RocksDBException {
+        Objects.requireNonNull(snapshot, "snapshot");
+        Objects.requireNonNull(column, "column");
+        ReplicatedRangeStore.NativeUse nativeUse;
+        ColumnFamilyOptions columnOptions;
+        nativeMutation.acquireUninterruptibly();
+        try {
+            synchronized (admission) {
+                if (closing) throw new IllegalStateException("Pool is closing");
+            }
+            if (ranges.stream().noneMatch(snapshot::belongsTo)) {
+                throw new IllegalArgumentException("Snapshot belongs to another pool");
+            }
+            Binding binding = bindings.get(column);
+            if (binding == null || !snapshot.interval().columns().contains(column)) {
+                throw new IllegalArgumentException("Column is outside the snapshot range");
+            }
+            columnOptions = Objects.requireNonNull(loaded.definitiveColumnFamilyOptionsMap().get(binding.name));
+            // Pool close drains this range's pins before closing options, operators, caches or DB.
+            nativeUse = snapshot.retainForExport();
+        } finally { nativeMutation.release(); }
+        try (nativeUse) {
+            return NativeRangeSstExport.write(destination, snapshot, column, lowerInclusive, upperExclusive,
+                    loaded.dbOptions(), columnOptions, limits);
         }
     }
 

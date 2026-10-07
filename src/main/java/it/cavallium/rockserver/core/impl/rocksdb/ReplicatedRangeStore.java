@@ -571,6 +571,7 @@ public final class ReplicatedRangeStore {
         private final TransactionScope scope;
         private final SnapshotPin pin;
         private ScopedSnapshot(TransactionScope scope, SnapshotPin pin) { this.scope = scope; this.pin = pin; }
+        boolean belongsTo(ReplicatedRangeStore store) { return ReplicatedRangeStore.this == store; }
         public TransactionScope scope() { return scope; }
         public RangeOwnership.Interval interval() { return pin.interval(); }
         NativeUse retainForExport() {

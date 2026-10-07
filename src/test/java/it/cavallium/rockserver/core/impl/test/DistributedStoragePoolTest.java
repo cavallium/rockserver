@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool;
+import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport;
+import it.cavallium.rockserver.core.common.distributed.TransactionScope;
 import it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
@@ -151,6 +153,42 @@ class DistributedStoragePoolTest {
             assertThrows(IllegalArgumentException.class, () -> pool.openRange(new RangeOwnership.Owner(UUID.randomUUID(), 1),
                     new RangeOwnership.Interval(UUID.randomUUID(), Set.of(alias), new byte[] {5}, null),
                     new byte[32], Map.of(alias, "shared_data"), Set.of()));
+        }
+    }
+
+    @Test void poolExportUsesOwnedOptionsAndHistoricalCutAndRejectsForeignOrClosedAdmission() throws Exception {
+        var config = ConfigParser.parseDefault();
+        var limits = new NativeRangeSstExport.Limits(10, 1024, 1024 * 1024, Duration.ofSeconds(10));
+        try (var pool = open(directory.resolve("export-source"), config);
+                var other = open(directory.resolve("export-other"), config)) {
+            UUID group = UUID.randomUUID();
+            var store = range(pool, group, null, null);
+            store.apply(new ApplyPosition(1, 0), put(group, new byte[] {1}, new byte[] {7}), new byte[0]);
+            var scope = new TransactionScope(List.of(TransactionScope.Span.range(COLUMN, null, null)));
+            try (var snapshot = store.capture(scope)) {
+                store.apply(new ApplyPosition(1, 1), new DistributedCommand(group, 1, new byte[32],
+                        new OperationId(SESSION, 1, 1), List.of(new Mutation(Mutation.Kind.PUT, COLUMN,
+                        new byte[] {1}, new byte[] {8}))), new byte[0]);
+                assertThrows(IllegalArgumentException.class, () -> other.exportSst(directory.resolve("foreign.sst"),
+                        snapshot, COLUMN, null, null, limits));
+                assertThrows(IllegalArgumentException.class, () -> pool.exportSst(directory.resolve("wrong-column.sst"),
+                        snapshot, UUID.randomUUID(), null, null, limits));
+                var manifest = pool.exportSst(directory.resolve("owned.sst"), snapshot, COLUMN, null, null, limits);
+                assertEquals(new ApplyPosition(1, 0), manifest.position());
+                assertEquals(1, manifest.rows());
+                assertEquals(1, store.activeSnapshotPins());
+                try (var options = new org.rocksdb.Options().setCreateIfMissing(true);
+                        var target = org.rocksdb.RocksDB.open(options, directory.resolve("export-target").toString());
+                        var ingest = new org.rocksdb.IngestExternalFileOptions().setMoveFiles(false)) {
+                    target.ingestExternalFile(List.of(manifest.file().toString()), ingest);
+                    assertArrayEquals(new byte[] {7}, target.get(new byte[] {1}));
+                }
+                assertFalse(pool.close(Duration.ZERO));
+                assertThrows(IllegalStateException.class, () -> pool.exportSst(directory.resolve("closing.sst"),
+                        snapshot, COLUMN, null, null, limits));
+                assertArrayEquals(new byte[] {7}, snapshot.get(COLUMN, new byte[] {1}));
+            }
+            assertTrue(pool.close(Duration.ofSeconds(10)));
         }
     }
 

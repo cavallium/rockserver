@@ -468,3 +468,31 @@ file. This uses `test-compile surefire:test@default-test`, with no fuzzing, proc
 fixtures or network probes. The earlier registry prototype, its methods and
 release-tracking diff are preserved under `target/paused-registry-draft` outside
 the active source/build tree.
+
+## Pool-owned SST export and worktree recovery
+
+`DistributedStoragePool.exportSst` selects the exact loader-owned DB/column
+options, verifies snapshot ownership by store identity, and retains the native
+resource graph before releasing the schema semaphore. SST I/O holds no pool
+schema lock. Pool close stops export admission and drains the retained range pins
+before releasing DB/options/operators/caches. The caller still owns the cut.
+
+The ordinary combined gate passes 29 core/native and ten pure adapter cases,
+Maven exit zero: `/tmp/rockserver-pool-sst-export-recovered-gate.log`. New coverage
+exports a historical cut through the pool, ingests it into a fresh database,
+rejects foreign cuts and wrong columns, and verifies close/retry admission.
+No fuzzing, process fixtures, density fixtures or network probes ran.
+
+During the first gate, the app archived the worktree at 2026-10-08 01:03 Europe/Rome.
+Source, class files and native fixture files disappeared mid-run; that failed
+run is not behavioral acceptance. Snapshot `62fb3115d8c1aac709019d00e317dfc8cef4079b`
+retained the tracked edits and both untracked drafts. The same path and branch
+were restored using Git worktree registration and the snapshot diff; HEAD
+remained `5d32852`. Residual failed-run reports are preserved at
+`/tmp/rockserver-interrupted-gate-target-20261008`. Ignored target contents,
+including the paused registry draft, were not retained by the archive snapshot;
+that work remains inactive and is not reconstructed or validated here.
+
+Full distribution remains incomplete, including the Ratis fresh-read-barrier
+fix, public API/runtime/bootstrap integration, transactions/2PC, topology,
+receipt GC, long workflows and representative performance acceptance.
