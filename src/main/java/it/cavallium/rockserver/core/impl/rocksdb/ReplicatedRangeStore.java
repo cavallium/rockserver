@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.distributed.DistributedCommand;
 import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
 import it.cavallium.rockserver.core.common.distributed.CommandResult;
+import it.cavallium.rockserver.core.common.distributed.TransactionScope;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Map;
@@ -541,6 +542,52 @@ public final class ReplicatedRangeStore {
         enterNative();
         try { return captureUnderAdmission(); }
         finally { leaveNative(); }
+    }
+
+    /** One local cut restricted to the complete declared scope; the adapter supplies the read barrier. */
+    public ScopedSnapshot capture(TransactionScope scope) throws RocksDBException {
+        Objects.requireNonNull(scope);
+        enterNative();
+        try {
+            requireActive();
+            for (var span : scope.spans()) {
+                if (!columns.containsKey(span.columnId())) throw new IllegalArgumentException("Scope column is outside this range");
+                byte[] lower = span.lowerInclusive(), upper = span.upperExclusive();
+                if (span.isPoint()) {
+                    if (!contains(lower)) throw new IllegalArgumentException("Scope key is outside this range");
+                } else if ((interval.lowerInclusive() != null && (lower == null || Arrays.compareUnsigned(lower, interval.lowerInclusive()) < 0))
+                        || (interval.upperExclusive() != null && (upper == null || Arrays.compareUnsigned(upper, interval.upperExclusive()) > 0))) {
+                    throw new IllegalArgumentException("Scope interval is outside this range");
+                }
+            }
+            return new ScopedSnapshot(scope, captureUnderAdmission());
+        } finally { leaveNative(); }
+    }
+
+    /** Scope cannot expand; native reader ownership and close/drain semantics are retained by the pin. */
+    public final class ScopedSnapshot implements AutoCloseable {
+        private final TransactionScope scope;
+        private final SnapshotPin pin;
+        private ScopedSnapshot(TransactionScope scope, SnapshotPin pin) { this.scope = scope; this.pin = pin; }
+        public TransactionScope scope() { return scope; }
+        public ApplyPosition position() { return pin.position(); }
+        public UUID groupId() { return pin.groupId(); }
+        public long rangeEpoch() { return pin.rangeEpoch(); }
+        public byte[] schemaDigest() { return pin.schemaDigest(); }
+        public byte[] get(UUID columnId, byte[] key) throws RocksDBException {
+            byte[] physicalKey = Objects.requireNonNull(key).clone();
+            if (!scope.contains(columnId, physicalKey)) throw new IllegalArgumentException("Read outside declared scope");
+            return pin.get(columnId, physicalKey);
+        }
+        /** Null bounds request the entire owned interval, rather than silently clipping to the declared scope. */
+        public void visitColumn(UUID columnId, byte[] lowerInclusive, byte[] upperExclusive, SnapshotVisitor visitor)
+                throws RocksDBException, IOException {
+            byte[] lower = lowerInclusive == null ? interval.lowerInclusive() : lowerInclusive.clone();
+            byte[] upper = upperExclusive == null ? interval.upperExclusive() : upperExclusive.clone();
+            if (!scope.containsRange(columnId, lower, upper)) throw new IllegalArgumentException("Scan outside declared scope");
+            pin.visitColumn(columnId, lower, upper, Objects.requireNonNull(visitor));
+        }
+        @Override public void close() { pin.close(); }
     }
 
     private SnapshotPin captureUnderAdmission() throws RocksDBException {

@@ -228,6 +228,72 @@ class ReplicatedRangeStoreTest {
         }
     }
 
+    @Test void scopedSnapshotRetainsOneCrossColumnCutAndCanCloseAndReopen() throws Exception {
+        try (Pool pool = new Pool(path)) {
+            pool.store.applyNoop(new ApplyPosition(1, 0));
+            pool.store.apply(new ApplyPosition(1, 1), command(0,
+                    new Mutation(Mutation.Kind.PUT, A, bytes("k"), bytes("old-a")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("k"), bytes("old-b"))));
+            var scope = new TransactionScope(List.of(TransactionScope.Span.point(A, bytes("k")), TransactionScope.Span.point(B, bytes("k"))));
+            var snapshot = pool.store.capture(scope);
+            try {
+                assertEquals(1, pool.store.activeSnapshotPins());
+                pool.store.apply(new ApplyPosition(1, 2), command(1,
+                        new Mutation(Mutation.Kind.PUT, A, bytes("k"), bytes("new-a")),
+                        new Mutation(Mutation.Kind.PUT, B, bytes("k"), bytes("new-b"))));
+                assertEquals(new ApplyPosition(1, 1), snapshot.position());
+                assertArrayEquals(bytes("old-a"), snapshot.get(A, bytes("k")));
+                assertArrayEquals(bytes("old-b"), snapshot.get(B, bytes("k")));
+                assertThrows(IllegalArgumentException.class, () -> snapshot.get(A, bytes("outside")));
+                assertThrows(IllegalArgumentException.class, () -> snapshot.visitColumn(A, bytes("k"), bytes("l"), (key, value) -> fail("Point scope grants no scan")));
+            } finally { snapshot.close(); }
+            snapshot.close();
+            assertEquals(0, pool.store.activeSnapshotPins());
+            assertThrows(IllegalStateException.class, () -> snapshot.get(A, bytes("k")));
+            try (var reopened = pool.store.capture(scope)) {
+                assertEquals(new ApplyPosition(1, 2), reopened.position());
+                assertArrayEquals(bytes("new-a"), reopened.get(A, bytes("k")));
+                assertArrayEquals(bytes("new-b"), reopened.get(B, bytes("k")));
+            }
+        }
+    }
+
+    @Test void scopedScansRequireCompleteCoverageAndReadTheirOriginalCutAfterFence() throws Exception {
+        try (Pool pool = new Pool(path)) {
+            pool.store.applyNoop(new ApplyPosition(1, 0));
+            pool.store.apply(new ApplyPosition(1, 1), command(0,
+                    new Mutation(Mutation.Kind.PUT, B, bytes("a"), bytes("first")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("b"), bytes("second")),
+                    new Mutation(Mutation.Kind.PUT, B, bytes("d"), bytes("outside"))));
+            var scope = new TransactionScope(List.of(TransactionScope.Span.range(B, bytes("a"), bytes("b")),
+                    TransactionScope.Span.range(B, bytes("b"), bytes("c"))));
+            try (var snapshot = pool.store.capture(scope)) {
+                pool.store.fence();
+                var seen = new ArrayList<String>();
+                snapshot.visitColumn(B, bytes("a"), bytes("c"), (key, value) -> seen.add(new String(key, StandardCharsets.UTF_8)));
+                assertEquals(List.of("a", "b"), seen);
+                assertThrows(IllegalArgumentException.class, () -> snapshot.visitColumn(B, null, null, (key, value) -> fail("No full-range scan granted")));
+                assertThrows(IllegalArgumentException.class, () -> snapshot.get(A, bytes("a")));
+                assertThrows(IllegalStateException.class, () -> pool.store.capture(scope));
+                assertEquals(1, pool.store.activeSnapshotPins());
+            }
+            assertEquals(0, pool.store.activeSnapshotPins());
+        }
+    }
+
+    @Test void scopeOutsideNativeOwnerIsRejectedBeforePinAllocation() throws Exception {
+        try (Pool pool = new Pool(path, bytes("a"), bytes("m"))) {
+            var inside = new TransactionScope(List.of(TransactionScope.Span.range(A, bytes("a"), bytes("m"))));
+            try (var snapshot = pool.store.capture(inside)) { assertEquals(1, pool.store.activeSnapshotPins()); }
+            var outside = List.of(TransactionScope.Span.point(A, bytes("m")), TransactionScope.Span.range(A, null, bytes("m")),
+                    TransactionScope.Span.range(A, bytes("a"), null), TransactionScope.Span.point(UUID.randomUUID(), bytes("b")));
+            for (var span : outside) {
+                assertThrows(IllegalArgumentException.class, () -> pool.store.capture(new TransactionScope(List.of(span))));
+                assertEquals(0, pool.store.activeSnapshotPins());
+            }
+        }
+    }
+
     private static DistributedCommand command(long sequence, Mutation... mutations) {
         return new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, sequence), List.of(mutations));
     }
@@ -240,14 +306,15 @@ class ReplicatedRangeStoreTest {
         final List<ColumnFamilyHandle> handles = new ArrayList<>();
         final RocksDB db;
         final ReplicatedRangeStore store;
-        Pool(Path path) throws Exception {
+        Pool(Path path) throws Exception { this(path, null, null); }
+        Pool(Path path, byte[] lower, byte[] upper) throws Exception {
             var descriptors = List.of(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, plain),
                     new ColumnFamilyDescriptor(bytes("a"), merged), new ColumnFamilyDescriptor(bytes("b"), plain),
                     new ColumnFamilyDescriptor(bytes("state"), plain), new ColumnFamilyDescriptor(bytes("receipts"), plain));
             db = RocksDB.open(options, path.toString(), descriptors, handles);
             var guard = new RangeOwnership();
             var owner = new RangeOwnership.Owner(GROUP, 1);
-            guard.register(owner, new RangeOwnership.Interval(GROUP, Set.of(A, B), null, null), RangeOwnership.State.ACTIVE);
+            guard.register(owner, new RangeOwnership.Interval(GROUP, Set.of(A, B), lower, upper), RangeOwnership.State.ACTIVE);
             store = new ReplicatedRangeStore(db, guard, owner, new byte[32], Map.of(A, handles.get(1), B, handles.get(2)),
                     handles.get(3), handles.get(4), Set.of(A));
         }

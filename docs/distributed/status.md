@@ -370,3 +370,29 @@ tests or additional network probes are part of this gate.
 
 This gate passed five scope cases and eight directory cases (13 total, zero
 failures/errors/skips, Maven exit zero); log `/tmp/rockserver-transaction-scope-gate.log`.
+
+## Scoped native reader
+
+`ReplicatedRangeStore.capture(TransactionScope)` now validates every declared
+column/key/range against its native owner before allocating a snapshot pin.
+The returned `ScopedSnapshot` exposes scoped point reads and scans, the local
+cut/identity, and close. It does not expose the unrestricted pin. Reads copy
+caller bounds before validation; scans require complete declared range coverage.
+Null scan bounds request the owned interval, not automatic clipping to a smaller
+scope. Captured readers retain their historical cut after a local ownership fence
+and preserve the underlying native reader/drain ownership.
+
+Ordinary native validation passes 21 cases: scope five, native range twelve,
+loader-backed pool four. New cases verify one cross-CF historical cut, rejection
+before pin allocation, scoped scan coverage, close/reopen and pin release.
+The affected optional adapter compiles and its ten pure client/catalogue cases
+pass. Both commands use `test-compile surefire:test@default-test`; no fuzz
+execution, security-oriented testing, network probes or process fixtures ran.
+Logs: `/tmp/rockserver-scoped-native-gate.log` and
+`/tmp/rockserver-scoped-adapter-compile.log`, both exit zero.
+
+This is a local native snapshot facility. The caller still must establish the
+read barrier; distributed scoped snapshot coordination, writable transaction
+history/validation/reservations and the documented read-consistency fix remain
+unfinished. The native-stream warning is the io_uring ENOMEM fallback, with no
+failed test assertion.
