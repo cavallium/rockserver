@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.client.RaftClient;
@@ -77,6 +78,12 @@ public class RatisDurableProcessesTest {
                                         new Mutation(Mutation.Kind.PUT, B, bytes("key"), bytes("wrong-payload"))))));
                         assertThrows(org.apache.ratis.protocol.exceptions.StateMachineException.class,
                                 () -> retry.io().send(Message.valueOf(ByteString.copyFrom(new byte[] {1, 2}))));
+                        assertThrows(org.apache.ratis.protocol.exceptions.StateMachineException.class,
+                                () -> retry.io().send(message(command(4,
+                                        new Mutation(Mutation.Kind.MERGE, B, bytes("key"), bytes("not-supported"), Mutation.ReturnMode.CURRENT)))));
+                        assertThrows(org.apache.ratis.protocol.exceptions.StateMachineException.class,
+                                () -> retry.io().send(message(command(5,
+                                        new Mutation(Mutation.Kind.MERGE, B, bytes("key"), bytes("not-supported"))))));
                         assertArrayEquals(bytes("seed,first,later"), read(retry, A, "key"));
                         // Stop remaining original voters; the restarted one must join a durable quorum.
                         int other = (leader + 1) % 3;
@@ -156,7 +163,7 @@ public class RatisDurableProcessesTest {
                     new ColumnFamilyDescriptor(bytes("state"), plain), new ColumnFamilyDescriptor(bytes("receipts"), plain));
             try (var db = RocksDB.open(options, directory.resolve("pool").toString(), descriptors, handles)) {
                 var store = new ReplicatedRangeStore(db, GROUP, 1, new byte[32],
-                        Map.of(A, handles.get(1), B, handles.get(2)), handles.get(3), handles.get(4));
+                        Map.of(A, handles.get(1), B, handles.get(2)), handles.get(3), handles.get(4), Set.of(A));
                 var properties = RatisDurability.properties(directory.resolve("raft"));
                 RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.GRPC);
                 GrpcConfigKeys.Server.setPort(properties, ports[node]);

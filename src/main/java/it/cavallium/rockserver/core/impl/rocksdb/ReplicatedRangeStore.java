@@ -12,7 +12,10 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.io.IOException;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
@@ -36,21 +39,28 @@ public final class ReplicatedRangeStore {
     private final long rangeEpoch;
     private final byte[] schemaDigest;
     private final Map<UUID, ColumnFamilyHandle> columns;
+    private final Set<UUID> deterministicMergeColumns;
     private final ColumnFamilyHandle state;
     private final ColumnFamilyHandle receipts;
     private final byte[] markerKey;
     private final ReentrantLock applyLane = new ReentrantLock();
     private volatile ApplyPosition applied;
+    private final AtomicInteger snapshotPins = new AtomicInteger();
 
     public ReplicatedRangeStore(RocksDB db, UUID groupId, long rangeEpoch,
             byte[] schemaDigest, Map<UUID, ColumnFamilyHandle> columns,
-            ColumnFamilyHandle state, ColumnFamilyHandle receipts) throws RocksDBException {
+            ColumnFamilyHandle state, ColumnFamilyHandle receipts,
+            Set<UUID> deterministicMergeColumns) throws RocksDBException {
         this.db = Objects.requireNonNull(db);
         this.groupId = Objects.requireNonNull(groupId);
         if (rangeEpoch < 0 || schemaDigest.length != 32) throw new IllegalArgumentException("Invalid range schema");
         this.rangeEpoch = rangeEpoch;
         this.schemaDigest = schemaDigest.clone();
         this.columns = Map.copyOf(columns);
+        this.deterministicMergeColumns = Set.copyOf(deterministicMergeColumns);
+        if (!columns.keySet().containsAll(this.deterministicMergeColumns)) {
+            throw new IllegalArgumentException("Merge admission refers to an unknown column");
+        }
         this.state = Objects.requireNonNull(state);
         this.receipts = Objects.requireNonNull(receipts);
         if (state.getID() == receipts.getID() || columns.values().stream().anyMatch(
@@ -64,6 +74,7 @@ public final class ReplicatedRangeStore {
 
     /** Null means no log entry has yet completed. This is not a durable snapshot watermark. */
     public ApplyPosition applied() { return applied; }
+    public int activeSnapshotPins() { return snapshotPins.get(); }
 
     public void validate(DistributedCommand command) {
         if (!groupId.equals(command.groupId()) || rangeEpoch != command.rangeEpoch()
@@ -72,6 +83,9 @@ public final class ReplicatedRangeStore {
         }
         for (var mutation : command.mutations()) {
             if (!columns.containsKey(mutation.columnId())) throw new IllegalArgumentException("Unknown logical column");
+            if (mutation.kind() == Mutation.Kind.MERGE && !deterministicMergeColumns.contains(mutation.columnId())) {
+                throw new IllegalArgumentException("Column has no admitted deterministic merge operator");
+            }
         }
         if (command.mutations().stream().anyMatch(m -> m.returnMode() != Mutation.ReturnMode.NONE)
                 && command.mutations().stream().anyMatch(m -> m.kind() == Mutation.Kind.DELETE_RANGE)) {
@@ -210,7 +224,9 @@ public final class ReplicatedRangeStore {
                 byte[] marker = db.get(state, options, markerKey);
                 ApplyPosition cut = marker == null ? null : decodePosition(marker);
                 if (!Objects.equals(cut, applied)) throw new IllegalStateException("Snapshot marker differs from completed apply");
-                return new SnapshotPin(snapshot, cut);
+                var pin = new SnapshotPin(snapshot, cut);
+                snapshotPins.incrementAndGet();
+                return pin;
             } catch (Throwable failure) {
                 db.releaseSnapshot(snapshot);
                 throw failure;
@@ -224,33 +240,98 @@ public final class ReplicatedRangeStore {
         private final Snapshot snapshot;
         private final ApplyPosition position;
         private boolean closed;
+        private int nativeUsers;
         private SnapshotPin(Snapshot snapshot, ApplyPosition position) {
             this.snapshot = snapshot;
             this.position = position;
         }
         public ApplyPosition position() { return position; }
-        // A pin has one owner; callers must not close it concurrently with use.
         public byte[] get(UUID columnId, byte[] key) throws RocksDBException {
-            if (closed) throw new IllegalStateException("Snapshot pin closed");
-            var cf = columns.get(columnId);
-            if (cf == null) throw new IllegalArgumentException("Unknown logical column");
-            try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
-                return db.get(cf, options, key);
+            acquireUse();
+            try {
+                var cf = columns.get(columnId);
+                if (cf == null) throw new IllegalArgumentException("Unknown logical column");
+                try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
+                    return db.get(cf, options, key);
+                }
+            } finally {
+                releaseUse();
             }
         }
         public byte[] operationResult(OperationId id, byte[] payloadDigest) throws RocksDBException {
-            if (closed) throw new IllegalStateException("Snapshot pin closed");
-            try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
-                byte[] saved = db.get(receipts, options, receiptKey(id));
-                return saved == null ? null : decodeReceipt(saved, payloadDigest);
+            acquireUse();
+            try {
+                try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
+                    byte[] saved = db.get(receipts, options, receiptKey(id));
+                    return saved == null ? null : decodeReceipt(saved, payloadDigest);
+                }
+            } finally {
+                releaseUse();
             }
+        }
+        /** Visits copied key/value rows from this exact native cut in physical comparator order. */
+        public void visitColumn(UUID columnId, byte[] lowerInclusive, byte[] upperExclusive, SnapshotVisitor visitor)
+                throws RocksDBException, IOException {
+            var cf = columns.get(columnId);
+            if (cf == null) throw new IllegalArgumentException("Unknown logical column");
+            visit(cf, lowerInclusive == null ? null : lowerInclusive.clone(),
+                    upperExclusive == null ? null : upperExclusive.clone(), null, visitor);
+        }
+        public void visitState(SnapshotVisitor visitor) throws RocksDBException, IOException {
+            visit(state, markerKey, null, markerKey, visitor);
+        }
+        public void visitReceipts(SnapshotVisitor visitor) throws RocksDBException, IOException {
+            visit(receipts, markerKey, null, markerKey, visitor);
+        }
+        private void visit(ColumnFamilyHandle cf, byte[] lower, byte[] upper, byte[] prefix, SnapshotVisitor visitor)
+                throws RocksDBException, IOException {
+            if (lower != null && upper != null && Arrays.compareUnsigned(lower, upper) >= 0) {
+                throw new IllegalArgumentException("Invalid export interval");
+            }
+            acquireUse();
+            try (var options = new ReadOptions().setSnapshot(snapshot).setFillCache(false);
+                    var iterator = db.newIterator(cf, options)) {
+                if (lower == null) iterator.seekToFirst(); else iterator.seek(lower);
+                while (iterator.isValid()) {
+                    byte[] key = iterator.key();
+                    if (upper != null && Arrays.compareUnsigned(key, upper) >= 0) break;
+                    if (prefix != null && (key.length < prefix.length
+                            || !Arrays.equals(prefix, 0, prefix.length, key, 0, prefix.length))) break;
+                    visitor.accept(key, iterator.value());
+                    iterator.next();
+                }
+                iterator.status();
+            } finally {
+                releaseUse();
+            }
+        }
+        private synchronized void acquireUse() {
+            if (closed) throw new IllegalStateException("Snapshot pin closed");
+            nativeUsers++;
+        }
+        private void releaseUse() {
+            boolean release;
+            synchronized (this) { release = --nativeUsers == 0 && closed; }
+            if (release) releaseNative();
         }
         @Override public void close() {
-            if (!closed) {
+            boolean release;
+            synchronized (this) {
+                if (closed) return;
                 closed = true;
-                db.releaseSnapshot(snapshot);
+                release = nativeUsers == 0;
             }
+            if (release) releaseNative();
         }
+        private void releaseNative() {
+            try { db.releaseSnapshot(snapshot); }
+            finally { snapshotPins.decrementAndGet(); }
+        }
+    }
+
+    @FunctionalInterface
+    public interface SnapshotVisitor {
+        void accept(byte[] key, byte[] value) throws IOException;
     }
 
     private void requireNext(ApplyPosition next) {

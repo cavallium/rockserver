@@ -8,6 +8,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.*;
@@ -75,6 +79,9 @@ class ReplicatedRangeStoreTest {
             assertEquals(new ApplyPosition(1, 1), pool.store.applied());
             assertArrayEquals(bytes("first"), pool.db.get(pool.handles.get(1), bytes("k")));
             assertNull(pool.store.operationResult(invalid.operationId(), invalid.payloadDigest()));
+            var unsupportedMerge = command(2, new Mutation(Mutation.Kind.MERGE, B, bytes("k"), bytes("operand")));
+            assertThrows(IllegalArgumentException.class, () -> pool.store.apply(new ApplyPosition(1, 2), unsupportedMerge));
+            assertEquals(new ApplyPosition(1, 1), pool.store.applied());
         }
     }
 
@@ -135,6 +142,43 @@ class ReplicatedRangeStoreTest {
         }
     }
 
+    @Test void closingExportPinDefersNativeReleaseUntilReaderHasReturned() throws Exception {
+        try (Pool pool = new Pool(path); var executor = Executors.newSingleThreadExecutor()) {
+            pool.store.applyNoop(new ApplyPosition(1, 0));
+            pool.store.apply(new ApplyPosition(1, 1), command(0,
+                    new Mutation(Mutation.Kind.PUT, A, bytes("k"), bytes("old"))));
+            var pin = pool.store.capture();
+            var visiting = new CountDownLatch(1);
+            var finish = new CountDownLatch(1);
+            var export = executor.submit(() -> {
+                pin.visitColumn(A, null, null, (key, value) -> {
+                    assertArrayEquals(bytes("old"), value);
+                    visiting.countDown();
+                    try {
+                        if (!finish.await(10, TimeUnit.SECONDS)) throw new java.io.IOException("Reader barrier timed out");
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new java.io.IOException(interrupted);
+                    }
+                });
+                return null;
+            });
+            try {
+                assertTrue(visiting.await(10, TimeUnit.SECONDS));
+                pin.close();
+                assertEquals(1, pool.store.activeSnapshotPins());
+                assertThrows(IllegalStateException.class, () -> pin.get(A, bytes("k")));
+                pool.store.apply(new ApplyPosition(1, 2), command(1,
+                        new Mutation(Mutation.Kind.PUT, A, bytes("k"), bytes("new"))));
+            } finally {
+                finish.countDown();
+            }
+            export.get(10, TimeUnit.SECONDS);
+            pin.close();
+            assertEquals(0, pool.store.activeSnapshotPins());
+        }
+    }
+
     private static DistributedCommand command(long sequence, Mutation... mutations) {
         return new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, sequence), List.of(mutations));
     }
@@ -153,7 +197,7 @@ class ReplicatedRangeStoreTest {
                     new ColumnFamilyDescriptor(bytes("state"), plain), new ColumnFamilyDescriptor(bytes("receipts"), plain));
             db = RocksDB.open(options, path.toString(), descriptors, handles);
             store = new ReplicatedRangeStore(db, GROUP, 1, new byte[32], Map.of(A, handles.get(1), B, handles.get(2)),
-                    handles.get(3), handles.get(4));
+                    handles.get(3), handles.get(4), Set.of(A));
         }
         @Override public void close() {
             for (var handle : handles) handle.close();
