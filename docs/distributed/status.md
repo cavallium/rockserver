@@ -592,3 +592,65 @@ durable session receipt GC/floors, term-bound serializable transactions and
 reservations, 2PC/scoped fences, child seeds/dynamic topology, complete long
 workflows and representative equal-durability performance still require work.
 The unexecuted density fixture remains preserved and excluded.
+
+
+## Replicated receipt acknowledgements and sequence floors
+
+Command v3 explicitly carries a contiguous `acknowledgedThrough` for the issuing
+operation's own session UUID/epoch, strictly below its sequence. It supports
+acknowledgement-only and data-piggyback commands. Existing constructors stay v2;
+decoded v1/v2 bytes and hashes are preserved, including a frozen v2 digest check.
+The v3 header consumes the same 2 MiB encoded-command budget; item limits remain
+256. `SESSION_EXPIRED` is appended as result code 3 without changing prior codes.
+
+Ordered native apply reads a group/session/epoch floor before looking up receipts
+or evaluating business effects. A new advancing acknowledgement atomically writes
+the floor, deletes only receipt keys from sequence zero through the floor, saves
+the new issuer's receipt above that floor, and advances A in one WAL-enabled
+sync=false native batch. A conflict or oversized result still acknowledges prior
+outcomes without partially applying business data. Duplicate commands preserve
+original results; new regressive acknowledgements do not lower or rewrite the
+floor. An identity at/below the floor, including one never submitted to this
+range, returns canonical expiry, never executes or creates a new receipt, and
+only advances the marker if its committed position is new and contiguous.
+
+Live status serializes floor and receipt lookup in the apply lane. Native pins
+read both through their actual captured cut, so old pins keep old receipts while
+new pins see expiry. Portable images carry floors in their existing group-prefixed
+STATE section and validate the tagged key/value shape, version and sequence.
+Reopen and fenced install retain the floor. Explicit routed and catalogue ACK
+preparation preserve operation identity, canonical bytes and original descriptor
+through refresh/retry; no automatic mutation retry or rerouting is added.
+
+Ordinary validation passes 50 core/native, 16 read-round and 19 pure adapter cases,
+`/tmp/rockserver-session-floor-full-gate.log`, Maven exit zero. Source/codec tests
+cover legacy identity, v3 bounds, old/new pins, receipt removal, conflict and
+oversized-result ACKs, duplicate/regressive ACKs, group/session/epoch isolation,
+maximum sequences, reopen, image validation and prepared routes. The concurrent
+status case exercises racing readers/apply but does not force every interleaving.
+Updated boundary assertions and the native adapter reload fixture pass in
+`/tmp/rockserver-session-floor-boundary-final-gate.log` (22 native + one adapter).
+The unchanged checks from the full gate remain reusable.
+
+The new adapter fixture exercises actual RatisRangeStateMachine initialization,
+apply, snapshot publication, pause, reinitialize and resumed tail against native
+pool and file-backed RaftStorage, without starting transport or a server. An
+installed floor resolves a deferred command with a collected receipt as expiry;
+uncovered tail remains pending until replay and applies once. This is native
+reload composition, not quorum/failure-domain acceptance. Its initial fixture
+omitted required RaftStorage builder fields; after correcting that setup, the
+focused gate also passes in
+`/tmp/rockserver-session-floor-adapter-reload-final-gate.log`. Native io_uring
+ENOMEM fallback accounts for the Surefire native-stream warning; assertions pass.
+
+No fuzzing, security work, traffic-isolation exercises, network probes, server
+process fixtures, density runs or paused-registry validation ran. Standalone
+application paths are unchanged; no publication, push or deployment occurred.
+
+This is acknowledgement GC for a fixed range/session epoch, not the complete
+session protocol. Session expiry/coarse epoch floors, catalogue-issued lifetime
+authority, outstanding receipt-count/result-byte admission, floor/table cleanup,
+lineage transfer and rolling v3 feature negotiation remain required. Unacknowledged
+receipts and floor records are not yet given a complete retention bound. Frontend
+and public Java/Rust/Thrift session/status APIs are also still pending. Next is
+expiry/coarse-floor state and bounded reclamation, preserving this replay fence.

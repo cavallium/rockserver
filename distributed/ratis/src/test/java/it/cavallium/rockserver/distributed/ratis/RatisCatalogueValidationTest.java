@@ -22,6 +22,20 @@ class RatisCatalogueValidationTest {
         return new DistributedCommand(group, 1, new byte[32], new OperationId(UUID.randomUUID(), 1, 1),
                 List.of(new Mutation(Mutation.Kind.PUT, column, key, value)), List.of(new KeyPredicate(column, key, expected)));
     }
+    @Test void acknowledgementOnlyDoesNotRequireOrWeakenDirectoryReplacement() {
+        var operation = new OperationId(UUID.randomUUID(),1,2);
+        var ack = new DistributedCommand(group,1,new byte[32],operation,List.of(),List.of(),1);
+        assertDoesNotThrow(() -> validate.accept(ack));
+        assertThrows(IllegalArgumentException.class,() -> validate.accept(new DistributedCommand(UUID.randomUUID(),1,new byte[32],
+                operation,List.of(),List.of(),1)));
+        var initial = RangeDirectoryCodec.encode(directory(cluster,0));
+        var original = command(null,initial);
+        var piggyback = new DistributedCommand(group,1,new byte[32],operation,original.mutations(),original.predicates(),1);
+        assertDoesNotThrow(() -> validate.accept(piggyback));
+        assertThrows(IllegalArgumentException.class,() -> validate.accept(new DistributedCommand(group,1,new byte[32],operation,
+                original.mutations(),List.of(),1)));
+    }
+
     @Test void creationAndSingleGenerationAdvanceAreAccepted() {
         byte[] initial = RangeDirectoryCodec.encode(directory(cluster, 0));
         assertDoesNotThrow(() -> validate.accept(command(null, initial)));

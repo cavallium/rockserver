@@ -71,6 +71,10 @@ public final class RatisCatalogue {
         return command;
     }
 
+    public DistributedCommand prepareAcknowledgement(OperationId operationId, long acknowledgedThrough) {
+        return new DistributedCommand(groupId, rangeEpoch, schemaDigest, operationId, List.of(), List.of(), acknowledgedThrough);
+    }
+
     public CommandResult execute(DistributedCommand command) throws IOException {
         validator.accept(command);
         try { return CommandResult.decode(content(client.io().send(message(DistributedCommandCodec.encode(command))))); }
@@ -86,8 +90,11 @@ public final class RatisCatalogue {
         byte[] digest = schemaDigest.clone();
         return command -> {
             if (!command.groupId().equals(groupId) || command.rangeEpoch() != rangeEpoch
-                    || !Arrays.equals(command.schemaDigest(), digest)
-                    || command.mutations().size() != 1 || command.predicates().size() != 1) {
+                    || !Arrays.equals(command.schemaDigest(), digest)) {
+                throw new IllegalArgumentException("Wrong catalogue identity/schema");
+            }
+            if (command.acknowledgedThrough() >= 0 && command.mutations().isEmpty() && command.predicates().isEmpty()) return;
+            if (command.mutations().size() != 1 || command.predicates().size() != 1) {
                 throw new IllegalArgumentException("Catalogue requires one conditional directory replacement");
             }
             var mutation = command.mutations().getFirst();

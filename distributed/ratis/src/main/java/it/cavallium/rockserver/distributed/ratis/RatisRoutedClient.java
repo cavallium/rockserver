@@ -99,6 +99,18 @@ public final class RatisRoutedClient implements AutoCloseable {
     }
 
     public PreparedCommand prepare(OperationId operation, List<Mutation> mutations, List<KeyPredicate> predicates) {
+        return prepareInternal(operation, mutations, predicates, -1);
+    }
+
+    /** Piggyback a contiguous acknowledgement from this operation's own session/epoch. */
+    public PreparedCommand prepare(OperationId operation, List<Mutation> mutations, List<KeyPredicate> predicates,
+                                   long acknowledgedThrough) {
+        if (acknowledgedThrough < 0) throw new IllegalArgumentException("Negative acknowledgement");
+        return prepareInternal(operation, mutations, predicates, acknowledgedThrough);
+    }
+
+    private PreparedCommand prepareInternal(OperationId operation, List<Mutation> mutations,
+                                             List<KeyPredicate> predicates, long acknowledgedThrough) {
         RangeDirectory observed = current();
         Objects.requireNonNull(operation, "operation");
         Objects.requireNonNull(mutations, "mutations");
@@ -119,8 +131,22 @@ public final class RatisRoutedClient implements AutoCloseable {
             }
         }
         for (KeyPredicate predicate : predicates) target = sameRange(target, observed.route(predicate.columnId(), predicate.key()));
-        var command = new DistributedCommand(target.groupId(), target.rangeEpoch(), observed.schemaDigest(), operation, mutations, predicates);
+        var command = acknowledgedThrough < 0
+                ? new DistributedCommand(target.groupId(), target.rangeEpoch(), observed.schemaDigest(), operation, mutations, predicates)
+                : new DistributedCommand(target.groupId(), target.rangeEpoch(), observed.schemaDigest(), operation, mutations, predicates, acknowledgedThrough);
         return new PreparedCommand(observed, target, command);
+    }
+
+    /** The routing key selects one range; acknowledgement does not mutate that user key. */
+    public PreparedCommand prepareAcknowledgement(OperationId operation, UUID columnId, byte[] physicalKey,
+                                                  long acknowledgedThrough) {
+        Objects.requireNonNull(physicalKey);
+        if (physicalKey.length > DistributedCommandCodec.MAX_ENCODED_BYTES - 16) throw new IllegalArgumentException("Routing key exceeds budget");
+        var observed = current();
+        var descriptor = observed.route(columnId, physicalKey.clone());
+        var command = new DistributedCommand(descriptor.groupId(), descriptor.rangeEpoch(), observed.schemaDigest(),
+                operation, List.of(), List.of(), acknowledgedThrough);
+        return new PreparedCommand(observed, descriptor, command);
     }
 
     public CommandResult execute(PreparedCommand prepared) throws IOException {

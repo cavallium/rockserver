@@ -332,6 +332,15 @@ public final class NativeRangeImage {
                         || !Arrays.equals(key, 0, groupPrefix.length, groupPrefix, 0, groupPrefix.length)) {
                     throw new IOException("Wrong image group metadata prefix");
                 }
+                if (section == Section.STATE && key.length > 16 && key[16] == 2) {
+                    if (key.length != 41 || value.length != 12 || ByteBuffer.wrap(key, 33, 8).getLong() < 0) {
+                        throw new IOException("Invalid image session floor shape");
+                    }
+                    var floorValue = ByteBuffer.wrap(value);
+                    if (floorValue.getInt() != 1) throw new IOException("Unsupported image session floor version");
+                    long floor = floorValue.getLong();
+                    if (floor < 0 || floor == Long.MAX_VALUE) throw new IOException("Invalid image session floor sequence");
+                }
                 if (section == Section.STATE && key.length == 16) {
                     if (value.length != 20) throw new IOException("Invalid image applied marker length");
                     var markerValue = ByteBuffer.wrap(value);

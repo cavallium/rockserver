@@ -201,6 +201,27 @@ class RatisRoutedClientTest {
         assertEquals(2, transport.closes.get());
     }
 
+    @Test void explicitAcknowledgementPreservesOwnSessionFloorAndOriginalPreparedRoute() throws Exception {
+        var transport = new RecordingTransport();
+        try (var client = new RatisRoutedClient(directory(1,1),transport)) {
+            var ack = client.prepareAcknowledgement(OPERATION,A,key(1),4);
+            assertEquals(3,ack.command().formatVersion()); assertEquals(4,ack.command().acknowledgedThrough());
+            assertEquals(OPERATION,ack.command().operationId()); assertTrue(ack.command().mutations().isEmpty());
+            var original = DistributedCommandCodec.encode(ack.command());
+            client.refresh(directory(2,3)); client.execute(ack);
+            assertEquals(new UUID(8,1),transport.lastDescriptor.groupId());
+            assertArrayEquals(original,DistributedCommandCodec.encode(transport.commands.getFirst()));
+            assertEquals(1,transport.commands.size());
+            var piggyback = client.prepare(OPERATION,List.of(put(A,1)),List.of(),4);
+            assertEquals(new UUID(8,3),piggyback.command().groupId());
+            assertEquals(4,piggyback.command().acknowledgedThrough());
+            assertEquals(2,client.prepare(OPERATION,List.of(put(A,1))).command().formatVersion());
+            assertThrows(IllegalArgumentException.class,() -> client.prepareAcknowledgement(OPERATION,A,key(1),5));
+            assertThrows(IllegalArgumentException.class,() -> client.prepareAcknowledgement(OPERATION,UUID.randomUUID(),key(1),4));
+            assertThrows(IllegalArgumentException.class,() -> client.prepare(OPERATION,List.of(put(A,1),put(B,0x80)),List.of(),4));
+        }
+    }
+
     private class RecordingTransport implements RatisRoutedClient.Transport {
         final List<DistributedCommand> commands = new ArrayList<>();
         final AtomicInteger closes = new AtomicInteger();

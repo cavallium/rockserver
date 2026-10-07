@@ -473,6 +473,144 @@ class ReplicatedRangeStoreTest {
         }
     }
 
+    @Test void acknowledgementDeletesReceiptsAtomicallyAndCannotReplayMergesOrRegressFloor() throws Exception {
+        try (Pool pool = new Pool(path)) {
+            var first = command(0,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("first")));
+            pool.store.apply(new ApplyPosition(1,0),first);
+            try (var old = pool.store.capture()) {
+                var second = command(1,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("second")));
+                pool.store.apply(new ApplyPosition(1,1),second);
+                var ack = ack(2,0,List.of(),List.of());
+                var originalAck = pool.store.apply(new ApplyPosition(1,2),ack);
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(originalAck).status());
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,first));
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(old.operationResult(first.operationId(),first.payloadDigest())).status());
+                try (var cut = pool.store.capture()) {
+                    assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(cut.operationResult(first.operationId(),first.payloadDigest())).status());
+                    var receipts = new ArrayList<byte[]>(); cut.visitReceipts((key,value) -> receipts.add(key));
+                    assertEquals(2,receipts.size());
+                }
+                pool.store.apply(new ApplyPosition(1,3),ack(3,1,List.of(),List.of()));
+                assertArrayEquals(originalAck,pool.store.apply(new ApplyPosition(1,4),ack));
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,second));
+                var conflict = ack(4,2,List.of(new Mutation(Mutation.Kind.PUT,A,bytes("k"),bytes("wrong"))),
+                        List.of(new KeyPredicate(A,bytes("k"),bytes("not-current"))));
+                assertEquals(CommandResult.Status.CONFLICT,CommandResult.decode(pool.store.apply(new ApplyPosition(1,5),conflict)).status());
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,ack));
+                pool.store.apply(new ApplyPosition(1,6),ack(5,0,List.of(),List.of()));
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,second),"A new regressive ACK cannot lower the floor");
+                var changed = command(0,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("must-not-replay")));
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(pool.store.apply(new ApplyPosition(2,7),changed)).status());
+                assertArrayEquals(bytes("first,second"),pool.db.get(pool.handles.get(1),bytes("k")));
+                assertEquals(new ApplyPosition(2,7),pool.store.applied());
+                try (var cut = pool.store.capture()) {
+                    var receipts = new ArrayList<byte[]>(); cut.visitReceipts((key,value) -> receipts.add(key));
+                    assertEquals(3,receipts.size(),"Expired retry never creates a replacement receipt");
+                }
+            }
+        }
+    }
+
+    @Test void acknowledgementSurvivesReopenAndPortableImageInstallWithNoReceiptResurrection() throws Exception {
+        Path source = path.resolve("source"), target = path.resolve("target"), image = path.resolve("floor.image");
+        var first = command(0,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("first")));
+        var limits = new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.Limits(2*1024*1024,16*1024*1024,2);
+        try (Pool pool = new Pool(source)) {
+            pool.store.apply(new ApplyPosition(1,0),first);
+            pool.store.apply(new ApplyPosition(1,1),ack(1,0,List.of(),List.of()));
+            try (var pin = pool.store.capture()) {
+                it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.write(image,pin,pin.interval(),limits);
+            }
+        }
+        try (Pool pool = new Pool(source)) {
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,first));
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(pool.store.apply(new ApplyPosition(1,0),first)).status());
+            assertEquals(new ApplyPosition(1,1),pool.store.applied());
+            assertArrayEquals(bytes("first"),pool.db.get(pool.handles.get(1),bytes("k")));
+        }
+        try (Pool pool = new Pool(target)) {
+            pool.store.fence(); pool.store.installSnapshot(image,limits); pool.store.activate();
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,first));
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(pool.store.apply(new ApplyPosition(2,2),first)).status());
+            assertArrayEquals(bytes("first"),pool.db.get(pool.handles.get(1),bytes("k")));
+            pool.store.apply(new ApplyPosition(2,3),command(2,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("later"))));
+            assertArrayEquals(bytes("first,later"),pool.db.get(pool.handles.get(1),bytes("k")));
+        }
+    }
+
+    @Test void receiptDeletionIsLimitedToExactGroupSessionAndEpochEvenAtMaximumSequence() throws Exception {
+        try (Pool pool = new Pool(path,null,bytes("m"))) {
+            var owner = new RangeOwnership.Owner(UUID.randomUUID(),1);
+            var interval = new RangeOwnership.Interval(GROUP,Set.of(A,B),bytes("m"),null);
+            pool.guard.register(owner,interval,RangeOwnership.State.ACTIVE);
+            var other = new ReplicatedRangeStore(pool.db,pool.guard,owner,new byte[32],Map.of(A,pool.handles.get(1),B,pool.handles.get(2)),
+                    pool.handles.get(3),pool.handles.get(4),Set.of(A));
+            try {
+                var old = command(0,new Mutation(Mutation.Kind.PUT,A,bytes("a"),bytes("old")));
+                var neighborSession = new DistributedCommand(GROUP,1,new byte[32],new OperationId(UUID.randomUUID(),1,0),
+                        List.of(new Mutation(Mutation.Kind.PUT,A,bytes("b"),bytes("session"))));
+                var neighborEpoch = new DistributedCommand(GROUP,1,new byte[32],new OperationId(SESSION,2,0),
+                        List.of(new Mutation(Mutation.Kind.PUT,A,bytes("c"),bytes("epoch"))));
+                var neighborGroup = new DistributedCommand(owner.groupId(),1,new byte[32],old.operationId(),
+                        List.of(new Mutation(Mutation.Kind.PUT,A,bytes("z"),bytes("group"))));
+                pool.store.apply(new ApplyPosition(1,0),old);
+                pool.store.apply(new ApplyPosition(1,1),neighborSession);
+                pool.store.apply(new ApplyPosition(1,2),neighborEpoch);
+                other.apply(new ApplyPosition(1,0),neighborGroup);
+                var max = ack(Long.MAX_VALUE,Long.MAX_VALUE-1,List.of(),List.of());
+                pool.store.apply(new ApplyPosition(1,3),max);
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,old));
+                assertEquals(CommandResult.Status.SUCCESS,status(pool.store,neighborSession));
+                assertEquals(CommandResult.Status.SUCCESS,status(pool.store,neighborEpoch));
+                assertEquals(CommandResult.Status.SUCCESS,status(other,neighborGroup));
+                assertEquals(CommandResult.Status.SUCCESS,status(pool.store,max));
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(pool.store.apply(new ApplyPosition(1,4),max)).status());
+                var neverSubmitted = command(999,new Mutation(Mutation.Kind.PUT,A,bytes("a"),bytes("new")));
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,neverSubmitted));
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(pool.store.apply(new ApplyPosition(1,5),neverSubmitted)).status());
+                assertArrayEquals(bytes("old"),pool.db.get(pool.handles.get(1),bytes("a")));
+            } finally { assertTrue(other.close(Duration.ofSeconds(10))); }
+        }
+    }
+
+    @Test void oversizedResultStillAcknowledgesPriorReceiptsWithoutPartialBusinessEffects() throws Exception {
+        try (Pool pool = new Pool(path)) {
+            var first = command(0,new Mutation(Mutation.Kind.PUT,B,bytes("a"),new byte[1024*1024]));
+            var second = command(1,new Mutation(Mutation.Kind.PUT,B,bytes("b"),new byte[1024*1024]));
+            pool.store.apply(new ApplyPosition(1,0),first); pool.store.apply(new ApplyPosition(1,1),second);
+            var oversized = ack(2,1,List.of(new Mutation(Mutation.Kind.DELETE,B,bytes("a"),null,Mutation.ReturnMode.PREVIOUS),
+                    new Mutation(Mutation.Kind.DELETE,B,bytes("b"),null,Mutation.ReturnMode.PREVIOUS)),List.of());
+            assertEquals(CommandResult.Status.RESULT_TOO_LARGE,CommandResult.decode(pool.store.apply(new ApplyPosition(1,2),oversized)).status());
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,first));
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,second));
+            assertEquals(1024*1024,pool.db.get(pool.handles.get(2),bytes("a")).length);
+            assertEquals(1024*1024,pool.db.get(pool.handles.get(2),bytes("b")).length);
+            assertEquals(CommandResult.Status.RESULT_TOO_LARGE,status(pool.store,oversized));
+        }
+    }
+
+    @Test void statusRacingAcknowledgementNeverReportsMissingReceiptForCoveredOperation() throws Exception {
+        try (Pool pool = new Pool(path); var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var first = command(0,new Mutation(Mutation.Kind.PUT,B,bytes("k"),bytes("value")));
+            pool.store.apply(new ApplyPosition(1,0),first);
+            var start = new CountDownLatch(1);
+            var results = new ArrayList<java.util.concurrent.Future<CommandResult.Status>>();
+            for (int i=0;i<32;i++) results.add(executor.submit(() -> { start.await(); return status(pool.store,first); }));
+            var gc = executor.submit(() -> { start.await(); pool.store.apply(new ApplyPosition(1,1),ack(1,0,List.of(),List.of())); return null; });
+            start.countDown();
+            for (var result : results) assertTrue(Set.of(CommandResult.Status.SUCCESS,CommandResult.Status.SESSION_EXPIRED).contains(result.get(5,TimeUnit.SECONDS)));
+            gc.get(5,TimeUnit.SECONDS);
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,first));
+        }
+    }
+
+    private static DistributedCommand ack(long sequence,long through,List<Mutation> mutations,List<KeyPredicate> predicates) {
+        return new DistributedCommand(GROUP,1,new byte[32],new OperationId(SESSION,1,sequence),mutations,predicates,through);
+    }
+    private static CommandResult.Status status(ReplicatedRangeStore store,DistributedCommand command) throws Exception {
+        return CommandResult.decode(store.operationResult(command.operationId(),command.payloadDigest())).status();
+    }
+
     private static List<String> physicalKeys(PhysicalRangePage page) {
         return page.rows().stream().map(row -> new String(row.key(), StandardCharsets.UTF_8)).toList();
     }
@@ -489,13 +627,13 @@ class ReplicatedRangeStoreTest {
         final List<ColumnFamilyHandle> handles = new ArrayList<>();
         final RocksDB db;
         final ReplicatedRangeStore store;
+        final RangeOwnership guard = new RangeOwnership();
         Pool(Path path) throws Exception { this(path, null, null); }
         Pool(Path path, byte[] lower, byte[] upper) throws Exception {
             var descriptors = List.of(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, plain),
                     new ColumnFamilyDescriptor(bytes("a"), merged), new ColumnFamilyDescriptor(bytes("b"), plain),
                     new ColumnFamilyDescriptor(bytes("state"), plain), new ColumnFamilyDescriptor(bytes("receipts"), plain));
             db = RocksDB.open(options, path.toString(), descriptors, handles);
-            var guard = new RangeOwnership();
             var owner = new RangeOwnership.Owner(GROUP, 1);
             guard.register(owner, new RangeOwnership.Interval(GROUP, Set.of(A, B), lower, upper), RangeOwnership.State.ACTIVE);
             store = new ReplicatedRangeStore(db, guard, owner, new byte[32], Map.of(A, handles.get(1), B, handles.get(2)),

@@ -294,11 +294,50 @@ class DistributedCommandCodecTest {
                 () -> DistributedCommandCodec.decode(Arrays.copyOf(encoded, encoded.length + 1)));
     }
 
+    @Test void acknowledgementsPreserveLegacyIdentityAndRequireEarlierOwnSessionSequences() {
+        var legacy = command(List.of(put()));
+        assertEquals("0b4d9745c677d17fcf5f59a37bdfcabed9b3dedef3e19178b53ccd90818647e7",
+                HexFormat.of().formatHex(legacy.payloadDigest()));
+        assertEquals(2, legacy.formatVersion()); assertEquals(-1, legacy.acknowledgedThrough());
+        assertArrayEquals(DistributedCommandCodec.encode(legacy),
+                DistributedCommandCodec.encode(DistributedCommandCodec.decode(DistributedCommandCodec.encode(legacy))));
+        var ack = new DistributedCommand(GROUP, 9, new byte[32], OPERATION, List.of(), List.of(), 7);
+        var encoded = DistributedCommandCodec.encode(ack);
+        var decoded = DistributedCommandCodec.decode(encoded);
+        assertEquals(3, decoded.formatVersion()); assertEquals(7, decoded.acknowledgedThrough());
+        assertEquals(OPERATION, decoded.operationId()); assertTrue(decoded.mutations().isEmpty());
+        assertArrayEquals(encoded, DistributedCommandCodec.encode(decoded));
+        assertArrayEquals(ack.payloadDigest(), decoded.payloadDigest());
+        var earlier = new DistributedCommand(GROUP, 9, new byte[32], OPERATION, List.of(), List.of(), 6);
+        assertFalse(Arrays.equals(ack.payloadDigest(), earlier.payloadDigest()));
+        for (long floor : new long[]{-1, 8, Long.MAX_VALUE}) {
+            assertThrows(IllegalArgumentException.class, () -> new DistributedCommand(GROUP,9,new byte[32],OPERATION,List.of(),List.of(),floor));
+        }
+        assertThrows(IllegalArgumentException.class, () -> new DistributedCommand(GROUP,9,new byte[32],OPERATION,
+                List.of(),List.of(new KeyPredicate(COLUMN,new byte[0],null)),7));
+        for (int length=0; length<encoded.length; length++) {
+            var truncated = Arrays.copyOf(encoded,length);
+            assertThrows(IllegalArgumentException.class, () -> DistributedCommandCodec.decode(truncated));
+        }
+        assertThrows(IllegalArgumentException.class, () -> DistributedCommandCodec.decode(Arrays.copyOf(encoded,encoded.length+1)));
+    }
+
+    @Test void acknowledgementHeaderConsumesTheExistingEncodedByteBudget() {
+        int payload = DistributedCommandCodec.MAX_ENCODED_BYTES - 108 - 26;
+        var exact = new DistributedCommand(GROUP,9,new byte[32],OPERATION,
+                List.of(new Mutation(Mutation.Kind.PUT,COLUMN,new byte[0],new byte[payload])),List.of(),7);
+        var encoded = DistributedCommandCodec.encode(exact);
+        assertEquals(DistributedCommandCodec.MAX_ENCODED_BYTES,encoded.length);
+        assertArrayEquals(encoded,DistributedCommandCodec.encode(DistributedCommandCodec.decode(encoded)));
+        assertThrows(IllegalArgumentException.class, () -> new DistributedCommand(GROUP,9,new byte[32],OPERATION,
+                List.of(new Mutation(Mutation.Kind.PUT,COLUMN,new byte[0],new byte[payload+1])),List.of(),7));
+    }
+
     @Test
     void conflictResultHasExplicitCodeAndCannotCarryValues() {
         for (var status : CommandResult.Status.values()) {
             var result = new CommandResult(status, List.of());
-            int code = switch (status) { case SUCCESS -> 0; case RESULT_TOO_LARGE -> 1; case CONFLICT -> 2; };
+            int code = switch (status) { case SUCCESS -> 0; case RESULT_TOO_LARGE -> 1; case CONFLICT -> 2; case SESSION_EXPIRED -> 3; };
             assertArrayEquals(ByteBuffer.allocate(8).putInt(code).putInt(0).array(), result.encode());
             assertEquals(status, CommandResult.decode(result.encode()).status());
         }
@@ -307,6 +346,6 @@ class DistributedCommandCodecTest {
         assertThrows(IllegalArgumentException.class,
                 () -> CommandResult.decode(ByteBuffer.allocate(12).putInt(2).putInt(1).putInt(-1).array()));
         assertThrows(IllegalArgumentException.class,
-                () -> CommandResult.decode(ByteBuffer.allocate(8).putInt(3).putInt(0).array()));
+                () -> CommandResult.decode(ByteBuffer.allocate(8).putInt(4).putInt(0).array()));
     }
 }

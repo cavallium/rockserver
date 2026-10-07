@@ -265,6 +265,18 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             requireActive();
+            long currentFloor = acknowledgedThrough(command.operationId(), null);
+            if (command.operationId().sequence() <= currentFloor) {
+                if (applied == null || position.index() > applied.index()) {
+                    requireNext(position);
+                    try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(false)) {
+                        batch.put(state, markerKey, encodePosition(position));
+                        db.write(options, batch);
+                    }
+                    applied = position;
+                }
+                return expiredResult();
+            }
             byte[] saved = db.get(receipts, receiptKey);
             byte[] original = saved == null ? null : decodeReceipt(saved, digest);
             if (applied != null && position.index() <= applied.index()) {
@@ -290,6 +302,13 @@ public final class ReplicatedRangeStore {
                             case MERGE -> batch.merge(cf, mutation.key(), mutation.value());
                             case DELETE_RANGE -> batch.deleteRange(cf, mutation.key(), mutation.value());
                         }
+                    }
+                    if (command.acknowledgedThrough() > currentFloor) {
+                        long floor = command.acknowledgedThrough();
+                        batch.put(state, sessionFloorKey(command.operationId()),
+                                ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(floor).array());
+                        batch.deleteRange(receipts, receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), 0)),
+                                receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), floor + 1)));
                     }
                     batch.put(receipts, receiptKey, encodeReceipt(digest, stableResult));
                 }
@@ -526,13 +545,14 @@ public final class ReplicatedRangeStore {
     }
 
     private byte[] operationResultUnderAdmission(OperationId id, byte[] payloadDigest) throws RocksDBException {
-        long generation = installationGeneration;
-        if (pendingInstallation != null) throw new IllegalStateException("Range metadata is being installed");
-        byte[] saved = db.get(receipts, receiptKey(id));
-        if (generation != installationGeneration || pendingInstallation != null) {
-            throw new IllegalStateException("Range metadata changed during status lookup");
-        }
-        return saved == null ? null : decodeReceipt(saved, payloadDigest);
+        if (payloadDigest.length != 32) throw new IllegalArgumentException("Invalid payload digest");
+        applyLane.lock();
+        try {
+            if (pendingInstallation != null) throw new IllegalStateException("Range metadata is being installed");
+            if (id.sequence() <= acknowledgedThrough(id, null)) return expiredResult();
+            byte[] saved = db.get(receipts, receiptKey(id));
+            return saved == null ? null : decodeReceipt(saved, payloadDigest);
+        } finally { applyLane.unlock(); }
     }
 
     /**
@@ -752,6 +772,8 @@ public final class ReplicatedRangeStore {
             acquireUse();
             try {
                 try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
+                    if (payloadDigest.length != 32) throw new IllegalArgumentException("Invalid payload digest");
+                    if (id.sequence() <= acknowledgedThrough(id, options)) return expiredResult();
                     byte[] saved = db.get(receipts, options, receiptKey(id));
                     return saved == null ? null : decodeReceipt(saved, payloadDigest);
                 }
@@ -881,6 +903,23 @@ public final class ReplicatedRangeStore {
         if (next.index() != expected || (applied != null && next.term() < applied.term())) {
             throw new IllegalStateException("Noncontiguous or regressing committed apply: " + next);
         }
+    }
+
+    private static byte[] expiredResult() {
+        return new CommandResult(CommandResult.Status.SESSION_EXPIRED, List.of()).encode();
+    }
+    private byte[] sessionFloorKey(OperationId id) {
+        return ByteBuffer.allocate(41).put(uuidBytes(groupId)).put((byte) 2).put(uuidBytes(id.sessionId())).putLong(id.epoch()).array();
+    }
+    private long acknowledgedThrough(OperationId id, ReadOptions options) throws RocksDBException {
+        byte[] value = options == null ? db.get(state, sessionFloorKey(id)) : db.get(state, options, sessionFloorKey(id));
+        if (value == null) return -1;
+        if (value.length != 12) throw new IllegalStateException("Invalid session floor");
+        var input = ByteBuffer.wrap(value);
+        if (input.getInt() != STATE_VERSION) throw new IllegalStateException("Unsupported session floor version");
+        long floor = input.getLong();
+        if (floor < 0 || floor == Long.MAX_VALUE) throw new IllegalStateException("Invalid session floor sequence");
+        return floor;
     }
 
     private byte[] receiptKey(OperationId id) {

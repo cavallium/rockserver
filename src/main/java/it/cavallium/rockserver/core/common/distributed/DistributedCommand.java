@@ -13,6 +13,7 @@ public final class DistributedCommand {
     private final OperationId operationId;
     private final List<Mutation> mutations;
     private final List<KeyPredicate> predicates;
+    private final long acknowledgedThrough;
 
     public DistributedCommand(UUID groupId, long rangeEpoch, byte[] schemaDigest,
                               OperationId operationId, List<Mutation> mutations) {
@@ -21,13 +22,25 @@ public final class DistributedCommand {
 
     public DistributedCommand(UUID groupId, long rangeEpoch, byte[] schemaDigest,
                               OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates) {
-        this(DistributedCommandCodec.FORMAT_VERSION, groupId, rangeEpoch, schemaDigest, operationId, mutations, predicates);
+        this(2, groupId, rangeEpoch, schemaDigest, operationId, mutations, predicates);
+    }
+
+    /** A v3 acknowledgement covers this issuing session/epoch only, strictly before this operation. */
+    public DistributedCommand(UUID groupId, long rangeEpoch, byte[] schemaDigest, OperationId operationId,
+                              List<Mutation> mutations, List<KeyPredicate> predicates, long acknowledgedThrough) {
+        this(3, groupId, rangeEpoch, schemaDigest, operationId, mutations, predicates, acknowledgedThrough);
     }
 
     // Decoding retains the original version, including legacy payload/receipt identity.
     DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
                        OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates) {
-        if (formatVersion != 1 && formatVersion != 2) throw new IllegalArgumentException("Unsupported command version");
+        this(formatVersion, groupId, rangeEpoch, schemaDigest, operationId, mutations, predicates, -1);
+    }
+
+    DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
+                       OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates,
+                       long acknowledgedThrough) {
+        if (formatVersion < 1 || formatVersion > 3) throw new IllegalArgumentException("Unsupported command version");
         this.formatVersion = formatVersion;
         this.groupId = Objects.requireNonNull(groupId, "groupId");
         if (rangeEpoch < 0) throw new IllegalArgumentException("Range epoch must be nonnegative");
@@ -37,13 +50,16 @@ public final class DistributedCommand {
         this.operationId = Objects.requireNonNull(operationId, "operationId");
         Objects.requireNonNull(mutations, "mutations");
         Objects.requireNonNull(predicates, "predicates");
-        if (mutations.isEmpty() || (long) mutations.size() + predicates.size() > DistributedCommandCodec.MAX_ITEMS
+        if ((formatVersion == 3 ? acknowledgedThrough < 0 || acknowledgedThrough >= operationId.sequence() : acknowledgedThrough != -1)
+                || (mutations.isEmpty() && (formatVersion != 3 || !predicates.isEmpty()))
+                || (long) mutations.size() + predicates.size() > DistributedCommandCodec.MAX_ITEMS
                 || (formatVersion == 1 && !predicates.isEmpty())) {
-            throw new IllegalArgumentException("Command requires mutations and at most 256 total items; v1 has no predicates");
+            throw new IllegalArgumentException("Invalid command items or acknowledgement; v1 has no predicates");
         }
         this.mutations = List.copyOf(mutations);
         this.predicates = List.copyOf(predicates);
-        long size = DistributedCommandCodec.HEADER_BYTES + (formatVersion == 2 ? 4 : 0);
+        this.acknowledgedThrough = acknowledgedThrough;
+        long size = DistributedCommandCodec.headerBytes(formatVersion);
         for (Mutation mutation : this.mutations) size += mutation.encodedSize();
         for (KeyPredicate predicate : this.predicates) size += predicate.encodedSize();
         if (size > DistributedCommandCodec.MAX_ENCODED_BYTES) {
@@ -60,6 +76,8 @@ public final class DistributedCommand {
     public OperationId operationId() { return operationId; }
     public List<Mutation> mutations() { return mutations; }
     public List<KeyPredicate> predicates() { return predicates; }
+    /** -1 for legacy commands without an acknowledgement. */
+    public long acknowledgedThrough() { return acknowledgedThrough; }
     /** SHA-256 of the entire canonical encoding, including identity and ordered operands. */
     public byte[] payloadDigest() { return DistributedCommandCodec.digest(this); }
 }

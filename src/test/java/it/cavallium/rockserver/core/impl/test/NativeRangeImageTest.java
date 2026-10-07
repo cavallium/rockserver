@@ -277,6 +277,24 @@ class NativeRangeImageTest {
         }
     }
 
+    @Test void malformedSessionFloorMetadataCannotBePublishedAsAnInstallableImage() throws Exception {
+        try (Pool pool = new Pool(directory.resolve("floors"))) {
+            pool.store.applyNoop(new ApplyPosition(1,0));
+            byte[] key = ByteBuffer.allocate(41).putLong(GROUP.getMostSignificantBits()).putLong(GROUP.getLeastSignificantBits())
+                    .put((byte)2).putLong(SESSION.getMostSignificantBits()).putLong(SESSION.getLeastSignificantBits()).putLong(1).array();
+            var values = List.of(new byte[11],ByteBuffer.allocate(12).putInt(99).putLong(0).array(),
+                    ByteBuffer.allocate(12).putInt(1).putLong(-1).array(),ByteBuffer.allocate(12).putInt(1).putLong(Long.MAX_VALUE).array());
+            for (int i=0;i<values.size();i++) {
+                pool.db.put(pool.handles.get(3),key,values.get(i));
+                Path output = directory.resolve("bad-floor-"+i+".image");
+                try (var pin = pool.store.capture()) {
+                    assertThrows(IOException.class,() -> NativeRangeImage.write(output,pin,pin.interval(),LIMITS));
+                }
+                assertFalse(Files.exists(output));
+            }
+        }
+    }
+
     private int headerEnd(byte[] image) {
         var input = ByteBuffer.wrap(image);
         input.position(96);
