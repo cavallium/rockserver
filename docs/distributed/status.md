@@ -496,3 +496,47 @@ that work remains inactive and is not reconstructed or validated here.
 Full distribution remains incomplete, including the Ratis fresh-read-barrier
 fix, public API/runtime/bootstrap integration, transactions/2PC, topology,
 receipt GC, long workflows and representative performance acceptance.
+
+## Bounded reusable range clients
+
+`RatisRoutedClient` now borrows long-lived clients from a 32-slot LRU cache keyed
+by group, range epoch, configuration version and complete replica descriptors.
+Concurrent creation of the same route shares one result; active leases prevent
+eviction. Replacement closes the idle client before opening its successor,
+outside the cache monitor. All-busy capacity fails explicitly. Failed setup
+releases its slot; failed retirement retains the resource and stops further
+admission/growth. Shutdown drains routed calls, closes cached resources outside
+the monitor, and supports retry of failed close without reopening admission.
+Prepared commands still use their original descriptors and operation identity;
+there is no new automatic mutation retry or ambiguous rerouting.
+
+The focused ordinary gate passes 16 pure adapter cases (five cache, eight routed
+client, three catalogue validation), Maven exit zero; log
+`/tmp/rockserver-client-pool-final-gate.log`. Tests force blocked setup/retirement,
+concurrent borrowers, close/retry and capacity boundaries without Raft RPCs,
+sockets, server processes, density runs or excluded workflows. Core/native
+behavior is unchanged and retains the preceding 29-case passing evidence.
+This amortizes client setup for repeated range operations; it does not yet share
+all channels/executors across groups by node identity, establish a tested group
+density, or demonstrate measured throughput/resource acceptance.
+
+## Independent review of the inactive fresh-read draft
+
+Read-only architecture review verified the pinned server checksum and the stock
+cached `ackedCommitIndex` shortcut against local Ratis 3.3.1 bytecode. The draft's
+sealed batches and next-call-ID watermarks appear consistent with the pinned
+gRPC allocation order, current-term checks and Ratis joint-majority predicate.
+A concrete flaw remains: quorum-decided waiters leave deadline coverage before
+success publication on the server executor. An accepted but stalled executor
+can retain every admission indefinitely. Keep these waiters covered until
+publication, allowing timeout to defeat delayed success. The 16-appender bound
+also currently stops the tracker permanently when exceeded; treat an oversize
+transitional configuration as recoverable admission failure or prove its limit
+against supported topology. No draft source was changed or activated here.
+
+Next: repair those boundaries, add deterministic ordinary read-round tests for
+fresh ACKs, sealing, generations/joint quorum, startup/commit/apply order,
+timeout/publication, cancellation and shutdown/rejection. Compile and inspect
+replacement-class packaging and runtime dependency uniqueness before activation.
+Strict read acceptance and excluded failure exercises remain unverified; this
+review does not establish the deployed/runtime fix.

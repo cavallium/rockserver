@@ -26,7 +26,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Initial bounded point/same-range client. Cross-group atomicity and automatic ambiguity retry are
- * unsupported. Per-operation Raft clients favor simple resource ownership; performance is pending.
+ * unsupported. Range clients are reused within a bounded idle-evicting cache; measured density is pending.
  */
 public final class RatisRoutedClient implements AutoCloseable {
     static final int MAX_CONCURRENT_CALLS = 32;
@@ -56,7 +56,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     private RangeDirectory directory;
     private int activeCalls;
     private boolean closing;
-    private final CompletableFuture<Void> closed = new CompletableFuture<>();
+    private CompletableFuture<Void> closeAttempt;
 
     public RatisRoutedClient(RangeDirectory directory, Transport transport) {
         this.identity = this.directory = Objects.requireNonNull(directory, "directory");
@@ -161,9 +161,12 @@ public final class RatisRoutedClient implements AutoCloseable {
     @Override public void close() throws IOException {
         boolean owner;
         boolean interrupted = false;
+        CompletableFuture<Void> attempt;
         synchronized (this) {
-            owner = !closing;
             closing = true;
+            owner = closeAttempt == null || closeAttempt.isCompletedExceptionally();
+            if (owner) closeAttempt = new CompletableFuture<>();
+            attempt = closeAttempt;
             if (owner) {
                 while (activeCalls != 0) {
                     try { wait(); }
@@ -172,18 +175,22 @@ public final class RatisRoutedClient implements AutoCloseable {
             }
         }
         if (owner) {
-            try { transport.close(); closed.complete(null); }
-            catch (IOException | RuntimeException | Error failure) { closed.completeExceptionally(failure); }
+            try { transport.close(); attempt.complete(null); }
+            catch (IOException | RuntimeException | Error failure) { attempt.completeExceptionally(failure); }
         }
-        try { closed.join(); }
+        try { attempt.join(); }
         catch (CompletionException failure) { throw new IOException("Failed to close routed transport", failure.getCause()); }
         finally { if (interrupted) Thread.currentThread().interrupt(); }
     }
 
     private static final class RaftTransport implements Transport {
+        private final RatisClientPool clients = new RatisClientPool(MAX_CONCURRENT_CALLS, RaftTransport::connected);
+
+        @Override public void close() throws IOException { clients.close(); }
         @Override public byte[] read(RangeDescriptor descriptor, UUID column, byte[] key) throws IOException {
             var request = ByteBuffer.allocate(16 + key.length).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).put(key).array();
-            return rpc(() -> { try (RaftClient client = connected(descriptor)) {
+            return rpc(() -> { try (var lease = clients.acquire(descriptor)) {
+                RaftClient client = lease.client();
                 byte[] encoded = content(client.io().sendReadOnly(Message.valueOf(ByteString.copyFrom(request))));
                 if (encoded.length < 4) throw new IOException("Truncated point reply");
                 var input = ByteBuffer.wrap(encoded);
@@ -195,7 +202,8 @@ public final class RatisRoutedClient implements AutoCloseable {
         }
 
         @Override public CommandResult command(RangeDescriptor descriptor, DistributedCommand command) throws IOException {
-            return rpc(() -> { try (RaftClient client = connected(descriptor)) {
+            return rpc(() -> { try (var lease = clients.acquire(descriptor)) {
+                RaftClient client = lease.client();
                 byte[] encoded = content(client.io().send(Message.valueOf(ByteString.copyFrom(DistributedCommandCodec.encode(command)))));
                 try { return CommandResult.decode(encoded); }
                 catch (IllegalArgumentException invalid) { throw new IOException("Invalid command reply", invalid); }

@@ -187,6 +187,20 @@ class RatisRoutedClientTest {
         assertThrows(IllegalStateException.class, () -> client.refresh(directory(2, 1)));
     }
 
+    @Test
+    void failedTransportCloseCanBeRetriedWithoutReopeningAdmission() throws Exception {
+        var transport = new RecordingTransport() {
+            @Override public void close() throws IOException {
+                if (closes.incrementAndGet() == 1) throw new IOException("retained resource");
+            }
+        };
+        var client = new RatisRoutedClient(directory(1, 1), transport);
+        assertThrows(IOException.class, client::close);
+        assertThrows(IllegalStateException.class, () -> client.read(A, key(1)));
+        client.close(); client.close();
+        assertEquals(2, transport.closes.get());
+    }
+
     private class RecordingTransport implements RatisRoutedClient.Transport {
         final List<DistributedCommand> commands = new ArrayList<>();
         final AtomicInteger closes = new AtomicInteger();
@@ -197,6 +211,6 @@ class RatisRoutedClientTest {
         @Override public CommandResult command(RangeDescriptor descriptor, DistributedCommand command) throws IOException {
             lastDescriptor = descriptor; commands.add(command); return success;
         }
-        @Override public void close() { closes.incrementAndGet(); }
+        @Override public void close() throws IOException { closes.incrementAndGet(); }
     }
 }
