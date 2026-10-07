@@ -104,3 +104,11 @@ transactions, reservations/disjoint pipelining, production node/client/API
 integration, catalogue/topology, long workflows, transport parity and the final
 resource/performance/fault gates. A command combining range deletion with point
 return modes is currently rejected before append. The task remains active.
+
+Next acceptance sequence: implement streamed checksummed images and fenced,
+recoverable native installation; prove fresh-node recovery and local child seed
+initialization against Ratis; then measure idle 1/8/32-group cohorts on one shared
+pool per node. Density fixtures must cap per-division and gRPC executors, use
+fresh directories for group-add FORMAT, collect RSS/thread/FD samples after
+warmup, and report local results without extrapolating to production NUMA or
+quorum-durable throughput. This density measurement has not been run.
