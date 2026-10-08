@@ -114,11 +114,11 @@ class RatisParticipantFinalizeTest {
                 try (var plan=data.f.machine.prepareFinalization(home.statuses,initial.transactionId(),recovery(0))) {
                     var first=data.wire.propose(plan.bytes()); var duplicate=data.wire.propose(plan.bytes()); assertNull(first.getException()); assertNull(duplicate.getException());
                     data.f.machine.preAppendTransaction(first); first.initLogEntry(1,2); data.f.machine.preAppendTransaction(duplicate); duplicate.initLogEntry(1,3);
-                    data.f.store.applyCommit(new ApplyPosition(1,2),plan.finalization()); data.f.machine.takeSnapshot(); data.f.machine.pause();
+                    data.f.store.applyFinalization(new ApplyPosition(1,2),plan.finalization()); data.f.machine.takeSnapshot(); data.f.machine.pause();
                     var covered=data.f.machine.applyTransaction(first); var suffix=data.f.machine.applyTransaction(duplicate); data.f.machine.reinitialize();
-                    assertEquals(new ApplyPosition(1,2),RatisParticipantRecord.finalizationResult(covered.get(5,TimeUnit.SECONDS).getContent().toByteArray())); assertFalse(suffix.isDone()); assertEquals(0,data.f.machine.reservedFinalizationCount());
-                    assertEquals(new ApplyPosition(1,2),RatisParticipantRecord.finalizationResult(data.f.machine.applyTransaction(duplicate).get(5,TimeUnit.SECONDS).getContent().toByteArray()));
-                    assertEquals(new ApplyPosition(1,2),RatisParticipantRecord.finalizationResult(suffix.get(5,TimeUnit.SECONDS).getContent().toByteArray())); data.wire.index=3; released(data);
+                    assertEquals(new ApplyPosition(1,2),RatisParticipantRecord.finalizationResult(covered.get(5,TimeUnit.SECONDS).getContent().toByteArray()).position()); assertFalse(suffix.isDone()); assertEquals(0,data.f.machine.reservedFinalizationCount());
+                    assertEquals(new ApplyPosition(1,2),RatisParticipantRecord.finalizationResult(data.f.machine.applyTransaction(duplicate).get(5,TimeUnit.SECONDS).getContent().toByteArray()).position());
+                    assertEquals(new ApplyPosition(1,2),RatisParticipantRecord.finalizationResult(suffix.get(5,TimeUnit.SECONDS).getContent().toByteArray()).position()); data.wire.index=3; released(data);
                 }
             }
         }
@@ -200,7 +200,7 @@ class RatisParticipantFinalizeTest {
             try (var prepare=data.f.machine.prepareParticipant(pin,data.f.put(2),helper.control(0),home.statuses,initial.transactionId())) {
                 var pending=data.wire.propose(prepare.bytes()); assertNull(pending.getException()); data.f.machine.preAppendTransaction(pending); pending.initLogEntry(1,3); data.f.machine.cancelTransaction(pending);
                 homeDecision(home,initial,initial.decide(TransactionStatus.Phase.ABORT),1); var finalization=home.statuses.readFinalization(initial.transactionId(),data.f.groupId,recovery(0));
-                data.f.store.applyAbort(new ApplyPosition(1,1),finalization); data.f.machine.takeSnapshot(); data.f.machine.pause(); data.f.machine.reinitialize(); data.wire.index=1;
+                data.f.store.applyFinalization(new ApplyPosition(1,1),finalization); data.f.machine.takeSnapshot(); data.f.machine.pause(); data.f.machine.reinitialize(); data.wire.index=1;
                 assertEquals(0,data.f.machine.proposalFootprintStats().candidates()); assertEquals(0,data.f.machine.reservedParticipantCount()); assertTrue(data.f.counter("admittedBytes")>0);
                 var write=new DistributedCommand(data.f.groupId,1,new byte[32],new OperationId(new UUID(0,1960),1,0),List.of(new Mutation(Mutation.Kind.PUT,data.f.column,new byte[]{2},new byte[]{9})));
                 assertEquals(CommandResult.Status.SUCCESS,data.wire.command(data.directory.ranges().getFirst(),write).status());

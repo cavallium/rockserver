@@ -6,6 +6,10 @@ import it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt;
 import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
 import it.cavallium.rockserver.core.common.distributed.ParticipantFinalization;
 import it.cavallium.rockserver.core.common.distributed.ParticipantVote;
+import it.cavallium.rockserver.core.common.distributed.ParticipantIdentity;
+import it.cavallium.rockserver.core.common.distributed.ParticipantFenceProof;
+import it.cavallium.rockserver.core.common.distributed.ParticipantRetirement;
+import it.cavallium.rockserver.core.common.distributed.ParticipantFinalizationResult;
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
 import it.cavallium.rockserver.core.common.distributed.RejectedParticipant;
 import it.cavallium.rockserver.core.common.distributed.SnapshotFence;
@@ -632,17 +636,69 @@ public final class ReplicatedRangeStore {
         catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate HOME recovery identities",failure); }
     }
 
-    public record FinalizationEstimate(PreparedCapacity capacity,boolean newFence,ApplyPosition existing) {}
+    private record ParticipantAnchor(UUID home,long epoch,UUID group,TransactionStatus definition) {}
+    private void requireParticipantDefinition(UUID participantGroup,TransactionStatus definition,ReadOptions options) throws RocksDBException {
+        var participant=definition.participants().stream().filter(p -> p.groupId().equals(participantGroup)).findFirst().orElseThrow(() -> new IllegalArgumentException("Unregistered participant identity"));
+        if (!participantGroup.equals(groupId) || participant.rangeEpoch()!=rangeEpoch || !Arrays.equals(participant.schemaDigest(),schemaDigest)
+                || !definition.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Participant identity differs from native owner/schema");
+        if (logicalSchema!=null && (!logicalSchema.clusterId().equals(definition.clusterId()) || !logicalSchema.databaseId().equals(definition.databaseId()))) throw new IllegalArgumentException("Participant identity database differs from schema");
+        var authority=sessionAuthority(options);
+        if (authority!=null && (!authority.clusterId().equals(definition.clusterId()) || !authority.databaseId().equals(definition.databaseId()))) throw new IllegalArgumentException("Participant identity database differs from native session authority");
+    }
+    private byte[] participantRow(byte[] key,ReadOptions options) throws RocksDBException { return options==null ? db.get(state,key) : db.get(state,options,key); }
+    /** A floor proves retirement only when no retained row belongs to this original business anchor. */
+    private boolean retiredParticipant(UUID home,long epoch,UUID participantGroup,TransactionStatus definition,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+        requireParticipantDefinition(participantGroup,definition,options); var anchors=new ArrayList<ParticipantAnchor>(4); UUID transaction=definition.transactionId();
+        byte[] bytes=participantRow(preparedKey(transaction),options);
+        if (bytes!=null) { var record=PreparedParticipant.decode(bytes); requireParticipantCut(record.position(),cut); var preparation=record.preparation(); anchors.add(new ParticipantAnchor(preparation.homeGroup(),preparation.homeEpoch(),preparation.business().groupId(),preparation.registration())); }
+        bytes=participantRow(abortedKey(transaction),options);
+        if (bytes!=null) { var record=AbortedParticipant.decode(bytes); requireParticipantCut(record.position(),cut); var value=record.finalization(); anchors.add(new ParticipantAnchor(value.homeGroup(),value.homeEpoch(),value.participantGroup(),value.decision())); }
+        bytes=participantRow(committedKey(transaction),options);
+        if (bytes!=null) { var record=CommittedParticipant.decode(bytes); requireParticipantCut(record.position(),cut); var value=record.finalization(); anchors.add(new ParticipantAnchor(value.homeGroup(),value.homeEpoch(),value.participantGroup(),value.decision())); }
+        bytes=participantRow(rejectedKey(transaction),options);
+        if (bytes!=null) { var value=RejectedParticipant.decode(bytes); requireParticipantCut(value.position(),cut); anchors.add(new ParticipantAnchor(value.homeGroup(),value.homeEpoch(),value.participantGroup(),value.registration())); }
+        ParticipantAnchor first=null;
+        for (var anchor:anchors) {
+            requireParticipantDefinition(anchor.group(),anchor.definition(),options);
+            if (first==null) first=anchor;
+            else if (!first.home().equals(anchor.home()) || first.epoch()!=anchor.epoch() || !first.group().equals(anchor.group()) || !first.definition().sameDefinition(anchor.definition())) throw new IllegalArgumentException("Native participant family has crossed definitions");
+        }
+        if (first!=null && first.definition().operation().equals(definition.operation())) {
+            if (!first.home().equals(home) || first.epoch()!=epoch || !first.group().equals(participantGroup) || !first.definition().sameDefinition(definition)) throw new IllegalArgumentException("Retained participant definition changed");
+            return false;
+        }
+        if (definition.operation().epoch()<minimumSessionEpoch(options)) return true;
+        if (first!=null) throw new IllegalArgumentException("Transaction UUID belongs to another live business anchor");
+        return false;
+    }
+    private static void requireParticipantCut(ApplyPosition position,ApplyPosition cut) {
+        if (cut==null || position.term()>cut.term() || position.index()>cut.index() || position.index()==cut.index() && position.term()!=cut.term()) throw new IllegalArgumentException("Participant record differs from completed native cut");
+    }
+    private void advanceParticipantMarker(ApplyPosition position) throws RocksDBException {
+        if (applied!=null && position.index()<=applied.index()) {
+            if (position.index()==applied.index() && position.term()!=applied.term()) throw new IllegalArgumentException("Covered participant callback changed completed term");
+            return;
+        }
+        requireNext(position); var history=prepareScopedWrites(false,List.of(),Map.of());
+        try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+            batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+        }
+        publishScoped(position,history,false); applied=position;
+    }
+
+    public record FinalizationEstimate(PreparedCapacity capacity,boolean newFence,ApplyPosition existing,boolean retired) {}
     /** Admission observes terminal ownership/capacity at one completed cut; no old business grant is required. */
     public FinalizationEstimate estimateFinalization(ParticipantFinalization finalization) throws RocksDBException {
         Objects.requireNonNull(finalization); enterNative(); applyLane.lock();
         try {
-            requireActive(); requireFinalization(finalization);
+            requireActive();
+            if (readParticipantFence(identity(finalization),null,applied)!=null) return new FinalizationEstimate(preparedCapacityUnderLane(),false,null,true);
+            requireFinalization(finalization);
             var commit=committedIndex.get(finalization.transactionId()); var abort=abortedIndex.get(finalization.transactionId());
             if (commit!=null || abort!=null) {
                 var saved=commit!=null ? commit.finalization() : abort.finalization();
                 if (!saved.equals(finalization)) throw new IllegalArgumentException("Finalization intent changed");
-                return new FinalizationEstimate(preparedCapacityUnderLane(),false,commit!=null ? commit.position() : abort.position());
+                return new FinalizationEstimate(preparedCapacityUnderLane(),false,commit!=null ? commit.position() : abort.position(),false);
             }
             var prepared=preparedIndex.records().stream().filter(p -> p.preparation().transactionId().equals(finalization.transactionId())).findFirst().orElse(null);
             if (prepared!=null) finalization.requirePrepared(prepared);
@@ -655,16 +711,17 @@ public final class ReplicatedRangeStore {
             requireFinalizationRejectionIdentity(finalization);
             var capacity=preparedCapacityUnderLane(); boolean newFence=prepared==null && rejected==null;
             if (newFence && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("Finalization capacity exhausted");
-            return new FinalizationEstimate(capacity,newFence,null);
+            return new FinalizationEstimate(capacity,newFence,null,false);
         } finally { applyLane.unlock(); leaveNative(); }
     }
     /** Exact committed-native proof is available while fenced, before activation after image install. */
-    public ApplyPosition recoveredFinalization(ParticipantFinalization expected) throws RocksDBException {
+    public ParticipantFinalizationResult recoveredFinalization(ParticipantFinalization expected) throws RocksDBException {
         Objects.requireNonNull(expected); enterNative(); applyLane.lock();
-        try { return readFinalizationPosition(expected,null,applied); }
+        try { return readFinalizationResult(expected,null,applied); }
         finally { applyLane.unlock(); leaveNative(); }
     }
-    private ApplyPosition readFinalizationPosition(ParticipantFinalization expected,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+    private ParticipantFinalizationResult readFinalizationResult(ParticipantFinalization expected,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+        var retirement=readParticipantFence(identity(expected),options,cut); if (retirement!=null) return ParticipantFinalizationResult.retired(retirement);
         byte[] committed=options==null ? db.get(state,committedKey(expected.transactionId())) : db.get(state,options,committedKey(expected.transactionId()));
         byte[] aborted=options==null ? db.get(state,abortedKey(expected.transactionId())) : db.get(state,options,abortedKey(expected.transactionId()));
         if (committed!=null && aborted!=null) throw new IllegalArgumentException("Conflicting native finalization decisions");
@@ -673,8 +730,82 @@ public final class ReplicatedRangeStore {
         if (committed!=null) { var receipt=CommittedParticipant.decode(committed); actual=receipt.finalization(); position=receipt.position(); }
         else { var receipt=AbortedParticipant.decode(aborted); actual=receipt.finalization(); position=receipt.position(); }
         requireFinalization(actual);
+        byte[] prepared=participantRow(preparedKey(actual.transactionId()),options);
+        if (prepared==null && (actual.decision().phase()==TransactionStatus.Phase.COMMIT || actual.participant().prepared()!=null)) throw new IllegalArgumentException("Native finalization lacks required positive preparation");
+        if (prepared!=null) requireTerminalAfterPreparation(actual,position,PreparedParticipant.decode(prepared));
         if (!actual.equals(expected) || cut==null || position.index()>cut.index() || position.term()>cut.term() || position.index()==cut.index() && position.term()!=cut.term()) throw new IllegalArgumentException("Native finalization proof differs");
-        return position;
+        return ParticipantFinalizationResult.applied(position);
+    }
+    private static void requireTerminalAfterPreparation(ParticipantFinalization terminal,ApplyPosition position,PreparedParticipant prepared) {
+        terminal.requirePrepared(prepared);
+        if (position.index()<=prepared.position().index() || position.term()<prepared.position().term()) throw new IllegalArgumentException("Participant finalization does not follow native preparation");
+    }
+    private static ParticipantIdentity identity(ParticipantFinalization value) { return new ParticipantIdentity(value.homeGroup(),value.homeEpoch(),value.participantGroup(),value.decision()); }
+    private static ParticipantIdentity identity(PreparedParticipant.Preparation value) { return new ParticipantIdentity(value.homeGroup(),value.homeEpoch(),value.business().groupId(),value.registration()); }
+    private ParticipantFenceProof readParticipantFence(ParticipantIdentity identity,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+        byte[] marker=participantRow(markerKey,options); var observed=marker==null ? null : decodePosition(marker);
+        if (!Objects.equals(cut,observed)) throw new IllegalStateException("Participant proof cut differs from completed native marker");
+        if (!retiredParticipant(identity.homeGroup(),identity.homeEpoch(),identity.participantGroup(),identity.definition(),options,cut)) return null;
+        return new ParticipantFenceProof(identity,minimumSessionEpoch(options),cut);
+    }
+    /** Atomic current-cut absence/floor evidence; never invents a terminal effect or an original APOS. */
+    public ParticipantFenceProof participantFence(ParticipantIdentity identity) throws RocksDBException {
+        Objects.requireNonNull(identity); enterNative(); applyLane.lock();
+        try { return readParticipantFence(identity,null,applied); } finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Trusted committed FINALIZE seam. A retired original business can only advance the completed marker. */
+    public ParticipantFinalizationResult applyFinalization(ApplyPosition position,ParticipantFinalization finalization) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(finalization); enterNative(); applyLane.lock();
+        try {
+            requireActive(); ensureReceiptUsage(); var identity=identity(finalization);
+            if (readParticipantFence(identity,null,applied)!=null) {
+                advanceParticipantMarker(position); return ParticipantFinalizationResult.retired(readParticipantFence(identity,null,applied));
+            }
+            var original=finalization.decision().phase()==TransactionStatus.Phase.COMMIT ? applyCommit(position,finalization).position() : applyAbort(position,finalization).position();
+            return ParticipantFinalizationResult.applied(original);
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+    /** Preflight at one native cut. False means the original family is already fenced absent. */
+    public boolean estimateParticipantRetirement(ParticipantRetirement retirement) throws RocksDBException {
+        Objects.requireNonNull(retirement); enterNative(); applyLane.lock();
+        try { requireActive(); return retirementNeeded(retirement); } finally { applyLane.unlock(); leaveNative(); }
+    }
+    private boolean retirementNeeded(ParticipantRetirement retirement) throws RocksDBException {
+        var identity=retirement.identity();
+        if (readParticipantFence(identity,null,applied)!=null) return false;
+        if (identity.business().epoch()>=minimumSessionEpoch(null)) throw new IllegalStateException("Participant retirement requires a strictly newer native session epoch floor");
+        var terminal=readFinalizationResult(retirement.finalization(),null,applied);
+        if (terminal==null || terminal.retired() || !terminal.position().equals(retirement.position())) throw new IllegalArgumentException("Participant retirement lacks exact native terminal proof");
+        byte[] bytes=db.get(state,preparedKey(identity.transactionId()));
+        if (bytes!=null) requireTerminalAfterPreparation(retirement.finalization(),retirement.position(),PreparedParticipant.decode(bytes));
+        bytes=db.get(state,rejectedKey(identity.transactionId()));
+        if (bytes!=null) RejectedParticipant.decode(bytes).requireFinalization(retirement.finalization());
+        return true;
+    }
+    /** Qualified consumed HOME authority is supplied by the adapter. All four family rows disappear in one native batch. */
+    public void applyParticipantRetirement(ApplyPosition position,ParticipantRetirement retirement) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(retirement); enterNative(); applyLane.lock();
+        try {
+            requireActive(); ensureReceiptUsage(); var identity=retirement.identity();
+            if (!retirementNeeded(retirement)) { advanceParticipantMarker(position); return; }
+            if (applied!=null && position.index()<=applied.index()) throw new IllegalStateException("Covered retirement callback still has a retained family");
+            requireNext(position); var transaction=identity.transactionId();
+            var remaining=preparedIndex.records().stream().filter(record -> !record.preparation().transactionId().equals(transaction)).toList();
+            long bytes=0,scopeBytes=0;
+            for (var record:remaining) { bytes+=33L+record.encode().length+FINALIZATION_RESERVATION; scopeBytes+=RangeMutationHistory.accountedScopeBytes(record.preparation().scope()); }
+            var nextPrepared=new PreparedIndex(remaining,bytes,scopeBytes);
+            var nextAborted=new HashMap<>(abortedIndex); nextAborted.remove(transaction);
+            var nextCommitted=new HashMap<>(committedIndex); nextCommitted.remove(transaction);
+            var nextRejected=new HashMap<>(rejectedIndex); nextRejected.remove(transaction);
+            var publishedAborted=Map.copyOf(nextAborted); var publishedCommitted=Map.copyOf(nextCommitted); var publishedRejected=Map.copyOf(nextRejected);
+            var history=prepareScopedWrites(false,List.of(),Map.of());
+            try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                batch.delete(state,preparedKey(transaction)); batch.delete(state,abortedKey(transaction)); batch.delete(state,committedKey(transaction)); batch.delete(state,rejectedKey(transaction));
+                batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+            }
+            preparedIndex=nextPrepared; abortedIndex=publishedAborted; committedIndex=publishedCommitted; rejectedIndex=publishedRejected;
+            publishScoped(position,history,false); applied=position;
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
     private boolean isFinalized(UUID transaction) { return abortedIndex.containsKey(transaction) || committedIndex.containsKey(transaction); }
     private byte[] committedKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x22).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
@@ -687,7 +818,7 @@ public final class ReplicatedRangeStore {
             while (iterator.isValid()) {
                 if (records.size()>=MAX_PREPARED_PARTICIPANTS || iterator.key(sizing)!=33 || iterator.value(sizing)>CommittedParticipant.MAX_BYTES) throw new IllegalStateException("COMMIT recovery bound exceeded");
                 var record=CommittedParticipant.decode(iterator.value()); requireFinalization(record.finalization()); var id=record.finalization().transactionId();
-                if (!Arrays.equals(iterator.key(),committedKey(id)) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term()) throw new IllegalStateException("COMMIT receipt differs from completed cut");
+                if (!Arrays.equals(iterator.key(),committedKey(id)) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term() || record.position().index()==applied.index() && record.position().term()!=applied.term()) throw new IllegalStateException("COMMIT receipt differs from completed cut");
                 records.put(id,record); iterator.next();
             }
             iterator.status(); return Map.copyOf(records);
@@ -704,7 +835,7 @@ public final class ReplicatedRangeStore {
         }
     }
     /** Trusted committed COMMIT seam. Recovery does not depend on the original business grant remaining live. */
-    public CommittedParticipant applyCommit(ApplyPosition position,ParticipantFinalization finalization) throws RocksDBException {
+    private CommittedParticipant applyCommit(ApplyPosition position,ParticipantFinalization finalization) throws RocksDBException {
         Objects.requireNonNull(position); Objects.requireNonNull(finalization); enterNative(); applyLane.lock();
         try {
             requireActive(); ensureReceiptUsage(); var candidate=new CommittedParticipant(finalization,position); requireFinalization(finalization);
@@ -970,7 +1101,7 @@ public final class ReplicatedRangeStore {
             while (iterator.isValid()) {
                 if (records.size()>=MAX_PREPARED_PARTICIPANTS || iterator.key(sizing)!=33 || iterator.value(sizing)>RejectedParticipant.MAX_BYTES) throw new IllegalStateException("Rejected preparation recovery bound exceeded");
                 var record=RejectedParticipant.decode(iterator.value()); requireRejected(record);
-                if (!Arrays.equals(iterator.key(),rejectedKey(record.transactionId())) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term()) throw new IllegalStateException("Rejected preparation differs from completed cut");
+                if (!Arrays.equals(iterator.key(),rejectedKey(record.transactionId())) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term() || record.position().index()==applied.index() && record.position().term()!=applied.term()) throw new IllegalStateException("Rejected preparation differs from completed cut");
                 records.put(record.transactionId(),record); iterator.next();
             }
             iterator.status(); return Map.copyOf(records);
@@ -1008,7 +1139,11 @@ public final class ReplicatedRangeStore {
     /** Trusted committed negative-vote seam. The adapter supplies gate/ordering authority; no home ABORT is implied. */
     public ParticipantVote applyRejected(ApplyPosition position,PreparedParticipant.Preparation preparation) throws RocksDBException {
         Objects.requireNonNull(position); Objects.requireNonNull(preparation); enterNative(); applyLane.lock();
-        try { requireActive(); ensureReceiptUsage(); requirePreparation(preparation,true); return applyRejectedUnderLane(position,preparation); }
+        try {
+            requireActive(); ensureReceiptUsage(); var identity=identity(preparation);
+            if (readParticipantFence(identity,null,applied)!=null) { advanceParticipantMarker(position); return ParticipantVote.retired(readParticipantFence(identity,null,applied)); }
+            requirePreparation(preparation,true); return applyRejectedUnderLane(position,preparation);
+        }
         finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
     private ParticipantVote applyRejectedUnderLane(ApplyPosition position,PreparedParticipant.Preparation preparation) throws RocksDBException {
@@ -1051,7 +1186,7 @@ public final class ReplicatedRangeStore {
             while (iterator.isValid()) {
                 if (records.size()>=MAX_PREPARED_PARTICIPANTS || iterator.key(sizing)!=33 || iterator.value(sizing)>AbortedParticipant.MAX_BYTES) throw new IllegalStateException("ABORT recovery bound exceeded");
                 var record=AbortedParticipant.decode(iterator.value()); requireAbort(record); var id=record.finalization().transactionId();
-                if (!Arrays.equals(iterator.key(),abortedKey(id)) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term()) throw new IllegalStateException("ABORT fence differs from completed cut");
+                if (!Arrays.equals(iterator.key(),abortedKey(id)) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term() || record.position().index()==applied.index() && record.position().term()!=applied.term()) throw new IllegalStateException("ABORT fence differs from completed cut");
                 records.put(id,record); iterator.next();
             }
             iterator.status(); return Map.copyOf(records);
@@ -1071,7 +1206,7 @@ public final class ReplicatedRangeStore {
         for (var abort:abortedIndex.values()) {
             if (abort.finalization().participant().prepared()!=null && preparedIndex.records().stream().noneMatch(p -> p.preparation().transactionId().equals(abort.finalization().transactionId()))) throw new IllegalArgumentException("ABORT home vote lacks native evidence");
             for (var preparation:preparedIndex.records()) {
-                if (preparation.preparation().transactionId().equals(abort.finalization().transactionId())) { abort.finalization().requirePrepared(preparation); }
+                if (preparation.preparation().transactionId().equals(abort.finalization().transactionId())) { requireTerminalAfterPreparation(abort.finalization(),abort.position(),preparation); }
                 else if (abortOwns(abort,preparation.preparation().operation()) || abortOwns(abort,preparation.preparation().business().operationId())) throw new IllegalArgumentException("ABORT/prepare operation identity reused");
             }
             for (var other:abortedIndex.values()) if (other!=abort && (abortOwns(other,abort.finalization().operation()) || abortOwns(other,abort.finalization().decision().operation()))) throw new IllegalArgumentException("ABORT operation identity reused");
@@ -1084,7 +1219,7 @@ public final class ReplicatedRangeStore {
         return new PreparedCapacity(applied,count,bytes,preparedIndex.scopeBytes());
     }
     /** Trusted committed ABORT seam. Its adapter must verify fresh home authority and retain proposal ownership through return. */
-    public AbortedParticipant applyAbort(ApplyPosition position,ParticipantFinalization finalization) throws RocksDBException {
+    private AbortedParticipant applyAbort(ApplyPosition position,ParticipantFinalization finalization) throws RocksDBException {
         Objects.requireNonNull(position); Objects.requireNonNull(finalization); enterNative(); applyLane.lock();
         try {
             requireActive(); ensureReceiptUsage(); if (committedIndex.containsKey(finalization.transactionId())) throw new IllegalArgumentException("COMMIT decision cannot become ABORT"); var candidate=new AbortedParticipant(finalization,position); requireAbort(candidate);
@@ -1197,7 +1332,9 @@ public final class ReplicatedRangeStore {
     public RejectionEstimate estimateRejection(PreparedParticipant.Preparation preparation) throws RocksDBException {
         Objects.requireNonNull(preparation); enterNative(); applyLane.lock();
         try {
-            requireActive(); requirePreparation(preparation,true); var capacity=preparedCapacityUnderLane();
+            requireActive(); var retirement=readParticipantFence(identity(preparation),null,applied); var capacity=preparedCapacityUnderLane();
+            if (retirement!=null) return new RejectionEstimate(capacity,ParticipantVote.retired(retirement),false);
+            requirePreparation(preparation,true);
             for (var prepared:preparedIndex.records()) if (prepared.preparation().transactionId().equals(preparation.transactionId())) {
                 if (!prepared.preparation().equals(preparation)) throw new IllegalArgumentException("Prepared transaction payload changed");
                 return new RejectionEstimate(capacity,ParticipantVote.prepared(prepared.position()),false);
@@ -1217,7 +1354,9 @@ public final class ReplicatedRangeStore {
     public PreparationEstimate estimatePreparation(PreparedParticipant.Preparation preparation) throws RocksDBException {
         enterNative(); applyLane.lock();
         try {
-            requireActive(); requirePreparation(preparation,true);
+            requireActive(); var retirement=readParticipantFence(identity(preparation),null,applied);
+            if (retirement!=null) return new PreparationEstimate(preparedCapacityUnderLane(),ParticipantVote.retired(retirement));
+            requirePreparation(preparation,true);
             var control=preparation.operation(); long minimumControl=minimumSessionEpoch(null); long controlFloor=control.epoch()<minimumControl ? -1 : acknowledgedThrough(control,null);
             var business=preparation.business();
             var controlCommand=new DistributedCommand(business.groupId(),business.rangeEpoch(),business.schemaDigest(),control,business.mutations(),business.predicates());
@@ -1247,13 +1386,14 @@ public final class ReplicatedRangeStore {
         try {
             byte[] bytes=db.get(state,preparedKey(expected.transactionId())); if (bytes==null) return null;
             var record=PreparedParticipant.decode(bytes); requirePreparation(record.preparation(),false);
-            if (!record.preparation().equals(expected) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term()) throw new IllegalArgumentException("Recovered prepared receipt differs");
+            if (!record.preparation().equals(expected) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term() || record.position().index()==applied.index() && record.position().term()!=applied.term()) throw new IllegalArgumentException("Recovered prepared receipt differs");
             return record;
         } finally { applyLane.unlock(); leaveNative(); }
     }
     public ParticipantVote recoveredPreparationVote(PreparedParticipant.Preparation expected) throws RocksDBException {
         enterNative(); applyLane.lock();
         try {
+            var retirement=readParticipantFence(identity(expected),null,applied); if (retirement!=null) return ParticipantVote.retired(retirement);
             var prepared=recoveredParticipant(expected); if (prepared!=null) return ParticipantVote.prepared(prepared.position());
             byte[] bytes=db.get(state,rejectedKey(expected.transactionId())); if (bytes==null) return null;
             var rejected=RejectedParticipant.decode(bytes); requireRejected(rejected); rejected.requirePreparation(expected);
@@ -1264,7 +1404,9 @@ public final class ReplicatedRangeStore {
     public ParticipantVote applyPrepared(ApplyPosition position,PreparedParticipant.Preparation preparation) throws RocksDBException {
         Objects.requireNonNull(position); Objects.requireNonNull(preparation); enterNative(); applyLane.lock();
         try {
-            requireActive(); ensureReceiptUsage(); requirePreparation(preparation,true);
+            requireActive(); ensureReceiptUsage(); var identity=identity(preparation);
+            if (readParticipantFence(identity,null,applied)!=null) { advanceParticipantMarker(position); return ParticipantVote.retired(readParticipantFence(identity,null,applied)); }
+            requirePreparation(preparation,true);
             PreparedParticipant saved=null;
             for (var old:preparedIndex.records()) if (old.preparation().transactionId().equals(preparation.transactionId())) {
                 if (!Arrays.equals(old.preparation().digest(),preparation.digest())) throw new IllegalArgumentException("Prepared transaction payload changed"); saved=old;
@@ -2287,9 +2429,14 @@ public final class ReplicatedRangeStore {
                 releaseUse();
             }
         }
-        public ApplyPosition finalizationPosition(ParticipantFinalization expected) throws RocksDBException {
+        public ParticipantFenceProof participantFence(ParticipantIdentity identity) throws RocksDBException {
+            Objects.requireNonNull(identity); acquireUse();
+            try (var options=new ReadOptions().setSnapshot(snapshot)) { return readParticipantFence(identity,options,position); }
+            finally { releaseUse(); }
+        }
+        public ParticipantFinalizationResult finalizationResult(ParticipantFinalization expected) throws RocksDBException {
             Objects.requireNonNull(expected); acquireUse();
-            try (var options=new ReadOptions().setSnapshot(snapshot)) { return readFinalizationPosition(expected,options,position); }
+            try (var options=new ReadOptions().setSnapshot(snapshot)) { return readFinalizationResult(expected,options,position); }
             finally { releaseUse(); }
         }
         void validateHomeCreditImage(Map<UUID,HomeRecoveryCredit> credits) throws RocksDBException {
@@ -2320,6 +2467,9 @@ public final class ReplicatedRangeStore {
             } finally { releaseUse(); }
         }
         public ParticipantVote preparationVote(PreparedParticipant.Preparation expected) throws RocksDBException {
+            acquireUse();
+            try (var options=new ReadOptions().setSnapshot(snapshot)) { var retirement=readParticipantFence(identity(expected),options,position); if (retirement!=null) return ParticipantVote.retired(retirement); }
+            finally { releaseUse(); }
             var prepared=preparedParticipant(expected.transactionId()); if (prepared!=null) { if (!prepared.preparation().equals(expected)) throw new IllegalArgumentException("Prepared snapshot payload changed"); return ParticipantVote.prepared(prepared.position()); }
             acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) {
@@ -2333,7 +2483,7 @@ public final class ReplicatedRangeStore {
             try (var options=new ReadOptions().setSnapshot(snapshot)) {
                 byte[] bytes=db.get(state,options,preparedKey(transaction)); if (bytes==null) return null;
                 var record=PreparedParticipant.decode(bytes);
-                if (!record.preparation().transactionId().equals(transaction) || position==null || record.position().index()>position.index() || record.position().term()>position.term()) throw new IllegalStateException("Prepared receipt differs from snapshot cut");
+                if (!record.preparation().transactionId().equals(transaction) || position==null || record.position().index()>position.index() || record.position().term()>position.term() || record.position().index()==position.index() && record.position().term()!=position.term()) throw new IllegalStateException("Prepared receipt differs from snapshot cut");
                 return record;
             } finally { releaseUse(); }
         }

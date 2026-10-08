@@ -7,11 +7,19 @@ import java.util.*;
 
 /** Current canonical participant log record. PREPARE is separate from the accepted business effects it stages. */
 public final class RatisParticipantRecord {
-    private static final int MAGIC=0x52535054, PREPARE=1, FINALIZE=2, PREPARE_NEGATIVE=3;
+    private static final int MAGIC=0x52535054, PREPARE=1, FINALIZE=2, PREPARE_NEGATIVE=3, RETIRE=4;
     private RatisParticipantRecord() {}
     public static boolean isParticipant(byte[] bytes) { return bytes.length>=4 && ByteBuffer.wrap(bytes).getInt()==MAGIC; }
     public static boolean isNegative(byte[] bytes) { return bytes.length>=8 && ByteBuffer.wrap(bytes).getInt()==MAGIC && ByteBuffer.wrap(bytes).getInt(4)==PREPARE_NEGATIVE; }
     public static boolean isFinalization(byte[] bytes) { return bytes.length>=8 && ByteBuffer.wrap(bytes).getInt()==MAGIC && ByteBuffer.wrap(bytes).getInt(4)==FINALIZE; }
+    public static boolean isRetirement(byte[] bytes) { return bytes.length>=8 && ByteBuffer.wrap(bytes).getInt()==MAGIC && ByteBuffer.wrap(bytes).getInt(4)==RETIRE; }
+    public static byte[] encode(ParticipantRetirement retirement) { byte[] body=retirement.encode(); return ByteBuffer.allocate(8+body.length).putInt(MAGIC).putInt(RETIRE).put(body).array(); }
+    public static ParticipantRetirement decodeRetirement(byte[] bytes) {
+        if (!isRetirement(bytes) || bytes.length>8+ParticipantRetirement.MAX_BYTES) throw new IllegalArgumentException("Invalid retirement record");
+        return ParticipantRetirement.decode(Arrays.copyOfRange(bytes,8,bytes.length));
+    }
+    public static byte[] digest(ParticipantRetirement retirement) { return hash(encode(retirement)); }
+    public static OperationId operation(ParticipantRetirement retirement) { return new OperationId(UUID.nameUUIDFromBytes(digest(retirement)),retirement.identity().business().epoch(),0); }
     public static byte[] encode(ParticipantFinalization finalization) { byte[] body=finalization.encode(); return ByteBuffer.allocate(8+body.length).putInt(MAGIC).putInt(FINALIZE).put(body).array(); }
     public static ParticipantFinalization decodeFinalization(byte[] bytes) {
         if (bytes.length<8 || bytes.length>8+ParticipantFinalization.MAX_BYTES) throw new IllegalArgumentException("Invalid FINALIZE record size");
@@ -19,7 +27,7 @@ public final class RatisParticipantRecord {
         byte[] body=new byte[b.remaining()]; b.get(body); return ParticipantFinalization.decode(body);
     }
     public static byte[] digest(ParticipantFinalization finalization) { return hash(encode(finalization)); }
-    public static ApplyPosition finalizationResult(byte[] bytes) { var vote=result(bytes); if (!vote.prepared()) throw new IllegalArgumentException("FINALIZE requires an applied receipt"); return vote.position(); }
+    public static ParticipantFinalizationResult finalizationResult(byte[] bytes) { var vote=result(bytes); if (vote.retired()) return ParticipantFinalizationResult.retired(vote.retirementProof()); if (!vote.prepared()) throw new IllegalArgumentException("FINALIZE requires an applied receipt"); return ParticipantFinalizationResult.applied(vote.position()); }
     public static byte[] encode(PreparedParticipant.Preparation preparation) { return encode(preparation,false); }
     public static byte[] encode(PreparedParticipant.Preparation preparation,boolean negative) {
         byte[] body=preparation.encode(); return ByteBuffer.allocate(8+body.length).putInt(MAGIC).putInt(negative ? PREPARE_NEGATIVE : PREPARE).put(body).array();
@@ -32,10 +40,19 @@ public final class RatisParticipantRecord {
     public static byte[] digest(PreparedParticipant.Preparation preparation) { return digest(preparation,false); }
     public static byte[] digest(PreparedParticipant.Preparation preparation,boolean negative) { return hash(encode(preparation,negative)); }
     private static byte[] hash(byte[] bytes) { try { return MessageDigest.getInstance("SHA-256").digest(bytes); } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); } }
+    public static byte[] result(ParticipantFinalizationResult result) { return result.retired() ? result(ParticipantVote.retired(result.retirement())) : result(result.position()); }
     public static byte[] result(ApplyPosition position) { return result(ParticipantVote.prepared(position)); }
-    public static byte[] result(ParticipantVote vote) { if (!vote.prepared()) return new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode(); var position=vote.position(); return new CommandResult(CommandResult.Status.SUCCESS,List.of(ByteBuffer.allocate(16).putLong(position.term()).putLong(position.index()).array())).encode(); }
+    public static byte[] result(ParticipantVote vote) {
+        if (vote.retired()) { byte[] proof=vote.retirementProof().encode(); return ByteBuffer.allocate(1+proof.length).put((byte)2).put(proof).array(); }
+        if (!vote.prepared()) return new byte[]{0};
+        return ByteBuffer.allocate(17).put((byte)1).putLong(vote.position().term()).putLong(vote.position().index()).array();
+    }
     public static ParticipantVote result(byte[] bytes) {
-        var result=CommandResult.decode(bytes); if (result.status()==CommandResult.Status.CONFLICT && result.valueCount()==0) return ParticipantVote.negative(); if (result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=1 || result.value(0)==null || result.value(0).length!=16) throw new IllegalArgumentException("Invalid prepared vote receipt");
-        var b=ByteBuffer.wrap(result.value(0)); var position=new ApplyPosition(b.getLong(),b.getLong()); if (position.term()<=0 || position.index()<=0) throw new IllegalArgumentException("Invalid prepared position"); return ParticipantVote.prepared(position);
+        Objects.requireNonNull(bytes); if (bytes.length<1 || bytes.length>1+ParticipantFenceProof.MAX_BYTES) throw new IllegalArgumentException("Invalid participant reply size");
+        var b=ByteBuffer.wrap(bytes); int kind=b.get()&255;
+        if (kind==0 && !b.hasRemaining()) return ParticipantVote.negative();
+        if (kind==1 && b.remaining()==16) return ParticipantVote.prepared(new ApplyPosition(b.getLong(),b.getLong()));
+        if (kind!=2) throw new IllegalArgumentException("Invalid participant reply kind/size");
+        byte[] proof=new byte[b.remaining()]; b.get(proof); return ParticipantVote.retired(ParticipantFenceProof.decode(proof));
     }
 }

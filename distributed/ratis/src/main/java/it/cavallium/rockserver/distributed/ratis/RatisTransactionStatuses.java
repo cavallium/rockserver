@@ -56,6 +56,11 @@ public final class RatisTransactionStatuses {
         if (proof!=null) recovery.requireOutcome(proof);
         return routed.restoreHomeRecovery(recovery,command.descriptor());
     }
+    public RatisRoutedClient.PreparedHomeRecoveryOperation prepareFencedRecovery(OperationId operation,TransactionStatus expected,TransactionStatus next,ParticipantFenceProof proof) {
+        var command=prepare(operation,expected,next);
+        var recovery=new HomeRecovery(HomeRecovery.Action.ACK,command.command(),HomeRecovery.Proof.from(proof)); recovery.requireFence(proof);
+        return routed.restoreHomeRecovery(recovery,command.descriptor());
+    }
     public RatisRoutedClient.PreparedHomeRecoveryOperation restoreRecovery(HomeRecovery recovery,RangeDescriptor descriptor) {
         var operation=routed.restoreHomeRecovery(recovery,descriptor); validate(routed.restoreSessionCommand(recovery.command(),descriptor)); return operation;
     }

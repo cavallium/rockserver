@@ -83,7 +83,7 @@ Initial replication is three full voters across three independent node failure d
 
 ### Command and apply
 
-The canonical log envelope includes format version, group/epoch, operation identity, schema/operator digests, command kind, ordered logical mutations and any deterministic result-plan fields. The client/leader supplies timestamps, generated IDs and randomness as explicit data **before** consensus where needed. Request deadlines determine admission/cancellation, not whether an already-committed log command takes effect during replay.
+The single current canonical log envelope includes group/epoch, operation identity, schema/operator digests, command kind, ordered logical mutations and any deterministic result-plan fields. The client/leader supplies timestamps, generated IDs and randomness as explicit data **before** consensus where needed. Request deadlines determine admission/cancellation, not whether an already-committed log command takes effect during replay.
 
 For each group, define `C` = committed index, `A` = largest contiguous locally applied index, `D` = largest index covered by a durable installable snapshot. Always `D <= A <= C` for exposed committed state. Ratis configuration/no-op entries must also advance the adapter's contiguous accounting in the correct order.
 
@@ -92,7 +92,7 @@ Application of entry `(term,index)` is one native `WriteBatch` containing:
 1. all affected user-CF writes/merge operands/tombstones;
 2. corresponding durable receipt and returned outcome, if any;
 3. prepared/decision/lock metadata changes when applicable;
-4. this group's applied `(term,index)` and logical-state format version.
+4. this group's applied `(term,index)` and current logical-state metadata.
 
 Use RocksDB WAL enabled, `sync=false`. Do not call the existing ordinary `EmbeddedDB.put()` independently and then store the index: extract a small internal apply interface that can write the complete batch. Do not persist native transaction objects or Java callbacks in the log. There is one ordered apply owner per group; batches from independent groups can use shared pool group commit while preserving each group's order. Cross-group native co-batching is a storage optimization, never a new distributed atomicity promise.
 

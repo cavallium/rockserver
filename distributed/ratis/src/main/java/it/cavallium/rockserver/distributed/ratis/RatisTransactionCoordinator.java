@@ -15,7 +15,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
         @Override public void close() throws Exception { owner.close(); }
     }
     public enum Action {
-        RETRIED_HOME, REGISTRATION_ATTEMPTED, PREPARED, PREPARATION_REJECTED, VOTE_ATTEMPTED, COMMIT_ATTEMPTED,
+        RETRIED_HOME, REGISTRATION_ATTEMPTED, PREPARED, PREPARATION_REJECTED, PARTICIPANT_RETIRED, VOTE_ATTEMPTED, COMMIT_ATTEMPTED,
         ABORT_ATTEMPTED, FINALIZED, ACK_ATTEMPTED, VERIFIED, COMPLETE
     }
     /** CAS actions identify attempts; PREPARED/REJECTED identify durable votes. Completion never implies consumption. */
@@ -63,7 +63,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
         if (home.phase()!=TransactionStatus.Phase.PREPARING) {
             var step=terminal.stepTerminal(); return new Step(Action.valueOf(step.action().name()),step.participant(),step.complete());
         }
-        if (snapshot.participants().stream().anyMatch(p -> p.vote()!=null && !p.vote().prepared())) return decide(snapshot,TransactionStatus.Phase.ABORT);
+        if (snapshot.participants().stream().anyMatch(p -> p.retirementProof()!=null || p.vote()!=null && !p.vote().prepared())) return decide(snapshot,TransactionStatus.Phase.ABORT);
         boolean ready=true;
         for (var participant:home.participants()) {
             var vote=snapshot.participant(participant.groupId()).vote();
@@ -73,6 +73,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
         if (ready) return decide(snapshot,TransactionStatus.Phase.COMMIT);
         UUID group=nextIncomplete(snapshot);
         var progress=journal.resolveParticipant(group);
+        if (progress.retirementProof()!=null) return decide(journal.snapshot(),TransactionStatus.Phase.ABORT);
         var participant=home.participants().stream().filter(p -> p.groupId().equals(group)).findFirst().orElseThrow();
         if (participant.prepared()!=null) {
             var vote=progress.vote();
@@ -95,7 +96,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
             // Restore validates the original route; freeze additionally checks exact accepted business/control/registration.
             journal.freezePreparation(data.restoreParticipant(authorization.value(),progress.intent().route(),authorization.negative()));
             var vote=journal.executePreparation(group);
-            return result(vote.prepared() ? Action.PREPARED : Action.PREPARATION_REJECTED,group);
+            return result(vote.retired() ? Action.PARTICIPANT_RETIRED : vote.prepared() ? Action.PREPARED : Action.PREPARATION_REJECTED,group);
         } catch (IOException failure) { throw failure; }
         catch (Exception failure) { throw new IOException("Preparation authority failed",failure); }
     }
@@ -121,7 +122,8 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
     }
     private Step result(Action action,UUID group) throws IOException {
         var snapshot=journal.snapshot();
-        boolean complete=snapshot.observedHome()!=null && snapshot.observedHome().fullyFinalized() && snapshot.participants().stream().allMatch(p -> p.outcome()!=null);
+        boolean complete=snapshot.observedHome()!=null && snapshot.observedHome().fullyFinalized() && snapshot.participants().stream().allMatch(p -> p.outcome()!=null || p.retirementProof()!=null
+                && (snapshot.observedHome().phase()==TransactionStatus.Phase.ABORT || snapshot.observedHome().gcEligible()));
         return new Step(action,group,complete);
     }
     /** Pins, authority providers, journal and clients are borrowed. Only this policy's terminal helper is closed. */

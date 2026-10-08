@@ -82,7 +82,7 @@ class RatisFinalizationRpcTest {
             f.data.f.machine.preAppendTransaction(pending); pending.initLogEntry(1,++f.data.wire.index); f.data.f.machine.cancelTransaction(pending);
             f.data.routed.cancelFinalization(f.operation); assertEquals(1,f.data.f.machine.reservedFinalizationCount()); assertEquals(1,f.data.f.counter("protectedAdmissions"));
             var receipt=RatisParticipantRecord.finalizationResult(f.data.f.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray());
-            assertEquals(receipt,f.data.routed.executeFinalization(f.operation)); assertEquals(1,f.data.wire.index); f.released();
+            assertEquals(receipt.position(),f.data.routed.executeFinalization(f.operation)); assertEquals(1,f.data.wire.index); f.released();
         }
     }
     @Test void blockedHomeReadKeepsPreparingCapacityUntilActualReturnAndAllQueriesRequireDataAndFreshBarrier() throws Exception {

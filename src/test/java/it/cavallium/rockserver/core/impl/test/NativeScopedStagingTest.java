@@ -142,8 +142,8 @@ class NativeScopedStagingTest {
                             var preparation=new PreparedParticipant.Preparation(new UUID(0,13),1,new OperationId(new UUID(0,14),1,0),registration,accepted);
                             var vote=store.applyPrepared(new ApplyPosition(1,2),preparation); var decision=registration.prepared(group,accepted.payloadDigest(),vote.position()).decide(TransactionStatus.Phase.COMMIT);
                             var intent=new ParticipantFinalization(preparation.homeGroup(),1,group,new OperationId(new UUID(0,15),2,0),decision);
-                            var receipt=store.applyCommit(new ApplyPosition(2,3),intent); assertArrayEquals(stage.result().encode(),store.committedResult(registration.transactionId(),accepted.payloadDigest()));
-                            assertEquals(receipt,store.applyCommit(new ApplyPosition(2,4),intent));
+                            var receipt=NativeParticipantRetirementTest.appliedCommit(store,new ApplyPosition(2,3),intent); assertArrayEquals(stage.result().encode(),store.committedResult(registration.transactionId(),accepted.payloadDigest()));
+                            assertEquals(receipt,NativeParticipantRetirementTest.appliedCommit(store,new ApplyPosition(2,4),intent));
                         } else assertArrayEquals(stage.result().encode(),store.apply(new ApplyPosition(1,2),accepted));
                         try (var current=store.capture()) { assertEquals(expected,new String(current.get(column,key(1)),StandardCharsets.UTF_8)); }
                     }

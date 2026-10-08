@@ -54,6 +54,11 @@ public final class TransactionStatus {
         for (int i=0;i<participants.size();i++) if (!participants.get(i).sameDefinition(other.participants.get(i))) return false;
         return true;
     }
+    /** Canonical frozen definition, excluding votes and recovery progress. */
+    public TransactionStatus asInitial() {
+        return begin(clusterId,databaseId,domainId,transactionId,operation,schemaEpoch,schemaDigest,planDigest,
+                participants.stream().map(p -> new Participant(p.rangeId(),p.groupId(),p.rangeEpoch(),p.schemaDigest(),p.planDigest(),null,false)).toList());
+    }
     /** Stable chosen decision. Mutable recovery progress is not part of a participant's finalization identity. */
     public TransactionStatus terminalDecision() {
         if (phase==Phase.PREPARING) throw invalid("Home has no terminal decision");

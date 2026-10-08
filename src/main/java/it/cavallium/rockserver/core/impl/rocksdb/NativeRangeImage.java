@@ -404,7 +404,7 @@ public final class NativeRangeImage {
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x20).putLong(preparation.transactionId().getMostSignificantBits()).putLong(preparation.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !plan.groupId().equals(header.owner().groupId()) || plan.rangeEpoch()!=header.owner().epoch()
                                 || !Arrays.equals(plan.schemaDigest(),header.schema()) || !preparation.registration().domainId().equals(header.interval().domainId())
-                                || record.position().index()>header.position().index() || record.position().term()>header.position().term()) throw new IOException("Prepared image identity/cut differs");
+                                || record.position().index()>header.position().index() || record.position().term()>header.position().term() || record.position().index()==header.position().index() && record.position().term()!=header.position().term()) throw new IOException("Prepared image identity/cut differs");
                         for (var span:scope.spans()) {
                             byte[] lo=span.lowerInclusive(),hi=span.upperExclusive();
                             if (!header.interval().columns().contains(span.columnId()) || lower!=null && (lo==null || Arrays.compareUnsigned(lo,lower)<0)
@@ -423,7 +423,7 @@ public final class NativeRangeImage {
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x21).putLong(finalization.transactionId().getMostSignificantBits()).putLong(finalization.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !participant.groupId().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
                                 || !Arrays.equals(participant.schemaDigest(),header.schema()) || !finalization.decision().domainId().equals(header.interval().domainId())
-                                || abort.position().index()>header.position().index() || abort.position().term()>header.position().term()) throw new IOException("ABORT image identity/cut differs");
+                                || abort.position().index()>header.position().index() || abort.position().term()>header.position().term() || abort.position().index()==header.position().index() && abort.position().term()!=header.position().term()) throw new IOException("ABORT image identity/cut differs");
                         if (aborted.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("ABORT image count exceeded");
                         aborted.put(finalization.transactionId(),abort);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid ABORT image record",invalid); }
@@ -434,7 +434,7 @@ public final class NativeRangeImage {
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x22).putLong(finalization.transactionId().getMostSignificantBits()).putLong(finalization.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !participant.groupId().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
                                 || !Arrays.equals(participant.schemaDigest(),header.schema()) || !finalization.decision().domainId().equals(header.interval().domainId())
-                                || commit.position().index()>header.position().index() || commit.position().term()>header.position().term()) throw new IOException("COMMIT image identity/cut differs");
+                                || commit.position().index()>header.position().index() || commit.position().term()>header.position().term() || commit.position().index()==header.position().index() && commit.position().term()!=header.position().term()) throw new IOException("COMMIT image identity/cut differs");
                         if (committed.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("COMMIT image count exceeded"); committed.put(finalization.transactionId(),commit);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid COMMIT image record",invalid); }
                 }
@@ -445,7 +445,7 @@ public final class NativeRangeImage {
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x23).putLong(record.transactionId().getMostSignificantBits()).putLong(record.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !record.participantGroup().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
                                 || !Arrays.equals(participant.schemaDigest(),header.schema()) || !record.registration().domainId().equals(header.interval().domainId())
-                                || record.position().index()>header.position().index() || record.position().term()>header.position().term()) throw new IOException("Rejected image identity/cut differs");
+                                || record.position().index()>header.position().index() || record.position().term()>header.position().term() || record.position().index()==header.position().index() && record.position().term()!=header.position().term()) throw new IOException("Rejected image identity/cut differs");
                         if (rejected.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("Rejected image count exceeded");
                         rejected.put(record.transactionId(),record);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid rejected image record",invalid); }
@@ -598,7 +598,10 @@ public final class NativeRangeImage {
             long terminalOnly=0;
             for (var record:prepared) {
                 var abort=aborted.get(record.preparation().transactionId());
-                if (abort!=null) { try { abort.finalization().requirePrepared(record); } catch (IllegalArgumentException invalid) { throw new IOException("ABORT/preparation binding differs",invalid); } }
+                if (abort!=null) { try {
+                    abort.finalization().requirePrepared(record);
+                    if (abort.position().index()<=record.position().index() || abort.position().term()<record.position().term()) throw new IllegalArgumentException("ABORT precedes native preparation");
+                } catch (IllegalArgumentException invalid) { throw new IOException("ABORT/preparation binding differs",invalid); } }
                 else if (!committed.containsKey(record.preparation().transactionId())) for (var other:prepared) if (other!=record && !committed.containsKey(other.preparation().transactionId()) && !aborted.containsKey(other.preparation().transactionId()) && other.preparation().scope().intersects(record.preparation().scope())) throw new IOException("Active prepared image scopes overlap");
             }
             for (var abort:aborted.values()) {

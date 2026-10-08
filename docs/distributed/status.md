@@ -351,7 +351,19 @@ ABORT and rejection-only transactions reserve the same combined allowance, count
 once even after ABORT follows rejection. These capacities
 are separate from ordinary user-receipt GC and are not donated by lease expiration,
 fencing or lock release. Raft PREPARE admission reserves the bounds before append;
-native apply also checks them. Retained terminal records still have no GC path.
+native apply also checks them. Participant retirement now reclaims the complete
+prepared/rejected/COMMIT/ABORT family atomically, including its capacity charge,
+after an exact consumed HOME decision and a strictly newer DATA business-epoch
+floor. Remote retirement uses the fixed HOME reader and protected admission, with
+at most 16 shared control slots and 1 MiB of retained retirement input per group.
+Retired retries return bound fenced-absence evidence rather than a fabricated vote,
+finalization position or business result; old pinned readers retain their original
+proofs. Unresolved positive preparations remain finalizable after business expiry.
+A never-prepared expired participant can ACK ABORT through fresh atomic DATA
+absence/floor evidence. Journals persist that evidence separately from native votes
+and receipts, and explicit client consumption remains required. Missing consumed
+COMMIT results raise a typed outcome-expired error. HOME records, recovery receipts,
+snapshot gates, pin tombstones and client journals still need their own GC paths.
 
 The native snapshot-gate kernel freezes the complete participant set, directory
 and schema identities, local physical scopes, and distinct install/release controls.

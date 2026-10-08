@@ -10,6 +10,7 @@ public record ParticipantOutcome(ParticipantFinalization finalization,ApplyPosit
     public ParticipantOutcome {
         Objects.requireNonNull(finalization); Objects.requireNonNull(position);
         if (position.term()<=0 || position.index()<=0) throw new IllegalArgumentException("Invalid finalization position");
+        if (vote!=null && vote.retired()) throw new IllegalArgumentException("Retirement is not a native terminal vote");
         var homeVote=finalization.participant().prepared();
         if (vote!=null && vote.prepared() && (vote.position().index()>=position.index() || vote.position().term()>position.term()
                 || homeVote!=null && !homeVote.equals(vote.position()))) throw new IllegalArgumentException("Finalization vote/cut differs");

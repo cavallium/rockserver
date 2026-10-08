@@ -34,9 +34,10 @@ public final class RatisParticipantRecovery implements AutoCloseable {
             return transition(snapshot,home.decide(TransactionStatus.Phase.ABORT),Action.ABORT_ATTEMPTED);
         }
         UUID group=snapshot.participantRoute().groupId();
-        if (snapshot.outcome()==null) {
+        if (snapshot.outcome()==null && snapshot.retirementProof()==null) {
             if (journal.resolveParticipant()!=null) return result(Action.VERIFIED);
             snapshot=journal.snapshot();
+            if (snapshot.retirementProof()!=null) return result(Action.VERIFIED);
             // A forced append receipt only needs native proof lookup; it must not require new write authority.
             if (snapshot.finalizationReceipt()!=null) { journal.executeFinalization(); return result(Action.VERIFIED); }
             var value=new ParticipantFinalization(snapshot.homeRoute().groupId(),snapshot.homeRoute().rangeEpoch(),group,snapshot.finalizeControl(),home);
@@ -51,7 +52,7 @@ public final class RatisParticipantRecovery implements AutoCloseable {
     }
     private Step result(Action action) throws IOException {
         var snapshot=journal.snapshot(); var home=snapshot.observedHome(); UUID group=snapshot.participantRoute().groupId();
-        return new Step(action,snapshot.outcome()!=null && home.phase()!=TransactionStatus.Phase.PREPARING && home.participants().stream().filter(p -> p.groupId().equals(group)).findFirst().orElseThrow().finalized());
+        return new Step(action,(snapshot.outcome()!=null || snapshot.retirementProof()!=null && home.gcEligible()) && home.phase()!=TransactionStatus.Phase.PREPARING && home.participants().stream().filter(p -> p.groupId().equals(group)).findFirst().orElseThrow().finalized());
     }
     @Override public synchronized void close() throws IOException { if (active) throw new IOException("Participant recovery step active; ownership retained"); closed=true; }
 }

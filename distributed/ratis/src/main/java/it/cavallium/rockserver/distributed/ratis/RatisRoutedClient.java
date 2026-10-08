@@ -332,14 +332,13 @@ public final class RatisRoutedClient implements AutoCloseable {
         Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
         try { authorizeFinalizationCall(operation); } finally { endCall(); }
     }
-    private ApplyPosition authorizeFinalizationCall(PreparedFinalizationOperation operation) throws IOException {
+    private ParticipantFinalizationResult authorizeFinalizationCall(PreparedFinalizationOperation operation) throws IOException {
         try {
             var input=ByteBuffer.wrap(transactionReply(operation.descriptor,ScopedTransactionRpc.FINALIZATION_PREPARE,operation.bytes,true));
-            byte[] digest=ScopedTransactionRpc.blob(input,32,false),bytes=ScopedTransactionRpc.blob(input,16,true);
+            byte[] digest=ScopedTransactionRpc.blob(input,32,false),bytes=ScopedTransactionRpc.blob(input,ParticipantFinalizationResult.MAX_BYTES,true);
             if (!Arrays.equals(digest,RatisParticipantRecord.digest(operation.finalization)) || input.hasRemaining()) throw new IllegalArgumentException("Finalization authority changed its frozen request");
             if (bytes==null) return null;
-            if (bytes.length!=16) throw new IllegalArgumentException("Invalid retained finalization position");
-            var position=ByteBuffer.wrap(bytes); var result=new ApplyPosition(position.getLong(),position.getLong()); requireFinalizationPosition(operation,result); return result;
+            var result=ParticipantFinalizationResult.decode(bytes); requireFinalizationResult(operation,result); return result;
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid participant finalization authority reply",malformed); }
     }
     /** Retained proof finishes an exact retry without another append or another HOME read. */
@@ -348,9 +347,16 @@ public final class RatisRoutedClient implements AutoCloseable {
         try {
             var retained=authorizeFinalizationCall(operation);
             var position=retained==null ? RatisParticipantRecord.finalizationResult(transport.participant(operation.descriptor,operation.bytes)) : retained;
-            requireFinalizationPosition(operation,position); return position;
+            requireFinalizationResult(operation,position);
+            if (position.retired()) throw new RatisParticipantRetiredException(position.retirement()); return position.position();
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid finalization applied reply",malformed); }
         finally { endCall(); }
+    }
+    private static void requireFinalizationResult(PreparedFinalizationOperation operation,ParticipantFinalizationResult result) {
+        if (result.retired()) {
+            var f=operation.finalization;
+            if (!result.retirement().identity().equals(new ParticipantIdentity(f.homeGroup(),f.homeEpoch(),f.participantGroup(),f.decision()))) throw new IllegalArgumentException("Retired finalization identity changed");
+        } else requireFinalizationPosition(operation,result.position());
     }
     private static void requireFinalizationPosition(PreparedFinalizationOperation operation,ApplyPosition position) {
         var vote=operation.finalization.participant().prepared();
@@ -389,6 +395,10 @@ public final class RatisRoutedClient implements AutoCloseable {
         java.util.Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
         try {
             var vote=RatisParticipantRecord.result(transport.participant(operation.descriptor,operation.bytes));
+            if (vote.retired()) {
+                var p=operation.preparation;
+                if (!vote.retirementProof().identity().equals(new ParticipantIdentity(p.homeGroup(),p.homeEpoch(),p.business().groupId(),p.registration()))) throw new IllegalArgumentException("Retired PREPARE identity changed");
+            }
             if (operation.negative && vote.prepared()) throw new IllegalArgumentException("Negative PREPARE returned a positive vote"); return vote;
         }
         catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant vote reply",invalid); }
@@ -418,6 +428,40 @@ public final class RatisRoutedClient implements AutoCloseable {
                     || !Arrays.equals(participant.schemaDigest(),observed.schemaDigest()) || !decision.clusterId().equals(observed.clusterId()) || !decision.databaseId().equals(observed.databaseId()) || !decision.domainId().equals(observed.domainId())) throw new IllegalArgumentException("Participant outcome route/identity changed");
             return outcome;
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant outcome reply",invalid); }
+    }
+    /** Reclaim only the exact terminal family after qualified server-side consumed HOME validation. */
+    public void retireParticipant(ParticipantRetirement retirement) throws IOException {
+        Objects.requireNonNull(retirement); var route=prepareFinalization(retirement.finalization()); beginCall();
+        try {
+            byte[] record=RatisParticipantRecord.encode(retirement),digest=RatisParticipantRecord.digest(retirement);
+            byte[] reply=transactionReply(route.descriptor,ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE,record,true);
+            if (reply.length!=33 || !Arrays.equals(Arrays.copyOf(reply,32),digest) || (reply[32]&255)>1) throw new IOException("Invalid participant retirement authority reply");
+            if (reply[32]==1) return;
+            var result=CommandResult.decode(transport.participant(route.descriptor,record));
+            if (result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=0) throw new IOException("Invalid participant retirement applied reply");
+        } finally { endCall(); }
+    }
+    public void cancelParticipantRetirement(ParticipantRetirement retirement) throws IOException {
+        Objects.requireNonNull(retirement); var route=prepareFinalization(retirement.finalization()); beginCall();
+        try {
+            byte[] reply=transactionReply(route.descriptor,ScopedTransactionRpc.PARTICIPANT_RETIRE_CANCEL,RatisParticipantRecord.encode(retirement),true);
+            if (reply.length!=33 || !Arrays.equals(Arrays.copyOf(reply,32),RatisParticipantRecord.digest(retirement)) || reply[32]!=0) throw new IOException("Invalid participant retirement cancellation reply");
+        } finally { endCall(); }
+    }
+    /** A single fresh native cut binds absence and the durable aggregate business fence. */
+    public ParticipantFenceProof participantFence(ParticipantIdentity identity) throws IOException {
+        Objects.requireNonNull(identity); var observed=current(); var participant=identity.participant();
+        var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(identity.participantGroup())).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route absent"));
+        if (!observed.clusterId().equals(identity.definition().clusterId()) || !observed.databaseId().equals(identity.definition().databaseId()) || !observed.domainId().equals(identity.definition().domainId())
+                || !descriptor.rangeId().equals(participant.rangeId()) || descriptor.rangeEpoch()!=participant.rangeEpoch() || !Arrays.equals(observed.schemaDigest(),participant.schemaDigest())) throw new IllegalArgumentException("Participant fence route differs");
+        try {
+            var input=ByteBuffer.wrap(transaction(descriptor,ScopedTransactionRpc.PARTICIPANT_FENCE,identity.encode(),true));
+            if (input.remaining()<36) throw new IllegalArgumentException("Truncated participant fence reply"); byte[] digest=new byte[32]; input.get(digest);
+            byte[] bytes=ScopedTransactionRpc.blob(input,ParticipantFenceProof.MAX_BYTES,true);
+            if (!Arrays.equals(digest,identity.digest()) || input.hasRemaining()) throw new IllegalArgumentException("Participant fence binding changed");
+            if (bytes==null) return null; var proof=ParticipantFenceProof.decode(bytes);
+            if (!proof.identity().equals(identity)) throw new IllegalArgumentException("Participant fence identity changed"); return proof;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid participant fence reply",malformed); }
     }
     private final RangeDirectory identity;
     private final Transport transport;

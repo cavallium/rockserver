@@ -48,6 +48,79 @@ class RatisTransactionRecoveryTest {
             f.reopen(); assertNotNull(f.journal.snapshot().participant(f.data.f.groupId).outcome());
         }
     }
+    @Test void neverPreparedExpiredBusinessAbortsAndAcknowledgesWithDurableFenceOnly() throws Exception {
+        try (var f=new Fixture("expired-never-prepared")) {
+            f.journal.executeHome(); f.pin.close();
+            var preparation=new PreparedParticipant.Preparation(f.home.f.groupId,1,f.plan.intent().prepareControl(),f.plan.initial(),f.plan.intent().acceptedBusiness());
+            var original=f.data.routed.restoreParticipant(preparation,f.plan.intent().route());
+            var floor=DistributedCommand.advanceSessionEpochFloor(f.data.f.groupId,1,new byte[32],new OperationId(f.data.f.admin,2,0),2);
+            f.data.wire.command(f.plan.intent().route(),floor); f.reopen();
+            try (var recovery=f.recovery()) { drain(f,recovery); }
+            var progress=f.journal.snapshot().participant(f.data.f.groupId);
+            assertNotNull(progress.retirementProof()); assertNull(progress.vote()); assertNull(progress.outcome()); assertNull(progress.finalizationReceipt());
+            assertTrue(f.journal.snapshot().observedHome().fullyFinalized()); assertFalse(f.journal.snapshot().observedHome().consumed());
+            assertEquals(CommandResult.Status.CONFLICT,f.journal.result().status());
+            assertTrue(f.journal.snapshot().pendingRecovery().recovery().proof().fenced());
+            assertNull(f.data.routed.finalizedParticipant(f.data.f.groupId,f.plan.initial().transactionId()));
+            f.reopen(); long writes=f.home.wire.index+f.data.wire.index;
+            try (var recovery=f.recovery()) { assertTrue(recovery.step().complete()); }
+            assertEquals(writes,f.home.wire.index+f.data.wire.index);
+            var acknowledged=f.journal.snapshot().observedHome();
+            f.journal.queueHome(f.home.statuses.prepare(next(f.journal.snapshot().lastHome()),acknowledged,acknowledged.consume())); f.journal.executeHome();
+            f.reopen(); assertTrue(f.journal.snapshot().observedHome().gcEligible()); assertEquals(CommandResult.Status.CONFLICT,f.journal.result().status());
+            var retired=f.data.routed.executeParticipant(original); assertTrue(retired.retired());
+            assertNull(f.data.routed.preparedParticipant(f.data.f.groupId,f.plan.initial().transactionId()));
+            assertNull(f.data.routed.finalizedParticipant(f.data.f.groupId,f.plan.initial().transactionId()));
+            assertNull(f.data.routed.read(f.data.f.column,new byte[]{2}));
+        }
+    }
+    @Test void consumedCommitRetirementReopensBothJournalsWithoutInventingNativeResults() throws Exception {
+        try (var f=new Fixture("consumed-retirement")) {
+            var commit=f.commit(false); var transaction=f.plan.initial().transactionId();
+            var localPath=root.resolve("consumed-local.bin");
+            try (var local=RatisDurableParticipantRecovery.create(localPath,f.home.statuses,f.data.routed,
+                    f.data.routed.preparedParticipant(f.data.f.groupId,transaction),f.plan.intent().route())) {
+                var foreign=new OperationId(new UUID(0,1991),0,0);
+                var finalization=new ParticipantFinalization(f.home.f.groupId,1,f.data.f.groupId,foreign,commit);
+                var frozen=f.data.routed.restoreFinalization(finalization,f.plan.intent().route());
+                var position=f.data.routed.executeFinalization(frozen);
+                var nativeOutcome=f.data.routed.finalizedParticipant(f.data.f.groupId,transaction);
+                var acknowledged=commit.finalized(f.data.f.groupId);
+                f.home.statuses.executeRecovery(f.home.statuses.prepareRecovery(new OperationId(new UUID(0,1992),0,0),commit,acknowledged,nativeOutcome));
+                var consumed=acknowledged.consume();
+                f.home.statuses.execute(f.home.statuses.prepare(new OperationId(new UUID(0,1993),2,0),acknowledged,consumed));
+                f.data.wire.command(f.plan.intent().route(),DistributedCommand.advanceSessionEpochFloor(f.data.f.groupId,1,new byte[32],new OperationId(f.data.f.admin,2,0),2));
+                f.data.f.store.applyParticipantRetirement(new ApplyPosition(1,++f.data.wire.index),new ParticipantRetirement(finalization,position,consumed));
+                assertNull(f.data.routed.preparedParticipant(f.data.f.groupId,transaction)); assertNull(f.data.routed.finalizedParticipant(f.data.f.groupId,transaction));
+                assertThrows(RatisParticipantRetiredException.class,() -> f.data.routed.executeFinalization(frozen));
+            }
+            f.reopen(); long writes=f.home.wire.index+f.data.wire.index;
+            try (var recovery=f.recovery()) { assertTrue(recovery.step().complete()); }
+            var progress=f.journal.snapshot().participant(f.data.f.groupId);
+            assertNotNull(progress.retirementProof()); assertNull(progress.outcome()); assertNull(progress.finalizationReceipt());
+            assertThrows(RatisTransactionOutcomeExpiredException.class,f.journal::result);
+            f.reopen(); assertThrows(RatisTransactionOutcomeExpiredException.class,f.journal::result);
+            try (var local=RatisDurableParticipantRecovery.reopen(localPath,f.home.statuses,f.data.routed);
+                    var recovery=new RatisParticipantRecovery(local,f.home.statuses,f.data.routed,false)) {
+                assertTrue(recovery.step().complete()); assertNotNull(local.snapshot().retirementProof()); assertNull(local.snapshot().outcome()); assertNull(local.snapshot().finalizationReceipt());
+            }
+            try (var local=RatisDurableParticipantRecovery.reopen(localPath,f.home.statuses,f.data.routed);
+                    var recovery=new RatisParticipantRecovery(local,f.home.statuses,f.data.routed,false)) { assertTrue(recovery.step().complete()); }
+            assertEquals(writes,f.home.wire.index+f.data.wire.index); assertArrayEquals(new byte[]{7},f.data.routed.read(f.data.f.column,new byte[]{2}));
+        }
+    }
+    @Test void cachedNativeCommitResultSurvivesAuthorizedRetirement() throws Exception {
+        try (var f=new Fixture("cached-consumed-retirement")) {
+            f.commit(false); try (var recovery=f.recovery()) { drain(f,recovery); }
+            var outcome=f.journal.snapshot().participant(f.data.f.groupId).outcome(); var expected=f.journal.result().encode();
+            var home=f.home.statuses.read(f.plan.initial().transactionId()); var consumed=home.consume();
+            f.home.statuses.execute(f.home.statuses.prepare(new OperationId(new UUID(0,1994),2,0),home,consumed));
+            f.data.wire.command(f.plan.intent().route(),DistributedCommand.advanceSessionEpochFloor(f.data.f.groupId,1,new byte[32],new OperationId(f.data.f.admin,2,0),2));
+            f.data.f.store.applyParticipantRetirement(new ApplyPosition(1,++f.data.wire.index),new ParticipantRetirement(outcome.finalization(),outcome.position(),consumed));
+            f.reopen(); try (var recovery=f.recovery()) { assertTrue(recovery.step().complete()); }
+            assertEquals(outcome,f.journal.snapshot().participant(f.data.f.groupId).outcome()); assertArrayEquals(expected,f.journal.result().encode());
+        }
+    }
     @Test void abandonedReadyPrepareDoesNotLeaveAVolatileScopeAfterRecoveredAbort() throws Exception {
         try (var f=new Fixture("ready")) {
             f.journal.executeHome();

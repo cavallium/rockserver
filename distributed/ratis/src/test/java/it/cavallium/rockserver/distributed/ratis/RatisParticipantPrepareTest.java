@@ -43,6 +43,11 @@ class RatisParticipantPrepareTest {
                 if (home) {
                     machine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value) -> RatisTransactionStatuses.validateRecord(cluster,database,key,value));
                     machine.homeRecoveryReservations(cluster,database,ownedInterval.columns().iterator().next());
+                    machine.homeRecoveryFences(identity -> {
+                        var node=nodes.get(identity.participantGroup());
+                        if (node==null) throw new IOException("Unconfigured controlled DATA fence group");
+                        return node.routed.participantFence(identity);
+                    });
                     machine.homeRecoveryProofs(recovery -> {
                         var node=nodes.get(recovery.proof().participant());
                         if (node==null) throw new IOException("Unconfigured controlled DATA proof group");
@@ -187,7 +192,7 @@ class RatisParticipantPrepareTest {
                 home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,2),status,decision));
                 var finalization=home.statuses.readFinalization(registration.transactionId(),data.f.groupId,new OperationId(new UUID(0,778),3,0));
                 var finalPosition=new ApplyPosition(1,++data.wire.index);
-                if (mode==0) data.f.store.applyCommit(finalPosition,finalization); else data.f.store.applyAbort(finalPosition,finalization);
+                data.f.store.applyFinalization(finalPosition,finalization);
                 var outcome=data.routed.finalizedParticipant(data.f.groupId,registration.transactionId()); assertEquals(finalization,outcome.finalization()); assertEquals(finalPosition,outcome.position());
                 if (mode==0) { assertArrayEquals(plan.preparation().business().acceptance().result(),outcome.result()); assertArrayEquals(new byte[]{7},data.routed.read(data.f.column,new byte[]{2})); }
                 else { assertNull(outcome.result()); assertNull(data.routed.read(data.f.column,new byte[]{2})); }
@@ -208,7 +213,7 @@ class RatisParticipantPrepareTest {
         try (var home=new Node("invalid-home",true); var data=new Node("invalid-data",false); var pin=data.f.store.captureTracked(scope(data,1,4))) {
             var business=data.f.put(2); var registration=register(home,data,pin,business,0); var decision=registration.decide(TransactionStatus.Phase.ABORT);
             home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,1),registration,decision));
-            var finalization=home.statuses.readFinalization(registration.transactionId(),data.f.groupId,new OperationId(new UUID(0,779),2,0)); data.f.store.applyAbort(new ApplyPosition(1,1),finalization); data.wire.index=1;
+            var finalization=home.statuses.readFinalization(registration.transactionId(),data.f.groupId,new OperationId(new UUID(0,779),2,0)); data.f.store.applyFinalization(new ApplyPosition(1,1),finalization); data.wire.index=1;
             var outcome=data.f.store.finalizedParticipant(registration.transactionId()); var trailing=new java.util.concurrent.atomic.AtomicBoolean();
             var transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException { return data.wire.read(route,column,key); }
@@ -229,7 +234,7 @@ class RatisParticipantPrepareTest {
         assertEquals(ParticipantVote.prepared(new ApplyPosition(1,1)),RatisParticipantRecord.result(RatisParticipantRecord.result(new ApplyPosition(1,1))));
         for (var status:List.of(CommandResult.Status.SESSION_EXPIRED,CommandResult.Status.RESULT_TOO_LARGE)) assertThrows(IllegalArgumentException.class,() -> RatisParticipantRecord.result(new CommandResult(status,List.of()).encode()));
         assertThrows(IllegalArgumentException.class,() -> RatisParticipantRecord.result(new CommandResult(CommandResult.Status.CONFLICT,List.of(new byte[]{1})).encode()));
-        assertThrows(IllegalArgumentException.class,() -> new ParticipantVote(false,new ApplyPosition(1,1)));
+        assertThrows(IllegalArgumentException.class,() -> new ParticipantVote(ParticipantVote.Kind.REJECTED,new ApplyPosition(1,1),null));
     }
     @Test void abortFenceBeforeAdmittedPrepareProducesStableNegativeVoteAndSettlesOwnership() throws Exception {
         try (var home=new Node("abort-home",true); var data=new Node("abort-data",false); var pin=data.f.store.captureTracked(scope(data,1,4))) {
@@ -238,7 +243,7 @@ class RatisParticipantPrepareTest {
                 var pending=data.wire.propose(plan.bytes()); assertNull(pending.getException()); data.f.machine.preAppendTransaction(pending);
                 var abort=registration.decide(TransactionStatus.Phase.ABORT); home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,1),registration,abort));
                 var intent=home.statuses.readFinalization(registration.transactionId(),data.f.groupId,new OperationId(new UUID(0,777),2,0));
-                data.f.store.applyAbort(new ApplyPosition(1,1),intent); data.wire.index=1; pending.initLogEntry(1,2);
+                data.f.store.applyFinalization(new ApplyPosition(1,1),intent); data.wire.index=1; pending.initLogEntry(1,2);
                 assertEquals(ParticipantVote.negative(),RatisParticipantRecord.result(data.f.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray())); data.wire.index=2; released(data);
                 var operation=data.routed.prepareParticipant(plan.preparation()); data.wire.lose=true;
                 assertThrows(IOException.class,() -> data.routed.executeParticipant(operation)); assertEquals(ParticipantVote.negative(),data.routed.executeParticipant(operation)); released(data);

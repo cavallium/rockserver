@@ -76,11 +76,11 @@ public final class RatisTransactionRecovery implements AutoCloseable {
         cursor=(cursor+1)%participants.size();
         var progress=snapshot.participant(group);
         if (progress.outcome()==null) progress=journal.resolveParticipant(group);
-        if (progress.outcome()==null) {
+        if (progress.outcome()==null && progress.retirementProof()==null) {
             var route=snapshot.pendingHome().descriptor();
             var value=new ParticipantFinalization(route.groupId(),route.rangeEpoch(),group,progress.intent().finalizeControl(),home);
             journal.freezeFinalization(data.restoreFinalization(value,progress.intent().route()));
-            journal.executeFinalization(group);
+            try { journal.executeFinalization(group); } catch (RatisParticipantRetiredException retired) { /* The journal forced the proof before exposure. */ }
             return result(Action.FINALIZED,group);
         }
         // A fresh query may accept another coordinator's winning proof without claiming this journal's RPC succeeded.
@@ -99,7 +99,8 @@ public final class RatisTransactionRecovery implements AutoCloseable {
     private Step result(Action action,UUID participant) throws IOException { return new Step(action,participant,complete(journal.snapshot())); }
     private static boolean complete(RatisDurableTransaction.Snapshot snapshot) {
         return snapshot.observedHome()!=null && snapshot.observedHome().fullyFinalized()
-                && snapshot.participants().stream().allMatch(p -> p.outcome()!=null);
+                && snapshot.participants().stream().allMatch(p -> p.outcome()!=null || p.retirementProof()!=null
+                        && (snapshot.observedHome().phase()==TransactionStatus.Phase.ABORT || snapshot.observedHome().gcEligible()));
     }
     /** Borrowed clients/journal remain open. Active RPC and file ownership must settle before close can succeed. */
     @Override public synchronized void close() throws IOException {

@@ -63,7 +63,7 @@ class NativeSnapshotGateTest {
             var prepared=f.store.preparedParticipant(prior.transactionId());
             var decision=commit ? prior.registration().prepared(outer.group,prior.business().payloadDigest(),prepared.position()).decide(TransactionStatus.Phase.COMMIT) : prior.registration().decide(TransactionStatus.Phase.ABORT);
             var finalization=new ParticipantFinalization(prior.homeGroup(),prior.homeEpoch(),outer.group,new OperationId(new UUID(0,602),2,0),decision);
-            if (commit) f.store.applyCommit(new ApplyPosition(2,4),finalization); else f.store.applyAbort(new ApplyPosition(2,4),finalization);
+            if (commit) NativeParticipantRetirementTest.appliedCommit(f.store,new ApplyPosition(2,4),finalization); else NativeParticipantRetirementTest.appliedAbort(f.store,new ApplyPosition(2,4),finalization);
             assertTrue(f.store.gateBlockers(fence).isEmpty());
             try (var pin=f.store.captureGate(fence)) { assertArrayEquals(commit ? key(9) : null,pin.get(outer.fixed,key(1))); }
             f.store.applyGateRelease(new ApplyPosition(2,5),SnapshotFenceStatus.begin(fence).abort());
