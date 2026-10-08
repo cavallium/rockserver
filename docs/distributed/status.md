@@ -1472,3 +1472,51 @@ placement authorization, public CLI/service/schema/API adapters, topology and
 cross-domain recovery, full resource envelopes, transactions/2PC and other original
 architecture requirements remain open. Standalone runtime behavior is unchanged;
 the active goal is not complete.
+
+## Content-bound logical schemas and fixed-key session client
+
+`DistributedSchema` now gives each column an explicit stable numeric API alias,
+UUID and name, independent of a native CF handle. Its immutable content includes
+cluster/database/domain, schema epoch, the existing physical-key codec version,
+key/value shape and routing projection. Optional operator identities bind exact
+name/version/class/artifact SHA-256 and value/operand codec versions; describing
+an operator does not activate or qualify it on replicas. The bounded canonical
+binary encoding uses explicit hash-codec IDs and unsigned UUID order. Its cached
+SHA-256 must match the directory's schema digest. Schema lists, input collections,
+operator hashes and returned digest bytes cannot mutate the frozen content.
+Colocated prefixes must end at the same fixed component boundaries in every
+column and fit the directory projection limit.
+
+`RatisLogicalClient` resolves names and numeric aliases from that cached schema
+and encodes fixed logical `Keys` exactly as the existing standalone physical-key
+codec, including zero-key columns and negative signed IDs. Reads use routed
+linearizable point reads. Ordered same-range PUT/DELETE plans and equality
+conditions retain the existing session's frozen command identity, peer route and
+ACK. The caller explicitly consumes each terminal outcome before acknowledging;
+IOException retains the operation for exact retry. Null absence and present-empty
+key-only values remain distinct. Invalid/cross-range plans and unsupported bucket
+or operator operations fail before RPC or sequence allocation. Clients and
+schedulers remain borrowed; no per-key executor or per-operation catalogue lookup
+was added.
+
+This is a logical point API integration step, not full `RocksDBConnection`
+capability parity. The complete schema image still needs catalogue publication
+and coordinated bootstrap integration. Durable user-window recovery, bucket
+RMW, scoped transactions, range/cursor adapters and other architecture requirements
+remain open. Reconstructing an already used user grant is unsupported; restart
+requires a newly issued grant. A caller must separately own durable maintenance
+binding identities. Standalone APIs and storage encodings are unchanged.
+
+Validation: the established `test-compile surefire:test@default-test` selected gate
+passed 90 core, 19 patched-server and 95 adapter cases (204 total, zero failures,
+errors or skipped cases), exit zero:
+`/tmp/rockserver-logical-schema-full-gate.log`. Eight schema cases cover canonical
+round trips, deep ownership, hash/operator identity, every binary truncation,
+malformed bounds/UTF-8, aggregate size, projection limits and differential fixed-key
+encoding against `ColumnInstance.calculateKey`. Three logical-client cases cover
+native same-range cross-column writes/conditions, lost reply and exact retry,
+explicit consumption and receipt ACK, negative-key routing, key-only absence,
+deletes, saved conflicts, immutable inputs and pre-RPC rejection. Native test
+stores use the existing disk-directory fixture. These results establish local
+native/interface behavior; no server process, network/quorum, power-loss,
+performance-density or deployment acceptance was attempted.
