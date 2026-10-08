@@ -1,6 +1,9 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.RangeSessionControl;
+import it.cavallium.rockserver.core.common.distributed.SessionAuthority;
+import it.cavallium.rockserver.core.common.distributed.SessionEpochLedger;
 import it.cavallium.rockserver.core.common.distributed.ReceiptUsage;
 import it.cavallium.rockserver.core.common.distributed.ReceiptRetentionEstimate;
 import it.cavallium.rockserver.core.common.distributed.DistributedCommand;
@@ -208,8 +211,17 @@ public final class ReplicatedRangeStore {
                 && (upper == null || Arrays.compareUnsigned(key, upper) < 0);
     }
 
+    private volatile boolean sessionControlsEnabled;
+
+    /** Bootstrap must install catalogue proposal authority before enabling new controls. Persisted data enforcement is unconditional. */
+    public void enableSessionControls() {
+        enterNative(); applyLane.lock();
+        try { requireActive(); sessionControlsEnabled=true; }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+
     public void validate(DistributedCommand command) {
-        if (command.sessionControl()!=null) throw new UnsupportedOperationException("Replicated session binding is not activated");
+        if (command.sessionControl()!=null && !sessionControlsEnabled) throw new UnsupportedOperationException("Replicated session binding is not activated");
         if (closing) throw new IllegalStateException("Range admission is closed");
         requireActive();
         if (!groupId.equals(command.groupId()) || rangeEpoch != command.rangeEpoch()
@@ -266,6 +278,7 @@ public final class ReplicatedRangeStore {
             throws RocksDBException {
         Objects.requireNonNull(position);
         validate(command);
+        if (result!=null && command.sessionControl()!=null) throw new IllegalArgumentException("Session controls require ordered native evaluation");
         if (result != null && !command.predicates().isEmpty()) {
             throw new IllegalArgumentException("Precomputed results require a fully evaluated plan without live predicates");
         }
@@ -298,7 +311,14 @@ public final class ReplicatedRangeStore {
                 return original;
             }
             requireNext(position);
+            var sessionStatus = saved==null ? sessionDecision(command,currentFloor) : CommandResult.Status.SUCCESS;
+            boolean acceptMaintenance = sessionStatus==CommandResult.Status.SUCCESS;
+            long effectiveMinimum = acceptMaintenance ? command.minimumSessionEpoch() : -1;
+            long effectiveAcknowledgement = acceptMaintenance ? command.acknowledgedThrough() : -1;
             boolean installUserEffects = true;
+            if (saved==null && !acceptMaintenance) {
+                stableResult=new CommandResult(sessionStatus,List.of()).encode(); installUserEffects=false;
+            }
             if (saved == null && stableResult == null) {
                 var evaluated = evaluate(command);
                 stableResult = evaluated.encode();
@@ -317,18 +337,20 @@ public final class ReplicatedRangeStore {
                             case DELETE_RANGE -> batch.deleteRange(cf, mutation.key(), mutation.value());
                         }
                     }
-                    if (command.minimumSessionEpoch() > currentEpochFloor) {
-                        batch.put(state, epochFloorKey(), ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(command.minimumSessionEpoch()).array());
+                    if (acceptMaintenance && command.sessionControl()!=null) installSessionControl(batch,command.sessionControl());
+                    if (effectiveMinimum > currentEpochFloor) {
+                        batch.put(state, epochFloorKey(), ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(effectiveMinimum).array());
+                        batch.deleteRange(state, bindingPrefix(), bindingKey(effectiveMinimum));
                     }
-                    if (command.acknowledgedThrough() > currentFloor) {
-                        long floor = command.acknowledgedThrough();
+                    if (effectiveAcknowledgement > currentFloor) {
+                        long floor = effectiveAcknowledgement;
                         batch.put(state, sessionFloorKey(command.operationId()),
                                 ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(floor).array());
                         batch.deleteRange(receipts, receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), 0)),
                                 receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), floor + 1)));
                     }
                     byte[] encodedReceipt = encodeReceipt(digest, stableResult);
-                    updateReceiptUsage(batch, command, currentEpochFloor, currentFloor, encodedReceipt.length, position);
+                    updateReceiptUsage(batch, command, effectiveMinimum, effectiveAcknowledgement, currentEpochFloor, currentFloor, encodedReceipt.length, position);
                     batch.put(receipts, receiptKey, encodedReceipt);
                 }
                 batch.put(state, markerKey, encodePosition(position));
@@ -340,6 +362,73 @@ public final class ReplicatedRangeStore {
         } finally {
             applyLane.unlock();
         }
+    }
+
+    private byte[] authorityKey() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x13).array(); }
+    private byte[] bindingPrefix() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x14).array(); }
+    private byte[] bindingKey(long epoch) { return ByteBuffer.allocate(25).put(bindingPrefix()).putLong(epoch).array(); }
+    private SessionAuthority sessionAuthority() throws RocksDBException {
+        byte[] bytes=db.get(state,authorityKey());
+        if (bytes==null) return null;
+        var control=RangeSessionControl.decode(bytes);
+        if (control.binding()) throw new IllegalStateException("Invalid persisted session authority");
+        return control.authority();
+    }
+    private RangeSessionControl sessionBinding(long epoch) throws RocksDBException {
+        byte[] bytes=db.get(state,bindingKey(epoch));
+        if (bytes==null) return null;
+        var control=RangeSessionControl.decode(bytes);
+        if (!control.binding() || control.grant().epoch()!=epoch) throw new IllegalStateException("Invalid persisted session binding");
+        return control;
+    }
+    private SessionAuthority effectiveAuthority(RangeSessionControl control,SessionAuthority current) {
+        if (current==null) return control.authority();
+        try { control.authority().requireAtLeast(current); return control.authority(); }
+        catch (IllegalArgumentException older) {
+            if (!control.binding()) throw older;
+            current.requireAtLeast(control.authority()); return current;
+        }
+    }
+    private CommandResult.Status sessionDecision(DistributedCommand command,long acknowledged) throws RocksDBException {
+        var authority=sessionAuthority(); var control=command.sessionControl();
+        if (control!=null) {
+            final SessionAuthority effective;
+            try { effective=effectiveAuthority(control,authority); }
+            catch (IllegalArgumentException stale) { return CommandResult.Status.CONFLICT; }
+            if (control.binding()) {
+                if (!effective.permits(control.grant()) || control.grant().epoch()<minimumSessionEpoch(null)) return CommandResult.Status.SESSION_EXPIRED;
+                var previous=sessionBinding(control.grant().epoch());
+                if (previous!=null && (!previous.grant().equals(control.grant()) || previous.outstandingWindow()!=control.outstandingWindow())) return CommandResult.Status.CONFLICT;
+                if (previous==null) {
+                    int count=0;
+                    byte[] prefix=bindingPrefix(), end=prefixEnd(prefix);
+                    try (var lower=new org.rocksdb.Slice(prefix); var upper=new org.rocksdb.Slice(end);
+                            var options=new ReadOptions().setFillCache(false).setIterateLowerBound(lower).setIterateUpperBound(upper);
+                            var iterator=db.newIterator(state,options)) {
+                        iterator.seek(bindingKey(Math.max(minimumSessionEpoch(null),control.authority().minimumEpoch())));
+                        while (iterator.isValid()) {
+                            if (++count>=SessionEpochLedger.MAX_GRANTS) return CommandResult.Status.CONFLICT;
+                            iterator.next();
+                        }
+                        iterator.status();
+                    }
+                }
+            }
+            return CommandResult.Status.SUCCESS;
+        }
+        if (authority==null || command.minimumSessionEpoch()>=0) return CommandResult.Status.SUCCESS;
+        var id=command.operationId(); var binding=sessionBinding(id.epoch());
+        if (binding==null || !binding.grant().sessionId().equals(id.sessionId())) return CommandResult.Status.SESSION_EXPIRED;
+        boolean acknowledgementOnly=command.acknowledgedThrough()>=0 && command.mutations().isEmpty() && command.predicates().isEmpty();
+        if (!acknowledgementOnly && !authority.permits(binding.grant())) return CommandResult.Status.SESSION_EXPIRED;
+        long floor=Math.max(acknowledged,command.acknowledgedThrough());
+        int window=binding.outstandingWindow();
+        return floor>Long.MAX_VALUE-window || id.sequence()<=floor+window ? CommandResult.Status.SUCCESS : CommandResult.Status.CONFLICT;
+    }
+    private void installSessionControl(WriteBatch batch,RangeSessionControl control) throws RocksDBException {
+        var effective=effectiveAuthority(control,sessionAuthority());
+        batch.put(state,authorityKey(),new RangeSessionControl(effective,null,0).encode());
+        if (control.binding()) batch.put(state,bindingKey(control.grant().epoch()),control.encode());
     }
 
     private CommandResult evaluate(DistributedCommand command) throws RocksDBException {
@@ -1078,6 +1167,8 @@ public final class ReplicatedRangeStore {
                 decodeReceipt(saved, command.payloadDigest());
                 return new ReceiptRetentionEstimate(usage, false, 0, 0, maintenance);
             }
+            var sessionStatus=sessionDecision(command,floor);
+            if (sessionStatus!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Session admission rejected: " + sessionStatus);
             Usage removed = new Usage(0, 0);
             if (command.minimumSessionEpoch() > minimum) {
                 byte[] end = ByteBuffer.allocate(25).put(usageBucketsPrefix).putLong(command.minimumSessionEpoch()).array();
@@ -1151,20 +1242,20 @@ public final class ReplicatedRangeStore {
         return total;
     }
 
-    private void updateReceiptUsage(WriteBatch batch, DistributedCommand command, long epochFloor,
+    private void updateReceiptUsage(WriteBatch batch, DistributedCommand command, long minimumEpoch, long acknowledgement, long epochFloor,
             long acknowledged, int valueBytes, ApplyPosition position) throws RocksDBException {
         Usage total = readUsage(usageKey);
         byte[] bucketKey = usageBucketKey(command.operationId());
         Usage bucket = readUsage(bucketKey);
-        if (command.minimumSessionEpoch() > epochFloor) {
-            byte[] end = ByteBuffer.allocate(25).put(usageBucketsPrefix).putLong(command.minimumSessionEpoch()).array();
+        if (minimumEpoch > epochFloor) {
+            byte[] end = ByteBuffer.allocate(25).put(usageBucketsPrefix).putLong(minimumEpoch).array();
             total = total.minus(scanUsage(state, usageBucketsPrefix, end, false));
             batch.deleteRange(state, usageBucketsPrefix, end);
         }
-        if (command.acknowledgedThrough() > acknowledged) {
+        if (acknowledgement > acknowledged) {
             var id = command.operationId();
             Usage removed = scanUsage(receipts, receiptKey(new OperationId(id.sessionId(), id.epoch(), 0)),
-                    receiptKey(new OperationId(id.sessionId(), id.epoch(), command.acknowledgedThrough() + 1)), true);
+                    receiptKey(new OperationId(id.sessionId(), id.epoch(), acknowledgement + 1)), true);
             total = total.minus(removed);
             bucket = bucket.minus(removed);
         }

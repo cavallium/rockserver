@@ -953,3 +953,54 @@ live bindings, monotonic cuts, a stale catalogue proof, authority progress with 
 live user issuer, unavailable catalogue and rejection before native apply. Previous
 session-client/retention tests also pass. No excluded workflow, density fixture,
 network/server process, publication/deployment or main-checkout change occurred.
+
+## Native replicated session authority, binding and ACK windows
+
+Native stores can explicitly enable session controls after the adapter's catalogue
+proposal authority is configured. Controls persist a group authority cut at tag0x13
+and epoch-keyed immutable bindings at tag0x14, in the same WAL-enabled sync=false
+batch as receipt/usage/floors/A. The authority row activates ordinary data checks;
+that persisted enforcement survives reopen/install regardless of the runtime
+control-enable flag. Existing ranges without an authority row keep legacy behavior.
+No server bootstrap enables these controls automatically yet.
+
+New bound data identities must match the grant UUID/epoch and be live under the
+range's replicated logical time. Sequence admission uses the maximum of the stored
+ACK floor and the command's frozen piggyback ACK, with overflow-safe window bounds.
+Native apply independently evaluates these rules in committed order: invalid
+committed outcomes retain a terminal SESSION_EXPIRED/CONFLICT receipt, rather than
+becoming executable after a later binding or ACK. Retained original outcomes still
+resolve after lifetime expiry until ACK/coarse fencing removes their receipt.
+A bound expired session can submit an ACK-only command within its own window to
+drain receipts; it cannot install user effects. The receipt estimator rejects new
+invalid proposals before append and still recognizes known/expired retries.
+
+Authority updates cannot regress identity/generation/time/floor. An older binding
+cut may be installed under a newer dominating native cut only while its exact grant
+is still live. Epoch bindings cannot switch UUID/grant/window. Binding rows are
+bounded at 1024; a coarse floor atomically range-deletes older epoch-first rows.
+Rejected controls neither advance authority/floors nor spend ACK/removal credit.
+Control receipts and physical receipt cleanup retain their earlier accounting
+contracts. The legacy floor-admission callback explicitly rejects typed controls;
+it cannot accidentally substitute for grant proof validation.
+
+Snapshots validate exact authority/binding shapes, authority dominance, key/grant
+epoch identity, unique bounded bindings and consistency with the coarse floor.
+Logically expired grant holes above that floor remain valid metadata until fencing.
+Legacy images remain valid. Actual native export/install and persistent reopen tests
+verify the bound behavior and original outcomes; malformed parser fixtures cover
+shape/version/kind/window/identity/generation/floor/count failures.
+
+The full ordinary gate passes 77 core/native, 16 read-round and 35 adapter cases
+(128 total), exit zero: `/tmp/rockserver-native-session-binding-full-gate.log`.
+After extending the terminal unbound-outcome regression, a focused unchanged-
+implementation gate passes 6 core and 5 adapter cases, exit zero:
+`/tmp/rockserver-native-session-binding-terminal-gate.log`. No excluded workflow,
+density execution, network/server process, publication/deployment or main-checkout
+mutation occurred. These are native/interface acceptance results, not independent-
+node, callback concurrency, physical power-loss or performance acceptance.
+
+Next work includes Ratis/bootstrap control wiring, automatic logical-clock/floor
+propagation with explicit completion, range session binding from the client,
+node/pool/tenant budgets and the other remaining architecture workflows. Activation
+remains explicit; no catalogue-wide instantaneous expiry guarantee is claimed.

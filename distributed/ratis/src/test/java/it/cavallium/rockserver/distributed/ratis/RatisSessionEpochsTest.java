@@ -169,6 +169,7 @@ class RatisSessionEpochsTest {
             var binding=f.epochs.prepareSessionBinding(dir,dataGroup,operation(10),live.grants().getFirst(),32,9);
             assertEquals(reads+1,f.reads.get());
             var admission=f.epochs.sessionControlAdmission(dir,dataGroup);
+            assertThrows(IllegalArgumentException.class,() -> f.epochs.floorAdmission(dir,dataGroup).accept(binding));
             admission.accept(binding); assertEquals(reads+2,f.reads.get());
             var fake=new RangeSessionControl(SessionAuthority.from(live),new SessionEpochLedger.Grant(1,a,10,99),32);
             assertThrows(IllegalStateException.class,() -> admission.accept(DistributedCommand.sessionControl(dataGroup,1,new byte[32],operation(11),fake,-1)));

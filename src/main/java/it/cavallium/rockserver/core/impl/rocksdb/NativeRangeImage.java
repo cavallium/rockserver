@@ -1,6 +1,9 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.RangeSessionControl;
+import it.cavallium.rockserver.core.common.distributed.SessionAuthority;
+import it.cavallium.rockserver.core.common.distributed.SessionEpochLedger;
 import org.rocksdb.RocksDBException;
 
 import java.io.*;
@@ -311,6 +314,8 @@ public final class NativeRangeImage {
         private boolean marker;
         private boolean usagePresent;
         private boolean usageBound;
+        private SessionAuthority sessionAuthority;
+        private int sessionBindings;
         private long usageCount, usageBytes, bucketCount, bucketBytes, receiptCount, receiptBytes, epochFloor;
 
         Rows(Header header, Limits limits) {
@@ -334,6 +339,27 @@ public final class NativeRangeImage {
                 if (column != null || key.length < groupPrefix.length
                         || !Arrays.equals(key, 0, groupPrefix.length, groupPrefix, 0, groupPrefix.length)) {
                     throw new IOException("Wrong image group metadata prefix");
+                }
+                if (section == Section.STATE && key.length > 16 && (key[16] == 0x13 || key[16] == 0x14)) {
+                    boolean binding = key[16] == 0x14;
+                    if (key.length != (binding ? 25 : 17)
+                            || value.length != (binding ? RangeSessionControl.BIND_BYTES : RangeSessionControl.ADVANCE_BYTES)) {
+                        throw new IOException("Invalid image range session control shape");
+                    }
+                    try {
+                        var control = RangeSessionControl.decode(value);
+                        if (control.binding() != binding) throw new IOException("Invalid image range session control kind");
+                        if (binding) {
+                            if (sessionAuthority == null) throw new IOException("Image binding has no range authority");
+                            sessionAuthority.requireAtLeast(control.authority());
+                            if (ByteBuffer.wrap(key, 17, 8).getLong() != control.grant().epoch()
+                                    || control.grant().epoch() < epochFloor || ++sessionBindings > SessionEpochLedger.MAX_GRANTS) {
+                                throw new IOException("Invalid image range session binding epoch or count");
+                            }
+                        } else sessionAuthority = control.authority();
+                    } catch (IllegalArgumentException invalid) {
+                        throw new IOException("Invalid image range session control", invalid);
+                    }
                 }
                 if (section == Section.STATE && key.length > 16 && key[16] == 0x12) {
                     throw new IOException("Image contains incomplete receipt usage rebuild");
@@ -419,6 +445,9 @@ public final class NativeRangeImage {
 
         void finish() throws IOException {
             if (!marker) throw new IOException("Image has no applied marker");
+            if (sessionAuthority != null && sessionAuthority.minimumEpoch() > epochFloor) {
+                throw new IOException("Image range session authority exceeds coarse epoch floor");
+            }
             if (usageBound ? usageCount != bucketCount || usageBytes != bucketBytes
                     || usageCount != receiptCount || usageBytes != receiptBytes : !usagePresent && (bucketCount != 0 || bucketBytes != 0)) {
                 throw new IOException("Image receipt usage differs from retained receipts/buckets");

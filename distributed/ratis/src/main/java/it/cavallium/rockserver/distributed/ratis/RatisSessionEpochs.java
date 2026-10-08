@@ -127,7 +127,7 @@ public final class RatisSessionEpochs {
         return descriptor;
     }
     private void admitFloor(DistributedCommand command) {
-        if (command.minimumSessionEpoch()<0) throw new IllegalArgumentException("Not an epoch-floor command");
+        if (command.minimumSessionEpoch()<0 || command.sessionControl()!=null) throw new IllegalArgumentException("Not an epoch-floor command");
         try {
             var ledger=read();
             if (ledger==null || !ledger.isLive(command.operationId()) || command.minimumSessionEpoch()>ledger.minimumEpoch()) {
