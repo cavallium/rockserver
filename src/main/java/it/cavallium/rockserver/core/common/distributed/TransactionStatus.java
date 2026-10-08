@@ -6,7 +6,7 @@ import java.util.*;
 /** Immutable home record. Vote positions are durable participant evidence supplied by the coordinator, not self-verifying proofs. */
 public final class TransactionStatus {
     public enum Phase { PREPARING, COMMIT, ABORT }
-    public static final int MAX_PARTICIPANTS=64, HEADER_BYTES=186, PARTICIPANT_BYTES=121;
+    public static final int MAX_PARTICIPANTS=64, HEADER_BYTES=182, PARTICIPANT_BYTES=121;
     public static final int MAX_BYTES=HEADER_BYTES+MAX_PARTICIPANTS*PARTICIPANT_BYTES;
     public record Participant(UUID rangeId,UUID groupId,long rangeEpoch,byte[] schemaDigest,byte[] planDigest,ApplyPosition prepared,boolean finalized) {
         public Participant {
@@ -91,7 +91,7 @@ public final class TransactionStatus {
         if (!valid) throw invalid("Illegal transaction status transition");
     }
     public byte[] encode() {
-        var b=ByteBuffer.allocate(HEADER_BYTES+participants.size()*PARTICIPANT_BYTES).putInt(1);
+        var b=ByteBuffer.allocate(HEADER_BYTES+participants.size()*PARTICIPANT_BYTES);
         uuid(b,clusterId); uuid(b,databaseId); uuid(b,domainId); uuid(b,transactionId); uuid(b,operation.sessionId());
         b.putLong(operation.epoch()).putLong(operation.sequence()).putLong(schemaEpoch).put(schemaDigest).put(planDigest).putLong(generation).put((byte)phase.ordinal()).put((byte)(consumed ? 1 : 0)).putInt(participants.size());
         for (var p:participants) { uuid(b,p.rangeId()); uuid(b,p.groupId()); b.putLong(p.rangeEpoch()).put(p.schemaDigest()).put(p.planDigest()).putLong(p.prepared()==null ? 0 : p.prepared().term()).putLong(p.prepared()==null ? -1 : p.prepared().index()).put((byte)(p.finalized() ? 1 : 0)); }
@@ -99,7 +99,7 @@ public final class TransactionStatus {
     }
     public static TransactionStatus decode(byte[] bytes) {
         Objects.requireNonNull(bytes); if (bytes.length<HEADER_BYTES || bytes.length>MAX_BYTES) throw invalid("Invalid transaction status byte length");
-        var b=ByteBuffer.wrap(bytes); if (b.getInt()!=1) throw invalid("Unsupported transaction status encoding");
+        var b=ByteBuffer.wrap(bytes);
         UUID cluster=uuid(b),database=uuid(b),domain=uuid(b),transaction=uuid(b); var operation=new OperationId(uuid(b),b.getLong(),b.getLong()); long epoch=b.getLong();
         byte[] schema=new byte[32],plan=new byte[32]; b.get(schema).get(plan); long generation=b.getLong(); int phase=b.get() & 255; boolean consumed=flag(b); int count=b.getInt();
         if (phase>=Phase.values().length || count<1 || count>MAX_PARTICIPANTS || b.remaining()!=count*PARTICIPANT_BYTES) throw invalid("Invalid transaction status phase/count");

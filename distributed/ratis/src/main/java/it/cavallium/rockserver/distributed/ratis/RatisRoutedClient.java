@@ -34,6 +34,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     public interface Transport extends AutoCloseable {
         byte[] read(RangeDescriptor descriptor, UUID columnId, byte[] physicalKey) throws IOException;
         CommandResult command(RangeDescriptor descriptor, DistributedCommand command) throws IOException;
+        default byte[] participant(RangeDescriptor descriptor,byte[] record) throws IOException { throw new IOException("Participant prepare unsupported by this transport"); }
         default RangeStateView stateView(RangeDescriptor descriptor) throws IOException { throw new IOException("Range-state reads unsupported by this transport"); }
         default byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) throws IOException { throw new IOException("Scoped transactions unsupported by this transport"); }
         @Override default void close() throws IOException {}
@@ -53,6 +54,43 @@ public final class RatisRoutedClient implements AutoCloseable {
         public DistributedCommand command() { return command; }
     }
 
+    public static final class PreparedParticipantOperation {
+        private final RangeDirectory source; private final RangeDescriptor descriptor; private final PreparedParticipant.Preparation preparation; private final byte[] bytes;
+        private PreparedParticipantOperation(RangeDirectory source,RangeDescriptor descriptor,PreparedParticipant.Preparation preparation) { this.source=source; this.descriptor=descriptor; this.preparation=preparation; bytes=RatisParticipantRecord.encode(preparation); }
+        public RangeDescriptor descriptor() { return descriptor; } public PreparedParticipant.Preparation preparation() { return preparation; } public byte[] bytes() { return bytes.clone(); }
+    }
+    /** Freeze and durably retain this operation before the first participant write RPC. No route or identity is regenerated on retry. */
+    public PreparedParticipantOperation prepareParticipant(PreparedParticipant.Preparation preparation) {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(preparation.business().groupId())).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route is absent"));
+        return restoreParticipant(preparation,descriptor);
+    }
+    public PreparedParticipantOperation restoreParticipant(PreparedParticipant.Preparation preparation,RangeDescriptor descriptor) {
+        var observed=current();
+        var registered=preparation.registration().participants().stream().filter(p -> p.groupId().equals(descriptor.groupId())).findFirst().orElseThrow();
+        if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || descriptor.rangeEpoch()!=preparation.business().rangeEpoch() || !registered.rangeId().equals(descriptor.rangeId())
+                || !Arrays.equals(observed.schemaDigest(),preparation.business().schemaDigest()) || !observed.domainId().equals(preparation.registration().domainId())
+                || !observed.clusterId().equals(preparation.registration().clusterId()) || !observed.databaseId().equals(preparation.registration().databaseId())) throw new IllegalArgumentException("Participant route differs from frozen registration");
+        restoreSessionCommand(preparation.business(),descriptor);
+        return new PreparedParticipantOperation(identity,descriptor,preparation);
+    }
+    public ApplyPosition executeParticipant(PreparedParticipantOperation operation) throws IOException {
+        java.util.Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try { return RatisParticipantRecord.result(transport.participant(operation.descriptor,operation.bytes)); }
+        catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant vote reply",invalid); }
+        finally { endCall(); }
+    }
+    /** Fresh independently queryable state survives prepare-response loss and control-session receipt GC. */
+    public PreparedParticipant preparedParticipant(UUID group,UUID transactionId) throws IOException {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route absent"));
+        var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,transactionId);
+        try {
+            var input=ByteBuffer.wrap(transaction(descriptor,ScopedTransactionRpc.PARTICIPANT_STATE,body.array(),true));
+            byte[] bytes=ScopedTransactionRpc.blob(input,16+PreparedParticipant.Preparation.MAX_BYTES,true); if (input.hasRemaining()) throw new IllegalArgumentException("Trailing prepared state");
+            if (bytes==null) return null; var record=PreparedParticipant.decode(bytes);
+            if (!record.preparation().transactionId().equals(transactionId) || !record.preparation().business().groupId().equals(group)) throw new IllegalArgumentException("Prepared reply identity changed");
+            prepareParticipant(record.preparation()); return record;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid prepared state reply",malformed); }
+    }
     private final RangeDirectory identity;
     private final Transport transport;
     private RangeDirectory directory;
@@ -120,6 +158,12 @@ public final class RatisRoutedClient implements AutoCloseable {
             } catch (IllegalArgumentException malformed) { throw new IOException("Invalid staging reply",malformed); }
         }
         public CommandResult stage(List<Mutation> mutations) throws IOException { return stage(mutations,List.of()); }
+        public byte[] participantPlanDigest(DistributedCommand intent,CommandResult stagedResult) throws IOException {
+            synchronized (this) { if (closed) throw new IOException("Transaction handle is closed"); }
+            if (!intent.groupId().equals(descriptor.groupId()) || intent.rangeEpoch()!=descriptor.rangeEpoch() || !Arrays.equals(intent.schemaDigest(),schemaDigest)) throw new IllegalArgumentException("Participant intent differs from frozen route");
+            var audit=new TransactionAcceptance(handle.position(),handle.generation(),handle.owner(),scope,stagedResult.encode());
+            return PreparedParticipant.Preparation.planDigest(DistributedCommand.acceptedTransaction(intent,audit));
+        }
         public DistributedCommand plan(DistributedCommand intent) throws IOException {
             byte[] encoded=DistributedCommandCodec.encode(intent); var body=ByteBuffer.allocate(60+encoded.length); ScopedTransactionRpc.writeHandle(body,handle); ScopedTransactionRpc.putBlob(body,encoded);
             byte[] reply=call(ScopedTransactionRpc.PLAN,body.array());
@@ -166,7 +210,9 @@ public final class RatisRoutedClient implements AutoCloseable {
         directory = next;
     }
 
-    public byte[] read(UUID columnId, byte[] physicalKey) throws IOException {
+    record RoutedRead(RangeDescriptor descriptor,byte[] value) {}
+    public byte[] read(UUID columnId,byte[] physicalKey) throws IOException { return readWithRoute(columnId,physicalKey).value(); }
+    RoutedRead readWithRoute(UUID columnId,byte[] physicalKey) throws IOException {
         Objects.requireNonNull(physicalKey, "physicalKey");
         if (physicalKey.length > DistributedCommandCodec.MAX_ENCODED_BYTES - 16) throw new IllegalArgumentException("Point read key exceeds budget");
         byte[] key = physicalKey.clone();
@@ -176,7 +222,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         try {
             byte[] value = transport.read(descriptor, columnId, key);
             if (value != null && value.length > DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IOException("Point value exceeds budget");
-            return value == null ? null : value.clone();
+            return new RoutedRead(descriptor,value==null ? null : value.clone());
         } finally { endCall(); }
     }
 
@@ -424,6 +470,10 @@ public final class RatisRoutedClient implements AutoCloseable {
                 var message=Message.valueOf(ByteString.copyFrom(request));
                 return content(freshBarrier ? lease.client().io().sendReadOnly(message) : lease.client().io().sendReadOnlyNonLinearizable(message),ScopedTransactionRpc.MAX_REPLY_BYTES);
             } });
+        }
+
+        @Override public byte[] participant(RangeDescriptor descriptor,byte[] record) throws IOException {
+            return rpc(() -> { try (var lease=clients.acquire(descriptor)) { return content(lease.client().io().send(Message.valueOf(ByteString.copyFrom(record)))); } });
         }
 
         private static RaftClient connected(RangeDescriptor descriptor) throws IOException {

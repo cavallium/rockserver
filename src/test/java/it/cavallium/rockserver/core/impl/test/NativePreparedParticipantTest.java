@@ -19,7 +19,7 @@ class NativePreparedParticipantTest {
     PreparedParticipant.Preparation preparation(NativeBucketApplyTest.Fixture f,DistributedCommand base,TransactionScope scope,long n) throws Exception {
         DistributedCommand accepted;
         try (var pin=f.store.captureTracked(scope)) { accepted=f.store.planScopedCommit(pin,base,0,new UUID(0,99)); }
-        var participant=new TransactionStatus.Participant(outer.group,outer.group,1,f.schema.digest(),PreparedParticipant.Preparation.planDigest(base),null,false);
+        var participant=new TransactionStatus.Participant(outer.group,outer.group,1,f.schema.digest(),PreparedParticipant.Preparation.planDigest(accepted),null,false);
         var registration=TransactionStatus.begin(outer.cluster,outer.database,outer.domain,new UUID(0,n),base.operationId(),1,f.schema.digest(),new byte[32],List.of(participant));
         return new PreparedParticipant.Preparation(new UUID(0,100),1,new OperationId(new UUID(0,101),1,n),registration,accepted);
     }
@@ -92,7 +92,7 @@ class NativePreparedParticipantTest {
             var changed=new PreparedParticipant.Preparation(one.homeGroup(),one.homeEpoch()+1,one.operation(),one.registration(),one.business());
             assertThrows(IllegalArgumentException.class,() -> f.store.applyPrepared(new ApplyPosition(1,2),changed));
             assertEquals(new ApplyPosition(1,1),f.store.applied()); assertEquals(1,f.store.preparedParticipantCount()); assertArrayEquals(record.encode(),f.store.preparedParticipant(one.transactionId()).encode());
-            byte[] malformed=record.encode(); malformed[16]=9; assertThrows(IllegalArgumentException.class,() -> PreparedParticipant.decode(malformed));
+            byte[] malformed=record.encode(); java.nio.ByteBuffer.wrap(malformed).putInt(72,-1); assertThrows(IllegalArgumentException.class,() -> PreparedParticipant.decode(malformed));
         }
     }
     @Test void corruptPreparedMetadataCannotBeExportedOrReactivated() throws Exception {
@@ -101,7 +101,7 @@ class NativePreparedParticipantTest {
             var dbField=ReplicatedRangeStore.class.getDeclaredField("db"); var stateField=ReplicatedRangeStore.class.getDeclaredField("state"); dbField.setAccessible(true); stateField.setAccessible(true);
             var db=(org.rocksdb.RocksDB)dbField.get(f.store); var state=(org.rocksdb.ColumnFamilyHandle)stateField.get(f.store);
             byte[] key=java.nio.ByteBuffer.allocate(33).putLong(outer.group.getMostSignificantBits()).putLong(outer.group.getLeastSignificantBits()).put((byte)0x20).putLong(0).putLong(1).array();
-            byte[] corrupt=record.encode(); corrupt[16]=9;
+            byte[] corrupt=record.encode(); java.nio.ByteBuffer.wrap(corrupt).putInt(72,-1);
             try (var options=new org.rocksdb.WriteOptions().setSync(true)) { db.put(state,options,key,corrupt); }
             try (var pin=f.store.capture()) {
                 assertThrows(java.io.IOException.class,() -> NativeRangeImage.write(root.resolve("corrupt-image"),pin,f.store.ownership().interval(),new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,4)));

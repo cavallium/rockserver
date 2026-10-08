@@ -416,6 +416,44 @@ public final class ReplicatedRangeStore {
         for (var p:command.predicates()) spans.add(TransactionScope.Span.point(p.columnId(),p.key()));
         if (!spans.isEmpty()) requireUnlocked(new TransactionScope(spans));
     }
+    public record PreparedCapacity(ApplyPosition position,int count,long bytes,long scopeBytes) {}
+    public record PreparationEstimate(PreparedCapacity capacity,PreparedParticipant existing) {}
+    public PreparedCapacity preparedCapacity() {
+        enterNative(); applyLane.lock();
+        try { requireActive(); return new PreparedCapacity(applied,preparedIndex.records().size(),preparedIndex.bytes(),preparedIndex.scopeBytes()); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Native checks and quota observation from one completed cut, before entering the adapter admission monitor. */
+    public PreparationEstimate estimatePreparation(PreparedParticipant.Preparation preparation) throws RocksDBException {
+        enterNative(); applyLane.lock();
+        try {
+            requireActive(); requirePreparation(preparation,true);
+            var control=preparation.operation(); long minimumControl=minimumSessionEpoch(null); long controlFloor=control.epoch()<minimumControl ? -1 : acknowledgedThrough(control,null);
+            var business=preparation.business();
+            var controlCommand=new DistributedCommand(business.groupId(),business.rangeEpoch(),business.schemaDigest(),control,business.mutations(),business.predicates());
+            if (control.epoch()<minimumControl || control.sequence()<=controlFloor || sessionDecision(controlCommand,controlFloor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Prepare control session is fenced; query its durable state");
+            for (var record:preparedIndex.records()) if (record.preparation().transactionId().equals(preparation.transactionId())) {
+                if (!record.preparation().equals(preparation)) throw new IllegalArgumentException("Prepared transaction payload changed");
+                return new PreparationEstimate(preparedCapacity(),record);
+            }
+            var id=business.operationId(); long minimum=minimumSessionEpoch(null); long floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
+            if (id.epoch()<minimum || id.sequence()<=floor || db.get(receipts,receiptKey(id))!=null || db.get(receipts,receiptKey(preparation.operation()))!=null
+                    || sessionDecision(business,floor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Prepared identity is no longer eligible");
+            if (applied==null || applied.index()==Long.MAX_VALUE || business.acceptance().snapshot().index()==Long.MAX_VALUE) throw new IllegalStateException("Participant completed prefix unavailable/exhausted");
+            addPrepared(preparedIndex,new PreparedParticipant(preparation,new ApplyPosition(business.acceptance().snapshot().term(),Math.max(applied.index()+1,business.acceptance().snapshot().index()+1))));
+            return new PreparationEstimate(preparedCapacity(),null);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Exact native recovery lookup is permitted while fenced; it grants no user admission authority. */
+    public PreparedParticipant recoveredParticipant(PreparedParticipant.Preparation expected) throws RocksDBException {
+        enterNative(); applyLane.lock();
+        try {
+            byte[] bytes=db.get(state,preparedKey(expected.transactionId())); if (bytes==null) return null;
+            var record=PreparedParticipant.decode(bytes); requirePreparation(record.preparation(),false);
+            if (!record.preparation().equals(expected) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term()) throw new IllegalArgumentException("Recovered prepared receipt differs");
+            return record;
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
     /** Only committed accepted preparations may enter. The adapter must retain its complete proposal reservation through this return. */
     public PreparedParticipant applyPrepared(ApplyPosition position,PreparedParticipant.Preparation preparation) throws RocksDBException {
         Objects.requireNonNull(position); Objects.requireNonNull(preparation); enterNative(); applyLane.lock();
@@ -1429,6 +1467,15 @@ public final class ReplicatedRangeStore {
             } finally {
                 releaseUse();
             }
+        }
+        public PreparedParticipant preparedParticipant(UUID transaction) throws RocksDBException {
+            acquireUse();
+            try (var options=new ReadOptions().setSnapshot(snapshot)) {
+                byte[] bytes=db.get(state,options,preparedKey(transaction)); if (bytes==null) return null;
+                var record=PreparedParticipant.decode(bytes);
+                if (!record.preparation().transactionId().equals(transaction) || position==null || record.position().index()>position.index() || record.position().term()>position.term()) throw new IllegalStateException("Prepared receipt differs from snapshot cut");
+                return record;
+            } finally { releaseUse(); }
         }
         public byte[] operationResult(OperationId id, byte[] payloadDigest) throws RocksDBException {
             acquireUse();

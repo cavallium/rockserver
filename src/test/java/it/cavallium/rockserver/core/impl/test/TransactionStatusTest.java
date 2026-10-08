@@ -37,7 +37,7 @@ class TransactionStatusTest {
     @Test void decodingRejectsMalformedFlagsCountsPositionsOrderingAndTruncation() {
         byte[] valid=initial().encode();
         for (int n=0;n<valid.length;n++) { byte[] truncated=Arrays.copyOf(valid,n); assertThrows(IllegalArgumentException.class,() -> TransactionStatus.decode(truncated)); }
-        for (int offset:new int[]{0,181,182}) { byte[] invalid=valid.clone(); if (offset==181) invalid[offset]=2; else ByteBuffer.wrap(invalid).putInt(offset,-1); assertThrows(IllegalArgumentException.class,() -> TransactionStatus.decode(invalid)); }
+        for (int offset:new int[]{177,178}) { byte[] invalid=valid.clone(); if (offset==177) invalid[offset]=2; else ByteBuffer.wrap(invalid).putInt(offset,-1); assertThrows(IllegalArgumentException.class,() -> TransactionStatus.decode(invalid)); }
         byte[] vote=valid.clone(); ByteBuffer.wrap(vote).putLong(TransactionStatus.HEADER_BYTES+104,1); // A term without a positive prepare index is not evidence.
         assertThrows(IllegalArgumentException.class,() -> TransactionStatus.decode(vote));
         byte[] flags=valid.clone(); flags[TransactionStatus.HEADER_BYTES+120]=2; assertThrows(IllegalArgumentException.class,() -> TransactionStatus.decode(flags));
@@ -51,9 +51,9 @@ class TransactionStatusTest {
         var initial=initial(); var ready=prepared(); assertThrows(IllegalArgumentException.class,() -> ready.requireSuccessorOf(initial));
         var other=TransactionStatus.begin(cluster,database,domain,UUID.randomUUID(),initial.operation(),1,new byte[32],new byte[32],initial.participants()).prepared(a,new byte[32],new ApplyPosition(1,1));
         assertThrows(IllegalArgumentException.class,() -> other.requireSuccessorOf(initial));
-        byte[] exhausted=initial.encode(); ByteBuffer.wrap(exhausted).putLong(172,Long.MAX_VALUE); var maximum=TransactionStatus.decode(exhausted);
+        byte[] exhausted=initial.encode(); ByteBuffer.wrap(exhausted).putLong(168,Long.MAX_VALUE); var maximum=TransactionStatus.decode(exhausted);
         assertThrows(IllegalArgumentException.class,() -> maximum.prepared(a,new byte[32],new ApplyPosition(1,1)));
-        byte[] jump=ready.encode(); ByteBuffer.wrap(jump).putLong(172,initial.generation()+1); var forged=TransactionStatus.decode(jump);
+        byte[] jump=ready.encode(); ByteBuffer.wrap(jump).putLong(168,initial.generation()+1); var forged=TransactionStatus.decode(jump);
         assertThrows(IllegalArgumentException.class,() -> forged.requireSuccessorOf(initial));
         var participants=new ArrayList<TransactionStatus.Participant>(); for (int i=0;i<TransactionStatus.MAX_PARTICIPANTS;i++) participants.add(participant(new UUID(0,100+i)));
         var max=TransactionStatus.begin(cluster,database,domain,transaction,initial.operation(),1,new byte[32],new byte[32],participants);

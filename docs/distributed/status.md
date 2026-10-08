@@ -122,8 +122,8 @@ does not establish complete distributed API parity or production acceptance.
   transaction-record consumption. Recovery CAS operations have their own identity
   and epoch; they do not replace the frozen business identity.
   This is a home-record kernel, not complete 2PC: reports are not self-verifying
-  participant proofs. Protected status-role activation, durable participant staged
-  plans/locks, late-PREPARE fencing, finalization and recovery scheduling remain.
+  participant proofs. Protected status-role activation, late-PREPARE fencing,
+  finalization and recovery scheduling remain.
 - The native participant substrate now installs an immutable accepted business plan,
   frozen home/participant binding, complete exclusive scope and stable prepare
   position in the internal state CF, atomically with completed A and accounting.
@@ -137,11 +137,20 @@ does not establish complete distributed API parity or production acceptance.
   available. Existing immutable cuts may finish reading their old values. Administrative
   captures remain available for export/recovery. Malformed prepared metadata blocks
   image export and activation.
-  `applyPrepared` is a trusted committed-native seam, not a public Raft prepare path.
-  Raft acceptance/reservation handoff, capacity reservations, home verification,
-  finalization and durable late-PREPARE fences still need implementation. Raft admission
-  must reserve both the control and business identities before appending, and retain
-  the existing full scope until the durable index has been published.
+- Transaction-home and preparation records use one current encoding without format
+  release markers or compatibility readers.
+- The Raft participant PREPARE path reserves both control/business identities, durable
+  record capacity and the complete exclusive scope before append. A fresh home read
+  captures the frozen registration and its route together. The registered plan hash
+  binds the full accepted command, including original read cut, scope, owner and result;
+  it cannot be rebased during preparation. The proposal hands its scope to native
+  durable ownership only after publication. Uncertain submitted work retains its
+  charges until native outcome, covered-snapshot recovery or a newer completed term
+  establishes settlement. Applied retries return the original typed prepare position.
+  A fresh linearizable participant-state query survives response loss and control-session
+  receipt GC. The routed client freezes exact bytes and the original descriptor for
+  retry, but callers must durably retain them; a multi-group coordinator journal is
+  still missing. Finalization and durable late-PREPARE abort fences remain unfinished.
 - Durable grant issuance, logical-session handoff, bounded user/maintenance windows,
   catalogue clocks/propagation, immutable schema publication and static node plans
   have local recovery fixtures. The owned node launcher checks established storage,
@@ -183,13 +192,14 @@ Rejected receipts reserve their actual bounded no-effects growth, preserving
 own-ACK progress at the retention cap.
 
 Durable native preparation has a separate per-range maximum of 64 records, 16 MiB of
-encoded records and 16 MiB of scope accounting. A preparation body is at most 2 MiB;
+encoded records and 16 MiB of scope accounting. A preparation body is at most 2 MiB
+minus its eight-byte Raft envelope;
 its stored receipt adds the 16-byte original apply position. These capacities are not
 part of ordinary user-receipt GC and are not donated by lease expiration or fencing.
-Admission must reserve them before a future Raft PREPARE append; the native seam
-currently rejects overflow before writing. No finalize/release/GC path is exposed yet.
+Raft admission reserves these bounds before PREPARE append; the native seam also
+rejects overflow before writing. No finalize/release/GC path is exposed yet.
 
-A transaction-home record has at most 64 frozen participants and 7,930 encoded bytes.
+A transaction-home record has at most 64 frozen participants and 7,926 encoded bytes.
 Both expected and replacement images fit comfortably within the 2 MiB atomic command
 bound. This is a per-record bound; global active-decision retention/admission and
 protected status-pool execution envelopes still need implementation.
@@ -217,22 +227,30 @@ Verification uses ordinary `test-compile surefire:test@default-test` selections,
 not root `mvn test` (which binds fuzzing). Native fixtures use the XFS test-directory
 factories. The excluded density fixture remains untouched and unselected.
 
-The native preparation regression gate passed 51 core and 50 adapter cases
-(101 total, zero failures/errors/skips), exit zero:
-`/tmp/rockserver-prepared-native-regression.log`. Independent review found a cross-role
-prepare/business operation-ID collision; insertion, recovery and image validation
-now share one ownership check. After that fix and codec/collision coverage, the final
-selection passed 23 core and 9 adapter cases (32 total), exit zero:
-`/tmp/rockserver-prepared-native-final.log`. The reviewer confirmed the finding was
-closed, with no additional finding at this native boundary.
+The PREPARE regression gate passed 32 core and 85 adapter cases (117 total,
+zero failures/errors/skips), exit zero: `/tmp/rockserver-raft-prepare-regression.log`.
+The final focused selection passed eight core and ten adapter cases (18 total),
+exit zero: `/tmp/rockserver-raft-prepare-final.log`. Independent review identified
+an ownerless-admission settlement lookup and a home-record/route refresh race;
+both were corrected. The registered hash now binds the full accepted plan.
+Review found no remaining concrete finding at the implemented PREPARE boundary.
+Native io_uring allocation warnings occurred without test failures.
+After removing transaction-home/preparation format release markers directly, the
+codec/native-image/home/PREPARE selection passed 24 core and 12 adapter cases
+(36 total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-current-transaction-format.log`. No legacy reader was added.
 
 The exercised native preparation cases cover unchanged user values, complete read/
-absence/range/bucket lock scope, disjoint upper-bound access, old immutable readers,
-new capture/planning/admission rejection, stable duplicate prepare positions, separate
-ordinary receipt accounting, session-floor independence, bounded count capacity,
-actual native pool close/reopen, portable image installation and corrupt-record
-fencing. These fixtures invoke the committed-native seam directly. They do not
-establish a Raft PREPARE proposal/append handoff or a participant quorum vote.
+absence/range/bucket lock scope, disjoint access, old immutable readers, new capture/
+planning/admission rejection, stable duplicate prepare positions, separate ordinary
+receipt accounting, session-floor independence, count capacity, native pool reopen,
+portable image installation and corrupt-record fencing. Controlled Raft fixtures
+also cover lost replies, both identity reservations, capacity held during blocked
+home reads, invalidation, frozen route restoration, snapshot-covered deferred apply,
+unknown same-term suffixes and fresh-only state queries. Two data groups report
+actual controlled applied votes to a home before COMMIT; user effects deliberately
+remain unapplied and finalization remains incomplete. These fixtures do not establish
+participant quorum behavior or a complete distributed transaction workflow.
 
 The exercised native/controlled-dispatch workflows include OPEN/read/STAGE/PLAN,
 forced acceptance before submission, applied native outcomes, lost PLAN/commit
@@ -274,10 +292,10 @@ server process, network/quorum probe, power-loss run or deployment was performed
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
-- Raft participant PREPARE envelopes/admission and durable capacity reservation,
-  home verification, finalization and late-PREPARE fencing; protected status-group
-  node/pool activation, full 2PC recovery and consistent multi-group scoped snapshot
-  fences. Native prepared records and the home kernel alone do not establish these.
+- Participant finalization and late-PREPARE abort fencing; protected status-group
+  node/pool activation, durable coordinator journaling, full 2PC recovery and consistent
+  multi-group scoped snapshot fences. PREPARE and the home kernel alone do not
+  establish these.
 - Topology controllers, lineage-aware routing/receipts, relocation, split/merge,
   placement authority and real operator-artifact activation.
 - Complete bounded bulk/import, CDC, export/backup/restore and operational repair

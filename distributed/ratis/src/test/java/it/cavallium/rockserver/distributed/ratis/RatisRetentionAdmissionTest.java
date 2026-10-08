@@ -107,7 +107,8 @@ class RatisRetentionAdmissionTest {
         }
     }
     static final class Fixture implements AutoCloseable {
-        final UUID groupId=UUID.randomUUID(), column=UUID.randomUUID(), session=UUID.randomUUID(), admin=UUID.randomUUID();
+        final UUID groupId=UUID.randomUUID(), session=UUID.randomUUID(), admin=UUID.randomUUID();
+        final UUID column;
         final RaftPeer peer=RaftPeer.newBuilder().setId("fixture").build();
         final RaftGroup group=RaftGroup.valueOf(RaftGroupId.valueOf(groupId),peer);
         final AtomicReference<RatisRangeStateMachine.Leadership> leadership=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
@@ -119,11 +120,15 @@ class RatisRetentionAdmissionTest {
             this(root,limits,validator,System::nanoTime);
         }
         Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits,java.util.function.Consumer<DistributedCommand> validator,java.util.function.LongSupplier nanos) throws Exception {
+            this(root,limits,validator,nanos,null);
+        }
+        Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits,java.util.function.Consumer<DistributedCommand> validator,java.util.function.LongSupplier nanos,RangeOwnership.Interval interval) throws Exception {
+            column=interval==null ? UUID.randomUUID() : interval.columns().iterator().next();
             pool=DistributedStoragePool.open(root.resolve("native"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
             storage=RaftStorage.newBuilder().setDirectory(root.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT)
                     .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
                     .setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build(); storage.initialize();
-            store=pool.openRange(new RangeOwnership.Owner(groupId,1),new RangeOwnership.Interval(groupId,Set.of(column),null,null),new byte[32],Map.of(column,"data"),Set.of());
+            store=pool.openRange(new RangeOwnership.Owner(groupId,1),interval==null ? new RangeOwnership.Interval(groupId,Set.of(column),null,null) : interval,new byte[32],Map.of(column,"data"),Set.of());
             var identity=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> {
                 if (method.getName().equals("getId")) return peer.getId();
                 if (method.getName().equals("toString")) return "identity-fixture";

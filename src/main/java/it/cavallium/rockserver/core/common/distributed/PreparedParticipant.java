@@ -18,7 +18,7 @@ public record PreparedParticipant(Preparation preparation,ApplyPosition position
     }
     /** Immutable accepted business plan; the separate prepare identity never becomes a business receipt. */
     public static final class Preparation {
-        public static final int MAX_BYTES=DistributedCommandCodec.MAX_ENCODED_BYTES;
+        public static final int MAX_BYTES=DistributedCommandCodec.MAX_ENCODED_BYTES-8;
         private final UUID homeGroup;
         private final long homeEpoch;
         private final OperationId operation;
@@ -31,7 +31,7 @@ public record PreparedParticipant(Preparation preparation,ApplyPosition position
             var participant=registration.participants().stream().filter(p -> p.groupId().equals(business.groupId())).findFirst().orElseThrow(() -> new IllegalArgumentException("Unregistered participant group"));
             if (participant.prepared()!=null || participant.rangeEpoch()!=business.rangeEpoch() || !Arrays.equals(participant.schemaDigest(),business.schemaDigest())
                     || !Arrays.equals(participant.planDigest(),planDigest(business))) throw new IllegalArgumentException("Participant plan differs from frozen registration");
-            if ((long)68+registration.encode().length+DistributedCommandCodec.encodedSize(business)>MAX_BYTES) throw new IllegalArgumentException("Prepared plan exceeds byte budget");
+            if ((long)64+registration.encode().length+DistributedCommandCodec.encodedSize(business)>MAX_BYTES) throw new IllegalArgumentException("Prepared plan exceeds byte budget");
         }
         public UUID homeGroup() { return homeGroup; } public long homeEpoch() { return homeEpoch; } public OperationId operation() { return operation; }
         public TransactionStatus registration() { return registration; } public DistributedCommand business() { return business; }
@@ -39,7 +39,8 @@ public record PreparedParticipant(Preparation preparation,ApplyPosition position
         public boolean ownsOperation(OperationId id) { return operation.equals(id) || business.operationId().equals(id); }
         public boolean sharesOperation(Preparation other) { return ownsOperation(other.operation) || ownsOperation(other.business.operationId()); }
         public static byte[] planDigest(DistributedCommand business) {
-            return new DistributedCommand(business.groupId(),business.rangeEpoch(),business.schemaDigest(),business.operationId(),business.mutations(),business.predicates(),business.acknowledgedThrough()).payloadDigest();
+            if (business.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED) throw new IllegalArgumentException("Participant plan must bind its original cut, scope, owner and result");
+            return business.payloadDigest();
         }
         @Override public boolean equals(Object other) { return other instanceof Preparation preparation && Arrays.equals(encode(),preparation.encode()); }
         @Override public int hashCode() { return Arrays.hashCode(encode()); }
@@ -48,12 +49,12 @@ public record PreparedParticipant(Preparation preparation,ApplyPosition position
         }
         public byte[] encode() {
             byte[] home=registration.encode(),plan=DistributedCommandCodec.encode(business);
-            var b=ByteBuffer.allocate(68+home.length+plan.length).putInt(1); uuid(b,homeGroup); b.putLong(homeEpoch); uuid(b,operation.sessionId()); b.putLong(operation.epoch()).putLong(operation.sequence());
+            var b=ByteBuffer.allocate(64+home.length+plan.length); uuid(b,homeGroup); b.putLong(homeEpoch); uuid(b,operation.sessionId()); b.putLong(operation.epoch()).putLong(operation.sequence());
             b.putInt(home.length).put(home).putInt(plan.length).put(plan); return b.array();
         }
         public static Preparation decode(byte[] bytes) {
-            if (bytes.length<68 || bytes.length>MAX_BYTES) throw new IllegalArgumentException("Invalid preparation length"); var b=ByteBuffer.wrap(bytes);
-            if (b.getInt()!=1) throw new IllegalArgumentException("Unsupported preparation encoding"); UUID group=uuid(b); long epoch=b.getLong(); var operation=new OperationId(uuid(b),b.getLong(),b.getLong());
+            if (bytes.length<64 || bytes.length>MAX_BYTES) throw new IllegalArgumentException("Invalid preparation length"); var b=ByteBuffer.wrap(bytes);
+            UUID group=uuid(b); long epoch=b.getLong(); var operation=new OperationId(uuid(b),b.getLong(),b.getLong());
             int homeSize=b.getInt(); if (homeSize<TransactionStatus.HEADER_BYTES || homeSize>TransactionStatus.MAX_BYTES || homeSize>b.remaining()-4) throw new IllegalArgumentException("Invalid registration length");
             byte[] home=new byte[homeSize]; b.get(home); int planSize=b.getInt(); if (planSize!=b.remaining()) throw new IllegalArgumentException("Invalid staged plan length"); byte[] plan=new byte[planSize]; b.get(plan);
             var value=new Preparation(group,epoch,operation,TransactionStatus.decode(home),DistributedCommandCodec.decode(plan)); if (!Arrays.equals(bytes,value.encode())) throw new IllegalArgumentException("Noncanonical preparation"); return value;

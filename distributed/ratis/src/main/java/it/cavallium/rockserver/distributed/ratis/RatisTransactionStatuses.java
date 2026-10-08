@@ -16,9 +16,12 @@ public final class RatisTransactionStatuses {
         if (!directory.columns().equals(Set.of(column))) throw new IllegalArgumentException("Status directory must have its dedicated status column");
         cluster=directory.clusterId(); database=directory.databaseId(); schemaDigest=directory.schemaDigest();
     }
-    public TransactionStatus read(UUID transaction) throws IOException {
-        byte[] bytes=routed.read(column,key(transaction)); if (bytes==null) return null;
-        try { var status=TransactionStatus.decode(bytes); requireIdentity(status,cluster,database,key(transaction)); return status; }
+    public record RegistrationRead(TransactionStatus status,RangeDescriptor descriptor) {}
+    public TransactionStatus read(UUID transaction) throws IOException { return readRegistration(transaction).status(); }
+    public RegistrationRead readRegistration(UUID transaction) throws IOException {
+        var read=routed.readWithRoute(column,key(transaction)); byte[] bytes=read.value();
+        if (bytes==null) return new RegistrationRead(null,read.descriptor());
+        try { var status=TransactionStatus.decode(bytes); requireIdentity(status,cluster,database,key(transaction)); return new RegistrationRead(status,read.descriptor()); }
         catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction home record",malformed); }
     }
     /** Each transition has its own caller-owned operation identity. An uncertain retry retains this exact command.
