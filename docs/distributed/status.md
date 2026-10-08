@@ -1609,3 +1609,55 @@ best-effort failed-open cleanup even when a client close fails. All selected cas
 had zero failures/errors/skips. Production launcher execution, network/quorum,
 power-loss and measured performance acceptance remain unverified; the excluded
 fixture was not selected or staged.
+
+## Durable user-session windows with pipelined RPC ownership
+
+`RatisDurableSessionClient` adds an explicit create-new-grant/reopen-journal path
+without reconstructing a used in-memory session. Its stable locked journal binds
+the database/domain/schema identity, exact grant and window limits. Prepared
+commands and original peer routes are forced before being returned. Native
+outcomes are forced before exposure; the application separately durably consumes
+them before calling acknowledge. Out-of-order consumed holes remain represented
+until the contiguous prefix drains. Reopen exposes both saved outcomes and their
+consumed markers, preserves every operation/ACK byte and never silently allocates
+replacement identities. Expired grants may be reopened for exact retries; native
+authority still determines admission and outcomes. Missing recovery journals fail
+closed, and create is exclusively for a new grant whose window was never used.
+
+Journal transitions use one explicit lock, while disjoint RPC owners run outside
+that lane. An active RPC or binding read prevents close/reownership. Any checkpoint
+failure fences subsequent preparation, RPC admission and acknowledgement until
+reopen. A concurrently completed result may appear in another transition's
+checkpoint before its own caller returns; this only strengthens recovery and does
+not expose an unsaved result. Borrowed routed clients remain caller-owned.
+
+`SessionWindowJournal` validates canonical command/result bytes, complete frozen
+routes, grant ownership, contiguous allocation, sequence exhaustion, consumed
+holes and recomputed reservations. It bounds command and result reservations to
+16 MiB each and the whole checksummed state image to 64 MiB, including all copied
+bounds/peers/results, before allocation. Recovery forces the surviving file and
+parent. Route restoration checks every point/predicate and the full deletion
+interval under the original routing projection. Ordinary session execution now
+also rejects replies inconsistent with the command's result plan.
+
+This is an optional durable physical-command client, not complete logical/frontend
+API parity or durable session issuance. First-use binding identities still need
+a separate durable maintenance owner. The journal rewrites a bounded state image;
+its throughput/allocation cost has not been calibrated. User-facing logical
+recovery integration, bucket protocols, scoped transactions and the remaining
+architecture requirements stay open. Standalone operation is unchanged.
+
+Validation: the established selected `test-compile surefire:test@default-test`
+gate passed 90 core, 19 patched-server and 124 adapter cases (233 total, zero
+failures/errors/skips), exit zero:
+`/tmp/rockserver-durable-user-window-full-gate.log`. Five journal cases cover
+canonical file/route recovery, locks, identity, malformed data, persistence
+failure and resource caps. Five durable-client cases exercise prepared reopen,
+native lost-reply retry with its original returned value, saved-result reuse,
+durable consumed holes/ACK/new-sequence allocation, completion-write fencing,
+concurrent disjoint RPC progress with close/same-identity rejection, final sequence
+exhaustion and full predicate/range-deletion projection checks. Existing session,
+logical, catalogue, bootstrap and runtime consumers still pass. This establishes
+local disk/native/interface behavior; power-loss, live quorum and measured journal
+performance remain unverified. No server process/network probe was run, and the
+excluded density fixture was neither staged nor selected.

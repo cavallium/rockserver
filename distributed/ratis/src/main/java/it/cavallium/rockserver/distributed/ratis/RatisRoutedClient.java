@@ -190,6 +190,42 @@ public final class RatisRoutedClient implements AutoCloseable {
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IllegalArgumentException("Invalid recovered control route");
         return new PreparedCommand(identity,descriptor,command);
     }
+    /** Restore an immutable user retry route without rebasing it onto the current topology. */
+    PreparedCommand restoreSessionCommand(DistributedCommand command,RangeDescriptor descriptor) {
+        Objects.requireNonNull(command); Objects.requireNonNull(descriptor); var observed=current();
+        if (command.formatVersion()!=2 && command.formatVersion()!=3 || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
+                || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
+                || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE
+                || command.mutations().isEmpty() && (command.acknowledgedThrough()<0 || !command.predicates().isEmpty())) {
+            throw new IllegalArgumentException("Invalid recovered user command route");
+        }
+        int prefix=observed.routingPrefixBytes();
+        if (prefix>0 && (descriptor.lowerInclusive()!=null && descriptor.lowerInclusive().length!=prefix
+                || descriptor.upperExclusive()!=null && descriptor.upperExclusive().length!=prefix)) throw new IllegalArgumentException("Recovered bounds differ from projection");
+        for (var mutation:command.mutations()) {
+            recoveredKey(observed,descriptor,mutation.columnId(),mutation.key());
+            if (mutation.kind()==Mutation.Kind.DELETE_RANGE) {
+                byte[] upper=projectRecovered(observed,mutation.value()); int order=descriptor.upperExclusive()==null ? -1 : Arrays.compareUnsigned(upper,descriptor.upperExclusive());
+                if (order>0 || order==0 && observed.routingPrefixBytes()>0 && mutation.value().length>observed.routingPrefixBytes()) {
+                    throw new IllegalArgumentException("Recovered range deletion crosses frozen route");
+                }
+            }
+        }
+        for (var predicate:command.predicates()) recoveredKey(observed,descriptor,predicate.columnId(),predicate.key());
+        return new PreparedCommand(identity,descriptor,command);
+    }
+    private static byte[] projectRecovered(RangeDirectory directory,byte[] key) {
+        int prefix=directory.routingPrefixBytes();
+        if (prefix>key.length) throw new IllegalArgumentException("Recovered key is shorter than routing prefix");
+        return prefix==0 ? key : Arrays.copyOf(key,prefix);
+    }
+    private static void recoveredKey(RangeDirectory directory,RangeDescriptor descriptor,UUID column,byte[] key) {
+        if (!directory.columns().contains(column)) throw new IllegalArgumentException("Recovered key belongs to another column");
+        byte[] projected=projectRecovered(directory,key), lower=descriptor.lowerInclusive(), upper=descriptor.upperExclusive();
+        if (lower!=null && Arrays.compareUnsigned(projected,lower)<0 || upper!=null && Arrays.compareUnsigned(projected,upper)>=0) {
+            throw new IllegalArgumentException("Recovered key is outside frozen route");
+        }
+    }
     byte[] sessionIdentityDigest() {
         var output=ByteBuffer.allocate(96+16*identity.columns().size());
         output.putLong(identity.clusterId().getMostSignificantBits()).putLong(identity.clusterId().getLeastSignificantBits());

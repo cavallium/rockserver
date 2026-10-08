@@ -30,6 +30,10 @@ public final class RatisSessionClient {
         public DistributedCommand command() { return prepared.command(); }
         public RangeDescriptor descriptor() { return prepared.descriptor(); }
     }
+    record WindowEntry(RatisRoutedClient.PreparedCommand prepared,CommandResult result,boolean consumed) {}
+    record WindowState(long nextSequence,long acknowledgedThrough,boolean exhausted,List<WindowEntry> entries) {
+        WindowState { entries=List.copyOf(entries); }
+    }
     private final RatisRoutedClient routed;
     private final SessionEpochLedger.Grant grant;
     private final Limits limits;
@@ -39,17 +43,61 @@ public final class RatisSessionClient {
 
     /**
      * One exclusive sequence owner for a newly issued grant. Never reconstruct with a previously used grant:
-     * restart must issue a new grant until durable client-window recovery is available.
+     * use RatisDurableSessionClient for recovery, or issue a new grant on restart.
      * The verified issuance image does not substitute for range-side lifetime authority.
      */
     public RatisSessionClient(RatisRoutedClient routed,SessionEpochLedger ledger,SessionEpochLedger.Grant grant,Limits limits) {
-        this.routed=Objects.requireNonNull(routed); this.grant=Objects.requireNonNull(grant); this.limits=Objects.requireNonNull(limits);
+        this(routed,grant,limits);
         var directory=routed.directory();
         if (!ledger.clusterId().equals(directory.clusterId()) || !ledger.databaseId().equals(directory.databaseId())
                 || !ledger.isLive(new OperationId(grant.sessionId(),grant.epoch(),0))
                 || !ledger.grants().get((int)(grant.epoch()-ledger.minimumEpoch())).equals(grant)) {
             throw new IllegalArgumentException("Session grant is not live in this database's issuance image");
         }
+    }
+    private RatisSessionClient(RatisRoutedClient routed,SessionEpochLedger.Grant grant,Limits limits) {
+        this.routed=Objects.requireNonNull(routed); this.grant=Objects.requireNonNull(grant); this.limits=Objects.requireNonNull(limits);
+    }
+    synchronized WindowState snapshot() {
+        return new WindowState(nextSequence,acknowledgedThrough,exhausted,pending.values().stream()
+                .map(entry -> new WindowEntry(entry.prepared,entry.result,entry.consumed)).toList());
+    }
+    /** Journal recovery is separate from fresh issuance; an expired grant may still have saved outcomes to resolve. */
+    static RatisSessionClient restore(RatisRoutedClient routed,SessionEpochLedger.Grant grant,Limits limits,WindowState state) {
+        var client=new RatisSessionClient(routed,grant,limits);
+        long ack=state.acknowledgedThrough(), next=state.nextSequence();
+        if (ack< -1 || next<0 || state.exhausted() && next!=Long.MAX_VALUE || ack>next
+                || ack==Long.MAX_VALUE && !state.exhausted()) throw new IllegalArgumentException("Invalid recovered sequence state");
+        long count=ack==Long.MAX_VALUE ? 0 : next-(ack+1);
+        if (count<0 || count>limits.outstanding()) throw new IllegalArgumentException("Recovered sequence window exceeds bounds");
+        if (state.exhausted() && ack!=Long.MAX_VALUE) {
+            if (count==limits.outstanding()) throw new IllegalArgumentException("Recovered final sequence exceeds window"); count++;
+        }
+        if (count!=state.entries().size()) throw new IllegalArgumentException("Recovered sequence window is not contiguous");
+        long sequence=ack==Long.MAX_VALUE ? Long.MAX_VALUE : ack+1;
+        for (var saved:state.entries()) {
+            var prepared=routed.restoreSessionCommand(saved.prepared().command(),saved.prepared().descriptor()); var command=prepared.command(); var id=command.operationId();
+            if (!id.sessionId().equals(grant.sessionId()) || id.epoch()!=grant.epoch() || id.sequence()!=sequence
+                    || command.acknowledgedThrough()>ack || saved.consumed() && saved.result()==null
+                    || client.pending.isEmpty() && saved.consumed()) throw new IllegalArgumentException("Invalid recovered command/outcome ownership");
+            int bytes=DistributedCommandCodec.encodedSize(command), result=maximumResult(command);
+            if (bytes>limits.commandBytes()-client.commandBytes || result>limits.resultBytes()-client.resultBytes) throw new IllegalArgumentException("Recovered byte window exceeds limits");
+            if (saved.result()!=null) validateResult(command,saved.result());
+            var entry=new Pending(client,prepared,bytes,result); entry.result=saved.result(); entry.consumed=saved.consumed();
+            client.pending.put(sequence,entry); client.commandBytes+=bytes; client.resultBytes+=result;
+            if (sequence!=Long.MAX_VALUE) sequence++;
+        }
+        client.nextSequence=next; client.acknowledgedThrough=ack; client.exhausted=state.exhausted(); return client;
+    }
+    synchronized java.util.List<Pending> retained() { return java.util.List.copyOf(pending.values()); }
+    synchronized CommandResult resolved(Pending entry) { requireOwner(entry); return entry.result; }
+    synchronized boolean consumed(Pending entry) { requireOwner(entry); return entry.consumed; }
+    private static int maximumResult(DistributedCommand command) {
+        return command.mutations().stream().allMatch(m -> m.returnMode()==Mutation.ReturnMode.NONE) ? 8 : CommandResult.MAX_BYTES;
+    }
+    private static void validateResult(DistributedCommand command,CommandResult result) {
+        long count=command.mutations().stream().filter(m -> m.returnMode()!=Mutation.ReturnMode.NONE).count();
+        if (result.status()==CommandResult.Status.SUCCESS && result.valueCount()!=count) throw new IllegalArgumentException("Outcome differs from command result plan");
     }
     public SessionEpochLedger.Grant grant() { return grant; }
     public synchronized int outstanding() { return pending.size(); }
@@ -76,7 +124,7 @@ public final class RatisSessionClient {
     }
     private Pending retain(RatisRoutedClient.PreparedCommand prepared) {
         int encoded=DistributedCommandCodec.encodedSize(prepared.command());
-        int maximumResult=prepared.command().mutations().stream().allMatch(m -> m.returnMode()==Mutation.ReturnMode.NONE) ? 8 : CommandResult.MAX_BYTES;
+        int maximumResult=maximumResult(prepared.command());
         if (encoded > limits.commandBytes()-commandBytes || maximumResult > limits.resultBytes()-resultBytes) {
             throw new IllegalStateException("Session command/result byte window exhausted");
         }
@@ -104,6 +152,7 @@ public final class RatisSessionClient {
         }
         try {
             CommandResult result=routed.execute(entry.prepared);
+            try { validateResult(entry.command(),result); } catch (IllegalArgumentException malformed) { throw new IOException("Invalid session outcome",malformed); }
             synchronized (this) { entry.result=result; }
             return result;
         } finally {
