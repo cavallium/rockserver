@@ -64,6 +64,8 @@ public interface GlobalDatabaseConfig {
 
 	boolean unorderedWrite() throws GestaltException;
 
+	boolean adaptiveCompactionIo() throws GestaltException;
+
 	boolean disableAutoCompactions() throws GestaltException;
 
 	boolean disableWriteSlowdown() throws GestaltException;

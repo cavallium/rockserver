@@ -5,6 +5,8 @@ import org.jetbrains.annotations.Nullable;
 
 public interface FallbackColumnConfig {
 
+	@Nullable java.time.Duration compactionTtl() throws GestaltException;
+
 	@Nullable
 	String mergeOperatorClass() throws GestaltException;
 

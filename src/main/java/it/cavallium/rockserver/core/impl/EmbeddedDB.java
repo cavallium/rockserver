@@ -418,6 +418,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Timer rawScanPinAcquisitionTimer;
 	private final EnumMap<WriteElisionRequest, EnumMap<WriteElisionDecision, Counter>> writeElisionDecisionCounters;
 	private final RocksDBStatistics rocksDBStatistics;
+	private @Nullable CompactionIoController compactionIoController;
+	private volatile @Nullable Runnable compactionIoSampleObserver;
 	private final boolean fastGet;
 	private final @Nullable NativeRocksDBGet fastGetReader;
 	private volatile @Nullable Consumer<Boolean> rangeReadOptionsObserver;
@@ -832,6 +834,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var afterLoad = Instant.now();
 
 		loadTimer.record(Duration.between(beforeLoad, afterLoad));
+		if (loadedDb.compactionIoLimiter() != null) {
+			try {
+				compactionIoController = new CompactionIoController(name, loadedDb.compactionIoLimiter(),
+						() -> sampleCompactionIo(loadedDb.compactionIoLimiter()), metrics.getRegistry());
+			} catch (RuntimeException | Error failure) {
+				try { close(); } catch (Throwable cleanupFailure) { failure.addSuppressed(cleanupFailure); }
+				throw failure;
+			}
+		}
 	}
 
 	private Timer createActionTimer(Class<? extends RocksDBAPICommand> className) {
@@ -1342,6 +1353,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// Statistics reads use the same operation gate as API calls. Stop their
 			// producer before closing admission, then make shutdown-aware logical
 			// reads release their leases before waiting for genuinely active work.
+			if (compactionIoController != null) compactionIoController.close();
 			logger.info("Closing... stopping background statistics");
 			try {
 				rocksDBStatistics.close();
@@ -3052,6 +3064,60 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} finally {
 			ops.endOp();
 		}
+	}
+
+	@VisibleForTesting
+	public void setCompactionIoSampleObserverForTesting(@Nullable Runnable observer) {
+		compactionIoSampleObserver = observer;
+	}
+
+	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter) {
+		ops.beginOp();
+		boolean stopped = false;
+		boolean pressure = false;
+		try {
+			var observer = compactionIoSampleObserver;
+			if (observer != null) observer.run();
+			var nativeDb = db.get();
+			stopped = nativeDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY) != 0;
+			pressure = stopped || nativeDb.getLongProperty(ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY) != 0;
+			boolean recoveryClear = !pressure;
+			// Unlike admission polling, inspect every column even after a pressure trigger.
+			boolean complete = true;
+			for (var column : storagePressureColumns) {
+				var registered = column.registeredColumn();
+				if (registered != null && !tryBeginColumnUse(registered)) { complete = false; continue; }
+				try {
+					long debt = nativeDb.getLongProperty(column.handle(), ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
+					long limit = column.effectiveSoftPendingCompactionBytesLimit();
+					pressure |= limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit) >= 0;
+					recoveryClear &= !(limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit - limit / 5) >= 0);
+					long levelZeroFiles = nativeDb.getLongProperty(column.handle(), "rocksdb.num-files-at-level0");
+					pressure |= levelZeroFiles >= 20;
+					recoveryClear &= levelZeroFiles < 16;
+				} finally { if (registered != null) registered.endUse(); }
+			}
+			try (var statistics = dbOptions.statistics()) {
+				var histogram = statistics.getHistogramData(org.rocksdb.HistogramType.READ_BLOCK_GET_MICROS);
+				boolean background = nativeDb.getLongProperty("rocksdb.num-running-compactions") > 0
+						|| nativeDb.getLongProperty("rocksdb.num-running-flushes") > 0;
+				boolean foregroundPending = ops.getPendingOpsCount() > 1;
+				for (var profile : WorkloadProfile.values()) {
+					foregroundPending |= scheduler.activeTasks(profile) + scheduler.queuedTasks(profile) > 0;
+				}
+				return new CompactionIoBudget.Sample(System.nanoTime(), histogram.getCount(), histogram.getSum(),
+						limiter.getTotalBytesThrough(), background, pressure, stopped, complete,
+						foregroundPending,
+						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ)
+								+ statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN), recoveryClear);
+			}
+		} catch (org.rocksdb.RocksDBException failure) {
+			if (pressure) {
+				return new CompactionIoBudget.Sample(System.nanoTime(), 0, 0, 0,
+						false, pressure, stopped, false);
+			}
+			throw new RuntimeException(failure);
+		} finally { ops.endOp(); }
 	}
 
 	private void refreshStoragePressure() {

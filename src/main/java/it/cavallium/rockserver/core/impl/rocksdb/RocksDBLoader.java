@@ -4,6 +4,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
 import it.cavallium.rockserver.core.impl.DelegatingMergeOperator;
+import it.cavallium.rockserver.core.impl.CompactionIoBudget;
 import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
 import java.io.InputStream;
 import java.nio.file.StandardCopyOption;
@@ -129,7 +130,7 @@ public class RocksDBLoader {
                            RocksDBObjects refs, @Nullable Cache cache,
                            Map<String, Cache> caches,
                            Map<String, Long> cacheCapacities,
-                           Map<String, String> definitiveColumnCacheNames) {}
+                           Map<String, String> definitiveColumnCacheNames, @Nullable RateLimiter compactionIoLimiter) {}
 
     private static final class OpenedDbGuard implements AutoCloseable {
 
@@ -316,6 +317,18 @@ public class RocksDBLoader {
             boolean disableAutoCompactions = Optional.ofNullable(columnOptions.disableAutoCompactions())
                     .orElse(globalDatabaseConfig.disableAutoCompactions());
             boolean disableWriteSlowdown = disableAutoCompactions || globalDatabaseConfig.disableWriteSlowdown();
+            if (globalDatabaseConfig.adaptiveCompactionIo() && disableWriteSlowdown) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "adaptive-compaction-io requires automatic compaction and write slowdown for column " + name);
+            }
+            var ttl = columnOptions.compactionTtl();
+            if (ttl != null) {
+                if (ttl.isNegative() || ttl.getNano() != 0) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                            "compaction-ttl must be whole nonnegative seconds for column " + name);
+                }
+                columnFamilyOptions.setTtl(ttl.getSeconds());
+            }
             if (disableAutoCompactions) {
                 columnFamilyOptions.setDisableAutoCompactions(true);
             }
@@ -646,7 +659,7 @@ public class RocksDBLoader {
     record OptionsWithCache(DBOptions options,
                             @Nullable Cache standardCache,
                             Map<String, Cache> caches,
-                            Map<String, Long> cacheCapacities) {}
+                            Map<String, Long> cacheCapacities, @Nullable RateLimiter compactionIoLimiter) {}
 
     private static DBOptions newCompatibleDBOptions() {
         // DBOptions.getDBOptionsFromProps(), unlike the public constructor, does not bootstrap JNI itself.
@@ -692,6 +705,26 @@ public class RocksDBLoader {
             refs.add(statistics);
             statistics.setStatsLevel(StatsLevel.EXCEPT_TIME_FOR_MUTEX);
             options.setStatistics(statistics);
+            RateLimiter compactionIoLimiter = null;
+            if (databaseOptions.global().adaptiveCompactionIo()) {
+                if (databaseOptions.global().disableAutoCompactions() || databaseOptions.global().disableWriteSlowdown()) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                            "adaptive-compaction-io requires automatic compaction and write slowdown protections");
+                }
+                if (Objects.equals(databaseOptions.global().maxBackgroundJobs(), 0)) {
+                    throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                            "adaptive-compaction-io requires background jobs");
+                }
+                long buffer = Optional.ofNullable(databaseOptions.global().writeBufferManager())
+                        .map(DataSize::longValue).orElse(DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET);
+                if (buffer <= 0) buffer = DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET;
+                long seed = Math.max(CompactionIoBudget.MIN_BYTES_PER_SECOND,
+                        Math.min(CompactionIoBudget.MAX_BYTES_PER_SECOND, buffer / 5));
+                compactionIoLimiter = new RateLimiter(seed, 100_000, RateLimiter.DEFAULT_FAIRNESS,
+                        RateLimiterMode.ALL_IO, false);
+                refs.add(compactionIoLimiter);
+                options.setRateLimiter(compactionIoLimiter);
+            }
 
             if (!databaseOptions.global().unorderedWrite()) {
                 options.setEnablePipelinedWrite(true);
@@ -863,6 +896,10 @@ public class RocksDBLoader {
                         // guessed
                         .setWritableFileMaxBufferSize(8 * SizeUnit.MB);
             }
+            if (databaseOptions.global().adaptiveCompactionIo()) {
+                // Buffered advisory prefetch bypasses RateLimiter. Direct internal prefetch is charged.
+                options.setCompactionReadaheadSize(0);
+            }
             options.setIncreaseParallelism(Runtime.getRuntime().availableProcessors());
 
             // Apply max-background-jobs after setIncreaseParallelism, since that method
@@ -922,7 +959,7 @@ public class RocksDBLoader {
             return new OptionsWithCache(options,
                     blockCache,
                     Collections.unmodifiableMap(new LinkedHashMap<>(blockCaches)),
-                    Collections.unmodifiableMap(new LinkedHashMap<>(blockCacheCapacities)));
+                    Collections.unmodifiableMap(new LinkedHashMap<>(blockCacheCapacities)), compactionIoLimiter);
         } catch (GestaltException e) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, e);
         }
@@ -1059,7 +1096,13 @@ public class RocksDBLoader {
 
             var rocksLogger = new RocksLogger(logger);
             refs.add(rocksLogger);
-            rocksdbOptions.setListeners(List.of(rocksLogger));
+            if (meterRegistry != null && databaseName != null) {
+                var compactionMetrics = new CompactionMetrics(meterRegistry, databaseName);
+                refs.add(compactionMetrics);
+                rocksdbOptions.setListeners(List.of(rocksLogger, compactionMetrics));
+            } else {
+                rocksdbOptions.setListeners(List.of(rocksLogger));
+            }
 
             var columnConfigs = databaseOptions.global().columnOptions();
 
@@ -1204,7 +1247,7 @@ public class RocksDBLoader {
                         optionsWithCache.standardCache(),
                         optionsWithCache.caches(),
                         optionsWithCache.cacheCapacities(),
-                        Collections.unmodifiableMap(new HashMap<>(definitiveColumnCacheNames)));
+                        Collections.unmodifiableMap(new HashMap<>(definitiveColumnCacheNames)), optionsWithCache.compactionIoLimiter());
                 openedDbGuard.release();
                 envRegistered = false;
                 return loadedDb;
