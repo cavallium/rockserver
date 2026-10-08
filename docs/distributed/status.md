@@ -1715,3 +1715,46 @@ ownership and expiry without replacement. Existing ephemeral and durable clients
 remain covered. These are local disk/native/interface results; no server process,
 network/quorum, power-loss or measured performance acceptance was attempted. The
 excluded density fixture remains unselected and unstaged.
+
+## Collision-bucket codec and physical/member key identity foundation
+
+`DistributedBucket` now provides an immutable bounded codec compatible with valid
+standalone bucket bytes: empty bytes for an empty bucket, otherwise a count and
+length-prefixed members containing unsigned-short original tail keys and value
+remainder. Insertions append, replacements retain position, and removals preserve
+the remaining order. Key-only presence remains an empty value distinct from
+absence. Defensive copies prevent caller mutation; duplicate detection uses
+content tuples with ordered hash-collision tie-breaking rather than quadratic
+comparison against all prior members.
+
+The fixed protocol limits are 65,536 members, 256 tail components, 65,535 bytes per
+tail and `MAX_ENCODED_BYTES - 4` for the complete bucket. The last limit reserves
+the point-response length prefix. Policy refusal has a distinct
+`LimitExceededException`; malformed lengths/counts, duplicate identities,
+trailing bytes and key-only residue fail explicit structural checks. A budget
+refusal does not assert that oversized stored bytes are otherwise well formed.
+`DistributedSchema.encodeLogicalKey` reproduces every existing physical hash
+codec while retaining the original collision-member keys. `requireBucketKey`
+checks member shape and hash suffix against the exact qualified physical key.
+Fixed-key encoding, schema digests and existing wire bytes are unchanged.
+
+This is a prerequisite, not activated logical bucket RMW. The next native slice
+requires v6 bucket/member commands and predicates, immutable schema qualification
+on every replica, and an evaluated physical-effect plan even for NONE-return
+commands. All colliding changes must see earlier ordered changes; predicates must
+use the pre-command image. Bucket replacements, logical saved returns, receipt
+and apply marker must enter one batch, and retries must bypass reevaluation.
+Per-bucket and aggregate staged-rewrite limits must be protocol-bound; overload
+must save an all-or-nothing no-effects outcome. Existing logical clients still
+reject bucket operations; no client CAS workaround was introduced.
+
+Validation: the focused `test-compile surefire:test@default-test` gate passed six
+bucket cases, ten schema cases and seven logical-client/session consumer cases
+(23 total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-bucket-codec-focused-gate.log`. Checks include differential
+standalone bytes/values for multi-tail collisions, insertion/replacement/delete,
+key-only and empty values; every truncated encoding; structural errors versus
+policy limits; exact byte/unsigned-short bounds; full maximum-member decode;
+all existing physical hash codecs, forced collisions and defensive ownership.
+No native bucket mutation, server-process, network/quorum, power-loss or measured
+performance acceptance is claimed. The excluded density fixture remains untouched.

@@ -111,6 +111,65 @@ public final class DistributedSchema {
         for (int i=0;i<keys.length;i++) { int width=schema.key(i); keys[i]=Buf.wrap(Arrays.copyOfRange(encoded,offset,offset+width)); offset+=width; }
         return new Keys(keys);
     }
+    /** Existing physical hash key plus original collision-member components, both defensively owned. */
+    public record EncodedKey(byte[] physicalKey,List<byte[]> variableKeys) {
+        public EncodedKey {
+            Objects.requireNonNull(physicalKey); Objects.requireNonNull(variableKeys);
+            if (physicalKey.length>DistributedCommandCodec.MAX_ENCODED_BYTES || variableKeys.size()>DistributedSchemaCodec.MAX_KEY_COMPONENTS) throw new IllegalArgumentException("Encoded logical key exceeds bounds");
+            long bytes=2L*variableKeys.size();
+            for (var key:variableKeys) {
+                Objects.requireNonNull(key); bytes+=key.length;
+                if (key.length>Character.MAX_VALUE || bytes>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Encoded collision member exceeds budget");
+            }
+            physicalKey=physicalKey.clone(); variableKeys=variableKeys.stream().map(byte[]::clone).toList();
+        }
+        @Override public byte[] physicalKey() { return physicalKey.clone(); }
+        @Override public List<byte[]> variableKeys() { return variableKeys.stream().map(byte[]::clone).toList(); }
+        @Override public boolean equals(Object other) {
+            if (!(other instanceof EncodedKey key) || !Arrays.equals(physicalKey,key.physicalKey) || variableKeys.size()!=key.variableKeys.size()) return false;
+            for (int i=0;i<variableKeys.size();i++) if (!Arrays.equals(variableKeys.get(i),key.variableKeys.get(i))) return false; return true;
+        }
+        @Override public int hashCode() { int hash=Arrays.hashCode(physicalKey); for (var key:variableKeys) hash=31*hash+Arrays.hashCode(key); return hash; }
+    }
+    /** Reproduces standalone calculateKey, retaining every original variable key so collisions remain distinct. */
+    public EncodedKey encodeLogicalKey(UUID columnId,Keys logical) {
+        var shape=column(columnId).schema; Objects.requireNonNull(logical); var parts=logical.keys();
+        if (parts.length!=shape.keysCount()) throw new IllegalArgumentException("Logical key component count differs from schema");
+        long original=2L*shape.variableLengthKeysCount(); int physical=0;
+        for (int i=0;i<parts.length;i++) {
+            var part=Objects.requireNonNull(parts[i]); int size=part.size(); original+=size; physical+=shape.key(i);
+            if (i<shape.fixedLengthKeysCount() ? size!=shape.key(i) : size>Character.MAX_VALUE) throw new IllegalArgumentException("Logical key component width differs from codec");
+            if (original>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Logical key exceeds command budget");
+        }
+        byte[] encoded=new byte[physical]; int offset=0; var variables=new ArrayList<byte[]>(shape.variableLengthKeysCount());
+        for (int i=0;i<parts.length;i++) {
+            byte[] bytes;
+            if (i<shape.fixedLengthKeysCount()) bytes=parts[i].toByteArray();
+            else { variables.add(parts[i].toByteArray()); bytes=hash(shape.variableTailKey(i),variables.getLast()); }
+            System.arraycopy(bytes,0,encoded,offset,bytes.length); offset+=bytes.length;
+        }
+        return new EncodedKey(encoded,variables);
+    }
+    /** Verify that a bucket-member envelope names the physical bucket under this exact schema. */
+    public void requireBucketKey(UUID columnId,byte[] physicalKey,List<byte[]> variables) {
+        var shape=column(columnId).schema; Objects.requireNonNull(physicalKey); variables=List.copyOf(variables);
+        if (shape.variableLengthKeysCount()==0 || variables.size()!=shape.variableLengthKeysCount()) throw new IllegalArgumentException("Bucket member shape differs from schema");
+        int size=0, offset=0; for (int i=0;i<shape.keysCount();i++) { size+=shape.key(i); if (i<shape.fixedLengthKeysCount()) offset+=shape.key(i); }
+        if (physicalKey.length!=size) throw new IllegalArgumentException("Bucket physical key width differs from schema");
+        long bytes=2L*variables.size();
+        for (int i=0;i<variables.size();i++) {
+            var key=Objects.requireNonNull(variables.get(i)); bytes+=key.length;
+            if (key.length>Character.MAX_VALUE || bytes>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Bucket member key exceeds budget");
+            byte[] digest=hash(shape.variableTailKey(shape.fixedLengthKeysCount()+i),key);
+            for (int b=0;b<digest.length;b++) if (physicalKey[offset+b]!=digest[b]) throw new IllegalArgumentException("Bucket member hash differs from physical key");
+            offset+=digest.length;
+        }
+    }
+    private static byte[] hash(ColumnHashType hash,byte[] key) {
+        var result=Buf.createZeroes(hash.bytesSize());
+        try { hash.hash(Buf.wrap(key),result); } catch (UnsupportedOperationException malformed) { throw new IllegalArgumentException("Variable key differs from hash codec input",malformed); }
+        return result.toByteArray();
+    }
     private ColumnSchema fixed(UUID id) {
         var schema=column(id).schema;
         if (schema.variableLengthKeysCount()!=0) throw new UnsupportedOperationException("Variable-tail physical keys require the existing bucket protocol");

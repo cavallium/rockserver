@@ -166,4 +166,38 @@ class DistributedSchemaTest {
             assertThrows(IllegalArgumentException.class,() -> schema.requireMatches(mismatch));
         }
     }
+    @Test void variablePhysicalKeysMatchExistingHashesAndRetainDistinctCollisionMembers() {
+        for (var hash:ColumnHashType.values()) {
+            var shape=ColumnSchema.of(IntArrayList.of(8),ObjectArrayList.of(hash,ColumnHashType.ALLSAME8),true);
+            var schema=schema(8,column(1,A,"bucket",shape));
+            byte[] fixed=ByteBuffer.allocate(8).putLong(-42).array();
+            byte[] variable=hash==ColumnHashType.FIXEDINTEGER32 ? ByteBuffer.allocate(4).putInt(-7).array() : new byte[]{7,8,9};
+            var keys=new Keys(Buf.wrap(fixed),Buf.wrap(variable),Buf.wrap(new byte[]{1,2})); var encoded=schema.encodeLogicalKey(A,keys);
+            assertArrayEquals(new ColumnInstance(null,shape).calculateKey(keys.keys()).toByteArray(),encoded.physicalKey());
+            assertDoesNotThrow(() -> schema.requireBucketKey(A,encoded.physicalKey(),encoded.variableKeys()));
+            var collided=schema.encodeLogicalKey(A,new Keys(Buf.wrap(fixed),Buf.wrap(variable),Buf.wrap(new byte[]{9,9,9})));
+            assertArrayEquals(encoded.physicalKey(),collided.physicalKey()); assertNotEquals(encoded,collided);
+            fixed[0]^=1; variable[0]^=1; encoded.physicalKey()[0]^=1; encoded.variableKeys().getFirst()[0]^=1;
+            assertNotEquals(fixed[0],encoded.physicalKey()[0]); assertNotEquals(variable[0],encoded.variableKeys().getFirst()[0]);
+            assertEquals(encoded,new DistributedSchema.EncodedKey(encoded.physicalKey(),encoded.variableKeys()));
+        }
+    }
+    @Test void bucketHashVerificationRejectsMisroutedMalformedAndOversizedMemberKeys() {
+        var shape=ColumnSchema.of(IntArrayList.of(1),ObjectArrayList.of(ColumnHashType.XXHASH32),false);
+        var schema=schema(0,column(1,A,"bucket",shape)); var encoded=schema.encodeLogicalKey(A,new Keys(Buf.wrap(new byte[]{7}),Buf.wrap(new byte[]{1,2})));
+        byte[] wrong=encoded.physicalKey(); wrong[1]^=1;
+        assertThrows(IllegalArgumentException.class,() -> schema.requireBucketKey(A,wrong,encoded.variableKeys()));
+        assertThrows(IllegalArgumentException.class,() -> schema.requireBucketKey(A,new byte[1],encoded.variableKeys()));
+        assertThrows(IllegalArgumentException.class,() -> schema.requireBucketKey(A,encoded.physicalKey(),List.of()));
+        assertThrows(IllegalArgumentException.class,() -> schema.encodeLogicalKey(A,new Keys(Buf.wrap(new byte[]{1,2}),Buf.wrap(new byte[]{1}))));
+        assertThrows(IllegalArgumentException.class,() -> schema.encodeLogicalKey(A,new Keys(Buf.wrap(new byte[]{7}),Buf.wrap(new byte[65536]))));
+        var integerShape=ColumnSchema.of(IntArrayList.of(),ObjectArrayList.of(ColumnHashType.FIXEDINTEGER32),true);
+        var integer=schema(0,column(1,A,"int",integerShape));
+        assertThrows(IllegalArgumentException.class,() -> integer.encodeLogicalKey(A,new Keys(Buf.wrap(new byte[3]))));
+        var fixed=schema(0,column(1,A,"fixed",fixed(4)));
+        var key=new Keys(Buf.wrap(ByteBuffer.allocate(4).putInt(-1).array()));
+        assertArrayEquals(fixed.encodeFixedKey(A,key),fixed.encodeLogicalKey(A,key).physicalKey()); assertTrue(fixed.encodeLogicalKey(A,key).variableKeys().isEmpty());
+        assertThrows(IllegalArgumentException.class,() -> fixed.requireBucketKey(A,new byte[4],List.of()));
+    }
+
 }
