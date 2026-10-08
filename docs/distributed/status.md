@@ -53,7 +53,19 @@ does not establish complete distributed API parity or production acceptance.
   extensions preserve the previous view. PLAN requires the exact final business
   prefix, releases staging and accepts it under the real durable operation ID.
   Staging itself uses the ephemeral handle nonce and never appends a command or ACK.
-  Logical transaction adapters and range-delete staging remain incomplete.
+  Range-delete staging and complete frontend adapters remain incomplete.
+- Durable logical sessions now expose one-group scoped transactions over cached
+  logical column IDs/keys. Logical GET decodes complete collision buckets; STAGE
+  preserves ordered PUT/DELETE prefixes and original-image conditions, including
+  key-only presence. COMMIT freezes one durable unaccepted intent, installs binding,
+  obtains PLAN, forces accepted bytes and waits for applied execution. Equal retries
+  retain that identity; differing commit plans fail before another allocation.
+  Successful binding is remembered for the commit attempt so a lost PLAN reply
+  cannot introduce a new metadata write behind its existing reservation. Unaccepted
+  PLAN failures remain recoverable intents that may be explicitly abandoned and
+  acknowledged; accepted entries retain ordinary exact retry after session reopen.
+  Handles must close before the owning session releases its root lock. Read-only
+  handles allocate no durable operation identity.
 - Bounded mutation history detects ABA, same-value writes, absence deletes and range
   phantoms. Physical collision-bucket members share one stamp. Range deletion
   conservatively invalidates tracked observations. Exact native snapshots retain
@@ -121,7 +133,9 @@ Rejected receipts reserve their actual bounded no-effects growth, preserving
 own-ACK progress at the retention cap.
 
 The handle registry defaults to 128 handles, 16 MiB scope accounting, 16 MiB retained
-plans and a maximum 60-second TTL. Logical expiry cannot donate capacity still
+plans and a maximum 60-second TTL. A durable logical session additionally bounds its
+open handles by `min(128, outstandingWindow)` (32 by default); opening calls and
+failed/closed handles retain/release that admission explicitly. Logical expiry cannot donate capacity still
 owned by blocked capture/planning/read work. Expiry defaults to 32 groups per
 100 ms quantum; cleanup may lag under failure/queue pressure, while access rejects
 expired ownership immediately. These are fixed accounting bounds, not measured
@@ -163,6 +177,17 @@ reopen/retry, logical collision buckets, aggregate admission, and expiry during 
 replacement construction. No real server process or quorum was used. Native fixtures
 reported an io_uring allocation warning on the test host; all selected cases completed.
 
+The durable logical transaction regression gate passed 12 core and 87 adapter
+cases (99 total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-logical-transaction-regression.log`. After removing redundant retained
+plan data, the final logical-session/staging selection passed 13 adapter cases,
+exit zero: `/tmp/rockserver-logical-transaction-final.log`. It verifies forced exact
+accepted bytes before the write RPC, lost PLAN/commit reply recovery, same-identity
+commit retry, conflict/intention reopen and explicit abandonment/ACK, logical
+collision members and key-only presence, scope rejection before sequence allocation,
+and root/handle admission lifetimes. These are native/controlled-dispatch fixtures;
+full frontend parity, real quorum acceptance and range-delete staging remain pending.
+
 The end-to-end local workflow includes native OPEN/read/PLAN, forced acceptance,
 controlled append/native apply, lost reply, close/reopen, exact receipt retry and
 ACK. It also covers failed PLAN followed by durable local abandonment, and missing
@@ -186,7 +211,7 @@ server process, network/quorum probe, power-loss run or deployment was performed
 
 ## Required remaining work
 
-- Logical transaction adapters and range-delete staging; complete public
+- Range-delete staging and remaining logical/frontend transaction adapters; complete public
   RocksDB API/frontend transaction, range and cursor parity.
 - Durable prepared locks, transaction-status groups, 2PC decision/finalization and
   consistent multi-group scoped snapshot fences.

@@ -23,13 +23,15 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
         public RangeDescriptor descriptor() { return pending.descriptor(); }
         public CommandResult savedResult() { return pending.savedResult(); }
         public boolean consumed() { return pending.consumed(); }
+        public boolean awaitingAcceptance() { return pending.awaitingAcceptance(); }
+        public boolean abandoned() { return pending.abandoned(); }
     }
     private static final int MAGIC=0x44534c53, BODY_BYTES=109;
     private final Path root,intent; private final DistributedSchema schema; private final RatisSessionEpochs epochs;
     private final RatisRoutedClient routed; private final byte[] identity; private final long expires;
     private final RatisSessionClient.Limits limits; private final FileChannel channel; private final FileLock lock;
     private final ReentrantLock lane=new ReentrantLock(); private RatisGrantIssuer issuer; private RatisDurableSessionClient window;
-    private Phase phase; private SessionEpochLedger.Grant activatedGrant; private int active; private boolean advancing,fenced,closeRequested,closed;
+    private Phase phase; private SessionEpochLedger.Grant activatedGrant; private int active,transactionHandles; private boolean advancing,fenced,closeRequested,closed;
     public static RatisDurableLogicalSession create(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,
             long expiresAtMillis,RatisSessionClient.Limits limits) throws IOException {
         return new RatisDurableLogicalSession(root,schema,epochs,routed,true,expiresAtMillis,limits);
@@ -125,11 +127,86 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
             if (value!=null && !binding.schema().hasValue() && value.length!=0) throw new IOException("Nonempty key-only value"); return value==null ? null : Buf.wrap(value);
         });
     }
+    /** One complete physical scope and native cut. Close each handle before closing its owning session. */
+    public Transaction openTransaction(TransactionScope scope,java.time.Duration ttl) throws IOException {
+        return run(() -> {
+            lane.lock();
+            try {
+                if (transactionHandles>=Math.min(128,limits.outstanding())) throw new IOException("Logical transaction handle budget exhausted");
+                transactionHandles++;
+            } finally { lane.unlock(); }
+            boolean success=false;
+            try { var transaction=new Transaction(routed.openTransaction(scope,ttl),scope); success=true; return transaction; }
+            finally { if (!success) { lane.lock(); try { transactionHandles--; } finally { lane.unlock(); } } }
+        });
+    }
+    public final class Transaction implements AutoCloseable {
+        private final RatisRoutedClient.ScopedTransaction scoped;
+        private final TransactionScope scope;
+        private Pending commit;
+        private boolean closed,bindingReady;
+        private Transaction(RatisRoutedClient.ScopedTransaction scoped,TransactionScope scope) { this.scoped=scoped; this.scope=scope; }
+        public ApplyPosition snapshot() { return scoped.snapshot(); }
+        public RangeDescriptor descriptor() { return scoped.descriptor(); }
+        private void requireOpen() throws IOException { if (closed) throw new IOException("Logical transaction is closed"); }
+        private void requireMutable() throws IOException { requireOpen(); if (commit!=null) throw new IOException("Logical transaction commit is already frozen"); }
+        public synchronized Buf get(long column,Keys keys) throws IOException {
+            requireMutable();
+            return run(() -> {
+                var binding=RatisLogicalClient.supported(schema,column); var encoded=schema.encodeLogicalKey(binding.columnId(),keys);
+                byte[] value=scoped.get(binding.columnId(),encoded.physicalKey());
+                if (binding.schema().variableLengthKeysCount()!=0) {
+                    try { value=schema.decodeBucket(binding.columnId(),encoded.physicalKey(),value).get(encoded.variableKeys()); }
+                    catch (IllegalArgumentException malformed) { throw new IOException("Stored bucket cannot be served completely",malformed); }
+                }
+                if (value!=null && !binding.schema().hasValue() && value.length!=0) throw new IOException("Nonempty key-only value");
+                return value==null ? null : Buf.wrap(value);
+            });
+        }
+        private void validatePlan(RatisLogicalClient.Plan plan) {
+            for (var mutation:plan.mutations()) if (!scope.contains(mutation.columnId(),mutation.key())) throw new IllegalArgumentException("Mutation outside declared logical transaction scope");
+            for (var predicate:plan.predicates()) if (!scope.contains(predicate.columnId(),predicate.key())) throw new IllegalArgumentException("Predicate outside declared logical transaction scope");
+        }
+        /** Full equal/extended prefix. Original-image conditions and result order match ordinary logical operations. */
+        public synchronized CommandResult stage(List<RatisLogicalClient.Change> changes,List<RatisLogicalClient.Condition> conditions) throws IOException {
+            requireMutable(); return run(() -> { var plan=RatisLogicalClient.plan(schema,changes,conditions); validatePlan(plan); return scoped.stage(plan.mutations(),plan.predicates()); });
+        }
+        public CommandResult stage(List<RatisLogicalClient.Change> changes) throws IOException { return stage(changes,List.of()); }
+        /** Freezes one durable intent, binds its session, accepts and forces it, then waits for applied consensus outcome. */
+        public synchronized CommandResult commit(List<RatisLogicalClient.Change> changes,List<RatisLogicalClient.Condition> conditions) throws IOException {
+            requireOpen();
+            return run(() -> {
+                var plan=RatisLogicalClient.plan(schema,changes,conditions); validatePlan(plan);
+                if (commit!=null && (!commit.command().mutations().equals(plan.mutations()) || !commit.command().predicates().equals(plan.predicates()))) throw new IllegalArgumentException("Logical commit retry changed the frozen plan");
+                if (commit==null) {
+                    commit=new Pending(RatisDurableLogicalSession.this,window.prepareTransactionIntent(plan.mutations(),plan.predicates()));
+                }
+                if (commit.pending.awaitingAcceptance()) {
+                    if (!bindingReady) {
+                        if (ensureBindingUnderCall(commit).status()!=CommandResult.Status.SUCCESS) throw new IOException("Logical transaction session binding failed");
+                        bindingReady=true; // PLAN may already own metadata exclusions on a lost reply; never rebind that retry.
+                    }
+                    window.acceptTransaction(commit.pending,scoped.plan(commit.command()));
+                }
+                return window.execute(commit.pending);
+            });
+        }
+        public CommandResult commit(List<RatisLogicalClient.Change> changes) throws IOException { return commit(changes,List.of()); }
+        /** Includes unresolved intents after PLAN failure; accepted outcomes are resolved through the owning session after reopen. */
+        public synchronized Pending pendingCommit() { return commit; }
+        @Override public synchronized void close() throws IOException {
+            if (closed) return;
+            scoped.close(); closed=true;
+            lane.lock(); try { transactionHandles--; } finally { lane.unlock(); }
+        }
+    }
     public Pending preparePut(long column,Keys keys,Buf value,Mutation.ReturnMode returns) throws IOException { return prepare(List.of(RatisLogicalClient.Change.put(column,keys,value,returns)),List.of()); }
     public Pending prepareDelete(long column,Keys keys,Mutation.ReturnMode returns) throws IOException { return prepare(List.of(RatisLogicalClient.Change.delete(column,keys,returns)),List.of()); }
     public Pending prepare(List<RatisLogicalClient.Change> changes,List<RatisLogicalClient.Condition> conditions) throws IOException {
         return run(() -> { var plan=RatisLogicalClient.plan(schema,changes,conditions); return new Pending(this,window.prepare(plan.mutations(),plan.predicates())); });
     }
+    /** A never-accepted intent has no write authority. Persist its local no-effects outcome; ACK remains explicit. */
+    public CommandResult abandonTransactionIntent(Pending pending) throws IOException { return run(() -> window.abandonTransactionIntent(owned(pending))); }
     public CommandResult execute(Pending pending) throws IOException { return run(() -> window.execute(owned(pending))); }
     public void acknowledge(Pending pending) throws IOException { run(() -> { window.acknowledge(owned(pending)); return null; }); }
     public Pending prepareAcknowledgement(long column,Keys keys) throws IOException {
@@ -137,17 +214,18 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
     }
     /** Explicit durable first-use binding; ordinary execution performs no catalogue lookup. */
     public CommandResult ensureBinding(Pending pending) throws IOException {
-        return run(() -> {
-            owned(pending); Path directory=Files.createDirectories(root.resolve("bindings")); SessionJournalFiles.force(directory); SessionJournalFiles.force(root);
-            try (var maintenance=new RatisSessionMaintenance(directory.resolve(pending.descriptor().groupId()+".bin"),epochs,routed,pending.descriptor().groupId())) {
-                if (maintenance.rangeEpoch()!=pending.command().rangeEpoch()) throw new IOException("Logical pending range incarnation changed");
-                var command=maintenance.pendingCommand(); if (command==null) command=maintenance.prepareBinding(window.grant(),limits.outstanding());
-                var control=command.sessionControl();
-                if (control==null || !control.binding() || !control.grant().equals(window.grant()) || control.outstandingWindow()!=limits.outstanding()
-                        || !command.groupId().equals(pending.command().groupId()) || command.rangeEpoch()!=pending.command().rangeEpoch()) throw new IOException("Recovered binding differs from logical grant/window");
-                return maintenance.execute();
-            }
-        });
+        return run(() -> ensureBindingUnderCall(pending));
+    }
+    private CommandResult ensureBindingUnderCall(Pending pending) throws IOException {
+        owned(pending); Path directory=Files.createDirectories(root.resolve("bindings")); SessionJournalFiles.force(directory); SessionJournalFiles.force(root);
+        try (var maintenance=new RatisSessionMaintenance(directory.resolve(pending.descriptor().groupId()+".bin"),epochs,routed,pending.descriptor().groupId())) {
+            if (maintenance.rangeEpoch()!=pending.command().rangeEpoch()) throw new IOException("Logical pending range incarnation changed");
+            var command=maintenance.pendingCommand(); if (command==null) command=maintenance.prepareBinding(window.grant(),limits.outstanding());
+            var control=command.sessionControl();
+            if (control==null || !control.binding() || !control.grant().equals(window.grant()) || control.outstandingWindow()!=limits.outstanding()
+                    || !command.groupId().equals(pending.command().groupId()) || command.rangeEpoch()!=pending.command().rangeEpoch()) throw new IOException("Recovered binding differs from logical grant/window");
+            return maintenance.execute();
+        }
     }
     private RatisDurableSessionClient.Pending owned(Pending pending) { if (pending==null || pending.owner!=this) throw new IllegalArgumentException("Foreign logical pending operation"); return pending.pending; }
     @FunctionalInterface private interface Work<T> { T run() throws IOException; }
@@ -171,7 +249,7 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
     @Override public void close() throws IOException {
         lane.lock();
         try {
-            if (closed) return; if (active!=0) throw new IOException("Logical session work is active"); closeRequested=true;
+            if (closed) return; if (active!=0 || transactionHandles!=0) throw new IOException("Logical session work or transaction handles are active"); closeRequested=true;
             if (window!=null) window.close(); issuer.close();
             IOException failure=null;
             try { if (lock.isValid()) lock.release(); } catch (IOException cleanup) { failure=cleanup; }

@@ -145,6 +145,7 @@ class RatisSessionPropagationTest {
         final Map<UUID,ReplicatedRangeStore> stores=new LinkedHashMap<>(); final Map<UUID,RatisRangeStateMachine> machines=new LinkedHashMap<>();
         final Map<UUID,RaftGroup> raftGroups=new HashMap<>(); final List<RaftStorage> storage=new ArrayList<>();
         final Set<UUID> failed=new HashSet<>(),lost=new HashSet<>(); RangeDirectory directory; SessionEpochLedger ledger;
+        java.util.function.Consumer<DistributedCommand> beforeCommand=command -> {};
         final RatisRoutedClient routed; final byte[] dataSchemaDigest; int submissions,metadataReads,customerReads; CountDownLatch started,release;
         Fixture(Path root) throws Exception { this(root,true); }
         Fixture(Path root,boolean initialized) throws Exception { this(root,initialized,new byte[32]); }
@@ -194,7 +195,7 @@ class RatisSessionPropagationTest {
                     catch (Exception failure) { throw new IOException(failure); }
                 }
                 public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) throws IOException {
-                    submissions++;
+                    submissions++; beforeCommand.accept(command);
                     if (started!=null) {
                         started.countDown(); try { if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("fixture timeout"); }
                         catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
